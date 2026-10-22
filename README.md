@@ -5,16 +5,15 @@
 | 组件 | 二进制 | 职责 |
 |---|---|---|
 | 采集端 | `rustboard-agent` | 采集 CPU / 内存 / 磁盘 / 网卡指标，本地磁盘缓冲，断网续传 |
-| 汇聚端 | `rustboard-hub` | 接收上报、落库（SQLite）、提供只读 API，并自带同等采集能力 |
+| 汇聚端 | `rustboard-hub` | 接收上报、落库（SQLite）、管理 API 与控制面，自带同等采集能力 |
 | 面板 | `rustboard-panel` | 浏览器界面，只通过 HTTP API 访问 hub |
 
 设计文档见 [docs/requirements.md](docs/requirements.md)，实现进度见 [docs/status.md](docs/status.md)，
 已知问题见 [docs/known-issues.md](docs/known-issues.md)。
 协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **当前状态：M1 已闭环；证书有效期/自动轮换与 M2 面板已完成（v0.2.0）；
-> v0.2.1 安全硬化已完成。**
-> M3 控制面正在开发；告警尚未实现。证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。
+> **当前状态：M1/M2 与 v0.2.1 安全硬化已完成；M3 控制面已完成（v0.3.0）。**
+> 告警与归档尚未实现。证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。
 >
 > 线协议版本为 **2**：hub 与 agent 必须严格一致。版本不符时 hub 回 `bad_protocol`
 > 且不下发 Welcome，agent 打印明确错误并以非零码退出，不会进入重连循环。
@@ -43,6 +42,39 @@
    - `rustboard-agent renew` 立即强制轮换客户端证书；
    - `rustboard-hub rotate-cert [--force] [--days N]` 重签服务端证书（成对备份旧 key/cert）；
      运行中的 hub 会在 ≤10s 内自动热加载新证书，无需重启；`--force` 用于未到阈值时强制轮换。
+
+## 控制面（v0.3.0，默认关闭）
+
+控制面是 **root 权限操作**，默认全部关闭；必须同时在 agent 与 hub 两端显式开启：
+
+```toml
+# agent.toml
+[control]
+enabled = true
+systemd = true
+systemd_units = ["nginx*"]        # 精确名或前缀通配；禁止 sshd / rustboard-* 等
+process = true
+logs = true
+[[control.log_sources]]
+id = "nginx-error"
+kind = "file"                     # file | journal
+target = "/var/log/nginx/error.log"
+
+# hub.toml
+[control]
+enabled = true
+systemd = true
+process = true
+logs = true
+```
+
+- systemd / Docker 只允许 start / stop / restart；进程结束只允许 SIGTERM / SIGKILL；
+  日志只读，按配置的 journald unit 或白名单文件 tail。
+- 所有变更类操作写审计（`GET /api/v1/audit`，面板“审计”页）；非 0 退出码与信号终止记失败。
+- **信任边界**：agent 是控制动作的实际执行者与结果来源。拿到 agent 证书 + secret 的主体
+  可以伪造执行结果；hub 审计不能抵抗被控 agent。控制面能力默认关闭、白名单与操作确认
+  是主要防线。
+- 操作前请在面板上二次确认；`curl` 直接调用时必须带 `"confirm": true`（start 除外）。
 
 ## 快速开始（开发环境）
 

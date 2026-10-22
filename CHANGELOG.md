@@ -10,6 +10,40 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-23
+
+### Added
+
+- M3 控制面：systemd / Docker / 进程 / 只读日志四个模块，全部默认关闭，安装/配置时逐项开启
+- agent 控制配置 `[control]`：能力开关、systemd unit 白名单、Docker 容器白名单、
+  日志来源（journald / 白名单文件）、命令超时与日志行数上限
+- hub 控制配置 `[control]`：总开关、四项能力开关、请求超时、每会话 pending 上限、输出上限
+- 线协议新增 `ControlRequest` / `ControlResponse` 帧（协议版本仍为 2；只在能力协商后发送，
+  旧 hub/旧 agent 完全兼容）
+- 管理 API：`GET/POST /api/v1/agents/{id}/control`、`GET /api/v1/audit`
+- 面板控制台 `/agents/:id/control` 与审计页 `/audit`（systemd/Docker 操作、进程结束、
+  日志 tail、审计分页过滤）
+- SQLite schema v5：`agent_control`、`audit_log`（180 天保留）
+- 审计记录成功/拒绝/失败/超时，actor 固定 `admin`；非 0 退出码与信号终止都记 error
+
+### Changed
+
+- 进程列表按 PID 降序（新进程优先）截断 200 条，保证刚启动的进程可见
+- 面板控制/审计 API 走同源代理，浏览器仍不接触 hub Bearer token
+- 控制动作全部使用固定枚举与参数数组，无 shell；systemd/docker 只允许 start/stop/restart，
+  进程只允许 SIGTERM/SIGKILL
+
+### Security
+
+- 控制面双端能力校验：hub 发送前核对配置 + agent 上报能力，agent 执行入口再次校验
+- systemd 禁止 `sshd` / `rustboard-*` / `sd-*` / `systemd-*` / `dbus*`；裸 `*` 拒绝
+- 日志文件使用 Linux `openat2`（RESOLVE_BENEATH/NO_SYMLINKS/NO_MAGICLINKS/NO_XDEV），
+  拒绝符号链接/目录/设备/FIFO；ENOSYS 不降级
+- 进程结束使用 `pidfd_open` + `pidfd_send_signal` 固定目标，PID+comm 双重校验；
+  旧内核无 pidfd 时保守回退 `kill(2)`
+- 审计不记录命令输出/stderr；agent 错误 message 不回显
+- 明确信任边界：agent 是控制动作的执行者与结果来源，hub 审计不能抵抗被控 agent 伪造
+
 ## [0.2.1] - 2026-10-23
 
 ### Added

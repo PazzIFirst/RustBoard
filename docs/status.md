@@ -10,7 +10,7 @@
 | 证书有效期与轮换 | 🟢 完成 | 显式有效期、服务端热续签、客户端会话内轮换、启动自愈（并入 v0.2.0） |
 | M2 面板 | 🟢 完成 | React/TS 前端、登录与代理、概览/详情四类图表、多指标分桶查询、采样间隔下发 |
 | v0.2.1 硬化 | 🟢 完成 | 修复 known-issues KI-01 ~ KI-12；单元/集成 259 个，hardening e2e 29/29 |
-| M3 控制面 | 🚧 进行中 | systemd / Docker / 进程 / 日志 + 能力开关 + 审计页（分支 `feat/m3-control-plane`） |
+| M3 控制面 | 🟢 完成 | systemd / Docker / 进程 / 日志 + 双端能力开关 + 审计页；单元 379，control e2e 99/99 |
 | M4 告警与归档 | ⬜ 未开始 | |
 | M5 安装与交付 | ⬜ 未开始 | |
 
@@ -101,6 +101,21 @@
       `panel.sh` 159；web 22
 - [x] 独立评审 + 渗透：无高危；低危项记录在 known-issues / status
 
+## M3 控制面明细
+
+已完成：
+
+- [x] 线协议：`ControlRequest` / `ControlResponse`（协议版本仍 2，能力协商后发送，旧端兼容）
+- [x] agent 控制模块：systemd / Docker / 进程 / 只读日志，执行入口二次校验能力与白名单
+- [x] hub 控制 API：`GET/POST /api/v1/agents/{id}/control`、`GET /api/v1/audit`
+- [x] 会话复用：每连接控制命令队列、pending 上限、超时、未知 id 丢弃、断线回 503
+- [x] 面板控制台 `/agents/:id/control` 与审计页 `/audit`，浏览器不接触 hub token
+- [x] SQLite schema v5：`agent_control`、`audit_log`（180 天保留）
+- [x] 安全：双端开关、固定动作枚举、无 shell、openat2 路径校验、FIFO/设备拒绝、
+      pidfd 结束进程、非 0 退出/信号终止审计失败
+- [x] 测试：单元/集成 379；`control.sh` 99/99；`cargo audit` 0 漏洞
+- [x] 独立评审 + 渗透：无高危；审计信任边界与低危限制已记录
+
 ## 已验证（2026-10-23，本机）
 
 - `rustboard-hub init` 生成 CA + 服务端证书并打印指纹，同时生成管理 API token；
@@ -113,9 +128,9 @@
 - 面板修改采样间隔后 60s 内 agent 日志出现 `采样间隔已更新`，重连后继续上报；
 - series 多指标、自动分桶、32 天/点数上限与非法参数 400 均验证；
 - 证书轮换失败场景（CA 不配套、缺 ca.key、坏 ca.crt、空 SAN、缺 server.crt）均有 e2e 断言；
-- 测试：`cargo test --workspace` 259 通过；`cargo audit` 0 漏洞；
+- 测试：`cargo test --workspace` 379 通过；`cargo audit` 0 漏洞；
   `security.sh` 9/9、`cert-rotation.sh` 103/103、`panel.sh` 159/159、
-  `hardening.sh` 29/29、web `pnpm test` 22/22。
+  `hardening.sh` 29/29、`control.sh` 99/99、web `pnpm test` 45/45。
 
 ## 已知限制
 
@@ -137,10 +152,20 @@
    `agent revoke` 后重新纳管。CA 私钥是最高敏感资产，泄露等于全部身份失守。
 8. 管理 API 限速按直连来源 IP 统计；置于反代后所有客户端共享反代 IP 的额度。管理口
    默认只绑回环，反代场景需自行评估并额外限速。
+9. 管理 API / 面板的 HTTP 监听仍未加 header 读超时与连接上限，未认证慢速连接可占用 fd；
+   默认仅回环，对外暴露必须经带超时的可信反代（KI-17，v0.2.2 修复）。
+10. `reset-password` 只热加载新密码，不吊销已有会话 Cookie；若怀疑会话泄露，重置密码后
+   仍需等待 TTL 或重启面板（KI-18，v0.2.2 修复）。
+11. **控制面信任边界**：agent 是 systemd/Docker/进程动作的实际执行者与结果来源。拿到
+    agent 证书 + secret 的主体可以伪造执行结果；hub 审计不能抵抗被控 agent。能力默认关闭、
+   白名单与操作确认是主要防线（KI-25）。
+12. `nginx*` 这类前缀白名单会匹配 `nginx-evil`；需要更精确时请写完整 unit 名或更细前缀。
+    日志白名单文件的硬链接不会被 openat2 拦截（需日志目录写权限，KI-22）。
+13. 同 agent 多连接时，能力缓存以最新 Hello 为准；旧连接断开后可能短暂陈旧（KI-24，
+    v0.3.1 修复）。
 
 ## 下一步建议
 
-**M3 控制面**（systemd / Docker / 进程 / 日志，能力默认关闭 + 审计）→ 计数器结转与降采样 →
-告警与冷归档 → 安装器与镜像。
+**M4 告警与归档**（规则引擎、通知渠道、降采样、冷归档）→ 计数器结转 → 安装器与镜像。
 
-TLS 与面板已经就位，控制面可以安全地接在后面做。
+控制面已按“默认关闭 + 双端开关 + 审计”交付，可以安全进入告警阶段。
