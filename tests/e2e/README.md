@@ -9,8 +9,9 @@
 | `cert-rotation.sh` | 证书有效期、`cert-info` / `renew`、服务端 `rotate-cert`、CA 信任自动重连、指纹一致性 |
 | `panel.sh` | M2 面板：admin token 鉴权、登录/限速/Cookie、overview/series/settings、采样间隔 60s 内生效、静态与路径穿越 |
 | `hardening.sh` | v0.2.1 硬化：弱 token、未知 API 鉴权、管理限速、非回环 WARN、单 IP 连接洪水、rotate 热加载、可信代理 XFF、Origin、reset-password |
+| `control.sh` | M3 控制面：能力协商、systemd/Docker 白名单、进程 PID+名称、日志 tail/逃逸、审计分页与面板代理、能力关闭/离线 |
 
-`security.sh` 是最早的一套，下文细节以它为例；另外三套脚本的断言清单见各自文件头部注释。
+`security.sh` 是最早的一套，下文细节以它为例；其余脚本的断言清单见各自文件头部注释。
 
 ## 依赖
 
@@ -19,7 +20,8 @@
 | Linux | 脚本使用 `mktemp`、`sed -i`、`awk`、`date +%s%3N` 等 GNU 工具 |
 | bash 4.4+ | 使用数组与 `set -euo pipefail` |
 | Python 3.8+ | **仅标准库**（`ssl` / `socket` / `hashlib` / `urllib`）；无需 `pip install`，也不联网 |
-| cargo / rustc | 用于 `cargo build --locked -p rustboard-hub -p rustboard-agent`（`hardening.sh` 还会构建 panel） |
+| cargo / rustc | 用于 `cargo build --locked`（`hardening.sh` / `control.sh` 还会构建 panel） |
+| curl | `control.sh` 用 curl 访问 hub 管理 API 与面板 API |
 
 脚本不会安装任何依赖，也不会访问网络。`probe.py` 里自带最小 MessagePack
 编解码器和 RFC 6455 客户端。
@@ -95,6 +97,8 @@ e2e 结果: 全部 9 项通过
 - `hardening.sh` + `hardening_probe.py`：v0.2.1 硬化回归；覆盖弱 token、管理 API 限速、
   未知 API 鉴权、非回环 WARN、单 IP 连接洪水、`rotate-cert` 热加载、
   面板可信代理 XFF / Secure Cookie、Origin 校验与 `reset-password`
+- `control.sh`：M3 控制面回归；使用临时 fake `systemctl` / `docker` / `journalctl`，
+  不依赖宿主机服务，也不需要 root
 - `probe.py`：TLS + WebSocket + MessagePack 测试客户端；子命令
   `hello` / `batch` / `hold` / `status` / `series-count` / `health`
 
