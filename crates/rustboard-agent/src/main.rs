@@ -28,7 +28,8 @@ const AGENT_SECRET: &str = "agent.secret";
 const AGENT_CA: &str = "ca.crt";
 const AGENT_ID: &str = "agent_id";
 
-type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Parser)]
 #[command(name = "rustboard-agent", version, about = "RustBoard 采集端")]
@@ -78,7 +79,10 @@ fn main() -> Result<()> {
         Cmd::Info { config } => {
             let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_CONFIG));
             let cfg = AgentConfig::load(&path).with_context(|| {
-                format!("读取配置失败: {}（先执行 rustboard-agent init）", path.display())
+                format!(
+                    "读取配置失败: {}（先执行 rustboard-agent init）",
+                    path.display()
+                )
             })?;
             let agent_id = std::fs::read_to_string(cfg.data_dir.join(AGENT_ID))
                 .map(|s| s.trim().to_string())
@@ -92,7 +96,15 @@ fn main() -> Result<()> {
             println!("数据目录: {}", cfg.data_dir.display());
             Ok(())
         }
-        Cmd::Init { config, hub, token, fingerprint, name, data_dir, force } => {
+        Cmd::Init {
+            config,
+            hub,
+            token,
+            fingerprint,
+            name,
+            data_dir,
+            force,
+        } => {
             let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_CONFIG));
             if path.exists() && !force {
                 bail!("{} 已存在，使用 --force 覆盖", path.display());
@@ -125,7 +137,10 @@ fn main() -> Result<()> {
         Cmd::Run { config } => {
             let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_CONFIG));
             let cfg = AgentConfig::load(&path).with_context(|| {
-                format!("读取配置失败: {}（先执行 rustboard-agent init）", path.display())
+                format!(
+                    "读取配置失败: {}（先执行 rustboard-agent init）",
+                    path.display()
+                )
             })?;
             cfg.validate()?;
             run(cfg)
@@ -209,8 +224,7 @@ async fn run_async(cfg: AgentConfig) -> Result<()> {
             Ok(ws) => {
                 backoff_secs = 1;
                 tracing::info!(url = %cfg.hub_url, "已连接 hub");
-                if let Err(err) =
-                    session(ws, &cfg, &agent_id, epoch, &boot, &buffer, &notify).await
+                if let Err(err) = session(ws, &cfg, &agent_id, epoch, &boot, &buffer, &notify).await
                 {
                     tracing::warn!(error = %err, "会话中断");
                 }
@@ -241,11 +255,7 @@ async fn connect(cfg: &AgentConfig, with_client_cert: bool) -> Result<WsStream> 
         } else {
             (None, None)
         };
-        let config = tls::client_config(
-            &cfg.server_fingerprint,
-            cert.as_deref(),
-            key.as_deref(),
-        )?;
+        let config = tls::client_config(&cfg.server_fingerprint, cert.as_deref(), key.as_deref())?;
         Some(tokio_tungstenite::Connector::Rustls(config))
     } else {
         None
@@ -310,14 +320,15 @@ async fn try_enroll(cfg: &AgentConfig) -> std::result::Result<(), EnrollError> {
                 .map_err(EnrollError::Fatal)?;
             write_private(&cfg.data_dir.join(AGENT_KEY), key_pem.as_bytes())
                 .map_err(EnrollError::Fatal)?;
-            write_private(&cfg.data_dir.join(AGENT_SECRET), resp.agent_secret.as_bytes())
-                .map_err(EnrollError::Fatal)?;
-            std::fs::write(cfg.data_dir.join(AGENT_CA), &resp.ca_pem).map_err(|e| {
-                EnrollError::Fatal(anyhow!("写入 CA 证书失败: {e}"))
-            })?;
-            std::fs::write(cfg.data_dir.join(AGENT_ID), &resp.agent_id).map_err(|e| {
-                EnrollError::Fatal(anyhow!("写入 agent_id 失败: {e}"))
-            })?;
+            write_private(
+                &cfg.data_dir.join(AGENT_SECRET),
+                resp.agent_secret.as_bytes(),
+            )
+            .map_err(EnrollError::Fatal)?;
+            std::fs::write(cfg.data_dir.join(AGENT_CA), &resp.ca_pem)
+                .map_err(|e| EnrollError::Fatal(anyhow!("写入 CA 证书失败: {e}")))?;
+            std::fs::write(cfg.data_dir.join(AGENT_ID), &resp.agent_id)
+                .map_err(|e| EnrollError::Fatal(anyhow!("写入 agent_id 失败: {e}")))?;
             tracing::info!(agent = %resp.agent_id, "纳管成功");
             Ok(())
         }
@@ -408,7 +419,8 @@ async fn session(
 
         for batch in batches {
             let seq = batch.seq;
-            sink.send(Message::Binary(Frame::Batch(batch).encode()?)).await?;
+            sink.send(Message::Binary(Frame::Batch(batch).encode()?))
+                .await?;
 
             let acked = tokio::time::timeout(Duration::from_secs(20), async {
                 loop {
@@ -418,7 +430,8 @@ async fn session(
                             bail!("hub 报错: {code} {message}")
                         }
                         Frame::Ping { ts } => {
-                            sink.send(Message::Binary(Frame::Pong { ts }.encode()?)).await?;
+                            sink.send(Message::Binary(Frame::Pong { ts }.encode()?))
+                                .await?;
                         }
                         _ => {}
                     }
@@ -439,8 +452,9 @@ async fn session(
 
 async fn recv_frame<S>(stream: &mut S) -> Result<Frame>
 where
-    S: futures_util::Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
-        + Unpin,
+    S: futures_util::Stream<
+            Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
+        > + Unpin,
 {
     loop {
         match stream.next().await {

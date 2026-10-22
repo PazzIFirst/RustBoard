@@ -10,9 +10,30 @@ use super::{labelled, Collector};
 
 /// 这些文件系统不计入容量统计：要么是虚拟的，要么和别的挂载点重复。
 const SKIP_FS: &[&str] = &[
-    "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup", "cgroup2", "overlay", "squashfs",
-    "nsfs", "rpc_pipefs", "autofs", "securityfs", "debugfs", "tracefs", "pstore", "bpf",
-    "configfs", "fusectl", "mqueue", "hugetlbfs", "efivarfs", "binfmt_misc", "ramfs",
+    "proc",
+    "sysfs",
+    "devtmpfs",
+    "devpts",
+    "tmpfs",
+    "cgroup",
+    "cgroup2",
+    "overlay",
+    "squashfs",
+    "nsfs",
+    "rpc_pipefs",
+    "autofs",
+    "securityfs",
+    "debugfs",
+    "tracefs",
+    "pstore",
+    "bpf",
+    "configfs",
+    "fusectl",
+    "mqueue",
+    "hugetlbfs",
+    "efivarfs",
+    "binfmt_misc",
+    "ramfs",
 ];
 
 /// `/proc/mounts` 里的字段带八进制转义（空格是 `\040`）。
@@ -78,7 +99,11 @@ impl Collector for DiskUsageCollector {
             let Some(st) = statvfs(&mount) else {
                 continue;
             };
-            let frsize = if st.f_frsize > 0 { st.f_frsize as u64 } else { st.f_bsize as u64 };
+            let frsize = if st.f_frsize > 0 {
+                st.f_frsize
+            } else {
+                st.f_bsize
+            };
             let total = st.f_blocks.saturating_mul(frsize) as f64;
             let free = st.f_bfree.saturating_mul(frsize) as f64;
             let avail = st.f_bavail.saturating_mul(frsize) as f64;
@@ -88,13 +113,25 @@ impl Collector for DiskUsageCollector {
 
             let mount_label = mount.as_str();
             let fs_label = fs.as_str();
-            out.push(labelled("disk.total", "mount", mount_label, ts, total)
-                .with_label("fs", fs_label)
-                .with_label("dev", dev.as_str()));
-            out.push(labelled("disk.used", "mount", mount_label, ts, (total - free).max(0.0))
-                .with_label("fs", fs_label));
-            out.push(labelled("disk.avail", "mount", mount_label, ts, avail.max(0.0))
-                .with_label("fs", fs_label));
+            out.push(
+                labelled("disk.total", "mount", mount_label, ts, total)
+                    .with_label("fs", fs_label)
+                    .with_label("dev", dev.as_str()),
+            );
+            out.push(
+                labelled(
+                    "disk.used",
+                    "mount",
+                    mount_label,
+                    ts,
+                    (total - free).max(0.0),
+                )
+                .with_label("fs", fs_label),
+            );
+            out.push(
+                labelled("disk.avail", "mount", mount_label, ts, avail.max(0.0))
+                    .with_label("fs", fs_label),
+            );
 
             let inodes_total = st.f_files as f64;
             if inodes_total > 0.0 {
@@ -105,7 +142,13 @@ impl Collector for DiskUsageCollector {
                     ts,
                     (st.f_files - st.f_ffree) as f64,
                 ));
-                out.push(labelled("disk.inode.total", "mount", mount_label, ts, inodes_total));
+                out.push(labelled(
+                    "disk.inode.total",
+                    "mount",
+                    mount_label,
+                    ts,
+                    inodes_total,
+                ));
             }
         }
         out
@@ -126,15 +169,25 @@ pub struct DiskIoCollector {
     prev: Mutex<(HashMap<String, IoCounters>, Option<i64>)>,
 }
 
+impl Default for DiskIoCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DiskIoCollector {
     pub fn new() -> Self {
-        Self { prev: Mutex::new((HashMap::new(), None)) }
+        Self {
+            prev: Mutex::new((HashMap::new(), None)),
+        }
     }
 }
 
 /// 这些设备名不是真实磁盘，统计进去只会重复计数。
 fn skip_device(name: &str) -> bool {
-    ["loop", "ram", "zram", "sr", "fd", "dm-", "md"].iter().any(|p| name.starts_with(p))
+    ["loop", "ram", "zram", "sr", "fd", "dm-", "md"]
+        .iter()
+        .any(|p| name.starts_with(p))
 }
 
 fn read_diskstats() -> HashMap<String, IoCounters> {
@@ -188,19 +241,50 @@ impl Collector for DiskIoCollector {
         for (name, cur) in &current {
             let key = name.as_str();
             // 原始计数器：原样上报，重启归零由 hub 侧结转
-            out.push(labelled("diskio.read_bytes", "dev", key, ts, (cur.read_sectors * 512) as f64));
-            out.push(labelled("diskio.write_bytes", "dev", key, ts, (cur.write_sectors * 512) as f64));
-            out.push(labelled("diskio.read_ops", "dev", key, ts, cur.read_ops as f64));
-            out.push(labelled("diskio.write_ops", "dev", key, ts, cur.write_ops as f64));
+            out.push(labelled(
+                "diskio.read_bytes",
+                "dev",
+                key,
+                ts,
+                (cur.read_sectors * 512) as f64,
+            ));
+            out.push(labelled(
+                "diskio.write_bytes",
+                "dev",
+                key,
+                ts,
+                (cur.write_sectors * 512) as f64,
+            ));
+            out.push(labelled(
+                "diskio.read_ops",
+                "dev",
+                key,
+                ts,
+                cur.read_ops as f64,
+            ));
+            out.push(labelled(
+                "diskio.write_ops",
+                "dev",
+                key,
+                ts,
+                cur.write_ops as f64,
+            ));
 
             if let (Some(old), Some(elapsed)) = (prev.get(name), elapsed_ms) {
                 let d_ops = (cur.read_ops + cur.write_ops)
-                    .saturating_sub(old.read_ops + old.write_ops) as f64;
+                    .saturating_sub(old.read_ops + old.write_ops)
+                    as f64;
                 let d_ms = cur.io_ms.saturating_sub(old.io_ms) as f64;
                 if d_ops > 0.0 {
                     out.push(labelled("diskio.await_ms", "dev", key, ts, d_ms / d_ops));
                 }
-                out.push(labelled("diskio.util", "dev", key, ts, (d_ms / elapsed * 100.0).min(100.0)));
+                out.push(labelled(
+                    "diskio.util",
+                    "dev",
+                    key,
+                    ts,
+                    (d_ms / elapsed * 100.0).min(100.0),
+                ));
             }
         }
 

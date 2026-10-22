@@ -39,7 +39,9 @@ pub fn cert_dir(data_dir: &Path) -> PathBuf {
 fn ca_params() -> Result<CertificateParams> {
     let mut params = CertificateParams::new(Vec::<String>::new())?;
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.distinguished_name.push(DnType::CommonName, CA_COMMON_NAME);
+    params
+        .distinguished_name
+        .push(DnType::CommonName, CA_COMMON_NAME);
     params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,
         KeyUsagePurpose::CrlSign,
@@ -114,10 +116,15 @@ pub fn issue_server_cert(ca_key_pem: &str, sans: &[String]) -> Result<(String, S
 
     let key = KeyPair::generate()?;
     let mut params = CertificateParams::new(Vec::<String>::new())?;
-    params.distinguished_name.push(DnType::CommonName, SERVER_COMMON_NAME);
+    params
+        .distinguished_name
+        .push(DnType::CommonName, SERVER_COMMON_NAME);
     params.subject_alt_names = san_entries(sans);
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    params.key_usages = vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyEncipherment];
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
 
     let cert = params.signed_by(&key, &ca_cert, &ca_key)?;
     Ok((cert.pem(), key.serialize_pem()))
@@ -127,7 +134,9 @@ pub fn issue_server_cert(ca_key_pem: &str, sans: &[String]) -> Result<(String, S
 pub fn make_csr() -> Result<(String, String)> {
     let key = KeyPair::generate()?;
     let mut params = CertificateParams::new(Vec::<String>::new())?;
-    params.distinguished_name.push(DnType::CommonName, "rustboard-agent-pending");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "rustboard-agent-pending");
     let csr: CertificateSigningRequest = params.serialize_request(&key)?;
     Ok((csr.pem()?, key.serialize_pem()))
 }
@@ -141,7 +150,9 @@ pub fn sign_client_csr(ca_key_pem: &str, csr_pem: &str, agent_id: &str) -> Resul
         .context("CSR 解析失败（可能不是合法的 PEM CSR）")?;
 
     csr.params.distinguished_name = DistinguishedName::new();
-    csr.params.distinguished_name.push(DnType::CommonName, agent_id);
+    csr.params
+        .distinguished_name
+        .push(DnType::CommonName, agent_id);
     csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     csr.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     csr.params.subject_alt_names = Vec::new();
@@ -207,11 +218,13 @@ pub fn server_config(data_dir: &Path) -> Result<Arc<rustls::ServerConfig>> {
     }
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier =
-        rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
-            .allow_unauthenticated()
-            .build()
-            .context("构建客户端证书校验器失败")?;
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .allow_unauthenticated()
+    .build()
+    .context("构建客户端证书校验器失败")?;
 
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
@@ -229,7 +242,10 @@ pub fn client_config(
 ) -> Result<Arc<rustls::ClientConfig>> {
     let pinned = parse_fingerprint(fingerprint)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = Arc::new(PinnedCertVerifier { fingerprint: pinned, provider: provider.clone() });
+    let verifier = Arc::new(PinnedCertVerifier {
+        fingerprint: pinned,
+        provider: provider.clone(),
+    });
 
     let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
@@ -237,7 +253,9 @@ pub fn client_config(
         .with_custom_certificate_verifier(verifier);
 
     let mut config = match (client_cert_pem, client_key_pem) {
-        (Some(cert), Some(key)) => builder.with_client_auth_cert(load_certs(cert)?, load_key(key)?)?,
+        (Some(cert), Some(key)) => {
+            builder.with_client_auth_cert(load_certs(cert)?, load_key(key)?)?
+        }
         _ => builder.with_no_client_auth(),
     };
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -307,7 +325,9 @@ impl ServerCertVerifier for PinnedCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -332,7 +352,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join(":");
         assert_eq!(parse_fingerprint(&colon).unwrap(), parsed);
-        assert_eq!(parse_fingerprint(&format!("sha256:{colon}")).unwrap(), parsed);
+        assert_eq!(
+            parse_fingerprint(&format!("sha256:{colon}")).unwrap(),
+            parsed
+        );
     }
 
     #[test]
@@ -353,8 +376,7 @@ mod tests {
         // 用 CA 校验链（只验证能解析、能被 webpki 接受）
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca_cert.der().clone()).unwrap();
-        let parsed = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-            .build();
+        let parsed = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build();
         assert!(parsed.is_ok());
     }
 }

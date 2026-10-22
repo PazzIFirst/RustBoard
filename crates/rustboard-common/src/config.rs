@@ -59,7 +59,9 @@ impl AgentConfig {
             return Err(Error::InvalidConfig("hub_url 不能为空".into()));
         }
         if !self.hub_url.starts_with("ws://") && !self.hub_url.starts_with("wss://") {
-            return Err(Error::InvalidConfig("hub_url 必须以 ws:// 或 wss:// 开头".into()));
+            return Err(Error::InvalidConfig(
+                "hub_url 必须以 ws:// 或 wss:// 开头".into(),
+            ));
         }
         if self.sample_interval_ms < 1_000 {
             return Err(Error::InvalidConfig("采样间隔不能小于 1000ms".into()));

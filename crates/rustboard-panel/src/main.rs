@@ -53,7 +53,12 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     match Cli::parse().cmd {
-        Cmd::Init { config, listen, hub, force } => {
+        Cmd::Init {
+            config,
+            listen,
+            hub,
+            force,
+        } => {
             let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_PANEL_CONFIG));
             if path.exists() && !force {
                 bail!("{} 已存在，使用 --force 覆盖", path.display());
@@ -91,7 +96,11 @@ fn main() -> Result<()> {
             println!("hub API: {}", cfg.hub_url);
             Ok(())
         }
-        Cmd::Run { config, listen, hub } => {
+        Cmd::Run {
+            config,
+            listen,
+            hub,
+        } => {
             let mut cfg = PanelConfig::default();
             let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_PANEL_CONFIG));
             if path.exists() {
@@ -110,7 +119,9 @@ fn main() -> Result<()> {
 }
 
 fn run(cfg: PanelConfig) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     runtime.block_on(async move {
         let app = Router::new()
             .route("/", get(index))

@@ -15,7 +15,12 @@ pub struct Sample {
 
 impl Sample {
     pub fn new(metric: impl Into<String>, ts: i64, value: f64) -> Self {
-        Self { metric: metric.into(), labels: Labels::new(), ts, value }
+        Self {
+            metric: metric.into(),
+            labels: Labels::new(),
+            ts,
+            value,
+        }
     }
 
     pub fn with_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {

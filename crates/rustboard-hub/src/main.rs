@@ -109,9 +109,23 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     match Cli::parse().cmd {
-        Cmd::Init { config, data_dir, agent_listen, admin_listen, sans, advertise, force } => {
-            init(config, data_dir, agent_listen, admin_listen, sans, advertise, force)
-        }
+        Cmd::Init {
+            config,
+            data_dir,
+            agent_listen,
+            admin_listen,
+            sans,
+            advertise,
+            force,
+        } => init(
+            config,
+            data_dir,
+            agent_listen,
+            admin_listen,
+            sans,
+            advertise,
+            force,
+        ),
         Cmd::Run { config } => {
             let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
             let cfg = load_config(&path)?;
@@ -119,7 +133,11 @@ fn main() -> Result<()> {
             run(cfg, db_path)
         }
         Cmd::Agent { action } => match action {
-            AgentAction::Add { config, name, ttl_minutes } => agent_add(config, name, ttl_minutes),
+            AgentAction::Add {
+                config,
+                name,
+                ttl_minutes,
+            } => agent_add(config, name, ttl_minutes),
             AgentAction::Revoke { config, id } => agent_revoke(config, id),
         },
         Cmd::Ports { config } => print_ports(config),
@@ -127,8 +145,12 @@ fn main() -> Result<()> {
 }
 
 fn load_config(path: &std::path::Path) -> Result<HubConfig> {
-    HubConfig::load(path)
-        .with_context(|| format!("读取配置失败: {}（先执行 rustboard-hub init）", path.display()))
+    HubConfig::load(path).with_context(|| {
+        format!(
+            "读取配置失败: {}（先执行 rustboard-hub init）",
+            path.display()
+        )
+    })
 }
 
 fn init(
@@ -167,7 +189,8 @@ fn init(
     }
     cfg.name = hostname();
     // 安装命令里的地址：显式指定 > 默认出口 IP
-    let advertise = advertise.or_else(|| rustboard_common::util::primary_ipv4().map(|ip| ip.to_string()));
+    let advertise =
+        advertise.or_else(|| rustboard_common::util::primary_ipv4().map(|ip| ip.to_string()));
     if let Some(host) = &advertise {
         cfg.server_names.push(host.clone());
         cfg.advertise_host = Some(host.clone());
@@ -186,7 +209,10 @@ fn init(
     println!("（端口为随机五位数，随时可用 `rustboard-hub ports` 查看）");
     println!("\n下一步:");
     println!("  1) rustboard-hub run --config {}", path.display());
-    println!("  2) rustboard-hub agent add --config {} --name web-01", path.display());
+    println!(
+        "  2) rustboard-hub agent add --config {} --name web-01",
+        path.display()
+    );
     Ok(())
 }
 
@@ -224,10 +250,9 @@ fn agent_add(config: Option<PathBuf>, name: String, ttl_minutes: u32) -> Result<
     let expires = now + (ttl_minutes as i64) * 60_000;
     db.create_enroll_token(&tls::sha256_hex(&token), &name, now, expires)?;
 
-    let cert_pem = std::fs::read_to_string(
-        tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE),
-    )
-    .context("找不到服务端证书，先执行 rustboard-hub init")?;
+    let cert_pem =
+        std::fs::read_to_string(tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE))
+            .context("找不到服务端证书，先执行 rustboard-hub init")?;
     let fingerprint = tls::fingerprint_of_pem(&cert_pem)?;
 
     let host = cfg
@@ -284,14 +309,16 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
 
         let tls_config = tls::server_config(&cfg.data_dir)?;
         let fingerprint = {
-            let pem = std::fs::read_to_string(
-                tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE),
-            )?;
+            let pem =
+                std::fs::read_to_string(tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE))?;
             tls::fingerprint_of_pem(&pem)?
         };
         tracing::info!(fingerprint, "TLS 已启用");
 
-        let state = AppState { storage: storage.clone(), cfg: Arc::new(cfg.clone()) };
+        let state = AppState {
+            storage: storage.clone(),
+            cfg: Arc::new(cfg.clone()),
+        };
 
         if cfg.self_monitor {
             spawn_self_monitor(storage.clone(), cfg.clone());
@@ -328,11 +355,7 @@ async fn serve(app: Router, addr: String) -> Result<()> {
     Ok(())
 }
 
-async fn serve_tls(
-    app: Router,
-    addr: String,
-    config: Arc<rustls::ServerConfig>,
-) -> Result<()> {
+async fn serve_tls(app: Router, addr: String, config: Arc<rustls::ServerConfig>) -> Result<()> {
     let sock: SocketAddr = addr
         .parse()
         .with_context(|| format!("监听地址非法: {addr}"))?;
@@ -442,11 +465,7 @@ async fn dispatch(mut socket: WebSocket, state: AppState) -> Result<()> {
     }
 }
 
-async fn handle_enroll(
-    mut socket: WebSocket,
-    state: AppState,
-    req: EnrollRequest,
-) -> Result<()> {
+async fn handle_enroll(mut socket: WebSocket, state: AppState, req: EnrollRequest) -> Result<()> {
     if req.protocol != PROTOCOL_VERSION {
         send_frame(&mut socket, &problem(codes::BAD_PROTOCOL, "协议版本不匹配")).await?;
         bail!("enrollment 协议版本不匹配: {}", req.protocol);
@@ -457,19 +476,22 @@ async fn handle_enroll(
         .storage
         .consume_enroll_token(&tls::sha256_hex(&req.token), now)?
     else {
-        send_frame(&mut socket, &problem(codes::ENROLL_DENIED, "token 无效、已使用或已过期")).await?;
+        send_frame(
+            &mut socket,
+            &problem(codes::ENROLL_DENIED, "token 无效、已使用或已过期"),
+        )
+        .await?;
         bail!("enrollment token 无效");
     };
 
     let dir = tls::cert_dir(&state.cfg.data_dir);
-    let ca_key = std::fs::read_to_string(dir.join(tls::CA_KEY_FILE))
-        .context("读取 CA 私钥失败")?;
-    let ca_pem = std::fs::read_to_string(dir.join(tls::CA_CERT_FILE))
-        .context("读取 CA 证书失败")?;
+    let ca_key = std::fs::read_to_string(dir.join(tls::CA_KEY_FILE)).context("读取 CA 私钥失败")?;
+    let ca_pem =
+        std::fs::read_to_string(dir.join(tls::CA_CERT_FILE)).context("读取 CA 证书失败")?;
 
     let agent_id = uuid::Uuid::new_v4().to_string();
-    let cert_pem = tls::sign_client_csr(&ca_key, &req.csr_pem, &agent_id)
-        .context("签发客户端证书失败")?;
+    let cert_pem =
+        tls::sign_client_csr(&ca_key, &req.csr_pem, &agent_id).context("签发客户端证书失败")?;
 
     let secret = new_secret();
     state
@@ -477,7 +499,11 @@ async fn handle_enroll(
         .set_agent_secret(&agent_id, &tls::sha256_hex(&secret), now)?;
     state.storage.upsert_agent(&AgentRecord {
         agent_id: agent_id.clone(),
-        name: if token_name.is_empty() { req.hostname.clone() } else { token_name },
+        name: if token_name.is_empty() {
+            req.hostname.clone()
+        } else {
+            token_name
+        },
         hostname: req.hostname.clone(),
         os: String::new(),
         arch: String::new(),
@@ -584,9 +610,10 @@ async fn handle_session(
                     Frame::Batch(batch) => {
                         let batch_for_db = batch.clone();
                         let storage = state.storage.clone();
-                        let result =
-                            tokio::task::spawn_blocking(move || storage.insert_batch(&batch_for_db))
-                                .await?;
+                        let result = tokio::task::spawn_blocking(move || {
+                            storage.insert_batch(&batch_for_db)
+                        })
+                        .await?;
                         match result {
                             Ok(outcome) => {
                                 tracing::debug!(
@@ -600,7 +627,8 @@ async fn handle_session(
                             }
                             Err(err) => {
                                 tracing::error!(error = %err, "入库失败");
-                                send_frame(&mut socket, &problem(codes::INTERNAL, "入库失败")).await?;
+                                send_frame(&mut socket, &problem(codes::INTERNAL, "入库失败"))
+                                    .await?;
                             }
                         }
                     }
@@ -629,7 +657,10 @@ async fn handle_session(
 }
 
 fn problem(code: &str, message: &str) -> Frame {
-    Frame::Problem { code: code.to_string(), message: message.to_string() }
+    Frame::Problem {
+        code: code.to_string(),
+        message: message.to_string(),
+    }
 }
 
 async fn send_frame(socket: &mut WebSocket, frame: &Frame) -> Result<()> {
@@ -649,7 +680,11 @@ fn spawn_self_monitor(storage: Arc<SqliteStorage>, cfg: HubConfig) {
 
         let record = AgentRecord {
             agent_id: agent_id.clone(),
-            name: if cfg.name.is_empty() { hostname() } else { cfg.name.clone() },
+            name: if cfg.name.is_empty() {
+                hostname()
+            } else {
+                cfg.name.clone()
+            },
             hostname: hostname(),
             os: os_pretty_name(),
             arch: arch(),

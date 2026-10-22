@@ -16,7 +16,10 @@ pub trait Collector: Send + Sync {
 }
 
 /// 组装默认采集器集合。
-pub fn default_collectors(per_core: bool, excluded_interfaces: &[String]) -> Vec<Box<dyn Collector>> {
+pub fn default_collectors(
+    per_core: bool,
+    excluded_interfaces: &[String],
+) -> Vec<Box<dyn Collector>> {
     vec![
         Box::new(cpu::CpuCollector::new(per_core)),
         Box::new(mem::MemCollector),
@@ -33,13 +36,7 @@ pub(crate) fn point(metric: &str, ts: i64, value: f64) -> Sample {
 }
 
 /// 构造一个单标签采样点。
-pub(crate) fn labelled(
-    metric: &str,
-    key: &str,
-    value: &str,
-    ts: i64,
-    sample_value: f64,
-) -> Sample {
+pub(crate) fn labelled(metric: &str, key: &str, value: &str, ts: i64, sample_value: f64) -> Sample {
     let mut sample = Sample::new(metric, ts, sample_value);
     let mut labels = Labels::new();
     labels.insert(key.to_string(), value.to_string());

@@ -23,7 +23,14 @@ struct CpuTimes {
 
 impl CpuTimes {
     fn total(self) -> u64 {
-        self.user + self.nice + self.system + self.idle + self.iowait + self.irq + self.softirq + self.steal
+        self.user
+            + self.nice
+            + self.system
+            + self.idle
+            + self.iowait
+            + self.irq
+            + self.softirq
+            + self.steal
     }
 
     fn busy(self) -> u64 {
@@ -102,7 +109,10 @@ pub struct CpuCollector {
 
 impl CpuCollector {
     pub fn new(per_core: bool) -> Self {
-        Self { per_core, prev: Mutex::new(None) }
+        Self {
+            per_core,
+            prev: Mutex::new(None),
+        }
     }
 }
 
@@ -189,8 +199,14 @@ mod tests {
 
     #[test]
     fn delta_saturates_on_reset() {
-        let a = CpuTimes { user: 50, ..Default::default() };
-        let b = CpuTimes { user: 10, ..Default::default() };
+        let a = CpuTimes {
+            user: 50,
+            ..Default::default()
+        };
+        let b = CpuTimes {
+            user: 10,
+            ..Default::default()
+        };
         assert_eq!(b.delta(a).user, 0);
     }
 }

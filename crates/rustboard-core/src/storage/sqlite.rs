@@ -70,7 +70,8 @@ impl SqliteStorage {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("创建数据目录失败: {}", parent.display()))?;
         }
-        let conn = Connection::open(path).with_context(|| format!("打开数据库失败: {}", path.display()))?;
+        let conn = Connection::open(path)
+            .with_context(|| format!("打开数据库失败: {}", path.display()))?;
         Self::init(conn)
     }
 
@@ -86,7 +87,9 @@ impl SqliteStorage {
         conn.pragma_update(None, "busy_timeout", 5_000)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -162,7 +165,10 @@ impl Storage for SqliteStorage {
         if let Some((epoch, last_seq)) = state {
             if epoch == batch.epoch && batch.seq <= last_seq {
                 tx.commit()?;
-                return Ok(InsertOutcome { inserted: 0, duplicate: true });
+                return Ok(InsertOutcome {
+                    inserted: 0,
+                    duplicate: true,
+                });
             }
         }
 
@@ -188,7 +194,10 @@ impl Storage for SqliteStorage {
             params![batch.agent_id, batch.epoch, batch.seq, batch.sent_at],
         )?;
         tx.commit()?;
-        Ok(InsertOutcome { inserted, duplicate: false })
+        Ok(InsertOutcome {
+            inserted,
+            duplicate: false,
+        })
     }
 
     fn list_agents(&self) -> Result<Vec<AgentRecord>> {
@@ -409,7 +418,8 @@ mod tests {
     #[test]
     fn enroll_token_is_single_use() {
         let s = SqliteStorage::open_in_memory().unwrap();
-        s.create_enroll_token("hash-a", "web-01", 1_000, 5_000).unwrap();
+        s.create_enroll_token("hash-a", "web-01", 1_000, 5_000)
+            .unwrap();
         assert_eq!(
             s.consume_enroll_token("hash-a", 2_000).unwrap().as_deref(),
             Some("web-01")
@@ -423,7 +433,8 @@ mod tests {
     #[test]
     fn expired_enroll_token_rejected() {
         let s = SqliteStorage::open_in_memory().unwrap();
-        s.create_enroll_token("hash-c", "web-02", 1_000, 2_000).unwrap();
+        s.create_enroll_token("hash-c", "web-02", 1_000, 2_000)
+            .unwrap();
         assert_eq!(s.consume_enroll_token("hash-c", 2_001).unwrap(), None);
     }
 
