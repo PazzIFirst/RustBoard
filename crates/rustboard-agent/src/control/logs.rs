@@ -5,6 +5,8 @@
 //!   普通文件（不存在则允许，读取时报错）；
 //! - 读取时以父目录 fd + 文件名调用 Linux `openat2(2)`，使用
 //!   `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV`；
+//! - `O_NONBLOCK` 打开后再 `fstat`，只接受普通文件；FIFO / 设备 / 目录一律拒绝，
+//!   避免日志文件被替换成 FIFO 后永久阻塞控制线程；
 //! - 内核不支持 `openat2`（ENOSYS）时直接失败并返回错误，**不降级**到 `fs::read`；
 //! - 只从文件尾部倒读，最多 2000 行、单行 4096 字节、总输出 256 KiB。
 
@@ -372,7 +374,9 @@ fn open_beneath(parent: &Path, file_name: &OsStr) -> io::Result<File> {
     }
 
     let how = OpenHow {
-        flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
+        // O_NONBLOCK：日志文件若被替换成 FIFO，open 不会因为没有写端而永久阻塞；
+        // 打开后再用 fstat 拒绝任何非普通文件。
+        flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK) as u64,
         mode: 0,
         resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV,
     };
@@ -396,7 +400,17 @@ fn open_beneath(parent: &Path, file_name: &OsStr) -> io::Result<File> {
         return Err(open_err);
     }
     // SAFETY: fd 由 openat2(2) 返回，是唯一所有者的文件描述符，交给 File 管理。
-    Ok(unsafe { File::from_raw_fd(fd as libc::c_int) })
+    let file = unsafe { File::from_raw_fd(fd as libc::c_int) };
+    // 只允许普通文件：FIFO / 设备 / 目录即使被放进白名单目录也要拒绝。
+    // 这是 O_NONBLOCK 打开后的二次确认，保证后续 read/seek 不会永久阻塞。
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "日志文件不是普通文件（FIFO / 设备 / 目录）",
+        ));
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -405,6 +419,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
 
     fn temp_dir(tag: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -619,6 +634,47 @@ mod tests {
 
         // 父目录不是绝对路径时直接拒绝。
         assert!(open_beneath(Path::new("relative"), OsStr::new("x")).is_err());
+
+        // 目录同样不是普通文件，打开后必须被拒绝。
+        std::fs::create_dir(dir.join("subdir")).unwrap();
+        assert!(
+            open_beneath(&dir, OsStr::new("subdir")).is_err(),
+            "目录必须被拒绝"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 安全回归：日志文件被替换成 FIFO 时，打开必须立即失败而不是阻塞控制线程。
+    #[test]
+    fn fifo_log_target_is_rejected_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = temp_dir("fifo");
+        let fifo = dir.join("app.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c 是以 NUL 结尾的合法路径，mkfifo(2) 只读取该 C 字符串。
+        let rc = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo 失败: {}", io::Error::last_os_error());
+
+        // 启动校验：已存在的 FIFO 不是普通文件，必须拒绝启动。
+        let cfg = cfg_with(vec![file_source("fifo", &fifo)]);
+        let err = format!("{:#}", validate_sources_io(&cfg).unwrap_err());
+        assert!(err.contains("不是普通文件"), "{err}");
+
+        // 运行期（启动后文件被替换成 FIFO）：tail 必须快速返回错误，不能挂起。
+        let started = Instant::now();
+        let err = tail(&cfg, &cfg.log_sources[0], 10).expect_err("FIFO 必须被拒绝");
+        assert_eq!(err.code, control::codes::CONTROL_FAILED);
+        assert!(
+            err.message.contains("普通文件") || err.message.contains("openat2"),
+            "错误信息应说明非普通文件: {}",
+            err.message
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "FIFO 打开不能阻塞: {:?}",
+            started.elapsed()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
