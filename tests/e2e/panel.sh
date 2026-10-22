@@ -38,9 +38,6 @@ PYTHON=${PYTHON:-python3}
 CARGO=${CARGO:-cargo}
 
 # 按任务约定固定使用这套 cargo/rustup 环境。
-export PATH="/tmp/cargo/bin:${PATH}"
-export CARGO_HOME=/tmp/cargo
-export RUSTUP_HOME=/tmp/rustup
 
 PASSES=0
 FAILS=0
