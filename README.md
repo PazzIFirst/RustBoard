@@ -103,4 +103,4 @@ SQLite 批次幂等、一次性 token 单次使用与过期、吊销清除 secre
 
 ## License
 
-MIT
+[MIT](LICENSE) © 2026 PazzIFirst
