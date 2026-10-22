@@ -510,9 +510,17 @@ echo "==> 初始化 hub（agent=${AGENT_PORT} admin=${ADMIN_PORT}）"
 
 sed -i 's/^self_monitor = true$/self_monitor = false/' "$HUB_CFG"
 sed -i 's/^sample_interval_ms = 5000$/sample_interval_ms = 1000/' "$HUB_CFG"
-# 控制面用例会连续 POST；关闭管理写限速，避免第 11 次起被 429 干扰业务断言。
-if ! grep -q '^admin_write_rate_limit_per_min' "$HUB_CFG"; then
+# 控制面用例会连续 POST/GET；hub init 已把默认值写进配置，必须覆盖而不是只追加。
+# 关闭读/写限速，避免默认 60/min、10/min 把业务断言打成 429。
+if grep -q '^admin_write_rate_limit_per_min' "$HUB_CFG"; then
+  sed -i 's/^admin_write_rate_limit_per_min = .*/admin_write_rate_limit_per_min = 0/' "$HUB_CFG"
+else
   printf '\nadmin_write_rate_limit_per_min = 0\n' >> "$HUB_CFG"
+fi
+if grep -q '^admin_rate_limit_per_min' "$HUB_CFG"; then
+  sed -i 's/^admin_rate_limit_per_min = .*/admin_rate_limit_per_min = 0/' "$HUB_CFG"
+else
+  printf '\nadmin_rate_limit_per_min = 0\n' >> "$HUB_CFG"
 fi
 [[ -f "$CA" ]] || die "缺少 CA 证书: $CA"
 
@@ -963,11 +971,15 @@ panel_api POST "/api/agents/${A_ID}/control" \
 expect_status "7.5 面板 restart nginx 200" 200
 check_eq "7.6 面板代理 restart ok" "True" "$(json_get 'd.get("ok")')"
 
-panel_api GET "/api/audit?limit=1&capability=systemd"
+# 前面越权测试也产生了 sshd.service 审计，不能只看最新一条；在列表里按 target 找。
+panel_api GET "/api/audit?limit=20&capability=systemd"
 expect_status "7.7 面板审计 200" 200
-check_eq "7.8 面板审计 actor=admin" "admin" "$(json_get 'd.get("entries",[{}])[0].get("actor")')"
-check_eq "7.9 面板审计 action=restart" "restart" "$(json_get 'd.get("entries",[{}])[0].get("action")')"
-check_eq "7.10 面板审计 target=nginx.service" "nginx.service" "$(json_get 'd.get("entries",[{}])[0].get("target")')"
+check_eq "7.8 面板审计存在 admin 的 nginx 记录" "True" \
+  "$(json_get 'any(e.get("actor")=="admin" and e.get("target")=="nginx.service" for e in d.get("entries",[]))')"
+check_eq "7.9 面板审计存在 nginx restart 记录" "True" \
+  "$(json_get 'any(e.get("action")=="restart" and e.get("target")=="nginx.service" for e in d.get("entries",[]))')"
+check_eq "7.10 面板审计 target=nginx.service" "True" \
+  "$(json_get 'any(e.get("target")=="nginx.service" and e.get("action")=="restart" and e.get("actor")=="admin" for e in d.get("entries",[]))')"
 
 # ---------------------------------------------------------------------------
 # 8. 离线 503 / hub 能力关闭 / hub 总开关关闭
