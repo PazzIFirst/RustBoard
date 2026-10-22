@@ -10,6 +10,7 @@ use axum::routing::get;
 use axum::Router;
 use clap::{Parser, Subcommand};
 use rustboard_common::config::PanelConfig;
+use rustboard_common::util::{pick_free_port, port_of};
 use rustboard_common::DEFAULT_PANEL_CONFIG;
 
 #[derive(Parser)]
@@ -39,6 +40,11 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// 查看当前使用的端口与访问地址。
+    Ports {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -53,8 +59,12 @@ fn main() -> Result<()> {
                 bail!("{} 已存在，使用 --force 覆盖", path.display());
             }
             let mut cfg = PanelConfig::default();
-            if let Some(l) = listen {
-                cfg.listen = l;
+            match listen {
+                Some(l) => cfg.listen = l,
+                None => {
+                    let port = pick_free_port()?;
+                    cfg.listen = format!("0.0.0.0:{port}");
+                }
             }
             if let Some(h) = hub {
                 cfg.hub_url = h;
@@ -62,6 +72,22 @@ fn main() -> Result<()> {
             cfg.save(&path)?;
             println!("已写入配置: {}", path.display());
             println!("面板监听: {}", cfg.listen);
+            println!("hub API: {}", cfg.hub_url);
+            println!("（端口为随机五位数，随时可用 `rustboard-panel ports` 查看）");
+            Ok(())
+        }
+        Cmd::Ports { config } => {
+            let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_PANEL_CONFIG));
+            let cfg = if path.exists() {
+                PanelConfig::load(&path)?
+            } else {
+                PanelConfig::default()
+            };
+            let port = port_of(&cfg.listen).unwrap_or(0);
+            println!("配置文件: {}", path.display());
+            println!("面板端口: {port}");
+            println!("  监听: {}", cfg.listen);
+            println!("  浏览器: http://<IP>:{port}");
             println!("hub API: {}", cfg.hub_url);
             Ok(())
         }

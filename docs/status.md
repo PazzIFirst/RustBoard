@@ -32,7 +32,10 @@
 - [x] **mTLS**：客户端证书校验 + Hello 中的 secret 二次身份绑定
 - [x] **吊销**：`agent revoke` 清除 secret、状态置为 revoked，重连被拒
 - [x] **离线检测**：连接断开即置 offline（revoked 状态不被覆盖）
-- [x] 单元测试 14 个，端到端联调通过（含错误指纹拒绝、吊销生效）
+- [x] **随机五位数端口**：安装时自动挑选并 bind 探测，支持自定义；
+      `rustboard-hub ports` / `rustboard-panel ports` / `rustboard-agent info` 随时查看
+- [x] 安装命令自动带上正确端口、hub 地址（自动探测出口 IP，可用 `--advertise` 覆盖）
+- [x] 单元测试 16 个，端到端联调通过（含错误指纹拒绝、吊销生效）
 
 未完成（M1 收尾 / 后续）：
 

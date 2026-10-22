@@ -36,24 +36,28 @@ sudo $BIN/rustboard-hub init
 # 2) 启动 hub
 sudo $BIN/rustboard-hub run &
 
-# 3) 生成一次性 token，按输出里的命令去目标机器上装 agent
+# 3) 查看分配到的端口（随机五位数）
+sudo $BIN/rustboard-hub ports
+
+# 4) 生成一次性 token，按输出里的命令去目标机器上装 agent
 sudo $BIN/rustboard-hub agent add --name web-01
-#   → 会打印：
-#   rustboard-agent init --hub wss://<ip>:8443/agent/ws \
+#   → 会打印完整命令，形如：
+#   rustboard-agent init --hub wss://<ip>:<agent端口>/agent/ws \
 #     --token <token> --fingerprint <指纹> --name web-01
 
-# 4) 目标机器上
-sudo $BIN/rustboard-agent init --hub wss://<ip>:8443/agent/ws \
-  --token <token> --fingerprint <指纹> --name web-01
+# 5) 目标机器上执行上面打印的命令，然后
 sudo $BIN/rustboard-agent run &
+sudo $BIN/rustboard-agent info          # 随时查看纳管状态
 
-# 5) 查数据
-curl -s http://127.0.0.1:8444/api/v1/agents
-curl -s 'http://127.0.0.1:8444/api/v1/series?agent=hub-self&metric=cpu.usage&from=0&to=9999999999999'
+# 6) 查数据（管理端口用 ports 命令看）
+ADMIN=$(sudo $BIN/rustboard-hub ports | awk '/管理 API 端口/{print $NF}')
+curl -s "http://127.0.0.1:$ADMIN/api/v1/agents"
+curl -s "http://127.0.0.1:$ADMIN/api/v1/series?agent=hub-self&metric=cpu.usage&from=0&to=9999999999999"
 
-# 6) 面板占位页
+# 7) 面板占位页
+sudo $BIN/rustboard-panel init --hub "http://127.0.0.1:$ADMIN"
 sudo $BIN/rustboard-panel run &
-open http://127.0.0.1:8080
+sudo $BIN/rustboard-panel ports        # 查看面板端口
 ```
 
 不想污染系统目录时，全部用 `--config` / `--data-dir` 指到临时目录：
@@ -66,11 +70,22 @@ open http://127.0.0.1:8080
 
 ## 端口
 
-| 端口 | 用途 | 协议 | 暴露建议 |
+**不占用 8080 / 8443 这类常见端口。** 每个端口在安装时随机挑一个五位数（20000–64999），
+并先 `bind` 一次确认未被占用；也可以用 `--agent-listen` / `--admin-listen` / `--listen` 自定义。
+
+| 用途 | 默认端口 | 协议 | 暴露建议 |
 |---|---|---|---|
-| 8443 | agent 接入 | WSS + mTLS | 必须公网可达 |
-| 8444 | 管理 API | HTTP | 只绑内网/回环，面板远程访问走 VPN |
-| 8080 | 面板 | HTTP | 同上 |
+| agent 接入 | 随机五位数 | WSS + mTLS | 必须公网可达 |
+| 管理 API | 随机五位数 | HTTP | 只绑回环/内网，远程面板走 VPN |
+| 面板 | 随机五位数 | HTTP | 同上 |
+
+随时在终端查看当前端口：
+
+```bash
+rustboard-hub ports       # agent 端口、管理端口、证书指纹
+rustboard-panel ports     # 面板端口、hub API
+rustboard-agent info      # hub 地址、agent_id、纳管状态
+```
 
 ## 目录结构
 

@@ -62,9 +62,61 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// 选一个五位数随机端口（20000–64999），并确认当前能绑定。
+///
+/// 刻意避开 10000 以下和常见的 8080/8443 等，降低与既有服务冲突、被扫描爆破的概率。
+pub fn pick_free_port() -> std::io::Result<u16> {
+    pick_free_port_excluding(&[])
+}
+
+/// 同上，但排除已占用的端口（用于同一进程内分配多个端口）。
+pub fn pick_free_port_excluding(exclude: &[u16]) -> std::io::Result<u16> {
+    use std::net::TcpListener;
+    for _ in 0..64 {
+        let port = 20_000 + (rand::random::<u16>() % 45_000);
+        if exclude.contains(&port) {
+            continue;
+        }
+        if TcpListener::bind(("0.0.0.0", port)).is_ok() {
+            return Ok(port);
+        }
+    }
+    // 极端情况下退回内核分配的临时端口
+    let listener = TcpListener::bind("0.0.0.0:0")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// 探测本机默认出口 IPv4（UDP connect 只查路由表，不发包）。
+pub fn primary_ipv4() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    socket.local_addr().ok().map(|addr| addr.ip())
+}
+
+/// 从 `host:port` 或 `[::1]:port` 中取出端口。
+pub fn port_of(addr: &str) -> Option<u16> {
+    addr.rsplit(':').next()?.trim().parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picked_port_is_five_digits_and_free() {
+        let port = pick_free_port().unwrap();
+        assert!(port >= 10_000, "端口 {port} 不是五位数");
+        // 分配后应能立即绑定
+        std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    }
+
+    #[test]
+    fn parses_port_from_addr() {
+        assert_eq!(port_of("0.0.0.0:27431"), Some(27431));
+        assert_eq!(port_of("127.0.0.1:51877"), Some(51877));
+        assert_eq!(port_of("[::1]:9000"), Some(9000));
+        assert_eq!(port_of("bad"), None);
+    }
 
     #[test]
     fn constant_time_eq_works() {

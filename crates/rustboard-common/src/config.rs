@@ -90,6 +90,8 @@ pub struct HubConfig {
     pub name: String,
     /// 服务端证书的 SAN 列表（localhost、内网 IP、公网 IP 等）。
     pub server_names: Vec<String>,
+    /// agent 安装命令里使用的 hub 地址。留空则自动从 server_names 里挑一个非回环 IP。
+    pub advertise_host: Option<String>,
     /// 下发给 agent 的默认采样间隔。
     pub sample_interval_ms: u64,
     pub per_core: bool,
@@ -109,6 +111,7 @@ impl Default for HubConfig {
             self_monitor: true,
             name: String::new(),
             server_names: vec!["localhost".to_string(), "127.0.0.1".to_string()],
+            advertise_host: None,
             sample_interval_ms: 5_000,
             per_core: false,
             excluded_interfaces: default_excluded_interfaces(),

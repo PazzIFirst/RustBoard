@@ -45,6 +45,11 @@ enum Cmd {
         config: Option<PathBuf>,
     },
     /// 生成默认配置。
+    /// 查看纳管状态、hub 地址与本地数据目录。
+    Info {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
     Init {
         #[arg(short, long)]
         config: Option<PathBuf>,
@@ -70,6 +75,23 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     match Cli::parse().cmd {
+        Cmd::Info { config } => {
+            let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_CONFIG));
+            let cfg = AgentConfig::load(&path).with_context(|| {
+                format!("读取配置失败: {}（先执行 rustboard-agent init）", path.display())
+            })?;
+            let agent_id = std::fs::read_to_string(cfg.data_dir.join(AGENT_ID))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| "未纳管".to_string());
+            let enrolled = is_enrolled(&cfg);
+            println!("配置文件: {}", path.display());
+            println!("hub: {}", cfg.hub_url);
+            println!("agent_id: {agent_id}");
+            println!("纳管状态: {}", if enrolled { "已纳管" } else { "未纳管" });
+            println!("采样间隔: {}ms", cfg.sample_interval_ms);
+            println!("数据目录: {}", cfg.data_dir.display());
+            Ok(())
+        }
         Cmd::Init { config, hub, token, fingerprint, name, data_dir, force } => {
             let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_CONFIG));
             if path.exists() && !force {

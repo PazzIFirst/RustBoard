@@ -23,7 +23,9 @@ use clap::{Parser, Subcommand};
 use rustboard_common::config::HubConfig;
 use rustboard_common::model::{AgentRecord, SampleBatch, SeriesQuery, SeriesRow};
 use rustboard_common::tls;
-use rustboard_common::util::{arch, boot_id, hostname, now_ms, os_pretty_name};
+use rustboard_common::util::{
+    arch, boot_id, hostname, now_ms, os_pretty_name, pick_free_port_excluding, port_of,
+};
 use rustboard_common::wire::{codes, EnrollRequest, Frame, Welcome};
 use rustboard_common::{DEFAULT_HUB_CONFIG, PROTOCOL_VERSION, VERSION};
 use rustboard_core::collect::default_collectors;
@@ -57,6 +59,9 @@ enum Cmd {
         /// 追加到服务端证书 SAN 的地址，可重复。
         #[arg(long = "san")]
         sans: Vec<String>,
+        /// 写进 agent 安装命令的 hub 地址（公网 IP 或域名），留空自动探测。
+        #[arg(long)]
+        advertise: Option<String>,
         #[arg(long)]
         force: bool,
     },
@@ -64,6 +69,11 @@ enum Cmd {
     Agent {
         #[command(subcommand)]
         action: AgentAction,
+    },
+    /// 查看当前使用的端口与访问地址。
+    Ports {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -99,8 +109,8 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     match Cli::parse().cmd {
-        Cmd::Init { config, data_dir, agent_listen, admin_listen, sans, force } => {
-            init(config, data_dir, agent_listen, admin_listen, sans, force)
+        Cmd::Init { config, data_dir, agent_listen, admin_listen, sans, advertise, force } => {
+            init(config, data_dir, agent_listen, admin_listen, sans, advertise, force)
         }
         Cmd::Run { config } => {
             let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
@@ -112,6 +122,7 @@ fn main() -> Result<()> {
             AgentAction::Add { config, name, ttl_minutes } => agent_add(config, name, ttl_minutes),
             AgentAction::Revoke { config, id } => agent_revoke(config, id),
         },
+        Cmd::Ports { config } => print_ports(config),
     }
 }
 
@@ -126,6 +137,7 @@ fn init(
     agent_listen: Option<String>,
     admin_listen: Option<String>,
     sans: Vec<String>,
+    advertise: Option<String>,
     force: bool,
 ) -> Result<()> {
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
@@ -137,13 +149,29 @@ fn init(
         cfg.database = format!("sqlite://{}/rustboard.db", d.display());
         cfg.data_dir = d;
     }
-    if let Some(a) = agent_listen {
-        cfg.agent_listen = a;
+    // 端口默认随机五位数，避免和机器上已有服务撞车；用户显式指定时以用户为准
+    match agent_listen {
+        Some(a) => cfg.agent_listen = a,
+        None => {
+            let port = pick_free_port_excluding(&[])?;
+            cfg.agent_listen = format!("0.0.0.0:{port}");
+        }
     }
-    if let Some(a) = admin_listen {
-        cfg.admin_listen = a;
+    match admin_listen {
+        Some(a) => cfg.admin_listen = a,
+        None => {
+            let exclude: Vec<u16> = port_of(&cfg.agent_listen).into_iter().collect();
+            let port = pick_free_port_excluding(&exclude)?;
+            cfg.admin_listen = format!("127.0.0.1:{port}");
+        }
     }
     cfg.name = hostname();
+    // 安装命令里的地址：显式指定 > 默认出口 IP
+    let advertise = advertise.or_else(|| rustboard_common::util::primary_ipv4().map(|ip| ip.to_string()));
+    if let Some(host) = &advertise {
+        cfg.server_names.push(host.clone());
+        cfg.advertise_host = Some(host.clone());
+    }
     cfg.server_names.extend(sans);
     cfg.server_names.push(hostname());
 
@@ -155,9 +183,34 @@ fn init(
     println!("服务端证书指纹: {fingerprint}");
     println!("agent 接入监听: {}", cfg.agent_listen);
     println!("管理 API 监听: {}", cfg.admin_listen);
+    println!("（端口为随机五位数，随时可用 `rustboard-hub ports` 查看）");
     println!("\n下一步:");
     println!("  1) rustboard-hub run --config {}", path.display());
     println!("  2) rustboard-hub agent add --config {} --name web-01", path.display());
+    Ok(())
+}
+
+fn print_ports(config: Option<PathBuf>) -> Result<()> {
+    let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
+    let cfg = load_config(&path)?;
+    let agent_port = port_of(&cfg.agent_listen).unwrap_or(0);
+    let admin_port = port_of(&cfg.admin_listen).unwrap_or(0);
+
+    println!("配置文件: {}", path.display());
+    println!("agent 接入端口: {agent_port}");
+    println!("  监听: {}", cfg.agent_listen);
+    println!("  对外: wss://<公网IP>:{agent_port}/agent/ws");
+    println!("管理 API 端口: {admin_port}");
+    println!("  本机: http://127.0.0.1:{admin_port}");
+    if let Some(host) = &cfg.advertise_host {
+        println!("agent 连接地址: wss://{host}:{agent_port}/agent/ws");
+    }
+
+    let cert_path = tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE);
+    match std::fs::read_to_string(cert_path) {
+        Ok(pem) => println!("证书指纹: {}", tls::fingerprint_of_pem(&pem)?),
+        Err(_) => println!("证书: 未初始化（先执行 rustboard-hub init）"),
+    }
     Ok(())
 }
 
@@ -178,10 +231,19 @@ fn agent_add(config: Option<PathBuf>, name: String, ttl_minutes: u32) -> Result<
     let fingerprint = tls::fingerprint_of_pem(&cert_pem)?;
 
     let host = cfg
-        .server_names
-        .iter()
-        .find(|h| h.parse::<std::net::IpAddr>().is_ok())
-        .cloned()
+        .advertise_host
+        .clone()
+        .or_else(|| {
+            cfg.server_names
+                .iter()
+                .find(|h| {
+                    h.parse::<std::net::IpAddr>()
+                        .map(|ip| !ip.is_loopback())
+                        .unwrap_or(false)
+                })
+                .cloned()
+        })
+        .or_else(|| cfg.server_names.first().cloned())
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let port = cfg.agent_listen.rsplit(':').next().unwrap_or("8443");
 

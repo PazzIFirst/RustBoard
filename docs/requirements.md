@@ -79,7 +79,7 @@ serverdashboard/
 | 面板鉴权 | 单管理员 + 密码（Argon2id）+ 可选 TOTP | v1 不做多用户 |
 | 面板部署 | 默认同机，支持远程独立部署 | 远程时只依赖 hub 的管理 API，不碰 agent 入口 |
 | 母进程角色 | **hub 内置完整采集能力**，agent 是其轻量裁剪版 | 单机部署时不需要装两个进程 |
-| 端口隔离 | 8443 只收 agent（mTLS），8444 只收面板/管理 API | 两套信任域不交叉，降低面暴露 |
+| 端口策略 | 默认随机五位数，可自定义；agent 与管理 API 端口隔离 | 避免与既有服务冲突、降低被扫描爆破概率 |
 | 证书 | 域名 ACME / 公网 IP 短证书 / 自签+指纹 三模式 | 见第 9 节；安装器负责探测 |
 | 控制面 | **默认全部关闭**，安装时逐项开启 | root 权限操作，必须显式授权 |
 
@@ -116,12 +116,14 @@ serverdashboard/
            浏览器                     浏览器
 ```
 
+> 图中端口仅为示例。实际安装时默认随机五位数，见 5.5。
+
 ### 5.2 连接与复用
 
-- agent 启动后与 hub 建立 **一条** WSS 长连接，路径 `/agent/ws`，端口 `:8443`。
+- agent 启动后与 hub 建立 **一条** WSS 长连接，路径 `/agent/ws`，端口由配置决定（默认随机五位数）。
 - 连接上是带 `id` 的帧多路复用：`Hello` / `SampleBatch` / `Ack` / `Cmd` / `CmdResult` / `ConfigPush` / `Ping`。
 - 心跳 15s，3 次未响应判定断线；指数退避重连（1s → 60s，带抖动）。
-- **管理 API 独立监听 `:8444`**，使用独立的 TLS 配置与身份体系（面板 token / 会话），与 agent 入口在端口、证书用途、认证方式上三重隔离。
+- **管理 API 独立监听**（默认只绑回环），使用独立的 TLS 配置与身份体系（面板 token / 会话），与 agent 入口在端口、证书用途、认证方式上三重隔离。
 - v2 的批量传输（文件、终端）走独立路径 `/agent/bulk`，避免大流量阻塞指标上报的 TCP 连接（队头阻塞）。
 
 ### 5.3 数据流
@@ -146,6 +148,16 @@ hub 与 agent 不是两个代码库，而是同一套 `sd-core` 的两种装配�
 | 管理 API | ❌ | ✅ |
 
 这样“hub 兼管自己”是零成本的，也不会出现两套采集逻辑跑偏的问题。
+
+### 5.5 端口策略
+
+所有监听端口由安装时**随机挑选五位数（20000–64999）**，并在写入配置前实际 `bind` 一次确认未被占用。
+
+- 不使用 8080 / 8443 这类常见端口：既避免和机器上既有服务撞车，也降低被批量扫描爆破的概率。
+- 用户可用 `--agent-listen` / `--admin-listen` / `--listen` 显式指定，自定义优先。
+- 端口写入配置后不再变动，重启保持。
+- 随时查看：`rustboard-hub ports`、`rustboard-panel ports`、`rustboard-agent info`。
+- `rustboard-hub agent add` 生成的安装命令会自动带上当前端口与证书指纹。
 
 ## 6. 采集指标清单
 
@@ -229,7 +241,7 @@ cold_exports(id, day, backend, object_key, size_bytes, sha256, status, created_a
 
 1. 在 hub 上执行 `sd-hub agent add --name web-01`，生成一次性 token（默认 30 分钟有效、单次使用）。
 2. 安装命令形如：
-   `curl -fsSL https://<hub>:8443/install.sh | sh -s -- --token <t> --hub <ip:8443>`
+   `curl -fsSL https://<hub>:<agent端口>/install.sh | sh -s -- --token <t> --hub <ip:agent端口>`
    安装脚本把 hub 的证书指纹也带进去（自签模式必需）。
 3. agent 首启生成 Ed25519 密钥对 → 用 token 认证 → 提交 CSR → hub 的私有 CA 签发 90 天客户端证书 → 返回 hub CA 证书链。
 4. 之后所有连接走 mTLS；agent 每 60 天自动轮换证书。
@@ -240,9 +252,9 @@ cold_exports(id, day, backend, object_key, size_bytes, sha256, status, created_a
 - 密码 Argon2id，`m=64MB, t=3, p=4`。
 - 会话用 HttpOnly + Secure + SameSite=Lax Cookie，默认 12 小时，支持“记住我”延长到 7 天。
 - 登录失败 5 次锁 15 分钟（按 IP + 用户名）；支持 TOTP，开启后必须二次验证。
-- **远程面板**：hub 生成 scoped token（只读/读写两种），面板携带 `Authorization: Bearer` 调 `:8444`；面板自己也有一层登录，两者是不同信任域。
-- 因为 `:8444` 一旦对公网开放就是爆破目标，默认**只监听内网/回环**。远程面板推荐三条路（安装器会说明）：
-  1. WireGuard / Tailscale 组网，`:8444` 完全不对公网暴露（推荐）；
+- **远程面板**：hub 生成 scoped token（只读/读写两种），面板携带 `Authorization: Bearer` 调管理端口；面板自己也有一层登录，两者是不同信任域。
+- 因为管理端口一旦对公网开放就是爆破目标，默认**只监听内网/回环**。远程面板推荐三条路（安装器会说明）：
+  1. WireGuard / Tailscale 组网，管理端口完全不对公网暴露（推荐）；
   2. 反代 + IP 白名单 + 限速；
   3. 确实要裸奔时，强制 TOTP + 失败锁定 + 只读 token。
 - 管理 API 全局限速：每 IP 60 req/min，登录接口 10 req/min。
@@ -300,7 +312,7 @@ cold_exports(id, day, backend, object_key, size_bytes, sha256, status, created_a
 所有交互项都有对应 flag，支持 `--yes` 全默认：
 
 ```
-sd-hub install --yes --db postgres://... --listen 0.0.0.0:8443 \
+sd-hub install --yes --db postgres://... --listen 0.0.0.0:<agent端口> \
   --tls acme-ip --retention raw=7d,1m=90d,1h=2y --panel yes
 ```
 
@@ -326,7 +338,7 @@ sd-hub install --yes --db postgres://... --listen 0.0.0.0:8443 \
    - 失败 → 按“本地监听正常 / 外部不通”这一判据直接指出问题在安全组或运营商侧，并给出排查命令。
 5. **失败兜底**：最多重试 3 轮；用户可随时放弃并自动回退到 `self-signed` + 指纹模式，安装继续进行，不阻塞交付。
 
-> 这项自检同样适用于 `acme-domain` 模式（只是挑战类型可能换成 DNS-01），以及独立安装的面板（检查 8444 是否可达）。
+> 这项自检同样适用于 `acme-domain` 模式（只是挑战类型可能换成 DNS-01），以及独立安装的面板（检查面板端口是否可达）。
 
 ## 11. 告警
 
@@ -366,7 +378,7 @@ M1、M2 完成即为可演示的最小产品。
 |---|---|---|
 | agent 以 root 被远程操控，凭据泄露等于整机失守 | 高 | mTLS + 单机吊销 + 能力默认关闭 + 白名单 + 审计 |
 | 6 天 IP 证书续期失败导致全节点失联 | 高 | 续期看门狗 + 剩余 <48h 告警 + 保留自签回退开关 |
-| 8444 管理接口暴露公网被爆破 | 高 | 默认只监听内网 + 限速 + 失败锁定 + 推荐组网访问 |
+| 管理接口暴露公网被爆破 | 高 | 默认只监听内网 + 随机端口 + 限速 + 失败锁定 + 推荐组网访问 |
 | 三个冷存储后端 + 四个告警渠道工作量被低估 | 中 | 全部走 trait/工厂，M4 单独排期 |
 | Docker 管理需要 socket 权限（等价 root） | 中 | 文档明确警告；建议只挂载 socket 而非 privileged |
 | SQLite 在大量小写入下锁竞争 | 中 | 批量事务 + WAL + 单写线程；超过 100 台默认推荐 PG |
