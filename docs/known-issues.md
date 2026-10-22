@@ -34,11 +34,11 @@
 | KI-10 | 低 | 证书轮换 | 已修复 | v0.2.1 | 运行中 `rotate-cert` 不生效；`/api/v1/system` 报磁盘证书而非监听器实际证书 |
 | KI-11 | 低 | 证书轮换 | 已修复 | v0.2.1 | 并发执行 `rotate-cert` 没有文件锁，可能交错写坏 key/cert |
 | KI-12 | 低 | agent 证书 | 已修复 | v0.2.1 | `session_max_hours=0` 且连接超长时，客户端续签检查只发生在握手 |
-| KI-17 | 中 | hub/panel HTTP | 待修复 | v0.2.2 | 管理 API / 面板监听没有 header 读超时与连接上限，未认证慢速连接可长期占 fd |
-| KI-18 | 低 | panel 会话 | 待修复 | v0.2.2 | `reset-password` 不吊销已有会话 Cookie，最多可继续使用一个 TTL |
-| KI-19 | 低 | hub Hello | 待修复 | v0.2.2 | `name` / `os` / `arch` / `version` 未做长度与控制字符校验 |
-| KI-20 | 低 | 安装命令 | 待修复 | v0.2.2 | `agent add --name` 打印的安装命令未对 name 做 shell 转义 |
-| KI-21 | 低 | 文件权限 | 待修复 | v0.2.2 | SQLite 数据库默认 0644、数据目录 0755（不含明文 secret） |
+| KI-17 | 中 | hub/panel HTTP | 待修复 | v0.3.1 | 管理 API / 面板监听没有 header 读超时与连接上限，未认证慢速连接可长期占 fd |
+| KI-18 | 低 | panel 会话 | 待修复 | v0.3.1 | `reset-password` 不吊销已有会话 Cookie，最多可继续使用一个 TTL |
+| KI-19 | 低 | hub Hello | 待修复 | v0.3.1 | `name` / `os` / `arch` / `version` 未做长度与控制字符校验 |
+| KI-20 | 低 | 安装命令 | 待修复 | v0.3.1 | `agent add --name` 打印的安装命令未对 name 做 shell 转义 |
+| KI-21 | 低 | 文件权限 | 待修复 | v0.3.1 | SQLite 数据库默认 0644、数据目录 0755（不含明文 secret） |
 | KI-22 | 低 | 控制面日志 | 待修复 | v0.3.1 | 白名单日志文件的硬链接不会被 openat2 拦截（需目录写权限） |
 | KI-23 | 低 | 控制面白名单 | 不修复 | 文档 | `nginx*` 前缀会匹配 `nginx-evil`；这是前缀通配语义，部署时需写更精确的模式 |
 | KI-24 | 低 | 控制面能力 | 待修复 | v0.3.1 | 同 agent 多连接时能力缓存可被新 Hello 覆盖，旧连接断开后可能陈旧 |
