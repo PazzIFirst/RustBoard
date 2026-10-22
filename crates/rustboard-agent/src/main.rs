@@ -381,6 +381,37 @@ fn session_deadline(hours: u64, seed_ms: i64) -> Option<Duration> {
     Some(Duration::from_secs(base_secs.saturating_add_signed(offset)))
 }
 
+/// 会话内周期证书检查的退避：续签失败后至少隔这么久再试，避免每个 tick 重试。
+const CERT_RENEW_RETRY_MS: i64 = 60 * 60 * 1000;
+
+/// 会话内证书检查周期（秒）。配置层已限制 1–168 小时，这里再 max(1) 防御坏配置。
+fn cert_check_period(hours: u64) -> Duration {
+    Duration::from_secs(hours.max(1).saturating_mul(3_600))
+}
+
+/// 本轮周期检查是否应触发续签（纯函数，便于边界测试）。
+///
+/// - `days_left > threshold`：还没进入续签窗口，不触发；
+/// - `last_attempt_ms <= 0`：本会话尚未尝试过，首次到点即触发；
+/// - 距离上次尝试不足 [`CERT_RENEW_RETRY_MS`]：跳过，避免失败后忙重试。
+fn cert_check_due(days_left: i64, threshold: i64, now_ms: i64, last_attempt_ms: i64) -> bool {
+    if days_left > threshold {
+        return false;
+    }
+    if last_attempt_ms <= 0 {
+        return true;
+    }
+    now_ms.saturating_sub(last_attempt_ms) >= CERT_RENEW_RETRY_MS
+}
+
+/// 读取本地客户端证书剩余天数。
+fn client_cert_days_left(cfg: &AgentConfig) -> Result<i64> {
+    let cert_path = cfg.data_dir.join(AGENT_CERT);
+    let cert_pem = std::fs::read_to_string(&cert_path)
+        .with_context(|| format!("读取客户端证书失败: {}", cert_path.display()))?;
+    tls::days_left(&cert_pem, now_ms())
+}
+
 /// 按 `session_max_hours` 给会话加一个最长存活时间。
 ///
 /// 到点主动断开重连：让轮换后的客户端证书、hub 侧配置变更有机会生效。
@@ -875,6 +906,15 @@ async fn session(
     let mut ping_timer = tokio::time::interval(Duration::from_secs(15));
     ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // KI-12：会话空闲时也要周期检查客户端证书。`session_max_hours = 0` 只表示
+    // 不主动重连，不能跳过续签窗口；定时器与 session_deadline 相互独立。
+    let mut cert_timer =
+        tokio::time::interval(cert_check_period(ctx.cfg.cert_check_interval_hours));
+    cert_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // 第一次 tick 立即完成：握手后已经检查过一次，跳过这次立即检查。
+    cert_timer.tick().await;
+    let mut last_cert_attempt_ms = 0i64;
+
     loop {
         let batches = {
             let mut guard = buffer.lock().await;
@@ -885,6 +925,34 @@ async fn session(
             tokio::select! {
                 _ = ping_timer.tick() => {
                     sink.send(Message::Binary(Frame::Ping { ts: now_ms() }.encode()?)).await?;
+                }
+                _ = cert_timer.tick() => {
+                    // 只在无在途批次（本分支）检查，避免与 ACK 等待争抢同一个 stream。
+                    match client_cert_days_left(ctx.cfg) {
+                        Ok(days_left) => {
+                            let now = now_ms();
+                            let threshold = i64::from(ctx.cfg.cert_renew_before_days);
+                            if cert_check_due(days_left, threshold, now, last_cert_attempt_ms) {
+                                last_cert_attempt_ms = now;
+                                tracing::info!(days_left, threshold, "周期证书检查：进入续签窗口");
+                                if let Err(err) = maybe_renew_client_cert(
+                                    &mut sink,
+                                    &mut stream,
+                                    ctx.cfg,
+                                    ctx.agent_id,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(error = %err, "周期证书续签失败，本次会话继续");
+                                }
+                            } else {
+                                tracing::debug!(days_left, threshold, "周期证书检查：尚未进入续签窗口");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "周期证书检查读取本地证书失败");
+                        }
+                    }
                 }
                 _ = notify.notified() => {}
                 incoming = stream.next() => {
@@ -1533,5 +1601,63 @@ mod tests {
         let elapsed = sleep_sample_interval(&interval, 0, Duration::from_millis(5)).await;
         assert!(elapsed >= Duration::from_millis(1));
         assert!(elapsed < Duration::from_secs(1));
+    }
+
+    /// KI-12：周期检查纯函数边界——阈值、首次、退避窗口与时钟回退。
+    #[test]
+    fn v021_cert_check_due_boundaries() {
+        let threshold = 30;
+        let now = 1_700_000_000_000i64;
+        // 剩余寿命高于阈值：不触发。
+        assert!(!cert_check_due(threshold + 1, threshold, now, 0));
+        // 恰好等于阈值 / 低于阈值：触发。
+        assert!(cert_check_due(threshold, threshold, now, 0));
+        assert!(cert_check_due(0, threshold, now, 0));
+        assert!(cert_check_due(-5, threshold, now, 0));
+
+        // 已尝试过：退避窗口内不触发，恰好到窗口触发。
+        let last = now - CERT_RENEW_RETRY_MS + 1;
+        assert!(!cert_check_due(1, threshold, now, last));
+        assert!(cert_check_due(1, threshold, now, last - 1));
+        let last = now - CERT_RENEW_RETRY_MS;
+        assert!(cert_check_due(1, threshold, now, last));
+
+        // 时钟回退 / last 在未来：不能触发（saturating_sub 为 0）。
+        assert!(!cert_check_due(1, threshold, now, now + 60_000));
+
+        // 未进入窗口时，即使 last 很久以前也不触发。
+        assert!(!cert_check_due(
+            threshold + 1,
+            threshold,
+            now,
+            now - 10 * CERT_RENEW_RETRY_MS
+        ));
+    }
+
+    /// KI-12：`session_max_hours = 0` 仍必须有周期检查；周期由小时换算为秒且有护栏。
+    #[test]
+    fn v021_cert_check_period_has_no_session_max_hours_blind_spot() {
+        // 0 表示不主动重连：会话不会按 deadline 重启，只能靠周期检查续签。
+        let cfg = AgentConfig {
+            session_max_hours: 0,
+            cert_check_interval_hours: 6,
+            ..AgentConfig::default()
+        };
+        cfg.validate().expect("session_max_hours=0 必须合法");
+        assert_eq!(
+            cert_check_period(cfg.cert_check_interval_hours),
+            Duration::from_secs(6 * 3_600)
+        );
+        // 即使坏配置传入 0 也不允许 0 周期忙循环。
+        assert_eq!(cert_check_period(0), Duration::from_secs(3_600));
+        assert_eq!(cert_check_period(168), Duration::from_secs(168 * 3_600));
+
+        // 默认值 6 小时；配置范围 1–168 已在 common 校验。
+        let default_cfg: AgentConfig = toml::from_str("").unwrap();
+        assert_eq!(default_cfg.cert_check_interval_hours, 6);
+        assert_eq!(
+            cert_check_period(default_cfg.cert_check_interval_hours),
+            Duration::from_secs(6 * 3_600)
+        );
     }
 }
