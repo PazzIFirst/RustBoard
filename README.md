@@ -9,6 +9,7 @@
 | 面板 | `rustboard-panel` | 浏览器界面，只通过 HTTP API 访问 hub |
 
 设计文档见 [docs/requirements.md](docs/requirements.md)，实现进度见 [docs/status.md](docs/status.md)。
+协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 > **当前状态：M1 已闭环（含 TLS / mTLS / enrollment）。** 面板、控制面、告警尚未实现。
 > 证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。

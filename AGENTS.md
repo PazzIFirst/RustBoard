@@ -1,0 +1,212 @@
+# AGENTS.md
+
+本仓库的协作契约。所有在本仓库工作的 AI Agent（主 Agent 与子 Agent）都必须遵守。
+与用户当次指令冲突时，以用户指令为准；本文件不约束人类维护者。
+
+---
+
+## 0. 角色与分工
+
+| 角色 | 职责 | 硬约束 |
+|---|---|---|
+| 主 Agent | 读需求、写方案、拆任务、集成、提交、打 tag、发布 | **不写业务实现**；不跳过评审与测试 |
+| 编码子 Agent | 按方案实现代码 | 只改方案列出的文件；提交前自测 |
+| 测试子 Agent | 独立编写测试 | **先读方案与接口，不看实现细节**；不得为通过而弱化断言 |
+| 评审子 Agent | 只读代码评审 | 只报问题，不改代码 |
+| 渗透子 Agent | 攻击面验证 | 只对本地起的实例测试，不碰生产 |
+
+主 Agent 负责编排：一个任务至少涉及「编码子 Agent + 测试子 Agent + 评审子 Agent」三个独立角色，
+同一个人格不得既写代码又给同一份代码出评审结论。
+
+---
+
+## 1. 开工前：同步工作区（强制）
+
+任何写操作之前，先执行：
+
+```bash
+git status --porcelain
+git fetch --prune origin
+git rev-list --left-right --count HEAD...origin/main
+```
+
+判定：
+
+- 输出必须是 `0	0`（不领先、不落后）才能开工。
+- **有未提交改动**：先 commit 或 `git stash`，禁止带着脏工作区开新任务。
+- **落后远端**：`git pull --rebase origin main`。
+- **已分叉**（两侧都不为 0）：停下来向人报告，不要自行 merge。
+- 禁止 `git push --force` 到 `main`；其他分支 force push 前必须先确认。
+
+---
+
+## 2. 方案先行
+
+主 Agent 在动手前必须先给出方案，包含：
+
+1. 目标与验收标准（可验证，不写“优化一下”这种话）
+2. 范围：涉及哪些 crate / 文件
+3. 接口与数据变更：协议帧、表结构、配置项、CLI 参数
+4. 兼容性影响：已安装的 agent / 已有数据库会不会炸
+5. 测试点清单
+6. 回滚方式
+
+涉及**协议帧、数据库表结构、证书格式**的变更，必须单独标注兼容性结论。
+方案落盘到 `docs/plans/<YYYY-MM-DD>-<slug>.md`（改动跨 3 个以上文件时强制）。
+
+---
+
+## 3. 编码与测试并行
+
+- 主 Agent 按文件边界拆任务，避免两个子 Agent 改同一个文件。
+- **编码子 Agent**：只实现方案内内容；完成前必须跑通 `cargo check`。
+- **测试子 Agent**：依据方案里的验收标准写测试，不参考实现细节；
+  至少覆盖正常路径、边界值、错误路径三类。
+- 两边产出由主 Agent 集成；冲突由主 Agent 裁决，不得让子 Agent 互相改对方的文件。
+
+---
+
+## 4. 独立评审
+
+编码完成后，交给一个**独立**子 Agent 做只读评审，检查：
+
+- 正确性与边界条件、错误处理是否吞错
+- 并发与资源泄漏（锁、文件句柄、任务）
+- 安全：认证、授权、注入、越界、密钥处理
+- 与 `docs/requirements.md` 的行为是否一致
+- 测试是否真的覆盖了方案里的验收点
+
+报告格式：
+
+```
+[严重] crates/rustboard-hub/src/main.rs:412 — 未校验 agent 是否已吊销 — 建议在 Hello 后检查
+[建议] crates/rustboard-core/src/buffer.rs:88 — 魔法数字 1MB 应提为常量
+```
+
+**严重问题（安全 / 数据丢失 / 协议不兼容）不修复不得提交。**
+
+---
+
+## 5. 阶段收尾：渗透测试 → 打 tag
+
+阶段（Phase）定义：一个可独立验收的功能切片，例如“证书轮换”“面板概览页”。
+
+流程固定为：
+
+```
+测试通过 → 评审通过 → 渗透测试 → 修复 → 打 tag
+```
+
+> tag 只打在通过渗透测试的提交上。若先打 tag 再做渗透，发现问题就得移动 tag，历史会变脏。
+
+### 5.1 渗透测试清单
+
+由独立子 Agent 针对**本地启动的实例**执行，至少覆盖：
+
+| 类别 | 检查项 |
+|---|---|
+| 认证 | 缺失 / 错误 / 过期 token；enrollment token 重复使用；错误 agent secret |
+| 传输 | 错误证书指纹；过期或伪造证书；不带客户端证书连接；降级到明文 |
+| 注入 | SQL 全部参数化；控制面命令注入；文件/日志路径穿越与符号链接逃逸 |
+| 资源 | 超大帧、超长字段、连接洪水、慢速读写导致的 DoS |
+| 泄露 | 日志与错误响应是否回显 secret / token / 私钥；私钥文件权限是否 0600 |
+| 依赖 | `cargo audit` 无高危；新增依赖无已知恶意包 |
+| 配置 | 默认监听地址；控制面能力默认关闭；管理端口默认只绑回环 |
+
+报告必须包含：复现步骤、影响、严重级别、修复建议。**高危项必须修复后才能 tag。**
+
+### 5.2 tag 规范
+
+```bash
+git tag -a checkpoint/<YYYY-MM-DD>-<slug> -m "<阶段名>：<一句话结论>"
+git push origin <tag>
+```
+
+已推送的 tag 不得修改或删除；需要重打就换新名字。
+
+---
+
+## 6. 里程碑发布：Release + 镜像
+
+**大版本 = 一个里程碑（M1/M2/...）完成**，版本号映射：
+
+| 里程碑 | 版本 |
+|---|---|
+| M1 采集闭环 | `v0.1.0` |
+| M2 面板 | `v0.2.0` |
+| M3 控制面 | `v0.3.0` |
+| M4 告警与归档 | `v0.4.0` |
+| M5 安装与交付 | `v1.0.0` |
+
+发布步骤：
+
+1. 确认 `main` 干净且与远端一致，全部门禁通过
+2. 更新 `CHANGELOG.md`：`[Unreleased]` 归档为 `[vX.Y.Z] - YYYY-MM-DD`
+3. 打注释 tag 并推送
+4. 发布 GitHub Release（notes 取自 CHANGELOG 对应段落）
+5. 构建并推送镜像（M5 引入 Dockerfile 后启用）
+
+```bash
+git tag -a v0.2.0 -m "v0.2.0 M2 面板"
+git push origin main --tags
+gh release create v0.2.0 --title "v0.2.0 M2 面板" --notes-file /tmp/release-notes.md
+```
+
+镜像命名（M5 起）：
+
+```
+ghcr.io/pazzifirst/rustboard-hub:v0.2.0
+ghcr.io/pazzifirst/rustboard-agent:v0.2.0
+ghcr.io/pazzifirst/rustboard-panel:v0.2.0
+```
+
+要求多架构（`linux/amd64`、`linux/arm64`），并同时推 `latest`。
+
+---
+
+## 7. CHANGELOG
+
+- 文件：`CHANGELOG.md`，格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本遵循 SemVer。
+- 日常提交**不直接改版本段落**，只往 `[Unreleased]` 里追加条目。
+- **仅在 §6 发布时**把 `[Unreleased]` 归档成 `[vX.Y.Z] - 日期`，并新开空的 `[Unreleased]`。
+- 分类固定：`Added` / `Changed` / `Deprecated` / `Removed` / `Fixed` / `Security`。
+
+---
+
+## 8. 每次提交前的质量门禁
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+三条全绿才允许 commit。另外：
+
+- 新功能必须有测试；修 bug 必须先写能复现的测试。
+- 不得用 `#[allow(...)]` 掩盖 clippy 报错（确需例外时，注释写明理由）。
+
+---
+
+## 9. 安全红线
+
+- **绝不提交**私钥、证书、token、真实 IP / 域名 / 密码；示例一律用占位符。
+- 日志不得输出 secret、token、私钥内容。
+- 新增依赖要说明理由，优先纯 Rust、无 cmake 依赖（本项目 rustls 固定用 `ring`）。
+- 控制面（systemd / Docker / 进程 / 日志 / 终端）能力**默认关闭**，必须显式开启。
+- `unsafe` 必须带注释说明安全性，并有对应测试。
+- 对外监听的端点默认最小暴露：管理 API 只绑回环，agent 入口才对外。
+
+---
+
+## 10. 仓库约定
+
+- **提交信息**：Conventional Commits，中文摘要，例如
+  `feat: 默认随机五位数端口，新增 ports 查询命令`
+- **分支**：`feat/<slug>`、`fix/<slug>`、`chore/<slug>`；`main` 保持可发布状态。
+- **语言**：文档与代码注释用中文；标识符用英文。
+- **目录**：代码在 `crates/rustboard-*`，文档在 `docs/`，方案在 `docs/plans/`。
+
+---
+
+本文件的修改属于流程变更，需要单独提交并在提交信息里说明原因。
