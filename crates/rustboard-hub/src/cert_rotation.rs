@@ -178,12 +178,16 @@ impl RenewedServerCert {
 /// 启动后台续签任务。
 ///
 /// 任务本身不会 panic：单次失败只记日志，下个周期继续尝试（证书不会因为一次
-/// 写盘失败就永远不续签）。续签成功后同步刷新 `live`，让 `/api/v1/system`
-/// 立即反映监听器实际证书；即使这里漏更新，文件轮询任务也会在 10s 内补上。
+/// 写盘失败就永远不续签）。
+///
+/// `live` 参数保留仅为兼容调用方；续签成功后**不在这里**更新 live，
+/// 而是由文件 watcher 在校验并热加载成功后统一更新。否则自动续签读到的
+/// 磁盘摘要可能覆盖并发 CLI `rotate-cert` 刚写入的新证书，导致 watcher
+/// 误判「已加载」而跳过真正的热加载。`/system` 最多滞后一个轮询周期（≤10s）。
 pub fn spawn_server_renewal(
     cfg: Arc<HubConfig>,
     tx: TlsConfigSender,
-    live: Arc<RwLock<CertStatus>>,
+    _live: Arc<RwLock<CertStatus>>,
 ) {
     tokio::spawn(async move {
         // 配置层要求 ≥ 60 秒；这里再 max(1) 只是防御「手工改配置绕过校验」导致的
@@ -207,12 +211,6 @@ pub fn spawn_server_renewal(
 
             match result {
                 Ok(Ok(Some(fingerprint))) => {
-                    match read_disk_cert_status(&cfg) {
-                        Ok(status) => write_live(&live, status),
-                        Err(err) => {
-                            tracing::warn!(error = %err, "续签后读取证书摘要失败，live 状态暂不更新")
-                        }
-                    }
                     tracing::info!(fingerprint, "服务端证书续签完成，新连接已使用新证书");
                 }
                 Ok(Ok(None)) => {}
@@ -615,16 +613,27 @@ static FAIL_REBUILD_FOR: std::sync::Mutex<Option<std::path::PathBuf>> = std::syn
 
 /// 检查并在需要时重签服务端证书；返回 `Some(新指纹)` 表示实际发生了续签。
 ///
-/// 流程：判断是否需要续签 → 成对备份 → 文件级签发（含全部 S1 校验）→ 重建配置自检
-/// → 推送 watch。重建失败会回滚旧材料并返回错误，**不会**推送新配置。
+/// 流程：获取进程间文件锁 → 判断是否需要续签 → 成对备份 → 文件级签发
+/// （含全部 S1 校验）→ 重建配置自检 → 推送 watch。重建失败会回滚旧材料并
+/// 返回错误，**不会**推送新配置。
+///
+/// 锁被 CLI `rotate-cert` 占用时返回可读错误且不写任何文件，由续签任务下个
+/// 周期重试。CLI 自己已持锁并直接调用 [`renew_server_cert_files`]，不会走到
+/// 这里，因此不存在嵌套获取锁的死锁。
 pub fn check_and_renew(
     cfg: &HubConfig,
     tx: &TlsConfigSender,
     force: bool,
     override_days: Option<u32>,
 ) -> Result<Option<String>> {
+    let cert_dir = tls::cert_dir(&cfg.data_dir);
+    // KI-11（严重项）：自动续签与 CLI rotate-cert 必须互斥，否则可能交错
+    // 写 key/cert，得到一对不配套的材料。
+    let _lock = CertLock::acquire(&cert_dir)
+        .context("获取证书续签锁失败（另一个 rotate-cert 正在运行），本次不写盘，下个周期重试")?;
+
     // 先判断是否真要续签，避免每次都产生无意义备份。
-    let cert_path = tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE);
+    let cert_path = cert_dir.join(tls::SERVER_CERT_FILE);
     let old_cert_pem = std::fs::read_to_string(&cert_path).with_context(|| {
         format!(
             "读取服务端证书失败: {}（先执行 rustboard-hub init）",
@@ -1746,6 +1755,57 @@ mod tests {
         assert!(!rx.has_changed().unwrap());
         assert_eq!(read_live(&live), old_status);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 严重项（KI-11）：自动续签必须与 CLI `rotate-cert` 共用文件锁。
+    ///
+    /// 锁被占用时 `check_and_renew` 必须失败且不碰任何服务端材料；
+    /// 释放后才允许续签。否则两者交错写 key/cert 会得到不配套的一对。
+    #[test]
+    fn v021_auto_renewal_respects_cert_lock_and_never_writes_when_held() {
+        let dir = temp_dir("auto-renew-lock");
+        let policy = tls::CertPolicy {
+            server_days: 365,
+            ..Default::default()
+        };
+        let (tx, rx) = prepare(&dir, policy);
+        let cfg = test_config(&dir, 365, 30);
+        let cert_dir = tls::cert_dir(&dir);
+        let cert_before = read(&dir, SERVER_CERT_FILE);
+        let key_before = read(&dir, SERVER_KEY_FILE);
+        let fingerprint_before = tls::fingerprint_of_pem(&cert_before).unwrap();
+
+        let lock = CertLock::acquire(&cert_dir).expect("测试先持有 CLI 侧锁");
+        let err =
+            check_and_renew(&cfg, &tx, true, Some(30)).expect_err("锁被占用时自动续签必须失败");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("另一个 rotate-cert 正在运行"),
+            "错误信息必须说明锁被占用: {text}"
+        );
+        assert_eq!(read(&dir, SERVER_CERT_FILE), cert_before, "不得改写证书");
+        assert_eq!(read(&dir, SERVER_KEY_FILE), key_before, "不得改写私钥");
+        assert!(
+            managed_backups(&dir, SERVER_CERT_FILE).is_empty(),
+            "获取锁失败时不得产生备份"
+        );
+        assert!(!rx.has_changed().unwrap(), "失败时不得推送新配置");
+        assert!(lock.path().exists(), "失败方不得删除他人的锁");
+
+        // 释放锁后可正常续签，且锁文件随 RAII 删除。
+        drop(lock);
+        let renewed = check_and_renew(&cfg, &tx, true, Some(30))
+            .unwrap()
+            .expect("释放锁后必须续签");
+        assert_ne!(renewed, fingerprint_before);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(
+            managed_backups(&dir, SERVER_CERT_FILE).len(),
+            1,
+            "成功续签必须成对备份旧材料"
+        );
+        assert!(!cert_dir.join(CERT_LOCK_FILE).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
