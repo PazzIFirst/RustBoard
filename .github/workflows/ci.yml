@@ -55,6 +55,32 @@ jobs:
       - name: 单元与集成测试
         run: cargo test --workspace --locked
 
+  e2e:
+    name: e2e 安全回归
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: 缓存 cargo 与 target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: 运行安全回归
+        run: bash tests/e2e/security.sh
+
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
