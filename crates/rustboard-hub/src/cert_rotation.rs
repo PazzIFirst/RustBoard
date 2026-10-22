@@ -717,6 +717,11 @@ fn unrepairable(original: anyhow::Error, hint: &str) -> anyhow::Error {
 
 fn repair_tls_material(cfg: &HubConfig, original: anyhow::Error) -> Result<Arc<ServerConfig>> {
     let dir = tls::cert_dir(&cfg.data_dir);
+    // KI-11：启动自愈同样会写服务端材料，必须与 CLI rotate-cert 互斥；
+    // 锁被占用时宁可拒绝启动，也不能和运维进程交错写 key/cert。
+    let _lock = CertLock::acquire(&dir).context(
+        "获取证书修复锁失败（另一个 rotate-cert 正在运行），拒绝启动以免写坏材料；请等待其结束后重试",
+    )?;
     let cert_path = dir.join(tls::SERVER_CERT_FILE);
     let key_path = dir.join(tls::SERVER_KEY_FILE);
 
