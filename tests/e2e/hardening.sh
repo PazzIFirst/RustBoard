@@ -384,7 +384,7 @@ echo "==> 1/9 弱 admin_token 拒绝启动"
   --agent-listen "127.0.0.1:$WEAK_AGENT_PORT" \
   --admin-listen "127.0.0.1:$WEAK_ADMIN_PORT" \
   --san 127.0.0.1 --force > "$TMP_DIR/init-weak.log" 2>&1 \
-  || fail "1.0" "弱 token 用例 hub init 失败"
+  || die "弱 token 用例 hub init 失败"
 "$PYTHON" - "$WEAK_CFG" <<'PY'
 import re
 import sys
@@ -692,10 +692,15 @@ fi
 for i in 1 2 3 4 5; do
   out=$(panel_login "$WRONG_PASSWORD" "$IP_A" "https" 2>/dev/null || true)
   status=$(printf '%s' "$out" | json_get status || true)
-  if [[ "$status" != "401" ]]; then
-    fail "7.4.$i" "IP A 第 $i 次错误密码返回 $status（期望 401）"
-    break
+  if [[ "$status" == "401" ]]; then
+    continue
   fi
+  # 第 5 次失败可能已经触发锁定（401 或 429 都符合“5 次失败后锁定”）。
+  if (( i == 5 )) && [[ "$status" == "429" ]]; then
+    continue
+  fi
+  fail "7.4.$i" "IP A 第 $i 次错误密码返回 $status（期望 401，第 5 次可为 429）"
+  break
 done
 out=$(panel_login "$OLD_PASSWORD" "$IP_A" "https" 2>/dev/null || true)
 status=$(printf '%s' "$out" | json_get status || true)
