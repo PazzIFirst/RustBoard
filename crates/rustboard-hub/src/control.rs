@@ -78,6 +78,8 @@ pub mod hub_codes {
     pub const CONTROL_TIMEOUT: &str = "control_timeout";
     pub const TOO_MANY_PENDING: &str = "too_many_pending";
     pub const INTERNAL: &str = "internal_error";
+    pub const AGENT_NOT_FOUND: &str = "agent_not_found";
+    pub const PAYLOAD_TOO_LARGE: &str = "payload_too_large";
 }
 
 /// 审计 `result` 取值，与面板 `auditResultClass` 的识别范围一致。
@@ -439,6 +441,25 @@ impl Reject {
             audit_result: AUDIT_ERROR,
         }
     }
+
+    /// 与 `GET /control` 一致：完全未知的 agent 返回 404，而不是伪装成能力未开。
+    fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: hub_codes::AGENT_NOT_FOUND,
+            message: "agent 不存在".to_string(),
+            audit_result: AUDIT_DENIED,
+        }
+    }
+
+    fn payload_too_large() -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: hub_codes::PAYLOAD_TOO_LARGE,
+            message: "请求体超过管理 API 的 64 KiB 上限".to_string(),
+            audit_result: AUDIT_DENIED,
+        }
+    }
 }
 
 /// 控制请求的完整处理结果（成功或错误都带审计草稿）。
@@ -462,15 +483,16 @@ pub(crate) async fn control_action(
 
     let payload = match body {
         Ok(Json(payload)) => payload,
-        Err(_) => {
-            // 不回传 serde 的原始错误：其中可能回显未知字段名。
-            return finish_error(
-                &state,
-                audit,
-                started,
-                &Reject::invalid("请求体不是合法 JSON 或包含未知字段"),
-            )
-            .await;
+        Err(rejection) => {
+            // 超过 DefaultBodyLimit（64 KiB）时拒绝状态是 413；axum 0.8 没有
+            // `JsonRejection::PayloadTooLarge` 变体，按 `status()` 区分即可。
+            // 其余错误不回传 serde 原文：其中可能回显未知字段名。
+            let reject = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                Reject::payload_too_large()
+            } else {
+                Reject::invalid("请求体不是合法 JSON 或包含未知字段")
+            };
+            return finish_error(&state, audit, started, &reject).await;
         }
     };
     audit.capability = clip_label(&payload.capability);
@@ -512,15 +534,33 @@ pub(crate) async fn control_action(
             return finish_error(&state, audit, started, &Reject::internal()).await;
         }
     };
-    let capability_reported = reported
-        .map(|record| {
-            record
-                .capabilities
-                .iter()
-                .any(|capability| capability == &prepared.capability)
+    let Some(record) = reported else {
+        // 没有 agent_control 行：老 agent（agents 行存在）按能力未上报回 403；
+        // 完全未知的 agent 与 GET /control 一致回 404。
+        let exists = tokio::task::spawn_blocking({
+            let storage = state.storage.clone();
+            let agent_id = agent_id.clone();
+            move || storage.get_agent(&agent_id)
         })
-        .unwrap_or(false);
-    if !capability_reported {
+        .await;
+        return match exists {
+            Ok(Ok(Some(_))) => finish_error(&state, audit, started, &Reject::disabled()).await,
+            Ok(Ok(None)) => finish_error(&state, audit, started, &Reject::not_found()).await,
+            Ok(Err(err)) => {
+                tracing::error!(agent = %agent_id, error = %err, "读取 agent 记录失败");
+                finish_error(&state, audit, started, &Reject::internal()).await
+            }
+            Err(err) => {
+                tracing::error!(agent = %agent_id, error = %err, "读取 agent 记录任务失败");
+                finish_error(&state, audit, started, &Reject::internal()).await
+            }
+        };
+    };
+    if !record
+        .capabilities
+        .iter()
+        .any(|capability| capability == &prepared.capability)
+    {
         return finish_error(&state, audit, started, &Reject::disabled()).await;
     }
 
@@ -605,6 +645,11 @@ fn reject_from_agent_error(error: &ControlError) -> Reject {
         // 会话内 pending 表满（`ControlSession::enqueue`）与 mpsc 队列满走同一个
         // 错误码：对面板都是 429，不能落到 502。
         hub_codes::TOO_MANY_PENDING => Reject::too_many_pending(),
+        // pending 期间 agent 断开 / 会话 Drop 会回这些 hub 侧错误码，
+        // 必须保留原语义，不能因为不在 agent 错误表里就落 502。
+        hub_codes::AGENT_OFFLINE => Reject::offline(),
+        hub_codes::CONTROL_TIMEOUT => Reject::timeout(),
+        hub_codes::INTERNAL => Reject::internal(),
         control_codes::CAPABILITY_DISABLED => Reject {
             status: StatusCode::FORBIDDEN,
             code: control_codes::CAPABILITY_DISABLED,
@@ -1667,6 +1712,23 @@ mod tests {
         assert_eq!(reject.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(reject.code, hub_codes::TOO_MANY_PENDING);
         assert_eq!(reject.audit_result, AUDIT_ERROR);
+    }
+
+    /// 会话侧回传的 hub 错误码（agent 断开 / 超时 / 内部错误 / pending 满）
+    /// 必须保留各自 HTTP 语义，不能统一落 502。
+    #[test]
+    fn hub_side_pending_errors_keep_their_status() {
+        for (code, status) in [
+            (hub_codes::AGENT_OFFLINE, StatusCode::SERVICE_UNAVAILABLE),
+            (hub_codes::CONTROL_TIMEOUT, StatusCode::GATEWAY_TIMEOUT),
+            (hub_codes::INTERNAL, StatusCode::INTERNAL_SERVER_ERROR),
+            (hub_codes::TOO_MANY_PENDING, StatusCode::TOO_MANY_REQUESTS),
+        ] {
+            let reject = reject_from_agent_error(&ControlError::new(code, "这里的内容不该被使用"));
+            assert_eq!(reject.status, status, "{code}");
+            assert_eq!(reject.code, code);
+            assert_eq!(reject.audit_result, AUDIT_ERROR);
+        }
     }
 
     #[test]

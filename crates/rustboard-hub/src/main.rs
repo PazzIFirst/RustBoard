@@ -5677,4 +5677,61 @@ mod tests {
         assert_eq!(entries[0].result, "error");
         assert_eq!(entries[0].error_code, "too_many_pending");
     }
+
+    /// POST /control 对完全不存在的 agent 返回 404（与 GET 一致）；
+    /// 老 agent（agents 行存在、无能力行）仍按能力未上报回 403。
+    #[tokio::test]
+    async fn m3_control_post_unknown_agent_is_404() {
+        let state = m3_state(m3_control_cfg());
+        let router = admin_router(state.clone());
+
+        let (status, body) = m3_post(
+            &router,
+            "missing",
+            r#"{"capability":"systemd","action":"list"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "agent_not_found");
+
+        // 老 agent：有 agents 行但没有 agent_control 行 → 403 capability_disabled。
+        state.storage.upsert_agent(&test_agent("legacy")).unwrap();
+        let (status, body) = m3_post(
+            &router,
+            "legacy",
+            r#"{"capability":"systemd","action":"list"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "capability_disabled");
+
+        let entries = m3_audit(&state);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].error_code, "agent_not_found");
+        assert_eq!(entries[1].result, "denied");
+        assert_eq!(entries[0].error_code, "capability_disabled");
+    }
+
+    /// 超过 64 KiB 管理 API 请求体上限时回 413 payload_too_large（不是 400），
+    /// 并且仍然写一条审计。
+    #[tokio::test]
+    async fn m3_control_post_oversized_body_is_413() {
+        let state = m3_state(m3_control_cfg());
+        let router = admin_router(state.clone());
+        let body = format!(
+            r#"{{"capability":"systemd","action":"list","padding":"{}"}}"#,
+            "x".repeat(70_000)
+        );
+
+        let (status, response) = m3_post(&router, "a1", &body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "payload_too_large");
+
+        let entries = m3_audit(&state);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].error_code, "payload_too_large");
+        assert_eq!(entries[0].result, "denied");
+    }
 }
