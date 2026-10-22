@@ -11,7 +11,10 @@ use rusqlite::{
 };
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 
-use super::{AgentSeriesRow, IngestOutcome, QueryTooLarge, RejectReason, Storage};
+use super::{
+    AgentControlRecord, AgentSeriesRow, AuditEntry, IngestOutcome, NewAuditEntry, QueryTooLarge,
+    RejectReason, Storage, AUDIT_RETENTION_MS,
+};
 
 /// 默认只读连接池大小（与 `HubConfig::read_pool_size` 默认值一致）。
 pub const DEFAULT_READ_POOL_SIZE: usize = 4;
@@ -21,8 +24,15 @@ pub const MAX_READ_POOL_SIZE: usize = 16;
 
 /// `PRAGMA user_version`：v1 = `ingest_state` 以 agent_id 为主键，
 /// v2 = `(agent_id, epoch)`，v3 = 新增 `ingest_batches` 精确判重，
-/// v4 = 新增 `agent_settings`（每台 agent 的采样间隔，纯新增表）。
-const SCHEMA_VERSION: i64 = 4;
+/// v4 = 新增 `agent_settings`（每台 agent 的采样间隔，纯新增表），
+/// v5 = 新增 `agent_control` / `audit_log`（M3 控制面，纯新增表）。
+const SCHEMA_VERSION: i64 = 5;
+
+/// 每这么多次审计写入清理一次 180 天前的记录。
+const AUDIT_CLEANUP_EVERY: u64 = 1_000;
+
+/// 审计 `params` 的存储上限（字节）；调用方已限长，这里是最后一道防线。
+const MAX_AUDIT_PARAMS_BYTES: usize = 1_024;
 
 /// `ingest_batches` 判重记录保留 48 小时；过期后重放视为新批次。
 const INGEST_BATCH_TTL_MS: i64 = 48 * 60 * 60 * 1000;
@@ -122,6 +132,32 @@ CREATE TABLE IF NOT EXISTS agent_settings (
 );
 "#;
 
+/// v5 新增表：agent 控制能力与操作审计。纯新增，不重写 v1–v4 任何表。
+const CONTROL_AUDIT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_control (
+    agent_id     TEXT PRIMARY KEY,
+    capabilities TEXT NOT NULL DEFAULT '[]',
+    updated_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            INTEGER NOT NULL,
+    actor         TEXT NOT NULL,
+    agent_id      TEXT NOT NULL,
+    capability    TEXT NOT NULL,
+    action        TEXT NOT NULL,
+    target        TEXT NOT NULL DEFAULT '',
+    params        TEXT NOT NULL DEFAULT '{}',
+    result        TEXT NOT NULL,
+    error_code    TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    duration_ms   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+CREATE INDEX IF NOT EXISTS idx_audit_agent_ts ON audit_log(agent_id, ts);
+"#;
+
 pub struct SqliteStorage {
     /// 唯一写连接：迁移、事务、写入都走它，保证 `(agent_id, epoch, seq)` 判重原子。
     writer: Mutex<Connection>,
@@ -131,6 +167,8 @@ pub struct SqliteStorage {
     next_reader: AtomicUsize,
     /// 成功插入批次的累计计数，用于低频触发 `ingest_batches` 清理。
     inserted_batches: AtomicU64,
+    /// 成功写入审计的累计计数，用于低频触发 180 天保留期清理。
+    audit_writes: AtomicU64,
 }
 
 /// 读路径的连接 guard：正常情况下取自只读池；池为空时回退到写连接。
@@ -236,6 +274,7 @@ impl SqliteStorage {
             readers,
             next_reader: AtomicUsize::new(0),
             inserted_batches: AtomicU64::new(0),
+            audit_writes: AtomicU64::new(0),
         })
     }
 
@@ -280,6 +319,7 @@ impl SqliteStorage {
             readers,
             next_reader: AtomicUsize::new(0),
             inserted_batches: AtomicU64::new(0),
+            audit_writes: AtomicU64::new(0),
         })
     }
 
@@ -464,13 +504,15 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     tx.execute_batch(INGEST_STATE_V2)?;
     tx.execute_batch(INGEST_BATCHES)?;
     tx.execute_batch(AGENT_SETTINGS)?;
+    // v5：控制面能力与审计表。纯新增，旧版本二进制忽略这两张表。
+    tx.execute_batch(CONTROL_AUDIT_SCHEMA)?;
 
     if version < SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tracing::info!(
             from = version,
             to = SCHEMA_VERSION,
-            "数据库已迁移：新增 agent_settings（每 agent 采样间隔）"
+            "数据库已迁移：新增 agent_control / audit_log（M3 控制面）"
         );
     }
     tx.commit()?;
@@ -906,6 +948,170 @@ impl Storage for SqliteStorage {
         )?;
         Ok(exists != 0)
     }
+
+    // ---- M3：控制面能力与审计 ----
+
+    fn upsert_agent_control(
+        &self,
+        agent_id: &str,
+        capabilities: &[String],
+        updated_at: i64,
+    ) -> Result<()> {
+        let json = serde_json::to_string(capabilities).context("序列化控制能力失败")?;
+        self.lock_write().execute(
+            "INSERT INTO agent_control (agent_id, capabilities, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                capabilities = excluded.capabilities,
+                updated_at = excluded.updated_at",
+            params![agent_id, json, updated_at],
+        )?;
+        Ok(())
+    }
+
+    fn get_agent_control(&self, agent_id: &str) -> Result<Option<AgentControlRecord>> {
+        let row: Option<(String, i64)> = self
+            .lock_read()
+            .query_row(
+                "SELECT capabilities, updated_at FROM agent_control WHERE agent_id = ?1",
+                params![agent_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((json, updated_at)) = row else {
+            return Ok(None);
+        };
+        // 数据库内容可能来自旧版本或被损坏：解析失败降级为空能力而不是报错，
+        // 控制 API 会因此返回 403，面板仍能正常打开。
+        let capabilities: Vec<String> = match serde_json::from_str(&json) {
+            Ok(capabilities) => capabilities,
+            Err(err) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %err,
+                    "agent_control.capabilities 不是合法 JSON，按空能力处理"
+                );
+                Vec::new()
+            }
+        };
+        Ok(Some(AgentControlRecord {
+            capabilities,
+            updated_at,
+        }))
+    }
+
+    fn insert_audit(&self, entry: &NewAuditEntry) -> Result<i64> {
+        // 最后防线：调用方已限长，这里再夹一次，避免异常调用撑大数据库。
+        let params = truncate_utf8(&entry.params, MAX_AUDIT_PARAMS_BYTES);
+        let conn = self.lock_write();
+        conn.execute(
+            "INSERT INTO audit_log
+                (ts, actor, agent_id, capability, action, target, params, result,
+                 error_code, error_message, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                entry.ts,
+                entry.actor,
+                entry.agent_id,
+                entry.capability,
+                entry.action,
+                entry.target,
+                params,
+                entry.result,
+                entry.error_code,
+                entry.error_message,
+                entry.duration_ms
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+
+        // 每 1000 条成功写入清理一次 180 天前的记录，避免每条都 DELETE。
+        let written = self.audit_writes.fetch_add(1, Ordering::Relaxed) + 1;
+        if written % AUDIT_CLEANUP_EVERY == 0 {
+            let cutoff = rustboard_common::util::now_ms().saturating_sub(AUDIT_RETENTION_MS);
+            match conn.execute("DELETE FROM audit_log WHERE ts < ?1", params![cutoff]) {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(removed, cutoff, "已清理过期审计记录");
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(error = %err, "清理过期审计记录失败"),
+            }
+        }
+        Ok(id)
+    }
+
+    fn list_audit(
+        &self,
+        limit: usize,
+        before_id: Option<i64>,
+        agent_id: Option<&str>,
+        capability: Option<&str>,
+    ) -> Result<Vec<AuditEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut sql = String::from(
+            "SELECT id, ts, actor, agent_id, capability, action, target, params, result,
+                    error_code, error_message, duration_ms
+             FROM audit_log WHERE 1 = 1",
+        );
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(before_id) = before_id {
+            sql.push_str(" AND id < ?");
+            values.push(rusqlite::types::Value::Integer(before_id));
+        }
+        if let Some(agent_id) = agent_id {
+            sql.push_str(" AND agent_id = ?");
+            values.push(rusqlite::types::Value::Text(agent_id.to_string()));
+        }
+        if let Some(capability) = capability {
+            sql.push_str(" AND capability = ?");
+            values.push(rusqlite::types::Value::Text(capability.to_string()));
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        values.push(rusqlite::types::Value::Integer(
+            i64::try_from(limit).unwrap_or(i64::MAX),
+        ));
+
+        let conn = self.lock_read();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| {
+            Ok(AuditEntry {
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                actor: r.get(2)?,
+                agent_id: r.get(3)?,
+                capability: r.get(4)?,
+                action: r.get(5)?,
+                target: r.get(6)?,
+                params: r.get(7)?,
+                result: r.get(8)?,
+                error_code: r.get(9)?,
+                error_message: r.get(10)?,
+                duration_ms: r.get(11)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn prune_audit(&self, before_ts: i64) -> Result<usize> {
+        let removed = self
+            .lock_write()
+            .execute("DELETE FROM audit_log WHERE ts < ?1", params![before_ts])?;
+        Ok(removed)
+    }
+}
+
+/// 按字节截断 UTF-8 字符串，保证不会切出半个字符。
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 #[cfg(test)]
@@ -1191,7 +1397,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// L3：v2 库（user_version=2）启动时补建 ingest_batches 与 agent_settings，升级到 v4。
+    /// L3：v2 库（user_version=2）启动时补建 ingest_batches / agent_settings /
+    /// v5 控制面表，user_version 升级到当前版本。
     #[test]
     fn l3_v2_schema_upgrades_to_v3_with_ingest_batches() {
         let dir = std::env::temp_dir().join(format!("rb-sqlite-v2-{}", std::process::id()));
@@ -1220,7 +1427,7 @@ mod tests {
             .lock_read()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, SCHEMA_VERSION);
         // 水位 9 只作统计：seq 3 未处理过，必须正常写入（M2）。
         assert_eq!(
             s.insert_batch(&batch_with("a1", 1, 3)).unwrap(),
@@ -1383,7 +1590,7 @@ mod tests {
         assert_eq!(updated_at, 102, "覆盖写入必须刷新 updated_at");
     }
 
-    /// v3 → v4：只建新表、升级 user_version，旧数据原样保留；重复打开幂等。
+    /// v3 → 当前版本：只建新表、升级 user_version，旧数据原样保留；重复打开幂等。
     #[test]
     fn v4_migration_from_v3_is_idempotent_and_preserves_data() {
         let dir = std::env::temp_dir().join(format!("rb-sqlite-v3-v4-{}", std::process::id()));
@@ -1421,7 +1628,7 @@ mod tests {
                 .lock_read()
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 4);
+            assert_eq!(version, SCHEMA_VERSION);
             let settings_table: i64 = s
                 .lock_read()
                 .query_row(
@@ -1816,5 +2023,210 @@ mod tests {
         assert_eq!(s.sample_count("a1").unwrap(), 2);
         assert_eq!(s.list_agents().unwrap().len(), 0);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // ------------------------------------------------------------------
+    // M3：schema v5 / agent_control / audit_log
+    // ------------------------------------------------------------------
+
+    fn audit_entry(agent_id: &str, capability: &str, action: &str, ts: i64) -> NewAuditEntry {
+        NewAuditEntry {
+            ts,
+            actor: "admin".into(),
+            agent_id: agent_id.into(),
+            capability: capability.into(),
+            action: action.into(),
+            target: "nginx.service".into(),
+            params: "{\"target\":\"nginx.service\"}".into(),
+            result: "ok".into(),
+            error_code: String::new(),
+            error_message: String::new(),
+            duration_ms: 12,
+        }
+    }
+
+    /// v4 库（已有 agent_settings 行）启动时幂等升级到 v5：只新增表，旧数据保留。
+    #[test]
+    fn m3_v4_schema_upgrades_to_v5_without_touching_old_tables() {
+        let dir = std::env::temp_dir().join(format!("rb-sqlite-v5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("rustboard.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agent_settings (
+                     agent_id           TEXT PRIMARY KEY,
+                     sample_interval_ms INTEGER NOT NULL,
+                     updated_at         INTEGER NOT NULL
+                 );
+                 INSERT INTO agent_settings VALUES ('a1', 2500, 42);
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        }
+
+        for round in 0..2 {
+            let s = SqliteStorage::open(&db_path)
+                .unwrap_or_else(|err| panic!("第 {round} 次打开 v4 库失败（迁移必须幂等）: {err}"));
+            let version: i64 = s
+                .lock_read()
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+            assert_eq!(s.get_sample_interval("a1").unwrap(), Some(2500));
+            for table in ["agent_control", "audit_log"] {
+                let exists: i64 = s
+                    .lock_read()
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                        params![table],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(exists, 1, "v5 必须建好 {table} 表");
+            }
+            assert_eq!(s.list_audit(10, None, None, None).unwrap(), Vec::new());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn m3_agent_control_upsert_replaces_capabilities() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        assert!(s.get_agent_control("a1").unwrap().is_none());
+
+        s.upsert_agent_control("a1", &["systemd".to_string(), "logs".to_string()], 111)
+            .unwrap();
+        let record = s.get_agent_control("a1").unwrap().expect("应能读回能力");
+        assert_eq!(record.capabilities, vec!["systemd", "logs"]);
+        assert_eq!(record.updated_at, 111);
+
+        // 再次 Hello 只覆盖一行，不产生重复记录。
+        s.upsert_agent_control("a1", &["process".to_string()], 222)
+            .unwrap();
+        let record = s.get_agent_control("a1").unwrap().unwrap();
+        assert_eq!(record.capabilities, vec!["process"]);
+        assert_eq!(record.updated_at, 222);
+        let rows: i64 = s
+            .lock_read()
+            .query_row("SELECT COUNT(*) FROM agent_control", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn m3_audit_pagination_and_filters() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let first = s
+            .insert_audit(&audit_entry("a1", "systemd", "list", 100))
+            .unwrap();
+        let second = s
+            .insert_audit(&audit_entry("a1", "systemd", "restart", 200))
+            .unwrap();
+        let third = s
+            .insert_audit(&audit_entry("b2", "docker", "list", 300))
+            .unwrap();
+        let fourth = s
+            .insert_audit(&audit_entry("b2", "docker", "restart", 400))
+            .unwrap();
+        assert!(first < second && second < third && third < fourth);
+
+        // 按 id 倒序 + limit。
+        let page = s.list_audit(2, None, None, None).unwrap();
+        assert_eq!(
+            page.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![fourth, third]
+        );
+
+        // before_id 为排他游标。
+        let page = s.list_audit(2, Some(third), None, None).unwrap();
+        assert_eq!(
+            page.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![second, first]
+        );
+        assert!(s
+            .list_audit(10, Some(first), None, None)
+            .unwrap()
+            .is_empty());
+
+        // agent / capability 过滤可以叠加。
+        let only_a1 = s.list_audit(10, None, Some("a1"), None).unwrap();
+        assert_eq!(
+            only_a1.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![second, first]
+        );
+        let only_docker = s.list_audit(10, None, None, Some("docker")).unwrap();
+        assert_eq!(
+            only_docker.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![fourth, third]
+        );
+        let combined = s
+            .list_audit(10, Some(fourth), Some("a1"), Some("systemd"))
+            .unwrap();
+        assert_eq!(
+            combined.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![second, first]
+        );
+        assert!(s.list_audit(0, None, None, None).unwrap().is_empty());
+
+        // 字段完整落库。
+        let entry = &s.list_audit(1, None, None, None).unwrap()[0];
+        assert_eq!(entry.actor, "admin");
+        assert_eq!(entry.target, "nginx.service");
+        assert_eq!(entry.params, "{\"target\":\"nginx.service\"}");
+        assert_eq!(entry.duration_ms, 12);
+    }
+
+    #[test]
+    fn m3_audit_prune_removes_only_expired_rows() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let now = rustboard_common::util::now_ms();
+        let old = now - AUDIT_RETENTION_MS - 1;
+        let old_id = s
+            .insert_audit(&audit_entry("a1", "systemd", "list", old))
+            .unwrap();
+        let fresh_id = s
+            .insert_audit(&audit_entry("a1", "systemd", "list", now))
+            .unwrap();
+
+        let cutoff = now - AUDIT_RETENTION_MS;
+        assert_eq!(s.prune_audit(cutoff).unwrap(), 1);
+        let left = s.list_audit(10, None, None, None).unwrap();
+        assert_eq!(
+            left.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![fresh_id]
+        );
+        assert_ne!(old_id, fresh_id);
+        // 再清理一次不会重复计数。
+        assert_eq!(s.prune_audit(cutoff).unwrap(), 0);
+    }
+
+    /// 每 1000 条成功写入触发一次保留期清理：第 1000 条写入后过期记录被删。
+    #[test]
+    fn m3_audit_auto_prunes_every_thousand_writes() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let now = rustboard_common::util::now_ms();
+        let stale_ts = now - AUDIT_RETENTION_MS - 1;
+        s.insert_audit(&audit_entry("a1", "systemd", "list", stale_ts))
+            .unwrap();
+
+        // 再写 999 条：累计 1000 条，触发清理。
+        for _ in 0..AUDIT_CLEANUP_EVERY {
+            s.insert_audit(&audit_entry("a1", "systemd", "list", now))
+                .unwrap();
+        }
+        let stale_left = s
+            .list_audit(10, None, Some("a1"), None)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.ts == stale_ts)
+            .count();
+        assert_eq!(stale_left, 0, "第 1000 条写入后应清理 180 天前的审计");
+        assert_eq!(
+            s.list_audit(10, None, None, None).unwrap().len(),
+            10,
+            "新写入的审计必须保留"
+        );
     }
 }

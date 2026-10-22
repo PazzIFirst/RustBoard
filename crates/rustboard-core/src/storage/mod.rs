@@ -5,6 +5,61 @@ pub mod sqlite;
 use anyhow::Result;
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 
+/// 审计记录保留时长：180 天（毫秒）。启动时与每 1000 条写入后按此清理。
+pub const AUDIT_RETENTION_MS: i64 = 180 * 24 * 60 * 60 * 1000;
+
+/// agent 上报的控制能力（schema v5 `agent_control` 表）。
+///
+/// 每次 Hello 后整行覆盖；断线不清空，面板仍可看到历史能力。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentControlRecord {
+    /// 已知能力字符串（`systemd` / `docker` / `process` / `logs`），顺序与上报一致。
+    pub capabilities: Vec<String>,
+    /// 最后一次 Hello 的 hub 时间（毫秒）。
+    pub updated_at: i64,
+}
+
+/// 一条待写入的审计记录（没有自增 `id`）。
+///
+/// `params` 只放 `target` / `pid` / `name` / `signal` / `lines`，
+/// **绝不**写命令输出、日志内容或 agent 错误详情。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewAuditEntry {
+    /// hub 时间（毫秒）。
+    pub ts: i64,
+    pub actor: String,
+    pub agent_id: String,
+    pub capability: String,
+    pub action: String,
+    /// systemd unit / 容器名 / 日志来源 id / 进程名。
+    pub target: String,
+    /// 参数 JSON，调用方负责限长。
+    pub params: String,
+    /// `ok` / `denied` / `error`。
+    pub result: String,
+    pub error_code: String,
+    pub error_message: String,
+    pub duration_ms: i64,
+}
+
+/// 一条审计记录。直接序列化给管理 API（面板页面只依赖其中的展示字段）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AuditEntry {
+    /// 自增主键，同时是分页游标。
+    pub id: i64,
+    pub ts: i64,
+    pub actor: String,
+    pub agent_id: String,
+    pub capability: String,
+    pub action: String,
+    pub target: String,
+    pub params: String,
+    pub result: String,
+    pub error_code: String,
+    pub error_message: String,
+    pub duration_ms: i64,
+}
+
 /// 一批数据的写入结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngestOutcome {
@@ -134,4 +189,34 @@ pub trait Storage: Send + Sync {
     fn revoke_agent(&self, agent_id: &str, ts: i64) -> Result<()>;
 
     fn is_revoked(&self, agent_id: &str) -> Result<bool>;
+
+    // ---- M3 控制面能力与审计 ----
+
+    /// 覆盖写入 agent 上报的控制能力（Hello 后调用）。
+    fn upsert_agent_control(
+        &self,
+        agent_id: &str,
+        capabilities: &[String],
+        updated_at: i64,
+    ) -> Result<()>;
+
+    /// 读取 agent 最近一次上报的控制能力；从未上报返回 `None`。
+    fn get_agent_control(&self, agent_id: &str) -> Result<Option<AgentControlRecord>>;
+
+    /// 写入一条审计记录，返回自增 id。
+    ///
+    /// 每 1000 条成功后按 [`AUDIT_RETENTION_MS`] 清理一次过期记录。
+    fn insert_audit(&self, entry: &NewAuditEntry) -> Result<i64>;
+
+    /// 按 id 倒序分页查询审计；`before_id` 为**排他**游标（`id < before_id`）。
+    fn list_audit(
+        &self,
+        limit: usize,
+        before_id: Option<i64>,
+        agent_id: Option<&str>,
+        capability: Option<&str>,
+    ) -> Result<Vec<AuditEntry>>;
+
+    /// 删除 `ts < before_ts` 的审计记录，返回删除行数。
+    fn prune_audit(&self, before_ts: i64) -> Result<usize>;
 }
