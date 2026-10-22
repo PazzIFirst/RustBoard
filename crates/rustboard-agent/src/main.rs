@@ -1,0 +1,455 @@
+//! RustBoard 采集端。
+//!
+//! 首次启动：用一次性 token 完成 enrollment，拿到客户端证书与独立 secret；
+//! 之后：采集 -> 本地磁盘缓冲 -> 按序上报，收到 Ack 才丢弃。
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{Parser, Subcommand};
+use futures_util::{SinkExt, StreamExt};
+use rustboard_common::config::AgentConfig;
+use rustboard_common::model::SampleBatch;
+use rustboard_common::tls;
+use rustboard_common::util::{arch, boot_id, hostname, now_ms, os_pretty_name};
+use rustboard_common::wire::{AgentHello, EnrollRequest, Frame};
+use rustboard_common::{DEFAULT_AGENT_CONFIG, PROTOCOL_VERSION, VERSION};
+use rustboard_core::buffer::DiskBuffer;
+use rustboard_core::collect::default_collectors;
+use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::Message;
+
+const AGENT_CERT: &str = "agent.crt";
+const AGENT_KEY: &str = "agent.key";
+const AGENT_SECRET: &str = "agent.secret";
+const AGENT_CA: &str = "ca.crt";
+const AGENT_ID: &str = "agent_id";
+
+type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[derive(Parser)]
+#[command(name = "rustboard-agent", version, about = "RustBoard 采集端")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// 启动采集。
+    Run {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// 生成默认配置。
+    Init {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        hub: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        /// hub 服务端证书的 SHA-256 指纹，由 `rustboard-hub init` 输出。
+        #[arg(long)]
+        fingerprint: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+fn main() -> Result<()> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "rustboard_agent=info".into());
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    match Cli::parse().cmd {
+        Cmd::Init { config, hub, token, fingerprint, name, data_dir, force } => {
+            let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_CONFIG));
+            if path.exists() && !force {
+                bail!("{} 已存在，使用 --force 覆盖", path.display());
+            }
+            let mut cfg = AgentConfig::default();
+            if let Some(h) = hub {
+                cfg.hub_url = h;
+            }
+            if let Some(t) = token {
+                cfg.token = t;
+            }
+            if let Some(f) = fingerprint {
+                cfg.server_fingerprint = f;
+            }
+            if let Some(n) = name {
+                cfg.name = n;
+            }
+            if let Some(d) = data_dir {
+                cfg.data_dir = d;
+            }
+            cfg.save(&path)?;
+            println!("已写入配置: {}", path.display());
+            println!("hub 地址: {}", cfg.hub_url);
+            if cfg.hub_url.starts_with("wss://") && cfg.server_fingerprint.is_empty() {
+                println!("警告: wss:// 连接缺少 --fingerprint，启动时会失败");
+            }
+            println!("\n下一步: rustboard-agent run --config {}", path.display());
+            Ok(())
+        }
+        Cmd::Run { config } => {
+            let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_CONFIG));
+            let cfg = AgentConfig::load(&path).with_context(|| {
+                format!("读取配置失败: {}（先执行 rustboard-agent init）", path.display())
+            })?;
+            cfg.validate()?;
+            run(cfg)
+        }
+    }
+}
+
+fn run(cfg: AgentConfig) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move { run_async(cfg).await })
+}
+
+async fn run_async(cfg: AgentConfig) -> Result<()> {
+    std::fs::create_dir_all(&cfg.data_dir)?;
+
+    // 没纳管过就先走 enrollment；拿到证书后再开始采集，避免用临时 agent_id 产生脏数据。
+    if !is_enrolled(&cfg) {
+        tracing::info!("尚未纳管，开始 enrollment");
+        ensure_enrolled(&cfg).await?;
+    }
+
+    let agent_id = load_or_create_agent_id(&cfg.data_dir)?;
+    let boot = boot_id();
+    let epoch = now_ms() as u64;
+    tracing::info!(%agent_id, epoch, "采集端启动");
+
+    let collectors = Arc::new(default_collectors(cfg.per_core, &cfg.excluded_interfaces));
+    let buffer = Arc::new(Mutex::new(DiskBuffer::open(
+        &cfg.data_dir,
+        cfg.buffer_max_bytes,
+    )?));
+    let seq = Arc::new(AtomicU64::new(0));
+    // 采集器写入后立刻唤醒上传循环，避免空缓冲时只能等心跳
+    let notify = Arc::new(tokio::sync::Notify::new());
+
+    // 采集任务
+    {
+        let collectors = collectors.clone();
+        let buffer = buffer.clone();
+        let seq = seq.clone();
+        let agent_id = agent_id.clone();
+        let boot = boot.clone();
+        let interval = cfg.sample_interval_ms;
+        let notify = notify.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(interval));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let ts = now_ms();
+                let mut samples = Vec::new();
+                for collector in collectors.iter() {
+                    samples.extend(collector.collect(ts));
+                }
+                if samples.is_empty() {
+                    continue;
+                }
+                let batch = SampleBatch {
+                    agent_id: agent_id.clone(),
+                    epoch,
+                    seq: seq.fetch_add(1, Ordering::Relaxed),
+                    boot_id: boot.clone(),
+                    sent_at: ts,
+                    samples,
+                };
+                let mut guard = buffer.lock().await;
+                match guard.push(&batch) {
+                    Ok(()) => notify.notify_one(),
+                    Err(err) => tracing::warn!(error = %err, "写入本地缓冲失败"),
+                }
+            }
+        });
+    }
+
+    // 上传任务（主循环，断线指数退避重连）
+    let mut backoff_secs = 1u64;
+    loop {
+        match connect(&cfg, true).await {
+            Ok(ws) => {
+                backoff_secs = 1;
+                tracing::info!(url = %cfg.hub_url, "已连接 hub");
+                if let Err(err) =
+                    session(ws, &cfg, &agent_id, epoch, &boot, &buffer, &notify).await
+                {
+                    tracing::warn!(error = %err, "会话中断");
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, retry_in = backoff_secs, "连接 hub 失败");
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(60);
+            }
+        }
+    }
+}
+
+fn is_enrolled(cfg: &AgentConfig) -> bool {
+    cfg.data_dir.join(AGENT_CERT).exists()
+        && cfg.data_dir.join(AGENT_KEY).exists()
+        && cfg.data_dir.join(AGENT_SECRET).exists()
+}
+
+async fn connect(cfg: &AgentConfig, with_client_cert: bool) -> Result<WsStream> {
+    let connector = if cfg.hub_url.starts_with("wss://") {
+        let (cert, key) = if with_client_cert {
+            (
+                Some(std::fs::read_to_string(cfg.data_dir.join(AGENT_CERT))?),
+                Some(std::fs::read_to_string(cfg.data_dir.join(AGENT_KEY))?),
+            )
+        } else {
+            (None, None)
+        };
+        let config = tls::client_config(
+            &cfg.server_fingerprint,
+            cert.as_deref(),
+            key.as_deref(),
+        )?;
+        Some(tokio_tungstenite::Connector::Rustls(config))
+    } else {
+        None
+    };
+
+    let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
+        cfg.hub_url.as_str(),
+        None,
+        false,
+        connector,
+    )
+    .await?;
+    Ok(ws)
+}
+
+enum EnrollError {
+    Fatal(anyhow::Error),
+    Retry(anyhow::Error),
+}
+
+async fn ensure_enrolled(cfg: &AgentConfig) -> Result<()> {
+    let mut backoff = 1u64;
+    loop {
+        match try_enroll(cfg).await {
+            Ok(()) => return Ok(()),
+            Err(EnrollError::Fatal(err)) => return Err(err),
+            Err(EnrollError::Retry(err)) => {
+                tracing::warn!(error = %err, retry_in = backoff, "纳管失败，稍后重试");
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
+            }
+        }
+    }
+}
+
+async fn try_enroll(cfg: &AgentConfig) -> std::result::Result<(), EnrollError> {
+    let ws = connect(cfg, false).await.map_err(EnrollError::Retry)?;
+    let (mut sink, mut stream) = ws.split();
+
+    let (csr_pem, key_pem) = tls::make_csr().map_err(EnrollError::Fatal)?;
+    let request = Frame::Enroll(EnrollRequest {
+        token: cfg.token.clone(),
+        csr_pem,
+        requested_name: cfg.name.clone(),
+        hostname: hostname(),
+        protocol: PROTOCOL_VERSION,
+    });
+    sink.send(Message::Binary(
+        request.encode().map_err(|e| EnrollError::Fatal(e.into()))?,
+    ))
+    .await
+    .map_err(|e| EnrollError::Retry(e.into()))?;
+
+    let frame = tokio::time::timeout(Duration::from_secs(20), recv_frame(&mut stream))
+        .await
+        .map_err(|_| EnrollError::Retry(anyhow!("等待纳管应答超时")))?
+        .map_err(EnrollError::Retry)?;
+
+    match frame {
+        Frame::Enrolled(resp) => {
+            write_private(&cfg.data_dir.join(AGENT_CERT), resp.cert_pem.as_bytes())
+                .map_err(EnrollError::Fatal)?;
+            write_private(&cfg.data_dir.join(AGENT_KEY), key_pem.as_bytes())
+                .map_err(EnrollError::Fatal)?;
+            write_private(&cfg.data_dir.join(AGENT_SECRET), resp.agent_secret.as_bytes())
+                .map_err(EnrollError::Fatal)?;
+            std::fs::write(cfg.data_dir.join(AGENT_CA), &resp.ca_pem).map_err(|e| {
+                EnrollError::Fatal(anyhow!("写入 CA 证书失败: {e}"))
+            })?;
+            std::fs::write(cfg.data_dir.join(AGENT_ID), &resp.agent_id).map_err(|e| {
+                EnrollError::Fatal(anyhow!("写入 agent_id 失败: {e}"))
+            })?;
+            tracing::info!(agent = %resp.agent_id, "纳管成功");
+            Ok(())
+        }
+        Frame::Problem { code, message } => Err(EnrollError::Fatal(anyhow!(
+            "纳管被拒绝: {code} {message}（token 可能已过期，请重新生成）"
+        ))),
+        _ => Err(EnrollError::Retry(anyhow!("意外的纳管应答"))),
+    }
+}
+
+async fn session(
+    ws: WsStream,
+    cfg: &AgentConfig,
+    agent_id: &str,
+    epoch: u64,
+    boot: &str,
+    buffer: &Arc<Mutex<DiskBuffer>>,
+    notify: &Arc<tokio::sync::Notify>,
+) -> Result<()> {
+    let (mut sink, mut stream) = ws.split();
+    let secret = std::fs::read_to_string(cfg.data_dir.join(AGENT_SECRET))
+        .context("读取 agent secret 失败，可能需要重新纳管")?
+        .trim()
+        .to_string();
+
+    let hello = Frame::Hello(AgentHello {
+        agent_id: agent_id.to_string(),
+        name: cfg.name.clone(),
+        hostname: hostname(),
+        os: os_pretty_name(),
+        arch: arch(),
+        version: VERSION.to_string(),
+        protocol: PROTOCOL_VERSION,
+        boot_id: boot.to_string(),
+        epoch,
+        secret,
+        capabilities: Vec::new(),
+    });
+    sink.send(Message::Binary(hello.encode()?)).await?;
+
+    match tokio::time::timeout(Duration::from_secs(10), recv_frame(&mut stream)).await {
+        Err(_) => bail!("等待 Welcome 超时"),
+        Ok(Err(err)) => bail!("等待 Welcome 失败: {err}"),
+        Ok(Ok(Frame::Welcome(w))) => {
+            if w.sample_interval_ms == 0 {
+                bail!("hub 下发了非法的采样间隔");
+            }
+            tracing::info!(
+                server = %w.server_version,
+                sample_interval_ms = w.sample_interval_ms,
+                "握手完成"
+            );
+        }
+        Ok(Ok(Frame::Problem { code, message })) => bail!("hub 拒绝连接: {code} {message}"),
+        Ok(Ok(_)) => bail!("首帧不是 Welcome"),
+    }
+
+    let mut ping_timer = tokio::time::interval(Duration::from_secs(15));
+    ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        let batches = {
+            let mut guard = buffer.lock().await;
+            guard.read_next(16)?
+        };
+
+        if batches.is_empty() {
+            tokio::select! {
+                _ = ping_timer.tick() => {
+                    sink.send(Message::Binary(Frame::Ping { ts: now_ms() }.encode()?)).await?;
+                }
+                _ = notify.notified() => {}
+                incoming = stream.next() => {
+                    match incoming {
+                        Some(Ok(Message::Close(_))) | None => bail!("hub 关闭了连接"),
+                        Some(Ok(Message::Binary(bytes))) => {
+                            if let Ok(Frame::Ping { ts }) = Frame::decode(bytes.as_ref()) {
+                                sink.send(Message::Binary(Frame::Pong { ts }.encode()?)).await?;
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(err)) => return Err(err.into()),
+                    }
+                }
+            }
+            continue;
+        }
+
+        for batch in batches {
+            let seq = batch.seq;
+            sink.send(Message::Binary(Frame::Batch(batch).encode()?)).await?;
+
+            let acked = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    match recv_frame(&mut stream).await? {
+                        Frame::Ack { seq: ack } if ack >= seq => return Ok(()),
+                        Frame::Problem { code, message } => {
+                            bail!("hub 报错: {code} {message}")
+                        }
+                        Frame::Ping { ts } => {
+                            sink.send(Message::Binary(Frame::Pong { ts }.encode()?)).await?;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+
+            match acked {
+                Ok(Ok(())) => {
+                    buffer.lock().await.ack(seq)?;
+                }
+                Ok(Err(err)) => return Err(err),
+                Err(_) => bail!("等待 Ack 超时 (seq={seq})"),
+            }
+        }
+    }
+}
+
+async fn recv_frame<S>(stream: &mut S) -> Result<Frame>
+where
+    S: futures_util::Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    loop {
+        match stream.next().await {
+            Some(Ok(Message::Binary(bytes))) => return Ok(Frame::decode(bytes.as_ref())?),
+            Some(Ok(Message::Ping(_))) => continue,
+            Some(Ok(Message::Close(_))) | None => bail!("连接已关闭"),
+            Some(Ok(_)) => continue,
+            Some(Err(err)) => return Err(err.into()),
+        }
+    }
+}
+
+fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    std::fs::write(path, data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn load_or_create_agent_id(dir: &std::path::Path) -> Result<String> {
+    let path = dir.join(AGENT_ID);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let id = existing.trim().to_string();
+        if !id.is_empty() {
+            return Ok(id);
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    std::fs::write(&path, &id)?;
+    Ok(id)
+}
