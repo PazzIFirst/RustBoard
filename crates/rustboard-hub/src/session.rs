@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+
+use crate::control::{ControlCommand, CONTROL_COMMAND_BUFFER};
 
 /// 活跃连接注册表。通过 `Arc` 在会话任务与吊销轮询任务之间共享。
 pub struct SessionRegistry {
@@ -25,7 +27,14 @@ pub struct SessionRegistry {
 }
 
 struct SessionEntry {
-    connections: HashMap<u64, watch::Sender<ShutdownReason>>,
+    connections: HashMap<u64, ConnectionEntry>,
+}
+
+/// 单条连接持有的信号：关闭原因 + 控制命令队列。
+struct ConnectionEntry {
+    shutdown: watch::Sender<ShutdownReason>,
+    /// M3：管理 API 通过它把控制命令投递给该连接所属的会话任务。
+    control: mpsc::Sender<ControlCommand>,
 }
 
 /// 会话关闭原因。
@@ -37,10 +46,12 @@ pub enum ShutdownReason {
     Reconfigure,
 }
 
-/// 一次注册的凭据：连接编号 + 取消信号接收端。
+/// 一次注册的凭据：连接编号 + 取消信号接收端 + 控制命令接收端。
 pub struct SessionHandle {
     pub conn_id: u64,
     pub shutdown: watch::Receiver<ShutdownReason>,
+    /// 该连接专属的控制命令队列；会话循环 `select!` 从中取命令。
+    pub control_rx: mpsc::Receiver<ControlCommand>,
 }
 
 impl SessionRegistry {
@@ -63,6 +74,9 @@ impl SessionRegistry {
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         // 初始值不会触发 `changed()`；真正的关闭原因只由 shutdown/reconfigure 写入。
         let (shutdown, receiver) = watch::channel(ShutdownReason::Revoke);
+        // 容量 16：控制 API 自身限速 10/min，正常情况下队列不会堆积；
+        // 堆积时 `try_send` 直接回 429，绝不阻塞会话的采集 / ACK 路径。
+        let (control, control_rx) = mpsc::channel(CONTROL_COMMAND_BUFFER);
         let active = {
             let mut inner = self.lock();
             let entry = inner
@@ -70,14 +84,31 @@ impl SessionRegistry {
                 .or_insert_with(|| SessionEntry {
                     connections: HashMap::new(),
                 });
-            entry.connections.insert(conn_id, shutdown);
+            entry
+                .connections
+                .insert(conn_id, ConnectionEntry { shutdown, control });
             entry.connections.len()
         };
         tracing::debug!(agent = %agent_id, conn_id, active, "agent 会话已注册");
         SessionHandle {
             conn_id,
             shutdown: receiver,
+            control_rx,
         }
+    }
+
+    /// 取该 agent **最新一条连接**的控制命令发送端。
+    ///
+    /// 重连风暴期间旧连接可能还没清理干净：控制命令只投给 conn_id 最大的那条，
+    /// 避免把命令送给即将关闭的会话。agent 不在线时返回 `None`。
+    pub fn control_sender(&self, agent_id: &str) -> Option<mpsc::Sender<ControlCommand>> {
+        let inner = self.lock();
+        let entry = inner.get(agent_id)?;
+        entry
+            .connections
+            .iter()
+            .max_by_key(|(conn_id, _)| **conn_id)
+            .map(|(_, connection)| connection.control.clone())
     }
 
     /// 注销连接：仅当这是该 agent 的**最后一条**连接时返回 `true`。
@@ -116,8 +147,8 @@ impl SessionRegistry {
         let inner = self.lock();
         match inner.get(agent_id) {
             Some(entry) => {
-                for shutdown in entry.connections.values() {
-                    let _ = shutdown.send(reason);
+                for connection in entry.connections.values() {
+                    let _ = connection.shutdown.send(reason);
                 }
                 true
             }
@@ -148,6 +179,7 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustboard_common::control::ControlOp;
 
     #[test]
     fn only_last_connection_marks_agent_offline() {
@@ -233,6 +265,58 @@ mod tests {
             .expect("shutdown 信号未在 1s 内送达")
             .unwrap();
         assert_eq!(received, ShutdownReason::Revoke);
+    }
+
+    /// M3：控制命令只投给最新连接；旧连接（即便还没注销）不能收到。
+    #[test]
+    fn control_sender_prefers_latest_connection() {
+        let registry = SessionRegistry::new();
+        let mut old = registry.register("a");
+        let mut new = registry.register("a");
+
+        // 先投一条：只有新连接能收到。
+        let sender = registry
+            .control_sender("a")
+            .expect("在线 agent 应有控制发送端");
+        let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+        sender
+            .try_send(ControlCommand {
+                op: ControlOp::SystemdList,
+                reply,
+            })
+            .expect("新连接队列应可写");
+        assert!(old.control_rx.try_recv().is_err(), "旧连接不得收到控制命令");
+        let received = new.control_rx.try_recv().expect("最新连接应收到控制命令");
+        assert_eq!(received.op, ControlOp::SystemdList);
+
+        // 旧连接注销后，发送端仍然指向新连接。
+        assert!(!registry.unregister("a", old.conn_id));
+        assert!(registry.control_sender("a").is_some());
+        assert!(registry.unregister("a", new.conn_id));
+        assert!(
+            registry.control_sender("a").is_none(),
+            "最后一条连接注销后必须报告不在线"
+        );
+        assert!(registry.control_sender("missing").is_none());
+    }
+
+    /// 会话结束（接收端 drop）后 `try_send` 必须失败，API 据此回 agent_offline。
+    #[test]
+    fn closed_control_channel_is_reported_as_offline() {
+        let registry = SessionRegistry::new();
+        let handle = registry.register("a");
+        let sender = registry.control_sender("a").expect("应取得发送端");
+        drop(handle.control_rx);
+        let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+        assert!(
+            sender
+                .try_send(ControlCommand {
+                    op: ControlOp::ProcessList,
+                    reply,
+                })
+                .is_err(),
+            "会话结束后 try_send 必须失败"
+        );
     }
 
     /// 配置变更走 Reconfigure，不能混成吊销；多连接都要收到。

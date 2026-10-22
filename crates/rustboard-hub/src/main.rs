@@ -38,15 +38,19 @@ use rustboard_common::wire::{codes, EnrollRequest, Frame, Welcome};
 use rustboard_common::{DEFAULT_HUB_CONFIG, PROTOCOL_VERSION, VERSION};
 use rustboard_core::collect::default_collectors;
 use rustboard_core::storage::sqlite::SqliteStorage;
-use rustboard_core::storage::{AgentSeriesRow, IngestOutcome, QueryTooLarge, Storage};
+use rustboard_core::storage::{
+    AgentSeriesRow, IngestOutcome, QueryTooLarge, Storage, AUDIT_RETENTION_MS,
+};
 use tokio::net::TcpListener;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 
 mod cert_rotation;
+mod control;
 mod session;
 use cert_rotation::CertStatus;
+use control::{ControlCommand, ControlSession};
 use session::{SessionRegistry, ShutdownReason};
 
 /// 内置本机采集使用的 agent_id，只允许 hub 进程内部写入。
@@ -725,6 +729,14 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
             tracing::info!(count = reset, "启动时已将残留的 online 状态重置为 offline");
         }
 
+        // M3：审计保留 180 天，启动时先清一次过期记录（运行期每 1000 条再清）。
+        let audit_cutoff = now_ms().saturating_sub(AUDIT_RETENTION_MS);
+        match storage.prune_audit(audit_cutoff) {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(removed, "启动时已清理过期审计记录"),
+            Err(err) => tracing::warn!(error = %err, "启动时清理过期审计记录失败"),
+        }
+
         // 升级路径：旧安装的 ca.key / server.key 可能是 0644
         tls::harden_hub_material(&cfg.data_dir)?;
         // 启动自愈：上次续签在写盘中途被中断时，key/cert 会不配套，
@@ -841,6 +853,13 @@ fn admin_router(state: AppState) -> Router {
             "/api/v1/agents/{id}/settings",
             get(get_settings).put(put_settings),
         )
+        // M3 控制面：GET 读能力状态（不写审计），POST 执行动作（每次写审计）。
+        .route(
+            "/api/v1/agents/{id}/control",
+            get(control::control_status).post(control::control_action),
+        )
+        // 审计只读接口。
+        .route("/api/v1/audit", get(control::audit_list))
         // KI-08：未知 /api/v1/* 也要先过 Bearer 再 404，不能泄露路由是否存在。
         .route("/api/v1", any(api_not_found))
         .route("/api/v1/{*rest}", any(api_not_found))
@@ -2223,8 +2242,26 @@ async fn handle_session(
         agent_id.clone(),
         handle.conn_id,
     );
+    // M3：控制命令的 pending 表属于本会话。声明顺序保证会话结束时先 Drop
+    // `ControlSession`（给所有等待者回 agent_offline），再注销注册表。
+    let mut control = ControlSession::new(state.cfg.control.max_pending_per_session);
+    let mut control_rx = handle.control_rx;
+    let mut watch_control = true;
 
     state.storage.upsert_agent(&record)?;
+    // M3：登记 agent 实际启用的控制能力。未知能力在入库前就被忽略，
+    // 数据库里只会有本版本认识的四个字符串。
+    let capabilities = control::sanitize_agent_capabilities(&hello.capabilities);
+    state
+        .storage
+        .upsert_agent_control(&agent_id, &capabilities, now)?;
+    if !capabilities.is_empty() {
+        tracing::info!(
+            agent = %agent_id,
+            capabilities = capabilities.len(),
+            "agent 控制能力已登记"
+        );
+    }
     // upsert_agent 会把状态写回 online；若吊销恰好发生在握手期间，立即恢复 revoked。
     if state.storage.is_revoked(&agent_id)? {
         state.storage.set_status(&agent_id, "revoked", now_ms())?;
@@ -2259,6 +2296,10 @@ async fn handle_session(
                     Err(_) => SessionEvent::WatchClosed,
                 }
             }
+            command = control_rx.recv(), if watch_control => match command {
+                Some(command) => SessionEvent::Control(command),
+                None => SessionEvent::ControlClosed,
+            },
             received = recv => match received {
                 Err(_) => SessionEvent::IdleTimeout,
                 Ok(None) => SessionEvent::Closed,
@@ -2304,8 +2345,25 @@ async fn handle_session(
                 tracing::warn!(agent = %agent_id, error = %err, "接收失败，关闭会话");
                 break;
             }
+            SessionEvent::Control(command) => {
+                // 分配会话内 id 并发送 ControlRequest；容量超限时 dispatch 已回错误。
+                control.dispatch(&mut socket, command).await?;
+            }
+            SessionEvent::ControlClosed => {
+                tracing::debug!(agent = %agent_id, "控制命令通道已关闭，停止接收控制请求");
+                watch_control = false;
+            }
             SessionEvent::Message(message) => {
-                match handle_message(&mut socket, &state, &agent_id, &mut renew, message).await? {
+                match handle_message(
+                    &mut socket,
+                    &state,
+                    &agent_id,
+                    &mut renew,
+                    &mut control,
+                    message,
+                )
+                .await?
+                {
                     MessageAction::Continue => {}
                     MessageAction::Close => break,
                 }
@@ -2352,6 +2410,10 @@ fn sample_interval_for(state: &AppState, agent_id: &str) -> u64 {
 /// `select!` 每轮只产出一个事件，避免在分支里同时借用 socket 与取消信号。
 enum SessionEvent {
     Message(Message),
+    /// 管理 API 投递过来的控制命令。
+    Control(ControlCommand),
+    /// 控制命令通道关闭（注册表已无发送端），后续不再轮询。
+    ControlClosed,
     Closed,
     RecvError(String),
     IdleTimeout,
@@ -2565,6 +2627,7 @@ async fn handle_message(
     state: &AppState,
     agent_id: &str,
     renew: &mut RenewState,
+    control: &mut ControlSession,
     message: Message,
 ) -> Result<MessageAction> {
     match message {
@@ -2664,6 +2727,15 @@ async fn handle_message(
                 }
                 Frame::Pong { .. } => {
                     mark_seen(state, agent_id);
+                }
+                Frame::ControlResponse(response) => {
+                    // 只按 id 匹配本会话已登记的请求；未知 id 丢弃并计数。
+                    control.complete(response);
+                }
+                Frame::ControlRequest(_) => {
+                    // hub 永远不会接受 agent 发来的控制请求，忽略而不是断开，
+                    // 避免协议误用影响正常采集。
+                    tracing::debug!(agent = %agent_id, "收到 agent 发来的 ControlRequest，已忽略");
                 }
                 Frame::RenewCert { csr_pem } => {
                     // 限流/冷却判定、长度检查、读 CA 私钥与签发都在 handle_renewal 里；
@@ -4999,5 +5071,547 @@ mod tests {
             "rotate 结束后必须删除锁文件"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // M3：控制面管理 API / 审计
+    // ------------------------------------------------------------------
+
+    use rustboard_common::config::HubControlConfig;
+    use rustboard_common::control::{
+        ControlError, ControlResult, DockerContainer, LogSourceInfo, ProcessInfo, SystemdUnit,
+    };
+    use rustboard_core::storage::AuditEntry;
+
+    const M3_TOKEN: &str = "m3-control-test-token";
+
+    fn m3_control_cfg() -> HubControlConfig {
+        HubControlConfig {
+            enabled: true,
+            systemd: true,
+            docker: true,
+            process: true,
+            logs: true,
+            request_timeout_ms: 1_000,
+            max_pending_per_session: 8,
+            max_output_bytes: 262_144,
+        }
+    }
+
+    fn m3_state(control: HubControlConfig) -> AppState {
+        hub_state_with(HubConfig {
+            admin_token: M3_TOKEN.to_string(),
+            // 限速在 v0.2.1 已有专门测试；这里关闭，避免多次 POST 触发 10/min。
+            admin_rate_limit_per_min: 0,
+            admin_write_rate_limit_per_min: 0,
+            control,
+            ..HubConfig::default()
+        })
+    }
+
+    /// 建好 agents 记录 + 能力行并注册一条在线会话，返回的句柄必须活到测试结束。
+    fn m3_register_agent(
+        state: &AppState,
+        agent_id: &str,
+        capabilities: &[&str],
+    ) -> crate::session::SessionHandle {
+        state.storage.upsert_agent(&test_agent(agent_id)).unwrap();
+        state
+            .storage
+            .upsert_agent_control(
+                agent_id,
+                &capabilities
+                    .iter()
+                    .map(|cap| cap.to_string())
+                    .collect::<Vec<_>>(),
+                now_ms(),
+            )
+            .unwrap();
+        state.sessions.register(agent_id)
+    }
+
+    /// 在会话侧按顺序应答控制命令；返回已应答条数。
+    fn m3_spawn_responder(
+        mut rx: tokio::sync::mpsc::Receiver<ControlCommand>,
+        responses: Vec<std::result::Result<ControlResult, ControlError>>,
+    ) -> tokio::task::JoinHandle<usize> {
+        tokio::spawn(async move {
+            let mut served = 0;
+            for response in responses {
+                let Some(command) = rx.recv().await else {
+                    break;
+                };
+                let _ = command.reply.send(response);
+                served += 1;
+            }
+            served
+        })
+    }
+
+    async fn m3_post(
+        router: &Router,
+        agent_id: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let (status, _, bytes) = admin_call(
+            router,
+            "POST",
+            &format!("/api/v1/agents/{agent_id}/control"),
+            Some(M3_TOKEN),
+            Some(body),
+        )
+        .await;
+        (status, json_body(&bytes))
+    }
+
+    async fn m3_get(router: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let (status, _, bytes) = admin_call(router, "GET", uri, Some(M3_TOKEN), None).await;
+        (status, json_body(&bytes))
+    }
+
+    fn m3_audit(state: &AppState) -> Vec<AuditEntry> {
+        state.storage.list_audit(500, None, None, None).unwrap()
+    }
+
+    /// 能力状态：hub 开关、agent 上报、在线状态各来源正确；GET 不写审计。
+    #[tokio::test]
+    async fn m3_control_status_reports_capabilities_without_audit() {
+        let state = m3_state(m3_control_cfg());
+        let handle = m3_register_agent(&state, "a1", &["systemd", "logs"]);
+        // 直接写入未知能力，GET 必须过滤掉（旧 agent / 恶意 Hello 的历史数据）。
+        state
+            .storage
+            .upsert_agent_control(
+                "a1",
+                &[
+                    "systemd".to_string(),
+                    "shell".to_string(),
+                    "logs".to_string(),
+                ],
+                now_ms(),
+            )
+            .unwrap();
+        let router = admin_router(state.clone());
+
+        let (status, body) = m3_get(&router, "/api/v1/agents/a1/control").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["control_enabled"], true);
+        assert_eq!(body["online"], true);
+        assert_eq!(body["capabilities"], serde_json::json!(["systemd", "logs"]));
+        assert_eq!(
+            body["hub_capabilities"],
+            serde_json::json!(["systemd", "docker", "process", "logs"])
+        );
+
+        // 注销后在线状态立即变 false，但能力历史保留。
+        assert!(state.sessions.unregister("a1", handle.conn_id));
+        drop(handle);
+        assert!(!state.sessions.has_active("a1"));
+        let (status, body) = m3_get(&router, "/api/v1/agents/a1/control").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["online"], false);
+        assert_eq!(body["capabilities"], serde_json::json!(["systemd", "logs"]));
+
+        // 旧 agent：agents 行存在但没有能力行 → 200 + 空能力。
+        state.storage.upsert_agent(&test_agent("legacy")).unwrap();
+        let (status, body) = m3_get(&router, "/api/v1/agents/legacy/control").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["capabilities"], serde_json::json!([]));
+        assert_eq!(body["online"], false);
+
+        // 完全不存在的 agent → 404。
+        let (status, _) = m3_get(&router, "/api/v1/agents/missing/control").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // GET 不写审计。
+        assert!(m3_audit(&state).is_empty(), "只读接口不得写审计");
+    }
+
+    /// 双端开关：hub 关闭 / agent 未上报 → 403；无会话 → 503。
+    #[tokio::test]
+    async fn m3_control_post_capability_gates_and_offline() {
+        let mut cfg = m3_control_cfg();
+        cfg.systemd = false;
+        let state = m3_state(cfg);
+        let _online = m3_register_agent(&state, "a1", &["systemd"]);
+        let router = admin_router(state.clone());
+
+        let (status, body) =
+            m3_post(&router, "a1", r#"{"capability":"systemd","action":"list"}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "capability_disabled");
+
+        // hub 开启但 agent 未上报该能力 → 403。
+        let mut cfg = m3_control_cfg();
+        cfg.logs = true;
+        let state2 = m3_state(cfg);
+        let _online2 = m3_register_agent(&state2, "a2", &["docker"]);
+        let router2 = admin_router(state2.clone());
+        let (status, body) = m3_post(
+            &router2,
+            "a2",
+            r#"{"capability":"systemd","action":"list"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "capability_disabled");
+
+        // 能力已上报但没有活跃会话 → 503 agent_offline。
+        state2.storage.upsert_agent(&test_agent("a3")).unwrap();
+        state2
+            .storage
+            .upsert_agent_control("a3", &["docker".to_string()], now_ms())
+            .unwrap();
+        let (status, body) =
+            m3_post(&router2, "a3", r#"{"capability":"docker","action":"list"}"#).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "agent_offline");
+
+        // 总开关关闭：即使单项都写 true 也 403（配置层会拒绝这种组合，这里直接构造）。
+        let mut cfg = m3_control_cfg();
+        cfg.enabled = false;
+        let state3 = m3_state(cfg);
+        let _online3 = m3_register_agent(&state3, "a4", &["logs"]);
+        let router3 = admin_router(state3.clone());
+        let (status, body) =
+            m3_post(&router3, "a4", r#"{"capability":"logs","action":"list"}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "capability_disabled");
+
+        // 所有拒绝都落审计。
+        for state in [&state, &state2, &state3] {
+            let entries = m3_audit(state);
+            assert!(!entries.is_empty(), "拒绝也必须写审计");
+            assert!(entries.iter().all(|entry| entry.actor == "admin"));
+            assert!(entries.iter().all(|entry| entry.result != "ok"));
+        }
+    }
+
+    /// 参数校验全部 400 invalid_request，且带审计。
+    #[tokio::test]
+    async fn m3_control_post_validation_failures_are_audited() {
+        let state = m3_state(m3_control_cfg());
+        let _online = m3_register_agent(&state, "a1", &["systemd", "process", "logs"]);
+        let router = admin_router(state.clone());
+
+        let too_long = "a".repeat(rustboard_common::control::MAX_TARGET_LEN + 1);
+        let long_body = format!(
+            r#"{{"capability":"systemd","action":"restart","target":"{too_long}","confirm":true}}"#
+        );
+        let cases = [
+            r#"{"capability":"systemd","action":"restart","target":"nginx.service"}"#.to_string(),
+            r#"{"capability":"process","action":"kill","pid":1,"name":"systemd","signal":"term","confirm":true}"#.to_string(),
+            r#"{"capability":"logs","action":"tail","source":"nginx-error","lines":2001}"#.to_string(),
+            r#"{"capability":"logs","action":"list","unknown":true}"#.to_string(),
+            r#"{"capability":"systemd""#.to_string(),
+            long_body,
+        ];
+        for body in cases {
+            let (status, body) = m3_post(&router, "a1", &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["ok"], false);
+            assert_eq!(body["error"]["code"], "invalid_request");
+        }
+
+        let entries = m3_audit(&state);
+        assert_eq!(entries.len(), 6, "每次拒绝都要写一条审计");
+        assert!(entries.iter().all(|entry| entry.result == "denied"));
+        assert!(entries
+            .iter()
+            .all(|entry| entry.error_code == "invalid_request"));
+    }
+
+    /// 成功路径：6 种结果形状、审计内容与分页过滤。
+    #[tokio::test]
+    async fn m3_control_post_success_shapes_and_audit_pagination() {
+        let state = m3_state(m3_control_cfg());
+        let handle = m3_register_agent(&state, "a1", &["systemd", "docker", "process", "logs"]);
+        let responder = m3_spawn_responder(
+            handle.control_rx,
+            vec![
+                Ok(ControlResult::SystemdUnits(vec![SystemdUnit {
+                    unit: "nginx.service".into(),
+                    load: "loaded".into(),
+                    active: "active".into(),
+                    sub: "running".into(),
+                    description: "Nginx".into(),
+                }])),
+                Ok(ControlResult::ActionOutput {
+                    stdout: "restarted".into(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                }),
+                Ok(ControlResult::DockerContainers(vec![DockerContainer {
+                    name: "web-1".into(),
+                    image: "nginx:latest".into(),
+                    state: "running".into(),
+                    status: "Up 1 hour".into(),
+                    id: "abc".into(),
+                }])),
+                Ok(ControlResult::Processes(vec![ProcessInfo {
+                    pid: 42,
+                    name: "sleep".into(),
+                    cmdline: "sleep 300".into(),
+                    uid: 0,
+                    rss_kb: 1024,
+                }])),
+                Ok(ControlResult::LogSources(vec![LogSourceInfo {
+                    id: "nginx-error".into(),
+                    kind: rustboard_common::config::LogSourceKind::File,
+                    target: "/var/log/nginx/error.log".into(),
+                    name: "Nginx".into(),
+                }])),
+                Ok(ControlResult::LogLines {
+                    source: "nginx-error".into(),
+                    lines: vec!["line-3".into(), "line-4".into()],
+                    truncated: false,
+                    size_bytes: 42,
+                }),
+            ],
+        );
+        let router = admin_router(state.clone());
+
+        let (status, body) =
+            m3_post(&router, "a1", r#"{"capability":"systemd","action":"list"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["result"]["type"], "systemd_units");
+        assert_eq!(body["result"]["units"][0]["unit"], "nginx.service");
+
+        let (status, body) = m3_post(
+            &router,
+            "a1",
+            r#"{"capability":"systemd","action":"restart","target":"nginx.service","confirm":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["type"], "action_output");
+        assert_eq!(body["result"]["exit_code"], 0);
+
+        let (status, body) =
+            m3_post(&router, "a1", r#"{"capability":"docker","action":"list"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["containers"][0]["name"], "web-1");
+
+        let (status, body) =
+            m3_post(&router, "a1", r#"{"capability":"process","action":"list"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        // 面板契约：rss_kb 是线协议原字段。
+        assert_eq!(body["result"]["processes"][0]["rss_kb"], 1024);
+        assert!(body["result"]["processes"][0].get("rss").is_none());
+
+        let (status, body) =
+            m3_post(&router, "a1", r#"{"capability":"logs","action":"list"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["sources"][0]["kind"], "file");
+        assert_eq!(
+            body["result"]["sources"][0]["target"],
+            "/var/log/nginx/error.log"
+        );
+        assert!(body["result"]["sources"][0].get("size").is_none());
+
+        let (status, body) = m3_post(
+            &router,
+            "a1",
+            r#"{"capability":"logs","action":"tail","source":"nginx-error","lines":200}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["type"], "log_lines");
+        assert_eq!(body["result"]["lines"][0], "line-3");
+        assert_eq!(body["result"]["size_bytes"], 42);
+
+        assert_eq!(responder.await.unwrap(), 6, "6 条命令都应送达会话");
+
+        // 审计：actor / capability / action / target / params 全部受限且不含输出。
+        let entries = m3_audit(&state);
+        assert_eq!(entries.len(), 6);
+        assert!(entries.iter().all(|entry| entry.actor == "admin"));
+        assert!(entries.iter().all(|entry| entry.result == "ok"));
+        assert!(entries.iter().all(|entry| entry.error_code.is_empty()));
+        let restart = entries
+            .iter()
+            .find(|entry| entry.action == "restart")
+            .expect("应有 restart 审计");
+        assert_eq!(restart.capability, "systemd");
+        assert_eq!(restart.target, "nginx.service");
+        let params: serde_json::Value = serde_json::from_str(&restart.params).unwrap();
+        assert_eq!(params["target"], "nginx.service");
+        assert!(params.get("stdout").is_none(), "params 绝不能包含命令输出");
+        let tail = entries
+            .iter()
+            .find(|entry| entry.action == "tail")
+            .expect("应有 tail 审计");
+        let params: serde_json::Value = serde_json::from_str(&tail.params).unwrap();
+        assert_eq!(params["lines"], 200);
+        assert!(!restart.params.contains("restarted"));
+
+        // 分页：limit=2 + before_id 排他游标，第二页严格小于游标且不重复。
+        let (status, page) = m3_get(&router, "/api/v1/audit?limit=2").await;
+        assert_eq!(status, StatusCode::OK);
+        let ids: Vec<i64> = page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        let cursor = page["next_before_id"].as_i64().expect("满页必须有游标");
+        assert_eq!(cursor, ids[1]);
+
+        let (status, page2) = m3_get(
+            &router,
+            &format!("/api/v1/audit?limit=2&before_id={cursor}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let ids2: Vec<i64> = page2["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_i64().unwrap())
+            .collect();
+        assert!(
+            ids2.iter().all(|id| *id < cursor),
+            "before_id 必须是排他游标"
+        );
+        assert!(ids2.iter().all(|id| !ids.contains(id)));
+
+        // 过滤：capability / agent_id。
+        let (status, page) = m3_get(&router, "/api/v1/audit?limit=50&capability=systemd").await;
+        assert_eq!(status, StatusCode::OK);
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry["capability"] == "systemd"));
+
+        let (status, page) = m3_get(&router, "/api/v1/audit?limit=50&agent_id=a1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["entries"].as_array().unwrap().len(), 6);
+
+        let (status, page) = m3_get(&router, "/api/v1/audit?limit=50&agent_id=other").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page["entries"].as_array().unwrap().is_empty());
+        assert!(page["next_before_id"].is_null());
+
+        // 大量 GET 之后审计条数不变：只读接口不写审计。
+        assert_eq!(m3_audit(&state).len(), 6);
+    }
+
+    /// agent 错误映射 + 超时 504；两者都不能回显 agent 输出。
+    #[tokio::test]
+    async fn m3_control_post_maps_agent_errors_and_timeout() {
+        const SECRET: &str = "SECRET-STDERR-MUST-NOT-LEAK";
+        let mut cfg = m3_control_cfg();
+        cfg.request_timeout_ms = 20;
+        let state = m3_state(cfg);
+        let handle = m3_register_agent(&state, "a1", &["systemd", "docker"]);
+        let responder = m3_spawn_responder(
+            handle.control_rx,
+            vec![
+                Err(ControlError::not_whitelisted(SECRET)),
+                Err(ControlError::control_failed(SECRET)),
+            ],
+        );
+        // 另一台在线 agent 故意不应答：覆盖超时分支（保持句柄存活让通道不关闭）。
+        let _silent = m3_register_agent(&state, "a2", &["docker"]);
+        let router = admin_router(state.clone());
+
+        let body = r#"{"capability":"systemd","action":"restart","target":"nginx.service","confirm":true}"#;
+        let (status, response) = m3_post(&router, "a1", body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(response["error"]["code"], "not_whitelisted");
+        assert!(
+            !response.to_string().contains(SECRET),
+            "不得回显 agent 错误详情"
+        );
+
+        let (status, response) = m3_post(&router, "a1", body).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(response["error"]["code"], "control_failed");
+        assert!(!response.to_string().contains(SECRET));
+
+        assert_eq!(responder.await.unwrap(), 2);
+
+        let (status, response) =
+            m3_post(&router, "a2", r#"{"capability":"docker","action":"list"}"#).await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(response["error"]["code"], "control_timeout");
+
+        // 按 id 倒序：最近一条是超时，最早一条是 agent 拒绝。
+        let entries = m3_audit(&state);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].result, "error");
+        assert_eq!(entries[0].error_code, "control_timeout");
+        assert_eq!(entries[1].error_code, "control_failed");
+        assert_eq!(entries[2].result, "denied");
+        assert_eq!(entries[2].error_code, "not_whitelisted");
+        assert!(
+            entries.iter().all(
+                |entry| !entry.error_message.contains(SECRET) && !entry.params.contains(SECRET)
+            ),
+            "审计不得写入 agent 错误详情"
+        );
+    }
+
+    /// 控制结果在 hub 侧按 max_output_bytes 截断，不信任 agent 长度。
+    #[tokio::test]
+    async fn m3_control_result_is_capped_by_hub_max_output_bytes() {
+        let mut cfg = m3_control_cfg();
+        cfg.max_output_bytes = 1024;
+        let state = m3_state(cfg);
+        let handle = m3_register_agent(&state, "a1", &["logs"]);
+        let lines: Vec<String> = (0..500).map(|_| "x".repeat(4096)).collect();
+        let responder = m3_spawn_responder(
+            handle.control_rx,
+            vec![Ok(ControlResult::LogLines {
+                source: "nginx-error".into(),
+                lines,
+                truncated: false,
+                size_bytes: 10_000_000,
+            })],
+        );
+        let router = admin_router(state.clone());
+
+        let (status, body) = m3_post(
+            &router,
+            "a1",
+            r#"{"capability":"logs","action":"tail","source":"nginx-error","lines":200}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let result_bytes = serde_json::to_vec(&body["result"]).unwrap().len();
+        assert!(
+            result_bytes <= 1024,
+            "result 必须被截断到 max_output_bytes 以内，实际 {result_bytes}"
+        );
+        assert_eq!(body["result"]["type"], "log_lines");
+        assert_eq!(body["result"]["truncated"], true);
+        assert_eq!(responder.await.unwrap(), 1);
+    }
+
+    /// 审计查询参数校验：limit 1–200、before_id 正整数、过滤值合法。
+    #[tokio::test]
+    async fn m3_audit_query_validation() {
+        let state = m3_state(m3_control_cfg());
+        let router = admin_router(state.clone());
+        for query in [
+            "/api/v1/audit?limit=0",
+            "/api/v1/audit?limit=201",
+            "/api/v1/audit?limit=abc",
+            "/api/v1/audit?before_id=0",
+            "/api/v1/audit?before_id=-1",
+            "/api/v1/audit?agent_id=bad%2Fid",
+            "/api/v1/audit?agent_id=",
+            "/api/v1/audit?capability=",
+            "/api/v1/audit?limit=1&limit=2",
+        ] {
+            let (status, _) = m3_get(&router, query).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        }
+        let (status, body) = m3_get(&router, "/api/v1/audit").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["entries"].as_array().unwrap().is_empty());
+        assert!(body["next_before_id"].is_null());
     }
 }
