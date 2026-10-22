@@ -337,7 +337,8 @@ wait_samples_at_least() {
 
 panel_login() {
   # $1 密码，$2 XFF（可空），$3 XFP（可空），$4 cookie 输出（可空）
-  local password=$1 xff=$2 xfp=$3 cookie_out=$4
+  # 可选参数必须用 ${n:-}：7.4 只传 3 个参数，裸 $4 在 set -u 下会直接退出。
+  local password=$1 xff=${2:-} xfp=${3:-} cookie_out=${4:-}
   local args=(login --url "$PANEL_URL/api/login" --password "$password")
   # 注意：不能用 `[[ ... ]] && args+=(...)`，条件为假时整个 && 列表返回 1，
   # 在 set -e 下会让函数在 probe 执行前直接退出（无 cookie_out 的调用必踩）。
