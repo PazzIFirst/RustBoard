@@ -5734,4 +5734,41 @@ mod tests {
         assert_eq!(entries[0].error_code, "payload_too_large");
         assert_eq!(entries[0].result, "denied");
     }
+
+    /// 命令被信号杀死（exit_code = None）：响应仍 200 + exit_code=null，
+    /// 但审计必须记 error/control_failed，文案区分「命令被信号终止」。
+    #[tokio::test]
+    async fn m3_control_signaled_command_is_audited_as_error() {
+        let state = m3_state(m3_control_cfg());
+        let handle = m3_register_agent(&state, "a1", &["docker"]);
+        let responder = m3_spawn_responder(
+            handle.control_rx,
+            vec![Ok(ControlResult::ActionOutput {
+                stdout: "stopping".into(),
+                stderr: String::new(),
+                exit_code: None,
+            })],
+        );
+        let router = admin_router(state.clone());
+
+        let (status, body) = m3_post(
+            &router,
+            "a1",
+            r#"{"capability":"docker","action":"restart","target":"web-1","confirm":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert!(
+            body["result"]["exit_code"].is_null(),
+            "被信号终止时响应仍返回 exit_code=null"
+        );
+        assert_eq!(responder.await.unwrap(), 1);
+
+        let entries = m3_audit(&state);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].result, "error");
+        assert_eq!(entries[0].error_code, "control_failed");
+        assert_eq!(entries[0].error_message, "命令被信号终止");
+    }
 }

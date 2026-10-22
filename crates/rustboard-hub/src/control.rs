@@ -601,17 +601,14 @@ pub(crate) async fn control_action(
             return finish_error(&state, audit, started, &Reject::offline()).await;
         }
         Ok(Ok(Ok(result))) => {
-            // 非零退出码代表动作实际失败：响应仍保留 200 + 真实 exit_code
-            // （前端已按 exit_code 展示失败），但审计必须记 error 而不是 ok。
-            // 审计只写固定文案，不回显 stderr。
-            let exit_code = match &result {
-                ControlResult::ActionOutput { exit_code, .. } => *exit_code,
-                _ => None,
-            };
+            // 命令是否成功只看退出码：只有明确的 0 算成功；非 0 与被信号终止
+            // （exit_code = None）都按失败记审计。响应仍保留 200 + 真实 exit_code
+            // （前端按 exit_code 展示失败），审计只写固定文案，不回显 stderr。
             let value = control_result_json(&result, state.cfg.control.max_output_bytes);
             let duration = elapsed_ms(started);
-            let entry = match exit_code {
-                Some(code) if code != 0 => {
+            let entry = match command_exit(&result) {
+                CommandExit::Success => audit.into_entry(AUDIT_OK, "", "", duration),
+                CommandExit::NonZero(code) => {
                     tracing::warn!(
                         agent = %agent_id,
                         capability = %audit.capability,
@@ -626,7 +623,20 @@ pub(crate) async fn control_action(
                         duration,
                     )
                 }
-                _ => audit.into_entry(AUDIT_OK, "", "", duration),
+                CommandExit::Signaled => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        capability = %audit.capability,
+                        action = %audit.action,
+                        "控制命令被信号终止"
+                    );
+                    audit.into_entry(
+                        AUDIT_ERROR,
+                        control_codes::CONTROL_FAILED,
+                        "命令被信号终止",
+                        duration,
+                    )
+                }
             };
             record_audit(&state, entry).await;
             Json(json!({ "ok": true, "result": value })).into_response()
@@ -636,6 +646,29 @@ pub(crate) async fn control_action(
             let reject = reject_from_agent_error(&error);
             finish_error(&state, audit, started, &reject).await
         }
+    }
+}
+
+/// `ActionOutput` 的退出状态分类。
+///
+/// 只有明确的 `Some(0)` 算成功；非零退出码与被信号终止（`None`）都是失败。
+/// 其他 `ControlResult` 变体不是命令执行结果，按成功处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandExit {
+    Success,
+    NonZero(i32),
+    /// 进程被信号杀死：`ExitStatus::code()` 为 None。
+    Signaled,
+}
+
+fn command_exit(result: &ControlResult) -> CommandExit {
+    match result {
+        ControlResult::ActionOutput { exit_code, .. } => match exit_code {
+            Some(0) => CommandExit::Success,
+            Some(code) => CommandExit::NonZero(*code),
+            None => CommandExit::Signaled,
+        },
+        _ => CommandExit::Success,
     }
 }
 
@@ -1831,6 +1864,25 @@ mod tests {
         assert_eq!(output["type"], "action_output");
         assert_eq!(output["stdout"], "ok");
         assert_eq!(output["exit_code"], 0);
+    }
+
+    /// 只有明确的 0 算成功；非 0 与被信号终止（None）都算失败。
+    #[test]
+    fn command_exit_only_zero_counts_as_success() {
+        let output = |exit_code| ControlResult::ActionOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code,
+        };
+        assert_eq!(command_exit(&output(Some(0))), CommandExit::Success);
+        assert_eq!(command_exit(&output(Some(5))), CommandExit::NonZero(5));
+        assert_eq!(command_exit(&output(Some(-1))), CommandExit::NonZero(-1));
+        assert_eq!(command_exit(&output(None)), CommandExit::Signaled);
+        // 列表类结果没有退出码，不参与命令成败判定。
+        assert_eq!(
+            command_exit(&ControlResult::Processes(Vec::new())),
+            CommandExit::Success
+        );
     }
 
     #[test]
