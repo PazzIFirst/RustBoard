@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth";
 
 export default function Layout({ children }: { children: ReactNode }) {
@@ -29,13 +29,35 @@ export default function Layout({ children }: { children: ReactNode }) {
           </Link>
           <span className="brand-sub">监控面板</span>
         </div>
-        <button type="button" className="button ghost" onClick={handleLogout} disabled={busy}>
-          {busy ? "正在退出…" : "退出登录"}
-        </button>
+        <div className="topbar-actions">
+          <nav className="topnav" aria-label="主导航">
+            <NavLink
+              to="/"
+              end
+              className={({ isActive }) => `topnav-link ${isActive ? "active" : ""}`}
+            >
+              概览
+            </NavLink>
+            <NavLink
+              to="/audit"
+              className={({ isActive }) => `topnav-link ${isActive ? "active" : ""}`}
+            >
+              审计
+            </NavLink>
+          </nav>
+          <button
+            type="button"
+            className="button ghost"
+            onClick={handleLogout}
+            disabled={busy}
+          >
+            {busy ? "正在退出…" : "退出登录"}
+          </button>
+        </div>
       </header>
       <main className="content">{children}</main>
       <footer className="footer">
-        <span>RustBoard · M2 面板</span>
+        <span>RustBoard · M3 控制面</span>
         <span className="muted">hub 管理 API 由面板服务端代理，浏览器不接触管理 token</span>
       </footer>
     </div>

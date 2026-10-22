@@ -50,3 +50,123 @@ export interface SeriesResponse {
 }
 
 export type SystemInfo = Record<string, unknown>;
+
+/** M3 控制面：hub / agent 共同开启的能力。 */
+export type ControlCapability = "systemd" | "docker" | "process" | "logs";
+
+export interface ControlStatus {
+  control_enabled: boolean;
+  online: boolean;
+  /** agent 实际上报的能力。 */
+  capabilities: string[];
+  /** hub 配置中开启的能力。 */
+  hub_capabilities: string[];
+}
+
+export interface SystemdUnit {
+  unit: string;
+  load: string;
+  active: string;
+  sub: string;
+  description: string;
+}
+
+export interface DockerContainer {
+  id: string;
+  name: string;
+  image: string;
+  state: string;
+  status: string;
+}
+
+export interface ProcessInfo {
+  pid: number;
+  name: string;
+  uid: number;
+  /** 常驻内存，统一换算成字节。 */
+  rss: number;
+  /** 线协议原始字段（KiB）；hub 若直接透传 agent 字段会出现。 */
+  rss_kb?: number;
+  cmdline: string;
+}
+
+export interface LogSourceInfo {
+  id: string;
+  name: string;
+  kind: string;
+  /** file 为绝对路径，journal 为 unit 名。 */
+  target: string;
+  /** 可选：hub 能提供大小时展示；当前线协议没有该字段。 */
+  size?: number;
+}
+
+export interface ControlActionOutput {
+  stdout: string;
+  stderr: string;
+  exit_code: number | null;
+}
+
+export interface ControlLogLines {
+  source: string;
+  lines: string[];
+  truncated: boolean;
+  size_bytes: number;
+}
+
+/** hub 控制 API 的 `result` 判别联合；字段以方案 §3.1 / §3.3 为准。 */
+export type ControlResult =
+  | { type: "systemd_units"; units: SystemdUnit[] }
+  | { type: "docker_containers"; containers: DockerContainer[] }
+  | { type: "processes"; processes: ProcessInfo[] }
+  | { type: "log_sources"; sources: LogSourceInfo[] }
+  | ({ type: "log_lines" } & ControlLogLines)
+  | ({ type: "action_output" } & ControlActionOutput);
+
+export interface ControlError {
+  code: string;
+  message: string;
+}
+
+/** `api.control()` 已把 HTTP 错误归一化成 `ok:false`，页面无需再解析响应体。 */
+export type ControlResponse =
+  | { ok: true; result: ControlResult }
+  | { ok: false; error: ControlError; status?: number };
+
+export interface ControlRequestPayload {
+  capability: ControlCapability;
+  action: string;
+  target?: string;
+  pid?: number;
+  name?: string;
+  signal?: "term" | "kill";
+  source?: string;
+  lines?: number;
+  confirm?: boolean;
+}
+
+export interface AuditEntry {
+  id: number;
+  /** 服务端时间戳；兼容秒与毫秒，展示层统一归一化。 */
+  ts: number;
+  actor: string;
+  agent_id: string;
+  capability: string;
+  action: string;
+  target: string;
+  result: string;
+  error_code: string;
+  error_message: string;
+  duration_ms: number;
+}
+
+export interface AuditResponse {
+  entries: AuditEntry[];
+  next_before_id?: number;
+}
+
+export interface AuditQuery {
+  limit?: number;
+  beforeId?: number;
+  agentId?: string;
+  capability?: string;
+}

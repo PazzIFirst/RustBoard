@@ -264,6 +264,12 @@ export default function AgentDetailPage() {
           <p className="muted">节点详情 · CPU / 内存 / 磁盘 / 网络</p>
         </div>
         <div className="button-row">
+          <Link
+            className="button"
+            to={`/agents/${encodeURIComponent(agentId)}/control`}
+          >
+            控制台
+          </Link>
           <button
             type="button"
             className="button"
