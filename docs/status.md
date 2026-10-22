@@ -130,7 +130,7 @@
 - 证书轮换失败场景（CA 不配套、缺 ca.key、坏 ca.crt、空 SAN、缺 server.crt）均有 e2e 断言；
 - 测试：`cargo test --workspace` 379 通过；`cargo audit` 0 漏洞；
   `security.sh` 9/9、`cert-rotation.sh` 103/103、`panel.sh` 159/159、
-  `hardening.sh` 29/29、`control.sh` 99/99、web `pnpm test` 45/45。
+  `hardening.sh` 29/29、`control.sh` 99/99、web `pnpm test` 46/46。
 
 ## 已知限制
 
