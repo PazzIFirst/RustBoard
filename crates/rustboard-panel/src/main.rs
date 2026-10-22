@@ -94,6 +94,13 @@ enum Cmd {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// 重置管理员密码（不传 --password 时自动生成 20 位随机密码）。
+    ResetPassword {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        password: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -112,6 +119,7 @@ fn main() -> Result<()> {
             force,
         } => init(config, listen, hub, hub_token, password, static_dir, force),
         Cmd::Ports { config } => ports(config),
+        Cmd::ResetPassword { config, password } => reset_password(config, password),
         Cmd::Run {
             config,
             listen,
@@ -129,10 +137,15 @@ struct AppState {
     static_files: Option<web::StaticFiles>,
     password_hash: String,
     argon2_slots: Arc<Semaphore>,
+    /// 只有这些来源的 `X-Forwarded-*` 才被采信。
+    trusted_proxies: Vec<auth::IpNet>,
 }
 
 impl AppState {
     fn new(cfg: PanelConfig, static_files: Option<web::StaticFiles>) -> Result<Self> {
+        cfg.validate().context("面板配置校验失败")?;
+        let trusted_proxies = auth::parse_trusted_proxies(&cfg.trusted_proxies)
+            .context("解析 trusted_proxies 失败")?;
         if !auth::validate_phc(&cfg.admin_password_hash) {
             bail!(
                 "admin_password_hash 为空或不是有效的 Argon2id PHC 串；请运行 `rustboard-panel init` 生成配置"
@@ -156,6 +169,7 @@ impl AppState {
             static_files,
             password_hash,
             argon2_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ARGON2)),
+            trusted_proxies,
         })
     }
 }
@@ -187,6 +201,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/logout", post(api_logout))
         .route("/api/session", get(api_session))
         .merge(protected)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            same_origin_guard,
+        ))
         .layer(middleware::from_fn(force_json_content_type));
 
     Router::new()
@@ -231,6 +249,53 @@ async fn force_json_content_type(request: Request, next: Next) -> Response {
     response
 }
 
+/// 变更类 API 的同源校验（KI-07）。
+///
+/// 只拦截 `/api/*` 的 POST/PUT/PATCH/DELETE：
+/// - 带 `Origin`：必须与 `Host` 同源，或与 `public_origin` 完全一致；
+/// - 不带 `Origin`：要求 `Content-Type: application/json`，挡住跨站表单；
+/// - 否则 403 `origin_mismatch`。
+async fn same_origin_guard(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().clone();
+    if !matches!(
+        method,
+        axum::http::Method::POST
+            | axum::http::Method::PUT
+            | axum::http::Method::PATCH
+            | axum::http::Method::DELETE
+    ) {
+        return next.run(request).await;
+    }
+
+    let headers = request.headers();
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let allowed = match origin.as_deref() {
+        Some(origin) => auth::same_origin(origin, host.as_deref(), &state.cfg.public_origin),
+        None => is_json_content_type(headers),
+    };
+    if allowed {
+        next.run(request).await
+    } else {
+        tracing::warn!(
+            method = %method,
+            origin = origin.as_deref().unwrap_or("<none>"),
+            "拒绝跨源或非 JSON 的变更请求"
+        );
+        proxy::json_error(StatusCode::FORBIDDEN, "origin_mismatch")
+    }
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -261,7 +326,7 @@ async fn api_login(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let ip = peer.ip();
+    let ip = auth::client_ip(peer.ip(), &headers, &state.trusted_proxies);
 
     if !is_json_content_type(&headers) {
         tracing::warn!(ip = %ip, "面板登录缺少 application/json");
@@ -314,7 +379,12 @@ async fn api_login(
             state.limiter.record_success(ip);
             attempt_guard.disarm();
             let token = state.sessions.create(now);
-            let secure = auth::is_secure_request(&headers);
+            let secure = auth::secure_cookie(
+                state.cfg.cookie_secure,
+                peer.ip(),
+                &headers,
+                &state.trusted_proxies,
+            );
             tracing::info!(ip = %ip, "面板登录成功");
             let mut response = Response::new(Body::empty());
             *response.status_mut() = StatusCode::NO_CONTENT;
@@ -343,7 +413,11 @@ async fn api_login(
     }
 }
 
-async fn api_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn api_logout(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
     // 登出也是变更类请求；要求 JSON 可挡住跨站表单（配合 SameSite=Lax）。
     if !is_json_content_type(&headers) {
         return proxy::json_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "json_required");
@@ -351,7 +425,12 @@ async fn api_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     if let Some(token) = auth::token_from_headers(&headers) {
         state.sessions.revoke(&token);
     }
-    let secure = auth::is_secure_request(&headers);
+    let secure = auth::secure_cookie(
+        state.cfg.cookie_secure,
+        peer.ip(),
+        &headers,
+        &state.trusted_proxies,
+    );
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::NO_CONTENT;
     if let Ok(value) = HeaderValue::from_str(&auth::clear_cookie(secure)) {
@@ -810,6 +889,43 @@ fn init(
         }
     );
     println!("面板密码（仅显示一次，请立即保存）: {password}");
+    println!(
+        "以后修改密码: rustboard-panel reset-password --config {}",
+        path.display()
+    );
+    Ok(())
+}
+
+/// 重置管理员密码：写回新的 Argon2id PHC 哈希（配置保持 0600）。
+///
+/// 未传 `--password` 时生成 20 位随机密码；stdout 只展示一次。
+/// 已登录会话保存在内存里，不会因改密自动失效（重启面板后清空）。
+fn reset_password(config: Option<PathBuf>, password: Option<String>) -> Result<()> {
+    let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_PANEL_CONFIG));
+    if !path.exists() {
+        bail!(
+            "配置文件不存在: {}（先运行 `rustboard-panel init`）",
+            path.display()
+        );
+    }
+    let mut cfg =
+        PanelConfig::load(&path).with_context(|| format!("读取配置失败: {}", path.display()))?;
+    let password = match password {
+        Some(password) if password.trim().is_empty() => bail!("密码不能为空"),
+        Some(password) => {
+            if password.len() < MIN_PASSWORD_LEN {
+                eprintln!("警告: 密码短于 {MIN_PASSWORD_LEN} 个字符，建议使用自动生成的随机密码");
+            }
+            password
+        }
+        None => generate_password(),
+    };
+    cfg.admin_password_hash =
+        auth::hash_password(&password).context("生成 Argon2id 密码哈希失败")?;
+    cfg.save(&path)?;
+    println!("已重置面板密码（仅显示一次，请立即保存）: {password}");
+    println!("配置文件: {}（0600）", path.display());
+    println!("提示: 已有登录会话仍然有效；重启面板后全部失效。");
     Ok(())
 }
 
@@ -1023,6 +1139,8 @@ mod tests {
             hub_url: "http://127.0.0.1:1".to_string(),
             token: "test-hub-token".to_string(),
             admin_password_hash: hash,
+            // 该地址用于验证 Auto 策略下“可信反代 + XFP=https → Secure”。
+            trusted_proxies: vec!["203.0.113.9".to_string()],
             ..PanelConfig::default()
         };
         let files = web::StaticFiles::from_root(&site.dir).unwrap();
@@ -1199,7 +1317,7 @@ mod tests {
             Some("203.0.113.30:50000"),
         )
         .await;
-        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(
             headers.get(header::CONTENT_TYPE).unwrap(),
             "application/json"
@@ -1211,7 +1329,7 @@ mod tests {
             "/api/logout",
             &[("cookie", &cookie), ("content-type", "application/json")],
             Body::from("{}"),
-            None,
+            Some("203.0.113.30:50000"),
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
@@ -1327,7 +1445,7 @@ mod tests {
     #[tokio::test]
     async fn login_requires_json_and_body_limit() {
         let (state, _site) = test_state();
-        let (status, _, _) = call(
+        let (status, _, body) = call(
             &state,
             Method::POST,
             "/api/login",
@@ -1336,7 +1454,8 @@ mod tests {
             Some("203.0.113.10:50000"),
         )
         .await;
-        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(String::from_utf8_lossy(&body).contains("origin_mismatch"));
 
         let (status, _, _) = call(
             &state,
@@ -1347,7 +1466,7 @@ mod tests {
             Some("203.0.113.10:50000"),
         )
         .await;
-        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(status, StatusCode::FORBIDDEN);
 
         let huge = format!("{{\"password\":\"{}\"}}", "a".repeat(MAX_JSON_BODY + 16));
         let (status, _, _) = call(
@@ -1473,7 +1592,7 @@ mod tests {
             "/api/logout",
             &[("cookie", &cookie), ("content-type", "application/json")],
             Body::from("{}"),
-            None,
+            Some("203.0.113.30:50000"),
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
@@ -1511,7 +1630,12 @@ mod tests {
             &state,
             Method::PUT,
             "/api/agents/hub-self/settings",
-            &[("cookie", &cookie), ("content-type", "text/plain")],
+            &[
+                ("cookie", &cookie),
+                ("content-type", "text/plain"),
+                ("host", "panel.test:8080"),
+                ("origin", "http://panel.test:8080"),
+            ],
             Body::from(r#"{"sample_interval_ms":1000}"#),
             None,
         )
@@ -1708,5 +1832,111 @@ mod tests {
         assert_eq!(password.len(), GENERATED_PASSWORD_LEN);
         assert!(password.chars().all(|c| c.is_ascii_alphanumeric()));
         assert_ne!(password, generate_password());
+    }
+
+    #[tokio::test]
+    async fn same_origin_guard_blocks_cross_site_writes() {
+        let (state, _site) = test_state();
+        let (status, _, body) = call(
+            &state,
+            Method::POST,
+            "/api/logout",
+            &[
+                ("content-type", "application/json"),
+                ("host", "panel.test:8080"),
+                ("origin", "https://evil.example"),
+            ],
+            Body::from("{}"),
+            Some("203.0.113.30:50000"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(String::from_utf8_lossy(&body).contains("origin_mismatch"));
+
+        let (status, _, _) = call(
+            &state,
+            Method::POST,
+            "/api/logout",
+            &[
+                ("content-type", "application/json"),
+                ("host", "panel.test:8080"),
+                ("origin", "http://panel.test:8080"),
+            ],
+            Body::from("{}"),
+            Some("203.0.113.30:50000"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // 无 Origin 时必须 JSON；表单/text 一律 403。
+        let (status, _, _) = call(
+            &state,
+            Method::POST,
+            "/api/logout",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            Body::from("{}"),
+            Some("203.0.113.30:50000"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // GET 请求不受 Origin 中间件影响。
+        let (status, _, _) = call(
+            &state,
+            Method::GET,
+            "/api/session",
+            &[("origin", "https://evil.example")],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn app_state_rejects_invalid_trusted_proxy() {
+        let hash = auth::hash_password("panel-test-password").unwrap();
+        let cfg = PanelConfig {
+            hub_url: "http://127.0.0.1:1".to_string(),
+            token: "test-hub-token".to_string(),
+            admin_password_hash: hash,
+            trusted_proxies: vec!["10.0.0.0/99".to_string()],
+            ..PanelConfig::default()
+        };
+        let err = match AppState::new(cfg, None) {
+            Ok(_) => panic!("非法 trusted_proxies 必须拒绝启动"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("trusted_proxies"));
+    }
+
+    #[test]
+    fn reset_password_updates_hash_and_keeps_config_private() {
+        let site = TempSite::new();
+        let path = site.dir.join("panel.toml");
+        let old = "old-password";
+        let cfg = PanelConfig {
+            hub_url: "http://127.0.0.1:1".to_string(),
+            token: "test-hub-token".to_string(),
+            admin_password_hash: auth::hash_password(old).unwrap(),
+            trusted_proxies: vec!["127.0.0.1".to_string()],
+            ..PanelConfig::default()
+        };
+        cfg.save(&path).unwrap();
+
+        reset_password(Some(path.clone()), Some("new-password".to_string())).unwrap();
+        let saved = PanelConfig::load(&path).unwrap();
+        assert!(auth::verify_password(
+            "new-password",
+            &saved.admin_password_hash
+        ));
+        assert!(!auth::verify_password(old, &saved.admin_password_hash));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }

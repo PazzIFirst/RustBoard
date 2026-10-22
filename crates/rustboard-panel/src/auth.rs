@@ -6,16 +6,17 @@
 //! 3. 内存表都有上限与过期清理，避免登录接口被打爆内存。
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Mutex, MutexGuard};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
 use axum::http::{header, HeaderMap};
 use rand::RngCore;
+use rustboard_common::config::CookieSecure;
 
 /// 会话 Cookie 名。
 pub const SESSION_COOKIE: &str = "rb_session";
@@ -346,6 +347,238 @@ pub fn is_secure_request(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// XFF 最多接受的跳数。超过时视为不可信，回退直连地址。
+pub const MAX_XFF_HOPS: usize = 8;
+
+/// 可信反代条目：精确 IP 或 CIDR（IPv4 / IPv6）。
+///
+/// 输入不必是网络地址；`contains` 按前缀逐位比较，因此 `10.1.2.3/8` 与
+/// `10.0.0.0/8` 等价。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpNet {
+    network: IpAddr,
+    prefix: u8,
+}
+
+impl IpNet {
+    pub fn parse(input: &str) -> Result<Self> {
+        let input = input.trim();
+        let (addr, prefix) = match input.rsplit_once('/') {
+            Some((addr, prefix)) => (addr.trim(), Some(prefix.trim())),
+            None => (input, None),
+        };
+        let network: IpAddr = addr
+            .parse()
+            .with_context(|| format!("不是合法 IP 地址: {addr:?}"))?;
+        let max_prefix = if network.is_ipv4() { 32 } else { 128 };
+        let prefix = match prefix {
+            Some(prefix) => prefix
+                .parse::<u8>()
+                .with_context(|| format!("前缀长度不是 0–{max_prefix} 的整数: {prefix:?}"))?,
+            None => max_prefix,
+        };
+        if prefix > max_prefix {
+            return Err(anyhow!(
+                "前缀长度 {prefix} 超过 {} 的上限 {max_prefix}",
+                if network.is_ipv4() { "IPv4" } else { "IPv6" }
+            ));
+        }
+        Ok(Self { network, prefix })
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.network, ip) {
+            (IpAddr::V4(network), IpAddr::V4(ip)) => {
+                masked_v4(network, self.prefix) == masked_v4(ip, self.prefix)
+            }
+            (IpAddr::V6(network), IpAddr::V6(ip)) => {
+                masked_v6(network, self.prefix) == masked_v6(ip, self.prefix)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn masked_v4(ip: Ipv4Addr, prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::from(ip) & (u32::MAX << (32 - u32::from(prefix)))
+    }
+}
+
+fn masked_v6(ip: Ipv6Addr, prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::from(ip) & (u128::MAX << (128 - u32::from(prefix)))
+    }
+}
+
+/// 解析配置里的可信反代列表；任何一条非法都让面板启动失败。
+pub fn parse_trusted_proxies(entries: &[String]) -> Result<Vec<IpNet>> {
+    entries
+        .iter()
+        .map(|entry| {
+            IpNet::parse(entry).with_context(|| format!("trusted_proxies 含非法条目 {entry:?}"))
+        })
+        .collect()
+}
+
+/// 计算请求的真实客户端地址。
+///
+/// - 直连对端不在 `trusted_proxies` 中时，完全忽略 `X-Forwarded-For`，避免任意
+///   客户端伪造来源绕过登录限速；
+/// - 对端可信时，从 XFF 最右侧开始向左跳过可信代理，返回第一个非可信地址；
+/// - XFF 非法、为空、超过 [`MAX_XFF_HOPS`] 跳或全部都是可信地址时，回退直连地址。
+pub fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> IpAddr {
+    if !trusted.iter().any(|net| net.contains(peer)) {
+        return peer;
+    }
+    let mut hops: Vec<&str> = Vec::new();
+    for value in headers.get_all("x-forwarded-for").iter() {
+        let Ok(value) = value.to_str() else {
+            return peer;
+        };
+        for part in value.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if hops.len() >= MAX_XFF_HOPS {
+                return peer;
+            }
+            hops.push(part);
+        }
+    }
+    for raw in hops.iter().rev() {
+        let Ok(ip) = raw.parse::<IpAddr>() else {
+            return peer;
+        };
+        if trusted.iter().any(|net| net.contains(ip)) {
+            continue;
+        }
+        return ip;
+    }
+    peer
+}
+
+/// 按配置决定会话 Cookie 是否加 `Secure`。
+///
+/// `Auto` 只信任「直连对端是可信反代 + 该反代声明 XFP=https」，
+/// 不能被直连客户端伪造的 `X-Forwarded-Proto` 影响。
+pub fn secure_cookie(
+    mode: CookieSecure,
+    peer: IpAddr,
+    headers: &HeaderMap,
+    trusted: &[IpNet],
+) -> bool {
+    match mode {
+        CookieSecure::Always => true,
+        CookieSecure::Never => false,
+        CookieSecure::Auto => {
+            trusted.iter().any(|net| net.contains(peer)) && is_secure_request(headers)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OriginScheme {
+    Http,
+    Https,
+}
+
+impl OriginScheme {
+    fn default_port(self) -> u16 {
+        match self {
+            Self::Http => 80,
+            Self::Https => 443,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OriginUrl {
+    scheme: OriginScheme,
+    host: String,
+    port: u16,
+}
+
+/// 解析 `scheme://host[:port]`；只用于 Origin / public_origin，不接受路径。
+fn parse_origin_url(raw: &str) -> Option<OriginUrl> {
+    let raw = raw.trim();
+    let (scheme, rest) = if let Some(rest) = raw.strip_prefix("https://") {
+        (OriginScheme::Https, rest)
+    } else {
+        let rest = raw.strip_prefix("http://")?;
+        (OriginScheme::Http, rest)
+    };
+    if rest.is_empty()
+        || rest.contains('/')
+        || rest.contains('?')
+        || rest.contains('#')
+        || rest.contains('@')
+    {
+        return None;
+    }
+    let (host, port) = parse_host_port(rest, scheme.default_port())?;
+    Some(OriginUrl { scheme, host, port })
+}
+
+/// 解析 `host[:port]`，支持 IPv6 方括号；无端口时用 `default_port`。
+fn parse_host_port(value: &str, default_port: u16) -> Option<(String, u16)> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        let port = match after {
+            "" => default_port,
+            _ => after.strip_prefix(':')?.parse::<u16>().ok()?,
+        };
+        (host.to_string(), port)
+    } else {
+        match value.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => {
+                (host.to_string(), port.parse::<u16>().ok()?)
+            }
+            // 无端口，或未加方括号的 IPv6（Host/Origin 不允许这种写法）。
+            _ if value.contains(':') => return None,
+            _ => (value.to_string(), default_port),
+        }
+    };
+    if host.is_empty() || host.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some((
+        host.to_ascii_lowercase().trim_end_matches('.').to_string(),
+        port,
+    ))
+}
+
+/// 校验变更类请求的 `Origin` 是否与当前站点同源。
+///
+/// 同源判定：`Origin` 与 `Host` 的 host+port 一致，或与显式配置的 `public_origin`
+/// 的 scheme+host+port 完全一致。默认端口按 scheme 归一化（http→80，https→443），
+/// 因此 `Origin: https://panel.example.com` 能匹配 `Host: panel.example.com`。
+pub fn same_origin(origin: &str, host: Option<&str>, public_origin: &str) -> bool {
+    let Some(origin) = parse_origin_url(origin) else {
+        return false;
+    };
+    let public = public_origin.trim();
+    if !public.is_empty() && parse_origin_url(public).as_ref() == Some(&origin) {
+        return true;
+    }
+    let Some(host) = host.filter(|host| !host.trim().is_empty()) else {
+        return false;
+    };
+    let Some((host, port)) = parse_host_port(host, origin.scheme.default_port()) else {
+        return false;
+    };
+    host == origin.host && port == origin.port
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,5 +830,197 @@ mod tests {
         headers.insert("x-forwarded-proto", "http".parse().unwrap());
         assert!(!is_secure_request(&headers));
         assert!(!is_secure_request(&HeaderMap::new()));
+    }
+
+    fn net(value: &str) -> IpNet {
+        IpNet::parse(value).unwrap()
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(*name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn ipnet_parses_exact_and_cidr_v4_v6() {
+        assert!(net("10.1.2.3").contains("10.1.2.3".parse().unwrap()));
+        assert!(!net("10.1.2.3").contains("10.1.2.4".parse().unwrap()));
+        assert!(net("10.0.0.0/8").contains("10.255.1.2".parse().unwrap()));
+        assert!(!net("10.0.0.0/8").contains("11.0.0.1".parse().unwrap()));
+        assert!(net("192.168.1.7/24").contains("192.168.1.99".parse().unwrap()));
+        assert!(net("0.0.0.0/0").contains("203.0.113.9".parse().unwrap()));
+        assert!(net("2001:db8::/32").contains("2001:db8::1".parse().unwrap()));
+        assert!(net("2001:db8::1/128").contains("2001:db8::1".parse().unwrap()));
+        assert!(!net("2001:db8::1/128").contains("2001:db8::2".parse().unwrap()));
+        assert!(!net("10.0.0.0/8").contains("2001:db8::1".parse().unwrap()));
+        assert!(!net("::/0").contains("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipnet_rejects_invalid_prefix_and_address() {
+        assert!(IpNet::parse("10.0.0.0/33").is_err());
+        assert!(IpNet::parse("2001:db8::/129").is_err());
+        assert!(IpNet::parse("10.0.0.0/abc").is_err());
+        assert!(IpNet::parse("not-an-ip").is_err());
+        assert!(IpNet::parse("10.0.0.0/").is_err());
+        assert!(IpNet::parse("").is_err());
+    }
+
+    #[test]
+    fn trusted_proxies_parse_list_and_name_bad_entry() {
+        let list =
+            parse_trusted_proxies(&["127.0.0.1".into(), "10.0.0.0/8".into(), "::1/128".into()])
+                .unwrap();
+        assert_eq!(list.len(), 3);
+        let err = parse_trusted_proxies(&["10.0.0.0/99".into()]).unwrap_err();
+        assert!(format!("{err:#}").contains("trusted_proxies"));
+        assert!(format!("{err:#}").contains("10.0.0.0/99"));
+    }
+
+    #[test]
+    fn client_ip_ignores_xff_from_untrusted_peer() {
+        let peer: IpAddr = "198.51.100.1".parse().unwrap();
+        let h = headers(&[("x-forwarded-for", "203.0.113.7")]);
+        let trusted = vec![net("10.0.0.0/8")];
+        assert_eq!(client_ip(peer, &h, &trusted), peer);
+    }
+
+    #[test]
+    fn client_ip_skips_trusted_proxies_from_the_right() {
+        let trusted = vec![net("10.0.0.0/8")];
+        let peer: IpAddr = "10.0.0.2".parse().unwrap();
+        let h = headers(&[("x-forwarded-for", "203.0.113.7, 10.0.0.3")]);
+        assert_eq!(
+            client_ip(peer, &h, &trusted),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+
+        // 右侧继续出现可信地址时继续跳过。
+        let h = headers(&[("x-forwarded-for", "203.0.113.7, 10.0.0.3, 10.0.0.2")]);
+        assert_eq!(
+            client_ip(peer, &h, &trusted),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn client_ip_falls_back_on_invalid_or_too_many_hops() {
+        let trusted = vec![net("10.0.0.0/8")];
+        let peer: IpAddr = "10.0.0.2".parse().unwrap();
+        for value in [
+            "not-an-ip",
+            "203.0.113.7, garbage",
+            "1.1.1.1,2.2.2.2,3.3.3.3,4.4.4.4,5.5.5.5,6.6.6.6,7.7.7.7,8.8.8.8,9.9.9.9",
+            "",
+        ] {
+            let h = headers(&[("x-forwarded-for", value)]);
+            assert_eq!(client_ip(peer, &h, &trusted), peer, "value={value:?}");
+        }
+    }
+
+    #[test]
+    fn client_ip_returns_peer_when_all_hops_are_trusted() {
+        let trusted = vec![net("10.0.0.0/8")];
+        let peer: IpAddr = "10.0.0.2".parse().unwrap();
+        let h = headers(&[("x-forwarded-for", "10.0.0.3")]);
+        assert_eq!(client_ip(peer, &h, &trusted), peer);
+        assert_eq!(client_ip(peer, &HeaderMap::new(), &trusted), peer);
+    }
+
+    #[test]
+    fn secure_cookie_respects_policy_and_trust() {
+        let trusted = vec![net("10.0.0.0/8")];
+        let trusted_peer: IpAddr = "10.0.0.2".parse().unwrap();
+        let plain_peer: IpAddr = "198.51.100.1".parse().unwrap();
+        let https = headers(&[("x-forwarded-proto", "https")]);
+
+        assert!(secure_cookie(
+            CookieSecure::Auto,
+            trusted_peer,
+            &https,
+            &trusted
+        ));
+        assert!(!secure_cookie(
+            CookieSecure::Auto,
+            plain_peer,
+            &https,
+            &trusted
+        ));
+        assert!(!secure_cookie(
+            CookieSecure::Auto,
+            trusted_peer,
+            &headers(&[("x-forwarded-proto", "http")]),
+            &trusted
+        ));
+        assert!(secure_cookie(
+            CookieSecure::Always,
+            plain_peer,
+            &HeaderMap::new(),
+            &trusted
+        ));
+        assert!(!secure_cookie(
+            CookieSecure::Never,
+            trusted_peer,
+            &https,
+            &trusted
+        ));
+    }
+
+    #[test]
+    fn same_origin_matches_host_and_public_origin() {
+        assert!(same_origin(
+            "https://panel.example.com",
+            Some("panel.example.com"),
+            ""
+        ));
+        assert!(same_origin(
+            "https://panel.example.com:443",
+            Some("panel.example.com"),
+            ""
+        ));
+        assert!(same_origin(
+            "http://panel.example.com:80",
+            Some("panel.example.com:80"),
+            ""
+        ));
+        assert!(!same_origin(
+            "https://panel.example.com:8443",
+            Some("panel.example.com"),
+            ""
+        ));
+        assert!(!same_origin(
+            "https://evil.example.com",
+            Some("panel.example.com"),
+            ""
+        ));
+        assert!(!same_origin(
+            "https://sub.panel.example.com",
+            Some("panel.example.com"),
+            ""
+        ));
+        assert!(same_origin(
+            "https://panel.example.com",
+            Some("internal:8080"),
+            "https://panel.example.com"
+        ));
+        assert!(same_origin(
+            "https://panel.example.com:8443",
+            Some("internal:8080"),
+            "https://panel.example.com:8443"
+        ));
+        assert!(!same_origin(
+            "https://panel.example.com/evil",
+            Some("panel.example.com"),
+            ""
+        ));
+        assert!(!same_origin("null", Some("panel.example.com"), ""));
+        assert!(same_origin(
+            "https://[2001:db8::1]",
+            Some("[2001:db8::1]"),
+            ""
+        ));
     }
 }
