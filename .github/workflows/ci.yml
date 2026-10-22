@@ -98,6 +98,9 @@ jobs:
       - name: 面板回归
         run: bash tests/e2e/panel.sh
 
+      - name: 安全硬化回归
+        run: bash tests/e2e/hardening.sh
+
   web:
     name: web / tsc / build
     runs-on: ubuntu-latest
