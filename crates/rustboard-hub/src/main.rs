@@ -1334,16 +1334,19 @@ async fn system_info(State(state): State<AppState>) -> Result<Json<SystemInfo>, 
     .await
     .map_err(ApiError::from)??;
 
+    let now = now_ms();
     let live = state
         .live_cert
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
+        .clone()
+        // days_left 在请求时重算：live 只在证书变化时更新，不能冻结加载时的天数。
+        .with_current_days_left(now);
 
     Ok(Json(SystemInfo {
         version: VERSION,
         protocol: PROTOCOL_VERSION,
-        server_time: now_ms(),
+        server_time: now,
         cert: CertInfo {
             fingerprint: live.fingerprint.clone(),
             not_after: live.not_after,
@@ -4912,12 +4915,14 @@ mod tests {
             ..HubConfig::default()
         };
         let mut state = hub_state_with(cfg);
+        // live 摘要里的 days_left 故意写错：请求时必须按 not_after 重算。
+        let not_after = now_ms() / 1_000 + 2 * 86_400;
         let live = CertStatus {
             fingerprint: "live-fingerprint".to_string(),
-            not_after: 111,
-            days_left: 5,
+            not_after,
+            days_left: 999,
         };
-        state.live_cert = Arc::new(RwLock::new(live.clone()));
+        state.live_cert = Arc::new(RwLock::new(live));
         let router = admin_router(state);
 
         let (status, _, body) =
@@ -4926,12 +4931,15 @@ mod tests {
         let body = json_body(&body);
         assert_eq!(body["protocol"], PROTOCOL_VERSION);
         assert_eq!(body["cert"]["live"]["fingerprint"], "live-fingerprint");
-        assert_eq!(body["cert"]["live"]["not_after"], 111);
-        assert_eq!(body["cert"]["live"]["days_left"], 5);
+        assert_eq!(body["cert"]["live"]["not_after"], not_after);
+        assert_eq!(
+            body["cert"]["live"]["days_left"], 2,
+            "days_left 必须按请求时间重算，不能冻结加载时的值"
+        );
         // 顶层旧字段必须等于 live，避免旧面板显示成磁盘上的未生效证书。
         assert_eq!(body["cert"]["fingerprint"], "live-fingerprint");
-        assert_eq!(body["cert"]["not_after"], 111);
-        assert_eq!(body["cert"]["days_left"], 5);
+        assert_eq!(body["cert"]["not_after"], not_after);
+        assert_eq!(body["cert"]["days_left"], 2);
 
         let disk_pem =
             std::fs::read_to_string(tls::cert_dir(&dir).join(tls::SERVER_CERT_FILE)).unwrap();

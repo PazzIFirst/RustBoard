@@ -79,6 +79,17 @@ impl CertStatus {
             days_left: tls::days_left(pem, now_ms())?,
         })
     }
+
+    /// 按当前时间重新计算剩余天数。
+    ///
+    /// `live` 只在证书变化时更新，若直接复用加载时的 `days_left`，长期运行的
+    /// hub 会在 `/api/v1/system` 里展示过期天数（甚至证书已过期仍显示旧值）。
+    pub fn with_current_days_left(mut self, now_ms: i64) -> Self {
+        const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+        let remaining_ms = self.not_after.saturating_mul(1_000).saturating_sub(now_ms);
+        self.days_left = (remaining_ms + DAY_MS - 1).div_euclid(DAY_MS);
+        self
+    }
 }
 
 /// 读取磁盘上服务端证书的公开摘要。
