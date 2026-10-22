@@ -11,8 +11,11 @@
 设计文档见 [docs/requirements.md](docs/requirements.md)，实现进度见 [docs/status.md](docs/status.md)。
 协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **当前状态：M1 已闭环（含 TLS / mTLS / enrollment）。** 面板、控制面、告警尚未实现。
+> **当前状态：M1 已闭环（协议 v2 + TLS / mTLS / enrollment）。** 面板、控制面、告警尚未实现。
 > 证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。
+>
+> 线协议版本为 **2**：hub 与 agent 必须严格一致。版本不符时 hub 回 `bad_protocol`
+> 且不下发 Welcome，agent 打印明确错误并以非零码退出，不会进入重连循环。
 
 ## 安全模型
 
@@ -22,6 +25,8 @@
    发送 CSR，hub 用私有 CA 签发 90 天客户端证书，并下发该机器独有的 `agent_secret`。
 4. 之后所有连接走 mTLS；Hello 里再带 `agent_secret` 做身份绑定（防止已纳管机器互相冒名）。
 5. `rustboard-hub agent revoke --id <id>` 立即清除 secret 并拒绝该 agent 重连。
+6. 敏感文件从创建起就是 0600（配置 / 私钥 / secret），证书为 0644；
+   agent 接入层限制并发连接数、10s TLS 握手超时、10s 请求头读取超时与 15s 写超时。
 
 ## 快速开始（开发环境）
 
@@ -110,12 +115,19 @@ docs/                 需求确认稿、实现进度
 ## 测试
 
 ```bash
-cargo test --workspace
+cargo test --workspace --locked
+bash tests/e2e/security.sh
 ```
 
-覆盖：CPU/内存解析、计数器重置容纳、磁盘缓冲落盘与恢复、
-SQLite 批次幂等、一次性 token 单次使用与过期、吊销清除 secret、
-指纹解析、CA 签发 CSR。
+单元与集成测试覆盖：CPU/内存解析、计数器重置容纳、磁盘缓冲落盘与恢复、
+SQLite 批次精确幂等与 v1/v2→v3 迁移、跨 epoch 乱序与 48h 判重清理、
+一次性 token 单次使用与过期、吊销清除 secret / 状态不被覆盖、
+指纹解析、CA 签发 CSR、原子写符号链接防护、配置权限收紧、协议版本门禁。
+
+`tests/e2e/security.sh` 会自行构建并用临时目录启动 hub/agent（随机五位数端口），
+实际覆盖 9 项：正常采集与 online/offline、无客户端证书 Hello 被拒、
+证书 CN≠agent_id、跨 agent 伪造 Batch、多连接下线的状态语义、
+协议版本 1 收到 `bad_protocol`、吊销后 ≤3s 断开且重连被拒。
 
 ## License
 
