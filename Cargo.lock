@@ -1261,6 +1261,7 @@ dependencies = [
  "anyhow",
  "clap",
  "futures-util",
+ "libc",
  "rmp-serde",
  "rustboard-common",
  "rustboard-core",

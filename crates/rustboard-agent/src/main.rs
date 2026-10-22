@@ -3,6 +3,8 @@
 //! 首次启动：用一次性 token 完成 enrollment，拿到客户端证书与独立 secret；
 //! 之后：采集 -> 本地磁盘缓冲 -> 按序上报，收到 Ack 才丢弃。
 
+mod control;
+
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use rustboard_common::config::AgentConfig;
+use rustboard_common::control::ControlResponse;
 use rustboard_common::fsutil;
 use rustboard_common::model::SampleBatch;
 use rustboard_common::tls;
@@ -36,6 +39,9 @@ type WsError = tokio_tungstenite::tungstenite::Error;
 
 /// 等待 hub 下发 `CertRenewed` 的上限；超时只影响续签，不影响会话。
 const CERT_RENEW_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 等待某个批次 `Ack` 的上限；控制请求的处理不占用这个预算。
+const ACK_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 采样间隔分片休眠的单片上限。每片之后重新读取共享间隔，
 /// 保证 Welcome 下发新值后最多 1s 就会被采集循环看到。
@@ -239,6 +245,12 @@ fn main() -> Result<()> {
 fn run(cfg: AgentConfig) -> Result<()> {
     // config.rs 只校验下界；这里补上限，避免本地配置本身就忙采/形同停采。
     validate_sample_interval_config(cfg.sample_interval_ms)?;
+    // M3：文件日志来源的父目录 / 符号链接必须在启动前检查，坏配置直接拒绝启动。
+    control::validate_io(&cfg.control).context("控制面日志来源 I/O 校验失败")?;
+    let capabilities = control::enabled_capabilities(&cfg.control);
+    if !capabilities.is_empty() {
+        tracing::info!(?capabilities, "控制面已启用");
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -622,7 +634,7 @@ where
         boot_id: boot.to_string(),
         epoch,
         secret,
-        capabilities: Vec::new(),
+        capabilities: control::enabled_capabilities(&cfg.control),
     });
     sink.send(Message::Binary(hello.encode()?)).await?;
 
@@ -869,6 +881,125 @@ where
     Ok(())
 }
 
+/// 会话中收到的一帧，或无法解码的帧。
+///
+/// `Frame` 较大，但该枚举只在会话接收循环里短暂存在，boxing 带来的额外分配
+/// 没有收益，因此允许变体大小不一致。
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+enum IncomingFrame {
+    Frame(Frame),
+    /// 无法解码；若外层是 `ControlRequest` 且 id 可读，则带上 id 用于回 `unsupported`。
+    Bad {
+        control_id: Option<u64>,
+    },
+}
+
+/// 把一条 Binary 消息分类。坏帧不产生 Err：会话必须继续，不能因为一帧脏数据断开采集。
+fn classify_incoming(bytes: &[u8]) -> IncomingFrame {
+    match Frame::decode(bytes) {
+        Ok(frame) => IncomingFrame::Frame(frame),
+        Err(_) => {
+            let control_id = control::probe_control_request_id(bytes);
+            tracing::warn!("收到无法解码的帧，已忽略（会话继续）");
+            IncomingFrame::Bad { control_id }
+        }
+    }
+}
+
+/// 会话主循环使用的接收：跳过 WebSocket 控制帧，坏帧也返回给调用方。
+async fn recv_incoming<S>(stream: &mut S) -> Result<IncomingFrame>
+where
+    S: Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    loop {
+        match stream.next().await {
+            Some(Ok(Message::Binary(bytes))) => return Ok(classify_incoming(bytes.as_ref())),
+            Some(Ok(Message::Close(_))) | None => bail!("连接已关闭"),
+            Some(Ok(_)) => continue,
+            Some(Err(err)) => return Err(err.into()),
+        }
+    }
+}
+
+/// 处理与 ACK 无关的帧：心跳、控制请求、坏帧。
+///
+/// 控制请求只 spawn 任务并把应答交给 channel，不在这里等待执行结果，
+/// 因此不会阻塞采集 / ACK。
+async fn handle_side_frame<Si>(
+    sink: &mut Si,
+    dispatcher: &control::ControlDispatcher,
+    incoming: IncomingFrame,
+) -> Result<()>
+where
+    Si: Sink<Message, Error = WsError> + Unpin,
+{
+    match incoming {
+        IncomingFrame::Frame(Frame::Ping { ts }) => {
+            sink.send(Message::Binary(Frame::Pong { ts }.encode()?))
+                .await?;
+        }
+        IncomingFrame::Frame(Frame::ControlRequest(request)) => {
+            // ControlRequest 的 Debug 只输出 id 与变体名，参数不会进日志。
+            tracing::debug!(?request, "收到控制请求");
+            dispatcher.spawn(request);
+        }
+        IncomingFrame::Frame(_) => {}
+        IncomingFrame::Bad {
+            control_id: Some(id),
+        } => {
+            dispatcher.unsupported(id, "不支持或无法解析的控制操作");
+        }
+        IncomingFrame::Bad { control_id: None } => {}
+    }
+    Ok(())
+}
+
+/// 等待某个批次的 Ack；期间照常回 Ping、分发控制请求、发送控制应答。
+///
+/// 用固定 deadline 而不是整段 timeout 包住循环：控制任务在独立任务里跑，
+/// 这里只负责把已完成的应答写回 sink，不额外占用 Ack 预算。
+async fn wait_for_ack<Si, St>(
+    sink: &mut Si,
+    stream: &mut St,
+    control_rx: &mut tokio::sync::mpsc::Receiver<ControlResponse>,
+    dispatcher: &control::ControlDispatcher,
+    batch_epoch: u64,
+    batch_seq: u64,
+) -> Result<()>
+where
+    Si: Sink<Message, Error = WsError> + Unpin,
+    St: Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + ACK_TIMEOUT;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+            bail!("等待 Ack 超时 (epoch={batch_epoch}, seq={batch_seq})");
+        };
+        tokio::select! {
+            received = tokio::time::timeout(remaining, recv_incoming(stream)) => {
+                match received {
+                    Err(_) => bail!("等待 Ack 超时 (epoch={batch_epoch}, seq={batch_seq})"),
+                    Ok(Err(err)) => return Err(err),
+                    // ACK 必须对应同一 epoch，否则不能推进缓冲读指针。
+                    Ok(Ok(IncomingFrame::Frame(Frame::Ack { epoch, seq })))
+                        if epoch == batch_epoch && seq >= batch_seq => return Ok(()),
+                    Ok(Ok(IncomingFrame::Frame(Frame::Problem { code, message }))) => {
+                        if problem_is_fatal(&code) {
+                            return Err(fatal_rejection_error(&format!("{code}: {message}")));
+                        }
+                        bail!("hub 报错: {code} {message}");
+                    }
+                    Ok(Ok(incoming)) => handle_side_frame(sink, dispatcher, incoming).await?,
+                }
+            }
+            Some(response) = control_rx.recv() => {
+                sink.send(Message::Binary(Frame::ControlResponse(response).encode()?)).await?;
+            }
+        }
+    }
+}
+
 async fn session(
     ws: WsStream,
     ctx: &SessionContext<'_>,
@@ -914,6 +1045,9 @@ async fn session(
     // 第一次 tick 立即完成：握手后已经检查过一次，跳过这次立即检查。
     cert_timer.tick().await;
     let mut last_cert_attempt_ms = 0i64;
+    // M3：控制请求由独立任务执行，应答经 channel 回到会话循环统一写 sink。
+    // 这样控制执行不会阻塞采集、ACK 或心跳；sink 仍然只有一个写者。
+    let (dispatcher, mut control_rx) = control::ControlDispatcher::new(ctx.cfg.control.clone());
 
     loop {
         let batches = {
@@ -955,13 +1089,19 @@ async fn session(
                     }
                 }
                 _ = notify.notified() => {}
+                Some(response) = control_rx.recv() => {
+                    sink.send(Message::Binary(Frame::ControlResponse(response).encode()?)).await?;
+                }
                 incoming = stream.next() => {
                     match incoming {
                         Some(Ok(Message::Close(_))) | None => bail!("hub 关闭了连接"),
                         Some(Ok(Message::Binary(bytes))) => {
-                            if let Ok(Frame::Ping { ts }) = Frame::decode(bytes.as_ref()) {
-                                sink.send(Message::Binary(Frame::Pong { ts }.encode()?)).await?;
-                            }
+                            handle_side_frame(
+                                &mut sink,
+                                &dispatcher,
+                                classify_incoming(bytes.as_ref()),
+                            )
+                            .await?;
                         }
                         Some(Ok(_)) => {}
                         Some(Err(err)) => return Err(err.into()),
@@ -975,37 +1115,16 @@ async fn session(
             let (batch_epoch, batch_seq) = (batch.epoch, batch.seq);
             sink.send(Message::Binary(Frame::Batch(batch).encode()?))
                 .await?;
-
-            let acked = tokio::time::timeout(Duration::from_secs(20), async {
-                loop {
-                    match recv_frame(&mut stream).await? {
-                        // ACK 必须对应同一 epoch，否则不能推进缓冲读指针。
-                        Frame::Ack { epoch, seq } if epoch == batch_epoch && seq >= batch_seq => {
-                            return Ok(())
-                        }
-                        Frame::Problem { code, message } => {
-                            if problem_is_fatal(&code) {
-                                return Err(fatal_rejection_error(&format!("{code}: {message}")));
-                            }
-                            bail!("hub 报错: {code} {message}")
-                        }
-                        Frame::Ping { ts } => {
-                            sink.send(Message::Binary(Frame::Pong { ts }.encode()?))
-                                .await?;
-                        }
-                        _ => {}
-                    }
-                }
-            })
-            .await;
-
-            match acked {
-                Ok(Ok(())) => {
-                    buffer.lock().await.ack(batch_epoch, batch_seq)?;
-                }
-                Ok(Err(err)) => return Err(err),
-                Err(_) => bail!("等待 Ack 超时 (epoch={batch_epoch}, seq={batch_seq})"),
-            }
+            wait_for_ack(
+                &mut sink,
+                &mut stream,
+                &mut control_rx,
+                &dispatcher,
+                batch_epoch,
+                batch_seq,
+            )
+            .await?;
+            buffer.lock().await.ack(batch_epoch, batch_seq)?;
         }
     }
 }
@@ -1659,5 +1778,45 @@ mod tests {
             cert_check_period(default_cfg.cert_check_interval_hours),
             Duration::from_secs(6 * 3_600)
         );
+    }
+
+    /// M3：控制帧正常解码；未知操作 / 坏帧不返回 Err（会话必须继续），
+    /// 未知操作还能从帧里取出 id 以回 `unsupported`。
+    #[test]
+    fn m3_control_frames_never_close_the_session_on_decode_errors() {
+        use rustboard_common::control::{ControlOp, ControlRequest};
+
+        let valid = Frame::ControlRequest(ControlRequest::new(7, ControlOp::ProcessList))
+            .encode()
+            .unwrap();
+        match classify_incoming(&valid) {
+            IncomingFrame::Frame(Frame::ControlRequest(request)) => {
+                assert_eq!(request.id, 7);
+                assert_eq!(request.op, ControlOp::ProcessList);
+            }
+            other => panic!("控制请求分类错误: {other:?}"),
+        }
+
+        // 未知操作变体：Frame 整体解码失败，但 id 仍可取出。
+        let unknown = serde_json::json!({
+            "ControlRequest": {"id": 9, "op": {"SomethingNew": {"x": 1}}}
+        });
+        let bytes = rmp_serde::to_vec(&unknown).unwrap();
+        assert!(Frame::decode(&bytes).is_err());
+        match classify_incoming(&bytes) {
+            IncomingFrame::Bad {
+                control_id: Some(9),
+            } => {}
+            IncomingFrame::Bad { control_id } => {
+                panic!("应取出控制请求 id，实际: {control_id:?}")
+            }
+            IncomingFrame::Frame(frame) => panic!("未知操作不应解码成功: {frame:?}"),
+        }
+
+        // 与业务无关的坏帧同样不返回 Err，只忽略。
+        match classify_incoming(&[0xc1]) {
+            IncomingFrame::Bad { control_id: None } => {}
+            _ => panic!("坏帧应被分类为 Bad 且不携带 control id"),
+        }
     }
 }

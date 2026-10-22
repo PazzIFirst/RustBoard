@@ -85,6 +85,13 @@ pub enum Frame {
     CertRenewed {
         cert_pem: String,
     },
+    /// hub → agent：一次控制面请求（只在已认证会话、能力协商之后发送）。
+    ///
+    /// 旧 agent 收到未知变体会走「解码失败、跳过」分支，不会因此断开会话；
+    /// 旧 hub 永远不会发送这一帧，因此协议版本保持 v2 不变。
+    ControlRequest(crate::control::ControlRequest),
+    /// agent → hub：控制面请求的应答。
+    ControlResponse(crate::control::ControlResponse),
     Problem {
         code: String,
         message: String,
@@ -105,6 +112,8 @@ impl Frame {
             Frame::Pong { .. } => "Pong",
             Frame::RenewCert { .. } => "RenewCert",
             Frame::CertRenewed { .. } => "CertRenewed",
+            Frame::ControlRequest(_) => "ControlRequest",
+            Frame::ControlResponse(_) => "ControlResponse",
             Frame::Problem { .. } => "Problem",
         }
     }
@@ -242,5 +251,201 @@ mod tests {
                 assert!(!text.contains(leaked), "Debug 泄露了 {leaked}: {text}");
             }
         }
+    }
+
+    fn control_ops() -> Vec<crate::control::ControlOp> {
+        use crate::control::{ControlOp, DockerAction, KillSignal, SystemdAction};
+        vec![
+            ControlOp::SystemdList,
+            ControlOp::SystemdAction {
+                unit: "nginx.service".to_string(),
+                action: SystemdAction::Restart,
+            },
+            ControlOp::DockerList,
+            ControlOp::DockerAction {
+                container: "web-1".to_string(),
+                action: DockerAction::Stop,
+            },
+            ControlOp::ProcessList,
+            ControlOp::ProcessKill {
+                pid: 4242,
+                name: "nginx".to_string(),
+                signal: KillSignal::Term,
+            },
+            ControlOp::LogList,
+            ControlOp::LogTail {
+                source: "nginx-error".to_string(),
+                lines: 200,
+            },
+        ]
+    }
+
+    /// M3：每一种控制操作都必须能完整往返；协议版本保持 2。
+    #[test]
+    fn m3_control_request_roundtrip_all_ops() {
+        assert_eq!(crate::PROTOCOL_VERSION, 2);
+        for (id, op) in control_ops().into_iter().enumerate() {
+            let frame = Frame::ControlRequest(crate::control::ControlRequest {
+                id: id as u64,
+                op: op.clone(),
+            });
+            let bytes = frame.encode().unwrap();
+            let decoded = Frame::decode(&bytes).unwrap();
+            assert_eq!(decoded.kind(), "ControlRequest");
+            match decoded {
+                Frame::ControlRequest(request) => {
+                    assert_eq!(request.id, id as u64);
+                    assert_eq!(request.op, op);
+                }
+                other => panic!("解码出意外帧: {other:?}"),
+            }
+        }
+    }
+
+    /// M3：成功与错误两类应答都能往返，且 kind() 正确。
+    #[test]
+    fn m3_control_response_roundtrip_and_kind() {
+        use crate::config::LogSourceKind;
+        use crate::control::{
+            ControlError, ControlResponse, ControlResult, DockerContainer, LogSourceInfo,
+            ProcessInfo, SystemdUnit,
+        };
+
+        let responses = vec![
+            ControlResponse::success(
+                1,
+                ControlResult::SystemdUnits(vec![SystemdUnit {
+                    unit: "nginx.service".into(),
+                    load: "loaded".into(),
+                    active: "active".into(),
+                    sub: "running".into(),
+                    description: "Nginx".into(),
+                }]),
+            ),
+            ControlResponse::success(
+                2,
+                ControlResult::DockerContainers(vec![DockerContainer {
+                    name: "web-1".into(),
+                    image: "nginx:latest".into(),
+                    state: "running".into(),
+                    status: "Up 1 hour".into(),
+                    id: "abc123".into(),
+                }]),
+            ),
+            ControlResponse::success(
+                3,
+                ControlResult::Processes(vec![ProcessInfo {
+                    pid: 42,
+                    name: "nginx".into(),
+                    cmdline: "nginx -g daemon off;".into(),
+                    uid: 0,
+                    rss_kb: 1024,
+                }]),
+            ),
+            ControlResponse::success(
+                4,
+                ControlResult::LogSources(vec![LogSourceInfo {
+                    id: "nginx-error".into(),
+                    kind: LogSourceKind::File,
+                    target: "/var/log/nginx/error.log".into(),
+                    name: "Nginx 错误日志".into(),
+                }]),
+            ),
+            ControlResponse::success(
+                5,
+                ControlResult::LogLines {
+                    source: "nginx-error".into(),
+                    lines: vec!["line1".into(), "line2".into()],
+                    truncated: true,
+                    size_bytes: 123,
+                },
+            ),
+            ControlResponse::success(
+                6,
+                ControlResult::ActionOutput {
+                    stdout: "ok".into(),
+                    stderr: "warn".into(),
+                    exit_code: Some(0),
+                },
+            ),
+            ControlResponse::failure(7, ControlError::not_whitelisted("unit 不在白名单")),
+        ];
+
+        for response in responses {
+            let frame = Frame::ControlResponse(response.clone());
+            let bytes = frame.encode().unwrap();
+            assert_eq!(Frame::decode(&bytes).unwrap().kind(), "ControlResponse");
+            match Frame::decode(&bytes).unwrap() {
+                Frame::ControlResponse(decoded) => assert_eq!(decoded, response),
+                other => panic!("解码出意外帧: {other:?}"),
+            }
+        }
+    }
+
+    /// M3：控制帧的 Debug 不打印命令输出、日志行、错误详情与目标参数。
+    #[test]
+    fn m3_control_debug_redacts_payloads() {
+        use crate::control::{ControlError, ControlOp, ControlResponse, ControlResult};
+
+        let op = ControlOp::SystemdAction {
+            unit: "secret-unit.service".into(),
+            action: crate::control::SystemdAction::Restart,
+        };
+        let request = crate::control::ControlRequest { id: 11, op };
+        let request_text = format!("{request:?}");
+        assert!(request_text.contains("11"), "应保留 id: {request_text}");
+        assert!(
+            request_text.contains("SystemdAction"),
+            "应保留变体名: {request_text}"
+        );
+        assert!(
+            !request_text.contains("secret-unit.service"),
+            "不得打印目标: {request_text}"
+        );
+        assert_eq!(format!("{:?}", request.op), "SystemdAction");
+
+        let result = ControlResult::ActionOutput {
+            stdout: "stdout-secret".into(),
+            stderr: "stderr-secret".into(),
+            exit_code: Some(1),
+        };
+        let result_text = format!("{result:?}");
+        assert_eq!(result_text, "ActionOutput");
+        assert!(!result_text.contains("secret"));
+
+        let lines = ControlResult::LogLines {
+            source: "secret-source".into(),
+            lines: vec!["log-secret".into()],
+            truncated: false,
+            size_bytes: 1,
+        };
+        let lines_text = format!("{lines:?}");
+        assert_eq!(lines_text, "LogLines");
+        assert!(!lines_text.contains("secret"));
+
+        let error = ControlError::control_failed("stderr-secret-detail");
+        let error_text = format!("{error:?}");
+        assert!(error_text.contains("control_failed"));
+        assert!(!error_text.contains("stderr-secret-detail"));
+
+        let response = ControlResponse {
+            id: 12,
+            result: None,
+            error: Some(error),
+        };
+        let response_text = format!("{response:?}");
+        assert!(response_text.contains("12"));
+        assert!(response_text.contains("control_failed"));
+        assert!(!response_text.contains("stderr-secret-detail"));
+
+        let frame = Frame::ControlRequest(crate::control::ControlRequest {
+            id: 13,
+            op: ControlOp::ProcessKill {
+                pid: 99,
+                name: "process-secret".into(),
+                signal: crate::control::KillSignal::Kill,
+            },
+        });
+        assert_eq!(format!("{frame:?}"), "ControlRequest");
     }
 }

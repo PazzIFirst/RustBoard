@@ -1,6 +1,7 @@
 //! RustBoard 公共库：协议帧、数据模型、配置与工具函数。
 
 pub mod config;
+pub mod control;
 pub mod error;
 pub mod fsutil;
 pub mod model;

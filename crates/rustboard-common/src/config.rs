@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::{Error, Result};
+use crate::{control, Error, Result};
 
 /// agent 端配置。对应 `/etc/rustboard/agent.toml`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +43,9 @@ pub struct AgentConfig {
     pub cert_check_interval_hours: u64,
     /// 单批最多多少条采样点。
     pub max_batch_samples: usize,
+    /// M3 控制面配置；默认全部关闭，旧配置无需新增任何字段。
+    #[serde(default)]
+    pub control: ControlConfig,
 }
 
 impl Default for AgentConfig {
@@ -61,6 +65,7 @@ impl Default for AgentConfig {
             session_max_hours: default_session_max_hours(),
             cert_check_interval_hours: default_cert_check_interval_hours(),
             max_batch_samples: 512,
+            control: ControlConfig::default(),
         }
     }
 }
@@ -111,6 +116,328 @@ impl AgentConfig {
                 "cert_check_interval_hours 必须在 {MIN_CERT_CHECK_INTERVAL_HOURS}–\
                  {MAX_CERT_CHECK_INTERVAL_HOURS} 小时之间，实际 {}",
                 self.cert_check_interval_hours
+            )));
+        }
+        self.control.validate()?;
+        Ok(())
+    }
+}
+
+/// agent 端控制面配置。对应 `agent.toml` 的 `[control]`。
+///
+/// 全部默认关闭：旧配置（完全没有 `[control]`）启动后能力列表为空，
+/// hub 不会下发控制帧，采集链路完全不受影响。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ControlConfig {
+    /// 控制面总开关。单项能力开启时必须同时为 true。
+    pub enabled: bool,
+    /// 是否启用 systemd 管理。
+    pub systemd: bool,
+    /// 是否启用 Docker 管理。
+    pub docker: bool,
+    /// 是否启用进程查看与结束。
+    pub process: bool,
+    /// 是否启用只读日志。
+    pub logs: bool,
+    /// systemd 白名单：精确 unit 或尾部 `*` 前缀，例如 `["nginx*"]`。
+    pub systemd_units: Vec<String>,
+    /// Docker 白名单：精确容器名或尾部 `*` 前缀，例如 `["web-*"]`。
+    pub docker_containers: Vec<String>,
+    /// 日志来源白名单；`logs` 开启时不能为空。
+    pub log_sources: Vec<LogSourceConfig>,
+    /// 单条外部命令的超时（秒），1–60。
+    pub command_timeout_secs: u64,
+    /// 单次日志 tail 允许的最大行数，1–2000。
+    pub max_log_lines: u32,
+    /// systemctl 绝对路径；留空则按固定候选目录探测。
+    pub systemctl_path: String,
+    /// docker 绝对路径；留空则按固定候选目录探测。
+    pub docker_path: String,
+    /// journalctl 绝对路径；留空则按固定候选目录探测。
+    pub journalctl_path: String,
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            systemd: false,
+            docker: false,
+            process: false,
+            logs: false,
+            systemd_units: Vec::new(),
+            docker_containers: Vec::new(),
+            log_sources: Vec::new(),
+            command_timeout_secs: control::DEFAULT_COMMAND_TIMEOUT_SECS,
+            max_log_lines: control::DEFAULT_MAX_LOG_LINES,
+            systemctl_path: String::new(),
+            docker_path: String::new(),
+            journalctl_path: String::new(),
+        }
+    }
+}
+
+impl ControlConfig {
+    /// 配置级校验（纯函数，不做文件 I/O）。
+    ///
+    /// 文件日志的父目录存在性 / 符号链接检查在 agent 启动时由
+    /// `rustboard_agent::control::validate_io` 完成。
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            for (name, enabled) in [
+                ("systemd", self.systemd),
+                ("docker", self.docker),
+                ("process", self.process),
+                ("logs", self.logs),
+            ] {
+                if enabled {
+                    return Err(Error::InvalidConfig(format!(
+                        "control.{name} 已开启但 control.enabled=false；请先开启总开关"
+                    )));
+                }
+            }
+        }
+
+        // 能力开启但白名单为空会让“看起来开了、实际什么都操作不了”，启动即拒绝。
+        // process 是天然全量列表，不需要白名单。
+        if self.systemd && self.systemd_units.is_empty() {
+            return Err(Error::InvalidConfig(
+                "control.systemd 已开启但 control.systemd_units 为空".into(),
+            ));
+        }
+        if self.docker && self.docker_containers.is_empty() {
+            return Err(Error::InvalidConfig(
+                "control.docker 已开启但 control.docker_containers 为空".into(),
+            ));
+        }
+        if self.logs && self.log_sources.is_empty() {
+            return Err(Error::InvalidConfig(
+                "control.logs 已开启但 control.log_sources 为空".into(),
+            ));
+        }
+
+        for (index, pattern) in self.systemd_units.iter().enumerate() {
+            control::validate_unit_pattern(pattern).map_err(|err| {
+                Error::InvalidConfig(format!("control.systemd_units[{index}] 非法: {err}"))
+            })?;
+        }
+        for (index, pattern) in self.docker_containers.iter().enumerate() {
+            control::validate_container_pattern(pattern).map_err(|err| {
+                Error::InvalidConfig(format!("control.docker_containers[{index}] 非法: {err}"))
+            })?;
+        }
+
+        let mut seen_ids = HashSet::new();
+        for (index, source) in self.log_sources.iter().enumerate() {
+            control::validate_source_id(&source.id).map_err(|err| {
+                Error::InvalidConfig(format!("control.log_sources[{index}].id 非法: {err}"))
+            })?;
+            if !seen_ids.insert(source.id.as_str()) {
+                return Err(Error::InvalidConfig(format!(
+                    "control.log_sources 中 id 重复: {}",
+                    source.id
+                )));
+            }
+            if !source.name.is_empty() {
+                if source.name.len() > control::MAX_TARGET_LEN {
+                    return Err(Error::InvalidConfig(format!(
+                        "control.log_sources[{index}].name 不能超过 {} 字节",
+                        control::MAX_TARGET_LEN
+                    )));
+                }
+                if source.name.chars().any(char::is_control) {
+                    return Err(Error::InvalidConfig(format!(
+                        "control.log_sources[{index}].name 不能包含控制字符"
+                    )));
+                }
+            }
+            match source.kind {
+                LogSourceKind::File => {
+                    control::validate_log_file_target(&source.target).map_err(|err| {
+                        Error::InvalidConfig(format!(
+                            "control.log_sources[{index}].target 非法: {err}"
+                        ))
+                    })?;
+                }
+                LogSourceKind::Journal => {
+                    control::validate_unit_name(&source.target).map_err(|err| {
+                        Error::InvalidConfig(format!(
+                            "control.log_sources[{index}].target 不是合法 unit: {err}"
+                        ))
+                    })?;
+                    if control::is_forbidden_unit(&source.target) {
+                        return Err(Error::InvalidConfig(format!(
+                            "control.log_sources[{index}].target 是禁止操作的 unit: {}",
+                            source.target
+                        )));
+                    }
+                    if !control::unit_matches_whitelist(&source.target, &self.systemd_units) {
+                        return Err(Error::InvalidConfig(format!(
+                            "journal 日志来源 {} 的 target {} 必须同时出现在 control.systemd_units 白名单中",
+                            source.id, source.target
+                        )));
+                    }
+                }
+            }
+        }
+
+        if !(control::MIN_COMMAND_TIMEOUT_SECS..=control::MAX_COMMAND_TIMEOUT_SECS)
+            .contains(&self.command_timeout_secs)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "control.command_timeout_secs 必须在 {}–{} 之间，实际 {}",
+                control::MIN_COMMAND_TIMEOUT_SECS,
+                control::MAX_COMMAND_TIMEOUT_SECS,
+                self.command_timeout_secs
+            )));
+        }
+        if !(control::MIN_MAX_LOG_LINES..=control::MAX_MAX_LOG_LINES).contains(&self.max_log_lines)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "control.max_log_lines 必须在 {}–{} 之间，实际 {}",
+                control::MIN_MAX_LOG_LINES,
+                control::MAX_MAX_LOG_LINES,
+                self.max_log_lines
+            )));
+        }
+
+        for (name, path) in [
+            ("systemctl_path", &self.systemctl_path),
+            ("docker_path", &self.docker_path),
+            ("journalctl_path", &self.journalctl_path),
+        ] {
+            if path.is_empty() {
+                continue;
+            }
+            if path.contains('\0') {
+                return Err(Error::InvalidConfig(format!("control.{name} 不能包含 NUL")));
+            }
+            if !Path::new(path).is_absolute() {
+                return Err(Error::InvalidConfig(format!(
+                    "control.{name} 必须是绝对路径（留空则按固定候选目录探测）"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// 单个日志来源的配置。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LogSourceConfig {
+    /// 唯一 id，hub 用它在 `LogTail` 中指定来源。
+    pub id: String,
+    pub kind: LogSourceKind,
+    /// file 为绝对路径；journal 为白名单 unit 名。
+    pub target: String,
+    /// 展示名；留空时使用 `id`。
+    pub name: String,
+}
+
+impl Default for LogSourceConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: LogSourceKind::File,
+            target: String::new(),
+            name: String::new(),
+        }
+    }
+}
+
+/// 日志来源类型。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogSourceKind {
+    /// 白名单文件，读取时使用 `openat2` 防路径逃逸。
+    #[default]
+    File,
+    /// journald，通过 `journalctl -u <白名单 unit>` 读取。
+    Journal,
+}
+
+/// hub 端控制面配置。对应 `hub.toml` 的 `[control]`。
+///
+/// 由后续 hub 控制 API 使用；默认全部关闭，新增字段全部有默认值。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HubControlConfig {
+    /// 总开关；任一能力开启时必须为 true。
+    pub enabled: bool,
+    pub systemd: bool,
+    pub docker: bool,
+    pub process: bool,
+    pub logs: bool,
+    /// 等待 agent 控制应答的超时（毫秒），1000–60000。
+    pub request_timeout_ms: u64,
+    /// 每个会话最多同时挂起的控制命令数，1–128。
+    pub max_pending_per_session: usize,
+    /// 单条控制结果允许的最大字节数，1024–1048576。
+    pub max_output_bytes: usize,
+}
+
+impl Default for HubControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            systemd: false,
+            docker: false,
+            process: false,
+            logs: false,
+            request_timeout_ms: control::DEFAULT_REQUEST_TIMEOUT_MS,
+            max_pending_per_session: control::DEFAULT_MAX_PENDING_PER_SESSION,
+            max_output_bytes: control::DEFAULT_MAX_CONTROL_OUTPUT_BYTES,
+        }
+    }
+}
+
+impl HubControlConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            for (name, enabled) in [
+                ("systemd", self.systemd),
+                ("docker", self.docker),
+                ("process", self.process),
+                ("logs", self.logs),
+            ] {
+                if enabled {
+                    return Err(Error::InvalidConfig(format!(
+                        "hub.control.{name} 已开启但 hub.control.enabled=false；请先开启总开关"
+                    )));
+                }
+            }
+        }
+        if !(control::MIN_REQUEST_TIMEOUT_MS..=control::MAX_REQUEST_TIMEOUT_MS)
+            .contains(&self.request_timeout_ms)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "hub.control.request_timeout_ms 必须在 {}–{} 之间，实际 {}",
+                control::MIN_REQUEST_TIMEOUT_MS,
+                control::MAX_REQUEST_TIMEOUT_MS,
+                self.request_timeout_ms
+            )));
+        }
+        if !(control::MIN_MAX_PENDING_PER_SESSION..=control::MAX_MAX_PENDING_PER_SESSION)
+            .contains(&self.max_pending_per_session)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "hub.control.max_pending_per_session 必须在 {}–{} 之间，实际 {}",
+                control::MIN_MAX_PENDING_PER_SESSION,
+                control::MAX_MAX_PENDING_PER_SESSION,
+                self.max_pending_per_session
+            )));
+        }
+        if !(control::MIN_MAX_CONTROL_OUTPUT_BYTES..=control::MAX_MAX_CONTROL_OUTPUT_BYTES)
+            .contains(&self.max_output_bytes)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "hub.control.max_output_bytes 必须在 {}–{} 之间，实际 {}",
+                control::MIN_MAX_CONTROL_OUTPUT_BYTES,
+                control::MAX_MAX_CONTROL_OUTPUT_BYTES,
+                self.max_output_bytes
             )));
         }
         Ok(())
@@ -176,6 +503,9 @@ pub struct HubConfig {
     /// 服务端证书续签检查周期（秒），最小 1。
     #[serde(default = "default_cert_check_interval_secs")]
     pub cert_check_interval_secs: u64,
+    /// M3 控制面配置；默认全部关闭，供 hub 控制 API 使用。
+    #[serde(default)]
+    pub control: HubControlConfig,
 }
 
 /// agent 接入层默认的最大并发连接数。
@@ -231,6 +561,7 @@ impl Default for HubConfig {
             client_cert_validity_days: default_client_cert_validity_days(),
             renew_before_days: default_renew_before_days(),
             cert_check_interval_secs: default_cert_check_interval_secs(),
+            control: HubControlConfig::default(),
         }
     }
 }
@@ -312,6 +643,7 @@ impl HubConfig {
         // 启动/init 必须尽早失败（签发层还会再校验一次，这里给出配置级错误）。
         crate::tls::parse_server_sans(&self.server_names)
             .map_err(|err| Error::InvalidConfig(format!("server_names 非法: {err}")))?;
+        self.control.validate()?;
         Ok(())
     }
 
@@ -914,5 +1246,443 @@ mod tests {
 
         // 空字符串表示未配置，必须合法。
         PanelConfig::default().validate().expect("空配置必须合法");
+    }
+
+    /// 旧配置没有 `[control]`：必须能启动，且能力全部关闭。
+    #[test]
+    fn m3_control_defaults_are_off_and_old_configs_start() {
+        let agent: AgentConfig = toml::from_str("").unwrap();
+        assert!(!agent.control.enabled);
+        assert!(!agent.control.systemd);
+        assert!(!agent.control.docker);
+        assert!(!agent.control.process);
+        assert!(!agent.control.logs);
+        assert!(agent.control.systemd_units.is_empty());
+        assert!(agent.control.docker_containers.is_empty());
+        assert!(agent.control.log_sources.is_empty());
+        assert_eq!(agent.control.command_timeout_secs, 10);
+        assert_eq!(agent.control.max_log_lines, 500);
+        assert!(agent.control.systemctl_path.is_empty());
+        agent.validate().expect("默认 agent 配置必须合法");
+
+        let old: AgentConfig = toml::from_str(
+            "hub_url = \"ws://127.0.0.1:8443/agent/ws\"\nsample_interval_ms = 5000\n",
+        )
+        .unwrap();
+        assert!(!old.control.enabled);
+        old.validate().expect("旧配置缺 control 段也必须能启动");
+
+        let hub: HubConfig = toml::from_str("").unwrap();
+        assert!(!hub.control.enabled);
+        assert_eq!(hub.control.request_timeout_ms, 15_000);
+        assert_eq!(hub.control.max_pending_per_session, 32);
+        assert_eq!(hub.control.max_output_bytes, 262_144);
+        hub.validate().expect("默认 hub 配置必须合法");
+    }
+
+    /// TOML 结构：`[[control.log_sources]]` 能正确解析 kind / target / name。
+    #[test]
+    fn m3_control_toml_parses_log_sources() {
+        let toml_text = r#"
+[control]
+enabled = true
+systemd = true
+logs = true
+systemd_units = ["nginx*"]
+command_timeout_secs = 20
+max_log_lines = 800
+systemctl_path = "/usr/local/bin/systemctl"
+
+[[control.log_sources]]
+id = "nginx-error"
+kind = "file"
+target = "/var/log/nginx/error.log"
+name = "Nginx 错误日志"
+
+[[control.log_sources]]
+id = "nginx-journal"
+kind = "journal"
+target = "nginx.service"
+name = ""
+"#;
+        let agent: AgentConfig = toml::from_str(toml_text).unwrap();
+        assert!(agent.control.enabled);
+        assert!(agent.control.systemd);
+        assert!(!agent.control.docker);
+        assert_eq!(agent.control.command_timeout_secs, 20);
+        assert_eq!(agent.control.max_log_lines, 800);
+        assert_eq!(agent.control.systemctl_path, "/usr/local/bin/systemctl");
+        assert_eq!(agent.control.log_sources.len(), 2);
+        assert_eq!(agent.control.log_sources[0].kind, LogSourceKind::File);
+        assert_eq!(agent.control.log_sources[1].kind, LogSourceKind::Journal);
+        assert_eq!(agent.control.log_sources[1].target, "nginx.service");
+        agent.validate().expect("合法控制面配置必须通过");
+    }
+
+    fn enabled_control() -> ControlConfig {
+        ControlConfig {
+            enabled: true,
+            ..ControlConfig::default()
+        }
+    }
+
+    fn file_source(id: &str, target: &str) -> LogSourceConfig {
+        LogSourceConfig {
+            id: id.to_string(),
+            kind: LogSourceKind::File,
+            target: target.to_string(),
+            name: String::new(),
+        }
+    }
+
+    fn journal_source(id: &str, unit: &str) -> LogSourceConfig {
+        LogSourceConfig {
+            id: id.to_string(),
+            kind: LogSourceKind::Journal,
+            target: unit.to_string(),
+            name: String::new(),
+        }
+    }
+
+    /// 能力开关、白名单、unit / 容器名、日志来源、超时范围都必须校验。
+    #[test]
+    fn m3_agent_control_validation_rejects_unsafe_config() {
+        let cases: Vec<(ControlConfig, &str)> = vec![
+            (
+                ControlConfig {
+                    systemd: true,
+                    ..ControlConfig::default()
+                },
+                "control.enabled=false",
+            ),
+            (
+                ControlConfig {
+                    enabled: true,
+                    systemd: true,
+                    ..ControlConfig::default()
+                },
+                "systemd_units",
+            ),
+            (
+                ControlConfig {
+                    enabled: true,
+                    docker: true,
+                    ..ControlConfig::default()
+                },
+                "docker_containers",
+            ),
+            (
+                ControlConfig {
+                    enabled: true,
+                    logs: true,
+                    ..ControlConfig::default()
+                },
+                "log_sources",
+            ),
+            (
+                ControlConfig {
+                    systemd_units: vec!["sshd".into()],
+                    ..enabled_control()
+                },
+                "禁止",
+            ),
+            (
+                ControlConfig {
+                    systemd_units: vec!["systemd-*".into()],
+                    ..enabled_control()
+                },
+                "禁止",
+            ),
+            (
+                ControlConfig {
+                    systemd_units: vec!["rustboard-*".into()],
+                    ..enabled_control()
+                },
+                "禁止",
+            ),
+            (
+                ControlConfig {
+                    systemd_units: vec!["-nginx".into()],
+                    ..enabled_control()
+                },
+                "白名单",
+            ),
+            (
+                ControlConfig {
+                    systemd_units: vec!["nginx service".into()],
+                    ..enabled_control()
+                },
+                "白名单",
+            ),
+            (
+                ControlConfig {
+                    systemd_units: vec!["*".into()],
+                    ..enabled_control()
+                },
+                "裸 *",
+            ),
+            (
+                ControlConfig {
+                    docker_containers: vec!["web_1!".into()],
+                    ..enabled_control()
+                },
+                "docker_containers",
+            ),
+            (
+                ControlConfig {
+                    docker_containers: vec!["*".into()],
+                    ..enabled_control()
+                },
+                "docker_containers",
+            ),
+            (
+                ControlConfig {
+                    logs: true,
+                    log_sources: vec![
+                        file_source("dup", "/var/log/a.log"),
+                        file_source("dup", "/var/log/b.log"),
+                    ],
+                    ..enabled_control()
+                },
+                "重复",
+            ),
+            (
+                ControlConfig {
+                    logs: true,
+                    log_sources: vec![file_source("a", "var/log/a.log")],
+                    ..enabled_control()
+                },
+                "绝对路径",
+            ),
+            (
+                ControlConfig {
+                    logs: true,
+                    log_sources: vec![file_source("a", "/var/log/../etc/shadow")],
+                    ..enabled_control()
+                },
+                "..",
+            ),
+            (
+                ControlConfig {
+                    logs: true,
+                    systemd_units: vec!["nginx*".into()],
+                    log_sources: vec![journal_source("j", "redis.service")],
+                    ..enabled_control()
+                },
+                "systemd_units",
+            ),
+            (
+                ControlConfig {
+                    logs: true,
+                    log_sources: vec![journal_source("j", "dbus.service")],
+                    ..enabled_control()
+                },
+                "禁止",
+            ),
+            (
+                ControlConfig {
+                    enabled: true,
+                    command_timeout_secs: 0,
+                    ..ControlConfig::default()
+                },
+                "command_timeout_secs",
+            ),
+            (
+                ControlConfig {
+                    enabled: true,
+                    command_timeout_secs: 61,
+                    ..ControlConfig::default()
+                },
+                "command_timeout_secs",
+            ),
+            (
+                ControlConfig {
+                    enabled: true,
+                    max_log_lines: 0,
+                    ..ControlConfig::default()
+                },
+                "max_log_lines",
+            ),
+            (
+                ControlConfig {
+                    enabled: true,
+                    max_log_lines: 2001,
+                    ..ControlConfig::default()
+                },
+                "max_log_lines",
+            ),
+            (
+                ControlConfig {
+                    enabled: true,
+                    systemctl_path: "systemctl".into(),
+                    ..ControlConfig::default()
+                },
+                "systemctl_path",
+            ),
+            (
+                ControlConfig {
+                    enabled: true,
+                    journalctl_path: "/usr/bin/journalctl\0".into(),
+                    ..ControlConfig::default()
+                },
+                "journalctl_path",
+            ),
+        ];
+
+        for (control, needle) in cases {
+            let cfg = AgentConfig {
+                control,
+                ..AgentConfig::default()
+            };
+            let err = cfg
+                .validate()
+                .expect_err("非法控制面配置必须被拒绝")
+                .to_string();
+            assert!(err.contains(needle), "错误信息应包含 {needle}: {err}");
+        }
+    }
+
+    /// process 不需要白名单；其它能力在边界范围内必须合法。
+    #[test]
+    fn m3_agent_control_validation_accepts_safe_boundaries() {
+        let process_only = ControlConfig {
+            enabled: true,
+            process: true,
+            ..ControlConfig::default()
+        };
+        AgentConfig {
+            control: process_only,
+            ..AgentConfig::default()
+        }
+        .validate()
+        .expect("process 能力不需要白名单");
+
+        let full = ControlConfig {
+            enabled: true,
+            systemd: true,
+            docker: true,
+            process: true,
+            logs: true,
+            systemd_units: vec!["nginx*".into(), "redis.service".into()],
+            docker_containers: vec!["web-*".into(), "db".into()],
+            log_sources: vec![
+                file_source("nginx-error", "/var/log/nginx/error.log"),
+                journal_source("redis-journal", "redis.service"),
+            ],
+            command_timeout_secs: control::MIN_COMMAND_TIMEOUT_SECS,
+            max_log_lines: control::MAX_MAX_LOG_LINES,
+            systemctl_path: "/usr/local/bin/systemctl".into(),
+            docker_path: "/usr/local/bin/docker".into(),
+            journalctl_path: "/usr/local/bin/journalctl".into(),
+        };
+        AgentConfig {
+            control: full.clone(),
+            ..AgentConfig::default()
+        }
+        .validate()
+        .expect("完整合法配置必须通过");
+
+        // 另一个边界：60 秒超时 + 1 行。
+        let other_boundary = ControlConfig {
+            command_timeout_secs: control::MAX_COMMAND_TIMEOUT_SECS,
+            max_log_lines: control::MIN_MAX_LOG_LINES,
+            ..full
+        };
+        AgentConfig {
+            control: other_boundary,
+            ..AgentConfig::default()
+        }
+        .validate()
+        .expect("超时上限与行数下限必须合法");
+    }
+
+    /// hub 侧控制面：能力开但总开关关、超时 / 挂起 / 输出上限越界都必须拒绝。
+    #[test]
+    fn m3_hub_control_validation_checks_switches_and_ranges() {
+        let cases: Vec<(HubControlConfig, &str)> = vec![
+            (
+                HubControlConfig {
+                    systemd: true,
+                    ..HubControlConfig::default()
+                },
+                "hub.control.enabled=false",
+            ),
+            (
+                HubControlConfig {
+                    enabled: true,
+                    request_timeout_ms: 999,
+                    ..HubControlConfig::default()
+                },
+                "request_timeout_ms",
+            ),
+            (
+                HubControlConfig {
+                    enabled: true,
+                    request_timeout_ms: 60_001,
+                    ..HubControlConfig::default()
+                },
+                "request_timeout_ms",
+            ),
+            (
+                HubControlConfig {
+                    enabled: true,
+                    max_pending_per_session: 0,
+                    ..HubControlConfig::default()
+                },
+                "max_pending_per_session",
+            ),
+            (
+                HubControlConfig {
+                    enabled: true,
+                    max_pending_per_session: 129,
+                    ..HubControlConfig::default()
+                },
+                "max_pending_per_session",
+            ),
+            (
+                HubControlConfig {
+                    enabled: true,
+                    max_output_bytes: 1023,
+                    ..HubControlConfig::default()
+                },
+                "max_output_bytes",
+            ),
+            (
+                HubControlConfig {
+                    enabled: true,
+                    max_output_bytes: 1_048_577,
+                    ..HubControlConfig::default()
+                },
+                "max_output_bytes",
+            ),
+        ];
+        for (control, needle) in cases {
+            let cfg = HubConfig {
+                control,
+                ..HubConfig::default()
+            };
+            let err = cfg
+                .validate()
+                .expect_err("非法 hub 控制面配置必须被拒绝")
+                .to_string();
+            assert!(err.contains(needle), "错误信息应包含 {needle}: {err}");
+        }
+
+        let boundary = HubControlConfig {
+            enabled: true,
+            systemd: true,
+            docker: true,
+            process: true,
+            logs: true,
+            request_timeout_ms: control::MAX_REQUEST_TIMEOUT_MS,
+            max_pending_per_session: control::MAX_MAX_PENDING_PER_SESSION,
+            max_output_bytes: control::MAX_MAX_CONTROL_OUTPUT_BYTES,
+        };
+        HubConfig {
+            control: boundary,
+            ..HubConfig::default()
+        }
+        .validate()
+        .expect("hub 控制面边界值必须合法");
     }
 }
