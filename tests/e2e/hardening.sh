@@ -771,10 +771,7 @@ fi
 # 9. reset-password：旧密码失效、新密码可用
 # ---------------------------------------------------------------------------
 echo
-echo "==> 9/9 panel reset-password"
-kill -9 "$PANEL_PID" 2>/dev/null || true
-wait "$PANEL_PID" 2>/dev/null || true
-
+echo "==> 9/9 panel reset-password（运行中热加载，不重启面板）"
 if "$PANEL_BIN" reset-password --config "$PANEL_CFG" --password "$NEW_PASSWORD" \
     > "$PANEL_RESET_LOG" 2>&1; then
   pass "9.1" "reset-password 命令成功"
@@ -782,11 +779,10 @@ else
   fail "9.1" "reset-password 命令失败（日志: $PANEL_RESET_LOG）"
 fi
 
-RUST_LOG=rustboard_panel=info "$PANEL_BIN" run --config "$PANEL_CFG" >> "$PANEL_LOG" 2>&1 &
-PANEL_PID=$!
-PIDS+=("$PANEL_PID")
-if wait_http_200 "$PANEL_URL/healthz" 20; then
-  pass "9.2" "重置密码后面板重新就绪"
+# 实现保证 ≤1s 热加载；等待 2s 后再验证，同时确认进程没有退出。
+sleep 2
+if wait_http_200 "$PANEL_URL/healthz" 10; then
+  pass "9.2" "重置密码后运行中的面板仍健康"
 else
   fail "9.2" "重置密码后面板未就绪（最后状态: $LAST_STATUS）"
 fi
