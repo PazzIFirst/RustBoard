@@ -1,14 +1,23 @@
-//! SQLite 实现。所有写入走单连接 + 事务，WAL 模式。
+//! SQLite 实现。所有写入走单连接 + 事务，读路径走只读连接池，WAL 模式。
 
+use std::ops::Deref;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 
 use super::{AgentSeriesRow, IngestOutcome, QueryTooLarge, RejectReason, Storage};
+
+/// 默认只读连接池大小（与 `HubConfig::read_pool_size` 默认值一致）。
+pub const DEFAULT_READ_POOL_SIZE: usize = 4;
+/// 只读连接池下限 / 上限：连接数就是文件句柄，必须有硬上限。
+pub const MIN_READ_POOL_SIZE: usize = 1;
+pub const MAX_READ_POOL_SIZE: usize = 16;
 
 /// `PRAGMA user_version`：v1 = `ingest_state` 以 agent_id 为主键，
 /// v2 = `(agent_id, epoch)`，v3 = 新增 `ingest_batches` 精确判重，
@@ -114,48 +123,183 @@ CREATE TABLE IF NOT EXISTS agent_settings (
 "#;
 
 pub struct SqliteStorage {
-    conn: Mutex<Connection>,
+    /// 唯一写连接：迁移、事务、写入都走它，保证 `(agent_id, epoch, seq)` 判重原子。
+    writer: Mutex<Connection>,
+    /// 只读连接池：每条连接独立加锁，长查询不会阻塞写入。
+    readers: Vec<Mutex<Connection>>,
+    /// 轮询取读连接的下标，保证并发请求分摊到不同连接。
+    next_reader: AtomicUsize,
     /// 成功插入批次的累计计数，用于低频触发 `ingest_batches` 清理。
     inserted_batches: AtomicU64,
 }
 
+/// 读路径的连接 guard：正常情况下取自只读池；池为空时回退到写连接。
+///
+/// 回退只发生在「只读连接一条都打不开」的启动降级路径，保证 hub 仍可对外服务；
+/// 此时读会被写事务串行化，但不会数据错乱。
+enum ReadGuard<'a> {
+    Pool(MutexGuard<'a, Connection>),
+    Writer(MutexGuard<'a, Connection>),
+}
+
+impl Deref for ReadGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Pool(guard) => guard,
+            Self::Writer(guard) => guard,
+        }
+    }
+}
+
+/// 从互斥锁取连接；锁中毒说明持有者 panic 过，但连接本身仍然可用。
+fn lock_conn(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
+    match conn.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 impl SqliteStorage {
+    /// 打开数据库；只读连接池使用默认大小 4。
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_readers(path, DEFAULT_READ_POOL_SIZE)
+    }
+
+    /// 打开数据库并指定只读连接池大小（自动夹到 1–16）。
+    ///
+    /// 打开顺序：写连接建库 / 迁移 → 读连接打开同一路径并设置 `query_only=ON`。
+    /// 任一读连接打开失败时停止扩容并告警，已有读连接继续服务；
+    /// 一条都没有时读路径回退到写连接，**不允许启动失败**。
+    pub fn open_with_readers(path: &Path, read_pool_size: usize) -> Result<Self> {
+        let pool_size = read_pool_size.clamp(MIN_READ_POOL_SIZE, MAX_READ_POOL_SIZE);
+        if pool_size != read_pool_size {
+            tracing::warn!(
+                requested = read_pool_size,
+                actual = pool_size,
+                "read_pool_size 超出允许范围，已夹到合法区间"
+            );
+        }
         if let Some(parent) = path.parent() {
             rustboard_common::fsutil::ensure_dir(parent, 0o700)
                 .with_context(|| format!("创建数据目录失败: {}", parent.display()))?;
         }
-        let conn = Connection::open(path)
+        let writer = Connection::open(path)
             .with_context(|| format!("打开数据库失败: {}", path.display()))?;
-        Self::init(conn)
-    }
+        let writer = init_writer(writer)?;
 
-    pub fn open_in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
-    }
+        #[cfg(test)]
+        let force_reader_failure = {
+            let mut slot = FAIL_READER_OPEN_FOR
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.as_deref() == Some(path) {
+                slot.take();
+                true
+            } else {
+                // 其他测试的注入路径与本库无关，不能顺手消费掉。
+                false
+            }
+        };
+        #[cfg(not(test))]
+        let force_reader_failure = false;
 
-    fn init(mut conn: Connection) -> Result<Self> {
-        // busy_timeout 必须最先设置：两个进程并发首次打开旧库时，
-        // 切 WAL 会拿写锁，没有超时就会直接报 database is locked。
-        conn.pragma_update(None, "busy_timeout", 5_000)?;
-        // journal_mode 会返回一行，必须用 query_row 消费掉
-        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
-        tracing::debug!(mode, "sqlite journal mode");
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(SCHEMA)?;
-        migrate(&mut conn)?;
+        let mut readers = Vec::with_capacity(pool_size);
+        for index in 0..pool_size {
+            if force_reader_failure {
+                tracing::warn!(index, "测试注入：只读连接打开失败");
+                break;
+            }
+            match open_reader(path) {
+                Ok(conn) => readers.push(Mutex::new(conn)),
+                Err(err) => {
+                    // 读池是吞吐优化，不是正确性前提：失败时降级而不是拒绝启动。
+                    tracing::warn!(
+                        index,
+                        pool_size,
+                        error = %err,
+                        "只读连接打开失败，停止扩容并使用现有读连接"
+                    );
+                    break;
+                }
+            }
+        }
+        if readers.is_empty() {
+            tracing::warn!(
+                path = %path.display(),
+                "只读连接池为空，读路径回退到写连接（读会被写事务串行化）"
+            );
+        }
         Ok(Self {
-            conn: Mutex::new(conn),
+            writer: Mutex::new(writer),
+            readers,
+            next_reader: AtomicUsize::new(0),
             inserted_batches: AtomicU64::new(0),
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        match self.conn.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
+    /// 内存库：所有连接共享同一个 `file:...mode=memory&cache=shared` URI。
+    ///
+    /// 普通 `:memory:` 每条连接都是一个独立数据库，读池会看不到写入的数据；
+    /// 共享缓存 URI 才能让写连接与只读池看到同一份数据。
+    pub fn open_in_memory() -> Result<Self> {
+        static MEMORY_DB_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = MEMORY_DB_SEQ.fetch_add(1, Ordering::Relaxed);
+        let uri = format!(
+            "file:rustboard-{}-{seq}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let writer = Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .with_context(|| format!("打开内存数据库失败: {uri}"))?;
+        let writer = init_writer(writer)?;
+
+        let mut readers = Vec::with_capacity(DEFAULT_READ_POOL_SIZE);
+        for index in 0..DEFAULT_READ_POOL_SIZE {
+            match open_reader_with_flags(
+                &uri,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+            ) {
+                Ok(conn) => readers.push(Mutex::new(conn)),
+                Err(err) => {
+                    tracing::warn!(index, error = %err, "内存库只读连接打开失败，停止扩容");
+                    break;
+                }
+            }
         }
+        if readers.is_empty() {
+            tracing::warn!("内存库只读连接池为空，读路径回退到写连接");
+        }
+        Ok(Self {
+            writer: Mutex::new(writer),
+            readers,
+            next_reader: AtomicUsize::new(0),
+            inserted_batches: AtomicU64::new(0),
+        })
+    }
+
+    fn lock_write(&self) -> MutexGuard<'_, Connection> {
+        lock_conn(&self.writer)
+    }
+
+    /// 轮询取一条只读连接；池为空时回退到写连接。
+    fn lock_read(&self) -> ReadGuard<'_> {
+        if self.readers.is_empty() {
+            return ReadGuard::Writer(lock_conn(&self.writer));
+        }
+        let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        ReadGuard::Pool(lock_conn(&self.readers[index]))
+    }
+
+    /// 实际打开的只读连接数（测试与排障用）。
+    #[cfg(test)]
+    fn read_pool_len(&self) -> usize {
+        self.readers.len()
     }
 
     /// `latest_samples` 的实现：SQL 侧最多取 `limit` 行。
@@ -170,7 +314,7 @@ impl SqliteStorage {
         limit: usize,
     ) -> Result<Vec<AgentSeriesRow>> {
         debug_assert!(limit > 0, "latest_samples 的行数上限必须大于 0");
-        let conn = self.lock();
+        let conn = self.lock_read();
 
         let mut sql =
             String::from("SELECT agent_id, metric, labels, ts, value FROM samples WHERE ts >= ?");
@@ -231,6 +375,49 @@ impl SqliteStorage {
         }
         Ok(latest.into_values().collect())
     }
+}
+
+/// 测试注入：让指定路径的只读连接全部打开失败，覆盖「读池降级到写连接」分支。
+#[cfg(test)]
+static FAIL_READER_OPEN_FOR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// 初始化写连接：设置 PRAGMA、建表并迁移。
+fn init_writer(mut conn: Connection) -> Result<Connection> {
+    // busy_timeout 必须最先设置：两个进程并发首次打开旧库时，
+    // 切 WAL 会拿写锁，没有超时就会直接报 database is locked。
+    conn.pragma_update(None, "busy_timeout", 5_000)?;
+    // journal_mode 会返回一行，必须用 query_row 消费掉
+    let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+    tracing::debug!(mode, "sqlite journal mode");
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.execute_batch(SCHEMA)?;
+    migrate(&mut conn)?;
+    Ok(conn)
+}
+
+/// 打开一条文件库只读连接。
+fn open_reader(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("打开只读数据库连接失败: {}", path.display()))?;
+    prepare_reader(conn)
+}
+
+/// 打开一条指定 flags 的只读连接（内存共享缓存 URI 用）。
+fn open_reader_with_flags(uri: &str, flags: OpenFlags) -> Result<Connection> {
+    let conn = Connection::open_with_flags(uri, flags)
+        .with_context(|| format!("打开只读数据库连接失败: {uri}"))?;
+    prepare_reader(conn)
+}
+
+/// 只读连接的统一设置：busy_timeout + `query_only=ON`。
+///
+/// `query_only` 是 SQLite 层的写保护，防止读路径误写；真正的隔离靠「独立连接 +
+/// 独立锁」，而不是这把 PRAGMA。
+fn prepare_reader(conn: Connection) -> Result<Connection> {
+    conn.pragma_update(None, "busy_timeout", 5_000)?;
+    conn.pragma_update(None, "query_only", "ON")?;
+    Ok(conn)
 }
 
 /// 把 `ingest_state` 从 v1（agent_id 主键）迁移到 v2（agent_id + epoch 主键），
@@ -302,7 +489,7 @@ fn prune_ingest_batches(tx: &Transaction<'_>, now: i64) -> Result<()> {
 
 impl Storage for SqliteStorage {
     fn upsert_agent(&self, agent: &AgentRecord) -> Result<()> {
-        self.lock().execute(
+        self.lock_write().execute(
             "INSERT INTO agents
                 (agent_id, name, hostname, os, arch, version, boot_id, status, last_seen_at, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
@@ -336,7 +523,7 @@ impl Storage for SqliteStorage {
     }
 
     fn mark_seen(&self, agent_id: &str, ts: i64) -> Result<()> {
-        self.lock().execute(
+        self.lock_write().execute(
             // M1：活跃会话的 mark_seen 不能覆盖 revoked。
             "UPDATE agents
              SET last_seen_at = ?2,
@@ -348,7 +535,7 @@ impl Storage for SqliteStorage {
     }
 
     fn set_status(&self, agent_id: &str, status: &str, ts: i64) -> Result<()> {
-        self.lock().execute(
+        self.lock_write().execute(
             "UPDATE agents
              SET status = CASE WHEN status = 'revoked' THEN status ELSE ?2 END,
                  last_seen_at = ?3
@@ -360,7 +547,7 @@ impl Storage for SqliteStorage {
 
     fn reset_online_status(&self) -> Result<usize> {
         // L5：只清理 online，revoked 是终态必须保留。
-        let updated = self.lock().execute(
+        let updated = self.lock_write().execute(
             "UPDATE agents SET status = 'offline' WHERE status = 'online'",
             [],
         )?;
@@ -368,7 +555,7 @@ impl Storage for SqliteStorage {
     }
 
     fn insert_batch(&self, batch: &SampleBatch) -> Result<IngestOutcome> {
-        let mut conn = self.lock();
+        let mut conn = self.lock_write();
         let tx = conn.transaction()?;
 
         // 吊销检查与写入必须在同一事务内：命中后不写任何数据。
@@ -435,7 +622,7 @@ impl Storage for SqliteStorage {
     }
 
     fn list_agents(&self) -> Result<Vec<AgentRecord>> {
-        let conn = self.lock();
+        let conn = self.lock_read();
         let mut stmt = conn.prepare(
             "SELECT agent_id, name, hostname, os, arch, version, boot_id, status, last_seen_at, created_at
              FROM agents ORDER BY name",
@@ -458,7 +645,7 @@ impl Storage for SqliteStorage {
     }
 
     fn get_agent(&self, agent_id: &str) -> Result<Option<AgentRecord>> {
-        let conn = self.lock();
+        let conn = self.lock_read();
         let row = conn
             .query_row(
                 "SELECT agent_id, name, hostname, os, arch, version, boot_id, status, last_seen_at, created_at
@@ -484,7 +671,7 @@ impl Storage for SqliteStorage {
     }
 
     fn query_series(&self, query: &SeriesQuery) -> Result<Vec<SeriesRow>> {
-        let conn = self.lock();
+        let conn = self.lock_read();
         let mut sql = String::from(
             "SELECT metric, labels, ts, value FROM samples
              WHERE agent_id = ?1 AND ts >= ?2 AND ts <= ?3",
@@ -520,7 +707,7 @@ impl Storage for SqliteStorage {
     }
 
     fn sample_count(&self, agent_id: &str) -> Result<i64> {
-        let conn = self.lock();
+        let conn = self.lock_read();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM samples WHERE agent_id = ?1",
             params![agent_id],
@@ -533,7 +720,7 @@ impl Storage for SqliteStorage {
         if bucket_ms <= 0 {
             anyhow::bail!("bucket_ms 必须大于 0");
         }
-        let conn = self.lock();
+        let conn = self.lock_read();
 
         // 参数全部绑定：只有占位符数量由 metrics 决定，值本身不进 SQL 文本。
         // 桶起点 = floor(ts / bucket_ms) * bucket_ms（Unix 毫秒均为正数）。
@@ -590,7 +777,7 @@ impl Storage for SqliteStorage {
 
     fn get_sample_interval(&self, agent_id: &str) -> Result<Option<u64>> {
         let stored: Option<i64> = self
-            .lock()
+            .lock_read()
             .query_row(
                 "SELECT sample_interval_ms FROM agent_settings WHERE agent_id = ?1",
                 params![agent_id],
@@ -602,7 +789,7 @@ impl Storage for SqliteStorage {
 
     fn set_sample_interval(&self, agent_id: &str, ms: u64, now: i64) -> Result<()> {
         let ms = i64::try_from(ms).context("sample_interval_ms 超出可存储范围")?;
-        self.lock().execute(
+        self.lock_write().execute(
             "INSERT INTO agent_settings (agent_id, sample_interval_ms, updated_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(agent_id) DO UPDATE SET
@@ -614,7 +801,7 @@ impl Storage for SqliteStorage {
     }
 
     fn list_sample_intervals(&self) -> Result<Vec<(String, u64)>> {
-        let conn = self.lock();
+        let conn = self.lock_read();
         let mut stmt = conn
             .prepare("SELECT agent_id, sample_interval_ms FROM agent_settings ORDER BY agent_id")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
@@ -635,7 +822,7 @@ impl Storage for SqliteStorage {
         created_at: i64,
         expires_at: i64,
     ) -> Result<()> {
-        self.lock().execute(
+        self.lock_write().execute(
             "INSERT INTO enroll_tokens (token_hash, name, created_at, expires_at, used_at)
              VALUES (?1, ?2, ?3, ?4, NULL)",
             params![token_hash, name, created_at, expires_at],
@@ -644,7 +831,7 @@ impl Storage for SqliteStorage {
     }
 
     fn consume_enroll_token(&self, token_hash: &str, now: i64) -> Result<Option<String>> {
-        let mut conn = self.lock();
+        let mut conn = self.lock_write();
         let tx = conn.transaction()?;
         let name: Option<String> = tx
             .query_row(
@@ -665,7 +852,7 @@ impl Storage for SqliteStorage {
     }
 
     fn set_agent_secret(&self, agent_id: &str, secret_hash: &str, created_at: i64) -> Result<()> {
-        self.lock().execute(
+        self.lock_write().execute(
             "INSERT INTO agent_secrets (agent_id, secret_hash, created_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(agent_id) DO UPDATE SET
@@ -678,7 +865,7 @@ impl Storage for SqliteStorage {
 
     fn verify_agent_secret(&self, agent_id: &str, secret_hash: &str) -> Result<bool> {
         let stored: Option<String> = self
-            .lock()
+            .lock_read()
             .query_row(
                 "SELECT secret_hash FROM agent_secrets WHERE agent_id = ?1",
                 params![agent_id],
@@ -692,7 +879,7 @@ impl Storage for SqliteStorage {
 
     fn revoke_agent(&self, agent_id: &str, ts: i64) -> Result<()> {
         // L2：吊销涉及三张表，必须同一事务提交，避免只写了一半。
-        let mut conn = self.lock();
+        let mut conn = self.lock_write();
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO revoked_agents (agent_id, revoked_at) VALUES (?1, ?2)
@@ -712,7 +899,7 @@ impl Storage for SqliteStorage {
     }
 
     fn is_revoked(&self, agent_id: &str) -> Result<bool> {
-        let exists: i64 = self.lock().query_row(
+        let exists: i64 = self.lock_read().query_row(
             "SELECT EXISTS(SELECT 1 FROM revoked_agents WHERE agent_id = ?1)",
             params![agent_id],
             |r| r.get(0),
@@ -761,7 +948,7 @@ mod tests {
     }
 
     fn ingest_states(s: &SqliteStorage) -> Vec<(u64, u64)> {
-        let conn = s.lock();
+        let conn = s.lock_read();
         let mut stmt = conn
             .prepare("SELECT epoch, last_seq FROM ingest_state WHERE agent_id = ?1 ORDER BY epoch")
             .unwrap();
@@ -904,7 +1091,7 @@ mod tests {
     fn m2_ingest_batches_are_pruned_after_ttl() {
         let s = SqliteStorage::open_in_memory().unwrap();
         let now = rustboard_common::util::now_ms();
-        let mut conn = s.lock();
+        let mut conn = s.lock_write();
         let tx = conn.transaction().unwrap();
         // 直接写入一条超期记录（insert_batch 用的是接收时间，构造不出旧值）
         tx.execute(
@@ -932,7 +1119,7 @@ mod tests {
         );
         assert_eq!(s.sample_count("a1").unwrap(), 0);
         let states: i64 = s
-            .lock()
+            .lock_read()
             .query_row("SELECT COUNT(*) FROM ingest_state", [], |r| r.get(0))
             .unwrap();
         assert_eq!(states, 0);
@@ -963,12 +1150,12 @@ mod tests {
 
         let s = SqliteStorage::open(&db_path).unwrap();
         let version: i64 = s
-            .lock()
+            .lock_read()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         let batches_table: i64 = s
-            .lock()
+            .lock_read()
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ingest_batches')",
                 [],
@@ -1030,7 +1217,7 @@ mod tests {
 
         let s = SqliteStorage::open(&db_path).unwrap();
         let version: i64 = s
-            .lock()
+            .lock_read()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 4);
@@ -1156,7 +1343,7 @@ mod tests {
 
     /// 直接写 samples 表，绕开批次判重（聚合 / 最新点测试只关心数据本身）。
     fn insert_samples(s: &SqliteStorage, agent_id: &str, rows: &[(&str, &str, i64, f64)]) {
-        let conn = s.lock();
+        let conn = s.lock_write();
         let mut stmt = conn
             .prepare("INSERT INTO samples (agent_id, metric, labels, ts, value) VALUES (?1, ?2, ?3, ?4, ?5)")
             .unwrap();
@@ -1186,7 +1373,7 @@ mod tests {
         );
 
         let updated_at: i64 = s
-            .lock()
+            .lock_read()
             .query_row(
                 "SELECT updated_at FROM agent_settings WHERE agent_id = 'a1'",
                 [],
@@ -1231,12 +1418,12 @@ mod tests {
         for _ in 0..2 {
             let s = SqliteStorage::open(&db_path).unwrap();
             let version: i64 = s
-                .lock()
+                .lock_read()
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(version, 4);
             let settings_table: i64 = s
-                .lock()
+                .lock_read()
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_settings')",
                     [],
@@ -1425,5 +1612,209 @@ mod tests {
         // 未达到上限时正常去重返回。
         let rows = s.latest_samples_limited(0, &[], None, 3).unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("rb-sqlite-{}-{tag}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("rustboard.db")
+    }
+
+    /// KI-02：读连接池大小可配置并在 1–16 内夹取；读连接必须是 `query_only=ON`。
+    #[test]
+    fn v021_read_pool_size_is_clamped_and_query_only() {
+        let path = temp_db("pool-size");
+
+        let s = SqliteStorage::open_with_readers(&path, 0).unwrap();
+        assert_eq!(
+            s.read_pool_len(),
+            MIN_READ_POOL_SIZE,
+            "0 条读连接必须夹到 1"
+        );
+        {
+            let conn = s.lock_read();
+            let query_only: i64 = conn
+                .query_row("PRAGMA query_only", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(query_only, 1, "读连接必须开启 query_only");
+        }
+        drop(s);
+
+        let s = SqliteStorage::open_with_readers(&path, 99).unwrap();
+        assert_eq!(
+            s.read_pool_len(),
+            MAX_READ_POOL_SIZE,
+            "超过 16 条的配置必须夹到上限"
+        );
+        drop(s);
+
+        let s = SqliteStorage::open_with_readers(&path, 2).unwrap();
+        assert_eq!(s.read_pool_len(), 2);
+        drop(s);
+
+        // `open` 使用默认池大小 4。
+        let s = SqliteStorage::open(&path).unwrap();
+        assert_eq!(s.read_pool_len(), DEFAULT_READ_POOL_SIZE);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// KI-02：只读连接必须能看到写连接写入的数据（文件库 + 内存库两条路径）。
+    #[test]
+    fn v021_read_pool_sees_writes_in_file_and_memory_databases() {
+        let path = temp_db("visibility");
+        let file = SqliteStorage::open_with_readers(&path, 2).unwrap();
+        assert_eq!(
+            file.insert_batch(&batch(1)).unwrap(),
+            IngestOutcome::Inserted { inserted: 2 }
+        );
+        // 连续读多次会轮询到不同读连接，每条都必须看到同一份数据。
+        for _ in 0..4 {
+            assert_eq!(file.sample_count("a1").unwrap(), 2);
+            assert_eq!(
+                file.query_series(&SeriesQuery {
+                    agent_id: "a1".into(),
+                    metrics: vec!["cpu.usage".into()],
+                    from: 0,
+                    to: i64::MAX,
+                    limit: 10,
+                })
+                .unwrap()
+                .len(),
+                1
+            );
+        }
+        drop(file);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        // 内存库必须用共享缓存 URI，否则读连接会各自看到一个空库。
+        let memory = SqliteStorage::open_in_memory().unwrap();
+        assert!(memory.read_pool_len() > 0);
+        memory.insert_batch(&batch(1)).unwrap();
+        for _ in 0..4 {
+            assert_eq!(
+                memory.sample_count("a1").unwrap(),
+                2,
+                "内存库读连接必须与写连接共享同一份数据"
+            );
+        }
+    }
+
+    /// KI-02 关键回归：一条读连接持有长事务时，写入与心跳刷新必须立即完成，
+    /// 不能因为读路径占着全局锁而排队。
+    #[test]
+    fn v021_long_read_transaction_does_not_block_writes() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let path = temp_db("read-does-not-block-write");
+        let storage = std::sync::Arc::new(SqliteStorage::open_with_readers(&path, 1).unwrap());
+        storage.insert_batch(&batch(1)).unwrap();
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let reader = {
+            let storage = storage.clone();
+            std::thread::spawn(move || {
+                let conn = storage.lock_read();
+                conn.execute_batch("BEGIN").unwrap();
+                // 真实执行一次查询后再挂起事务，模拟面板的大范围分桶查询。
+                let count: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM samples", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 2);
+                ready_tx.send(()).unwrap();
+                // 长查询仍在进行：读者继续持锁 300ms。
+                std::thread::sleep(Duration::from_millis(300));
+                conn.execute_batch("COMMIT").unwrap();
+            })
+        };
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("读线程必须在 2s 内取得读连接并开始查询");
+
+        let started = Instant::now();
+        assert_eq!(
+            storage.insert_batch(&batch(2)).unwrap(),
+            IngestOutcome::Inserted { inserted: 2 }
+        );
+        storage.mark_seen("a1", 123).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "长读事务期间写入被阻塞了 {elapsed:?}（必须 <200ms）"
+        );
+        reader.join().unwrap();
+        assert_eq!(storage.sample_count("a1").unwrap(), 4);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// KI-02：至少两条读连接能同时被占用（真正并发，而不是一把全局锁）。
+    #[test]
+    fn v021_read_pool_serves_two_concurrent_readers() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let path = temp_db("read-concurrency");
+        let storage = std::sync::Arc::new(SqliteStorage::open_with_readers(&path, 2).unwrap());
+        storage.insert_batch(&batch(1)).unwrap();
+
+        let (first_ready_tx, first_ready_rx) = mpsc::channel();
+        let first = {
+            let storage = storage.clone();
+            std::thread::spawn(move || {
+                let conn = storage.lock_read();
+                let value: i64 = conn.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
+                assert_eq!(value, 1);
+                first_ready_tx.send(()).unwrap();
+                // 持锁 500ms：单连接池时第二个线程要等到这里结束。
+                std::thread::sleep(Duration::from_millis(500));
+            })
+        };
+        first_ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("第一个读线程必须取得连接");
+
+        let (second_ready_tx, second_ready_rx) = mpsc::channel();
+        let second = {
+            let storage = storage.clone();
+            std::thread::spawn(move || {
+                let conn = storage.lock_read();
+                let value: i64 = conn.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
+                assert_eq!(value, 1);
+                second_ready_tx.send(()).unwrap();
+            })
+        };
+        second_ready_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("第二个读连接必须能并发取得（读池不能退化成一把全局锁）");
+
+        first.join().unwrap();
+        second.join().unwrap();
+        drop(storage);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// KI-02 降级路径：只读连接全部打不开时必须告警并回退到写连接，不能拒绝启动。
+    #[test]
+    fn v021_read_pool_falls_back_to_writer_when_open_fails() {
+        let path = temp_db("read-fallback");
+        {
+            let mut slot = FAIL_READER_OPEN_FOR
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = Some(path.clone());
+        }
+
+        let s = SqliteStorage::open_with_readers(&path, 4).unwrap();
+        assert_eq!(s.read_pool_len(), 0, "测试注入下读池应为空");
+        // 读路径仍然可用（走写连接），且能看到写入的数据。
+        s.insert_batch(&batch(1)).unwrap();
+        assert_eq!(s.sample_count("a1").unwrap(), 2);
+        assert_eq!(s.list_agents().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
