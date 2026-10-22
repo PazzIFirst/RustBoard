@@ -74,7 +74,7 @@
       多指标 `series`（自动分桶）、`settings`、`/api/v1/system`
 - [x] 采样间隔：面板修改 → 落库 → Reconfigure 踢会话 → agent 在 ≤2s 内采用
 - [x] SQLite v4：`agent_settings`；旧 v3 库幂等迁移
-- [x] 测试：单元/集成 211 个；`panel.sh` 156 断言、`cert-rotation.sh` 103 断言、
+- [x] 测试：单元/集成 222 个；`panel.sh` 159 断言、`cert-rotation.sh` 103 断言、
       `security.sh` 9 断言；web 22 个 vitest
 - [x] 三轮独立评审与渗透测试发现的问题（面板 token 代理泄露、默认 0.0.0.0、
       上游 HTML 透传、响应体无上限、间隔生效超时等）
@@ -91,8 +91,8 @@
 - 面板修改采样间隔后 60s 内 agent 日志出现 `采样间隔已更新`，重连后继续上报；
 - series 多指标、自动分桶、32 天/点数上限与非法参数 400 均验证；
 - 证书轮换失败场景（CA 不配套、缺 ca.key、坏 ca.crt、空 SAN、缺 server.crt）均有 e2e 断言；
-- 测试：`cargo test --workspace` 211 通过；`cargo audit` 0 漏洞；
-  `security.sh` 9/9、`cert-rotation.sh` 103/103、`panel.sh` 156/156、web `pnpm test` 22/22。
+- 测试：`cargo test --workspace` 222 通过；`cargo audit` 0 漏洞；
+  `security.sh` 9/9、`cert-rotation.sh` 103/103、`panel.sh` 159/159、web `pnpm test` 22/22。
 
 ## 已知限制
 
