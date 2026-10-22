@@ -347,8 +347,10 @@ pub fn is_secure_request(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// XFF 最多接受的跳数。超过时视为不可信，回退直连地址。
+/// XFF 最多接受的跳数。超过时视为不可信，拒绝请求。
 pub const MAX_XFF_HOPS: usize = 8;
+/// XFF 头部总字节上限，避免用超长头部打满解析路径。
+pub const MAX_XFF_BYTES: usize = 4096;
 
 /// 可信反代条目：精确 IP 或 CIDR（IPv4 / IPv6）。
 ///
@@ -427,40 +429,47 @@ pub fn parse_trusted_proxies(entries: &[String]) -> Result<Vec<IpNet>> {
 
 /// 计算请求的真实客户端地址。
 ///
-/// - 直连对端不在 `trusted_proxies` 中时，完全忽略 `X-Forwarded-For`，避免任意
-///   客户端伪造来源绕过登录限速；
-/// - 对端可信时，从 XFF 最右侧开始向左跳过可信代理，返回第一个非可信地址；
-/// - XFF 非法、为空、超过 [`MAX_XFF_HOPS`] 跳或全部都是可信地址时，回退直连地址。
-pub fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> IpAddr {
+/// - 直连对端不在 `trusted_proxies` 中时，完全忽略 `X-Forwarded-For`，返回直连地址；
+/// - 对端可信但没有 XFF 时返回直连地址；
+/// - 对端可信时，从 XFF 最右侧开始向左跳过可信代理，返回第一个合法非可信 IP；
+/// - 任一 hop 非法、总字节数超过 [`MAX_XFF_BYTES`]、跳数超过 [`MAX_XFF_HOPS`]，
+///   或全部 hop 都是可信地址时，返回 `None`。调用方必须拒绝请求，不能回退到
+///   共享的直连地址（否则多个被代理客户端会落入同一个限速桶）。
+pub fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> Option<IpAddr> {
     if !trusted.iter().any(|net| net.contains(peer)) {
-        return peer;
+        return Some(peer);
     }
     let mut hops: Vec<&str> = Vec::new();
+    let mut total_bytes = 0usize;
     for value in headers.get_all("x-forwarded-for").iter() {
-        let Ok(value) = value.to_str() else {
-            return peer;
-        };
+        let value = value.to_str().ok()?;
+        total_bytes = total_bytes.saturating_add(value.len());
+        if total_bytes > MAX_XFF_BYTES {
+            return None;
+        }
         for part in value.split(',') {
             let part = part.trim();
             if part.is_empty() {
                 continue;
             }
             if hops.len() >= MAX_XFF_HOPS {
-                return peer;
+                return None;
             }
             hops.push(part);
         }
     }
+    if hops.is_empty() {
+        return Some(peer);
+    }
     for raw in hops.iter().rev() {
-        let Ok(ip) = raw.parse::<IpAddr>() else {
-            return peer;
-        };
+        let ip = raw.parse::<IpAddr>().ok()?;
         if trusted.iter().any(|net| net.contains(ip)) {
             continue;
         }
-        return ip;
+        return Some(ip);
     }
-    peer
+    // 所有 hop 都是可信代理：没有可用的客户端地址。
+    Some(peer)
 }
 
 /// 按配置决定会话 Cookie 是否加 `Secure`。
@@ -885,7 +894,7 @@ mod tests {
         let peer: IpAddr = "198.51.100.1".parse().unwrap();
         let h = headers(&[("x-forwarded-for", "203.0.113.7")]);
         let trusted = vec![net("10.0.0.0/8")];
-        assert_eq!(client_ip(peer, &h, &trusted), peer);
+        assert_eq!(client_ip(peer, &h, &trusted), Some(peer));
     }
 
     #[test]
@@ -895,30 +904,42 @@ mod tests {
         let h = headers(&[("x-forwarded-for", "203.0.113.7, 10.0.0.3")]);
         assert_eq!(
             client_ip(peer, &h, &trusted),
-            "203.0.113.7".parse::<IpAddr>().unwrap()
+            Some("203.0.113.7".parse::<IpAddr>().unwrap())
         );
 
         // 右侧继续出现可信地址时继续跳过。
         let h = headers(&[("x-forwarded-for", "203.0.113.7, 10.0.0.3, 10.0.0.2")]);
         assert_eq!(
             client_ip(peer, &h, &trusted),
-            "203.0.113.7".parse::<IpAddr>().unwrap()
+            Some("203.0.113.7".parse::<IpAddr>().unwrap())
         );
     }
 
     #[test]
-    fn client_ip_falls_back_on_invalid_or_too_many_hops() {
+    fn client_ip_rejects_invalid_or_too_many_hops_without_falling_back() {
         let trusted = vec![net("10.0.0.0/8")];
         let peer: IpAddr = "10.0.0.2".parse().unwrap();
         for value in [
             "not-an-ip",
             "203.0.113.7, garbage",
             "1.1.1.1,2.2.2.2,3.3.3.3,4.4.4.4,5.5.5.5,6.6.6.6,7.7.7.7,8.8.8.8,9.9.9.9",
-            "",
         ] {
             let h = headers(&[("x-forwarded-for", value)]);
-            assert_eq!(client_ip(peer, &h, &trusted), peer, "value={value:?}");
+            assert_eq!(client_ip(peer, &h, &trusted), None, "value={value:?}");
         }
+
+        // 空 XFF == 没有 XFF，仍返回直连地址。
+        assert_eq!(
+            client_ip(peer, &headers(&[("x-forwarded-for", "")]), &trusted),
+            Some(peer)
+        );
+
+        // 总字节数超限也必须拒绝，而不是回退共享 peer。
+        let long = format!("203.0.113.7,{}", "1".repeat(MAX_XFF_BYTES));
+        assert_eq!(
+            client_ip(peer, &headers(&[("x-forwarded-for", &long)]), &trusted),
+            None
+        );
     }
 
     #[test]
@@ -926,8 +947,8 @@ mod tests {
         let trusted = vec![net("10.0.0.0/8")];
         let peer: IpAddr = "10.0.0.2".parse().unwrap();
         let h = headers(&[("x-forwarded-for", "10.0.0.3")]);
-        assert_eq!(client_ip(peer, &h, &trusted), peer);
-        assert_eq!(client_ip(peer, &HeaderMap::new(), &trusted), peer);
+        assert_eq!(client_ip(peer, &h, &trusted), Some(peer));
+        assert_eq!(client_ip(peer, &HeaderMap::new(), &trusted), Some(peer));
     }
 
     #[test]

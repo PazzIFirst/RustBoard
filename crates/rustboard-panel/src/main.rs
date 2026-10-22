@@ -10,7 +10,8 @@ mod web;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use axum::body::Body;
@@ -135,14 +136,24 @@ struct AppState {
     limiter: auth::LoginLimiter,
     proxy: proxy::ProxyClient,
     static_files: Option<web::StaticFiles>,
-    password_hash: String,
+    /// 当前生效的密码哈希；`reset-password` 后由轮询任务热更新。
+    password_hash: Arc<RwLock<String>>,
+    /// 配置文件路径；`None` 表示测试装配，不启用热加载。
+    config_path: Option<PathBuf>,
     argon2_slots: Arc<Semaphore>,
     /// 只有这些来源的 `X-Forwarded-*` 才被采信。
     trusted_proxies: Vec<auth::IpNet>,
 }
 
+/// 轮询配置文件并热加载密码哈希的周期。
+const PASSWORD_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
+
 impl AppState {
-    fn new(cfg: PanelConfig, static_files: Option<web::StaticFiles>) -> Result<Self> {
+    fn new(
+        cfg: PanelConfig,
+        static_files: Option<web::StaticFiles>,
+        config_path: Option<PathBuf>,
+    ) -> Result<Self> {
         cfg.validate().context("面板配置校验失败")?;
         let trusted_proxies = auth::parse_trusted_proxies(&cfg.trusted_proxies)
             .context("解析 trusted_proxies 失败")?;
@@ -160,7 +171,7 @@ impl AppState {
         if cfg.session_ttl_hours == 0 {
             tracing::warn!("session_ttl_hours=0 非法，已按 1 小时处理");
         }
-        let password_hash = cfg.admin_password_hash.clone();
+        let password_hash = Arc::new(RwLock::new(cfg.admin_password_hash.clone()));
         Ok(Self {
             cfg,
             sessions: auth::SessionStore::new(ttl_hours),
@@ -168,10 +179,69 @@ impl AppState {
             proxy,
             static_files,
             password_hash,
+            config_path,
             argon2_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ARGON2)),
             trusted_proxies,
         })
     }
+
+    /// 从磁盘重新加载配置里的密码哈希。返回 `true` 表示发生了变更。
+    ///
+    /// 只热加载密码哈希，不热加载监听地址 / 可信代理等需要重建监听器的字段；
+    /// `reset-password` 只改哈希，因此这一范围足够且不会中断服务。
+    fn reload_password_hash(&self) -> Result<bool> {
+        let Some(path) = self.config_path.as_ref() else {
+            return Ok(false);
+        };
+        let cfg = PanelConfig::load(path)
+            .with_context(|| format!("热加载配置失败: {}", path.display()))?;
+        if !auth::validate_phc(&cfg.admin_password_hash) {
+            bail!("配置里的 admin_password_hash 不是有效 Argon2id PHC 串，保留旧密码");
+        }
+        let mut guard = self
+            .password_hash
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *guard == cfg.admin_password_hash {
+            return Ok(false);
+        }
+        *guard = cfg.admin_password_hash;
+        tracing::info!(path = %path.display(), "检测到面板密码变更，已热加载（无需重启）");
+        Ok(true)
+    }
+}
+
+/// 每秒检查配置文件内容；变化时尝试热加载密码哈希。
+///
+/// 比较完整文件内容而不是 mtime：`reset-password` 的原子 rename 与某些文件系统
+/// 的秒级 mtime 粒度可能让 mtime 看起来不变。配置文件很小，每秒读一次成本可忽略。
+fn spawn_password_reload(state: Arc<AppState>) {
+    let Some(path) = state.config_path.clone() else {
+        return;
+    };
+    // 在 spawn 之前同步读取基线：否则 reset-password 若恰好发生在任务首次被
+    // 调度之前，任务会把“新内容”当成基线，永远看不到变化。
+    let mut last = std::fs::read_to_string(&path).ok();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(PASSWORD_RELOAD_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let read_path = path.clone();
+            let Ok(Ok(text)) =
+                tokio::task::spawn_blocking(move || std::fs::read_to_string(read_path)).await
+            else {
+                continue;
+            };
+            if last.as_deref() == Some(text.as_str()) {
+                continue;
+            }
+            last = Some(text);
+            if let Err(error) = state.reload_password_hash() {
+                tracing::warn!(path = %path.display(), error = %error, "密码热加载失败，保留旧密码");
+            }
+        }
+    });
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
@@ -326,7 +396,10 @@ async fn api_login(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let ip = auth::client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    let Some(ip) = auth::client_ip(peer.ip(), &headers, &state.trusted_proxies) else {
+        tracing::warn!(peer = %peer.ip(), "可信反代传来的 X-Forwarded-For 非法或过长，拒绝登录");
+        return proxy::json_error(StatusCode::BAD_REQUEST, "invalid_forwarded_for");
+    };
 
     if !is_json_content_type(&headers) {
         tracing::warn!(ip = %ip, "面板登录缺少 application/json");
@@ -367,7 +440,11 @@ async fn api_login(
         }
     };
     let password = request.password;
-    let hash = state.password_hash.clone();
+    let hash = state
+        .password_hash
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     let verified = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         auth::verify_password(&password, &hash)
@@ -754,15 +831,17 @@ fn run(config: Option<PathBuf>, listen: Option<String>, hub: Option<String>) -> 
             "未找到前端构建产物，页面请求将返回 503；请构建 web/ 或用 static_dir 指定目录"
         );
     }
-    let state = Arc::new(AppState::new(cfg, static_files)?);
+    let state = Arc::new(AppState::new(cfg, static_files, Some(path.clone()))?);
     let listen = state.cfg.listen.clone();
     let hub = state.cfg.hub_url.clone();
     let loopback = listen_is_loopback(&listen);
+    let reload_state = state.clone();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async move {
+        spawn_password_reload(reload_state);
         let app = build_router(state);
         let listener = tokio::net::TcpListener::bind(&listen)
             .await
@@ -925,7 +1004,7 @@ fn reset_password(config: Option<PathBuf>, password: Option<String>) -> Result<(
     cfg.save(&path)?;
     println!("已重置面板密码（仅显示一次，请立即保存）: {password}");
     println!("配置文件: {}（0600）", path.display());
-    println!("提示: 已有登录会话仍然有效；重启面板后全部失效。");
+    println!("提示: 运行中的面板会在 1 秒内自动加载新密码（无需重启）；已有登录会话仍然有效。");
     Ok(())
 }
 
@@ -1144,7 +1223,7 @@ mod tests {
             ..PanelConfig::default()
         };
         let files = web::StaticFiles::from_root(&site.dir).unwrap();
-        let state = Arc::new(AppState::new(cfg, Some(files)).unwrap());
+        let state = Arc::new(AppState::new(cfg, Some(files), None).unwrap());
         (state, site)
     }
 
@@ -1440,6 +1519,46 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         let cookie = headers.get(header::SET_COOKIE).unwrap().to_str().unwrap();
         assert!(cookie.contains("; Secure"));
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_invalid_xff_is_rejected_without_falling_back() {
+        let (state, _site) = test_state();
+        let login_body = format!(r#"{{"password":"{TEST_PASSWORD}"}}"#);
+        for xff in [
+            "not-an-ip",
+            "1.1.1.1,2.2.2.2,3.3.3.3,4.4.4.4,5.5.5.5,6.6.6.6,7.7.7.7,8.8.8.8,9.9.9.9",
+        ] {
+            let (status, _, body) = call(
+                &state,
+                Method::POST,
+                "/api/login",
+                &[
+                    ("content-type", "application/json"),
+                    ("x-forwarded-for", xff),
+                ],
+                Body::from(login_body.clone()),
+                Some("203.0.113.9:50000"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "xff={xff}");
+            assert!(String::from_utf8_lossy(&body).contains("invalid_forwarded_for"));
+        }
+
+        // 非可信来源的 XFF 完全忽略，不能被污染。
+        let (status, _, _) = call(
+            &state,
+            Method::POST,
+            "/api/login",
+            &[
+                ("content-type", "application/json"),
+                ("x-forwarded-for", "not-an-ip"),
+            ],
+            Body::from(r#"{"password":"wrong-password"}"#),
+            Some("198.51.100.1:50000"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -1903,7 +2022,7 @@ mod tests {
             trusted_proxies: vec!["10.0.0.0/99".to_string()],
             ..PanelConfig::default()
         };
-        let err = match AppState::new(cfg, None) {
+        let err = match AppState::new(cfg, None, None) {
             Ok(_) => panic!("非法 trusted_proxies 必须拒绝启动"),
             Err(err) => err,
         };
@@ -1938,5 +2057,90 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn reload_password_hash_updates_without_restart() {
+        let site = TempSite::new();
+        let path = site.dir.join("panel.toml");
+        let old = "old-password";
+        let cfg = PanelConfig {
+            hub_url: "http://127.0.0.1:1".to_string(),
+            token: "test-hub-token".to_string(),
+            admin_password_hash: auth::hash_password(old).unwrap(),
+            trusted_proxies: vec!["127.0.0.1".to_string()],
+            ..PanelConfig::default()
+        };
+        cfg.save(&path).unwrap();
+        let state = Arc::new(AppState::new(cfg, None, Some(path.clone())).unwrap());
+
+        reset_password(Some(path), Some("new-password".to_string())).unwrap();
+        assert!(state.reload_password_hash().unwrap());
+        let hash = state
+            .password_hash
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert!(auth::verify_password("new-password", &hash));
+        assert!(!auth::verify_password(old, &hash));
+        // 内容没再变化时不应重复报告。
+        assert!(!state.reload_password_hash().unwrap());
+    }
+
+    #[tokio::test]
+    async fn running_panel_picks_up_reset_password() {
+        let site = TempSite::new();
+        let path = site.dir.join("panel.toml");
+        let old = "old-password";
+        let cfg = PanelConfig {
+            hub_url: "http://127.0.0.1:1".to_string(),
+            token: "test-hub-token".to_string(),
+            admin_password_hash: auth::hash_password(old).unwrap(),
+            trusted_proxies: vec!["127.0.0.1".to_string()],
+            ..PanelConfig::default()
+        };
+        cfg.save(&path).unwrap();
+        let state = Arc::new(AppState::new(cfg, None, Some(path.clone())).unwrap());
+        spawn_password_reload(state.clone());
+
+        reset_password(Some(path), Some("new-password".to_string())).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let hash = state
+                    .password_hash
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if auth::verify_password("new-password", &hash) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("热加载任务未在 3s 内应用新密码");
+
+        let ip = Some("203.0.113.60:50000");
+        let (status, _, _) = call(
+            &state,
+            Method::POST,
+            "/api/login",
+            &[("content-type", "application/json")],
+            Body::from(r#"{"password":"old-password"}"#),
+            ip,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "旧密码必须失效");
+
+        let (status, _, _) = call(
+            &state,
+            Method::POST,
+            "/api/login",
+            &[("content-type", "application/json")],
+            Body::from(r#"{"password":"new-password"}"#),
+            ip,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "新密码必须立即可用");
     }
 }
