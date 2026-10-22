@@ -8,6 +8,7 @@ import {
   enabledCapabilities,
   formatAuditTime,
   formatDuration,
+  isActionFailed,
   isDangerousAction,
   isMutationAction,
   nextAuditBeforeId,
@@ -55,6 +56,13 @@ describe("危险动作判定", () => {
     expect(isMutationAction("list")).toBe(false);
     expect(isMutationAction("tail")).toBe(false);
     expect(isMutationAction("")).toBe(false);
+  });
+
+  it("退出码只有 0 算成功，null（信号终止）算失败", () => {
+    expect(isActionFailed(0)).toBe(false);
+    expect(isActionFailed(1)).toBe(true);
+    expect(isActionFailed(127)).toBe(true);
+    expect(isActionFailed(null)).toBe(true);
   });
 });
 

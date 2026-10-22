@@ -6,6 +6,7 @@ import {
   actionLabel,
   describeControlError,
   enabledCapabilities,
+  isActionFailed,
   isDangerousAction,
   isMutationAction,
 } from "../control";
@@ -65,13 +66,14 @@ function ActionFeedback({
     return <div className="banner info action-result">{title}：操作成功。</div>;
   }
   const { stdout, stderr, exit_code } = response.result;
-  const failed = exit_code !== null && exit_code !== 0;
+  // 与 hub 审计一致：null（被信号终止）也按失败展示。
+  const failed = isActionFailed(exit_code);
   return (
     <div className={`action-result ${failed ? "action-failed" : "action-ok"}`}>
       <div className="action-result-head">
         <span>{title}</span>
         <span className={`exit-code ${failed ? "bad" : "good"}`}>
-          退出码：{exit_code === null ? "—" : exit_code}
+          退出码：{exit_code === null ? "—（被信号终止）" : exit_code}
         </span>
       </div>
       <div className="output-block">

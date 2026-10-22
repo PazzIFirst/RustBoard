@@ -81,6 +81,16 @@ export function isMutationAction(action: string): boolean {
   return normalized !== "" && normalized !== "list" && normalized !== "tail";
 }
 
+/**
+ * 动作输出是否失败。
+ *
+ * hub 把 `exit_code = null`（进程被信号终止、没有正常退出码）也记为失败，
+ * 面板必须保持一致：只有退出码 0 视为成功。
+ */
+export function isActionFailed(exitCode: number | null): boolean {
+  return exitCode !== 0;
+}
+
 /** hub 与 agent 都开启的能力才可用；顺序固定为 systemd / Docker / 进程 / 日志。 */
 export function enabledCapabilities(
   status: Pick<ControlStatus, "capabilities" | "hub_capabilities">,
