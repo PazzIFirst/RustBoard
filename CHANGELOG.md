@@ -24,6 +24,10 @@
 - 随机五位数端口（20000–64999），支持自定义；`rustboard-hub ports`、
   `rustboard-panel ports`、`rustboard-agent info` 随时查看
 - hub 本机采集（`agent_id = hub-self`，本地直写，不经过网络）
+- 测试体系：八类测试矩阵（评审 / 静态分析 / 单测 / fuzz / 故障注入 / 并发 / 长稳 / 供应链）
+  与分阶段执行规则，见 `AGENTS.md` §8
+- CI：`.github/workflows/ci.yml` 跑 fmt、clippy、test 与 `cargo audit`
+  （push / PR / 每周定时），并作为发布门槛
 
 ### Changed
 
