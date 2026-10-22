@@ -3,4 +3,5 @@
 *.log
 web/node_modules
 web/dist
+.worktrees/
 .DS_Store
