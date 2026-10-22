@@ -161,7 +161,8 @@ export interface AuditEntry {
 
 export interface AuditResponse {
   entries: AuditEntry[];
-  next_before_id?: number;
+  /** 服务端排他游标（id < next_before_id）；null 表示没有更多。 */
+  next_before_id?: number | null;
 }
 
 export interface AuditQuery {

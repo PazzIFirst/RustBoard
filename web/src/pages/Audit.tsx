@@ -4,6 +4,7 @@ import {
   AUDIT_PAGE_SIZE,
   CONTROL_CAPABILITIES,
   auditErrorText,
+  auditHasMore,
   auditResultClass,
   formatAuditTime,
   formatDuration,
@@ -23,6 +24,8 @@ export default function AuditPage() {
   const [error, setError] = useState<string | null>(null);
   const [moreError, setMoreError] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
+  /** undefined = 服务端未给游标；null = 明确没有更多；number = 排他游标。 */
+  const [nextBeforeId, setNextBeforeId] = useState<number | null | undefined>(undefined);
   const [reloadKey, setReloadKey] = useState(0);
   const filterGeneration = useRef(0);
 
@@ -36,12 +39,14 @@ export default function AuditPage() {
     setMoreError(null);
     setEntries([]);
     setHasMore(false);
+    setNextBeforeId(undefined);
     api
       .audit({ ...applied, limit: AUDIT_PAGE_SIZE }, controller.signal)
       .then((data) => {
         if (controller.signal.aborted || generation !== filterGeneration.current) return;
         setEntries(data.entries);
-        setHasMore(data.entries.length >= AUDIT_PAGE_SIZE);
+        setNextBeforeId(data.next_before_id);
+        setHasMore(auditHasMore(data));
       })
       .catch((loadError: unknown) => {
         if (controller.signal.aborted || isAbortError(loadError)) return;
@@ -68,7 +73,7 @@ export default function AuditPage() {
 
   const loadMore = async () => {
     if (loading || loadingMore) return;
-    const beforeId = nextAuditBeforeId(entries);
+    const beforeId = nextAuditBeforeId(entries, nextBeforeId);
     if (beforeId === undefined) {
       setHasMore(false);
       return;
@@ -90,7 +95,8 @@ export default function AuditPage() {
           ...data.entries.filter((entry) => !seen.has(entry.id)),
         ];
       });
-      setHasMore(data.entries.length >= AUDIT_PAGE_SIZE);
+      setNextBeforeId(data.next_before_id);
+      setHasMore(auditHasMore(data));
     } catch (loadError) {
       if (isAbortError(loadError)) return;
       if (generation === filterGeneration.current) setMoreError(describeError(loadError));

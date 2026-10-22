@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   auditErrorText,
+  auditHasMore,
   auditQueryParams,
   auditResultClass,
   describeControlError,
@@ -328,6 +329,9 @@ describe("审计过滤参数编码", () => {
     expect(auditQueryParams({ agentId: "hub-self" })).toBe(
       "limit=100&agent_id=hub-self",
     );
+    // hub / 面板只接受正整数 before_id。
+    expect(auditQueryParams({ beforeId: 0 })).toBe("limit=100");
+    expect(auditQueryParams({ beforeId: 41 })).toBe("limit=100&before_id=41");
   });
 
   it("limit 限制在 1–100", () => {
@@ -336,11 +340,24 @@ describe("审计过滤参数编码", () => {
     expect(auditQueryParams({ limit: Number.NaN })).toBe("limit=100");
   });
 
-  it("加载更早使用最后一条 id - 1", () => {
+  it("优先使用服务端排他游标，缺失时回退最后一条 id（不减一）", () => {
     const entries = [auditEntry({ id: 50 }), auditEntry({ id: 42 })];
-    expect(nextAuditBeforeId(entries)).toBe(41);
+    expect(nextAuditBeforeId(entries, 42)).toBe(42);
+    expect(nextAuditBeforeId(entries, 30)).toBe(30);
+    expect(nextAuditBeforeId(entries)).toBe(42);
+    expect(nextAuditBeforeId(entries, null)).toBeUndefined();
     expect(nextAuditBeforeId([], 7)).toBe(7);
     expect(nextAuditBeforeId([])).toBeUndefined();
+  });
+
+  it("满页的 next_before_id 直接作为下一页 before_id", () => {
+    const page = normalizeAuditResponse({
+      entries: [auditEntry({ id: 100 }), auditEntry({ id: 99 })],
+      next_before_id: 99,
+    });
+    expect(page.next_before_id).toBe(99);
+    expect(nextAuditBeforeId(page.entries, page.next_before_id)).toBe(99);
+    expect(auditHasMore(page)).toBe(true);
   });
 });
 
@@ -358,6 +375,23 @@ describe("审计响应归一化", () => {
     expect(response.entries).toHaveLength(1);
     expect(response.entries[0].id).toBe(2);
     expect(response.next_before_id).toBe(1);
+  });
+
+  it("保留服务端明确返回的 null 游标，区分缺失与没有更多", () => {
+    expect(
+      normalizeAuditResponse({ entries: [auditEntry({ id: 2 })], next_before_id: null }),
+    ).toEqual({
+      entries: [auditEntry({ id: 2 })],
+      next_before_id: null,
+    });
+    expect(normalizeAuditResponse({ entries: [] })).toEqual({ entries: [] });
+
+    expect(auditHasMore({ entries: [auditEntry({ id: 2 })], next_before_id: null })).toBe(
+      false,
+    );
+    expect(auditHasMore({ entries: [auditEntry({ id: 2 })], next_before_id: 2 })).toBe(true);
+    expect(auditHasMore({ entries: [auditEntry({ id: 2 })] }, 1)).toBe(true);
+    expect(auditHasMore({ entries: [] })).toBe(false);
   });
 
   it("结果与错误列展示", () => {

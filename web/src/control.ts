@@ -339,7 +339,7 @@ export function auditQueryParams(query: AuditQuery = {}): string {
     : AUDIT_PAGE_SIZE;
   params.set("limit", String(limit));
 
-  if (query.beforeId !== undefined && Number.isFinite(query.beforeId) && query.beforeId >= 0) {
+  if (query.beforeId !== undefined && Number.isFinite(query.beforeId) && query.beforeId > 0) {
     params.set("before_id", String(Math.trunc(query.beforeId)));
   }
   const agentId = query.agentId?.trim() ?? "";
@@ -349,17 +349,34 @@ export function auditQueryParams(query: AuditQuery = {}): string {
   return params.toString();
 }
 
-/** 「加载更早」使用最后一条 id - 1；空列表时回退到调用方给的游标。 */
+/**
+ * 计算「加载更早」的 `before_id`。
+ *
+ * 后端使用排他游标 `id < before_id`：满页时 `next_before_id` 是本页最后一条 id，
+ * 因此必须优先使用服务端游标；只有响应缺失该字段时才回退到最后一条 id。
+ * 服务端明确返回 null 表示没有更多数据。
+ */
 export function nextAuditBeforeId(
   entries: AuditEntry[],
-  fallback?: number,
+  serverNext?: number | null,
 ): number | undefined {
-  const last = entries[entries.length - 1];
-  if (last && Number.isFinite(last.id) && last.id > 0) return Math.trunc(last.id) - 1;
-  if (fallback !== undefined && Number.isFinite(fallback) && fallback >= 0) {
-    return Math.trunc(fallback);
+  if (serverNext === null) return undefined;
+  if (serverNext !== undefined && Number.isFinite(serverNext) && serverNext > 0) {
+    return Math.trunc(serverNext);
   }
+  const last = entries[entries.length - 1];
+  if (last && Number.isFinite(last.id) && last.id > 0) return Math.trunc(last.id);
   return undefined;
+}
+
+/** 是否还有下一页；优先信任服务端 next_before_id，缺失时才按页大小推断。 */
+export function auditHasMore(
+  response: AuditResponse,
+  pageSize = AUDIT_PAGE_SIZE,
+): boolean {
+  if (response.next_before_id === null) return false;
+  if (response.next_before_id !== undefined) return response.entries.length > 0;
+  return response.entries.length >= pageSize;
 }
 
 function normalizeAuditEntry(value: unknown): AuditEntry | null {
@@ -381,12 +398,19 @@ function normalizeAuditEntry(value: unknown): AuditEntry | null {
   };
 }
 
-/** 审计响应归一化：丢弃没有有效 id 的条目，保证分页游标可用。 */
+/**
+ * 审计响应归一化：丢弃没有有效 id 的条目，保证分页游标可用。
+ *
+ * `next_before_id: null` 是服务端明确表示“没有更多”，必须保留，不能当作缺失。
+ */
 export function normalizeAuditResponse(raw: unknown): AuditResponse {
   const value = asRecord(raw);
   const entries = asArray(value.entries)
     .map(normalizeAuditEntry)
     .filter((entry): entry is AuditEntry => entry !== null);
+  if (value.next_before_id === null) {
+    return { entries, next_before_id: null };
+  }
   const next = asFiniteNumber(value.next_before_id);
   if (next !== null && next >= 0) {
     return { entries, next_before_id: Math.trunc(next) };
