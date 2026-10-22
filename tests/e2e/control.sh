@@ -510,6 +510,10 @@ echo "==> 初始化 hub（agent=${AGENT_PORT} admin=${ADMIN_PORT}）"
 
 sed -i 's/^self_monitor = true$/self_monitor = false/' "$HUB_CFG"
 sed -i 's/^sample_interval_ms = 5000$/sample_interval_ms = 1000/' "$HUB_CFG"
+# 控制面用例会连续 POST；关闭管理写限速，避免第 11 次起被 429 干扰业务断言。
+if ! grep -q '^admin_write_rate_limit_per_min' "$HUB_CFG"; then
+  printf '\nadmin_write_rate_limit_per_min = 0\n' >> "$HUB_CFG"
+fi
 [[ -f "$CA" ]] || die "缺少 CA 证书: $CA"
 
 ADMIN_TOKEN=$(cfg_str "$HUB_CFG" admin_token) || die "无法解析 hub admin_token"
@@ -706,7 +710,7 @@ expect_status "4.1 process list 200" 200
 check_eq "4.2 process result 类型" "processes" "$(json_get 'd.get("result",{}).get("type")')"
 if "$PYTHON" - "$BODY" "$TEST_PID" "$TEST_NAME" <<'PY'
 import json, sys
-data = json.load(sys.stdin)
+data = json.loads(sys.argv[1])
 want_pid = int(sys.argv[2])
 want_name = sys.argv[3]
 processes = data.get("result", {}).get("processes", [])
@@ -841,7 +845,7 @@ if [[ "$NEXT_ID" =~ ^[0-9]+$ ]]; then
   expect_status "6.4 before_id 分页 200" 200
   if "$PYTHON" - "$BODY" "$NEXT_ID" <<'PY'
 import json, sys
-data = json.load(sys.stdin)
+data = json.loads(sys.argv[1])
 before = int(sys.argv[2])
 ids = [int(e.get("id", 0)) for e in data.get("entries", [])]
 if ids and all(i < before for i in ids):
@@ -861,7 +865,7 @@ api GET "/api/v1/audit?limit=50&capability=systemd"
 expect_status "6.6 capability 过滤 200" 200
 if "$PYTHON" - "$BODY" <<'PY'
 import json, sys
-data = json.load(sys.stdin)
+data = json.loads(sys.argv[1])
 entries = data.get("entries", [])
 if entries and all(e.get("capability") == "systemd" for e in entries):
     raise SystemExit(0)
@@ -877,7 +881,7 @@ api GET "/api/v1/audit?limit=50&agent_id=${A_ID}"
 expect_status "6.8 agent_id 过滤 200" 200
 if "$PYTHON" - "$BODY" "$A_ID" <<'PY'
 import json, sys
-data = json.load(sys.stdin)
+data = json.loads(sys.argv[1])
 agent = sys.argv[2]
 entries = data.get("entries", [])
 if entries and all(e.get("agent_id") == agent for e in entries):
@@ -894,7 +898,7 @@ fi
 api GET "/api/v1/audit?limit=100&capability=systemd"
 if "$PYTHON" - "$BODY" <<'PY'
 import json, sys
-entries = json.load(sys.stdin).get("entries", [])
+entries = json.loads(sys.argv[1]).get("entries", [])
 results = {e.get("result") for e in entries}
 codes = {e.get("error_code") for e in entries if e.get("result") != "ok"}
 actors = {e.get("actor") for e in entries}
