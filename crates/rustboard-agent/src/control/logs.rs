@@ -651,6 +651,7 @@ mod tests {
 
     #[test]
     fn journal_tail_uses_fixed_args_for_whitelisted_unit() {
+        let _guard = exec::test_serial_guard();
         let dir = temp_dir("journal");
         let args_file = dir.join("args.txt");
         let script = write_script(
@@ -705,6 +706,7 @@ mod tests {
 
     #[test]
     fn journal_tail_non_zero_exit_is_control_failed() {
+        let _guard = exec::test_serial_guard();
         let dir = temp_dir("journal-fail");
         let script = write_script(&dir, "journalctl", "printf 'no journal\\n' >&2\nexit 1");
         let mut cfg = cfg_with(vec![journal_source("j", "nginx.service")]);

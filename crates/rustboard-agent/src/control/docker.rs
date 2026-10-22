@@ -167,6 +167,7 @@ malformed-without-tabs\n";
 
     #[test]
     fn list_runs_fixed_args_and_filters_output() {
+        let _guard = exec::test_serial_guard();
         let dir = temp_dir("list");
         let args_file = dir.join("args.txt");
         let script = write_script(
@@ -200,6 +201,7 @@ malformed-without-tabs\n";
 
     #[test]
     fn action_uses_verb_and_container() {
+        let _guard = exec::test_serial_guard();
         let dir = temp_dir("action");
         let args_file = dir.join("args.txt");
         let script = write_script(

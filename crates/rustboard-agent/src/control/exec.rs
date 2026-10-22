@@ -227,6 +227,15 @@ fn read_capped<R: Read>(mut reader: R, cap: usize) -> (Vec<u8>, bool) {
     (kept, truncated)
 }
 
+/// 测试用全局锁：多个测试会写临时可执行脚本并 spawn 子进程；并行 fork 时
+/// 另一个线程继承的写 fd 会让 exec 偶发 ETXTBSY。串行化所有 spawn 测试。
+#[cfg(test)]
+pub(crate) fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +285,7 @@ mod tests {
 
     #[test]
     fn env_clear_keeps_only_path_and_lang() {
+        let _guard = test_serial_guard();
         let tool = resolve_tool("", "env").expect("env 应存在");
         let out = run(&tool, &[], Duration::from_secs(5), 4096).unwrap();
         assert_eq!(out.exit_code, Some(0));
@@ -291,6 +301,7 @@ mod tests {
 
     #[test]
     fn timeout_kills_command_and_returns_control_failed() {
+        let _guard = test_serial_guard();
         let dir = temp_dir("timeout");
         // exec sleep：kill 直接命中 sleep，读线程随管道关闭退出，不会等满 5s。
         let script = write_script(&dir, "hang", "exec sleep 5");
@@ -310,6 +321,7 @@ mod tests {
 
     #[test]
     fn large_output_is_truncated_with_marker() {
+        let _guard = test_serial_guard();
         let dir = temp_dir("truncate");
         let script = write_script(&dir, "noisy", "head -c 300000 /dev/zero");
         let out = run(&script, &[], Duration::from_secs(5), 1024).unwrap();
@@ -331,6 +343,7 @@ mod tests {
 
     #[test]
     fn non_zero_exit_is_a_result_not_a_transport_error() {
+        let _guard = test_serial_guard();
         let dir = temp_dir("exit");
         let script = write_script(&dir, "fails", "printf 'oops' >&2\nexit 7");
         let out = run(&script, &[], Duration::from_secs(5), 4096).unwrap();
@@ -345,6 +358,7 @@ mod tests {
 
     #[test]
     fn missing_program_returns_control_failed() {
+        let _guard = test_serial_guard();
         let err = run(
             Path::new("/definitely/not/here/program"),
             &[],

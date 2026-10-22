@@ -12,7 +12,8 @@ use rustboard_common::control::{
     MAX_PROCESS_ITEMS,
 };
 
-/// 扫描 `/proc` 列出进程。PID 升序，最多 200 条；已退出的进程跳过。
+/// 扫描 `/proc` 列出进程。PID 降序（新进程优先），最多 200 条；
+/// 读取失败的进程（已退出 / 无权限）跳过并继续补足，不会让整个列表失败。
 pub fn list() -> Result<ControlResult, ControlError> {
     let mut pids: Vec<u32> = fs::read_dir("/proc")
         .map_err(|err| ControlError::control_failed(format!("读取 /proc 失败: {err}")))?
@@ -24,11 +25,15 @@ pub fn list() -> Result<ControlResult, ControlError> {
                 .and_then(|name| name.parse::<u32>().ok())
         })
         .collect();
-    pids.sort_unstable();
-    pids.truncate(MAX_PROCESS_ITEMS);
+    // 新进程优先：PID 越大越新，控制台/ e2e 更关心刚启动的进程。
+    pids.sort_unstable_by(|left, right| right.cmp(left));
 
-    let mut processes = Vec::with_capacity(pids.len());
+    let mut processes = Vec::with_capacity(MAX_PROCESS_ITEMS);
     for pid in pids {
+        if processes.len() >= MAX_PROCESS_ITEMS {
+            break;
+        }
+        // 进程可能在扫描期间退出；跳过并继续补足，不因单个 /proc 读取失败返回错误。
         if let Some(info) = read_process(pid) {
             processes.push(info);
         }
@@ -161,13 +166,21 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    fn wait_for_comm(pid: u32) -> String {
+    /// 等子进程真正 exec 到目标程序：fork 之后、exec 之前 comm 仍是测试进程名，
+    /// 只等“可读”会拿到旧名字，导致偶发的名称不匹配。
+    fn wait_for_comm(pid: u32, expected: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) {
-                return comm.trim_end_matches('\n').to_string();
+                let comm = comm.trim_end_matches('\n').to_string();
+                if comm == expected {
+                    return comm;
+                }
             }
-            assert!(Instant::now() < deadline, "进程 {pid} 的 comm 一直不可读");
+            assert!(
+                Instant::now() < deadline,
+                "进程 {pid} 的 comm 在 2s 内没有变成 {expected}"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -218,12 +231,13 @@ mod tests {
 
     #[test]
     fn kill_requires_matching_comm_then_sends_sigterm() {
+        let _guard = crate::control::exec::test_serial_guard();
         let mut child = Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("测试需要 sleep 命令");
         let pid = child.id();
-        let comm = wait_for_comm(pid);
+        let comm = wait_for_comm(pid, "sleep");
 
         // 名称不匹配：必须拒绝且进程仍然存活。
         let err = kill(pid, "definitely-not-the-process-name", KillSignal::Term).unwrap_err();
@@ -254,7 +268,10 @@ mod tests {
             ControlResult::Processes(processes) => {
                 assert!(processes.len() <= MAX_PROCESS_ITEMS);
                 for pair in processes.windows(2) {
-                    assert!(pair[0].pid <= pair[1].pid, "进程列表必须按 PID 升序");
+                    assert!(
+                        pair[0].pid >= pair[1].pid,
+                        "进程列表必须按 PID 降序（新进程优先）"
+                    );
                 }
             }
             other => panic!("意外结果: {other:?}"),

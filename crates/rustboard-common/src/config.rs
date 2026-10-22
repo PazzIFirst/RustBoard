@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use crate::{control, Error, Result};

@@ -165,6 +165,7 @@ malformed line
 
     #[test]
     fn list_runs_fixed_args_and_parses_fake_output() {
+        let _guard = exec::test_serial_guard();
         let dir = temp_dir("list");
         let args_file = dir.join("args.txt");
         let script = write_script(
@@ -202,6 +203,7 @@ malformed line
 
     #[test]
     fn action_uses_verb_and_unit_and_reports_exit_code() {
+        let _guard = exec::test_serial_guard();
         let dir = temp_dir("action");
         let args_file = dir.join("args.txt");
         let script = write_script(
@@ -242,6 +244,7 @@ malformed line
 
     #[test]
     fn missing_tool_and_failed_list_are_control_failed() {
+        let _guard = exec::test_serial_guard();
         let cfg = ControlConfig {
             enabled: true,
             systemd: true,
