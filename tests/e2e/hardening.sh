@@ -339,10 +339,21 @@ panel_login() {
   # $1 密码，$2 XFF（可空），$3 XFP（可空），$4 cookie 输出（可空）
   local password=$1 xff=$2 xfp=$3 cookie_out=$4
   local args=(login --url "$PANEL_URL/api/login" --password "$password")
-  [[ -n "$xff" ]] && args+=(--header "X-Forwarded-For: $xff")
-  [[ -n "$xfp" ]] && args+=(--header "X-Forwarded-Proto: $xfp")
-  [[ -n "$cookie_out" ]] && args+=(--cookie-out "$cookie_out")
-  "$PYTHON" "$PANEL_PROBE" "${args[@]}"
+  # 注意：不能用 `[[ ... ]] && args+=(...)`，条件为假时整个 && 列表返回 1，
+  # 在 set -e 下会让函数在 probe 执行前直接退出（无 cookie_out 的调用必踩）。
+  if [[ -n "$xff" ]]; then
+    args+=(--header "X-Forwarded-For: $xff")
+  fi
+  if [[ -n "$xfp" ]]; then
+    args+=(--header "X-Forwarded-Proto: $xfp")
+  fi
+  if [[ -n "$cookie_out" ]]; then
+    args+=(--cookie-out "$cookie_out")
+  fi
+  if "$PYTHON" "$PANEL_PROBE" "${args[@]}"; then
+    return 0
+  fi
+  return 1
 }
 
 echo "==> 构建 rustboard-hub / rustboard-agent / rustboard-panel"
