@@ -153,6 +153,14 @@ http_call() {
   "$PYTHON" "$HARDEN_PROBE" http "$@"
 }
 
+# 只取 HTTP 响应体。hardening_probe 的 http 输出是 {status,headers,body} 信封，
+# 不能把整个信封直接喂给解析业务 JSON 的 Python。
+http_body() {
+  local out
+  out=$(http_call "$@" --max-body 33554432 --max-inline 33554432 2>/dev/null || true)
+  printf '%s' "$out" | json_get body || true
+}
+
 wait_http_200() {
   local url=$1 timeout=$2
   local deadline=$(( $(date +%s%3N) + timeout * 1000 ))
@@ -258,9 +266,9 @@ EOF
 }
 
 agent_field() {
-  local agent_id=$1 field=$2 out
-  out=$(http_call --url "$ADMIN_URL/api/v1/agents" --bearer-env 2>/dev/null || true)
-  printf '%s' "$out" | "$PYTHON" -c '
+  local agent_id=$1 field=$2 body
+  body=$(http_body --url "$ADMIN_URL/api/v1/agents" --bearer-env)
+  printf '%s' "$body" | "$PYTHON" -c '
 import json
 import sys
 
@@ -295,10 +303,10 @@ wait_agent_online() {
 }
 
 agent_samples() {
-  local agent_id=$1 out
-  out=$(http_call --url "$ADMIN_URL/api/v1/series?agent=$agent_id&metric=cpu.usage&from=0&to=9999999999999&limit=50000" \
-    --bearer-env 2>/dev/null || true)
-  printf '%s' "$out" | "$PYTHON" -c '
+  local agent_id=$1 body
+  body=$(http_body --url "$ADMIN_URL/api/v1/series?agent=$agent_id&metric=cpu.usage&from=0&to=9999999999999&limit=50000" \
+    --bearer-env)
+  printf '%s' "$body" | "$PYTHON" -c '
 import json
 import sys
 try:
@@ -568,7 +576,7 @@ fi
 echo
 echo "==> 6/9 rotate-cert 热加载（live/disk/实际 TLS）"
 system_json() {
-  http_call --url "$ADMIN_URL/api/v1/system" --bearer-env 2>/dev/null || true
+  http_body --url "$ADMIN_URL/api/v1/system" --bearer-env
 }
 old_sys=$(system_json)
 OLD_LIVE=$(printf '%s' "$old_sys" | json_get cert.live.fingerprint || true)
