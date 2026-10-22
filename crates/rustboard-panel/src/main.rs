@@ -1482,7 +1482,7 @@ mod tests {
             admin_password_hash: hash,
             ..PanelConfig::default()
         };
-        Arc::new(AppState::new(cfg, None).unwrap())
+        Arc::new(AppState::new(cfg, None, None).unwrap())
     }
 
     async fn call(
