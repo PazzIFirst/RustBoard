@@ -8,17 +8,24 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 
-use super::{IngestOutcome, RejectReason, Storage};
+use super::{AgentSeriesRow, IngestOutcome, QueryTooLarge, RejectReason, Storage};
 
 /// `PRAGMA user_version`：v1 = `ingest_state` 以 agent_id 为主键，
-/// v2 = `(agent_id, epoch)`，v3 = 新增 `ingest_batches` 精确判重。
-const SCHEMA_VERSION: i64 = 3;
+/// v2 = `(agent_id, epoch)`，v3 = 新增 `ingest_batches` 精确判重，
+/// v4 = 新增 `agent_settings`（每台 agent 的采样间隔，纯新增表）。
+const SCHEMA_VERSION: i64 = 4;
 
 /// `ingest_batches` 判重记录保留 48 小时；过期后重放视为新批次。
 const INGEST_BATCH_TTL_MS: i64 = 48 * 60 * 60 * 1000;
 
 /// 每这么多次成功插入清理一次过期判重记录，避免每批都执行 DELETE。
 const INGEST_CLEANUP_EVERY: u64 = 512;
+
+/// `latest_samples` 单次查询允许扫描的行数硬上限。
+///
+/// 60s 窗口在大量 agent 的高频采样下仍可能超过 10 万行；SQL 侧先 `LIMIT`
+/// 截断，达到上限时返回 [`QueryTooLarge`]，避免把整窗口读进内存。
+const LATEST_SAMPLES_SQL_LIMIT: usize = 100_000;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS agents (
@@ -62,6 +69,12 @@ CREATE TABLE IF NOT EXISTS revoked_agents (
     agent_id   TEXT PRIMARY KEY,
     revoked_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS agent_settings (
+    agent_id           TEXT PRIMARY KEY,
+    sample_interval_ms INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL
+);
 "#;
 
 /// v2 的去重状态表：每个 `(agent_id, epoch)` 独立记录 `last_seq`。
@@ -89,6 +102,15 @@ CREATE TABLE IF NOT EXISTS ingest_batches (
     PRIMARY KEY (agent_id, epoch, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_ingest_batches_ts ON ingest_batches(ts);
+"#;
+
+/// v4 新增表：每台 agent 的显式采样间隔。纯新增，不重写旧表。
+const AGENT_SETTINGS: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_settings (
+    agent_id           TEXT PRIMARY KEY,
+    sample_interval_ms INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL
+);
 "#;
 
 pub struct SqliteStorage {
@@ -135,10 +157,84 @@ impl SqliteStorage {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
+
+    /// `latest_samples` 的实现：SQL 侧最多取 `limit` 行。
+    ///
+    /// 达到上限（行数 == limit）时返回错误而不是静默截断：截断后的「最新点」
+    /// 可能缺序列，面板会显示错误的监控数据；宁可让调用方缩小窗口。
+    fn latest_samples_limited(
+        &self,
+        since: i64,
+        metrics: &[String],
+        agent: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AgentSeriesRow>> {
+        debug_assert!(limit > 0, "latest_samples 的行数上限必须大于 0");
+        let conn = self.lock();
+
+        let mut sql =
+            String::from("SELECT agent_id, metric, labels, ts, value FROM samples WHERE ts >= ?");
+        let mut params: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Integer(since)];
+        if let Some(agent_id) = agent {
+            sql.push_str(" AND agent_id = ?");
+            params.push(rusqlite::types::Value::Text(agent_id.to_string()));
+        }
+        if !metrics.is_empty() {
+            let holders = vec!["?"; metrics.len()].join(",");
+            sql.push_str(&format!(" AND metric IN ({holders})"));
+            for metric in metrics {
+                params.push(rusqlite::types::Value::Text(metric.clone()));
+            }
+        }
+        sql.push_str(" ORDER BY agent_id, metric, labels, ts ASC LIMIT ?");
+        params.push(rusqlite::types::Value::Integer(
+            i64::try_from(limit).unwrap_or(i64::MAX),
+        ));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+            let labels_json: String = r.get(2)?;
+            let labels: Labels = serde_json::from_str(&labels_json).unwrap_or_default();
+            Ok(AgentSeriesRow {
+                agent_id: r.get(0)?,
+                metric: r.get(1)?,
+                labels,
+                ts: r.get(3)?,
+                value: r.get(4)?,
+            })
+        })?;
+        let rows: Vec<AgentSeriesRow> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+        if rows.len() >= limit {
+            tracing::error!(
+                limit,
+                since,
+                metrics = metrics.len(),
+                agent = agent.unwrap_or("<all>"),
+                "latest_samples 达到 SQL 行数硬上限，拒绝返回可能不完整的快照"
+            );
+            return Err(anyhow::Error::new(QueryTooLarge { limit }));
+        }
+
+        // SQL 已按 ts 升序；同键后到的（更新的 ts）覆盖先到的。
+        // 用 BTreeMap 保证最终输出顺序稳定，便于面板与测试断言。
+        let mut latest: std::collections::BTreeMap<(String, String, Labels), AgentSeriesRow> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let key = (row.agent_id.clone(), row.metric.clone(), row.labels.clone());
+            match latest.get(&key) {
+                Some(existing) if existing.ts > row.ts => {}
+                _ => {
+                    latest.insert(key, row);
+                }
+            }
+        }
+        Ok(latest.into_values().collect())
+    }
 }
 
 /// 把 `ingest_state` 从 v1（agent_id 主键）迁移到 v2（agent_id + epoch 主键），
-/// 并为 v3 建好 `ingest_batches` 精确判重表。
+/// 为 v3 建好 `ingest_batches` 精确判重表，为 v4 建好 `agent_settings` 表。
 ///
 /// v1 代码从未写过 `user_version`，所以只靠版本号无法区分「空库」和「v1 库」：
 /// 版本号不足 2 时再看表是否存在。整个迁移在一个 `BEGIN IMMEDIATE` 事务里完成，
@@ -180,13 +276,14 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     // 无论版本如何都执行 IF NOT EXISTS：兼容 v1/v2 以及迁移中断后缺表的库。
     tx.execute_batch(INGEST_STATE_V2)?;
     tx.execute_batch(INGEST_BATCHES)?;
+    tx.execute_batch(AGENT_SETTINGS)?;
 
     if version < SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tracing::info!(
             from = version,
             to = SCHEMA_VERSION,
-            "数据库已迁移：新增 ingest_batches 精确判重"
+            "数据库已迁移：新增 agent_settings（每 agent 采样间隔）"
         );
     }
     tx.commit()?;
@@ -430,6 +527,105 @@ impl Storage for SqliteStorage {
             |r| r.get(0),
         )?;
         Ok(count)
+    }
+
+    fn query_series_bucketed(&self, query: &SeriesQuery, bucket_ms: i64) -> Result<Vec<SeriesRow>> {
+        if bucket_ms <= 0 {
+            anyhow::bail!("bucket_ms 必须大于 0");
+        }
+        let conn = self.lock();
+
+        // 参数全部绑定：只有占位符数量由 metrics 决定，值本身不进 SQL 文本。
+        // 桶起点 = floor(ts / bucket_ms) * bucket_ms（Unix 毫秒均为正数）。
+        let mut sql = String::from(
+            "SELECT metric, labels, (ts / ?4) * ?4 AS bucket_ts, AVG(value)
+             FROM samples
+             WHERE agent_id = ?1 AND ts >= ?2 AND ts <= ?3",
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Text(query.agent_id.clone()),
+            rusqlite::types::Value::Integer(query.from),
+            rusqlite::types::Value::Integer(query.to),
+            rusqlite::types::Value::Integer(bucket_ms),
+        ];
+        if !query.metrics.is_empty() {
+            let holders: Vec<String> = (0..query.metrics.len())
+                .map(|i| format!("?{}", 5 + i))
+                .collect();
+            sql.push_str(&format!(" AND metric IN ({})", holders.join(",")));
+            for metric in &query.metrics {
+                params.push(rusqlite::types::Value::Text(metric.clone()));
+            }
+        }
+        let limit_idx = params.len() + 1;
+        sql.push_str(&format!(
+            " GROUP BY metric, labels, bucket_ts
+              ORDER BY metric, labels, bucket_ts
+              LIMIT ?{limit_idx}"
+        ));
+        params.push(rusqlite::types::Value::Integer(i64::from(query.limit)));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+            let labels_json: String = r.get(1)?;
+            let labels: Labels = serde_json::from_str(&labels_json).unwrap_or_default();
+            Ok(SeriesRow {
+                metric: r.get(0)?,
+                labels,
+                ts: r.get(2)?,
+                value: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn latest_samples(
+        &self,
+        since: i64,
+        metrics: &[String],
+        agent: Option<&str>,
+    ) -> Result<Vec<AgentSeriesRow>> {
+        self.latest_samples_limited(since, metrics, agent, LATEST_SAMPLES_SQL_LIMIT)
+    }
+
+    fn get_sample_interval(&self, agent_id: &str) -> Result<Option<u64>> {
+        let stored: Option<i64> = self
+            .lock()
+            .query_row(
+                "SELECT sample_interval_ms FROM agent_settings WHERE agent_id = ?1",
+                params![agent_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(stored.and_then(|ms| u64::try_from(ms).ok()))
+    }
+
+    fn set_sample_interval(&self, agent_id: &str, ms: u64, now: i64) -> Result<()> {
+        let ms = i64::try_from(ms).context("sample_interval_ms 超出可存储范围")?;
+        self.lock().execute(
+            "INSERT INTO agent_settings (agent_id, sample_interval_ms, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                sample_interval_ms = excluded.sample_interval_ms,
+                updated_at = excluded.updated_at",
+            params![agent_id, ms, now],
+        )?;
+        Ok(())
+    }
+
+    fn list_sample_intervals(&self) -> Result<Vec<(String, u64)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT agent_id, sample_interval_ms FROM agent_settings ORDER BY agent_id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (agent_id, ms) = row?;
+            if let Ok(ms) = u64::try_from(ms) {
+                out.push((agent_id, ms));
+            }
+        }
+        Ok(out)
     }
 
     fn create_enroll_token(
@@ -808,7 +1004,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// L3：v2 库（user_version=2）启动时补建 ingest_batches，并升级到 v3。
+    /// L3：v2 库（user_version=2）启动时补建 ingest_batches 与 agent_settings，升级到 v4。
     #[test]
     fn l3_v2_schema_upgrades_to_v3_with_ingest_batches() {
         let dir = std::env::temp_dir().join(format!("rb-sqlite-v2-{}", std::process::id()));
@@ -837,7 +1033,7 @@ mod tests {
             .lock()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         // 水位 9 只作统计：seq 3 未处理过，必须正常写入（M2）。
         assert_eq!(
             s.insert_batch(&batch_with("a1", 1, 3)).unwrap(),
@@ -956,5 +1152,278 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value, 12.5);
+    }
+
+    /// 直接写 samples 表，绕开批次判重（聚合 / 最新点测试只关心数据本身）。
+    fn insert_samples(s: &SqliteStorage, agent_id: &str, rows: &[(&str, &str, i64, f64)]) {
+        let conn = s.lock();
+        let mut stmt = conn
+            .prepare("INSERT INTO samples (agent_id, metric, labels, ts, value) VALUES (?1, ?2, ?3, ?4, ?5)")
+            .unwrap();
+        for (metric, labels, ts, value) in rows {
+            stmt.execute(params![agent_id, metric, labels, ts, value])
+                .unwrap();
+        }
+    }
+
+    /// v4：`agent_settings` 按 agent 覆盖写入，列表按 agent_id 稳定排序。
+    #[test]
+    fn v4_agent_settings_roundtrip() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        assert_eq!(s.get_sample_interval("a1").unwrap(), None);
+        assert!(s.list_sample_intervals().unwrap().is_empty());
+
+        s.set_sample_interval("a1", 10_000, 100).unwrap();
+        s.set_sample_interval("a2", 5_000, 101).unwrap();
+        s.set_sample_interval("a1", 30_000, 102).unwrap();
+
+        assert_eq!(s.get_sample_interval("a1").unwrap(), Some(30_000));
+        assert_eq!(s.get_sample_interval("a2").unwrap(), Some(5_000));
+        assert_eq!(s.get_sample_interval("missing").unwrap(), None);
+        assert_eq!(
+            s.list_sample_intervals().unwrap(),
+            vec![("a1".to_string(), 30_000), ("a2".to_string(), 5_000)]
+        );
+
+        let updated_at: i64 = s
+            .lock()
+            .query_row(
+                "SELECT updated_at FROM agent_settings WHERE agent_id = 'a1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_at, 102, "覆盖写入必须刷新 updated_at");
+    }
+
+    /// v3 → v4：只建新表、升级 user_version，旧数据原样保留；重复打开幂等。
+    #[test]
+    fn v4_migration_from_v3_is_idempotent_and_preserves_data() {
+        let dir = std::env::temp_dir().join(format!("rb-sqlite-v3-v4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("rustboard.db");
+        {
+            // 模拟 v3 库：真实旧表结构 + 一行样本，user_version = 3。
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE samples (
+                     agent_id TEXT NOT NULL,
+                     metric   TEXT NOT NULL,
+                     labels   TEXT NOT NULL DEFAULT '{}',
+                     ts       INTEGER NOT NULL,
+                     value    REAL NOT NULL
+                 );
+                 CREATE TABLE ingest_state (
+                     agent_id   TEXT NOT NULL,
+                     epoch      INTEGER NOT NULL,
+                     last_seq   INTEGER NOT NULL DEFAULT 0,
+                     updated_at INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (agent_id, epoch)
+                 );
+                 INSERT INTO samples (agent_id, metric, labels, ts, value)
+                     VALUES ('a1', 'cpu.usage', '{}', 1700000000000, 12.5);
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        }
+
+        for _ in 0..2 {
+            let s = SqliteStorage::open(&db_path).unwrap();
+            let version: i64 = s
+                .lock()
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 4);
+            let settings_table: i64 = s
+                .lock()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_settings')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(settings_table, 1, "v4 必须创建 agent_settings");
+            assert_eq!(s.sample_count("a1").unwrap(), 1, "旧样本不得被重写或删除");
+
+            let rows = s
+                .query_series(&SeriesQuery {
+                    agent_id: "a1".into(),
+                    metrics: Vec::new(),
+                    from: 0,
+                    to: i64::MAX,
+                    limit: 10,
+                })
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].value, 12.5);
+            assert_eq!(rows[0].ts, 1_700_000_000_000);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同桶多点取平均、ts 返回桶起点、空桶不补点；多指标分别聚合。
+    #[test]
+    fn v4_bucketed_query_averages_and_skips_empty_buckets() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", 1_000, 10.0),
+                ("cpu.usage", "{}", 1_900, 20.0),
+                ("cpu.usage", "{}", 2_100, 30.0),
+                ("cpu.usage", "{}", 4_000, 40.0),
+                ("mem.used", "{}", 1_500, 100.0),
+            ],
+        );
+
+        let query = SeriesQuery {
+            agent_id: "a1".into(),
+            metrics: Vec::new(),
+            from: 0,
+            to: 10_000,
+            limit: 100,
+        };
+        let rows = s.query_series_bucketed(&query, 2_000).unwrap();
+        let summary: Vec<(&str, i64, f64)> = rows
+            .iter()
+            .map(|r| (r.metric.as_str(), r.ts, r.value))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("cpu.usage", 0, 15.0),
+                ("cpu.usage", 2_000, 30.0),
+                ("cpu.usage", 4_000, 40.0),
+                ("mem.used", 0, 100.0),
+            ],
+            "同桶平均、桶起点、空桶（6s/8s）不补点"
+        );
+
+        // 指标过滤仍走参数绑定，且不影响聚合结果。
+        let filtered = s
+            .query_series_bucketed(
+                &SeriesQuery {
+                    metrics: vec!["cpu.usage".into()],
+                    ..query.clone()
+                },
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(filtered.len(), 3);
+        assert!(filtered.iter().all(|r| r.metric == "cpu.usage"));
+
+        // 非法桶宽直接拒绝，避免除法/乘法产生无意义结果。
+        assert!(s.query_series_bucketed(&query, 0).is_err());
+        assert!(s.query_series_bucketed(&query, -1).is_err());
+    }
+
+    /// 多桶同时存在时 `LIMIT` 作用在聚合之后（上层靠多取一条判定超限）。
+    #[test]
+    fn v4_bucketed_query_honours_limit_after_grouping() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", 1_000, 1.0),
+                ("cpu.usage", "{}", 1_500, 3.0),
+                ("cpu.usage", "{}", 2_000, 2.0),
+            ],
+        );
+        let rows = s
+            .query_series_bucketed(
+                &SeriesQuery {
+                    agent_id: "a1".into(),
+                    metrics: Vec::new(),
+                    from: 0,
+                    to: 10_000,
+                    limit: 1,
+                },
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value, 2.0, "桶内平均后再截断");
+    }
+
+    /// 最新点：按 (agent_id, metric, labels) 去重取最大 ts；指标 / agent 过滤生效。
+    #[test]
+    fn v4_latest_samples_dedupes_by_series_and_keeps_newest() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", 1_000, 1.0),
+                ("cpu.usage", "{}", 3_000, 3.0),
+                ("mem.used", "{}", 2_000, 20.0),
+                ("cpu.usage", "{\"core\":\"0\"}", 2_500, 25.0),
+            ],
+        );
+        insert_samples(&s, "a2", &[("cpu.usage", "{}", 4_000, 40.0)]);
+
+        let all = s.latest_samples(0, &[], None).unwrap();
+        assert_eq!(all.len(), 4, "同序列只保留最新一点，不同 label 是不同序列");
+        let a1_cpu = all
+            .iter()
+            .find(|r| r.agent_id == "a1" && r.metric == "cpu.usage" && r.labels.is_empty())
+            .expect("a1 的 cpu.usage 必须存在");
+        assert_eq!(a1_cpu.ts, 3_000);
+        assert_eq!(a1_cpu.value, 3.0);
+        assert!(
+            all.windows(2)
+                .all(|w| (&w[0].agent_id, &w[0].metric) <= (&w[1].agent_id, &w[1].metric)),
+            "返回顺序必须稳定"
+        );
+
+        let cpu_only = s
+            .latest_samples(0, &["cpu.usage".to_string()], None)
+            .unwrap();
+        assert_eq!(cpu_only.len(), 3);
+
+        let a1_only = s.latest_samples(0, &[], Some("a1")).unwrap();
+        assert_eq!(a1_only.len(), 3);
+        assert!(a1_only.iter().all(|r| r.agent_id == "a1"));
+
+        let recent = s.latest_samples(2_600, &[], None).unwrap();
+        assert_eq!(
+            recent.len(),
+            2,
+            "since 之后只剩 a1 cpu(3000) 与 a2 cpu(4000)"
+        );
+    }
+
+    /// M2-6：`latest_samples` 的 SQL 行数硬上限。
+    ///
+    /// 达到上限必须返回错误（不能静默截断后把不完整快照当成最新点），
+    /// 未达到时正常返回；同时确认常量确实限制在 10 万行。
+    #[test]
+    fn m2_latest_samples_hard_row_limit_is_enforced() {
+        assert_eq!(LATEST_SAMPLES_SQL_LIMIT, 100_000);
+
+        let s = SqliteStorage::open_in_memory().unwrap();
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", 1_000, 1.0),
+                ("mem.used", "{}", 2_000, 2.0),
+            ],
+        );
+
+        let err = s.latest_samples_limited(0, &[], None, 1).unwrap_err();
+        let typed = err
+            .downcast_ref::<QueryTooLarge>()
+            .expect("达到上限必须是可识别的 QueryTooLarge，供 HTTP 层映射为 413");
+        assert_eq!(typed.limit, 1);
+        assert!(err.to_string().contains("1 行上限"), "错误信息: {err}");
+        // 恰好等于上限也算「达到」，因为无法区分后面还有没有更多行。
+        assert!(s.latest_samples_limited(0, &[], None, 2).is_err());
+        // 未达到上限时正常去重返回。
+        let rows = s.latest_samples_limited(0, &[], None, 3).unwrap();
+        assert_eq!(rows.len(), 2);
     }
 }

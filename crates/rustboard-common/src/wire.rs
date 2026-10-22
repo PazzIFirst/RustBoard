@@ -55,6 +55,7 @@ pub struct EnrollResponse {
 ///
 /// `Debug` 是手写的，只输出变体名：`Hello`/`Enroll`/`Enrolled` 里带
 /// secret、token 与 CSR，一旦被 `tracing::debug!(?frame)` 打出来就是泄露。
+/// `RenewCert`/`CertRenewed` 同样按变体名处理，避免证书与 CSR 内容进日志。
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Frame {
     Enroll(EnrollRequest),
@@ -72,6 +73,17 @@ pub enum Frame {
     },
     Pong {
         ts: i64,
+    },
+    /// agent → hub：用当前私钥换一张新客户端证书（只在已认证会话内发送）。
+    ///
+    /// 旧 hub 收到未知变体会走「解码失败、跳过」分支，不会因此断开会话；
+    /// 旧 agent 永远不会发送这一帧，因此协议版本保持 v2 不变。
+    RenewCert {
+        csr_pem: String,
+    },
+    /// hub → agent：客户端证书续签结果。
+    CertRenewed {
+        cert_pem: String,
     },
     Problem {
         code: String,
@@ -91,6 +103,8 @@ impl Frame {
             Frame::Ack { .. } => "Ack",
             Frame::Ping { .. } => "Ping",
             Frame::Pong { .. } => "Pong",
+            Frame::RenewCert { .. } => "RenewCert",
+            Frame::CertRenewed { .. } => "CertRenewed",
             Frame::Problem { .. } => "Problem",
         }
     }
@@ -119,6 +133,8 @@ pub mod codes {
     pub const ENROLL_DENIED: &str = "enroll_denied";
     pub const INTERNAL: &str = "internal";
     pub const UNSUPPORTED: &str = "unsupported";
+    /// 同一会话内重复发起证书续签：拒绝但**不关闭连接**。
+    pub const RATE_LIMITED: &str = "rate_limited";
 }
 
 #[cfg(test)]
@@ -135,6 +151,52 @@ mod tests {
                 assert_eq!(seq, 42);
             }
             other => panic!("解码出意外帧: {other:?}"),
+        }
+    }
+
+    /// A6：新增的续签帧必须能完整往返，且不改变其他帧的解码行为。
+    #[test]
+    fn a6_renew_frames_roundtrip() {
+        let renew = Frame::RenewCert {
+            csr_pem: "-----BEGIN CERTIFICATE REQUEST-----\ncsr\n".to_string(),
+        };
+        let bytes = renew.encode().unwrap();
+        match Frame::decode(&bytes).unwrap() {
+            Frame::RenewCert { csr_pem } => {
+                assert_eq!(csr_pem, "-----BEGIN CERTIFICATE REQUEST-----\ncsr\n");
+            }
+            other => panic!("解码出意外帧: {other:?}"),
+        }
+
+        let renewed = Frame::CertRenewed {
+            cert_pem: "-----BEGIN CERTIFICATE-----\ncert\n".to_string(),
+        };
+        let bytes = renewed.encode().unwrap();
+        match Frame::decode(&bytes).unwrap() {
+            Frame::CertRenewed { cert_pem } => {
+                assert_eq!(cert_pem, "-----BEGIN CERTIFICATE-----\ncert\n");
+            }
+            other => panic!("解码出意外帧: {other:?}"),
+        }
+
+        assert_eq!(renew.kind(), "RenewCert");
+        assert_eq!(renewed.kind(), "CertRenewed");
+    }
+
+    /// A6：续签帧的 Debug 同样只输出变体名，CSR / 证书内容不能进日志。
+    #[test]
+    fn a6_renew_frames_debug_never_prints_material() {
+        let renew = Frame::RenewCert {
+            csr_pem: "csr-private-material".to_string(),
+        };
+        let renewed = Frame::CertRenewed {
+            cert_pem: "cert-material".to_string(),
+        };
+        for frame in [renew, renewed] {
+            let text = format!("{frame:?}");
+            assert_eq!(text, frame.kind());
+            assert!(!text.contains("csr-private-material"));
+            assert!(!text.contains("cert-material"));
         }
     }
 

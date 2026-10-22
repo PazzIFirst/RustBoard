@@ -11,11 +11,16 @@
 设计文档见 [docs/requirements.md](docs/requirements.md)，实现进度见 [docs/status.md](docs/status.md)。
 协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **当前状态：M1 已闭环（协议 v2 + TLS / mTLS / enrollment）。** 面板、控制面、告警尚未实现。
-> 证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。
+> **当前状态：M1 已闭环；证书有效期/自动轮换与 M2 面板已完成（v0.2.0）。**
+> 控制面、告警尚未实现；证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。
 >
 > 线协议版本为 **2**：hub 与 agent 必须严格一致。版本不符时 hub 回 `bad_protocol`
 > 且不下发 Welcome，agent 打印明确错误并以非零码退出，不会进入重连循环。
+>
+> **升级提示（v0.1 → v0.2）**：v0.2 的 agent 在纳管后改用「CA 信任 + 主机名校验」，
+> 因此服务端证书轮换后无需重新纳管；v0.1 的 agent 仍使用服务端指纹钉扎，
+> 一旦执行 `rustboard-hub rotate-cert` 或服务端证书到期续签就会失联，请先升级 agent。
+> 自动续签只在证书剩余寿命低于 `renew_before_days`（默认 30 天）时触发。
 
 ## 安全模型
 
@@ -23,11 +28,19 @@
 2. `rustboard-hub agent add --name web-01` 生成**一次性** enrollment token（默认 30 分钟）。
 3. agent 首次连接用安装命令里带过来的**指纹钉扎**校验 hub（等价 SSH 的 known_hosts），
    发送 CSR，hub 用私有 CA 签发客户端证书，并下发该机器独有的 `agent_secret`。
-   > 当前实现**未设置证书有效期**（rcgen 默认到 4096 年），自动轮换待实现；泄露后请用 `agent revoke` 吊销。
-4. 之后所有连接走 mTLS；Hello 里再带 `agent_secret` 做身份绑定（防止已纳管机器互相冒名）。
-5. `rustboard-hub agent revoke --id <id>` 立即清除 secret 并拒绝该 agent 重连。
-6. 敏感文件从创建起就是 0600（配置 / 私钥 / secret），证书为 0644；
+   证书有效期默认：CA 3650 天、服务端 365 天、客户端 90 天，均可配置。
+4. 纳管成功后 agent 改用 **CA 信任 + 主机名校验**；客户端证书在剩余
+   `cert_renew_before_days`（默认 30 天）时通过已认证会话自动轮换（复用私钥），
+   服务端证书由 hub 在剩余 `renew_before_days` 时自动续签并热加载，无需重启。
+5. 之后所有连接走 mTLS；Hello 里再带 `agent_secret` 做身份绑定（防止已纳管机器互相冒名）。
+6. `rustboard-hub agent revoke --id <id>` 立即清除 secret 并拒绝该 agent 重连。
+7. 敏感文件从创建起就是 0600（配置 / 私钥 / secret），证书为 0644；
    agent 接入层限制并发连接数、10s TLS 握手超时、10s 请求头读取超时与 15s 写超时。
+8. 运维命令：
+   - `rustboard-agent cert-info` 查看证书 CN / notBefore / notAfter / 剩余天数；
+   - `rustboard-agent renew` 立即强制轮换客户端证书；
+   - `rustboard-hub rotate-cert [--force] [--days N]` 重签服务端证书（成对备份旧 key/cert）；
+     运行中的 hub 需重启后才会使用新证书，`--force` 用于未到阈值时强制轮换。
 
 ## 快速开始（开发环境）
 
@@ -56,15 +69,20 @@ sudo $BIN/rustboard-hub agent add --name web-01
 sudo $BIN/rustboard-agent run &
 sudo $BIN/rustboard-agent info          # 随时查看纳管状态
 
-# 6) 查数据（管理端口用 ports 命令看）
+# 6) 查数据（管理端口用 ports 命令看；M2 起管理 API 需要 Bearer token）
 ADMIN=$(sudo $BIN/rustboard-hub ports | awk '/管理 API 端口/{print $NF}')
-curl -s "http://127.0.0.1:$ADMIN/api/v1/agents"
-curl -s "http://127.0.0.1:$ADMIN/api/v1/series?agent=hub-self&metric=cpu.usage&from=0&to=9999999999999"
+TOKEN=$(sudo $BIN/rustboard-hub admin-token)
+curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$ADMIN/api/v1/agents"
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:$ADMIN/api/v1/agents/hub-self/series?metric=cpu.usage&from=0&to=9999999999999"
 
-# 7) 面板占位页
+# 7) 构建并启动面板（默认只绑 127.0.0.1；远程访问请走 VPN/反代）
+(cd web && pnpm install --frozen-lockfile && pnpm build)
 sudo $BIN/rustboard-panel init --hub "http://127.0.0.1:$ADMIN"
+#   → 打印一次初始管理员密码；token 默认从 /etc/rustboard/hub.toml 读取
 sudo $BIN/rustboard-panel run &
 sudo $BIN/rustboard-panel ports        # 查看面板端口
+# 浏览器打开 http://127.0.0.1:<面板端口>，用刚打印的密码登录
 ```
 
 不想污染系统目录时，全部用 `--config` / `--data-dir` 指到临时目录：
@@ -75,6 +93,22 @@ sudo $BIN/rustboard-panel ports        # 查看面板端口
   --admin-listen 127.0.0.1:18444 --san 127.0.0.1
 ```
 
+### 远程面板
+
+面板默认只监听 `127.0.0.1`，且只提供明文 HTTP。推荐三种方式（按安全性排序）：
+
+1. **SSH 隧道（最简单）**：面板仍绑回环，浏览器侧建隧道
+   `ssh -L 8080:127.0.0.1:<面板端口> user@hub-host`，然后访问 `http://127.0.0.1:8080`。
+2. **VPN / Tailscale**：只把面板绑到 VPN 地址并只对该网段放行，例如
+   `rustboard-panel init --listen 10.8.0.2:<端口> --hub http://10.8.0.1:<管理端口> --hub-token <token>`。
+3. **同机反代 + TLS**：面板绑回环，由 nginx/Caddy 终止 TLS 并反向代理到面板；
+   反代需设置 `X-Forwarded-Proto: https`（面板据此给 Cookie 加 `Secure`），
+   同时自行做登录限速（面板按直连 IP 计数，反代后所有客户端共享同一 IP）。
+
+已有配置如果仍是 `listen = "0.0.0.0:..."`，启动时只会打印明文 HTTP WARN，不会拒绝；
+请改成回环或 VPN 地址。面板访问 hub 的 HTTP 客户端强制直连（忽略 `HTTP_PROXY`），
+因此不能再依赖企业 HTTP 代理访问 hub。
+
 ## 端口
 
 **不占用 8080 / 8443 这类常见端口。** 每个端口在安装时随机挑一个五位数（20000–64999），
@@ -84,7 +118,7 @@ sudo $BIN/rustboard-panel ports        # 查看面板端口
 |---|---|---|---|
 | agent 接入 | 随机五位数 | WSS + mTLS | 必须公网可达 |
 | 管理 API | 随机五位数 | HTTP | 只绑回环/内网，远程面板走 VPN |
-| 面板 | 随机五位数 | HTTP | 同上 |
+| 面板 | 随机五位数 | HTTP | 默认只绑回环；对外必须走 VPN/反代，M5 前不提供面板自身 TLS |
 
 随时在终端查看当前端口：
 

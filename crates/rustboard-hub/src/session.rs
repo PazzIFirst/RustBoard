@@ -5,10 +5,12 @@
 //!
 //! - 只有最后一条连接调用 `unregister` 时返回 `true`，调用方才把状态置为 offline；
 //!   因此旧连接关闭不会覆盖新连接，也不会在仍有连接时误判离线。
-//! - `shutdown` 对该 agent 的全部连接发取消信号，吊销传播不依赖「哪条是最新连接」。
+//! - `shutdown` / `reconfigure` 对该 agent 的全部连接发取消信号，传播不依赖
+//!   「哪条是最新连接」。
 //!
-//! 吊销传播依赖这里的 `shutdown` 信号：管理侧写入 `revoked_agents` 后，
-//! hub 的轮询任务对仍在注册表里的 agent 发送取消信号，会话循环随即关闭。
+//! 关闭原因用 [`ShutdownReason`] 区分：吊销（Revoke）回 `revoked` Problem，
+//! 采样间隔变更（Reconfigure）回 WebSocket `Close(1000)` 正常关闭，让 agent
+//! 立即重连并拿到新的 Welcome。两者都不改变「最后一条连接才 offline」的语义。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,13 +25,22 @@ pub struct SessionRegistry {
 }
 
 struct SessionEntry {
-    connections: HashMap<u64, watch::Sender<bool>>,
+    connections: HashMap<u64, watch::Sender<ShutdownReason>>,
+}
+
+/// 会话关闭原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownReason {
+    /// agent 已被吊销：会话回 `revoked` Problem 后关闭。
+    Revoke,
+    /// 配置变化（采样间隔）：回 `Close(1000)` 正常关闭，agent 随后重连。
+    Reconfigure,
 }
 
 /// 一次注册的凭据：连接编号 + 取消信号接收端。
 pub struct SessionHandle {
     pub conn_id: u64,
-    pub shutdown: watch::Receiver<bool>,
+    pub shutdown: watch::Receiver<ShutdownReason>,
 }
 
 impl SessionRegistry {
@@ -50,7 +61,8 @@ impl SessionRegistry {
     /// 注册一条新连接，返回连接编号与取消信号接收端。
     pub fn register(&self, agent_id: &str) -> SessionHandle {
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
-        let (shutdown, receiver) = watch::channel(false);
+        // 初始值不会触发 `changed()`；真正的关闭原因只由 shutdown/reconfigure 写入。
+        let (shutdown, receiver) = watch::channel(ShutdownReason::Revoke);
         let active = {
             let mut inner = self.lock();
             let entry = inner
@@ -88,13 +100,24 @@ impl SessionRegistry {
         }
     }
 
-    /// 取消某个 agent 的全部活跃连接。连接不存在时返回 `false`。
+    /// 取消某个 agent 的全部活跃连接（吊销语义）。连接不存在时返回 `false`。
     pub fn shutdown(&self, agent_id: &str) -> bool {
+        self.signal(agent_id, ShutdownReason::Revoke)
+    }
+
+    /// 通知某个 agent 的全部活跃连接：采样间隔已变更，正常关闭后重连。
+    ///
+    /// 返回 `false` 表示当前没有活跃连接——配置已落库，下次 Welcome 自然生效。
+    pub fn reconfigure(&self, agent_id: &str) -> bool {
+        self.signal(agent_id, ShutdownReason::Reconfigure)
+    }
+
+    fn signal(&self, agent_id: &str, reason: ShutdownReason) -> bool {
         let inner = self.lock();
         match inner.get(agent_id) {
             Some(entry) => {
                 for shutdown in entry.connections.values() {
-                    let _ = shutdown.send(true);
+                    let _ = shutdown.send(reason);
                 }
                 true
             }
@@ -148,8 +171,8 @@ mod tests {
         let first = registry.register("a");
         let second = registry.register("a");
         assert!(registry.shutdown("a"));
-        assert!(*first.shutdown.borrow());
-        assert!(*second.shutdown.borrow());
+        assert_eq!(*first.shutdown.borrow(), ShutdownReason::Revoke);
+        assert_eq!(*second.shutdown.borrow(), ShutdownReason::Revoke);
         assert!(!registry.shutdown("missing"));
     }
 
@@ -159,8 +182,8 @@ mod tests {
         let a = registry.register("a");
         let b = registry.register("b");
         registry.shutdown_all(&["a".to_string(), "b".to_string(), "c".to_string()]);
-        assert!(*a.shutdown.borrow());
-        assert!(*b.shutdown.borrow());
+        assert_eq!(*a.shutdown.borrow(), ShutdownReason::Revoke);
+        assert_eq!(*b.shutdown.borrow(), ShutdownReason::Revoke);
     }
 
     /// 吊销只影响目标 agent，其他 agent 的会话不能被误伤（issue #5）。
@@ -171,8 +194,8 @@ mod tests {
         let b = registry.register("b");
 
         assert!(registry.shutdown("a"));
-        assert!(*a.shutdown.borrow());
-        assert!(!*b.shutdown.borrow());
+        assert_eq!(*a.shutdown.borrow(), ShutdownReason::Revoke);
+        assert_eq!(*b.shutdown.borrow(), ShutdownReason::Revoke);
         assert!(registry.has_active("b"));
     }
 
@@ -190,7 +213,7 @@ mod tests {
 
         // 新连接仍然能收到吊销信号。
         assert!(registry.shutdown("a"));
-        assert!(*new.shutdown.borrow());
+        assert_eq!(*new.shutdown.borrow(), ShutdownReason::Revoke);
     }
 
     /// 会话循环用 `watch::Receiver::changed()` 等待吊销；这里验证信号真的能唤醒它。
@@ -209,6 +232,31 @@ mod tests {
             .await
             .expect("shutdown 信号未在 1s 内送达")
             .unwrap();
-        assert!(received);
+        assert_eq!(received, ShutdownReason::Revoke);
+    }
+
+    /// 配置变更走 Reconfigure，不能混成吊销；多连接都要收到。
+    #[test]
+    fn reconfigure_signals_every_connection_with_reconfigure() {
+        let registry = SessionRegistry::new();
+        let first = registry.register("a");
+        let second = registry.register("a");
+        let other = registry.register("b");
+
+        assert!(registry.reconfigure("a"));
+        assert_eq!(*first.shutdown.borrow(), ShutdownReason::Reconfigure);
+        assert_eq!(*second.shutdown.borrow(), ShutdownReason::Reconfigure);
+        assert_eq!(
+            *other.shutdown.borrow(),
+            ShutdownReason::Revoke,
+            "初始值不得被误读为 Reconfigure，且不能影响其他 agent"
+        );
+
+        // 没有活跃连接时返回 false，但不影响已落库的配置。
+        assert!(!registry.reconfigure("missing"));
+
+        // 同一连接随后收到吊销，原因必须是 Revoke。
+        assert!(registry.shutdown("a"));
+        assert_eq!(*first.shutdown.borrow(), ShutdownReason::Revoke);
     }
 }

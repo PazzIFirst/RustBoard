@@ -53,6 +53,13 @@ CertRenewed { cert_pem: String },
 
 ### 3.2 配置（`config.rs`，全部带 serde 默认值）
 
+`AgentConfig` 新增：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `cert_renew_before_days` | 30 | 客户端证书续签阈值（≥1） |
+| `session_max_hours` | 12 | 主动重连周期（±10% 抖动）；0 表示不主动重连 |
+
 `HubConfig` 新增：
 
 | 字段 | 默认 | 说明 |
@@ -61,16 +68,10 @@ CertRenewed { cert_pem: String },
 | `server_cert_validity_days` | 365 | 服务端证书 |
 | `client_cert_validity_days` | 90 | agent 客户端证书 |
 | `renew_before_days` | 30 | 剩余寿命 ≤ 该值触发续签 |
-| `cert_check_interval_secs` | 21600 | 服务端续签检查周期，最小 1 |
+| `cert_check_interval_secs` | 21600 | 服务端续签检查周期，最小 60（低于 60 会造成无意义的重复签名） |
 
-`AgentConfig` 新增：
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `cert_renew_before_days` | 30 | 客户端证书续签阈值 |
-| `session_max_hours` | 12 | 主动重连周期（让续签/配置变更有生效机会），0 表示不主动重连 |
-
-校验：有效期 1–36500 天；`renew_before_days ≥ 1`；`cert_check_interval_secs ≥ 1`。
+校验：有效期 1–36500 天；`renew_before_days ≥ 1` 且**必须小于** `server_cert_validity_days`；
+`cert_check_interval_secs ≥ 60`；`server_names` 必须非空且每项都能编码为 IP / DNS SAN。
 
 ### 3.3 CLI
 
@@ -111,14 +112,17 @@ pub fn check_and_renew(cfg: &HubConfig, tx: &watch::Sender<...>, force: bool, ov
 ```
 
 流程：读 `server.crt` → `days_left` → 不满足阈值则返回 `None`；否则
-`issue_server_cert(ca.key, cfg.server_names, days)` → `atomic_write(server.crt, 0644)` →
-`atomic_write(server.key, 0600)` → 重建 `tls::server_config(data_dir)` →
-`tx.send_replace(new)` → 打日志（旧/新指纹、notAfter）。
+`issue_server_cert(ca.key, cfg.server_names, days)` → **校验 ca.key 与 ca.crt 配套**、
+新证书由 ca.crt 签发、有效期合理、SAN 覆盖 `server_names` → 成对备份旧 key/cert
+（`.bak-<毫秒/PID>`，key 0600）→ 原子写 → `tls::server_config` 自检 → `tx.send_replace`。
+任一步失败都保留/恢复旧材料，不更新 watch。
+
+启动时 `load_or_repair_tls_config`：只对「server key/cert 不匹配」或「server.key 缺失」
+自愈；ca.crt/ca.key 缺失或损坏、server.crt 不可解析等错误直接 actionable fail，
+不写 server 文件。server.crt 缺失但 CA 完好时用 CA 直接补签。
 
 `serve_tls` 改为接收 `watch::Receiver<Arc<ServerConfig>>`，每条新连接
 `acceptor = TlsAcceptor::from(rx.borrow().clone())`，已建立连接不受影响。
-
-启动时若证书缺失：`ensure_hub_material` 用 policy 补签（保持现行为）。
 
 ### 4.2 hub 处理客户端续签（`main.rs`）
 
@@ -148,7 +152,7 @@ CSR 长度上限 16 KiB；超限/解析失败回 `Problem{BAD_FRAME}` 但**不�
 
 ### 4.4 `/api/v1/system`
 
-`GET /api/v1/system`（本阶段不加鉴权，M2 统一加）返回：
+`GET /api/v1/system`（自 v0.2.0 起与其它管理 API 一样要求 Bearer token，`/healthz` 除外）返回：
 
 ```json
 { "version": "...", "protocol": 2, "server_time": 0,
@@ -193,7 +197,9 @@ e2e（`tests/e2e/cert-rotation.sh`，由测试子 Agent 写）：
 
 - 新增配置项都有默认值，删除/回退代码后旧配置仍可解析；
 - 无数据库迁移，回滚不涉及数据；
-- 服务端证书轮换不可逆（旧指纹失效）：回滚前保留 `server.crt/key` 备份，`rotate-cert` 打印备份路径。
+- 服务端证书轮换不可逆（旧指纹失效）：`rotate-cert` 与自动续签都会成对备份
+  `server.crt` / `server.key`（同后缀），恢复后重启即可回到旧指纹；
+  运行中轮换前应先停 hub，避免两个写者竞争。
 
 ## 8. 风险
 

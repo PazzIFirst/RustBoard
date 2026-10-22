@@ -9,13 +9,25 @@ rust-version.workspace = true
 name = "rustboard-panel"
 path = "src/main.rs"
 
+[features]
+default = []
+embedded-web = ["dep:include_dir"]
+
 [dependencies]
 rustboard-common = { workspace = true }
 anyhow = { workspace = true }
+argon2 = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+include_dir = { workspace = true, optional = true }
+
+[dev-dependencies]
+tower = { workspace = true }

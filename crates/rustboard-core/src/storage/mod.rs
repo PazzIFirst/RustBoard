@@ -3,7 +3,7 @@
 pub mod sqlite;
 
 use anyhow::Result;
-use rustboard_common::model::{AgentRecord, SampleBatch, SeriesQuery, SeriesRow};
+use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 
 /// 一批数据的写入结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +20,41 @@ pub enum IngestOutcome {
 pub enum RejectReason {
     /// agent 已被吊销。
     Revoked,
+}
+
+/// 查询结果达到存储层的行数硬上限。
+///
+/// 单独定义成类型而不是普通 `anyhow!` 字符串，是为了让 HTTP 层能把它映射成
+/// `413 query_too_large`，而不是被统一当成 500 内部错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryTooLarge {
+    /// 触发的行数上限。
+    pub limit: usize,
+}
+
+impl std::fmt::Display for QueryTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "查询结果达到 {} 行上限，请缩小时间窗口或指标范围",
+            self.limit
+        )
+    }
+}
+
+impl std::error::Error for QueryTooLarge {}
+
+/// 一台 agent 的一组序列（metric + labels）的最新采样点。
+///
+/// 与 [`SeriesRow`] 的区别是带上 `agent_id`：`latest_samples` 一次可以跨多台
+/// agent 查询（`overview` 用），Rust 侧按 `(agent_id, metric, labels)` 去重。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct AgentSeriesRow {
+    pub agent_id: String,
+    pub metric: String,
+    pub labels: Labels,
+    pub ts: i64,
+    pub value: f64,
 }
 
 pub trait Storage: Send + Sync {
@@ -48,6 +83,32 @@ pub trait Storage: Send + Sync {
     fn get_agent(&self, agent_id: &str) -> Result<Option<AgentRecord>>;
 
     fn query_series(&self, query: &SeriesQuery) -> Result<Vec<SeriesRow>>;
+
+    /// 按时间桶聚合查询：`GROUP BY metric, labels, ts / bucket_ms`，取 `AVG(value)`。
+    ///
+    /// 返回点的 `ts` 是桶起点；空桶不补点。`query.limit` 在聚合后生效，
+    /// 供上层用「多取一条」的方式判断点数是否超限。
+    fn query_series_bucketed(&self, query: &SeriesQuery, bucket_ms: i64) -> Result<Vec<SeriesRow>>;
+
+    /// 取 `since` 之后、指定指标（空表示全部）的最新点。
+    ///
+    /// 按 `(agent_id, metric, labels)` 去重并保留最大 `ts`；`agent` 为 `None`
+    /// 时跨全部 agent 查询。返回顺序稳定（agent_id、metric、labels 升序）。
+    fn latest_samples(
+        &self,
+        since: i64,
+        metrics: &[String],
+        agent: Option<&str>,
+    ) -> Result<Vec<AgentSeriesRow>>;
+
+    /// 读取 agent 的显式采样间隔；没有配置过返回 `None`（上层回退配置默认值）。
+    fn get_sample_interval(&self, agent_id: &str) -> Result<Option<u64>>;
+
+    /// 写入/更新 agent 的采样间隔。
+    fn set_sample_interval(&self, agent_id: &str, ms: u64, now: i64) -> Result<()>;
+
+    /// 列出所有显式配置过采样间隔的 agent（按 agent_id 升序）。
+    fn list_sample_intervals(&self) -> Result<Vec<(String, u64)>>;
 
     fn sample_count(&self, agent_id: &str) -> Result<i64>;
 

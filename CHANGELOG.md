@@ -10,6 +10,58 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-23
+
+### Added
+
+- M2 面板：React + TypeScript + Vite 前端（登录、概览、单机详情四类图表、时间范围与拖拽缩放）
+- 面板后端：Argon2id 单管理员登录、HttpOnly 会话 Cookie、按 IP 登录限速、
+  服务端代理 hub 管理 API（token 不下发浏览器）、静态资源与 SPA 回退
+- hub 管理 API 鉴权：`admin_token`（Bearer），`/healthz` 除外；
+  `rustboard-hub admin-token` 查看/补生成
+- 管理 API：`overview`、`agents/{id}/latest`、多指标 `agents/{id}/series`
+  （服务端按时间跨度自动分桶）、`agents/{id}/settings`
+- 采样间隔动态下发：面板修改后 hub 落库并向活跃会话发送 Reconfigure，
+  agent 在 ≤2s 内采用新间隔（采集循环分片休眠）
+- SQLite schema v4：`agent_settings`（每台 agent 的采样间隔）
+- 证书显式有效期：CA 3650 天、服务端 365 天、客户端 90 天，均可通过配置 / `hub init` 参数调整
+- 服务端证书自动续签：剩余寿命低于 `renew_before_days` 时用私有 CA 重签、原子落盘，
+  通过 `watch` 通道热加载，新连接立即使用新证书，无需重启
+- 客户端证书自动轮换：agent 在剩余寿命低于阈值时通过已认证会话提交 CSR（复用私钥），
+  hub 强制以会话身份作为 CN 签发；`rustboard-agent renew` 可手动强制轮换
+- 运维命令：`rustboard-hub rotate-cert`（成对备份旧 key/cert）、
+  `rustboard-agent cert-info`、`GET /api/v1/system`（证书指纹与到期时间）
+- agent 纳管后改用 CA 信任 + 主机名校验；服务端证书轮换不再需要重新纳管
+  （v0.1 指纹钉扎 agent 需先升级，见升级提示）
+- 崩溃自愈：续签中途断电留下 key/cert 不匹配时，hub 启动会用 CA 重新签发一对；
+  重签前校验 ca.key/ca.crt 配套、新证书链与 SAN，失败不覆盖旧材料
+
+### Changed
+
+- 面板默认只监听 `127.0.0.1`（明文 HTTP），对外访问必须显式 `--listen` 并走 VPN/反代
+- 管理 API 必须携带 `admin_token`；v0.1 配置缺少该字段时需运行 `rustboard-hub admin-token`
+- 管理 API 的 500 响应统一为 `{"error":"internal_error"}`，内部细节只进日志
+- TLS 版本显式固定为 1.3（不再依赖 feature 默认值）
+- agent 会话最长存活 `session_max_hours`（默认 12 小时，±10% 抖动）到点主动重连，
+  让轮换后的证书与 hub 配置变更生效
+- `rustboard-hub init` 新增 `--ca-days`、`--server-cert-days`、`--client-cert-days`、
+  `--renew-before-days`
+
+### Security
+
+- 面板 → hub 的 HTTP 客户端禁用环境代理（`HTTP_PROXY`/`ALL_PROXY`），避免 Bearer token 泄露
+- 面板 `/api/*` 强制 JSON Content-Type 与 CSP，避免上游 HTML 在面板 origin 执行
+- 证书签发/续签前校验 ca.key 与 ca.crt 配套、新证书链与 SAN；失败不落盘
+- 管理 API Bearer scheme 大小写不敏感，token 仍常量时间比较
+
+### Fixed
+
+- 证书未设置有效期（实际到 4096 年）的问题
+- `rotate-cert` 只备份证书、不备份私钥导致无法回滚的问题
+- 续签写盘中断后 hub 因 `KeyMismatch` 无法启动的问题
+- 服务端证书轮换后仍靠指纹钉扎的旧 agent 失联问题（v0.2 agent 已改用 CA 信任）
+- 面板采样间隔在旧间隔较长时无法在 60s 内生效的问题
+
 ## [0.1.0] - 2026-10-23
 
 ### Added

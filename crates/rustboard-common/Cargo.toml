@@ -21,4 +21,5 @@ rcgen = { workspace = true }
 rustls = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-x509-parser = { workspace = true }
+x509-parser = { workspace = true, features = ["verify"] }
+time = { workspace = true }

@@ -18,13 +18,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
 
 jobs:
   test:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: 安装工具链
         run: |
@@ -35,7 +36,7 @@ jobs:
           cargo --version
 
       - name: 缓存 cargo 与 target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -59,7 +60,7 @@ jobs:
     name: e2e 安全回归
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: 安装工具链
         run: |
@@ -67,7 +68,7 @@ jobs:
           rustup default stable
 
       - name: 缓存 cargo 与 target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -78,14 +79,58 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: 安装 Node 22（面板 e2e 需要构建前端）
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: 构建前端资源
+        run: |
+          corepack enable
+          cd web && pnpm install --frozen-lockfile && pnpm build
+
       - name: 运行安全回归
         run: bash tests/e2e/security.sh
+
+      - name: 证书轮换回归
+        run: bash tests/e2e/cert-rotation.sh
+
+      - name: 面板回归
+        run: bash tests/e2e/panel.sh
+
+  web:
+    name: web / tsc / build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: 安装 Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: 启用 pnpm（版本由 packageManager 固定）
+        run: corepack enable
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 类型检查与单测
+        run: |
+          pnpm exec tsc --noEmit
+          pnpm test
+
+      - name: 构建
+        run: pnpm build
 
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: 安装工具链
         run: |
@@ -94,7 +139,7 @@ jobs:
 
       - name: 缓存 cargo-audit 二进制
         id: cache-audit
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cargo/bin/cargo-audit
           key: cargo-audit-${{ runner.os }}-v1

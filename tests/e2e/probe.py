@@ -658,9 +658,18 @@ def cmd_hold(args) -> int:
     return 0
 
 
+def _admin_headers():
+    """管理 API 的 Bearer 头；token 由 security.sh 从 hub 配置读取后经环境变量传入。"""
+    token = os.environ.get("RB_E2E_ADMIN_TOKEN", "")
+    if not token:
+        return {}
+    return {"Authorization": f"Bearer {token}"}
+
+
 def _http_json(url: str, timeout: float = 3.0):
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        request = urllib.request.Request(url, headers=_admin_headers())
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             if response.status != 200:
                 raise ProbeError(f"HTTP {response.status}: {url}")
             return json.loads(response.read().decode("utf-8"))

@@ -6,18 +6,20 @@
 //! 安全模型：私有 CA + 服务端证书指纹固定 + 一次性 enrollment token。
 //! agent 首次连接只允许发 `Enroll`，换取客户端证书与独立 secret，之后走 mTLS。
 
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use axum::body::Body;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Extension, Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, RawQuery, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
@@ -26,23 +28,25 @@ use hyper::Request;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use rustboard_common::config::HubConfig;
-use rustboard_common::model::{AgentRecord, SampleBatch, SeriesQuery, SeriesRow};
+use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 use rustboard_common::tls;
 use rustboard_common::util::{
-    arch, boot_id, hostname, now_ms, os_pretty_name, pick_free_port_excluding, port_of,
+    arch, boot_id, constant_time_eq, hostname, now_ms, os_pretty_name, pick_free_port_excluding,
+    port_of,
 };
 use rustboard_common::wire::{codes, EnrollRequest, Frame, Welcome};
 use rustboard_common::{DEFAULT_HUB_CONFIG, PROTOCOL_VERSION, VERSION};
 use rustboard_core::collect::default_collectors;
 use rustboard_core::storage::sqlite::SqliteStorage;
-use rustboard_core::storage::{IngestOutcome, Storage};
+use rustboard_core::storage::{AgentSeriesRow, IngestOutcome, QueryTooLarge, Storage};
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 
+mod cert_rotation;
 mod session;
-use session::SessionRegistry;
+use session::{SessionRegistry, ShutdownReason};
 
 /// 内置本机采集使用的 agent_id，只允许 hub 进程内部写入。
 /// WebSocket 单条消息上限。agent 的正常批次只有几 KB，1 MiB 足够宽裕；
@@ -66,6 +70,54 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// 单条 WebSocket 帧的写超时；写不出去说明对端已经不读了，直接清理会话。
 const SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+/// 客户端续签请求里 CSR 的 PEM 长度上限（16 KiB）。
+///
+/// 正常 CSR 约 1 KiB；放大上限只会给 hub 的解析路径增加攻击面。
+/// 纳管（enrollment）与续签（RenewCert）共用同一个上限。
+const MAX_CSR_PEM_LEN: usize = 16 * 1024;
+
+/// 管理 API 请求体上限（64 KiB）。管理端只有 settings 一个写接口。
+const MAX_ADMIN_BODY_SIZE: usize = 64 * 1024;
+/// `overview` 固定 60s 窗口：允许 1s–60s 覆盖，避免大窗口扫描拖垮 latest_samples。
+const OVERVIEW_WINDOW_MS: i64 = 60_000;
+const OVERVIEW_MIN_WINDOW_MS: i64 = 1_000;
+const OVERVIEW_MAX_WINDOW_MS: i64 = 60_000;
+/// `latest` 默认窗口 5 分钟，上限 1 小时。
+const LATEST_DEFAULT_WINDOW_MS: i64 = 5 * 60 * 1000;
+const LATEST_MAX_WINDOW_MS: i64 = 60 * 60 * 1000;
+/// 管理 API Bearer token 的最小长度（`admin-token` 生成的是 64 位 hex）。
+const MIN_ADMIN_TOKEN_LEN: usize = 32;
+/// `series` 查询最大跨度 32 天。
+const MAX_SERIES_SPAN_MS: i64 = 32 * 24 * 60 * 60 * 1000;
+const MAX_SERIES_METRICS: usize = 20;
+const MAX_METRIC_LEN: usize = 64;
+/// 自动降采样后单曲线目标点数上限。
+const MAX_AUTO_BUCKET_POINTS: i64 = 1_500;
+/// 单次 `series` 返回的序列（metric + labels）与点数上限。
+const MAX_SERIES_COUNT: usize = 50;
+const MAX_SERIES_POINTS: usize = 20_000;
+/// 自动 bucket 档位（毫秒）。
+const AUTO_BUCKETS_MS: [i64; 9] = [
+    1_000, 5_000, 10_000, 30_000, 60_000, 300_000, 900_000, 3_600_000, 21_600_000,
+];
+/// `overview.latest` 只查这些关键指标，避免全量扫描。
+const OVERVIEW_METRICS: [&str; 7] = [
+    "cpu.usage",
+    "mem.used",
+    "mem.total",
+    "disk.used",
+    "disk.total",
+    "load.1",
+    "uptime",
+];
+/// 采样间隔允许范围（毫秒），与 agent 侧校验保持一致。
+const MIN_SAMPLE_INTERVAL_MS: u64 = 1_000;
+const MAX_SAMPLE_INTERVAL_MS: u64 = 300_000;
+
+/// CSR 长度门禁：纳管与续签共用，必须在解析/消费 token 之前调用。
+fn csr_within_limit(csr_pem: &str) -> bool {
+    csr_pem.len() <= MAX_CSR_PEM_LEN
+}
 
 #[derive(Parser)]
 #[command(name = "rustboard-hub", version, about = "RustBoard 汇聚端")]
@@ -97,8 +149,36 @@ enum Cmd {
         /// 写进 agent 安装命令的 hub 地址（公网 IP 或域名），留空自动探测。
         #[arg(long)]
         advertise: Option<String>,
+        /// 新建 CA 的有效期（天，默认 3650，仅对新建 CA 生效）。
+        #[arg(long)]
+        ca_days: Option<u32>,
+        /// 新签发服务端证书的有效期（天，默认 365）。
+        #[arg(long)]
+        server_cert_days: Option<u32>,
+        /// 新签发 agent 客户端证书的有效期（天，默认 90）。
+        #[arg(long)]
+        client_cert_days: Option<u32>,
+        /// 证书剩余寿命不超过该天数时自动续签（默认 30）。
+        #[arg(long)]
+        renew_before_days: Option<u32>,
         #[arg(long)]
         force: bool,
+    },
+    /// 立即用 CA 重签服务端证书（备份旧证书，运行中的 hub 需重启）。
+    RotateCert {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// 剩余寿命仍高于阈值时也强制重签。
+        #[arg(long)]
+        force: bool,
+        /// 本次新证书的有效期（天），默认用配置里的值。
+        #[arg(long)]
+        days: Option<u32>,
+    },
+    /// 生成或查看管理 API 的 Bearer token（配置为空时生成并写入，0600）。
+    AdminToken {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
     /// 纳管相关的运维命令。
     Agent {
@@ -140,6 +220,8 @@ struct AppState {
     /// 已升级的 WebSocket 会话上限。TLS 层信号量在升级完成时释放，
     /// 长连接会话必须在这里再占一个许可，才真正限制并发会话数。
     session_slots: Arc<tokio::sync::Semaphore>,
+    /// 客户端证书续签的准入控制（按 agent 的冷却窗口 + 读盘/签名上下文）。
+    renewal: Arc<RenewalContext>,
 }
 
 /// 由 TLS accept 层注入到每个请求扩展里的对端身份。
@@ -150,7 +232,7 @@ struct PeerIdentity(Option<String>);
 
 fn main() -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "rustboard_hub=info,tower_http=warn".into());
+        .unwrap_or_else(|_| "rustboard_hub=info,rustboard_common=warn,tower_http=warn".into());
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     match Cli::parse().cmd {
@@ -161,6 +243,10 @@ fn main() -> Result<()> {
             admin_listen,
             sans,
             advertise,
+            ca_days,
+            server_cert_days,
+            client_cert_days,
+            renew_before_days,
             force,
         } => init(
             config,
@@ -169,6 +255,10 @@ fn main() -> Result<()> {
             admin_listen,
             sans,
             advertise,
+            ca_days,
+            server_cert_days,
+            client_cert_days,
+            renew_before_days,
             force,
         ),
         Cmd::Run { config } => {
@@ -177,6 +267,12 @@ fn main() -> Result<()> {
             let db_path = cfg.sqlite_path()?;
             run(cfg, db_path)
         }
+        Cmd::RotateCert {
+            config,
+            force,
+            days,
+        } => rotate_cert(config, force, days),
+        Cmd::AdminToken { config } => admin_token(config),
         Cmd::Agent { action } => match action {
             AgentAction::Add {
                 config,
@@ -198,6 +294,61 @@ fn load_config(path: &std::path::Path) -> Result<HubConfig> {
     })
 }
 
+/// hub 配置里的默认采样间隔范围校验。
+///
+/// `HubConfig::validate` 在 `rustboard-common`（panel 线同时维护），这里在
+/// hub 启动前补同一范围校验，保证 Welcome 不会下发 0 / 越界间隔。
+fn validate_hub_sample_interval(cfg: &HubConfig) -> Result<()> {
+    let ms = cfg.sample_interval_ms;
+    if !(MIN_SAMPLE_INTERVAL_MS..=MAX_SAMPLE_INTERVAL_MS).contains(&ms) {
+        bail!(
+            "sample_interval_ms 必须在 {MIN_SAMPLE_INTERVAL_MS}–{MAX_SAMPLE_INTERVAL_MS} 之间，\
+             实际 {ms}；请修改 hub 配置后重启"
+        );
+    }
+    Ok(())
+}
+
+/// 管理 API token 是否满足最低强度。
+fn admin_token_is_strong(token: &str) -> bool {
+    token.chars().count() >= MIN_ADMIN_TOKEN_LEN
+}
+
+/// `run` 的前置校验：管理 API 不允许空或弱 token 裸奔。
+fn require_admin_token(cfg: &HubConfig) -> Result<()> {
+    let token = cfg.admin_token.trim();
+    if token.is_empty() {
+        bail!(
+            "管理 API 未配置 admin_token，拒绝启动：请先执行 `rustboard-hub admin-token` \
+             生成并写入配置（或重新执行 `rustboard-hub init`）"
+        );
+    }
+    if !admin_token_is_strong(token) {
+        bail!(
+            "管理 API 的 admin_token 过短（{} 个字符，至少需要 {MIN_ADMIN_TOKEN_LEN} 个），\
+             拒绝启动：请执行 `rustboard-hub admin-token` 重新生成高强度 token",
+            token.chars().count()
+        );
+    }
+    Ok(())
+}
+
+/// `admin-token` 子命令：空或过短则重新生成并保存，合法则原样打印。
+///
+/// 配置读写都走 `HubConfig::load/save`，文件权限固定 0600；token 只输出到 stdout。
+fn admin_token(config: Option<PathBuf>) -> Result<()> {
+    let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
+    let mut cfg = load_config(&path)?;
+    if !admin_token_is_strong(cfg.admin_token.trim()) {
+        cfg.admin_token = new_secret();
+        cfg.save(&path)?;
+    }
+    println!("{}", cfg.admin_token);
+    Ok(())
+}
+
+// init 的参数与 `init` 子命令的 CLI 字段一一对应，拆结构体只会多一层搬运。
+#[allow(clippy::too_many_arguments)]
 fn init(
     config: Option<PathBuf>,
     data_dir: Option<PathBuf>,
@@ -205,6 +356,10 @@ fn init(
     admin_listen: Option<String>,
     sans: Vec<String>,
     advertise: Option<String>,
+    ca_days: Option<u32>,
+    server_cert_days: Option<u32>,
+    client_cert_days: Option<u32>,
+    renew_before_days: Option<u32>,
     force: bool,
 ) -> Result<()> {
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
@@ -232,7 +387,22 @@ fn init(
             cfg.admin_listen = format!("127.0.0.1:{port}");
         }
     }
+    // 有效期参数：显式指定 > 配置默认值（默认值与 config.rs 保持一致）。
+    if let Some(days) = ca_days {
+        cfg.ca_validity_days = days;
+    }
+    if let Some(days) = server_cert_days {
+        cfg.server_cert_validity_days = days;
+    }
+    if let Some(days) = client_cert_days {
+        cfg.client_cert_validity_days = days;
+    }
+    if let Some(days) = renew_before_days {
+        cfg.renew_before_days = days;
+    }
     cfg.name = hostname();
+    // 管理 API 必须有 Bearer token：init 一次性生成 64 位 hex，避免交付一个起不来的配置。
+    cfg.admin_token = new_secret();
     // 安装命令里的地址：显式指定 > 默认出口 IP
     let advertise =
         advertise.or_else(|| rustboard_common::util::primary_ipv4().map(|ip| ip.to_string()));
@@ -243,14 +413,33 @@ fn init(
     cfg.server_names.extend(sans);
     cfg.server_names.push(hostname());
 
-    let fingerprint = tls::ensure_hub_material(&cfg.data_dir, &cfg.server_names)?;
+    // 先校验再落盘/签发：非法有效期/非法 SAN 不能留下一个起不来的安装或半个 CA。
+    cfg.validate()
+        .context("init 参数校验失败（检查有效期参数、--renew-before-days 与 --san）")?;
+
+    let policy = tls::CertPolicy {
+        ca_days: cfg.ca_validity_days,
+        server_days: cfg.server_cert_validity_days,
+        client_days: cfg.client_cert_validity_days,
+    };
+    let fingerprint = tls::ensure_hub_material(&cfg.data_dir, &cfg.server_names, policy)?;
     cfg.save(&path)?;
 
     println!("已写入配置: {}", path.display());
     println!("证书目录: {}", tls::cert_dir(&cfg.data_dir).display());
     println!("服务端证书指纹: {fingerprint}");
+    println!(
+        "证书有效期: CA {} 天 / 服务端 {} 天 / 客户端 {} 天（剩余 ≤ {} 天时自动续签）",
+        cfg.ca_validity_days,
+        cfg.server_cert_validity_days,
+        cfg.client_cert_validity_days,
+        cfg.renew_before_days
+    );
     println!("agent 接入监听: {}", cfg.agent_listen);
     println!("管理 API 监听: {}", cfg.admin_listen);
+    println!("管理 API token: {}", cfg.admin_token);
+    println!("  面板/脚本访问管理 API 时使用 Authorization: Bearer <token>；");
+    println!("  可随时用 `rustboard-hub admin-token` 查看（为空时会重新生成）。");
     println!("（端口为随机五位数，随时可用 `rustboard-hub ports` 查看）");
     println!("\n下一步:");
     println!("  1) rustboard-hub run --config {}", path.display());
@@ -343,7 +532,102 @@ fn new_secret() -> String {
     )
 }
 
+/// 立即用 CA 重签服务端证书，供运维手工触发。
+///
+/// 运行中的 hub 把 TLS 配置缓存在内存里（每条新连接读一次 watch），
+/// 所以重签只影响磁盘：必须重启 hub 才会用新证书握手。
+///
+/// 走文件级签发（[`cert_rotation::renew_server_cert_files`]），不依赖当前 TLS 配置，
+/// 因此 key/cert 已经不配套时也能用它修复。
+fn rotate_cert(config: Option<PathBuf>, force: bool, days: Option<u32>) -> Result<()> {
+    let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
+    let cfg = load_config(&path)?;
+    let dir = tls::cert_dir(&cfg.data_dir);
+    let cert_path = dir.join(tls::SERVER_CERT_FILE);
+
+    // 证书缺失时允许用 --force 直接补签（修复场景），不带 --force 仍要求先 init。
+    let old_pem = match std::fs::read_to_string(&cert_path) {
+        Ok(pem) => Some(pem),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && force => {
+            println!("服务端证书不存在：将直接用 CA 补签一对新的证书与私钥。");
+            None
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "读取服务端证书失败: {}（先执行 rustboard-hub init，或加 --force 直接补签）",
+                    cert_path.display()
+                )
+            })
+        }
+    };
+    let old_not_after = old_pem.as_deref().map(tls::not_after_unix).transpose()?;
+    let old_days_left = old_pem
+        .as_deref()
+        .map(|pem| tls::days_left(pem, now_ms()))
+        .transpose()?;
+
+    // 默认只在进入续签窗口时重签：无谓的轮换会让仍在使用指纹钉扎的旧 agent 失联。
+    if !force {
+        let days_left = old_days_left.context("缺少服务端证书：需要加 --force 才能直接补签")?;
+        if days_left > i64::from(cfg.renew_before_days) {
+            println!(
+                "当前证书剩余 {days_left} 天，高于续签阈值 {} 天，未重签。",
+                cfg.renew_before_days
+            );
+            println!("确认要立即轮换请加 --force（旧版指纹钉扎的 agent 会因此失联，需要升级）。");
+            return Ok(());
+        }
+    }
+
+    println!("请先停止运行中的 hub；重签只改磁盘，运行中的进程仍在使用旧证书。");
+
+    // 文件级签发：内部先做 CA/SAN/新证书自检，全部通过后才成对备份并写盘，
+    // 失败路径不会留下无意义的备份；也不读旧 TLS 配置，key/cert 不配套时同样可用。
+    let renewed =
+        cert_rotation::renew_server_cert_files(&cfg, true, days)?.context("重签没有产生新证书")?;
+    // 自检新文件：确保写出的 key/cert 配套且能被 rustls 接受。
+    tls::server_config(&cfg.data_dir).context("重签后的证书/私钥无法被 rustls 接受")?;
+
+    for backup in &renewed.backup_paths {
+        let name = backup
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if name.contains(".key.") {
+            println!("旧私钥已备份: {}（0600）", backup.display());
+        } else {
+            println!("旧证书已备份: {}", backup.display());
+        }
+    }
+    match old_not_after {
+        Some(not_after) => println!(
+            "旧证书指纹: {}（到期 {}）",
+            renewed.old_fingerprint,
+            tls::format_unix_utc(not_after)
+        ),
+        None => println!("旧证书指纹: {}", renewed.old_fingerprint),
+    }
+    println!(
+        "新证书指纹: {}（到期 {}）",
+        renewed.fingerprint,
+        tls::format_unix_utc(renewed.not_after)
+    );
+    println!(
+        "运行中的 hub 需重启才会使用新证书；默认（CA 未变）已纳管 agent 用 CA 信任会自动重连；\
+         若这次轮换同时替换了 CA，所有 agent 必须重新纳管（旧 ca.crt/客户端证书属于旧 CA，会 mTLS 失败）。"
+    );
+    Ok(())
+}
+
 fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
+    // 启动前先做配置自洽性校验，避免把明显错误的有效期/检查周期带到运行期。
+    cfg.validate().context("hub 配置校验失败")?;
+    // common 侧暂不校验采样间隔；hub 启动前本地兜住，避免 Welcome 下发非法值。
+    validate_hub_sample_interval(&cfg)?;
+    // M2：管理 API 全部要求 Bearer token，空 token 不允许启动。
+    require_admin_token(&cfg)?;
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -362,7 +646,9 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
 
         // 升级路径：旧安装的 ca.key / server.key 可能是 0644
         tls::harden_hub_material(&cfg.data_dir)?;
-        let tls_config = tls::server_config(&cfg.data_dir)?;
+        // 启动自愈：上次续签在写盘中途被中断时，key/cert 会不配套，
+        // 直接构建配置会永久失败；这里用 CA 强制重签一对再继续。
+        let tls_config = cert_rotation::load_or_repair_tls_config(&cfg)?;
         let fingerprint = {
             let pem =
                 std::fs::read_to_string(tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE))?;
@@ -376,9 +662,18 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
             cfg: Arc::new(cfg.clone()),
             sessions: sessions.clone(),
             session_slots: Arc::new(tokio::sync::Semaphore::new(cfg.max_connections.max(1))),
+            renewal: RenewalContext::new(
+                tls::cert_dir(&cfg.data_dir),
+                cfg.client_cert_validity_days,
+            ),
         };
 
         spawn_revoke_watcher(storage.clone(), sessions);
+
+        // 服务端证书续签：每 `cert_check_interval_secs` 检查一次，需要时重签并把新的
+        // rustls 配置推进 watch；accept 循环每条新连接读一次，老连接不受影响。
+        let (tls_tx, tls_rx) = watch::channel(tls_config);
+        cert_rotation::spawn_server_renewal(state.cfg.clone(), tls_tx);
 
         if cfg.self_monitor {
             spawn_self_monitor(storage.clone(), cfg.clone());
@@ -388,11 +683,8 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
             .route("/agent/ws", get(agent_ws))
             .with_state(state.clone());
 
-        let admin_app = Router::new()
-            .route("/healthz", get(healthz))
-            .route("/api/v1/agents", get(list_agents))
-            .route("/api/v1/series", get(query_series))
-            .with_state(state);
+        // `/healthz` 免鉴权；`/api/v1/*` 统一挂 Bearer 中间件。
+        let admin_app = admin_router(state);
 
         let agent_addr = cfg.agent_listen.clone();
         let admin_addr = cfg.admin_listen.clone();
@@ -400,7 +692,7 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         tracing::info!(%admin_addr, "管理 API 监听（HTTP，请只绑内网）");
 
         tokio::try_join!(
-            serve_tls(agent_app, agent_addr, tls_config, cfg.max_connections),
+            serve_tls(agent_app, agent_addr, tls_rx, cfg.max_connections),
             serve(admin_app, admin_addr)
         )?;
         Ok(())
@@ -415,6 +707,78 @@ async fn serve(app: Router, addr: String) -> Result<()> {
     Ok(())
 }
 
+/// 组装管理 API：`/healthz` 放行，`/api/v1/*` 统一 Bearer 鉴权 + 64 KiB 请求体上限。
+fn admin_router(state: AppState) -> Router {
+    let protected = Router::new()
+        .route("/api/v1/system", get(system_info))
+        .route("/api/v1/agents", get(list_agents))
+        .route("/api/v1/series", get(query_series))
+        .route("/api/v1/overview", get(overview))
+        .route("/api/v1/agents/{id}/latest", get(agent_latest))
+        .route("/api/v1/agents/{id}/series", get(agent_series))
+        .route(
+            "/api/v1/agents/{id}/settings",
+            get(get_settings).put(put_settings),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer,
+        ));
+
+    Router::new()
+        .route("/healthz", get(healthz))
+        .merge(protected)
+        .layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_SIZE))
+        .layer(middleware::from_fn(no_store))
+        .with_state(state)
+}
+
+/// 常量时间比较 Bearer token；除 `/healthz` 外的管理 API 都必须通过这里。
+async fn require_bearer(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let authorized = bearer_matches(request.headers(), &state.cfg.admin_token);
+    if !authorized {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// 解析 `Authorization: Bearer <token>`；scheme 大小写不敏感，token 常量时间比较。
+///
+/// 只接受「scheme + 单个 token」两段，多余的分段（例如 token 里带空格）直接拒绝。
+fn bearer_matches(headers: &axum::http::HeaderMap, expected: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    let Some(value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let mut parts = value.split_ascii_whitespace();
+    let (Some(scheme), Some(token), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("bearer") && constant_time_eq(token.as_bytes(), expected.as_bytes())
+}
+
+/// 管理 API 全部响应禁止缓存（含 token 的 401 与实时指标）。
+async fn no_store(request: axum::extract::Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 /// H2：尝试占用一个连接许可；返回 None 表示已达上限，调用方应关闭 TCP。
 fn try_acquire_connection(permits: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
     permits.clone().try_acquire_owned().ok()
@@ -423,7 +787,7 @@ fn try_acquire_connection(permits: &Arc<Semaphore>) -> Option<OwnedSemaphorePerm
 async fn serve_tls(
     app: Router,
     addr: String,
-    config: Arc<rustls::ServerConfig>,
+    config: watch::Receiver<Arc<rustls::ServerConfig>>,
     max_connections: usize,
 ) -> Result<()> {
     let sock: SocketAddr = addr
@@ -432,7 +796,6 @@ async fn serve_tls(
     let listener = TcpListener::bind(sock)
         .await
         .with_context(|| format!("监听 {sock} 失败"))?;
-    let acceptor = TlsAcceptor::from(config);
     // H2：用信号量限制同时处理的 TLS 连接数；拿不到许可就立刻关 TCP。
     let max_connections = max_connections.max(1);
     let permits = Arc::new(Semaphore::new(max_connections));
@@ -462,7 +825,9 @@ async fn serve_tls(
             tracing::debug!(%peer, error = %err, "设置 TCP_NODELAY 失败");
         }
 
-        let acceptor = acceptor.clone();
+        // 续签任务是唯一写入者；这里每条新连接取一次当前配置。
+        // `borrow().clone()` 只复制 Arc，取值后立刻释放读锁，不跨 await 持有。
+        let acceptor = TlsAcceptor::from(config.borrow().clone());
         let app = app.clone();
         tokio::spawn(async move {
             // 许可跟随整条连接生命周期（TLS 握手 + WebSocket 会话）。
@@ -517,6 +882,52 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+/// `/api/v1/system` 的响应：版本、协议与**公开**的服务端证书信息。
+///
+/// M2 起所有 `/api/v1/*` 都在 [`admin_router`] 的 Bearer 中间件之后；
+/// 字段里只有证书指纹与有效期，没有私钥。
+#[derive(serde::Serialize)]
+struct SystemInfo {
+    version: &'static str,
+    protocol: u16,
+    server_time: i64,
+    cert: CertStatus,
+}
+
+#[derive(serde::Serialize)]
+struct CertStatus {
+    fingerprint: String,
+    /// Unix 秒。
+    not_after: i64,
+    days_left: i64,
+}
+
+/// 运维排障入口：读完请求时**磁盘上**的证书，因此指纹始终与文件一致。
+async fn system_info(State(state): State<AppState>) -> Result<Json<SystemInfo>, ApiError> {
+    let cert_path = tls::cert_dir(&state.cfg.data_dir).join(tls::SERVER_CERT_FILE);
+    let (fingerprint, not_after, days_left) = tokio::task::spawn_blocking(move || {
+        let pem = std::fs::read_to_string(&cert_path)?;
+        Ok::<_, anyhow::Error>((
+            tls::fingerprint_of_pem(&pem)?,
+            tls::not_after_unix(&pem)?,
+            tls::days_left(&pem, now_ms())?,
+        ))
+    })
+    .await
+    .map_err(ApiError::from)??;
+
+    Ok(Json(SystemInfo {
+        version: VERSION,
+        protocol: PROTOCOL_VERSION,
+        server_time: now_ms(),
+        cert: CertStatus {
+            fingerprint,
+            not_after,
+            days_left,
+        },
+    }))
+}
+
 async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<AgentRecord>>, ApiError> {
     let agents = tokio::task::spawn_blocking({
         let storage = state.storage.clone();
@@ -562,28 +973,549 @@ async fn query_series(
     Ok(Json(rows))
 }
 
-struct ApiError(anyhow::Error);
+#[derive(serde::Serialize)]
+struct OverviewResponse {
+    server_time: i64,
+    agents: Vec<AgentRecord>,
+    latest: Vec<AgentSeriesRow>,
+    settings: Vec<AgentSetting>,
+}
+
+/// `overview` 一次查询需要的数据：agent 列表、最新点、显式采样间隔。
+type OverviewSnapshot = (Vec<AgentRecord>, Vec<AgentSeriesRow>, Vec<(String, u64)>);
+
+#[derive(serde::Serialize)]
+struct AgentSetting {
+    agent_id: String,
+    sample_interval_ms: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateSettingsRequest {
+    sample_interval_ms: u64,
+}
+
+/// `GET /api/v1/overview`：agent 列表 + 关键指标最新值 + 每台 agent 的有效采样间隔。
+async fn overview(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<OverviewResponse>, ApiError> {
+    let pairs = parse_query_pairs(raw.as_deref()).map_err(ApiError::bad_request)?;
+    // 固定 60s 上限；允许 1s–60s 并真正用于最新点查询（前端固定带 window_ms=60000）。
+    let window_ms = parse_window_ms_between(
+        &pairs,
+        OVERVIEW_WINDOW_MS,
+        OVERVIEW_MIN_WINDOW_MS,
+        OVERVIEW_MAX_WINDOW_MS,
+    )
+    .map_err(ApiError::bad_request)?;
+
+    let default_interval = state.cfg.sample_interval_ms;
+    let (agents, latest, intervals) = tokio::task::spawn_blocking({
+        let storage = state.storage.clone();
+        move || -> Result<OverviewSnapshot> {
+            let metrics: Vec<String> = OVERVIEW_METRICS.iter().map(|m| m.to_string()).collect();
+            let since = now_ms() - window_ms;
+            Ok((
+                storage.list_agents()?,
+                storage.latest_samples(since, &metrics, None)?,
+                storage.list_sample_intervals()?,
+            ))
+        }
+    })
+    .await
+    .map_err(ApiError::from)??;
+
+    let explicit: HashMap<&str, u64> = intervals
+        .iter()
+        .map(|(agent_id, ms)| (agent_id.as_str(), *ms))
+        .collect();
+    let settings = agents
+        .iter()
+        .map(|agent| AgentSetting {
+            agent_id: agent.agent_id.clone(),
+            sample_interval_ms: explicit
+                .get(agent.agent_id.as_str())
+                .copied()
+                .filter(|ms| *ms > 0)
+                .unwrap_or(default_interval),
+        })
+        .collect();
+
+    Ok(Json(OverviewResponse {
+        server_time: now_ms(),
+        agents,
+        latest,
+        settings,
+    }))
+}
+
+/// `GET /api/v1/agents/{id}/latest`：该机每个序列的最新点。
+async fn agent_latest(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Vec<AgentSeriesRow>>, ApiError> {
+    validate_agent_path(&agent_id)?;
+    let pairs = parse_query_pairs(raw.as_deref()).map_err(ApiError::bad_request)?;
+    let window_ms =
+        parse_window_ms(&pairs, LATEST_DEFAULT_WINDOW_MS).map_err(ApiError::bad_request)?;
+    let since = now_ms() - window_ms;
+
+    // 与 settings 一致：不存在的 agent 返回 404，避免把「没有数据」伪装成空数组。
+    let rows = tokio::task::spawn_blocking(move || -> Result<Option<Vec<AgentSeriesRow>>> {
+        if state.storage.get_agent(&agent_id)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(state.storage.latest_samples(
+            since,
+            &[],
+            Some(&agent_id),
+        )?))
+    })
+    .await
+    .map_err(ApiError::from)??;
+    let Some(rows) = rows else {
+        return Err(ApiError::not_found("agent 不存在"));
+    };
+    Ok(Json(rows))
+}
+
+#[derive(serde::Serialize)]
+struct SeriesResponse {
+    bucket_ms: i64,
+    series: Vec<SeriesEntry>,
+}
+
+#[derive(serde::Serialize)]
+struct SeriesEntry {
+    metric: String,
+    labels: Labels,
+    points: Vec<(i64, f64)>,
+}
+
+/// `GET /api/v1/agents/{id}/series`：多指标 + 服务端按桶聚合。
+async fn agent_series(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<SeriesResponse>, ApiError> {
+    validate_agent_path(&agent_id)?;
+    let parsed = parse_series_query(raw.as_deref()).map_err(ApiError::bad_request)?;
+    let bucket_ms = parsed.bucket_ms;
+    let query = SeriesQuery {
+        agent_id,
+        metrics: parsed.metrics,
+        from: parsed.from,
+        to: parsed.to,
+        // 多取一条，交给上层判断是否超过 20000 点上限。
+        limit: u32::try_from(MAX_SERIES_POINTS + 1).unwrap_or(u32::MAX),
+    };
+
+    // 与 settings 一致：不存在的 agent 返回 404；存在性检查与查询放在同一次
+    // spawn_blocking 里，避免两次往返之间 agent 被删除造成不一致。
+    let rows = tokio::task::spawn_blocking(move || -> Result<Option<Vec<SeriesRow>>> {
+        if state.storage.get_agent(&query.agent_id)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(
+            state.storage.query_series_bucketed(&query, bucket_ms)?,
+        ))
+    })
+    .await
+    .map_err(ApiError::from)??;
+    let Some(rows) = rows else {
+        return Err(ApiError::not_found("agent 不存在"));
+    };
+    let response = build_series_response(bucket_ms, rows).map_err(ApiError::bad_request)?;
+    Ok(Json(response))
+}
+
+/// `GET /api/v1/agents/{id}/settings`：显式间隔，未配置过则回退 hub 默认值。
+async fn get_settings(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<AgentSetting>, ApiError> {
+    validate_agent_path(&agent_id)?;
+    let default_interval = state.cfg.sample_interval_ms;
+
+    let effective = tokio::task::spawn_blocking({
+        let storage = state.storage.clone();
+        let agent_id = agent_id.clone();
+        move || -> Result<Option<u64>> {
+            if storage.get_agent(&agent_id)?.is_none() {
+                return Ok(None);
+            }
+            let ms = storage
+                .get_sample_interval(&agent_id)?
+                .filter(|ms| *ms > 0)
+                .unwrap_or(default_interval);
+            Ok(Some(ms))
+        }
+    })
+    .await
+    .map_err(ApiError::from)??;
+
+    let Some(sample_interval_ms) = effective else {
+        return Err(ApiError::not_found("agent 不存在"));
+    };
+    Ok(Json(AgentSetting {
+        agent_id,
+        sample_interval_ms,
+    }))
+}
+
+/// `PUT /api/v1/agents/{id}/settings`：校验 → 落库 → 踢活跃会话触发重连。
+async fn put_settings(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    body: Result<Json<UpdateSettingsRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<AgentSetting>, ApiError> {
+    validate_agent_path(&agent_id)?;
+    let Json(request) = body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::PayloadTooLarge
+        } else {
+            ApiError::bad_request("请求体必须是 {\"sample_interval_ms\": <整数>}")
+        }
+    })?;
+    let sample_interval_ms = request.sample_interval_ms;
+    if !(MIN_SAMPLE_INTERVAL_MS..=MAX_SAMPLE_INTERVAL_MS).contains(&sample_interval_ms) {
+        return Err(ApiError::bad_request(format!(
+            "sample_interval_ms 必须在 {MIN_SAMPLE_INTERVAL_MS}–{MAX_SAMPLE_INTERVAL_MS} 之间"
+        )));
+    }
+
+    let existed = tokio::task::spawn_blocking({
+        let storage = state.storage.clone();
+        let agent_id = agent_id.clone();
+        move || -> Result<bool> {
+            if storage.get_agent(&agent_id)?.is_none() {
+                return Ok(false);
+            }
+            storage.set_sample_interval(&agent_id, sample_interval_ms, now_ms())?;
+            Ok(true)
+        }
+    })
+    .await
+    .map_err(ApiError::from)??;
+    if !existed {
+        return Err(ApiError::not_found("agent 不存在"));
+    }
+
+    // 间隔已落库；踢掉活跃会话让 agent 立刻重连，在 Welcome 里拿到新值。
+    // 没有活跃会话时返回 false，不影响本次修改（下次连接自然生效）。
+    let signaled = state.sessions.reconfigure(&agent_id);
+    tracing::info!(
+        agent = %agent_id,
+        sample_interval_ms,
+        signaled,
+        "采样间隔已更新，已通知活跃会话重连"
+    );
+
+    Ok(Json(AgentSetting {
+        agent_id,
+        sample_interval_ms,
+    }))
+}
+
+fn validate_agent_path(agent_id: &str) -> Result<(), ApiError> {
+    if is_valid_agent_id(agent_id) && agent_id != "." && agent_id != ".." {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("agent_id 非法"))
+    }
+}
+
+/// 解析查询串（与 `application/x-www-form-urlencoded` 一致：`+` 表示空格，`%XX` 转义）。
+///
+/// 不用 `serde_urlencoded` 直接反序列化 struct：它不支持「同名键重复」映射到
+/// `Vec<String>`，而 `series?metric=a&metric=b` 正是契约要求的写法。
+fn parse_query_pairs(raw: Option<&str>) -> std::result::Result<Vec<(String, String)>, String> {
+    let Some(raw) = raw.filter(|raw| !raw.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let mut pairs = Vec::new();
+    for part in raw.split('&') {
+        if part.is_empty() {
+            continue;
+        }
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        let key = percent_decode(key).ok_or_else(|| "查询参数编码非法".to_string())?;
+        let value = percent_decode(value).ok_or_else(|| "查询参数编码非法".to_string())?;
+        pairs.push((key, value));
+    }
+    Ok(pairs)
+}
+
+fn percent_decode(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let hi = hex_nibble(*bytes.get(index + 1)?)?;
+                let lo = hex_nibble(*bytes.get(index + 2)?)?;
+                out.push((hi << 4) | lo);
+                index += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 解析 `window_ms`；缺省用 `default`，非法或重复返回 400。
+fn parse_window_ms(pairs: &[(String, String)], default: i64) -> std::result::Result<i64, String> {
+    parse_window_ms_between(pairs, default, 1, LATEST_MAX_WINDOW_MS)
+}
+
+/// 带自定义下限的 `window_ms` 解析（`overview` 最小 1s，`latest` 最小 1ms）。
+fn parse_window_ms_between(
+    pairs: &[(String, String)],
+    default: i64,
+    min: i64,
+    max: i64,
+) -> std::result::Result<i64, String> {
+    let mut window = None;
+    for (key, value) in pairs {
+        match key.as_str() {
+            "window_ms" => {
+                if window.is_some() {
+                    return Err("window_ms 不能重复".to_string());
+                }
+                let ms: i64 = value
+                    .parse()
+                    .map_err(|_| "window_ms 必须是整数".to_string())?;
+                if !(min..=max).contains(&ms) {
+                    return Err(format!("window_ms 必须在 {min}–{max} 之间"));
+                }
+                window = Some(ms);
+            }
+            other => return Err(format!("不支持的查询参数: {other}")),
+        }
+    }
+    Ok(window.unwrap_or(default))
+}
+
+struct ParsedSeriesQuery {
+    metrics: Vec<String>,
+    from: i64,
+    to: i64,
+    bucket_ms: i64,
+}
+
+/// `series` 参数校验与自动 bucket 选择（全部为纯函数，便于单测边界）。
+fn parse_series_query(raw: Option<&str>) -> std::result::Result<ParsedSeriesQuery, String> {
+    let pairs = parse_query_pairs(raw)?;
+    let mut metrics = Vec::new();
+    let mut from = None;
+    let mut to = None;
+    let mut bucket_ms = None;
+
+    for (key, value) in pairs {
+        match key.as_str() {
+            "metric" => metrics.push(value),
+            "from" => set_once(&mut from, parse_timestamp("from", &value)?, "from")?,
+            "to" => set_once(&mut to, parse_timestamp("to", &value)?, "to")?,
+            "bucket_ms" => {
+                let ms: i64 = value
+                    .parse()
+                    .map_err(|_| "bucket_ms 必须是正整数".to_string())?;
+                if ms <= 0 {
+                    return Err("bucket_ms 必须大于 0".to_string());
+                }
+                set_once(&mut bucket_ms, ms, "bucket_ms")?;
+            }
+            other => return Err(format!("不支持的查询参数: {other}")),
+        }
+    }
+
+    if metrics.is_empty() || metrics.len() > MAX_SERIES_METRICS {
+        return Err(format!("metric 数量必须在 1–{MAX_SERIES_METRICS} 之间"));
+    }
+    for metric in &metrics {
+        if !is_valid_metric(metric) {
+            return Err(format!(
+                "metric 非法（仅允许 [a-z0-9_.-]，长度 1–{MAX_METRIC_LEN}）: {metric}"
+            ));
+        }
+    }
+
+    let from = from.ok_or_else(|| "缺少 from".to_string())?;
+    let to = to.ok_or_else(|| "缺少 to".to_string())?;
+    if from >= to {
+        return Err("from 必须早于 to".to_string());
+    }
+    let span_ms = to.saturating_sub(from);
+    if span_ms > MAX_SERIES_SPAN_MS {
+        return Err("时间跨度不能超过 32 天".to_string());
+    }
+
+    let bucket_ms = match bucket_ms {
+        Some(bucket) => bucket,
+        None => auto_bucket_ms(span_ms),
+    };
+    Ok(ParsedSeriesQuery {
+        metrics,
+        from,
+        to,
+        bucket_ms,
+    })
+}
+
+fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> std::result::Result<(), String> {
+    if slot.is_some() {
+        return Err(format!("{name} 不能重复"));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn parse_timestamp(name: &str, value: &str) -> std::result::Result<i64, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{name} 必须是毫秒时间戳"))
+}
+
+fn is_valid_metric(metric: &str) -> bool {
+    !metric.is_empty()
+        && metric.len() <= MAX_METRIC_LEN
+        && metric.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+/// 在方案给出的档位里选「单曲线不超过 1500 点」的最小 bucket。
+fn auto_bucket_ms(span_ms: i64) -> i64 {
+    AUTO_BUCKETS_MS
+        .iter()
+        .copied()
+        .find(|bucket| span_ms / bucket < MAX_AUTO_BUCKET_POINTS)
+        .unwrap_or(21_600_000)
+}
+
+/// 把聚合行按 `(metric, labels)` 组装成前端契约；同时兜住序列数与点数上限。
+fn build_series_response(
+    bucket_ms: i64,
+    rows: Vec<SeriesRow>,
+) -> std::result::Result<SeriesResponse, String> {
+    if rows.len() > MAX_SERIES_POINTS {
+        return Err(format!("返回点数超过 {MAX_SERIES_POINTS} 上限"));
+    }
+
+    let mut grouped: BTreeMap<(String, Labels), Vec<(i64, f64)>> = BTreeMap::new();
+    for row in rows {
+        grouped
+            .entry((row.metric, row.labels))
+            .or_default()
+            .push((row.ts, row.value));
+    }
+    if grouped.len() > MAX_SERIES_COUNT {
+        return Err(format!("序列数量超过 {MAX_SERIES_COUNT} 上限"));
+    }
+
+    let series = grouped
+        .into_iter()
+        .map(|((metric, labels), mut points)| {
+            points.sort_by_key(|(ts, _)| *ts);
+            SeriesEntry {
+                metric,
+                labels,
+                points,
+            }
+        })
+        .collect();
+    Ok(SeriesResponse { bucket_ms, series })
+}
+
+#[derive(Debug)]
+enum ApiError {
+    Internal(anyhow::Error),
+    BadRequest(String),
+    NotFound(String),
+    PayloadTooLarge,
+    /// 查询结果超过存储层硬上限：这是客户端可调整的参数问题，不是服务端错误。
+    QueryTooLarge,
+}
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::BadRequest(message.into())
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::NotFound(message.into())
+    }
+}
 
 impl From<anyhow::Error> for ApiError {
     fn from(err: anyhow::Error) -> Self {
-        ApiError(err)
+        // 存储层的行数上限是有业务含义的 413，不能被统一脱敏成 500。
+        if err.downcast_ref::<QueryTooLarge>().is_some() {
+            return ApiError::QueryTooLarge;
+        }
+        ApiError::Internal(err)
     }
 }
 
 impl From<tokio::task::JoinError> for ApiError {
     fn from(err: tokio::task::JoinError) -> Self {
-        ApiError(err.into())
+        ApiError::Internal(err.into())
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        tracing::error!(error = %self.0, "API 错误");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": self.0.to_string() })),
-        )
-            .into_response()
+        match self {
+            ApiError::Internal(err) => {
+                // 详细错误只进日志：响应体可能被面板/浏览器/日志采集看到，
+                // 不能回显数据库路径、SQL、文件系统等内部信息。
+                tracing::error!(error = %err, "API 内部错误");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "internal_error" })),
+                )
+                    .into_response()
+            }
+            ApiError::BadRequest(message) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "bad_request", "message": message })),
+            )
+                .into_response(),
+            ApiError::NotFound(message) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not_found", "message": message })),
+            )
+                .into_response(),
+            ApiError::PayloadTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": "payload_too_large" })),
+            )
+                .into_response(),
+            ApiError::QueryTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": "query_too_large" })),
+            )
+                .into_response(),
+        }
     }
 }
 
@@ -687,25 +1619,59 @@ async fn reject_and_close(socket: &mut WebSocket, code: &str, message: &str) {
     let _ = send_with_timeout(socket, Message::Close(None)).await;
 }
 
-async fn handle_enroll(mut socket: WebSocket, state: AppState, req: EnrollRequest) -> Result<()> {
-    if protocol_gate(req.protocol).is_some() {
-        // H1：协议不匹配不发 Welcome / Enrolled，回 Problem 后立即关闭。
-        reject_and_close(&mut socket, codes::BAD_PROTOCOL, "需要 agent ≥ 2").await;
-        bail!(
-            "enrollment 协议版本不匹配: 收到 {}，需要 {PROTOCOL_VERSION}",
-            req.protocol
-        );
+/// enrollment 在消费一次性 token **之前**必须通过的全部门槛。
+///
+/// 顺序：协议 → 字段安全 → CSR 长度 → CA 材料配套。任何一步失败都不能消耗
+/// token（否则运维刚生成的 token 会被一个注定失败的请求烧掉），也不能写 agent 记录。
+/// 返回已校验的 CA，供后续签发直接复用（避免二次读盘与 TOCTOU）。
+fn precheck_enroll(
+    state: &AppState,
+    req: &EnrollRequest,
+) -> std::result::Result<tls::ValidatedCa, Box<Frame>> {
+    if let Some(reject) = protocol_gate(req.protocol) {
+        return Err(Box::new(reject));
     }
-
     // requested_name 可以为空（agent init 不传 --name 时就是空），hub 实际使用的是 token 名。
     if !is_log_safe(&req.hostname, 255) || !is_log_safe_optional(&req.requested_name, 128) {
-        send_frame(
-            &mut socket,
-            &problem(codes::ENROLL_DENIED, "hostname 或 name 非法"),
-        )
-        .await?;
-        bail!("enrollment 字段含控制字符或过长");
+        return Err(Box::new(problem(
+            codes::ENROLL_DENIED,
+            "hostname 或 name 非法",
+        )));
     }
+    if !csr_within_limit(&req.csr_pem) {
+        return Err(Box::new(problem(codes::BAD_FRAME, "CSR 无效")));
+    }
+    // 先解析 CSR 再碰 CA：短小但非法的 CSR 同样不能烧掉一次性 token。
+    if let Err(err) = tls::validate_client_csr(&req.csr_pem) {
+        tracing::warn!(
+            error = %log_safe_error(&err),
+            "enrollment CSR 无法解析，拒绝且不消费 token"
+        );
+        return Err(Box::new(problem(codes::BAD_FRAME, "CSR 无效")));
+    }
+    tls::load_validated_ca(&state.cfg.data_dir).map_err(|err| {
+        tracing::error!(error = %err, "enrollment 前置检查失败：CA 材料不可用");
+        Box::new(problem(
+            codes::INTERNAL,
+            "hub CA 材料异常，暂时无法签发证书",
+        ))
+    })
+}
+
+async fn handle_enroll(mut socket: WebSocket, state: AppState, req: EnrollRequest) -> Result<()> {
+    // 所有门槛（含 CA 配套校验）都在 consume_enroll_token 之前完成。
+    let ca = match precheck_enroll(&state, &req) {
+        Ok(ca) => ca,
+        Err(reject) => {
+            let code = match reject.as_ref() {
+                Frame::Problem { code, .. } => code.clone(),
+                _ => codes::INTERNAL.to_string(),
+            };
+            let _ = send_frame(&mut socket, &reject).await;
+            let _ = send_with_timeout(&mut socket, Message::Close(None)).await;
+            bail!("enrollment 前置检查未通过: {code}");
+        }
+    };
 
     let now = now_ms();
     let Some(token_name) = state
@@ -720,14 +1686,12 @@ async fn handle_enroll(mut socket: WebSocket, state: AppState, req: EnrollReques
         bail!("enrollment token 无效");
     };
 
-    let dir = tls::cert_dir(&state.cfg.data_dir);
-    let ca_key = std::fs::read_to_string(dir.join(tls::CA_KEY_FILE)).context("读取 CA 私钥失败")?;
-    let ca_pem =
-        std::fs::read_to_string(dir.join(tls::CA_CERT_FILE)).context("读取 CA 证书失败")?;
+    let ca_pem = ca.cert_pem.clone();
 
     let agent_id = uuid::Uuid::new_v4().to_string();
-    let cert_pem =
-        tls::sign_client_csr(&ca_key, &req.csr_pem, &agent_id).context("签发客户端证书失败")?;
+    let cert_pem = ca
+        .sign_client_csr(&req.csr_pem, &agent_id, state.cfg.client_cert_validity_days)
+        .context("签发客户端证书失败")?;
 
     let secret = new_secret();
     state
@@ -844,13 +1808,15 @@ async fn handle_session(
         agent_id: agent_id.clone(),
         server_version: VERSION.to_string(),
         protocol: PROTOCOL_VERSION,
-        sample_interval_ms: state.cfg.sample_interval_ms,
+        sample_interval_ms: sample_interval_for(&state, &agent_id),
         server_time: now,
     });
     send_frame(&mut socket, &welcome).await?;
 
     let mut shutdown = handle.shutdown;
     let mut watch_shutdown = true;
+    // 每个会话最多成功续签一次，状态跟随会话生命周期。
+    let mut renew = RenewState::default();
 
     loop {
         // 45s 内收不到任何帧就认为连接已死；agent 每 15s 发一次 Ping。
@@ -858,9 +1824,9 @@ async fn handle_session(
         let event = tokio::select! {
             biased;
             changed = shutdown.changed(), if watch_shutdown => {
-                // 唯一的发送值是 true；Err 只会在取消信号发送端被销毁时出现。
+                // 关闭原因由 SessionRegistry 写入（吊销 / 配置变更）。
                 match changed {
-                    Ok(()) => SessionEvent::Shutdown,
+                    Ok(()) => SessionEvent::Shutdown(*shutdown.borrow_and_update()),
                     Err(_) => SessionEvent::WatchClosed,
                 }
             }
@@ -873,9 +1839,22 @@ async fn handle_session(
         };
 
         match event {
-            SessionEvent::Shutdown => {
+            SessionEvent::Shutdown(ShutdownReason::Revoke) => {
                 tracing::info!(agent = %agent_id, "收到吊销通知，关闭会话");
                 reject_and_close(&mut socket, codes::REVOKED, "该 agent 已被吊销").await;
+                break;
+            }
+            SessionEvent::Shutdown(ShutdownReason::Reconfigure) => {
+                // 配置变更不是吊销：发 Close(1000) 正常关闭，agent 会立即重连并
+                // 在 Welcome 里拿到新采样间隔。绝不发 revoked Problem。
+                tracing::info!(agent = %agent_id, "收到配置变更通知，正常关闭会话以便重连");
+                let close = Message::Close(Some(CloseFrame {
+                    code: close_code::NORMAL,
+                    reason: "reconfigure".into(),
+                }));
+                if let Err(err) = send_with_timeout(&mut socket, close).await {
+                    tracing::debug!(agent = %agent_id, error = %err, "发送 Close 帧失败");
+                }
                 break;
             }
             SessionEvent::WatchClosed => {
@@ -897,7 +1876,7 @@ async fn handle_session(
                 break;
             }
             SessionEvent::Message(message) => {
-                match handle_message(&mut socket, &state, &agent_id, message).await? {
+                match handle_message(&mut socket, &state, &agent_id, &mut renew, message).await? {
                     MessageAction::Continue => {}
                     MessageAction::Close => break,
                 }
@@ -909,13 +1888,45 @@ async fn handle_session(
     Ok(())
 }
 
+/// Welcome 下发的有效采样间隔：agent 显式配置优先，读失败/越界值回退配置默认值。
+///
+/// 兜底值也 clamp 到合法范围：即使配置层校验被绕过，Welcome 也绝不发非法值。
+fn sample_interval_for(state: &AppState, agent_id: &str) -> u64 {
+    let fallback = state
+        .cfg
+        .sample_interval_ms
+        .clamp(MIN_SAMPLE_INTERVAL_MS, MAX_SAMPLE_INTERVAL_MS);
+    match state.storage.get_sample_interval(agent_id) {
+        Ok(Some(ms)) if (MIN_SAMPLE_INTERVAL_MS..=MAX_SAMPLE_INTERVAL_MS).contains(&ms) => ms,
+        Ok(Some(ms)) => {
+            tracing::warn!(
+                agent = %agent_id,
+                ms,
+                min_ms = MIN_SAMPLE_INTERVAL_MS,
+                max_ms = MAX_SAMPLE_INTERVAL_MS,
+                "数据库中采样间隔越界，回退配置默认值"
+            );
+            fallback
+        }
+        Ok(None) => fallback,
+        Err(err) => {
+            tracing::warn!(
+                agent = %agent_id,
+                error = %err,
+                "读取采样间隔失败，回退配置默认值"
+            );
+            fallback
+        }
+    }
+}
+
 /// `select!` 每轮只产出一个事件，避免在分支里同时借用 socket 与取消信号。
 enum SessionEvent {
     Message(Message),
     Closed,
     RecvError(String),
     IdleTimeout,
-    Shutdown,
+    Shutdown(ShutdownReason),
     WatchClosed,
 }
 
@@ -924,10 +1935,207 @@ enum MessageAction {
     Close,
 }
 
+/// 单个会话的客户端证书续签状态。
+///
+/// 每个会话最多成功签发 1 次；跨会话的重复请求由 [`RenewGuard`] 的冷却窗口兜住。
+#[derive(Default)]
+struct RenewState {
+    succeeded: bool,
+}
+
+/// 客户端续签的冷却窗口：同一 agent 10 分钟内只允许一次尝试。
+///
+/// 每会话 1 次可以被「断开重连」绕过，冷却表把窗口收紧到每 agent 10 分钟；
+/// 正常轮换（90 天证书、30 天阈值）完全用不到第二次请求。
+const RENEW_COOLDOWN_MS: i64 = 10 * 60 * 1_000;
+/// 冷却表容量上限；超过后清理过期项，防止被大量 agent_id 撑爆内存。
+const RENEW_GUARD_MAX_ENTRIES: usize = 4_096;
+
+/// 续签准入表：`agent_id -> 最近一次尝试的 Unix 毫秒`。
+///
+/// 无效 CSR 也会占用一次机会（准入发生在解析之前），避免用坏请求刷签名。
+struct RenewGuard {
+    last_attempt_ms: HashMap<String, i64>,
+}
+
+impl RenewGuard {
+    fn new() -> Self {
+        Self {
+            last_attempt_ms: HashMap::new(),
+        }
+    }
+
+    /// 尝试占用一次续签机会：冷却窗口内返回 `false`，否则记录本次尝试并返回 `true`。
+    fn begin_attempt(&mut self, agent_id: &str, now_ms: i64) -> bool {
+        if let Some(prev) = self.last_attempt_ms.get(agent_id) {
+            if now_ms.saturating_sub(*prev) < RENEW_COOLDOWN_MS {
+                return false;
+            }
+        }
+        if self.last_attempt_ms.len() >= RENEW_GUARD_MAX_ENTRIES {
+            let cutoff = now_ms.saturating_sub(RENEW_COOLDOWN_MS);
+            self.last_attempt_ms.retain(|_, ts| *ts > cutoff);
+
+            // 仍在窗口内的条目占满表时，淘汰最早的一条，保证内存有硬上界。
+            // 合法 agent 数远小于上限，被淘汰的只会是极久未活跃的身份。
+            if self.last_attempt_ms.len() >= RENEW_GUARD_MAX_ENTRIES
+                && !self.last_attempt_ms.contains_key(agent_id)
+            {
+                if let Some(oldest) = self
+                    .last_attempt_ms
+                    .iter()
+                    .min_by_key(|(_, ts)| **ts)
+                    .map(|(id, _)| id.clone())
+                {
+                    self.last_attempt_ms.remove(&oldest);
+                }
+            }
+        }
+        self.last_attempt_ms.insert(agent_id.to_string(), now_ms);
+        true
+    }
+}
+
+/// 续签所需的 hub 侧资源；与 `AppState` 解耦，单测可以走真实处理路径。
+struct RenewalContext {
+    cert_dir: PathBuf,
+    client_days: u32,
+    /// 用 std Mutex：临界区只有一次 HashMap 操作，不跨 await 持有。
+    guard: StdMutex<RenewGuard>,
+}
+
+impl RenewalContext {
+    fn new(cert_dir: PathBuf, client_days: u32) -> Arc<Self> {
+        Arc::new(Self {
+            cert_dir,
+            client_days,
+            guard: StdMutex::new(RenewGuard::new()),
+        })
+    }
+
+    fn guard(&self) -> std::sync::MutexGuard<'_, RenewGuard> {
+        match self.guard.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+/// spawn_blocking 里的签发结果：把「CSR 有问题」和「hub 自身故障」分开，
+/// 前者回 `BAD_FRAME`，后者回 `INTERNAL`。
+enum SignOutcome {
+    Signed(String),
+    BadCsr(String),
+    Internal(String),
+}
+
+/// 处理一条 `RenewCert` 请求，返回要回给 agent 的帧。
+///
+/// 顺序（评审要求）：
+/// 1. 会话内已成功 → 限流；
+/// 2. 全局冷却窗口 → 限流（记录尝试，**无效 CSR 也计入**）；
+/// 3. CSR 长度上限（16 KiB，O(1)，不解析）；
+/// 4. 读 CA 私钥 + 解析 CSR + 签发，全部在 `spawn_blocking` 里做。
+///
+/// 安全要点：证书 CN **强制**取会话身份 `agent_id`，CSR 里自带的 CN 会被丢弃，
+/// 因此伪造 CN 也拿不到别人的身份。CSR 只作为公钥载体。
+async fn handle_renewal(
+    ctx: &RenewalContext,
+    renew: &mut RenewState,
+    agent_id: &str,
+    csr_pem: &str,
+    now_ms: i64,
+) -> Frame {
+    if renew.succeeded {
+        tracing::warn!(agent = %agent_id, "同一会话重复请求证书续签，已拒绝");
+        return problem(codes::RATE_LIMITED, "同一会话只能续签一次");
+    }
+    if !ctx.guard().begin_attempt(agent_id, now_ms) {
+        tracing::warn!(
+            agent = %agent_id,
+            cooldown_secs = RENEW_COOLDOWN_MS / 1_000,
+            "续签仍在冷却窗口内，已拒绝"
+        );
+        return problem(codes::RATE_LIMITED, "续签过于频繁，请稍后再试");
+    }
+    if !csr_within_limit(csr_pem) {
+        tracing::warn!(
+            agent = %agent_id,
+            len = csr_pem.len(),
+            limit = MAX_CSR_PEM_LEN,
+            "续签 CSR 超过长度上限，已拒绝"
+        );
+        return problem(codes::BAD_FRAME, "CSR 无效");
+    }
+
+    let cert_dir = ctx.cert_dir.clone();
+    let client_days = ctx.client_days;
+    let agent_id_owned = agent_id.to_string();
+    let csr = csr_pem.to_string();
+    let outcome = tokio::task::spawn_blocking(move || {
+        // 读 CA 私钥的同一次操作里校验 ca.crt 配套：不配套时绝不签发客户端证书
+        // （否则会给出无效链证书，agent 下次握手失败且旧证书可能已被覆盖）。
+        let ca = match tls::load_validated_ca_at(&cert_dir) {
+            Ok(ca) => ca,
+            Err(err) => return SignOutcome::Internal(format!("{err:#}")),
+        };
+        match ca.sign_client_csr(&csr, &agent_id_owned, client_days) {
+            Ok(cert_pem) => SignOutcome::Signed(cert_pem),
+            Err(err) => SignOutcome::BadCsr(format!("{err:#}")),
+        }
+    })
+    .await;
+
+    match outcome {
+        Ok(SignOutcome::Signed(cert_pem)) => match tls::not_after_unix(&cert_pem) {
+            Ok(not_after) => {
+                renew.succeeded = true;
+                // 日志只记身份与到期时间：CSR / 证书内容一律不入日志。
+                tracing::info!(
+                    agent = %agent_id,
+                    not_after = %tls::format_unix_utc(not_after),
+                    "客户端证书已续签"
+                );
+                Frame::CertRenewed { cert_pem }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %log_safe_error(&err),
+                    "签发出的证书无法解析"
+                );
+                problem(codes::INTERNAL, "hub 无法签发证书")
+            }
+        },
+        Ok(SignOutcome::BadCsr(reason)) => {
+            // 错误串只含解析原因，已被 log_safe_error 去掉控制字符。
+            tracing::warn!(
+                agent = %agent_id,
+                error = %log_safe_error(&reason),
+                "客户端证书续签被拒绝（CSR 无效）"
+            );
+            problem(codes::BAD_FRAME, "CSR 无效")
+        }
+        Ok(SignOutcome::Internal(reason)) => {
+            tracing::error!(
+                agent = %agent_id,
+                error = %log_safe_error(&reason),
+                "客户端证书续签失败（hub 内部错误）"
+            );
+            problem(codes::INTERNAL, "hub 无法签发证书")
+        }
+        Err(join_err) => {
+            tracing::error!(agent = %agent_id, error = %join_err, "证书续签任务失败");
+            problem(codes::INTERNAL, "hub 无法签发证书")
+        }
+    }
+}
+
 async fn handle_message(
     socket: &mut WebSocket,
     state: &AppState,
     agent_id: &str,
+    renew: &mut RenewState,
     message: Message,
 ) -> Result<MessageAction> {
     match message {
@@ -1027,6 +2235,16 @@ async fn handle_message(
                 }
                 Frame::Pong { .. } => {
                     mark_seen(state, agent_id);
+                }
+                Frame::RenewCert { csr_pem } => {
+                    // 限流/冷却判定、长度检查、读 CA 私钥与签发都在 handle_renewal 里；
+                    // 任何结果都只回 Problem / CertRenewed，不断开连接。
+                    let reply =
+                        handle_renewal(&state.renewal, renew, agent_id, &csr_pem, now_ms()).await;
+                    if matches!(reply, Frame::CertRenewed { .. }) {
+                        mark_seen(state, agent_id);
+                    }
+                    send_frame(socket, &reply).await?;
                 }
                 other => {
                     // L6：只打变体名，Frame 的 Debug 也已脱敏；绝不打印 Hello/Enroll 内容。
@@ -1328,6 +2546,8 @@ mod tests {
     }
 
     use super::*;
+    use rustboard_common::fsutil;
+    use rustboard_common::model::Sample;
 
     /// H1：旧协议必须收到 `bad_protocol` + 「需要 agent ≥ 2」，当前协议放行。
     #[test]
@@ -1371,5 +2591,1516 @@ mod tests {
             "释放许可后应允许新连接"
         );
         drop(second);
+    }
+
+    /// 测试用：临时目录（进程 id + 自增序号，避免并行测试互相覆盖）。
+    fn temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::AtomicU32;
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rb-hub-{}-{tag}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// 测试用：构造一个 CN 由攻击者控制的 CSR。
+    fn csr_with_cn(cn: &str) -> String {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.serialize_request(&key).unwrap().pem().unwrap()
+    }
+
+    /// 准备 CA 材料并返回续签上下文。
+    fn renewal_fixture(tag: &str) -> (PathBuf, Arc<RenewalContext>) {
+        let dir = temp_dir(tag);
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], tls::CertPolicy::default())
+            .unwrap();
+        let ctx = RenewalContext::new(tls::cert_dir(&dir), 90);
+        (dir, ctx)
+    }
+
+    fn problem_code(frame: &Frame) -> &str {
+        match frame {
+            Frame::Problem { code, .. } => code,
+            other => panic!("期望 Problem，实际: {other:?}"),
+        }
+    }
+
+    /// A5/安全：走真实 `handle_renewal` 路径——CN 强制取会话身份，
+    /// 同一会话第二次、以及重连后仍在冷却窗口内的请求都被限流。
+    #[tokio::test]
+    async fn a5_renewal_uses_session_identity_and_rate_limits() {
+        let (dir, ctx) = renewal_fixture("renew-identity");
+        let now = now_ms();
+        let csr = csr_with_cn("hub-self");
+
+        // 第一次：签发成功，CN 必须是会话身份，有效期按客户端证书配置。
+        let mut session = RenewState::default();
+        match handle_renewal(&ctx, &mut session, "session-agent", &csr, now).await {
+            Frame::CertRenewed { cert_pem } => {
+                let der = tls::load_certs(&cert_pem).unwrap();
+                assert_eq!(
+                    tls::peer_common_name(der[0].as_ref()).as_deref(),
+                    Some("session-agent"),
+                    "CN 必须取会话身份，不能取 CSR 里的 CN"
+                );
+                let not_after = tls::not_after_unix(&cert_pem).unwrap();
+                assert!(not_after * 1_000 > now, "新证书必须尚未过期");
+                assert_eq!(tls::days_left(&cert_pem, now).unwrap(), 90);
+                assert!(session.succeeded);
+            }
+            other => panic!("首次续签必须成功，实际: {other:?}"),
+        }
+
+        // 同一会话第二次：即使冷却已过也必须被会话级限流拦住。
+        let reply = handle_renewal(
+            &ctx,
+            &mut session,
+            "session-agent",
+            &csr,
+            now + RENEW_COOLDOWN_MS + 1,
+        )
+        .await;
+        assert_eq!(problem_code(&reply), codes::RATE_LIMITED);
+
+        // 换一个新会话（模拟断开重连）：仍在冷却窗口内 → 仍被限流。
+        let mut reconnect = RenewState::default();
+        let reply = handle_renewal(&ctx, &mut reconnect, "session-agent", &csr, now + 1_000).await;
+        assert_eq!(problem_code(&reply), codes::RATE_LIMITED);
+        assert!(!reconnect.succeeded);
+
+        // 其他 agent 不受影响。
+        let mut other = RenewState::default();
+        assert!(matches!(
+            handle_renewal(&ctx, &mut other, "other-agent", &csr, now + 1).await,
+            Frame::CertRenewed { .. }
+        ));
+
+        // 冷却窗口到期后允许再次续签。
+        let mut later = RenewState::default();
+        assert!(matches!(
+            handle_renewal(
+                &ctx,
+                &mut later,
+                "session-agent",
+                &csr,
+                now + RENEW_COOLDOWN_MS + 1
+            )
+            .await,
+            Frame::CertRenewed { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A6/资源：超长 / 非 PEM / 天数非法都必须回 Problem 而不是 panic；
+    /// 无效 CSR 计入冷却（防止用坏请求刷签名）。
+    #[tokio::test]
+    async fn a6_renewal_rejects_oversized_and_invalid_csr() {
+        let (dir, ctx) = renewal_fixture("renew-bad-csr");
+        let now = now_ms();
+
+        // 超长：直接在长度检查被拒，且计入一次尝试。
+        let oversized = "A".repeat(MAX_CSR_PEM_LEN + 1);
+        let mut session = RenewState::default();
+        let reply = handle_renewal(&ctx, &mut session, "agent-big", &oversized, now).await;
+        assert_eq!(problem_code(&reply), codes::BAD_FRAME);
+        // 紧接着用同一 agent 发合法 CSR：仍在冷却 → 限流（证明坏请求也计数）。
+        let reply = handle_renewal(
+            &ctx,
+            &mut session,
+            "agent-big",
+            &csr_with_cn("agent-big"),
+            now + 1,
+        )
+        .await;
+        assert_eq!(problem_code(&reply), codes::RATE_LIMITED);
+
+        // 非 PEM：BAD_FRAME，且不 panic。
+        let mut session = RenewState::default();
+        let reply = handle_renewal(&ctx, &mut session, "agent-garbage", "not a csr", now).await;
+        assert_eq!(problem_code(&reply), codes::BAD_FRAME);
+        assert!(!session.succeeded);
+
+        // 客户端有效期非法（0 天）：即使 CSR 合法也必须被拒。
+        let bad_days = RenewalContext::new(tls::cert_dir(&dir), 0);
+        let mut session = RenewState::default();
+        let reply = handle_renewal(
+            &bad_days,
+            &mut session,
+            "agent-zero-days",
+            &csr_with_cn("agent-zero-days"),
+            now,
+        )
+        .await;
+        assert_eq!(problem_code(&reply), codes::BAD_FRAME);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 严重项（rotate-cert 备份可回滚）：备份必须同时包含 cert 与 key，
+    /// 且 key/cert 不配套时 rotate-cert 仍能修复目录。
+    #[test]
+    fn a7_rotate_cert_backs_up_key_and_repairs_mismatched_pair() {
+        let dir = temp_dir("rotate-repair");
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            database: format!("sqlite://{}", dir.join("rustboard.db").display()),
+            self_monitor: false,
+            admin_token: "test-token".into(),
+            server_names: vec!["localhost".to_string()],
+            ..HubConfig::default()
+        };
+        tls::ensure_hub_material(&dir, &cfg.server_names, tls::CertPolicy::default()).unwrap();
+        let cfg_path = dir.join("hub.toml");
+        cfg.save(&cfg_path).unwrap();
+
+        let cert_path = tls::cert_dir(&dir).join(tls::SERVER_CERT_FILE);
+        let key_path = tls::cert_dir(&dir).join(tls::SERVER_KEY_FILE);
+        let old_cert = std::fs::read_to_string(&cert_path).unwrap();
+        let old_key = std::fs::read_to_string(&key_path).unwrap();
+        assert!(tls::cert_matches_key(&old_cert, &old_key).unwrap());
+
+        // 模拟续签写盘中途崩溃：key 与 cert 不配套，run 的启动自检会失败。
+        let bad_key = rcgen::KeyPair::generate().unwrap().serialize_pem();
+        fsutil::atomic_write(&key_path, bad_key.as_bytes(), 0o600).unwrap();
+        assert!(
+            tls::server_config(&dir).is_err(),
+            "不配套时必须能从配置构建阶段发现"
+        );
+
+        // rotate-cert 不依赖旧配置，可以直接修复。
+        rotate_cert(Some(cfg_path), true, Some(30)).expect("rotate-cert 必须能修复不配套材料");
+
+        // 修复后：配套、有效期按 --days、指纹变化。
+        let new_cert = std::fs::read_to_string(&cert_path).unwrap();
+        let new_key = std::fs::read_to_string(&key_path).unwrap();
+        assert!(tls::cert_matches_key(&new_cert, &new_key).unwrap());
+        assert!(tls::server_config(&dir).is_ok());
+        assert_eq!(tls::days_left(&new_cert, now_ms()).unwrap(), 30);
+        assert_ne!(
+            tls::fingerprint_of_pem(&new_cert).unwrap(),
+            tls::fingerprint_of_pem(&old_cert).unwrap()
+        );
+
+        // 备份：cert 0644 + key 0600，同一时间戳后缀，内容等于轮换前的磁盘内容。
+        let entries: Vec<String> = std::fs::read_dir(tls::cert_dir(&dir))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        let mut cert_backups: Vec<&String> = entries
+            .iter()
+            .filter(|name| name.starts_with("server.crt.bak-"))
+            .collect();
+        cert_backups.sort();
+        assert_eq!(cert_backups.len(), 1, "必须恰好有一个证书备份: {entries:?}");
+        let stamp = cert_backups[0]
+            .trim_start_matches("server.crt.bak-")
+            .to_string();
+        let key_backup_name = format!("server.key.bak-{stamp}");
+        assert!(
+            entries.iter().any(|name| name == &key_backup_name),
+            "缺少使用同一时间戳的私钥备份: {entries:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tls::cert_dir(&dir).join(cert_backups[0])).unwrap(),
+            old_cert,
+            "证书备份必须是轮换前的证书"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tls::cert_dir(&dir).join(&key_backup_name)).unwrap(),
+            bad_key,
+            "私钥备份必须是轮换前磁盘上的私钥"
+        );
+
+        // 备份权限：证书 0644、私钥 0600（A8）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |name: &str| {
+                std::fs::metadata(tls::cert_dir(&dir).join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode(cert_backups[0].as_str()), 0o644);
+            assert_eq!(mode(&key_backup_name), 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 资源保护：CSR 长度门禁的边界值（16 KiB 整合法，+1 拒绝），纳管与续签共用。
+    #[test]
+    fn csr_size_gate_boundary() {
+        assert!(csr_within_limit(""));
+        assert!(csr_within_limit(&"A".repeat(MAX_CSR_PEM_LEN)));
+        assert!(!csr_within_limit(&"A".repeat(MAX_CSR_PEM_LEN + 1)));
+    }
+
+    /// 冷却表：窗口内拒绝、窗口后放行、不同 agent 互不影响，且表大小有硬上界。
+    #[test]
+    fn renew_guard_cooldown_and_memory_bound() {
+        let mut guard = RenewGuard::new();
+        let now = 1_000_000;
+
+        assert!(guard.begin_attempt("a", now), "首次尝试必须放行");
+        assert!(
+            !guard.begin_attempt("a", now + RENEW_COOLDOWN_MS - 1),
+            "冷却窗口内必须拒绝"
+        );
+        assert!(
+            guard.begin_attempt("a", now + RENEW_COOLDOWN_MS),
+            "冷却结束后必须放行"
+        );
+        assert!(guard.begin_attempt("b", now), "不同 agent 的冷却互不影响");
+
+        // 塞入远多于上限的身份，表长度必须始终不超过上限（内存有硬上界）。
+        for i in 0..(RENEW_GUARD_MAX_ENTRIES + 32) {
+            assert!(guard.begin_attempt(&format!("agent-{i}"), now + i as i64));
+        }
+        assert!(
+            guard.last_attempt_ms.len() <= RENEW_GUARD_MAX_ENTRIES,
+            "冷却表不得无限增长，实际 {}",
+            guard.last_attempt_ms.len()
+        );
+    }
+
+    /// A2/A7：`init` 的四个有效期参数与 `rotate-cert` 参数必须出现在 --help 里。
+    #[test]
+    fn a2_init_and_rotate_cert_expose_cli_flags() {
+        use clap::CommandFactory;
+
+        let mut cmd = Cli::command();
+        let init = cmd
+            .find_subcommand_mut("init")
+            .expect("init 子命令必须存在");
+        for id in [
+            "ca_days",
+            "server_cert_days",
+            "client_cert_days",
+            "renew_before_days",
+        ] {
+            assert!(
+                init.get_arguments().any(|arg| arg.get_id() == id),
+                "init 缺少 --{}",
+                id.replace('_', "-")
+            );
+        }
+
+        let mut cmd = Cli::command();
+        let rotate = cmd
+            .find_subcommand_mut("rotate-cert")
+            .expect("rotate-cert 子命令必须存在");
+        for id in ["config", "force", "days"] {
+            assert!(
+                rotate.get_arguments().any(|arg| arg.get_id() == id),
+                "rotate-cert 缺少参数 {id}"
+            );
+        }
+    }
+
+    /// 第五轮建议：短小但非法的 CSR 也在消费 token 之前被拒（不烧 token）。
+    #[tokio::test]
+    async fn s5_enrollment_rejects_invalid_csr_without_consuming_token() {
+        let dir = temp_dir("enroll-bad-csr");
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], tls::CertPolicy::default())
+            .unwrap();
+        let state = AppState {
+            storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
+            cfg: Arc::new(HubConfig {
+                data_dir: dir.clone(),
+                admin_token: "token".to_string(),
+                ..HubConfig::default()
+            }),
+            sessions: SessionRegistry::new(),
+            session_slots: Arc::new(Semaphore::new(4)),
+            renewal: RenewalContext::new(tls::cert_dir(&dir), 90),
+        };
+        let token = "enroll-token-bad-csr";
+        let now = now_ms();
+        state
+            .storage
+            .create_enroll_token(&tls::sha256_hex(token), "agent", now, now + 600_000)
+            .unwrap();
+        let req = EnrollRequest {
+            token: token.to_string(),
+            csr_pem: "not a csr".to_string(),
+            requested_name: "agent".to_string(),
+            hostname: "host".to_string(),
+            protocol: PROTOCOL_VERSION,
+        };
+
+        match precheck_enroll(&state, &req) {
+            Err(reject) => match reject.as_ref() {
+                Frame::Problem { code, .. } => assert_eq!(code, codes::BAD_FRAME),
+                _ => panic!("非法 CSR 必须回 Problem"),
+            },
+            Ok(_) => panic!("非法 CSR 必须被拒绝"),
+        }
+        assert!(
+            state
+                .storage
+                .consume_enroll_token(&tls::sha256_hex(token), now)
+                .unwrap()
+                .is_some(),
+            "非法 CSR 不得消耗 token"
+        );
+        assert!(state.storage.list_agents().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S1-2：CA 不配套时 enrollment 必须在消费 token 之前被拒，
+    /// 一次性 token 不被烧掉，也不写 agent 记录。
+    #[tokio::test]
+    async fn s12_enrollment_rejects_bad_ca_without_consuming_token() {
+        let dir = temp_dir("enroll-bad-ca");
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], tls::CertPolicy::default())
+            .unwrap();
+        let state = AppState {
+            storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
+            cfg: Arc::new(HubConfig {
+                data_dir: dir.clone(),
+                admin_token: "token".to_string(),
+                ..HubConfig::default()
+            }),
+            sessions: SessionRegistry::new(),
+            session_slots: Arc::new(Semaphore::new(4)),
+            renewal: RenewalContext::new(tls::cert_dir(&dir), 90),
+        };
+
+        let token = "enroll-token-value";
+        let now = now_ms();
+        state
+            .storage
+            .create_enroll_token(&tls::sha256_hex(token), "agent", now, now + 600_000)
+            .unwrap();
+
+        let (csr_pem, _key) = tls::make_csr().unwrap();
+        let req = EnrollRequest {
+            token: token.to_string(),
+            csr_pem,
+            requested_name: "agent".to_string(),
+            hostname: "host".to_string(),
+            protocol: PROTOCOL_VERSION,
+        };
+
+        // CA 正常时前置检查通过（不消费 token）。
+        precheck_enroll(&state, &req).expect("CA 正常时前置检查应通过");
+        assert!(
+            state
+                .storage
+                .consume_enroll_token(&tls::sha256_hex(token), now)
+                .unwrap()
+                .is_some(),
+            "前置检查本身不应消费 token"
+        );
+
+        // 用一个新的 token，然后破坏 CA 配对（已消费的 token 行会保留，不能复用）。
+        let token2 = "enroll-token-value-2";
+        let now = now_ms();
+        state
+            .storage
+            .create_enroll_token(&tls::sha256_hex(token2), "agent", now, now + 600_000)
+            .unwrap();
+        let req_bad_ca = EnrollRequest {
+            token: token2.to_string(),
+            ..req.clone()
+        };
+        let other = temp_dir("enroll-bad-ca-other");
+        tls::ensure_hub_material(
+            &other,
+            &["localhost".to_string()],
+            tls::CertPolicy::default(),
+        )
+        .unwrap();
+        let other_key =
+            std::fs::read_to_string(tls::cert_dir(&other).join(tls::CA_KEY_FILE)).unwrap();
+        fsutil::atomic_write(
+            &tls::cert_dir(&dir).join(tls::CA_KEY_FILE),
+            other_key.as_bytes(),
+            0o600,
+        )
+        .unwrap();
+
+        match precheck_enroll(&state, &req_bad_ca) {
+            Err(reject) => match reject.as_ref() {
+                Frame::Problem { code, .. } => assert_eq!(code, codes::INTERNAL),
+                _ => panic!("CA 不配套时必须拒绝 enrollment"),
+            },
+            Ok(_) => panic!("CA 不配套时必须拒绝 enrollment"),
+        }
+        // token 必须仍然可用（未被消费），且没有写入 agent 记录。
+        assert!(
+            state
+                .storage
+                .consume_enroll_token(&tls::sha256_hex(token2), now)
+                .unwrap()
+                .is_some(),
+            "CA 不配套时不得消耗 token"
+        );
+        assert!(
+            state.storage.list_agents().unwrap().is_empty(),
+            "被拒绝的 enrollment 不得写 agent 记录"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// `init --san` 非法时必须在创建 CA 之前失败（不留下半个 CA / 半个配置）。
+    #[test]
+    fn s13_init_with_bad_san_leaves_no_ca_or_config() {
+        let dir = temp_dir("init-bad-san");
+        let cfg_path = dir.join("hub.toml");
+        let data_dir = dir.join("data");
+        let err = init(
+            Some(cfg_path.clone()),
+            Some(data_dir.clone()),
+            Some("127.0.0.1:0".to_string()),
+            Some("127.0.0.1:0".to_string()),
+            vec!["bad name".to_string()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect_err("非法 --san 必须让 init 失败");
+        assert!(
+            format!("{err:#}").contains("server_names"),
+            "错误信息: {err:#}"
+        );
+        assert!(!cfg_path.exists(), "失败时不得写入配置文件");
+        assert!(
+            !tls::cert_dir(&data_dir).exists(),
+            "失败时不得创建证书目录/CA"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CA 不配套时 `rotate-cert --force` 必须失败，且不新增任何备份、不改证书。
+    #[test]
+    fn a7_rotate_cert_failed_ca_leaves_no_backup() {
+        let dir = temp_dir("rotate-bad-ca");
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            database: format!("sqlite://{}", dir.join("rustboard.db").display()),
+            self_monitor: false,
+            admin_token: "test-token".into(),
+            server_names: vec!["localhost".to_string()],
+            ..HubConfig::default()
+        };
+        tls::ensure_hub_material(&dir, &cfg.server_names, tls::CertPolicy::default()).unwrap();
+        let cfg_path = dir.join("hub.toml");
+        cfg.save(&cfg_path).unwrap();
+        let cert_before =
+            std::fs::read_to_string(tls::cert_dir(&dir).join(tls::SERVER_CERT_FILE)).unwrap();
+        let other = temp_dir("rotate-bad-ca-other");
+        tls::ensure_hub_material(
+            &other,
+            &["localhost".to_string()],
+            tls::CertPolicy::default(),
+        )
+        .unwrap();
+        let other_key =
+            std::fs::read_to_string(tls::cert_dir(&other).join(tls::CA_KEY_FILE)).unwrap();
+        fsutil::atomic_write(
+            &tls::cert_dir(&dir).join(tls::CA_KEY_FILE),
+            other_key.as_bytes(),
+            0o600,
+        )
+        .unwrap();
+
+        rotate_cert(Some(cfg_path), true, Some(30)).expect_err("CA 不配套必须失败");
+
+        assert_eq!(
+            std::fs::read_to_string(tls::cert_dir(&dir).join(tls::SERVER_CERT_FILE)).unwrap(),
+            cert_before,
+            "失败不得改写证书"
+        );
+        let backups: Vec<String> = std::fs::read_dir(tls::cert_dir(&dir))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".bak-"))
+            .collect();
+        assert!(backups.is_empty(), "失败路径不得新增备份: {backups:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// 第五轮 S1：CA 两件套被另一套覆盖后，`init --force` 必须用当前 CA 重签 server
+    /// （成对备份、新链可验证），不能返回 0 却留着旧链。
+    #[test]
+    fn s5_init_force_reissues_when_ca_replaced() {
+        let dir = temp_dir("init-replace-ca");
+        let cfg_path = dir.join("hub.toml");
+        let data = dir.join("data");
+        let run_init = |force: bool| {
+            init(
+                Some(cfg_path.clone()),
+                Some(data.clone()),
+                Some("127.0.0.1:0".to_string()),
+                Some("127.0.0.1:0".to_string()),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                force,
+            )
+        };
+        run_init(false).expect("首次 init 必须成功");
+        let old_server =
+            std::fs::read_to_string(tls::cert_dir(&data).join(tls::SERVER_CERT_FILE)).unwrap();
+
+        // 另一套完整 CA 覆盖当前 CA 两件套。
+        let other = temp_dir("init-replace-ca-other");
+        tls::ensure_hub_material(
+            &other,
+            &["localhost".to_string()],
+            tls::CertPolicy::default(),
+        )
+        .unwrap();
+        for name in [tls::CA_CERT_FILE, tls::CA_KEY_FILE] {
+            let src = std::fs::read(tls::cert_dir(&other).join(name)).unwrap();
+            fsutil::atomic_write(&tls::cert_dir(&data).join(name), &src, 0o600).unwrap();
+        }
+
+        run_init(true).expect("CA 变化后 init --force 必须重签 server 并成功");
+
+        let server =
+            std::fs::read_to_string(tls::cert_dir(&data).join(tls::SERVER_CERT_FILE)).unwrap();
+        let key = std::fs::read_to_string(tls::cert_dir(&data).join(tls::SERVER_KEY_FILE)).unwrap();
+        let ca = std::fs::read_to_string(tls::cert_dir(&data).join(tls::CA_CERT_FILE)).unwrap();
+        assert_ne!(server, old_server, "必须重签 server 证书");
+        assert!(tls::cert_matches_key(&server, &key).unwrap());
+        assert!(
+            tls::cert_issued_by_ca(&server, &ca, now_ms()).unwrap(),
+            "新 server 证书必须由当前 CA 签发"
+        );
+        assert!(tls::server_config(&data).is_ok());
+        let backups: Vec<String> = std::fs::read_dir(tls::cert_dir(&data))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("server.crt.bak-"))
+            .collect();
+        assert_eq!(backups.len(), 1, "旧 server 证书必须成对备份: {backups:?}");
+        assert_eq!(
+            std::fs::read_to_string(tls::cert_dir(&data).join(&backups[0])).unwrap(),
+            old_server
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// 建议项：`rotate-cert --force` 在 server.crt 缺失时也能补签（不再先读旧证书失败）。
+    #[test]
+    fn a7_rotate_cert_force_reissues_missing_server_cert() {
+        let dir = temp_dir("rotate-missing-cert");
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            database: format!("sqlite://{}", dir.join("rustboard.db").display()),
+            self_monitor: false,
+            admin_token: "test-token".into(),
+            server_names: vec!["localhost".to_string()],
+            ..HubConfig::default()
+        };
+        tls::ensure_hub_material(&dir, &cfg.server_names, tls::CertPolicy::default()).unwrap();
+        let cfg_path = dir.join("hub.toml");
+        cfg.save(&cfg_path).unwrap();
+        std::fs::remove_file(tls::cert_dir(&dir).join(tls::SERVER_CERT_FILE)).unwrap();
+
+        rotate_cert(Some(cfg_path), true, Some(30)).expect("--force 应能补签缺失的服务端证书");
+
+        let cert_pem = std::fs::read_to_string(tls::cert_dir(&dir).join(tls::SERVER_CERT_FILE))
+            .expect("应写回 server.crt");
+        let key_pem = std::fs::read_to_string(tls::cert_dir(&dir).join(tls::SERVER_KEY_FILE))
+            .expect("应写回 server.key");
+        assert!(tls::cert_matches_key(&cert_pem, &key_pem).unwrap());
+        assert_eq!(tls::days_left(&cert_pem, now_ms()).unwrap(), 30);
+        assert!(tls::server_config(&dir).is_ok());
+        assert!(
+            std::fs::read_dir(tls::cert_dir(&dir))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("server.key.bak-")),
+            "补签前应备份旧私钥"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ------------------------------------------------------------------
+    // M2：管理 API 鉴权 / overview / latest / series / settings
+    // ------------------------------------------------------------------
+
+    fn hub_state(admin_token: &str) -> AppState {
+        AppState {
+            storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
+            cfg: Arc::new(HubConfig {
+                admin_token: admin_token.to_string(),
+                ..HubConfig::default()
+            }),
+            sessions: SessionRegistry::new(),
+            session_slots: Arc::new(Semaphore::new(8)),
+            renewal: RenewalContext::new(PathBuf::from("/tmp/rb-hub-test-unused-ca"), 90),
+        }
+    }
+
+    fn test_agent(agent_id: &str) -> AgentRecord {
+        AgentRecord {
+            agent_id: agent_id.to_string(),
+            name: agent_id.to_string(),
+            hostname: "test-host".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            version: "0.2.0".to_string(),
+            boot_id: "boot".to_string(),
+            status: "online".to_string(),
+            last_seen_at: now_ms(),
+            created_at: now_ms(),
+        }
+    }
+
+    /// 直接调用管理 API（不绑定端口），返回状态 / 响应头 / 响应体。
+    async fn admin_call(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        body: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if body.is_some() {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+        }
+        let request = builder
+            .body(
+                body.map(|body| Body::from(body.to_string()))
+                    .unwrap_or_else(Body::empty),
+            )
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, headers, bytes)
+    }
+
+    fn json_body(bytes: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(bytes).expect("响应必须是 JSON")
+    }
+
+    /// M2-7：`/healthz` 免鉴权；其余 `/api/v1/*` 缺 / 错 / 无 Bearer 前缀全部 401，
+    /// 正确 token 200，且所有响应带 `Cache-Control: no-store`。
+    #[tokio::test]
+    async fn m2_bearer_auth_healthz_public_and_api_protected() {
+        let router = admin_router(hub_state("m2-admin-token"));
+
+        let (status, headers, _) = admin_call(&router, "GET", "/healthz", None, None).await;
+        assert_eq!(status, StatusCode::OK, "/healthz 必须免鉴权");
+        assert_eq!(
+            headers.get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "管理端口所有响应都要禁缓存"
+        );
+
+        let (status, headers, body) =
+            admin_call(&router, "GET", "/api/v1/agents", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(json_body(&body)["error"], "unauthorized");
+
+        let (status, _, body) =
+            admin_call(&router, "GET", "/api/v1/agents", Some("wrong"), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(json_body(&body)["error"], "unauthorized");
+
+        // 只有 token、没有 Bearer 前缀同样拒绝。
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/v1/agents")
+            .header(header::AUTHORIZATION, "m2-admin-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let (status, _, body) = admin_call(
+            &router,
+            "GET",
+            "/api/v1/agents",
+            Some("m2-admin-token"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json_body(&body).is_array(), "正确 token 应返回 agent 数组");
+
+        // scheme 大小写不敏感：bearer / BEARER 都是合法 Bearer 认证。
+        for scheme in ["bearer", "BEARER", "BeArEr"] {
+            let request = axum::http::Request::builder()
+                .method("GET")
+                .uri("/api/v1/agents")
+                .header(header::AUTHORIZATION, format!("{scheme} m2-admin-token"))
+                .body(Body::empty())
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "scheme={scheme}");
+        }
+
+        // token 错误时，scheme 再正确也必须 401。
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/v1/agents")
+            .header(header::AUTHORIZATION, "bearer wrong-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Bearer 解析：scheme 大小写不敏感、token 常量时间比较、拒绝多余分段。
+    #[test]
+    fn m2_bearer_scheme_is_case_insensitive() {
+        use axum::http::HeaderMap;
+
+        let mut headers = HeaderMap::new();
+        assert!(!bearer_matches(&headers, "secret"));
+        assert!(!bearer_matches(&headers, ""));
+
+        for scheme in ["Bearer", "bearer", "BEARER", "bEaReR"] {
+            let value = format!("{scheme} secret");
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&value).unwrap(),
+            );
+            assert!(bearer_matches(&headers, "secret"), "scheme={scheme}");
+            assert!(!bearer_matches(&headers, "wrong"), "scheme={scheme}");
+        }
+
+        // 没有 scheme / 多余分段 / 空 token 都不接受。
+        for value in [
+            "secret",
+            "Bearer",
+            "Bearer secret extra",
+            "Basic secret",
+            "Bearer ",
+        ] {
+            headers.insert(header::AUTHORIZATION, HeaderValue::from_str(value).unwrap());
+            assert!(!bearer_matches(&headers, "secret"), "value={value}");
+        }
+    }
+
+    /// M2：500 响应只返回固定错误码，不能回显内部路径 / SQL / 文件系统信息。
+    #[tokio::test]
+    async fn m2_internal_error_response_is_sanitized() {
+        let err = ApiError::Internal(anyhow::anyhow!(
+            "打开数据库失败: /var/lib/rustboard/secret/rustboard.db: 权限不足 \
+             (SQL: SELECT * FROM agents)"
+        ));
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            json_body(&body),
+            serde_json::json!({ "error": "internal_error" }),
+            "500 响应体必须只有固定错误码"
+        );
+        let text = String::from_utf8_lossy(&body);
+        for leaked in ["/var/lib", "rustboard.db", "SELECT", "权限不足"] {
+            assert!(
+                !text.contains(leaked),
+                "500 响应泄露内部信息 {leaked}: {text}"
+            );
+        }
+    }
+
+    /// latest_samples 行数上限必须映射为 413 query_too_large，而不是 500 internal_error。
+    #[tokio::test]
+    async fn m2_query_too_large_maps_to_413() {
+        let err = anyhow::Error::new(QueryTooLarge { limit: 100_000 });
+        let response = ApiError::from(err).into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            json_body(&body),
+            serde_json::json!({ "error": "query_too_large" })
+        );
+        assert!(
+            !String::from_utf8_lossy(&body).contains("internal_error"),
+            "查询过大不能被当成内部错误"
+        );
+    }
+
+    /// M2：空 / 弱 admin_token 必须在启动前被拒绝，错误信息提示 admin-token 修复命令。
+    #[test]
+    fn m2_empty_or_weak_admin_token_refuses_startup() {
+        let err = require_admin_token(&HubConfig::default())
+            .expect_err("空 token 必须拒绝启动")
+            .to_string();
+        assert!(err.contains("admin-token"), "错误信息: {err}");
+
+        // 31 个字符仍算弱 token；32 个字符是下限。
+        let weak = HubConfig {
+            admin_token: "a".repeat(MIN_ADMIN_TOKEN_LEN - 1),
+            ..HubConfig::default()
+        };
+        let err = require_admin_token(&weak)
+            .expect_err("弱 token 必须拒绝启动")
+            .to_string();
+        assert!(err.contains("admin-token"), "错误信息: {err}");
+        assert!(err.contains("32"), "错误信息应说明最小长度: {err}");
+
+        let boundary = HubConfig {
+            admin_token: "a".repeat(MIN_ADMIN_TOKEN_LEN),
+            ..HubConfig::default()
+        };
+        require_admin_token(&boundary).expect("32 字符 token 必须放行");
+
+        let ok = HubConfig {
+            admin_token: "a".repeat(64),
+            ..HubConfig::default()
+        };
+        require_admin_token(&ok).expect("64 字符 token 必须放行");
+    }
+
+    /// M2：`admin-token` 为空时生成 64 位 hex 并落盘（0600），非空时保持不变。
+    #[test]
+    fn m2_admin_token_command_generates_and_persists() {
+        let dir = temp_dir("admin-token");
+        let path = dir.join("hub.toml");
+        HubConfig::default().save(&path).unwrap();
+
+        admin_token(Some(path.clone())).unwrap();
+        let generated = HubConfig::load(&path).unwrap().admin_token;
+        assert_eq!(generated.len(), 64, "token 应为 64 位 hex");
+        assert!(
+            generated.bytes().all(|b| b.is_ascii_hexdigit()),
+            "token 必须全部是十六进制: {generated}"
+        );
+
+        // 第二次调用必须读取已有 token，而不是重新生成。
+        admin_token(Some(path.clone())).unwrap();
+        assert_eq!(HubConfig::load(&path).unwrap().admin_token, generated);
+
+        // 配置里是弱 token 时，admin-token 必须重新生成，否则启动报错给出的
+        // 修复命令无法真正修复。
+        let mut weak = HubConfig::load(&path).unwrap();
+        weak.admin_token = "short".to_string();
+        weak.save(&path).unwrap();
+        admin_token(Some(path.clone())).unwrap();
+        let regenerated = HubConfig::load(&path).unwrap().admin_token;
+        assert_eq!(regenerated.len(), 64, "弱 token 应被重新生成为 64 位 hex");
+        assert_ne!(regenerated, "short");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "配置里的 admin_token 必须 0600");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 自动 bucket 档位：跨度越大档位越大，且每个档位能让单曲线 ≤1500 点。
+    #[test]
+    fn m2_auto_bucket_picks_smallest_sufficient_tier() {
+        let cases = [
+            (60_000_i64, 1_000_i64),
+            (3_600_000, 5_000),
+            (6 * 3_600_000, 30_000),
+            (24 * 3_600_000, 60_000),
+            (7 * 24 * 3_600_000, 900_000),
+            (MAX_SERIES_SPAN_MS, 3_600_000),
+        ];
+        for (span, expected) in cases {
+            let bucket = auto_bucket_ms(span);
+            assert_eq!(bucket, expected, "span={span} 的自动 bucket 不符");
+            assert!(
+                span / bucket < MAX_AUTO_BUCKET_POINTS,
+                "span={span} 的 bucket={bucket} 单曲线点数超限"
+            );
+        }
+        // 档位必须单调、且来自方案固定集合。
+        for bucket in [
+            1_000, 5_000, 10_000, 30_000, 60_000, 300_000, 900_000, 3_600_000, 21_600_000,
+        ] {
+            assert!(AUTO_BUCKETS_MS.contains(&bucket));
+        }
+    }
+
+    /// series 参数边界：多 metric、from/to、32 天、metric 字符集与数量、bucket 校验。
+    #[test]
+    fn m2_series_query_validation_boundaries() {
+        let from = 1_700_000_000_000_i64;
+        let to = from + MAX_SERIES_SPAN_MS;
+        let valid = format!("metric=cpu.usage&metric=mem.used&from={from}&to={to}");
+        let parsed = parse_series_query(Some(&valid)).expect("合法参数必须通过");
+        assert_eq!(parsed.metrics, vec!["cpu.usage", "mem.used"]);
+        assert_eq!(parsed.from, from);
+        assert_eq!(parsed.to, to);
+        assert_eq!(parsed.bucket_ms, auto_bucket_ms(MAX_SERIES_SPAN_MS));
+
+        let explicit = format!("metric=cpu.usage&from={from}&to={to}&bucket_ms=60000");
+        assert_eq!(
+            parse_series_query(Some(&explicit)).unwrap().bucket_ms,
+            60_000
+        );
+
+        // 时间参数。
+        assert!(parse_series_query(Some("metric=cpu.usage&from=1&to=1")).is_err());
+        assert!(parse_series_query(Some("metric=cpu.usage&from=2&to=1")).is_err());
+        let too_wide = format!(
+            "metric=cpu.usage&from={}&to={}",
+            from,
+            from + MAX_SERIES_SPAN_MS + 1
+        );
+        assert!(parse_series_query(Some(&too_wide)).is_err());
+        assert!(parse_series_query(Some("metric=cpu.usage&to=10")).is_err());
+        assert!(parse_series_query(Some("metric=cpu.usage")).is_err());
+        assert!(parse_series_query(Some("metric=cpu.usage&from=1&from=2&to=3")).is_err());
+        assert!(parse_series_query(Some("metric=cpu.usage&from=1&to=3&bucket_ms=0")).is_err());
+
+        // metric 数量 / 字符集 / 长度 / 空值。
+        assert!(parse_series_query(Some("from=1&to=3")).is_err());
+        let many: String = (0..=MAX_SERIES_METRICS)
+            .map(|i| format!("metric=m{i}&"))
+            .collect();
+        assert!(parse_series_query(Some(&format!("{many}from=1&to=3"))).is_err());
+        assert!(parse_series_query(Some("metric=CPU.usage&from=1&to=3")).is_err());
+        assert!(parse_series_query(Some("metric=cpu usage&from=1&to=3")).is_err());
+        assert!(parse_series_query(Some("metric=a/b&from=1&to=3")).is_err());
+        let long = "a".repeat(MAX_METRIC_LEN + 1);
+        assert!(parse_series_query(Some(&format!("metric={long}&from=1&to=3"))).is_err());
+        assert!(parse_series_query(Some("metric=&from=1&to=3")).is_err());
+        assert!(parse_series_query(Some("metric=cpu.usage&from=1&to=3&bogus=1")).is_err());
+    }
+
+    /// 单次响应的点数 / 序列数上限：超限必须返回 400（这里验证纯函数返回错误）。
+    #[test]
+    fn m2_series_response_limits() {
+        let row = |metric: String, labels: Labels, ts: i64| SeriesRow {
+            metric,
+            labels,
+            ts,
+            value: 1.0,
+        };
+
+        let too_many_points: Vec<SeriesRow> = (0..=MAX_SERIES_POINTS)
+            .map(|i| row("cpu.usage".to_string(), Labels::new(), i as i64))
+            .collect();
+        assert!(build_series_response(1_000, too_many_points).is_err());
+
+        let too_many_series: Vec<SeriesRow> = (0..=MAX_SERIES_COUNT)
+            .map(|i| row(format!("m{i}"), Labels::new(), 1))
+            .collect();
+        assert!(build_series_response(1_000, too_many_series).is_err());
+
+        let response = build_series_response(
+            1_000,
+            vec![
+                row("cpu.usage".to_string(), Labels::new(), 2_000),
+                row("cpu.usage".to_string(), Labels::new(), 1_000),
+            ],
+        )
+        .unwrap();
+        assert_eq!(response.bucket_ms, 1_000);
+        assert_eq!(response.series.len(), 1);
+        assert_eq!(
+            response.series[0].points,
+            vec![(1_000, 1.0), (2_000, 1.0)],
+            "点必须按 ts 升序"
+        );
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["series"][0]["points"][0][0], 1_000);
+        assert_eq!(json["series"][0]["labels"], serde_json::json!({}));
+    }
+
+    /// overview：固定指标 + 60s 窗口 + 同序列去重取最新 + 每机有效间隔。
+    #[tokio::test]
+    async fn m2_overview_dedupes_latest_and_reports_settings() {
+        let state = hub_state("token");
+        state.storage.upsert_agent(&test_agent("a1")).unwrap();
+        let now = now_ms();
+
+        let mut seq = 0u64;
+        let mut insert = |metric: &str, ts: i64, value: f64| {
+            let batch = SampleBatch {
+                agent_id: "a1".to_string(),
+                epoch: 1,
+                seq,
+                boot_id: "boot".to_string(),
+                sent_at: ts,
+                samples: vec![Sample::new(metric, ts, value)],
+            };
+            seq += 1;
+            state.storage.insert_batch(&batch).unwrap();
+        };
+        insert("cpu.usage", now - 2_000, 10.0);
+        insert("cpu.usage", now - 1_000, 20.0);
+        // 不在固定指标集合内，必须被过滤。
+        insert("net.rx_bytes", now - 500, 999.0);
+        // 超出 60s 窗口，必须被过滤。
+        insert("mem.used", now - OVERVIEW_WINDOW_MS - 60_000, 123.0);
+
+        let Json(data) = overview(State(state.clone()), RawQuery(None))
+            .await
+            .expect("overview 必须成功");
+        assert_eq!(data.agents.len(), 1);
+        assert!(data.server_time >= now);
+        assert_eq!(data.latest.len(), 1, "只保留关键指标且在窗口内的最新点");
+        assert_eq!(data.latest[0].agent_id, "a1");
+        assert_eq!(data.latest[0].metric, "cpu.usage");
+        assert_eq!(data.latest[0].ts, now - 1_000);
+        assert_eq!(data.latest[0].value, 20.0);
+        assert_eq!(data.settings.len(), 1);
+        assert_eq!(
+            data.settings[0].sample_interval_ms, state.cfg.sample_interval_ms,
+            "未显式配置时必须回退 cfg 默认值"
+        );
+
+        state
+            .storage
+            .set_sample_interval("a1", 10_000, now)
+            .unwrap();
+        let Json(data) = overview(State(state.clone()), RawQuery(None))
+            .await
+            .expect("overview 必须成功");
+        assert_eq!(data.settings[0].sample_interval_ms, 10_000);
+    }
+
+    /// overview 的 `window_ms`：默认 60s，允许 1s–1h 且必须真正用于查询；越界/非法 400。
+    #[tokio::test]
+    async fn m2_overview_window_ms_is_applied_and_bounded() {
+        let state = hub_state("token");
+        state.storage.upsert_agent(&test_agent("a1")).unwrap();
+        let now = now_ms();
+        // 5s 前的点：默认 60s 能看到，window_ms=1000 必须看不到。
+        state
+            .storage
+            .insert_batch(&SampleBatch {
+                agent_id: "a1".to_string(),
+                epoch: 1,
+                seq: 0,
+                boot_id: "boot".to_string(),
+                sent_at: now - 5_000,
+                samples: vec![Sample::new("cpu.usage", now - 5_000, 7.0)],
+            })
+            .unwrap();
+
+        let Json(data) = overview(State(state.clone()), RawQuery(None))
+            .await
+            .expect("overview 默认窗口必须成功");
+        assert_eq!(data.latest.len(), 1, "默认 60s 应包含 5s 前的点");
+
+        let Json(data) = overview(
+            State(state.clone()),
+            RawQuery(Some("window_ms=1000".to_string())),
+        )
+        .await
+        .expect("window_ms=1000 是合法边界");
+        assert!(
+            data.latest.is_empty(),
+            "window_ms=1000 必须真正过滤掉 5s 前的点"
+        );
+
+        let Json(data) = overview(
+            State(state.clone()),
+            RawQuery(Some("window_ms=60000".to_string())),
+        )
+        .await
+        .expect("window_ms=60000 是合法上限");
+        assert_eq!(data.latest.len(), 1, "60s 窗口应包含 5s 前的点");
+
+        // 超过 60000 必须 400，并在 message 里说明上限，前端固定 60000 不受影响。
+        let err = match overview(
+            State(state.clone()),
+            RawQuery(Some("window_ms=60001".to_string())),
+        )
+        .await
+        {
+            Ok(_) => panic!("window_ms=60001 必须被拒绝"),
+            Err(err) => err,
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = json_body(&body);
+        assert_eq!(body["error"], "bad_request");
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("60000"),
+            "错误信息必须说明上限 60000: {message}"
+        );
+
+        for bad in [
+            "window_ms=0",
+            "window_ms=999",
+            "window_ms=60001",
+            "window_ms=3600000",
+            "window_ms=abc",
+            "bogus=1",
+            "window_ms=1000&window_ms=2000",
+        ] {
+            let err = match overview(State(state.clone()), RawQuery(Some(bad.to_string()))).await {
+                Ok(_) => panic!("非法 overview 参数必须被拒绝: {bad}"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.into_response().status(),
+                StatusCode::BAD_REQUEST,
+                "bad={bad}"
+            );
+        }
+    }
+
+    /// settings：默认值 / 1000–300000 范围 / agent 不存在 404 / 落库后踢活跃会话。
+    #[tokio::test]
+    async fn m2_settings_range_404_and_reconfigure() {
+        let state = hub_state("token");
+        state.storage.upsert_agent(&test_agent("agent-1")).unwrap();
+        let session = state.sessions.register("agent-1");
+        let router = admin_router(state.clone());
+
+        let (status, _, body) = admin_call(
+            &router,
+            "GET",
+            "/api/v1/agents/agent-1/settings",
+            Some("token"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body = json_body(&body);
+        assert_eq!(body["agent_id"], "agent-1");
+        assert_eq!(body["sample_interval_ms"], 5_000);
+
+        for interval in [999_u64, 300_001] {
+            let payload = format!("{{\"sample_interval_ms\":{interval}}}");
+            let (status, _, body) = admin_call(
+                &router,
+                "PUT",
+                "/api/v1/agents/agent-1/settings",
+                Some("token"),
+                Some(&payload),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "interval={interval}");
+            assert_eq!(json_body(&body)["error"], "bad_request");
+        }
+
+        // 边界值 1000 / 300000 合法；写库后必须向活跃会话发 Reconfigure。
+        for interval in [1_000_u64, 300_000] {
+            let payload = format!("{{\"sample_interval_ms\":{interval}}}");
+            let (status, _, body) = admin_call(
+                &router,
+                "PUT",
+                "/api/v1/agents/agent-1/settings",
+                Some("token"),
+                Some(&payload),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "interval={interval}");
+            assert_eq!(json_body(&body)["sample_interval_ms"], interval);
+            assert_eq!(
+                state.storage.get_sample_interval("agent-1").unwrap(),
+                Some(interval),
+                "PUT 必须落库"
+            );
+            assert_eq!(
+                *session.shutdown.borrow(),
+                ShutdownReason::Reconfigure,
+                "配置变更必须走 Reconfigure，不能发吊销"
+            );
+        }
+
+        // 不存在的 agent：GET / PUT 都是 404。
+        let (status, _, _) = admin_call(
+            &router,
+            "GET",
+            "/api/v1/agents/missing/settings",
+            Some("token"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = admin_call(
+            &router,
+            "PUT",
+            "/api/v1/agents/missing/settings",
+            Some("token"),
+            Some("{\"sample_interval_ms\":10000}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(state.storage.get_sample_interval("missing").unwrap(), None);
+
+        // 非 JSON / 非数字 / 缺字段同样 400。
+        for payload in [
+            "{\"sample_interval_ms\":\"abc\"}",
+            "{\"sample_interval_ms\":-1}",
+            "{}",
+            "not-json",
+        ] {
+            let (status, _, _) = admin_call(
+                &router,
+                "PUT",
+                "/api/v1/agents/agent-1/settings",
+                Some("token"),
+                Some(payload),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "payload={payload}");
+        }
+    }
+
+    /// latest / series 路由：window 上限与参数错误返回 400 JSON，合法请求返回契约形状。
+    #[tokio::test]
+    async fn m2_latest_and_series_routes_validate_windows() {
+        let state = hub_state("token");
+        state.storage.upsert_agent(&test_agent("hub-self")).unwrap();
+        let router = admin_router(state);
+        let now = now_ms();
+
+        for uri in [
+            "/api/v1/agents/hub-self/latest?window_ms=0".to_string(),
+            "/api/v1/agents/hub-self/latest?window_ms=3600001".to_string(),
+            "/api/v1/agents/hub-self/latest?window_ms=abc".to_string(),
+        ] {
+            let (status, _, body) = admin_call(&router, "GET", &uri, Some("token"), None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "uri={uri}");
+            assert_eq!(json_body(&body)["error"], "bad_request");
+        }
+
+        let (status, _, body) = admin_call(
+            &router,
+            "GET",
+            "/api/v1/agents/hub-self/latest?window_ms=60000",
+            Some("token"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json_body(&body).is_array());
+
+        let from = now - 3_600_000;
+        let uri = format!(
+            "/api/v1/agents/hub-self/series?metric=cpu.usage&metric=mem.used&from={from}&to={now}"
+        );
+        let (status, _, body) = admin_call(&router, "GET", &uri, Some("token"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = json_body(&body);
+        assert_eq!(body["bucket_ms"], 5_000);
+        assert!(body["series"].is_array());
+
+        let uri = format!(
+            "/api/v1/agents/hub-self/series?metric=cpu.usage&from={from}&to={now}&bucket_ms=60000"
+        );
+        let (status, _, body) = admin_call(&router, "GET", &uri, Some("token"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json_body(&body)["bucket_ms"], 60_000);
+
+        // 非法 series 参数统一 400 JSON。
+        let invalid = [
+            format!("metric=cpu.usage&from={now}&to={now}"),
+            format!(
+                "metric=cpu.usage&from={from}&to={}",
+                from + MAX_SERIES_SPAN_MS + 1
+            ),
+            format!("metric=Bad&from={from}&to={now}"),
+            format!("metric=cpu.usage&from={from}"),
+        ];
+        for query in invalid {
+            let uri = format!("/api/v1/agents/hub-self/series?{query}");
+            let (status, _, body) = admin_call(&router, "GET", &uri, Some("token"), None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "query={query}");
+            assert_eq!(json_body(&body)["error"], "bad_request");
+        }
+    }
+
+    /// latest / series：不存在的 agent 返回 404（与 settings 一致），
+    /// 存在但没有数据时仍是 200 + 空结果。
+    #[tokio::test]
+    async fn m2_latest_and_series_missing_agent_are_404() {
+        let state = hub_state("token");
+        state.storage.upsert_agent(&test_agent("agent-1")).unwrap();
+        let router = admin_router(state);
+        let now = now_ms();
+
+        for uri in [
+            "/api/v1/agents/missing/latest".to_string(),
+            format!(
+                "/api/v1/agents/missing/series?metric=cpu.usage&from={}&to={}",
+                now - 1_000,
+                now
+            ),
+        ] {
+            let (status, _, body) = admin_call(&router, "GET", &uri, Some("token"), None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "uri={uri}");
+            let body = json_body(&body);
+            assert_eq!(body["error"], "not_found", "uri={uri}");
+            assert_eq!(body["message"], "agent 不存在", "uri={uri}");
+        }
+
+        // 存在但没有数据：空数组，不能误报 404。
+        let (status, _, body) = admin_call(
+            &router,
+            "GET",
+            "/api/v1/agents/agent-1/latest",
+            Some("token"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json_body(&body), serde_json::json!([]));
+
+        let uri = format!(
+            "/api/v1/agents/agent-1/series?metric=cpu.usage&from={}&to={}",
+            now - 1_000,
+            now
+        );
+        let (status, _, body) = admin_call(&router, "GET", &uri, Some("token"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json_body(&body)["series"], serde_json::json!([]));
+    }
+
+    /// 请求体上限 64 KiB：超限返回 413，不能把大请求读进内存。
+    #[tokio::test]
+    async fn m2_admin_body_limit_is_64kib() {
+        let state = hub_state("token");
+        state.storage.upsert_agent(&test_agent("agent-1")).unwrap();
+        let router = admin_router(state);
+
+        let mut payload = String::from("{\"sample_interval_ms\":10000,\"pad\":\"");
+        payload.push_str(&"a".repeat(MAX_ADMIN_BODY_SIZE));
+        payload.push_str("\"}");
+        let (status, _, _) = admin_call(
+            &router,
+            "PUT",
+            "/api/v1/agents/agent-1/settings",
+            Some("token"),
+            Some(&payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// M2：Welcome 使用显式采样间隔；未配置 / 读取失败回退 cfg（读取失败路径用
+    /// 现有真实存储验证「未配置」分支，避免为了造错去动存储抽象）。
+    #[test]
+    fn m2_welcome_interval_prefers_explicit_setting() {
+        let state = hub_state("token");
+        state.storage.upsert_agent(&test_agent("a1")).unwrap();
+        assert_eq!(
+            sample_interval_for(&state, "a1"),
+            state.cfg.sample_interval_ms
+        );
+
+        state
+            .storage
+            .set_sample_interval("a1", 10_000, now_ms())
+            .unwrap();
+        assert_eq!(sample_interval_for(&state, "a1"), 10_000);
+
+        // 0/越界值（只可能来自损坏数据）不能下发给 agent，必须回退默认值。
+        for invalid in [
+            0,
+            MIN_SAMPLE_INTERVAL_MS - 1,
+            MAX_SAMPLE_INTERVAL_MS + 1,
+            i64::MAX as u64,
+        ] {
+            state
+                .storage
+                .set_sample_interval("a1", invalid, now_ms())
+                .unwrap();
+            assert_eq!(
+                sample_interval_for(&state, "a1"),
+                state.cfg.sample_interval_ms,
+                "interval={invalid} 必须回退默认值"
+            );
+        }
+
+        // 边界值本身必须原样下发。
+        for valid in [MIN_SAMPLE_INTERVAL_MS, MAX_SAMPLE_INTERVAL_MS] {
+            state
+                .storage
+                .set_sample_interval("a1", valid, now_ms())
+                .unwrap();
+            assert_eq!(sample_interval_for(&state, "a1"), valid);
+        }
+    }
+
+    /// hub 本地采样间隔配置校验：1000–300000；越界配置启动失败，兜底值也不会非法。
+    #[test]
+    fn m2_hub_sample_interval_config_range_is_validated() {
+        for invalid in [0, 999, MAX_SAMPLE_INTERVAL_MS + 1, u64::MAX] {
+            let cfg = HubConfig {
+                sample_interval_ms: invalid,
+                ..HubConfig::default()
+            };
+            let err = validate_hub_sample_interval(&cfg)
+                .expect_err(&format!("{invalid}ms 必须被拒绝"))
+                .to_string();
+            assert!(err.contains("sample_interval_ms"), "错误信息: {err}");
+            assert!(
+                err.contains("1000") && err.contains("300000"),
+                "错误信息: {err}"
+            );
+        }
+        for valid in [MIN_SAMPLE_INTERVAL_MS, 5_000, MAX_SAMPLE_INTERVAL_MS] {
+            let cfg = HubConfig {
+                sample_interval_ms: valid,
+                ..HubConfig::default()
+            };
+            validate_hub_sample_interval(&cfg).expect("合法配置必须通过");
+        }
+
+        // 即使配置层漏校验（例如只有坏配置的单元测试），Welcome 兜底也 clamp 到 1000。
+        let mut state = hub_state("token");
+        state.cfg = Arc::new(HubConfig {
+            sample_interval_ms: 500,
+            ..HubConfig::default()
+        });
+        assert_eq!(
+            sample_interval_for(&state, "missing"),
+            MIN_SAMPLE_INTERVAL_MS,
+            "Welcome 绝不能下发越界配置值"
+        );
+    }
+
+    /// `admin-token` 子命令必须出现在 --help 里（面板 init 会提示用户运行它）。
+    #[test]
+    fn m2_admin_token_subcommand_exists() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let admin = cmd
+            .find_subcommand_mut("admin-token")
+            .expect("admin-token 子命令必须存在");
+        assert!(admin.get_arguments().any(|arg| arg.get_id() == "config"));
     }
 }

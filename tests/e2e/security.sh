@@ -116,6 +116,33 @@ wait_for_file() {
   return 0
 }
 
+# 从 hub 配置读取字符串标量（M2 起管理 API 需要 admin_token）。
+cfg_str() {
+  "$PYTHON" - "$1" "$2" <<'PY'
+import re
+import sys
+
+path, key = sys.argv[1], sys.argv[2]
+pattern = re.compile(
+    r'^\s*' + re.escape(key) + r'\s*=\s*"([^"]*)"\s*(?:#.*)?$'
+)
+values = []
+try:
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            match = pattern.match(line)
+            if match:
+                values.append(match.group(1))
+except OSError as exc:
+    print(f"读取配置失败 {path}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if len(values) != 1:
+    print(f"配置 {path} 中 {key} 出现 {len(values)} 次（期望 1 次）", file=sys.stderr)
+    raise SystemExit(1)
+print(values[0])
+PY
+}
+
 wait_status() {
   local agent=$1 expected=$2 timeout=$3
   local deadline=$(( $(date +%s%3N) + timeout * 1000 ))
@@ -217,6 +244,12 @@ grep -q '^self_monitor = false' "$HUB_CFG" || die "无法关闭 hub 的 self_mon
 grep -q '^agent_listen = "127.0.0.1:' "$HUB_CFG" || die "hub 配置未绑定 127.0.0.1"
 grep -q '^admin_listen = "127.0.0.1:' "$HUB_CFG" || die "admin 配置未绑定 127.0.0.1"
 [[ -f "$CA" ]] || die "缺少 CA 证书: $CA"
+
+# M2 起管理 API 要求 Bearer token。token 只从临时配置读取并放进环境变量，
+# probe.py 的 status / series-count 会自动带上 Authorization；不打印 token。
+ADMIN_TOKEN=$(cfg_str "$HUB_CFG" admin_token) || die "无法解析 hub admin_token"
+[[ -n "$ADMIN_TOKEN" ]] || die "hub 配置缺少 admin_token；请先执行 rustboard-hub admin-token"
+export RB_E2E_ADMIN_TOKEN="$ADMIN_TOKEN"
 
 FPR=$("$HUB_BIN" ports --config "$HUB_CFG" | sed -n 's/^证书指纹: //p')
 [[ "$FPR" =~ ^[0-9a-f]{64}$ ]] || die "无法读取服务端证书指纹: $FPR"

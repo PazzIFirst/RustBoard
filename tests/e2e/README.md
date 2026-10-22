@@ -1,9 +1,15 @@
-# RustBoard 端到端安全回归
+# RustBoard 端到端回归
 
-本目录是 issue #1–#8 与独立评审高危项（协议门禁）的**可重复执行**端到端验收脚本。
-它自己构建 hub/agent，在 `127.0.0.1` 的随机五位数端口上启动一套临时实例，
-用真实 TLS + WebSocket 会话验证身份绑定、协议版本、吊销与在线状态，
-结束后清理进程和临时目录。
+本目录包含三套可重复执行的端到端验收脚本，都在 `127.0.0.1` 的随机五位数端口上
+启动临时实例，用真实 TLS / WebSocket 会话验证行为，结束后清理进程和临时目录：
+
+| 脚本 | 覆盖 |
+|---|---|
+| `security.sh` | issue #1–#8 与协议门禁：身份绑定、协议版本、吊销、在线状态 |
+| `cert-rotation.sh` | 证书有效期、`cert-info` / `renew`、服务端 `rotate-cert`、CA 信任自动重连、指纹一致性 |
+| `panel.sh` | M2 面板：admin token 鉴权、登录/限速/Cookie、overview/series/settings、采样间隔 60s 内生效、静态与路径穿越 |
+
+`security.sh` 是最早的一套，下文细节以它为例；另外两套脚本的断言清单见各自文件头部注释。
 
 ## 依赖
 
@@ -82,9 +88,18 @@ e2e 结果: 全部 9 项通过
 
 ## 目录内容
 
-- `security.sh`：编排构建、启动、断言、清理
+- `security.sh`：身份/协议/吊销回归（本节断言的执行脚本）
+- `cert-rotation.sh`：证书轮换与 CA 信任回归
+- `panel.sh` + `panel_probe.py`：M2 面板与 hub 管理 API 回归（需要 `web/dist` 已构建）
 - `probe.py`：TLS + WebSocket + MessagePack 测试客户端；子命令
   `hello` / `batch` / `hold` / `status` / `series-count` / `health`
+
+`panel.sh` 需要先构建前端：
+
+```bash
+cd web && pnpm install --frozen-lockfile && pnpm build
+bash tests/e2e/panel.sh
+```
 
 ## 范围说明
 
