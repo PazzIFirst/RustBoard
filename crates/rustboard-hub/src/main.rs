@@ -6,21 +6,21 @@
 //! 安全模型：私有 CA + 服务端证书指纹固定 + 一次性 enrollment token。
 //! agent 首次连接只允许发 `Enroll`，换取客户端证书与独立 secret，之后走 mTLS。
 
-use std::collections::{BTreeMap, HashMap};
-use std::net::SocketAddr;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use axum::body::Body;
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Extension, Path, Query, RawQuery, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, RawQuery, State};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{any, get};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
 use hyper::body::Incoming;
@@ -46,6 +46,7 @@ use tower::ServiceExt;
 
 mod cert_rotation;
 mod session;
+use cert_rotation::CertStatus;
 use session::{SessionRegistry, ShutdownReason};
 
 /// 内置本机采集使用的 agent_id，只允许 hub 进程内部写入。
@@ -64,10 +65,10 @@ const MTLS_REQUIRED: &str = "mtls_required";
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 /// 吊销状态轮询周期，保证吊销后连接能在 2s 内被关闭。
 const REVOKE_POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// TLS 握手超时，避免半开连接长期占用资源。
-const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// TLS 握手超时，避免半开连接长期占用资源（5s：慢速握手不能长期占槽位）。
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// HTTP/1 请求头读取超时，抵挡 slowloris 一类慢速攻击。
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// 单条 WebSocket 帧的写超时；写不出去说明对端已经不读了，直接清理会话。
 const SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// 客户端续签请求里 CSR 的 PEM 长度上限（16 KiB）。
@@ -87,6 +88,29 @@ const LATEST_DEFAULT_WINDOW_MS: i64 = 5 * 60 * 1000;
 const LATEST_MAX_WINDOW_MS: i64 = 60 * 60 * 1000;
 /// 管理 API Bearer token 的最小长度（`admin-token` 生成的是 64 位 hex）。
 const MIN_ADMIN_TOKEN_LEN: usize = 32;
+/// token 至少要包含多少个不同字符（挡住 `aaaa...` 这类低熵值）。
+const MIN_ADMIN_TOKEN_DISTINCT: usize = 16;
+/// v0.2 的 64 位随机 hex token 可能只覆盖 15 个 hex 字符（约 23% 概率），
+/// 为保持升级兼容，64 位 hex 形态只要求至少 8 个不同字符。
+const MIN_ADMIN_TOKEN_DISTINCT_HEX64: usize = 8;
+/// token 占位符黑名单（大小写不敏感，子串匹配）。
+const ADMIN_TOKEN_PLACEHOLDERS: [&str; 9] = [
+    "changeme",
+    "change-me",
+    "secret",
+    "password",
+    "admin",
+    "token",
+    "rustboard",
+    "00000000",
+    "aaaaaaaa",
+];
+/// 单 IP 连接表容量：超过后清理空项并拒绝新来源，防止无限增长。
+const MAX_IP_CONNECTION_ENTRIES: usize = 4096;
+/// 管理 API 限速的固定窗口长度（毫秒）。
+const ADMIN_RATE_WINDOW_MS: i64 = 60_000;
+/// 管理 API 限速表容量（按 IP 计数）。
+const ADMIN_RATE_TABLE_CAPACITY: usize = 4096;
 /// `series` 查询最大跨度 32 天。
 const MAX_SERIES_SPAN_MS: i64 = 32 * 24 * 60 * 60 * 1000;
 const MAX_SERIES_METRICS: usize = 20;
@@ -164,7 +188,7 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// 立即用 CA 重签服务端证书（备份旧证书，运行中的 hub 需重启）。
+    /// 立即用 CA 重签服务端证书（备份旧证书，运行中的 hub 会在 ≤10s 内热加载）。
     RotateCert {
         #[arg(short, long)]
         config: Option<PathBuf>,
@@ -222,6 +246,10 @@ struct AppState {
     session_slots: Arc<tokio::sync::Semaphore>,
     /// 客户端证书续签的准入控制（按 agent 的冷却窗口 + 读盘/签名上下文）。
     renewal: Arc<RenewalContext>,
+    /// 监听器当前实际使用的证书摘要（热加载成功 / 自动续签后更新）。
+    live_cert: Arc<RwLock<CertStatus>>,
+    /// 管理 API 的每 IP 固定窗口限速。
+    admin_rate: Arc<AdminRateLimiter>,
 }
 
 /// 由 TLS accept 层注入到每个请求扩展里的对端身份。
@@ -309,9 +337,55 @@ fn validate_hub_sample_interval(cfg: &HubConfig) -> Result<()> {
     Ok(())
 }
 
+/// 管理 API token 强度检查；返回 `None` 表示合格，否则给出人类可读的失败原因。
+///
+/// 规则（KI-04）：
+/// 1. 长度 ≥ 32；
+/// 2. 仅 ASCII 可见字符（0x21–0x7e，不含空格）；
+/// 3. 至少 16 个不同字符；
+/// 4. 不包含常见占位符（大小写不敏感）。
+///
+/// 失败原因**不回显 token 本身**，只说明哪条不满足。
+fn admin_token_strength_error(token: &str) -> Option<String> {
+    let len = token.chars().count();
+    if len < MIN_ADMIN_TOKEN_LEN {
+        return Some(format!(
+            "长度不足（{len} 个字符，至少需要 {MIN_ADMIN_TOKEN_LEN} 个）"
+        ));
+    }
+    if !token.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Some("包含空白、控制字符或非 ASCII 字符".to_string());
+    }
+    let distinct = token.chars().collect::<HashSet<_>>().len();
+    // 兼容性豁免：v0.2 的 `hub init` / `admin-token` 生成 64 位随机 hex，
+    // 其不同字符数可能是 15（只缺一个 hex 字符），仍属高熵 token。
+    // 64 位 hex 至少要有 8 个不同字符：`abab...` / 全同字符会被拒绝。
+    let is_hex64 = token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let min_distinct = if is_hex64 {
+        MIN_ADMIN_TOKEN_DISTINCT_HEX64
+    } else {
+        MIN_ADMIN_TOKEN_DISTINCT
+    };
+    if distinct < min_distinct {
+        return Some(format!(
+            "不同字符只有 {distinct} 个，至少需要 {min_distinct} 个"
+        ));
+    }
+    let lower = token.to_ascii_lowercase();
+    if let Some(placeholder) = ADMIN_TOKEN_PLACEHOLDERS
+        .iter()
+        .find(|placeholder| lower.contains(**placeholder))
+    {
+        return Some(format!(
+            "包含常见占位符 {placeholder:?}，不能作为管理 token"
+        ));
+    }
+    None
+}
+
 /// 管理 API token 是否满足最低强度。
 fn admin_token_is_strong(token: &str) -> bool {
-    token.chars().count() >= MIN_ADMIN_TOKEN_LEN
+    admin_token_strength_error(token).is_none()
 }
 
 /// `run` 的前置校验：管理 API 不允许空或弱 token 裸奔。
@@ -323,11 +397,10 @@ fn require_admin_token(cfg: &HubConfig) -> Result<()> {
              生成并写入配置（或重新执行 `rustboard-hub init`）"
         );
     }
-    if !admin_token_is_strong(token) {
+    if let Some(reason) = admin_token_strength_error(token) {
         bail!(
-            "管理 API 的 admin_token 过短（{} 个字符，至少需要 {MIN_ADMIN_TOKEN_LEN} 个），\
-             拒绝启动：请执行 `rustboard-hub admin-token` 重新生成高强度 token",
-            token.chars().count()
+            "管理 API 的 admin_token 强度不足（{reason}），拒绝启动：\
+             请执行 `rustboard-hub admin-token` 重新生成高强度 token"
         );
     }
     Ok(())
@@ -545,6 +618,9 @@ fn rotate_cert(config: Option<PathBuf>, force: bool, days: Option<u32>) -> Resul
     let dir = tls::cert_dir(&cfg.data_dir);
     let cert_path = dir.join(tls::SERVER_CERT_FILE);
 
+    // KI-11：整个 rotate 过程持文件锁，第二个并发进程立即失败且不写证书。
+    let _lock = cert_rotation::CertLock::acquire(&dir).context("获取 rotate-cert 文件锁失败")?;
+
     // 证书缺失时允许用 --force 直接补签（修复场景），不带 --force 仍要求先 init。
     let old_pem = match std::fs::read_to_string(&cert_path) {
         Ok(pem) => Some(pem),
@@ -580,7 +656,7 @@ fn rotate_cert(config: Option<PathBuf>, force: bool, days: Option<u32>) -> Resul
         }
     }
 
-    println!("请先停止运行中的 hub；重签只改磁盘，运行中的进程仍在使用旧证书。");
+    println!("重签只改磁盘；运行中的 hub 会在 ≤10s 内自动热加载，无需重启。");
 
     // 文件级签发：内部先做 CA/SAN/新证书自检，全部通过后才成对备份并写盘，
     // 失败路径不会留下无意义的备份；也不读旧 TLS 配置，key/cert 不配套时同样可用。
@@ -614,8 +690,9 @@ fn rotate_cert(config: Option<PathBuf>, force: bool, days: Option<u32>) -> Resul
         tls::format_unix_utc(renewed.not_after)
     );
     println!(
-        "运行中的 hub 需重启才会使用新证书；默认（CA 未变）已纳管 agent 用 CA 信任会自动重连；\
-         若这次轮换同时替换了 CA，所有 agent 必须重新纳管（旧 ca.crt/客户端证书属于旧 CA，会 mTLS 失败）。"
+        "运行中的 hub 将在 ≤10s 内自动加载新证书（无需重启）；默认（CA 未变）已纳管 agent \
+         用 CA 信任会自动重连；若这次轮换同时替换了 CA，所有 agent 必须重新纳管\
+         （旧 ca.crt/客户端证书属于旧 CA，会 mTLS 失败）。"
     );
     Ok(())
 }
@@ -633,8 +710,12 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         .build()?;
 
     runtime.block_on(async move {
-        let storage = Arc::new(SqliteStorage::open(&db_path)?);
-        tracing::info!(db = %db_path.display(), "存储已就绪");
+        // KI-02：写连接 1 条 + 只读连接池，长查询不再阻塞写入与心跳。
+        let storage = Arc::new(SqliteStorage::open_with_readers(
+            &db_path,
+            cfg.read_pool_size,
+        )?);
+        tracing::info!(db = %db_path.display(), read_pool_size = cfg.read_pool_size, "存储已就绪");
 
         // L5：监听前清掉上次异常退出遗留的 online，避免面板长期显示假在线。
         let reset = storage
@@ -649,6 +730,10 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         // 启动自愈：上次续签在写盘中途被中断时，key/cert 会不配套，
         // 直接构建配置会永久失败；这里用 CA 强制重签一对再继续。
         let tls_config = cert_rotation::load_or_repair_tls_config(&cfg)?;
+        // KI-10：记录初始监听器证书摘要，供 `/api/v1/system` 区分 live 与 disk。
+        let initial_cert = cert_rotation::read_disk_cert_status(&cfg)
+            .context("读取服务端证书摘要失败（监听器已加载但状态不可读）")?;
+        let live_cert = Arc::new(RwLock::new(initial_cert));
         let fingerprint = {
             let pem =
                 std::fs::read_to_string(tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE))?;
@@ -666,6 +751,8 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
                 tls::cert_dir(&cfg.data_dir),
                 cfg.client_cert_validity_days,
             ),
+            live_cert: live_cert.clone(),
+            admin_rate: Arc::new(AdminRateLimiter::from_config(&cfg)),
         };
 
         spawn_revoke_watcher(storage.clone(), sessions);
@@ -673,7 +760,9 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         // 服务端证书续签：每 `cert_check_interval_secs` 检查一次，需要时重签并把新的
         // rustls 配置推进 watch；accept 循环每条新连接读一次，老连接不受影响。
         let (tls_tx, tls_rx) = watch::channel(tls_config);
-        cert_rotation::spawn_server_renewal(state.cfg.clone(), tls_tx);
+        cert_rotation::spawn_server_renewal(state.cfg.clone(), tls_tx.clone(), live_cert.clone());
+        // KI-10：每 10s 轮询磁盘证书，运行中 rotate 后 ≤10s 热加载（≤15s 验收）。
+        cert_rotation::spawn_cert_file_watcher(state.cfg.clone(), tls_tx, live_cert);
 
         if cfg.self_monitor {
             spawn_self_monitor(storage.clone(), cfg.clone());
@@ -692,22 +781,54 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         tracing::info!(%admin_addr, "管理 API 监听（HTTP，请只绑内网）");
 
         tokio::try_join!(
-            serve_tls(agent_app, agent_addr, tls_rx, cfg.max_connections),
+            serve_tls(
+                agent_app,
+                agent_addr,
+                tls_rx,
+                cfg.max_connections,
+                cfg.max_connections_per_ip
+            ),
             serve(admin_app, admin_addr)
         )?;
         Ok(())
     })
 }
 
+/// 管理监听地址是否需要非回环安全告警（KI-06）。
+///
+/// 解析失败与 bind 一样视为启动错误；回环地址（127.0.0.0/8、::1）不告警。
+fn admin_listen_needs_warning(addr: &str) -> Result<bool> {
+    let sock: SocketAddr = addr
+        .parse()
+        .with_context(|| format!("管理 API 监听地址非法: {addr}"))?;
+    Ok(!sock.ip().is_loopback())
+}
+
 async fn serve(app: Router, addr: String) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind(&addr)
+    let sock: SocketAddr = addr
+        .parse()
+        .with_context(|| format!("管理 API 监听地址非法: {addr}"))?;
+    // KI-06：管理 API 是明文 HTTP，绑到非回环必须显式告警。
+    if admin_listen_needs_warning(&addr)? {
+        tracing::warn!(
+            %sock,
+            "管理 API 监听在非回环地址，且为明文 HTTP：只应置于 VPN / 可信反向代理之后，\
+             禁止直接暴露到公网"
+        );
+    }
+    let listener = tokio::net::TcpListener::bind(sock)
         .await
-        .with_context(|| format!("监听 {addr} 失败"))?;
-    axum::serve(listener, app).await?;
+        .with_context(|| format!("监听 {sock} 失败"))?;
+    // KI-05：限速需要 ConnectInfo<SocketAddr> 取直连来源 IP。
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
-/// 组装管理 API：`/healthz` 放行，`/api/v1/*` 统一 Bearer 鉴权 + 64 KiB 请求体上限。
+/// 组装管理 API：`/healthz` 放行，`/api/v1/*` 统一 Bearer 鉴权 + 限速 + 64 KiB 请求体上限。
 fn admin_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/v1/system", get(system_info))
@@ -720,6 +841,9 @@ fn admin_router(state: AppState) -> Router {
             "/api/v1/agents/{id}/settings",
             get(get_settings).put(put_settings),
         )
+        // KI-08：未知 /api/v1/* 也要先过 Bearer 再 404，不能泄露路由是否存在。
+        .route("/api/v1", any(api_not_found))
+        .route("/api/v1/{*rest}", any(api_not_found))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
@@ -733,9 +857,20 @@ fn admin_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// 受保护路由树的兜底：走到这里说明 Bearer（与限速）已经通过，只是路由不存在。
+async fn api_not_found() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": "not_found" })),
+    )
+}
+
 /// 常量时间比较 Bearer token；除 `/healthz` 外的管理 API 都必须通过这里。
+///
+/// 顺序：先鉴权（401），再按直连 IP 限速（429）——未认证请求不能消耗限速额度。
 async fn require_bearer(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
@@ -747,6 +882,22 @@ async fn require_bearer(
         )
             .into_response();
     }
+
+    let is_write = is_admin_write_method(request.method());
+    if let Err(retry_after) = state.admin_rate.check(peer.ip(), is_write) {
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "rate_limited" })),
+        )
+            .into_response();
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_str(&retry_after.to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("60")),
+        );
+        return response;
+    }
+
     next.run(request).await
 }
 
@@ -779,6 +930,238 @@ async fn no_store(request: axum::extract::Request, next: Next) -> Response {
     response
 }
 
+/// 固定窗口计数：`started_at` 为窗口起点（Unix 毫秒），`count` 为本窗口请求数。
+#[derive(Debug, Clone, Copy, Default)]
+struct RateWindow {
+    started_at: i64,
+    count: u32,
+}
+
+/// 管理 API 的每 IP 固定窗口限速（KI-05）。
+///
+/// 读写操作分开计数：普通 GET 默认 60/min，写操作（PUT/POST/PATCH/DELETE）
+/// 默认 10/min。`0` 表示对应类别关闭限速。限速表有容量上限，满时先清理过期
+/// 窗口；仍然满则拒绝新 IP（此时同一个 token 已在极多来源使用，属于攻击迹象）。
+struct AdminRateLimiter {
+    read_limit: u32,
+    write_limit: u32,
+    windows: StdMutex<HashMap<IpAddr, AdminWindows>>,
+    /// 可注入时钟，单测覆盖窗口边界。
+    now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AdminWindows {
+    read: RateWindow,
+    write: RateWindow,
+}
+
+impl AdminWindows {
+    fn is_expired(&self, now: i64) -> bool {
+        let expired = |window: &RateWindow| {
+            // started_at == 0 表示该类别从未使用，可随另一侧过期一起清理。
+            window.started_at == 0 || now.saturating_sub(window.started_at) >= ADMIN_RATE_WINDOW_MS
+        };
+        expired(&self.read) && expired(&self.write)
+    }
+}
+
+impl AdminRateLimiter {
+    fn new(read_limit: u32, write_limit: u32) -> Self {
+        Self::with_clock(
+            read_limit,
+            write_limit,
+            Arc::new(rustboard_common::util::now_ms),
+        )
+    }
+
+    fn from_config(cfg: &HubConfig) -> Self {
+        Self::new(
+            cfg.admin_rate_limit_per_min,
+            cfg.admin_write_rate_limit_per_min,
+        )
+    }
+
+    fn with_clock(
+        read_limit: u32,
+        write_limit: u32,
+        now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) -> Self {
+        Self {
+            read_limit,
+            write_limit,
+            windows: StdMutex::new(HashMap::new()),
+            now_ms,
+        }
+    }
+
+    /// 记录一次请求；超限返回需要等待的秒数（用于 `Retry-After`）。
+    fn check(&self, ip: IpAddr, is_write: bool) -> std::result::Result<(), u64> {
+        let limit = if is_write {
+            self.write_limit
+        } else {
+            self.read_limit
+        };
+        if limit == 0 {
+            return Ok(());
+        }
+        let now = (self.now_ms)();
+        let mut windows = match self.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if !windows.contains_key(&ip) {
+            if windows.len() >= ADMIN_RATE_TABLE_CAPACITY {
+                windows.retain(|_, entry| !entry.is_expired(now));
+                if windows.len() >= ADMIN_RATE_TABLE_CAPACITY {
+                    tracing::warn!(
+                        %ip,
+                        capacity = ADMIN_RATE_TABLE_CAPACITY,
+                        "管理 API 限速表已满且无过期项，拒绝新来源"
+                    );
+                    return Err(ADMIN_RATE_WINDOW_MS as u64 / 1_000);
+                }
+            }
+            windows.insert(ip, AdminWindows::default());
+        }
+
+        let entry = windows.get_mut(&ip).expect("上一步已插入");
+        let window = if is_write {
+            &mut entry.write
+        } else {
+            &mut entry.read
+        };
+        if window.started_at == 0 || now.saturating_sub(window.started_at) >= ADMIN_RATE_WINDOW_MS {
+            window.started_at = now;
+            window.count = 0;
+        }
+        if window.count >= limit {
+            let elapsed = now.saturating_sub(window.started_at);
+            let remaining = (ADMIN_RATE_WINDOW_MS - elapsed).max(0);
+            // 向上取整到秒，至少 1 秒。
+            return Err(((remaining + 999) / 1_000).max(1) as u64);
+        }
+        window.count += 1;
+        Ok(())
+    }
+
+    /// 当前记录的来源数量（测试 / 排障）。
+    #[cfg(test)]
+    fn tracked_ips(&self) -> usize {
+        match self.windows.lock() {
+            Ok(guard) => guard.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+}
+
+fn is_admin_write_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    )
+}
+
+/// 单 IP 并发连接计数（KI-01）。
+///
+/// 设计取舍（第六轮评审）：不再设置独立的「未认证阶段预留信号量」。
+/// 合法 agent 的 TLS 握手同样需要经过未认证阶段，额外的小额度信号量在
+/// 空闲连接洪水下会先把合法握手挡在门外，而全局 `max_connections` 仍有空槽，
+/// 净效果是更差的可用性。因此这里只做「每来源 IP 上限」，配合：
+/// - 全局 `max_connections`（accept 后立即占用，已建立会话持有到结束）；
+/// - TLS 握手 / HTTP header 超时收紧到 5s（慢速连接最多占用 5s）。
+///
+/// 单 IP 洪水最多占 `max_connections_per_ip` 个全局槽位，且在超时后释放；
+/// 已建立会话不会被同 IP 的新连接直接挤掉（它们各自持有全局许可）。
+struct ConnectionLimiter {
+    max_per_ip: usize,
+    max_ip_entries: usize,
+    per_ip: StdMutex<HashMap<IpAddr, usize>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionLimitRejection {
+    /// 该来源 IP 已达并发上限。
+    PerIp,
+    /// 来源 IP 表已满（大量不同来源）。
+    TableFull,
+}
+
+/// 一条连接持有的限额凭证；Drop 时归还 per-IP 计数。
+struct ConnectionPermit {
+    limiter: Arc<ConnectionLimiter>,
+    ip: IpAddr,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let mut per_ip = match self.limiter.per_ip.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(count) = per_ip.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                // 计数归零立即删键：长时间运行不会积累已断开的来源。
+                per_ip.remove(&self.ip);
+            }
+        }
+    }
+}
+
+impl ConnectionLimiter {
+    fn new(max_per_ip: usize) -> Self {
+        Self::with_ip_capacity(max_per_ip, MAX_IP_CONNECTION_ENTRIES)
+    }
+
+    fn with_ip_capacity(max_per_ip: usize, max_ip_entries: usize) -> Self {
+        Self {
+            max_per_ip: max_per_ip.max(1),
+            max_ip_entries: max_ip_entries.max(1),
+            per_ip: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn try_acquire(
+        self: &Arc<Self>,
+        ip: IpAddr,
+    ) -> std::result::Result<ConnectionPermit, ConnectionLimitRejection> {
+        let mut per_ip = match self.per_ip.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let current = per_ip.get(&ip).copied().unwrap_or(0);
+        if current >= self.max_per_ip {
+            return Err(ConnectionLimitRejection::PerIp);
+        }
+        if current == 0 {
+            if per_ip.len() >= self.max_ip_entries {
+                // 正常情况下计数归零即删键，这里只清理异常残留。
+                per_ip.retain(|_, count| *count > 0);
+                if per_ip.len() >= self.max_ip_entries {
+                    return Err(ConnectionLimitRejection::TableFull);
+                }
+            }
+            per_ip.insert(ip, 1);
+        } else {
+            per_ip.insert(ip, current + 1);
+        }
+        Ok(ConnectionPermit {
+            limiter: self.clone(),
+            ip,
+        })
+    }
+
+    #[cfg(test)]
+    fn tracked_ips(&self) -> usize {
+        match self.per_ip.lock() {
+            Ok(guard) => guard.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+}
+
 /// H2：尝试占用一个连接许可；返回 None 表示已达上限，调用方应关闭 TCP。
 fn try_acquire_connection(permits: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
     permits.clone().try_acquire_owned().ok()
@@ -789,6 +1172,7 @@ async fn serve_tls(
     addr: String,
     config: watch::Receiver<Arc<rustls::ServerConfig>>,
     max_connections: usize,
+    max_connections_per_ip: usize,
 ) -> Result<()> {
     let sock: SocketAddr = addr
         .parse()
@@ -799,7 +1183,13 @@ async fn serve_tls(
     // H2：用信号量限制同时处理的 TLS 连接数；拿不到许可就立刻关 TCP。
     let max_connections = max_connections.max(1);
     let permits = Arc::new(Semaphore::new(max_connections));
-    tracing::info!(%sock, max_connections, "agent 接入监听（mTLS）");
+    let limits = Arc::new(ConnectionLimiter::new(max_connections_per_ip));
+    tracing::info!(
+        %sock,
+        max_connections,
+        max_connections_per_ip,
+        "agent 接入监听（mTLS）"
+    );
 
     loop {
         let (tcp, peer) = match listener.accept().await {
@@ -817,6 +1207,26 @@ async fn serve_tls(
             None => {
                 // 连接数已满：不握手、不读请求，直接关闭 TCP，避免慢速连接堆积。
                 tracing::warn!(%peer, max_connections, "agent 连接数已达上限，直接关闭 TCP");
+                continue;
+            }
+        };
+
+        // KI-01：来源 IP 维度的并发上限；计数随连接生命周期自动归还。
+        let connection = match limits.try_acquire(peer.ip()) {
+            Ok(connection) => connection,
+            Err(ConnectionLimitRejection::PerIp) => {
+                tracing::warn!(
+                    ip = %peer.ip(),
+                    max_connections_per_ip,
+                    "来源 IP 并发连接已达上限，直接关闭 TCP"
+                );
+                continue;
+            }
+            Err(ConnectionLimitRejection::TableFull) => {
+                tracing::warn!(
+                    ip = %peer.ip(),
+                    "连接来源表已满，拒绝新来源"
+                );
                 continue;
             }
         };
@@ -844,6 +1254,8 @@ async fn serve_tls(
                         return;
                     }
                 };
+            // 握手成功；连接许可（全局 + per-IP）继续持有到会话结束。
+            let _connection = connection;
 
             // 证书链已在 TLS 握手阶段由 rustls 校验；这里只取 subject CN 做身份绑定。
             let cn = stream
@@ -891,39 +1303,53 @@ struct SystemInfo {
     version: &'static str,
     protocol: u16,
     server_time: i64,
-    cert: CertStatus,
+    cert: CertInfo,
 }
 
+/// 证书状态：顶层字段保持旧版含义（= live），`live`/`disk` 供排障区分。
+///
+/// KI-10：运行中 rotate 后磁盘先变、监听器后热加载；旧面板只读顶层字段
+/// 时也必须看到监听器实际在用的证书，而不是磁盘上尚未生效的新证书。
 #[derive(serde::Serialize)]
-struct CertStatus {
+struct CertInfo {
     fingerprint: String,
     /// Unix 秒。
     not_after: i64,
     days_left: i64,
+    /// 监听器当前实际使用的证书。
+    live: CertStatus,
+    /// 请求时刻磁盘上的证书。
+    disk: CertStatus,
 }
 
-/// 运维排障入口：读完请求时**磁盘上**的证书，因此指纹始终与文件一致。
+/// 运维排障入口：`cert.live` 是监听器实际证书，`cert.disk` 是磁盘文件；
+/// 顶层 `cert.fingerprint/not_after/days_left` 始终等于 live（向后兼容）。
 async fn system_info(State(state): State<AppState>) -> Result<Json<SystemInfo>, ApiError> {
-    let cert_path = tls::cert_dir(&state.cfg.data_dir).join(tls::SERVER_CERT_FILE);
-    let (fingerprint, not_after, days_left) = tokio::task::spawn_blocking(move || {
+    let cert_dir = tls::cert_dir(&state.cfg.data_dir);
+    let disk = tokio::task::spawn_blocking(move || {
+        let cert_path = cert_dir.join(tls::SERVER_CERT_FILE);
         let pem = std::fs::read_to_string(&cert_path)?;
-        Ok::<_, anyhow::Error>((
-            tls::fingerprint_of_pem(&pem)?,
-            tls::not_after_unix(&pem)?,
-            tls::days_left(&pem, now_ms())?,
-        ))
+        CertStatus::from_pem(&pem)
     })
     .await
     .map_err(ApiError::from)??;
+
+    let live = state
+        .live_cert
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
 
     Ok(Json(SystemInfo {
         version: VERSION,
         protocol: PROTOCOL_VERSION,
         server_time: now_ms(),
-        cert: CertStatus {
-            fingerprint,
-            not_after,
-            days_left,
+        cert: CertInfo {
+            fingerprint: live.fingerprint.clone(),
+            not_after: live.not_after,
+            days_left: live.days_left,
+            live,
+            disk,
         },
     }))
 }
@@ -2910,16 +3336,20 @@ mod tests {
         let dir = temp_dir("enroll-bad-csr");
         tls::ensure_hub_material(&dir, &["localhost".to_string()], tls::CertPolicy::default())
             .unwrap();
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            admin_token: "token".to_string(),
+            ..HubConfig::default()
+        };
+        let admin_rate = Arc::new(AdminRateLimiter::from_config(&cfg));
         let state = AppState {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
-            cfg: Arc::new(HubConfig {
-                data_dir: dir.clone(),
-                admin_token: "token".to_string(),
-                ..HubConfig::default()
-            }),
+            cfg: Arc::new(cfg),
             sessions: SessionRegistry::new(),
             session_slots: Arc::new(Semaphore::new(4)),
             renewal: RenewalContext::new(tls::cert_dir(&dir), 90),
+            live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
+            admin_rate,
         };
         let token = "enroll-token-bad-csr";
         let now = now_ms();
@@ -2961,16 +3391,20 @@ mod tests {
         let dir = temp_dir("enroll-bad-ca");
         tls::ensure_hub_material(&dir, &["localhost".to_string()], tls::CertPolicy::default())
             .unwrap();
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            admin_token: "token".to_string(),
+            ..HubConfig::default()
+        };
+        let admin_rate = Arc::new(AdminRateLimiter::from_config(&cfg));
         let state = AppState {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
-            cfg: Arc::new(HubConfig {
-                data_dir: dir.clone(),
-                admin_token: "token".to_string(),
-                ..HubConfig::default()
-            }),
+            cfg: Arc::new(cfg),
             sessions: SessionRegistry::new(),
             session_slots: Arc::new(Semaphore::new(4)),
             renewal: RenewalContext::new(tls::cert_dir(&dir), 90),
+            live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
+            admin_rate,
         };
 
         let token = "enroll-token-value";
@@ -3245,15 +3679,22 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn hub_state(admin_token: &str) -> AppState {
+        hub_state_with(HubConfig {
+            admin_token: admin_token.to_string(),
+            ..HubConfig::default()
+        })
+    }
+
+    fn hub_state_with(cfg: HubConfig) -> AppState {
+        let admin_rate = Arc::new(AdminRateLimiter::from_config(&cfg));
         AppState {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
-            cfg: Arc::new(HubConfig {
-                admin_token: admin_token.to_string(),
-                ..HubConfig::default()
-            }),
+            cfg: Arc::new(cfg),
             sessions: SessionRegistry::new(),
             session_slots: Arc::new(Semaphore::new(8)),
             renewal: RenewalContext::new(PathBuf::from("/tmp/rb-hub-test-unused-ca"), 90),
+            live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
+            admin_rate,
         }
     }
 
@@ -3280,6 +3721,19 @@ mod tests {
         token: Option<&str>,
         body: Option<&str>,
     ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        admin_call_from(router, "127.0.0.1", method, uri, token, body).await
+    }
+
+    /// 指定直连来源 IP 的调用（限速测试用）：必须注入 `ConnectInfo<SocketAddr>`，
+    /// 否则限速中间件会因缺少扩展直接 500。
+    async fn admin_call_from(
+        router: &Router,
+        ip: &str,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        body: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
         let mut builder = axum::http::Request::builder().method(method).uri(uri);
         if let Some(token) = token {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
@@ -3287,12 +3741,14 @@ mod tests {
         if body.is_some() {
             builder = builder.header(header::CONTENT_TYPE, "application/json");
         }
-        let request = builder
+        let mut request = builder
             .body(
                 body.map(|body| Body::from(body.to_string()))
                     .unwrap_or_else(Body::empty),
             )
             .unwrap();
+        let peer: SocketAddr = format!("{ip}:54321").parse().expect("测试 IP 必须合法");
+        request.extensions_mut().insert(ConnectInfo(peer));
         let response = router.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let headers = response.headers().clone();
@@ -3301,6 +3757,18 @@ mod tests {
             .unwrap()
             .to_vec();
         (status, headers, bytes)
+    }
+
+    /// 给原始请求注入 ConnectInfo 后直接调用 Router；非 loopback 管理调用缺这个扩展
+    /// 会被 axum 直接拒绝（500），所以所有测试入口都必须走这里。
+    async fn call_router(
+        router: &Router,
+        mut request: axum::http::Request<Body>,
+    ) -> axum::response::Response {
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))));
+        router.clone().oneshot(request).await.unwrap()
     }
 
     fn json_body(bytes: &[u8]) -> serde_json::Value {
@@ -3339,7 +3807,7 @@ mod tests {
             .header(header::AUTHORIZATION, "m2-admin-token")
             .body(Body::empty())
             .unwrap();
-        let response = router.clone().oneshot(request).await.unwrap();
+        let response = call_router(&router, request).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let (status, _, body) = admin_call(
@@ -3361,7 +3829,7 @@ mod tests {
                 .header(header::AUTHORIZATION, format!("{scheme} m2-admin-token"))
                 .body(Body::empty())
                 .unwrap();
-            let response = router.clone().oneshot(request).await.unwrap();
+            let response = call_router(&router, request).await;
             assert_eq!(response.status(), StatusCode::OK, "scheme={scheme}");
         }
 
@@ -3372,7 +3840,7 @@ mod tests {
             .header(header::AUTHORIZATION, "bearer wrong-token")
             .body(Body::empty())
             .unwrap();
-        let response = router.clone().oneshot(request).await.unwrap();
+        let response = call_router(&router, request).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3455,7 +3923,7 @@ mod tests {
         );
     }
 
-    /// M2：空 / 弱 admin_token 必须在启动前被拒绝，错误信息提示 admin-token 修复命令。
+    /// M2/KI-04：空 / 弱 admin_token 必须在启动前被拒绝，错误信息提示 admin-token 修复命令。
     #[test]
     fn m2_empty_or_weak_admin_token_refuses_startup() {
         let err = require_admin_token(&HubConfig::default())
@@ -3463,28 +3931,92 @@ mod tests {
             .to_string();
         assert!(err.contains("admin-token"), "错误信息: {err}");
 
-        // 31 个字符仍算弱 token；32 个字符是下限。
+        // 31 个字符：长度不足。
         let weak = HubConfig {
-            admin_token: "a".repeat(MIN_ADMIN_TOKEN_LEN - 1),
+            admin_token: "abcdefghijklmnopqrstuvwxyz01234".to_string(),
             ..HubConfig::default()
         };
         let err = require_admin_token(&weak)
-            .expect_err("弱 token 必须拒绝启动")
+            .expect_err("31 字符 token 必须拒绝启动")
             .to_string();
         assert!(err.contains("admin-token"), "错误信息: {err}");
         assert!(err.contains("32"), "错误信息应说明最小长度: {err}");
 
-        let boundary = HubConfig {
+        // 32 个相同字符：长度够但不同字符数不足。
+        let same = HubConfig {
             admin_token: "a".repeat(MIN_ADMIN_TOKEN_LEN),
             ..HubConfig::default()
         };
-        require_admin_token(&boundary).expect("32 字符 token 必须放行");
+        let err = require_admin_token(&same)
+            .expect_err("全同字符 token 必须拒绝启动")
+            .to_string();
+        assert!(err.contains("不同字符"), "错误信息: {err}");
 
-        let ok = HubConfig {
-            admin_token: "a".repeat(64),
+        // 32 个字符但含空白：字符集不合法。
+        let spaced = HubConfig {
+            admin_token: "0123456789abcdef 0123456789abcdef".to_string(),
             ..HubConfig::default()
         };
-        require_admin_token(&ok).expect("64 字符 token 必须放行");
+        let err = require_admin_token(&spaced)
+            .expect_err("含空白的 token 必须拒绝启动")
+            .to_string();
+        assert!(err.contains("ASCII"), "错误信息: {err}");
+
+        // 非 ASCII 字符即使长度足够也必须拒绝。
+        let unicode = HubConfig {
+            admin_token: "密码".repeat(16),
+            ..HubConfig::default()
+        };
+        let err = require_admin_token(&unicode)
+            .expect_err("非 ASCII token 必须拒绝启动")
+            .to_string();
+        assert!(err.contains("ASCII"), "错误信息: {err}");
+
+        // 32 个字符、字符够多但包含占位符。
+        let placeholder = HubConfig {
+            admin_token: "changeme0123456789abcdefghijklmn".to_string(),
+            ..HubConfig::default()
+        };
+        assert_eq!(
+            placeholder.admin_token.chars().count(),
+            32,
+            "前提：长度合法"
+        );
+        let err = require_admin_token(&placeholder)
+            .expect_err("占位符 token 必须拒绝启动")
+            .to_string();
+        assert!(err.contains("占位符"), "错误信息: {err}");
+
+        // 边界：恰好 32 字符且恰好 16 个不同字符必须放行。
+        let boundary = HubConfig {
+            admin_token: "0123456789abcdef0123456789abcdef".to_string(),
+            ..HubConfig::default()
+        };
+        require_admin_token(&boundary).expect("32 字符 / 16 个不同字符必须放行");
+
+        // v0.2 的 64 位随机 hex token 必须继续合法（可能只有 15 个不同字符）。
+        let v02_shape = HubConfig {
+            admin_token: "3b18d03801b044a0b97e9e1800b860abb3ea0ba836e14ffd84ebef1150c9efa7"
+                .to_string(),
+            ..HubConfig::default()
+        };
+        require_admin_token(&v02_shape).expect("v0.2 形态的 64 位 hex token 必须放行");
+        let ok = HubConfig {
+            admin_token: new_secret(),
+            ..HubConfig::default()
+        };
+        require_admin_token(&ok).expect("v0.2 生成的 64 位 hex token 必须放行");
+        assert_eq!(ok.admin_token.len(), 64);
+
+        // 但低多样性的 64 位 hex 仍然拒绝（不是所有 hex 都放行）。
+        let weak_hex = HubConfig {
+            admin_token: "ab".repeat(32),
+            ..HubConfig::default()
+        };
+        let err = require_admin_token(&weak_hex)
+            .expect_err("低多样性 64 位 hex 必须拒绝")
+            .to_string();
+        assert!(err.contains("不同字符"), "错误信息: {err}");
     }
 
     /// M2：`admin-token` 为空时生成 64 位 hex 并落盘（0600），非空时保持不变。
@@ -4102,5 +4634,362 @@ mod tests {
             .find_subcommand_mut("admin-token")
             .expect("admin-token 子命令必须存在");
         assert!(admin.get_arguments().any(|arg| arg.get_id() == "config"));
+    }
+
+    /// KI-01：per-IP 上限、计数归零删键、来源表容量与陈旧项清理。
+    #[test]
+    fn v021_connection_limiter_per_ip_cleanup_and_table_capacity() {
+        let limiter = Arc::new(ConnectionLimiter::with_ip_capacity(2, 2));
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        let ip3: IpAddr = "10.0.0.3".parse().unwrap();
+
+        let first = limiter.try_acquire(ip1).expect("第 1 条连接必须允许");
+        let second = limiter.try_acquire(ip1).expect("第 2 条连接必须允许");
+        assert!(
+            matches!(
+                limiter.try_acquire(ip1),
+                Err(ConnectionLimitRejection::PerIp)
+            ),
+            "同一 IP 第 3 条连接必须被拒绝"
+        );
+        assert_eq!(limiter.tracked_ips(), 1);
+
+        let other = limiter.try_acquire(ip2).expect("其他 IP 不受影响");
+        assert!(
+            matches!(
+                limiter.try_acquire(ip3),
+                Err(ConnectionLimitRejection::TableFull)
+            ),
+            "来源表满时必须拒绝新 IP"
+        );
+
+        // 一条连接断开、计数归零后立即从表中删除，新 IP 可进入。
+        drop(first);
+        drop(second);
+        let third = limiter.try_acquire(ip3).expect("清理归零项后应有空间");
+        drop(other);
+        assert_eq!(limiter.tracked_ips(), 1, "ip3 仍在线");
+        drop(third);
+        assert_eq!(limiter.tracked_ips(), 0, "全部断开后表必须清空");
+    }
+
+    /// KI-01：单 IP 洪水达到上限时，已建立连接的凭证不会被回收。
+    #[test]
+    fn v021_connection_limiter_flood_does_not_displace_established_connection() {
+        let limiter = Arc::new(ConnectionLimiter::new(2));
+        let ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let established = limiter.try_acquire(ip).expect("已建立连接");
+        let flood_a = limiter.try_acquire(ip).expect("洪水第 1 条");
+        assert!(matches!(
+            limiter.try_acquire(ip),
+            Err(ConnectionLimitRejection::PerIp)
+        ));
+        drop(flood_a);
+        assert_eq!(limiter.tracked_ips(), 1, "已建立连接仍必须被计数");
+        drop(established);
+        assert_eq!(limiter.tracked_ips(), 0, "归零后必须清理");
+    }
+
+    /// KI-01：握手 / header 超时必须是 5s（慢速连接不能长期占槽位）。
+    #[test]
+    fn v021_connection_timeouts_are_five_seconds() {
+        assert_eq!(TLS_HANDSHAKE_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(HEADER_READ_TIMEOUT, Duration::from_secs(5));
+    }
+
+    /// KI-05：固定窗口边界、每 IP 隔离、读写分开计数、0 关闭。
+    #[test]
+    fn v021_admin_rate_limiter_window_boundary_and_per_ip() {
+        use std::sync::atomic::AtomicI64;
+
+        let clock = Arc::new(AtomicI64::new(1_000_000));
+        let clock_handle = clock.clone();
+        let limiter = AdminRateLimiter::with_clock(
+            2,
+            1,
+            Arc::new(move || clock_handle.load(Ordering::Relaxed)),
+        );
+        let ip1: IpAddr = "10.1.1.1".parse().unwrap();
+        let ip2: IpAddr = "10.1.1.2".parse().unwrap();
+
+        assert!(limiter.check(ip1, false).is_ok());
+        assert!(limiter.check(ip1, false).is_ok());
+        assert_eq!(limiter.check(ip1, false), Err(60), "第 3 次必须 429");
+        // 不同 IP 独立计数。
+        assert!(limiter.check(ip2, false).is_ok());
+
+        // 窗口未到（59.999s）：仍拒绝，Retry-After 向上取整到 1s。
+        clock.store(1_000_000 + 59_999, Ordering::Relaxed);
+        assert_eq!(limiter.check(ip1, false), Err(1));
+        // 30s 时剩余 30s。
+        clock.store(1_000_000 + 30_000, Ordering::Relaxed);
+        assert_eq!(limiter.check(ip1, false), Err(30));
+        // 恰好 60s：新窗口，重新放行。
+        clock.store(1_000_000 + 60_000, Ordering::Relaxed);
+        assert!(limiter.check(ip1, false).is_ok());
+
+        // 写额度独立且更低：1 次后第 2 次拒绝。
+        assert!(limiter.check(ip1, true).is_ok());
+        assert_eq!(limiter.check(ip1, true), Err(60));
+        // 写操作不占用读窗口（读刚重置，仍有额度）。
+        assert!(limiter.check(ip1, false).is_ok());
+
+        // 0 表示关闭：不记录任何来源。
+        let disabled = AdminRateLimiter::with_clock(0, 0, Arc::new(move || 0));
+        for _ in 0..100 {
+            disabled.check(ip1, false).unwrap();
+            disabled.check(ip1, true).unwrap();
+        }
+        assert_eq!(disabled.tracked_ips(), 0);
+    }
+
+    /// KI-05：限速表达到容量后先清理过期窗口，仍满则拒绝新来源。
+    #[test]
+    fn v021_admin_rate_limiter_table_capacity_is_bounded() {
+        use std::sync::atomic::AtomicI64;
+
+        let clock = Arc::new(AtomicI64::new(1_000_000));
+        let clock_handle = clock.clone();
+        let limiter = AdminRateLimiter::with_clock(
+            1,
+            1,
+            Arc::new(move || clock_handle.load(Ordering::Relaxed)),
+        );
+        for index in 0..ADMIN_RATE_TABLE_CAPACITY {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(index as u32));
+            limiter.check(ip, false).expect("容量内必须允许");
+        }
+        assert_eq!(limiter.tracked_ips(), ADMIN_RATE_TABLE_CAPACITY);
+        let overflow: IpAddr = "203.0.113.1".parse().unwrap();
+        assert!(
+            limiter.check(overflow, false).is_err(),
+            "容量满且无过期窗口时必须拒绝新来源"
+        );
+
+        // 时间推进一个窗口后，旧窗口可被清理，新来源恢复。
+        clock.store(1_000_000 + ADMIN_RATE_WINDOW_MS, Ordering::Relaxed);
+        limiter
+            .check(overflow, false)
+            .expect("过期窗口清理后必须允许新来源");
+        assert!(limiter.tracked_ips() <= ADMIN_RATE_TABLE_CAPACITY);
+    }
+
+    /// KI-05：管理 API 第 N+1 次请求 429 + Retry-After；不同 IP / 读写互不影响。
+    #[tokio::test]
+    async fn v021_admin_api_rate_limit_returns_429() {
+        let state = hub_state_with(HubConfig {
+            admin_token: "token".to_string(),
+            admin_rate_limit_per_min: 3,
+            admin_write_rate_limit_per_min: 1,
+            ..HubConfig::default()
+        });
+        state.storage.upsert_agent(&test_agent("agent-1")).unwrap();
+        let router = admin_router(state);
+
+        // 未认证请求不消耗额度。
+        for _ in 0..5 {
+            let (status, _, _) = admin_call(&router, "GET", "/api/v1/agents", None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        for _ in 0..3 {
+            let (status, _, _) =
+                admin_call(&router, "GET", "/api/v1/agents", Some("token"), None).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, headers, body) =
+            admin_call(&router, "GET", "/api/v1/agents", Some("token"), None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(json_body(&body)["error"], "rate_limited");
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        let retry: u64 = headers
+            .get(header::RETRY_AFTER)
+            .expect("429 必须带 Retry-After")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&retry), "Retry-After 非法: {retry}");
+
+        // 不同 IP 完全独立。
+        let (status, _, _) = admin_call_from(
+            &router,
+            "127.0.0.2",
+            "GET",
+            "/api/v1/agents",
+            Some("token"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "不同 IP 不得互相影响");
+
+        // 写额度独立（默认/此处为 1/min）：第一次 PUT 允许，第二次 429。
+        let payload = "{\"sample_interval_ms\":10000}";
+        let (status, _, _) = admin_call(
+            &router,
+            "PUT",
+            "/api/v1/agents/agent-1/settings",
+            Some("token"),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, body) = admin_call(
+            &router,
+            "PUT",
+            "/api/v1/agents/agent-1/settings",
+            Some("token"),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(json_body(&body)["error"], "rate_limited");
+    }
+
+    /// KI-08：未知 /api/v1/* 无 token 先 401；带 token 才 404；/healthz 保持公开。
+    #[tokio::test]
+    async fn v021_unknown_api_requires_bearer_before_404() {
+        let router = admin_router(hub_state("token"));
+
+        for path in [
+            "/api/v1",
+            "/api/v1/does-not-exist",
+            "/api/v1/agents/x/extra",
+        ] {
+            let (status, _, body) = admin_call(&router, "GET", path, None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "path={path}");
+            assert_eq!(json_body(&body)["error"], "unauthorized", "path={path}");
+
+            let (status, _, body) = admin_call(&router, "GET", path, Some("token"), None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "path={path}");
+            assert_eq!(json_body(&body)["error"], "not_found", "path={path}");
+        }
+
+        let (status, _, _) = admin_call(&router, "GET", "/healthz", None, None).await;
+        assert_eq!(status, StatusCode::OK, "/healthz 必须保持免鉴权");
+        // 具体路由优先级不受兜底影响。
+        let (status, _, _) =
+            admin_call(&router, "GET", "/api/v1/agents", Some("token"), None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// KI-06：只有非回环管理监听需要告警；非法地址启动失败。
+    #[test]
+    fn v021_admin_listen_warns_only_for_non_loopback() {
+        for addr in ["127.0.0.1:8444", "127.1.2.3:1", "[::1]:8444"] {
+            assert!(
+                !admin_listen_needs_warning(addr).unwrap(),
+                "回环地址不应告警: {addr}"
+            );
+        }
+        for addr in [
+            "0.0.0.0:8444",
+            "192.168.1.10:8444",
+            "8.8.8.8:8444",
+            "[::]:8444",
+        ] {
+            assert!(
+                admin_listen_needs_warning(addr).unwrap(),
+                "非回环地址必须告警: {addr}"
+            );
+        }
+        assert!(
+            admin_listen_needs_warning("not-an-address").is_err(),
+            "非法监听地址必须与 bind 一样启动失败"
+        );
+    }
+
+    /// KI-10：`/api/v1/system` 保留旧字段并新增 live/disk，顶层等于 live。
+    #[tokio::test]
+    async fn v021_system_info_exposes_live_and_disk_compatibly() {
+        let dir = temp_dir("system-live-disk");
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], tls::CertPolicy::default())
+            .unwrap();
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            admin_token: "token".to_string(),
+            server_names: vec!["localhost".to_string()],
+            ..HubConfig::default()
+        };
+        let mut state = hub_state_with(cfg);
+        let live = CertStatus {
+            fingerprint: "live-fingerprint".to_string(),
+            not_after: 111,
+            days_left: 5,
+        };
+        state.live_cert = Arc::new(RwLock::new(live.clone()));
+        let router = admin_router(state);
+
+        let (status, _, body) =
+            admin_call(&router, "GET", "/api/v1/system", Some("token"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = json_body(&body);
+        assert_eq!(body["protocol"], PROTOCOL_VERSION);
+        assert_eq!(body["cert"]["live"]["fingerprint"], "live-fingerprint");
+        assert_eq!(body["cert"]["live"]["not_after"], 111);
+        assert_eq!(body["cert"]["live"]["days_left"], 5);
+        // 顶层旧字段必须等于 live，避免旧面板显示成磁盘上的未生效证书。
+        assert_eq!(body["cert"]["fingerprint"], "live-fingerprint");
+        assert_eq!(body["cert"]["not_after"], 111);
+        assert_eq!(body["cert"]["days_left"], 5);
+
+        let disk_pem =
+            std::fs::read_to_string(tls::cert_dir(&dir).join(tls::SERVER_CERT_FILE)).unwrap();
+        let disk_fp = tls::fingerprint_of_pem(&disk_pem).unwrap();
+        assert_eq!(body["cert"]["disk"]["fingerprint"], disk_fp);
+        assert_ne!(body["cert"]["disk"]["fingerprint"], "live-fingerprint");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// KI-11：持锁时 rotate-cert 立即失败且不写证书；释放后可正常轮换。
+    #[test]
+    fn v021_rotate_cert_respects_lock_and_does_not_write_when_held() {
+        let dir = temp_dir("rotate-lock");
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], tls::CertPolicy::default())
+            .unwrap();
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            admin_token: "token".to_string(),
+            server_names: vec!["localhost".to_string()],
+            ..HubConfig::default()
+        };
+        let cfg_path = dir.join("hub.toml");
+        cfg.save(&cfg_path).unwrap();
+        let cert_path = tls::cert_dir(&dir).join(tls::SERVER_CERT_FILE);
+        let before = std::fs::read_to_string(&cert_path).unwrap();
+        let before_fingerprint = tls::fingerprint_of_pem(&before).unwrap();
+
+        let lock = cert_rotation::CertLock::acquire(&tls::cert_dir(&dir)).unwrap();
+        let err = rotate_cert(Some(cfg_path.clone()), true, Some(30))
+            .expect_err("持锁时第二个 rotate-cert 必须失败");
+        assert!(
+            format!("{err:#}").contains("另一个 rotate-cert 正在运行"),
+            "错误信息: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cert_path).unwrap(),
+            before,
+            "获取锁失败时绝不能写证书"
+        );
+        drop(lock);
+        assert!(!tls::cert_dir(&dir)
+            .join(cert_rotation::CERT_LOCK_FILE)
+            .exists());
+
+        rotate_cert(Some(cfg_path), true, Some(30)).expect("释放锁后必须能正常轮换");
+        let after = std::fs::read_to_string(&cert_path).unwrap();
+        assert_ne!(
+            tls::fingerprint_of_pem(&after).unwrap(),
+            before_fingerprint,
+            "正常轮换必须换证书"
+        );
+        assert!(
+            !tls::cert_dir(&dir)
+                .join(cert_rotation::CERT_LOCK_FILE)
+                .exists(),
+            "rotate 结束后必须删除锁文件"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

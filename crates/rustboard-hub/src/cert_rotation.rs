@@ -24,11 +24,12 @@
 //! 「最小 1」，实现采用更严格的安全下限——秒级检查在证书未到期时只是无意义的
 //! 磁盘读取，还会放大错误配置（有效期 ≤ 续签阈值）造成的重写频率。
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rustboard_common::config::HubConfig;
 use rustboard_common::util::now_ms;
 use rustboard_common::{fsutil, tls};
@@ -37,6 +38,68 @@ use tokio::sync::watch;
 
 /// 续签后的 TLS 配置通过 watch 广播：每个新连接读一次最新值。
 pub type TlsConfigSender = watch::Sender<Arc<ServerConfig>>;
+
+/// 证书文件轮询周期：运行中 `rotate-cert` 后，新连接最迟 10s 生效。
+pub const CERT_FILE_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// 热加载失败告警的最小间隔，避免坏证书每 10s 刷一条日志。
+const CERT_LOAD_WARN_INTERVAL: Duration = Duration::from_secs(60);
+/// rotate-cert 锁文件的名称（位于证书目录）。
+pub const CERT_LOCK_FILE: &str = ".rotate.lock";
+/// 锁文件超过该时长视为陈旧（持锁进程可能已崩溃）。
+const STALE_LOCK_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// 监听器当前实际使用的服务端证书摘要（只含公开信息）。
+///
+/// `system_info` 用它区分「磁盘上的证书」与「TLS 监听器实际在用的证书」；
+/// 热加载成功后更新，失败时保留旧值。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CertStatus {
+    pub fingerprint: String,
+    /// Unix 秒。
+    pub not_after: i64,
+    pub days_left: i64,
+}
+
+impl CertStatus {
+    /// 尚未加载任何证书时的占位值（只用于测试 / 初始化前的状态）。
+    #[cfg(test)]
+    pub fn unknown() -> Self {
+        Self {
+            fingerprint: String::new(),
+            not_after: 0,
+            days_left: 0,
+        }
+    }
+
+    /// 从证书 PEM 计算公开摘要。
+    pub fn from_pem(pem: &str) -> Result<Self> {
+        Ok(Self {
+            fingerprint: tls::fingerprint_of_pem(pem)?,
+            not_after: tls::not_after_unix(pem)?,
+            days_left: tls::days_left(pem, now_ms())?,
+        })
+    }
+}
+
+/// 读取磁盘上服务端证书的公开摘要。
+pub fn read_disk_cert_status(cfg: &HubConfig) -> Result<CertStatus> {
+    let path = tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE);
+    let pem = std::fs::read_to_string(&path)
+        .with_context(|| format!("读取服务端证书失败: {}", path.display()))?;
+    CertStatus::from_pem(&pem)
+}
+
+fn read_live(live: &RwLock<CertStatus>) -> CertStatus {
+    live.read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn write_live(live: &RwLock<CertStatus>, status: CertStatus) {
+    *live
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = status;
+}
 
 /// 一次文件级续签的结果。
 ///
@@ -104,8 +167,13 @@ impl RenewedServerCert {
 /// 启动后台续签任务。
 ///
 /// 任务本身不会 panic：单次失败只记日志，下个周期继续尝试（证书不会因为一次
-/// 写盘失败就永远不续签）。
-pub fn spawn_server_renewal(cfg: Arc<HubConfig>, tx: TlsConfigSender) {
+/// 写盘失败就永远不续签）。续签成功后同步刷新 `live`，让 `/api/v1/system`
+/// 立即反映监听器实际证书；即使这里漏更新，文件轮询任务也会在 10s 内补上。
+pub fn spawn_server_renewal(
+    cfg: Arc<HubConfig>,
+    tx: TlsConfigSender,
+    live: Arc<RwLock<CertStatus>>,
+) {
     tokio::spawn(async move {
         // 配置层要求 ≥ 60 秒；这里再 max(1) 只是防御「手工改配置绕过校验」导致的
         // 0 周期忙循环（见文件头关于检查周期的说明）。
@@ -128,6 +196,12 @@ pub fn spawn_server_renewal(cfg: Arc<HubConfig>, tx: TlsConfigSender) {
 
             match result {
                 Ok(Ok(Some(fingerprint))) => {
+                    match read_disk_cert_status(&cfg) {
+                        Ok(status) => write_live(&live, status),
+                        Err(err) => {
+                            tracing::warn!(error = %err, "续签后读取证书摘要失败，live 状态暂不更新")
+                        }
+                    }
                     tracing::info!(fingerprint, "服务端证书续签完成，新连接已使用新证书");
                 }
                 Ok(Ok(None)) => {}
@@ -136,6 +210,224 @@ pub fn spawn_server_renewal(cfg: Arc<HubConfig>, tx: TlsConfigSender) {
             }
         }
     });
+}
+
+/// 每 10s 检查磁盘证书；指纹变化且校验通过时热替换监听器的 TLS 配置。
+///
+/// 校验顺序：证书/私钥配套 → CA 链与 SAN → rustls 可构建。任何一步失败都
+/// **保留旧配置**并告警（同一错误每分钟最多一条）；坏证书绝不会替换 live。
+pub fn spawn_cert_file_watcher(
+    cfg: Arc<HubConfig>,
+    tx: TlsConfigSender,
+    live: Arc<RwLock<CertStatus>>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(CERT_FILE_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // 第一次 tick 立即完成：启动路径刚加载并校验过证书，直接跳过。
+        ticker.tick().await;
+
+        let mut last_warn: Option<Instant> = None;
+        loop {
+            ticker.tick().await;
+
+            let check_cfg = cfg.clone();
+            let check_tx = tx.clone();
+            let check_live = live.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                reload_server_config_if_changed(&check_cfg, &check_tx, &check_live)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(true)) => {
+                    tracing::info!("检测到服务端证书文件变化，已热加载到监听器（无需重启）");
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(err)) => {
+                    let now = Instant::now();
+                    let should_warn = match last_warn {
+                        Some(last) => now.duration_since(last) >= CERT_LOAD_WARN_INTERVAL,
+                        None => true,
+                    };
+                    if should_warn {
+                        last_warn = Some(now);
+                        tracing::warn!(
+                            error = %format!("{err:#}"),
+                            "服务端证书热加载失败，保留旧配置（每分钟最多告警一次）"
+                        );
+                    }
+                }
+                Err(err) => {
+                    let now = Instant::now();
+                    let should_warn = match last_warn {
+                        Some(last) => now.duration_since(last) >= CERT_LOAD_WARN_INTERVAL,
+                        None => true,
+                    };
+                    if should_warn {
+                        last_warn = Some(now);
+                        tracing::warn!(error = %err, "证书文件轮询任务失败，下个周期重试");
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// 读磁盘证书；校验通过且指纹与 live 不同才替换 watch 配置并更新 live。
+///
+/// 返回 `Ok(true)` 表示本次发生了热替换，`Ok(false)` 表示证书没变（或读取期间
+/// 又被 rotate 改了一次，留到下个周期处理）。
+pub fn reload_server_config_if_changed(
+    cfg: &HubConfig,
+    tx: &TlsConfigSender,
+    live: &RwLock<CertStatus>,
+) -> Result<bool> {
+    let dir = tls::cert_dir(&cfg.data_dir);
+    let cert_path = dir.join(tls::SERVER_CERT_FILE);
+    let key_path = dir.join(tls::SERVER_KEY_FILE);
+    let ca_path = dir.join(tls::CA_CERT_FILE);
+
+    let cert_pem = std::fs::read_to_string(&cert_path)
+        .with_context(|| format!("读取服务端证书失败: {}", cert_path.display()))?;
+    let key_pem = std::fs::read_to_string(&key_path)
+        .with_context(|| format!("读取服务端私钥失败: {}", key_path.display()))?;
+    let ca_pem = std::fs::read_to_string(&ca_path)
+        .with_context(|| format!("读取 CA 证书失败: {}", ca_path.display()))?;
+
+    // 1) key/cert 必须配套：rotate 先写 key 后写 cert，中间状态不能热加载。
+    if !tls::cert_matches_key(&cert_pem, &key_pem).context("校验证书与私钥配套失败")? {
+        bail!("服务端证书与私钥不配套，拒绝热加载");
+    }
+    // 2) CA 链、CN、有效期与 SAN 覆盖。
+    tls::validate_existing_server_cert(&cert_pem, &ca_pem, &cfg.server_names, now_ms())
+        .context("热加载证书校验失败（CA 链 / SAN / 有效期）")?;
+    let status = CertStatus::from_pem(&cert_pem)?;
+
+    // 3) 指纹没变：无需替换（避免每 10s 重建 rustls 配置）。
+    if read_live(live).fingerprint == status.fingerprint {
+        return Ok(false);
+    }
+
+    // 4) 用同一批文件构建 rustls 配置；随后复核指纹，防止读写之间又被 rotate 覆盖。
+    let server_config = tls::server_config(&cfg.data_dir).context("构建热加载 TLS 配置失败")?;
+    let confirmed = CertStatus::from_pem(&std::fs::read_to_string(&cert_path)?)?;
+    if confirmed.fingerprint != status.fingerprint {
+        tracing::debug!("证书在热加载过程中再次变化，本周期跳过，下个周期重试");
+        return Ok(false);
+    }
+
+    tx.send_replace(server_config);
+    write_live(live, confirmed);
+    tracing::info!(
+        fingerprint = %status.fingerprint,
+        not_after = %tls::format_unix_utc(status.not_after),
+        days_left = status.days_left,
+        "监听器已切换到磁盘上的新证书"
+    );
+    Ok(true)
+}
+
+/// rotate-cert 的进程间互斥锁：`<证书目录>/.rotate.lock`，`create_new` + 0600。
+///
+/// RAII：正常返回、出错返回、panic 展开时都会在 `Drop` 里删除锁文件。
+/// 持锁进程被 kill -9 时会留下锁文件，超过 [`STALE_LOCK_AGE`] 视为陈旧并自动清理。
+#[derive(Debug)]
+pub struct CertLock {
+    path: PathBuf,
+}
+
+impl CertLock {
+    /// 在证书目录获取锁；已有未过期的锁时返回错误。
+    pub fn acquire(cert_dir: &Path) -> Result<Self> {
+        fsutil::ensure_dir(cert_dir, 0o700)
+            .with_context(|| format!("创建证书目录失败: {}", cert_dir.display()))?;
+        let path = cert_dir.join(CERT_LOCK_FILE);
+        match create_lock_file(&path) {
+            Ok(()) => Ok(Self { path }),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if is_stale_lock(&path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "检测到超过 10 分钟的陈旧 rotate-cert 锁，清理后重试"
+                    );
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(remove_err) => {
+                            return Err(remove_err)
+                                .with_context(|| format!("清理陈旧锁文件失败: {}", path.display()))
+                        }
+                    }
+                    create_lock_file(&path).with_context(|| {
+                        format!(
+                            "另一个 rotate-cert 正在运行（锁文件 {}）；请等待其结束",
+                            path.display()
+                        )
+                    })?;
+                    Ok(Self { path })
+                } else {
+                    bail!(
+                        "另一个 rotate-cert 正在运行（锁文件 {}）；\
+                         若确认没有进程在运行，可等待 10 分钟后陈旧锁自动恢复，或手动删除该文件",
+                        path.display()
+                    )
+                }
+            }
+            Err(err) => {
+                Err(err).with_context(|| format!("创建 rotate-cert 锁文件失败: {}", path.display()))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for CertLock {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!(
+                path = %self.path.display(),
+                error = %err,
+                "删除 rotate-cert 锁文件失败，请手工清理"
+            ),
+        }
+    }
+}
+
+/// `create_new` 创建锁文件并写入 pid / 时间；已存在时返回 `AlreadyExists`。
+fn create_lock_file(path: &Path) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // 从创建的第一刻起就是 0600（不受 umask 影响）。
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    writeln!(file, "pid={} time_ms={}", std::process::id(), now_ms())?;
+    Ok(())
+}
+
+/// 锁文件是否已超过陈旧阈值（mtime 在未来或读不到时按不陈旧处理）。
+fn is_stale_lock(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    modified
+        .elapsed()
+        .map(|age| age >= STALE_LOCK_AGE)
+        .unwrap_or(false)
 }
 
 /// 是否现在需要续签；返回 `Some(新证书有效期天数)` 表示需要续签。
@@ -1349,6 +1641,174 @@ mod tests {
 
         let err = check_and_renew(&cfg, &tx2, true, None).unwrap_err();
         assert!(format!("{err:#}").contains("CA 私钥"), "错误信息: {err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// KI-10：磁盘证书指纹没变时不重建、不推送；rotate 后指纹变化才热替换。
+    #[test]
+    fn v021_cert_watcher_reloads_only_when_fingerprint_changes() {
+        let dir = temp_dir("watcher-reload");
+        let policy = tls::CertPolicy {
+            server_days: 365,
+            ..Default::default()
+        };
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let cfg = test_config(&dir, 365, 30);
+        let (tx, rx) = watch::channel(tls::server_config(&dir).unwrap());
+        let old_status = read_disk_cert_status(&cfg).unwrap();
+        let live = RwLock::new(old_status.clone());
+
+        // 未变化：不推送。
+        assert!(!reload_server_config_if_changed(&cfg, &tx, &live).unwrap());
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(read_live(&live), old_status);
+
+        // 只改磁盘（模拟运维手工执行 rotate-cert），不发 watch。
+        let renewed = renew_server_cert_files(&cfg, true, Some(60))
+            .unwrap()
+            .expect("force 必须重签");
+        assert_ne!(renewed.fingerprint, old_status.fingerprint);
+        assert!(!rx.has_changed().unwrap(), "文件级续签本身不推送 watch");
+
+        assert!(
+            reload_server_config_if_changed(&cfg, &tx, &live).unwrap(),
+            "指纹变化必须触发热加载"
+        );
+        assert!(rx.has_changed().unwrap(), "watch 必须收到新配置");
+        let live_after = read_live(&live);
+        assert_eq!(live_after.fingerprint, renewed.fingerprint);
+        assert_eq!(live_after.not_after, renewed.not_after);
+        assert_eq!(
+            live_after,
+            read_disk_cert_status(&cfg).unwrap(),
+            "live 摘要必须与磁盘一致"
+        );
+
+        // 再次轮询：指纹相同，保持无动作。
+        assert!(!reload_server_config_if_changed(&cfg, &tx, &live).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// KI-10：坏证书（不配套 / 不可解析 / SAN 不覆盖）绝不替换 live 配置。
+    #[test]
+    fn v021_cert_watcher_rejects_bad_certificate_and_keeps_old() {
+        let dir = temp_dir("watcher-bad-cert");
+        let policy = tls::CertPolicy {
+            server_days: 365,
+            ..Default::default()
+        };
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let cfg = test_config(&dir, 365, 30);
+        let (tx, rx) = watch::channel(tls::server_config(&dir).unwrap());
+        let old_status = read_disk_cert_status(&cfg).unwrap();
+        let live = RwLock::new(old_status.clone());
+        let cert_before = read(&dir, SERVER_CERT_FILE);
+
+        // 场景 A：证书与私钥不配套（rotate 写盘中途被 kill 的状态）。
+        break_key_pair(&dir);
+        let err = reload_server_config_if_changed(&cfg, &tx, &live)
+            .expect_err("不配套的 key/cert 必须拒绝热加载");
+        assert!(format!("{err:#}").contains("不配套"), "错误信息: {err:#}");
+        assert!(!rx.has_changed().unwrap(), "失败不得推送新配置");
+        assert_eq!(read_live(&live), old_status, "失败必须保留旧 live");
+        assert_eq!(read(&dir, SERVER_CERT_FILE), cert_before, "不得改写证书");
+
+        // 恢复配套后，换成不可解析的证书。
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        write(&dir, SERVER_CERT_FILE, b"not a certificate");
+        let err = reload_server_config_if_changed(&cfg, &tx, &live)
+            .expect_err("不可解析的证书必须拒绝热加载");
+        assert!(format!("{err:#}").contains("证书"), "错误信息: {err:#}");
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(read_live(&live), old_status);
+
+        // 场景 C：证书本身可解析且配套，但 SAN 不覆盖配置新增的条目。
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let mut stricter = cfg.clone();
+        stricter.server_names.push("added.example".to_string());
+        let err = reload_server_config_if_changed(&stricter, &tx, &live)
+            .expect_err("SAN 未覆盖必须拒绝热加载");
+        assert!(
+            format!("{err:#}").contains("added.example"),
+            "错误信息必须点名缺失 SAN: {err:#}"
+        );
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(read_live(&live), old_status);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// KI-11：锁文件 0600、内容含 pid；第二个 acquire 失败，Drop 后释放。
+    #[test]
+    fn v021_cert_lock_blocks_concurrent_rotate_and_releases_on_drop() {
+        let dir = temp_dir("cert-lock");
+        fsutil::ensure_dir(&dir, 0o700).unwrap();
+        let cert_dir = tls::cert_dir(&dir);
+        let lock = CertLock::acquire(&cert_dir).expect("首次获取锁必须成功");
+        let lock_path = lock.path().to_path_buf();
+        assert_eq!(lock_path.file_name().unwrap(), CERT_LOCK_FILE);
+        assert!(lock_path.exists());
+        let content = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(
+            content.contains(&format!("pid={}", std::process::id())),
+            "锁文件必须记录 pid: {content}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "锁文件必须是 0600");
+        }
+
+        let err = CertLock::acquire(&cert_dir).expect_err("并发第二个必须失败");
+        assert!(
+            format!("{err:#}").contains("另一个 rotate-cert 正在运行"),
+            "错误信息: {err:#}"
+        );
+        assert!(lock_path.exists(), "失败方不得删除他人的锁");
+
+        drop(lock);
+        assert!(!lock_path.exists(), "RAII 必须删除锁文件");
+        // 释放后可以再次获取。
+        let again = CertLock::acquire(&cert_dir).expect("释放后必须能重新获取");
+        drop(again);
+        assert!(!lock_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// KI-11：超过 10 分钟的陈旧锁可自动恢复；未超时的锁不被误删。
+    #[test]
+    fn v021_cert_lock_recovers_stale_lock() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = temp_dir("cert-lock-stale");
+        fsutil::ensure_dir(&dir, 0o700).unwrap();
+        let cert_dir = tls::cert_dir(&dir);
+        let lock = CertLock::acquire(&cert_dir).unwrap();
+        let lock_path = lock.path().to_path_buf();
+
+        // 模拟持锁进程被 kill -9：只留下锁文件（用 forget 跳过 Drop）。
+        std::mem::forget(lock);
+        assert!(lock_path.exists());
+
+        // 刚创建的锁未超时：仍必须拒绝。
+        let err = CertLock::acquire(&cert_dir).expect_err("新鲜锁不得被清理");
+        assert!(format!("{err:#}").contains("另一个 rotate-cert 正在运行"));
+
+        // 把 mtime 改成 11 分钟前：下一次 acquire 必须清理并成功。
+        let old = SystemTime::now() - Duration::from_secs(11 * 60);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        file.set_modified(old).unwrap();
+        drop(file);
+
+        let recovered = CertLock::acquire(&cert_dir).expect("陈旧锁必须可恢复");
+        assert!(lock_path.exists(), "恢复后应持有一把新锁");
+        drop(recovered);
+        assert!(!lock_path.exists());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
