@@ -5614,4 +5614,67 @@ mod tests {
         assert!(body["entries"].as_array().unwrap().is_empty());
         assert!(body["next_before_id"].is_null());
     }
+
+    /// 命令非零退出码：响应仍 200 + 真实 exit_code，但审计必须记 error
+    /// （control_failed），且不得回显 stderr。
+    #[tokio::test]
+    async fn m3_control_nonzero_exit_is_audited_as_error() {
+        const SECRET: &str = "SECRET-STDERR-MUST-NOT-LEAK";
+        let state = m3_state(m3_control_cfg());
+        let handle = m3_register_agent(&state, "a1", &["docker"]);
+        let responder = m3_spawn_responder(
+            handle.control_rx,
+            vec![Ok(ControlResult::ActionOutput {
+                stdout: "restarting".into(),
+                stderr: SECRET.into(),
+                exit_code: Some(5),
+            })],
+        );
+        let router = admin_router(state.clone());
+
+        let (status, body) = m3_post(
+            &router,
+            "a1",
+            r#"{"capability":"docker","action":"restart","target":"web-1","confirm":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["result"]["exit_code"], 5);
+        assert_eq!(responder.await.unwrap(), 1);
+
+        let entries = m3_audit(&state);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].result, "error");
+        assert_eq!(entries[0].error_code, "control_failed");
+        assert_eq!(entries[0].error_message, "命令退出码非 0");
+        assert!(
+            !entries[0].error_message.contains(SECRET) && !entries[0].params.contains(SECRET),
+            "审计不得回显 stderr"
+        );
+    }
+
+    /// 会话 pending 满（`too_many_pending`）必须映射 429，而不是 502。
+    #[tokio::test]
+    async fn m3_control_pending_limit_maps_to_429() {
+        let state = m3_state(m3_control_cfg());
+        let handle = m3_register_agent(&state, "a1", &["logs"]);
+        let responder = m3_spawn_responder(
+            handle.control_rx,
+            vec![Err(ControlError::new("too_many_pending", "待处理命令过多"))],
+        );
+        let router = admin_router(state.clone());
+
+        let (status, body) =
+            m3_post(&router, "a1", r#"{"capability":"logs","action":"list"}"#).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "too_many_pending");
+        assert_eq!(responder.await.unwrap(), 1);
+
+        let entries = m3_audit(&state);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].result, "error");
+        assert_eq!(entries[0].error_code, "too_many_pending");
+    }
 }

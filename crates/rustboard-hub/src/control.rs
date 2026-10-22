@@ -48,6 +48,13 @@ use crate::{is_valid_agent_id, validate_agent_path, ApiError, AppState};
 /// 立即回 `too_many_pending`，绝不阻塞会话的采集 / ACK 路径。
 pub const CONTROL_COMMAND_BUFFER: usize = 16;
 
+/// 控制请求帧的写超时。
+///
+/// 普通帧沿用会话级 15s 写超时；控制帧很小，且写操作发生在会话 `select!`
+/// 分支里，超时越长越久阻塞 Ping / ACK 处理。这里用更短的 5s：超时即关闭会话，
+/// 不会留下半帧状态。
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 会话内待处理命令的默认上限（配置层另有 1–128 的校验）。
 const MIN_PENDING_LIMIT: usize = 1;
 /// agent 上报能力的最大条数；超出部分直接忽略，避免恶意 Hello 撑爆存储。
@@ -145,11 +152,25 @@ impl ControlSession {
             Err(_) => return Ok(()),
         };
         let id = request.id;
-        if let Err(err) = crate::send_frame(socket, &Frame::ControlRequest(request)).await {
-            self.pending.remove(&id);
-            return Err(err);
+        let sent = tokio::time::timeout(
+            CONTROL_WRITE_TIMEOUT,
+            crate::send_frame(socket, &Frame::ControlRequest(request)),
+        )
+        .await;
+        match sent {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => {
+                self.pending.remove(&id);
+                Err(err)
+            }
+            Err(_) => {
+                self.pending.remove(&id);
+                anyhow::bail!(
+                    "发送 ControlRequest 超时（{}s）",
+                    CONTROL_WRITE_TIMEOUT.as_secs()
+                )
+            }
         }
-        Ok(())
     }
 
     /// 用 agent 的应答完成一个待处理请求；未知 id 丢弃并计数。
@@ -540,9 +561,33 @@ pub(crate) async fn control_action(
             return finish_error(&state, audit, started, &Reject::offline()).await;
         }
         Ok(Ok(Ok(result))) => {
+            // 非零退出码代表动作实际失败：响应仍保留 200 + 真实 exit_code
+            // （前端已按 exit_code 展示失败），但审计必须记 error 而不是 ok。
+            // 审计只写固定文案，不回显 stderr。
+            let exit_code = match &result {
+                ControlResult::ActionOutput { exit_code, .. } => *exit_code,
+                _ => None,
+            };
             let value = control_result_json(&result, state.cfg.control.max_output_bytes);
             let duration = elapsed_ms(started);
-            let entry = audit.into_entry(AUDIT_OK, "", "", duration);
+            let entry = match exit_code {
+                Some(code) if code != 0 => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        capability = %audit.capability,
+                        action = %audit.action,
+                        exit_code = code,
+                        "控制命令退出码非 0"
+                    );
+                    audit.into_entry(
+                        AUDIT_ERROR,
+                        control_codes::CONTROL_FAILED,
+                        "命令退出码非 0",
+                        duration,
+                    )
+                }
+                _ => audit.into_entry(AUDIT_OK, "", "", duration),
+            };
             record_audit(&state, entry).await;
             Json(json!({ "ok": true, "result": value })).into_response()
         }
@@ -557,6 +602,9 @@ pub(crate) async fn control_action(
 /// 把 agent 返回的错误码映射成 HTTP 状态与固定文案。
 fn reject_from_agent_error(error: &ControlError) -> Reject {
     match error.code.as_str() {
+        // 会话内 pending 表满（`ControlSession::enqueue`）与 mpsc 队列满走同一个
+        // 错误码：对面板都是 429，不能落到 502。
+        hub_codes::TOO_MANY_PENDING => Reject::too_many_pending(),
         control_codes::CAPABILITY_DISABLED => Reject {
             status: StatusCode::FORBIDDEN,
             code: control_codes::CAPABILITY_DISABLED,
@@ -1585,6 +1633,40 @@ mod tests {
             rx.try_recv().unwrap().unwrap_err().code,
             control_codes::CONTROL_FAILED
         );
+    }
+
+    /// 会话内 pending 满经 oneshot 回 `too_many_pending`；API 映射必须是 429，
+    /// 不能因为错误码不在 agent 错误表里就落到 502。
+    #[test]
+    fn pending_limit_error_maps_to_429_not_502() {
+        let mut session = ControlSession::new(1);
+        let (reply, _rx) = oneshot::channel();
+        session
+            .enqueue(ControlCommand {
+                op: ControlOp::SystemdList,
+                reply,
+            })
+            .unwrap();
+
+        let (reply, mut rx) = oneshot::channel();
+        let error = session
+            .enqueue(ControlCommand {
+                op: ControlOp::SystemdList,
+                reply,
+            })
+            .expect_err("pending 已满必须拒绝");
+        assert_eq!(error.code, hub_codes::TOO_MANY_PENDING);
+
+        let delivered = rx
+            .try_recv()
+            .expect("满时应主动回复错误")
+            .expect_err("必须是错误");
+        assert_eq!(delivered.code, hub_codes::TOO_MANY_PENDING);
+
+        let reject = reject_from_agent_error(&delivered);
+        assert_eq!(reject.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(reject.code, hub_codes::TOO_MANY_PENDING);
+        assert_eq!(reject.audit_result, AUDIT_ERROR);
     }
 
     #[test]
