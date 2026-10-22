@@ -6,11 +6,20 @@ use anyhow::Result;
 use rustboard_common::model::{AgentRecord, SampleBatch, SeriesQuery, SeriesRow};
 
 /// 一批数据的写入结果。
-#[derive(Debug, Default, Clone, Copy)]
-pub struct InsertOutcome {
-    pub inserted: usize,
-    /// 同一 epoch 下 seq 已存在，整批跳过。
-    pub duplicate: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestOutcome {
+    /// 正常写入，`inserted` 为本次新增的采样点数。
+    Inserted { inserted: usize },
+    /// 同一 `(agent_id, epoch, seq)` 已处理过，整批跳过。
+    Duplicate,
+    /// 批次被拒绝，不写入任何数据。
+    Rejected(RejectReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// agent 已被吊销。
+    Revoked,
 }
 
 pub trait Storage: Send + Sync {
@@ -23,8 +32,16 @@ pub trait Storage: Send + Sync {
     /// 修改状态（online / offline / revoked / pending）。
     fn set_status(&self, agent_id: &str, status: &str, ts: i64) -> Result<()>;
 
+    /// hub 启动时把上次遗留的 `online` 状态清成 `offline`，返回受影响行数。
+    ///
+    /// 进程异常退出时来不及走会话清理，数据库里会残留 online；监听前重置，
+    /// 避免面板长期显示假在线。`revoked` 不受影响。
+    fn reset_online_status(&self) -> Result<usize>;
+
     /// 写入一批采样点，按 `(agent_id, epoch, seq)` 幂等。
-    fn insert_batch(&self, batch: &SampleBatch) -> Result<InsertOutcome>;
+    ///
+    /// 已吊销 agent 的批次始终返回 `Rejected(Revoked)`，且不写入任何数据。
+    fn insert_batch(&self, batch: &SampleBatch) -> Result<IngestOutcome>;
 
     fn list_agents(&self) -> Result<Vec<AgentRecord>>;
 

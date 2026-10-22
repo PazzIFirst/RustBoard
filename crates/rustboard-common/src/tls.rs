@@ -17,7 +17,7 @@ use rcgen::{
     KeyIdMethod, KeyPair, KeyUsagePurpose, SanType,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
 
@@ -57,12 +57,12 @@ fn ca_issuer(ca_key: &KeyPair) -> Result<Certificate> {
 }
 
 fn write_private(path: &Path, data: &[u8]) -> Result<()> {
-    std::fs::write(path, data)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    crate::fsutil::atomic_write(path, data, 0o600)?;
+    Ok(())
+}
+
+fn write_public(path: &Path, data: &[u8]) -> Result<()> {
+    crate::fsutil::atomic_write(path, data, 0o644)?;
     Ok(())
 }
 
@@ -78,12 +78,24 @@ fn san_entries(hosts: &[String]) -> Vec<SanType> {
         .collect()
 }
 
+/// 收紧已有 hub 私钥的权限（升级路径：旧安装可能是 0644）。
+pub fn harden_hub_material(data_dir: &Path) -> Result<()> {
+    let dir = cert_dir(data_dir);
+    for name in [CA_KEY_FILE, SERVER_KEY_FILE] {
+        let path = dir.join(name);
+        if path.exists() {
+            crate::fsutil::harden(&path, 0o600)?;
+        }
+    }
+    Ok(())
+}
+
 /// 确保 hub 的 CA 与服务端证书存在，返回服务端证书的 SHA-256 指纹（hex）。
 ///
 /// 已存在的证书不会被覆盖——覆盖会改变指纹，所有已安装 agent 立即失联。
 pub fn ensure_hub_material(data_dir: &Path, sans: &[String]) -> Result<String> {
     let dir = cert_dir(data_dir);
-    std::fs::create_dir_all(&dir)?;
+    crate::fsutil::ensure_dir(&dir, 0o700)?;
 
     let ca_cert_path = dir.join(CA_CERT_FILE);
     let ca_key_path = dir.join(CA_KEY_FILE);
@@ -91,16 +103,18 @@ pub fn ensure_hub_material(data_dir: &Path, sans: &[String]) -> Result<String> {
         let key = KeyPair::generate()?;
         let cert = ca_params()?.self_signed(&key)?;
         write_private(&ca_key_path, key.serialize_pem().as_bytes())?;
-        std::fs::write(&ca_cert_path, cert.pem())?;
+        write_public(&ca_cert_path, cert.pem().as_bytes())?;
         tracing::info!(path = %ca_cert_path.display(), "已生成 CA");
     }
 
     let server_cert_path = dir.join(SERVER_CERT_FILE);
     let server_key_path = dir.join(SERVER_KEY_FILE);
     if !server_cert_path.exists() || !server_key_path.exists() {
+        // M3：已有 CA 私钥可能是旧版本按 0644 留下的，先收紧再读取。
+        crate::fsutil::harden(&ca_key_path, 0o600)?;
         let ca_key_pem = std::fs::read_to_string(&ca_key_path)?;
         let (cert_pem, key_pem) = issue_server_cert(&ca_key_pem, sans)?;
-        std::fs::write(&server_cert_path, cert_pem)?;
+        write_public(&server_cert_path, cert_pem.as_bytes())?;
         write_private(&server_key_path, key_pem.as_bytes())?;
         tracing::info!(path = %server_cert_path.display(), "已签发服务端证书");
     }
@@ -125,6 +139,8 @@ pub fn issue_server_cert(ca_key_pem: &str, sans: &[String]) -> Result<(String, S
         KeyUsagePurpose::DigitalSignature,
         KeyUsagePurpose::KeyEncipherment,
     ];
+    // 严格校验（OpenSSL -x509_strict / Python VERIFY_X509_STRICT）要求非自签证书带 AKI
+    params.use_authority_key_identifier_extension = true;
 
     let cert = params.signed_by(&key, &ca_cert, &ca_key)?;
     Ok((cert.pem(), key.serialize_pem()))
@@ -156,14 +172,24 @@ pub fn sign_client_csr(ca_key_pem: &str, csr_pem: &str, agent_id: &str) -> Resul
     csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     csr.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     csr.params.subject_alt_names = Vec::new();
+    csr.params.use_authority_key_identifier_extension = true;
 
     let cert = csr.signed_by(&ca_cert, &ca_key)?;
     Ok(cert.pem())
 }
 
+/// 从客户端证书 DER 里取出 subject CN。
+///
+/// 只做解析，不做链校验：证书链已经由 rustls 在 TLS 握手阶段验证过。
+/// 解析失败或没有 CN 时返回 `None`，调用方按「无身份」处理。
+pub fn peer_common_name(der: &[u8]) -> Option<String> {
+    let (_, cert) = x509_parser::parse_x509_certificate(der).ok()?;
+    let cn = cert.subject().iter_common_name().next()?.as_str().ok()?;
+    Some(cn.to_string())
+}
+
 pub fn load_certs(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let mut reader = std::io::BufReader::new(pem.as_bytes());
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("解析证书 PEM 失败")?;
     if certs.is_empty() {
@@ -173,10 +199,7 @@ pub fn load_certs(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 pub fn load_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
-    let mut reader = std::io::BufReader::new(pem.as_bytes());
-    rustls_pemfile::private_key(&mut reader)
-        .context("解析私钥 PEM 失败")?
-        .ok_or_else(|| anyhow!("PEM 中没有私钥"))
+    PrivateKeyDer::from_pem_slice(pem.as_bytes()).context("解析私钥 PEM 失败")
 }
 
 pub fn fingerprint_of_pem(pem: &str) -> Result<String> {
@@ -205,7 +228,10 @@ pub fn parse_fingerprint(text: &str) -> Result<[u8; 32]> {
 pub fn server_config(data_dir: &Path) -> Result<Arc<rustls::ServerConfig>> {
     let dir = cert_dir(data_dir);
     let cert_pem = std::fs::read_to_string(dir.join(SERVER_CERT_FILE))?;
-    let key_pem = std::fs::read_to_string(dir.join(SERVER_KEY_FILE))?;
+    let key_path = dir.join(SERVER_KEY_FILE);
+    // M3：服务端私钥也属于敏感文件，旧版本可能留下过宽权限。
+    crate::fsutil::harden(&key_path, 0o600)?;
+    let key_pem = std::fs::read_to_string(&key_path)?;
     let ca_pem = std::fs::read_to_string(dir.join(CA_CERT_FILE))?;
 
     let certs = load_certs(&cert_pem)?;
@@ -378,5 +404,81 @@ mod tests {
         roots.add(ca_cert.der().clone()).unwrap();
         let parsed = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build();
         assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn peer_common_name_reads_subject_cn() {
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params().unwrap().self_signed(&ca_key).unwrap();
+        let (csr_pem, _key_pem) = make_csr().unwrap();
+        let signed = sign_client_csr(&ca_key.serialize_pem(), &csr_pem, "agent-cn-42").unwrap();
+        let certs = load_certs(&signed).unwrap();
+        assert_eq!(
+            peer_common_name(certs[0].as_ref()).as_deref(),
+            Some("agent-cn-42")
+        );
+        assert_eq!(peer_common_name(b"not a certificate"), None);
+        // CA 证书的 CN 是固定的，也能被解析出来。
+        assert_eq!(
+            peer_common_name(ca_cert.der().as_ref()).as_deref(),
+            Some(CA_COMMON_NAME)
+        );
+    }
+
+    /// 证书 subject 没有 CN 时应返回 None，由调用方按「无身份」拒绝。
+    #[test]
+    fn peer_common_name_returns_none_without_cn() {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        // rcgen 默认会塞一个 CN，先清空再只放 O。
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "RustBoard Test");
+        let cert = params.self_signed(&key).unwrap();
+
+        assert_eq!(peer_common_name(cert.der().as_ref()), None);
+    }
+
+    /// subject 里出现多个 CN 时只取第一个，不能让后面的 CN 覆盖身份绑定结果。
+    #[test]
+    fn peer_common_name_uses_first_cn_when_subject_has_multiple() {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "agent-first");
+        // rcgen 的 DistinguishedName 按 DnType 去重；用同一 OID（2.5.4.3）的
+        // 自定义类型才能构造出两个 CN 属性。
+        params
+            .distinguished_name
+            .push(DnType::CustomDnType(vec![2, 5, 4, 3]), "agent-second");
+        let cert = params.self_signed(&key).unwrap();
+
+        assert_eq!(
+            peer_common_name(cert.der().as_ref()).as_deref(),
+            Some("agent-first")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_6_hub_material_permissions_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("rb-tls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        ensure_hub_material(&dir, &["localhost".to_string()]).unwrap();
+
+        let certs = cert_dir(&dir);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&certs), 0o700);
+        assert_eq!(mode(&certs.join(CA_KEY_FILE)), 0o600);
+        assert_eq!(mode(&certs.join(SERVER_KEY_FILE)), 0o600);
+        assert_eq!(mode(&certs.join(CA_CERT_FILE)), 0o644);
+        assert_eq!(mode(&certs.join(SERVER_CERT_FILE)), 0o644);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

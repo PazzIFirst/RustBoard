@@ -24,6 +24,9 @@ pub struct AgentConfig {
     pub excluded_interfaces: Vec<String>,
     /// 本地环形缓冲的最大字节数。
     pub buffer_max_bytes: u64,
+    /// 本地缓冲的最长保留小时数（与字节上限取先到者）。
+    #[serde(default = "default_buffer_max_age_hours")]
+    pub buffer_max_age_hours: u64,
     /// 单批最多多少条采样点。
     pub max_batch_samples: usize,
 }
@@ -40,6 +43,7 @@ impl Default for AgentConfig {
             per_core: false,
             excluded_interfaces: default_excluded_interfaces(),
             buffer_max_bytes: 500 * 1024 * 1024,
+            buffer_max_age_hours: 24,
             max_batch_samples: 512,
         }
     }
@@ -96,11 +100,19 @@ pub struct HubConfig {
     pub advertise_host: Option<String>,
     /// 下发给 agent 的默认采样间隔。
     pub sample_interval_ms: u64,
+    /// agent 接入层允许同时处理的 TLS 连接数；超出后直接关闭 TCP。
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
     pub per_core: bool,
     pub excluded_interfaces: Vec<String>,
     pub retention_raw_days: u32,
     pub retention_1m_days: u32,
     pub retention_1h_days: u32,
+}
+
+/// agent 接入层默认的最大并发连接数。
+fn default_max_connections() -> usize {
+    1024
 }
 
 impl Default for HubConfig {
@@ -115,6 +127,7 @@ impl Default for HubConfig {
             server_names: vec!["localhost".to_string(), "127.0.0.1".to_string()],
             advertise_host: None,
             sample_interval_ms: 5_000,
+            max_connections: default_max_connections(),
             per_core: false,
             excluded_interfaces: default_excluded_interfaces(),
             retention_raw_days: 7,
@@ -172,9 +185,28 @@ impl PanelConfig {
     }
 }
 
+fn default_buffer_max_age_hours() -> u64 {
+    24
+}
+
 pub fn default_excluded_interfaces() -> Vec<String> {
     ["lo", "docker", "veth", "br-", "virbr", "cni", "flannel"]
         .iter()
         .map(|s| s.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// H2：`max_connections` 缺省为 1024，老配置文件不需要显式写这一项。
+    #[test]
+    fn h2_hub_config_max_connections_is_backward_compatible() {
+        let cfg: HubConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.max_connections, 1024);
+
+        let cfg: HubConfig = toml::from_str("max_connections = 32\n").unwrap();
+        assert_eq!(cfg.max_connections, 32);
+    }
 }

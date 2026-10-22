@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod error;
+pub mod fsutil;
 pub mod model;
 pub mod tls;
 pub mod util;
@@ -12,8 +13,11 @@ pub use error::{Error, Result};
 /// 产品版本，取自 crate 元数据。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 线协议版本。hub 兼容低一个版本的 agent。
-pub const PROTOCOL_VERSION: u16 = 1;
+/// 线协议版本。
+///
+/// hub 与 agent 必须完全一致：协议不兼容时 agent 会直接退出，
+/// 避免带着错误的数据格式进入无限重连。
+pub const PROTOCOL_VERSION: u16 = 2;
 
 pub const DEFAULT_AGENT_CONFIG: &str = "/etc/rustboard/agent.toml";
 pub const DEFAULT_HUB_CONFIG: &str = "/etc/rustboard/hub.toml";

@@ -161,6 +161,11 @@ struct IoCounters {
     write_ops: u64,
     read_sectors: u64,
     write_sectors: u64,
+    /// 读请求累计耗时（/proc/diskstats 第 7 个字段，f[6]）。
+    read_ticks: u64,
+    /// 写请求累计耗时（/proc/diskstats 第 11 个字段，f[10]）。
+    write_ticks: u64,
+    /// 设备有 IO 在进行的累计时间（f[12]），只用于 util。
     io_ms: u64,
 }
 
@@ -190,11 +195,9 @@ fn skip_device(name: &str) -> bool {
         .any(|p| name.starts_with(p))
 }
 
-fn read_diskstats() -> HashMap<String, IoCounters> {
+/// 解析 `/proc/diskstats` 文本。抽成纯函数，便于用已知样例做单测。
+fn parse_diskstats(text: &str) -> HashMap<String, IoCounters> {
     let mut map = HashMap::new();
-    let Ok(text) = std::fs::read_to_string("/proc/diskstats") else {
-        return map;
-    };
     for line in text.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
         if f.len() < 14 {
@@ -210,13 +213,44 @@ fn read_diskstats() -> HashMap<String, IoCounters> {
             IoCounters {
                 read_ops: n(3),
                 read_sectors: n(5),
+                read_ticks: n(6),
                 write_ops: n(7),
                 write_sectors: n(9),
+                write_ticks: n(10),
                 io_ms: n(12),
             },
         );
     }
     map
+}
+
+fn read_diskstats() -> HashMap<String, IoCounters> {
+    match std::fs::read_to_string("/proc/diskstats") {
+        Ok(text) => parse_diskstats(&text),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// 平均请求耗时 = (Δread_ticks + Δwrite_ticks) / (Δread_ops + Δwrite_ops)。
+///
+/// `io_ms` 是设备忙碌时间，不能用来算单请求耗时；它只参与 `diskio.util`。
+/// 任一计数器回退（驱动重置 / 设备消失后重现 / 计数器回绕）都放弃本帧，
+/// 不能像旧实现那样只比较读数之和——那会把「只有 read_ticks 回退」漏过去。
+fn await_ms(old: &IoCounters, cur: &IoCounters) -> Option<f64> {
+    if cur.read_ops < old.read_ops
+        || cur.read_ticks < old.read_ticks
+        || cur.write_ops < old.write_ops
+        || cur.write_ticks < old.write_ticks
+    {
+        return None;
+    }
+
+    let d_ops = (cur.read_ops - old.read_ops) + (cur.write_ops - old.write_ops);
+    if d_ops == 0 {
+        return None;
+    }
+    let d_ticks = (cur.read_ticks - old.read_ticks) + (cur.write_ticks - old.write_ticks);
+    Some(d_ticks as f64 / d_ops as f64)
 }
 
 impl Collector for DiskIoCollector {
@@ -271,19 +305,17 @@ impl Collector for DiskIoCollector {
             ));
 
             if let (Some(old), Some(elapsed)) = (prev.get(name), elapsed_ms) {
-                let d_ops = (cur.read_ops + cur.write_ops)
-                    .saturating_sub(old.read_ops + old.write_ops)
-                    as f64;
-                let d_ms = cur.io_ms.saturating_sub(old.io_ms) as f64;
-                if d_ops > 0.0 {
-                    out.push(labelled("diskio.await_ms", "dev", key, ts, d_ms / d_ops));
+                if let Some(avg_await) = await_ms(old, cur) {
+                    out.push(labelled("diskio.await_ms", "dev", key, ts, avg_await));
                 }
+                // util 语义不变：设备忙碌时间 / 采样间隔。
+                let d_io_ms = cur.io_ms.saturating_sub(old.io_ms) as f64;
                 out.push(labelled(
                     "diskio.util",
                     "dev",
                     key,
                     ts,
-                    (d_ms / elapsed * 100.0).min(100.0),
+                    (d_io_ms / elapsed * 100.0).min(100.0),
                 ));
             }
         }
@@ -291,5 +323,136 @@ impl Collector for DiskIoCollector {
         *prev = current;
         *prev_ts = Some(ts);
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// issue #8 的已知两帧计数器样例。
+    const PREV: &str = "8 0 sda 100 0 0 1000 50 0 0 500 0 1200 0";
+    const CURR: &str = "8 0 sda 110 0 0 1500 60 0 0 1000 0 1600 0";
+
+    #[test]
+    fn issue_8_parse_diskstats_reads_ticks() {
+        let prev = parse_diskstats(PREV);
+        let cur = parse_diskstats(CURR);
+        let p = prev.get("sda").unwrap();
+        assert_eq!((p.read_ops, p.write_ops), (100, 50));
+        assert_eq!((p.read_ticks, p.write_ticks), (1000, 500));
+        assert_eq!(p.io_ms, 1200);
+
+        let c = cur.get("sda").unwrap();
+        assert_eq!((c.read_ops, c.write_ops), (110, 60));
+        assert_eq!((c.read_ticks, c.write_ticks), (1500, 1000));
+        assert_eq!(c.io_ms, 1600);
+    }
+
+    #[test]
+    fn issue_8_await_ms_matches_known_sample() {
+        let prev = parse_diskstats(PREV);
+        let cur = parse_diskstats(CURR);
+        // (500 + 500) / (10 + 10) = 50ms；旧公式 io_ticks 差分只能得到 20ms
+        assert_eq!(await_ms(&prev["sda"], &cur["sda"]), Some(50.0));
+        // util 仍基于 io_ticks 差分，行为不变
+        assert_eq!(cur["sda"].io_ms - prev["sda"].io_ms, 400);
+    }
+
+    #[test]
+    fn issue_8_await_ms_skips_zero_request_delta() {
+        let prev = parse_diskstats(PREV);
+        let cur = parse_diskstats(PREV);
+        assert_eq!(await_ms(&prev["sda"], &cur["sda"]), None);
+    }
+
+    #[test]
+    fn issue_8_await_ms_high_and_low_concurrency() {
+        // 高并发：请求数翻倍但 ticks 增长 3 倍，平均耗时 20ms；io_ticks 差分不参与
+        let high_prev = IoCounters {
+            read_ops: 1_000,
+            write_ops: 1_000,
+            read_ticks: 10_000,
+            write_ticks: 10_000,
+            ..IoCounters::default()
+        };
+        let high_cur = IoCounters {
+            read_ops: 2_000,
+            write_ops: 2_000,
+            read_ticks: 30_000,
+            write_ticks: 30_000,
+            ..IoCounters::default()
+        };
+        assert_eq!(await_ms(&high_prev, &high_cur), Some(20.0));
+
+        // 低并发：单个请求耗时 7ms
+        let low_prev = IoCounters::default();
+        let low_cur = IoCounters {
+            read_ops: 1,
+            read_ticks: 7,
+            ..IoCounters::default()
+        };
+        assert_eq!(await_ms(&low_prev, &low_cur), Some(7.0));
+    }
+
+    #[test]
+    fn issue_8_await_ms_handles_counter_reset() {
+        let prev = parse_diskstats(CURR);
+        let cur = parse_diskstats(PREV);
+        assert_eq!(await_ms(&prev["sda"], &cur["sda"]), None);
+    }
+
+    /// L4：只有 read_ticks 回退、其它计数器都在增长时，也不能输出负差分样本。
+    #[test]
+    fn l4_await_ms_rejects_any_single_counter_regression() {
+        let prev = IoCounters {
+            read_ops: 1_000,
+            write_ops: 1_000,
+            read_ticks: 10_000,
+            write_ticks: 10_000,
+            ..IoCounters::default()
+        };
+        let only_read_ticks_regressed = IoCounters {
+            read_ops: 1_100,
+            write_ops: 1_100,
+            read_ticks: 9_000,
+            write_ticks: 12_000,
+            ..IoCounters::default()
+        };
+        // 旧实现把 read_ticks/write_ticks 加总后做 saturating_sub，
+        // 会得到 1000 ticks 的“正常”结果；逐项检查必须返回 None。
+        assert_eq!(await_ms(&prev, &only_read_ticks_regressed), None);
+
+        // 其余三个计数器各自单独回退时同样拒绝。
+        let all_forward = IoCounters {
+            read_ops: 1_100,
+            write_ops: 1_100,
+            read_ticks: 12_000,
+            write_ticks: 12_000,
+            ..IoCounters::default()
+        };
+        let read_ops_regressed = IoCounters {
+            read_ops: 900,
+            ..all_forward
+        };
+        assert_eq!(await_ms(&prev, &read_ops_regressed), None);
+        let write_ops_regressed = IoCounters {
+            write_ops: 900,
+            ..all_forward
+        };
+        assert_eq!(await_ms(&prev, &write_ops_regressed), None);
+        let write_ticks_regressed = IoCounters {
+            write_ticks: 9_000,
+            ..all_forward
+        };
+        assert_eq!(await_ms(&prev, &write_ticks_regressed), None);
+    }
+
+    #[test]
+    fn issue_8_parse_diskstats_skips_virtual_devices() {
+        let text = "7 0 loop0 1 0 0 1 1 0 0 1 0 2 0\n8 0 sda 100 0 0 1000 50 0 0 500 0 1200 0";
+        let map = parse_diskstats(text);
+        assert!(!map.contains_key("loop0"));
+        assert!(map.contains_key("sda"));
     }
 }
