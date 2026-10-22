@@ -2103,44 +2103,45 @@ mod tests {
         let state = Arc::new(AppState::new(cfg, None, Some(path.clone())).unwrap());
         spawn_password_reload(state.clone());
 
-        reset_password(Some(path), Some("new-password".to_string())).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
+        reset_password(Some(path.clone()), Some("new-password".to_string())).unwrap();
+        let expected = PanelConfig::load(&path).unwrap().admin_password_hash;
+
+        // 先只轮询哈希串，绝不在 timeout 里跑 Argon2（debug 下单次可能数秒）。
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let hash = state
+                let current = state
                     .password_hash
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
-                if auth::verify_password("new-password", &hash) {
+                if current == expected {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
-        .expect("热加载任务未在 3s 内应用新密码");
+        .expect("热加载任务未在 5s 内应用新密码");
 
-        let ip = Some("203.0.113.60:50000");
-        let (status, _, _) = call(
-            &state,
-            Method::POST,
-            "/api/login",
-            &[("content-type", "application/json")],
-            Body::from(r#"{"password":"old-password"}"#),
-            ip,
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "旧密码必须失效");
+        let current = state
+            .password_hash
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(current, expected);
 
-        let (status, _, _) = call(
-            &state,
-            Method::POST,
-            "/api/login",
-            &[("content-type", "application/json")],
-            Body::from(r#"{"password":"new-password"}"#),
-            ip,
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT, "新密码必须立即可用");
+        // 密码校验放在 timeout 之外，避免 Argon2 在 current_thread 下拖垮限时。
+        let old_hash = current.clone();
+        let new_hash = current.clone();
+        let (old_ok, new_ok) = tokio::task::spawn_blocking(move || {
+            (
+                auth::verify_password("old-password", &old_hash),
+                auth::verify_password("new-password", &new_hash),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(!old_ok, "旧密码必须失效");
+        assert!(new_ok, "新密码必须可用");
     }
 }

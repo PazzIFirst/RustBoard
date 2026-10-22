@@ -432,9 +432,9 @@ pub fn parse_trusted_proxies(entries: &[String]) -> Result<Vec<IpNet>> {
 /// - 直连对端不在 `trusted_proxies` 中时，完全忽略 `X-Forwarded-For`，返回直连地址；
 /// - 对端可信但没有 XFF 时返回直连地址；
 /// - 对端可信时，从 XFF 最右侧开始向左跳过可信代理，返回第一个合法非可信 IP；
-/// - 任一 hop 非法、总字节数超过 [`MAX_XFF_BYTES`]、跳数超过 [`MAX_XFF_HOPS`]，
-///   或全部 hop 都是可信地址时，返回 `None`。调用方必须拒绝请求，不能回退到
-///   共享的直连地址（否则多个被代理客户端会落入同一个限速桶）。
+/// - 任一 hop 非法、总字节数超过 [`MAX_XFF_BYTES`]、跳数超过 [`MAX_XFF_HOPS`]
+///   时返回 `None`，调用方必须拒绝请求，不能回退到共享的直连地址；
+/// - 没有 XFF 或全部 hop 都是可信地址（无法确定客户端）时返回直连地址。
 pub fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> Option<IpAddr> {
     if !trusted.iter().any(|net| net.contains(peer)) {
         return Some(peer);
