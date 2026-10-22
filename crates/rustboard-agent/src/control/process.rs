@@ -2,10 +2,12 @@
 //!
 //! 列表直接扫描 `/proc` 数字目录（最多 [`MAX_PROCESS_ITEMS`] 条）；结束进程前必须
 //! 同时满足：PID > 1、PID != agent 自身、`/proc/<pid>/comm` 与请求 name 完全一致。
-//! 信号只有 SIGTERM / SIGKILL，直接使用 `kill(2)`，不经过 `kill` 命令。
+//! 信号只有 SIGTERM / SIGKILL；优先用 pidfd（`pidfd_open` + `pidfd_send_signal`），
+//! 避免 comm 校验与发信号之间的 PID 复用窗口；内核不支持 pidfd 时保守回退 `kill(2)`。
 
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use rustboard_common::control::{
     ControlError, ControlResult, KillSignal, ProcessInfo, MAX_CMDLINE_BYTES, MAX_NAME_LEN,
@@ -66,6 +68,10 @@ pub fn kill(pid: u32, name: &str, signal: KillSignal) -> Result<ControlResult, C
         return Err(ControlError::invalid_request("进程名不能包含控制字符"));
     }
 
+    // 先固定进程身份，再读取 comm：即使 PID 在校验与发信号之间被复用，
+    // 信号也只会发给 pidfd 指向的原进程（已退出则 ESRCH），不会误杀新进程。
+    let pidfd = open_pidfd(pid)?;
+
     let comm_path = format!("/proc/{pid}/comm");
     let comm = fs::read_to_string(&comm_path).map_err(|err| {
         ControlError::control_failed(format!("读取 {comm_path} 失败（进程可能已退出）: {err}"))
@@ -79,22 +85,61 @@ pub fn kill(pid: u32, name: &str, signal: KillSignal) -> Result<ControlResult, C
         )));
     }
 
-    let signal_number = signal_number(signal);
-    // SAFETY: pid 已校验 > 1、不是自身、且 <= i32::MAX；signal_number 是固定常量；
-    // kill(2) 只有整数参数，不解引用任何指针。
-    let rc = unsafe { libc::kill(pid as libc::pid_t, signal_number) };
-    if rc != 0 {
-        return Err(ControlError::control_failed(format!(
-            "发送信号失败: {}",
-            io::Error::last_os_error()
-        )));
-    }
+    send_signal(pid, pidfd.as_ref(), signal_number(signal))
+        .map_err(|err| ControlError::control_failed(format!("发送信号失败: {err}")))?;
 
     Ok(ControlResult::ActionOutput {
         stdout: String::new(),
         stderr: String::new(),
         exit_code: Some(0),
     })
+}
+
+/// 为 `pid` 打开 pidfd。内核不支持（ENOSYS）时返回 `None`，由调用方回退 `kill(2)`。
+fn open_pidfd(pid: u32) -> Result<Option<OwnedFd>, ControlError> {
+    // SAFETY: pidfd_open(2) 只接收整数参数（pid 已校验 > 1 且 <= i32::MAX），不涉及指针。
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd >= 0 {
+        // SAFETY: fd 由 pidfd_open 返回，是唯一所有者的文件描述符，交给 OwnedFd 关闭。
+        return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) }));
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ENOSYS) {
+        // 内核 < 5.1：没有 pidfd，只能退回 kill(2)（comm→kill 窗口仍在）。
+        return Ok(None);
+    }
+    Err(ControlError::control_failed(format!(
+        "打开 pidfd 失败: {err}"
+    )))
+}
+
+/// 通过 pidfd 发信号；pidfd 不可用时退回 `kill(2)`。
+fn send_signal(pid: u32, pidfd: Option<&OwnedFd>, signal: libc::c_int) -> io::Result<()> {
+    if let Some(pidfd) = pidfd {
+        // SAFETY: pidfd 是有效文件描述符；siginfo 传 NULL 表示使用默认信号信息，
+        // flags 为 0。pidfd_send_signal(2) 不读取用户态内存。
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(());
+    }
+
+    // SAFETY: pid 已校验 > 1、不是自身、且 <= i32::MAX；signal 是固定常量；
+    // kill(2) 只有整数参数，不解引用任何指针。
+    let rc = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// 信号映射固定为 SIGTERM / SIGKILL，不接受数字信号。
@@ -189,6 +234,14 @@ mod tests {
     fn signal_mapping_is_fixed_to_term_and_kill() {
         assert_eq!(signal_number(KillSignal::Term), libc::SIGTERM);
         assert_eq!(signal_number(KillSignal::Kill), libc::SIGKILL);
+    }
+
+    /// 现代内核能为自身打开 pidfd；老内核返回 None（走 kill 回退）。两者都不是错误。
+    #[test]
+    fn pidfd_open_is_optional_and_non_fatal() {
+        if let Some(pidfd) = open_pidfd(std::process::id()).expect("open_pidfd 不应失败") {
+            assert!(pidfd.as_raw_fd() >= 0);
+        }
     }
 
     #[test]
