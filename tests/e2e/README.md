@@ -1,6 +1,6 @@
 # RustBoard 端到端回归
 
-本目录包含三套可重复执行的端到端验收脚本，都在 `127.0.0.1` 的随机五位数端口上
+本目录包含四套可重复执行的端到端验收脚本，都在 `127.0.0.1` 的随机五位数端口上
 启动临时实例，用真实 TLS / WebSocket 会话验证行为，结束后清理进程和临时目录：
 
 | 脚本 | 覆盖 |
@@ -8,8 +8,9 @@
 | `security.sh` | issue #1–#8 与协议门禁：身份绑定、协议版本、吊销、在线状态 |
 | `cert-rotation.sh` | 证书有效期、`cert-info` / `renew`、服务端 `rotate-cert`、CA 信任自动重连、指纹一致性 |
 | `panel.sh` | M2 面板：admin token 鉴权、登录/限速/Cookie、overview/series/settings、采样间隔 60s 内生效、静态与路径穿越 |
+| `hardening.sh` | v0.2.1 硬化：弱 token、未知 API 鉴权、管理限速、非回环 WARN、单 IP 连接洪水、rotate 热加载、可信代理 XFF、Origin、reset-password |
 
-`security.sh` 是最早的一套，下文细节以它为例；另外两套脚本的断言清单见各自文件头部注释。
+`security.sh` 是最早的一套，下文细节以它为例；另外三套脚本的断言清单见各自文件头部注释。
 
 ## 依赖
 
@@ -18,7 +19,7 @@
 | Linux | 脚本使用 `mktemp`、`sed -i`、`awk`、`date +%s%3N` 等 GNU 工具 |
 | bash 4.4+ | 使用数组与 `set -euo pipefail` |
 | Python 3.8+ | **仅标准库**（`ssl` / `socket` / `hashlib` / `urllib`）；无需 `pip install`，也不联网 |
-| cargo / rustc | 用于 `cargo build --locked -p rustboard-hub -p rustboard-agent` |
+| cargo / rustc | 用于 `cargo build --locked -p rustboard-hub -p rustboard-agent`（`hardening.sh` 还会构建 panel） |
 
 脚本不会安装任何依赖，也不会访问网络。`probe.py` 里自带最小 MessagePack
 编解码器和 RFC 6455 客户端。
@@ -91,6 +92,9 @@ e2e 结果: 全部 9 项通过
 - `security.sh`：身份/协议/吊销回归（本节断言的执行脚本）
 - `cert-rotation.sh`：证书轮换与 CA 信任回归
 - `panel.sh` + `panel_probe.py`：M2 面板与 hub 管理 API 回归（需要 `web/dist` 已构建）
+- `hardening.sh` + `hardening_probe.py`：v0.2.1 硬化回归；覆盖弱 token、管理 API 限速、
+  未知 API 鉴权、非回环 WARN、单 IP 连接洪水、`rotate-cert` 热加载、
+  面板可信代理 XFF / Secure Cookie、Origin 校验与 `reset-password`
 - `probe.py`：TLS + WebSocket + MessagePack 测试客户端；子命令
   `hello` / `batch` / `hold` / `status` / `series-count` / `health`
 
@@ -100,6 +104,15 @@ e2e 结果: 全部 9 项通过
 cd web && pnpm install --frozen-lockfile && pnpm build
 bash tests/e2e/panel.sh
 ```
+
+`hardening.sh` 会自行构建 hub / agent / panel，同样可选使用已构建的 `web/dist`：
+
+```bash
+bash tests/e2e/hardening.sh
+KEEP_E2E_TMP=1 bash tests/e2e/hardening.sh   # 保留日志与临时证书/数据库
+```
+
+它按方案契约断言；实现未完成时对应项会如实 FAIL，不会修改实现。
 
 ## 范围说明
 
