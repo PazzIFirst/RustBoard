@@ -10,6 +10,42 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-23
+
+### Added
+
+- 管理 API 每 IP 固定窗口限速：读 60 req/min、写 10 req/min，429 + `Retry-After`；
+  `admin_rate_limit_per_min` / `admin_write_rate_limit_per_min` 可配置（0 关闭）
+- agent 接入层每来源 IP 并发连接上限 `max_connections_per_ip`（默认 16）
+- 面板可信反代配置 `trusted_proxies`、`cookie_secure`（auto/always/never）与 `public_origin`；
+  只有可信来源的 `X-Forwarded-For` / `X-Forwarded-Proto` 才会被采信
+- `rustboard-panel reset-password`：重新生成管理员密码并写回配置（0600），解决初始密码只显示一次
+- `/api/v1/system` 同时返回 `cert.live`（监听器实际证书）与 `cert.disk`（磁盘证书），顶层字段保持旧语义
+- 运行中 `rotate-cert` 后 ≤10s 自动热加载，无需重启；`rotate-cert` 增加进程间文件锁
+- agent 配置 `cert_check_interval_hours`（默认 6）：超长会话也会周期检查客户端证书续签窗口
+
+### Changed
+
+- hub 的 TLS 握手与 HTTP header 读取超时从 10s 收紧到 5s
+- 面板登录/登出限速键改用可信代理解析后的客户端 IP；`Secure` 只由可信代理声明或显式配置决定
+- 面板变更请求增加 Origin 同源校验（无 Origin 时必须为 JSON）
+- `admin_token` 增加字符集/多样性/占位符校验；v0.2 生成的 64 位 hex token 保持兼容
+
+### Fixed
+
+- SQLite 读路径改为独立只读连接池（默认 4 条），大查询不再阻塞写入与心跳刷新
+- 未知 `/api/v1/*` 先 Bearer 鉴权再返回 404，避免泄露路由存在性
+- 面板初始密码丢失后只能手改配置的问题
+- 运行中 `rotate-cert` 后 `/api/v1/system` 显示磁盘新证书、监听器仍用旧证书的不一致
+- `session_max_hours=0` 时客户端证书续签窗口可能被错过的问题
+
+### Security
+
+- 单 IP 空闲连接洪水不能挤占合法 agent 的入口连接；连接计数归零清理、来源表有上限
+- 管理 API 的弱 token 拒绝启动；管理端口非回环时启动告警
+- 面板不可信来源伪造 `X-Forwarded-For` / `X-Forwarded-Proto` 不再影响限速分桶与 Cookie 安全属性
+- `rotate-cert` 并发执行被文件锁拒绝，避免 key/cert 交错写坏
+
 ## [0.2.0] - 2026-10-23
 
 ### Added

@@ -8,11 +8,13 @@
 | 汇聚端 | `rustboard-hub` | 接收上报、落库（SQLite）、提供只读 API，并自带同等采集能力 |
 | 面板 | `rustboard-panel` | 浏览器界面，只通过 HTTP API 访问 hub |
 
-设计文档见 [docs/requirements.md](docs/requirements.md)，实现进度见 [docs/status.md](docs/status.md)。
+设计文档见 [docs/requirements.md](docs/requirements.md)，实现进度见 [docs/status.md](docs/status.md)，
+已知问题见 [docs/known-issues.md](docs/known-issues.md)。
 协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **当前状态：M1 已闭环；证书有效期/自动轮换与 M2 面板已完成（v0.2.0）。**
-> 控制面、告警尚未实现；证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。
+> **当前状态：M1 已闭环；证书有效期/自动轮换与 M2 面板已完成（v0.2.0）；
+> v0.2.1 安全硬化已完成。**
+> M3 控制面正在开发；告警尚未实现。证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。
 >
 > 线协议版本为 **2**：hub 与 agent 必须严格一致。版本不符时 hub 回 `bad_protocol`
 > 且不下发 Welcome，agent 打印明确错误并以非零码退出，不会进入重连循环。
@@ -35,12 +37,12 @@
 5. 之后所有连接走 mTLS；Hello 里再带 `agent_secret` 做身份绑定（防止已纳管机器互相冒名）。
 6. `rustboard-hub agent revoke --id <id>` 立即清除 secret 并拒绝该 agent 重连。
 7. 敏感文件从创建起就是 0600（配置 / 私钥 / secret），证书为 0644；
-   agent 接入层限制并发连接数、10s TLS 握手超时、10s 请求头读取超时与 15s 写超时。
+   agent 接入层限制每来源 IP 并发与总连接数、5s TLS 握手超时、5s 请求头读取超时与 15s 写超时。
 8. 运维命令：
    - `rustboard-agent cert-info` 查看证书 CN / notBefore / notAfter / 剩余天数；
    - `rustboard-agent renew` 立即强制轮换客户端证书；
    - `rustboard-hub rotate-cert [--force] [--days N]` 重签服务端证书（成对备份旧 key/cert）；
-     运行中的 hub 需重启后才会使用新证书，`--force` 用于未到阈值时强制轮换。
+     运行中的 hub 会在 ≤10s 内自动热加载新证书，无需重启；`--force` 用于未到阈值时强制轮换。
 
 ## 快速开始（开发环境）
 
@@ -101,9 +103,15 @@ sudo $BIN/rustboard-panel ports        # 查看面板端口
    `ssh -L 8080:127.0.0.1:<面板端口> user@hub-host`，然后访问 `http://127.0.0.1:8080`。
 2. **VPN / Tailscale**：只把面板绑到 VPN 地址并只对该网段放行，例如
    `rustboard-panel init --listen 10.8.0.2:<端口> --hub http://10.8.0.1:<管理端口> --hub-token <token>`。
-3. **同机反代 + TLS**：面板绑回环，由 nginx/Caddy 终止 TLS 并反向代理到面板；
-   反代需设置 `X-Forwarded-Proto: https`（面板据此给 Cookie 加 `Secure`），
-   同时自行做登录限速（面板按直连 IP 计数，反代后所有客户端共享同一 IP）。
+3. **同机反代 + TLS**：面板绑回环，由 nginx/Caddy 终止 TLS 并反向代理到面板。
+   面板默认**不信任**任何 `X-Forwarded-*`；必须显式配置可信反代地址才采信：
+   ```toml
+   trusted_proxies = ["127.0.0.1"]      # 反代的直连地址，也支持 CIDR
+   cookie_secure = "auto"               # auto 依据可信 XFP；也可 always / never
+   public_origin = "https://panel.example.com"  # 反代后的对外 Origin
+   ```
+   反代需设置 `X-Forwarded-Proto: https` 并正确传递 `X-Forwarded-For`；未配置
+   `trusted_proxies` 时所有 XFF/XFP 都被忽略，避免伪造头绕过登录限速或 Cookie 安全属性。
 
 已有配置如果仍是 `listen = "0.0.0.0:..."`，启动时只会打印明文 HTTP WARN，不会拒绝；
 请改成回环或 VPN 地址。面板访问 hub 的 HTTP 客户端强制直连（忽略 `HTTP_PROXY`），

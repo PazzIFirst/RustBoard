@@ -9,7 +9,7 @@
 | M1 骨架与闭环 | 🟢 完成 | 采集→缓冲→TLS 上报→入库→查询；协议 v2 + enrollment + mTLS + 吊销 |
 | 证书有效期与轮换 | 🟢 完成 | 显式有效期、服务端热续签、客户端会话内轮换、启动自愈（并入 v0.2.0） |
 | M2 面板 | 🟢 完成 | React/TS 前端、登录与代理、概览/详情四类图表、多指标分桶查询、采样间隔下发 |
-| v0.2.1 硬化 | 🚧 进行中 | 修复 known-issues KI-01 ~ KI-12（分支 `fix/v0.2.1-hardening`） |
+| v0.2.1 硬化 | 🟢 完成 | 修复 known-issues KI-01 ~ KI-12；单元/集成 259 个，hardening e2e 29/29 |
 | M3 控制面 | 🚧 进行中 | systemd / Docker / 进程 / 日志 + 能力开关 + 审计页（分支 `feat/m3-control-plane`） |
 | M4 告警与归档 | ⬜ 未开始 | |
 | M5 安装与交付 | ⬜ 未开始 | |
@@ -80,6 +80,27 @@
 - [x] 三轮独立评审与渗透测试发现的问题（面板 token 代理泄露、默认 0.0.0.0、
       上游 HTML 透传、响应体无上限、间隔生效超时等）
 
+## v0.2.1 硬化明细
+
+已完成（对应 [known-issues.md](known-issues.md) KI-01 ~ KI-12）：
+
+- [x] KI-01：agent 入口按来源 IP 限流（默认 16），单 IP 洪水不能挤掉合法会话；
+      TLS/header 超时收紧到 5s
+- [x] KI-02：SQLite 写连接 + 只读连接池（默认 4），长查询不阻塞写入与心跳
+- [x] KI-03：面板 `trusted_proxies` / `cookie_secure`；不可信 XFF/XFP 完全忽略
+- [x] KI-04：`admin_token` 强度校验（长度 / 字符集 / 多样性 / 占位符）
+- [x] KI-05：管理 API 每 IP 读 60/min、写 10/min，429 + `Retry-After`
+- [x] KI-06：管理端口非回环启动 WARN
+- [x] KI-07：面板变更请求 Origin 同源校验
+- [x] KI-08：未知 `/api/v1/*` 先 Bearer 再 404
+- [x] KI-09：`rustboard-panel reset-password`
+- [x] KI-10：运行中 `rotate-cert` ≤10s 热加载；`/api/v1/system` 同时返回 live/disk
+- [x] KI-11：`rotate-cert` 进程间文件锁（10 分钟陈旧锁自动恢复）
+- [x] KI-12：agent `cert_check_interval_hours`，`session_max_hours=0` 也会周期检查续签
+- [x] 测试：单元/集成 259 个；`hardening.sh` 29 断言、`security.sh` 9、`cert-rotation.sh` 103、
+      `panel.sh` 159；web 22
+- [x] 独立评审 + 渗透：无高危；低危项记录在 known-issues / status
+
 ## 已验证（2026-10-23，本机）
 
 - `rustboard-hub init` 生成 CA + 服务端证书并打印指纹，同时生成管理 API token；
@@ -92,8 +113,9 @@
 - 面板修改采样间隔后 60s 内 agent 日志出现 `采样间隔已更新`，重连后继续上报；
 - series 多指标、自动分桶、32 天/点数上限与非法参数 400 均验证；
 - 证书轮换失败场景（CA 不配套、缺 ca.key、坏 ca.crt、空 SAN、缺 server.crt）均有 e2e 断言；
-- 测试：`cargo test --workspace` 222 通过；`cargo audit` 0 漏洞；
-  `security.sh` 9/9、`cert-rotation.sh` 103/103、`panel.sh` 159/159、web `pnpm test` 22/22。
+- 测试：`cargo test --workspace` 259 通过；`cargo audit` 0 漏洞；
+  `security.sh` 9/9、`cert-rotation.sh` 103/103、`panel.sh` 159/159、
+  `hardening.sh` 29/29、web `pnpm test` 22/22。
 
 ## 已知限制
 
@@ -101,20 +123,20 @@
 
 1. **服务端证书轮换会让 v0.1 agent 失联**：v0.1 仍使用指纹钉扎，轮换/到期续签后必须升级
    到 v0.2（CA 信任）或重新纳管；v0.2 起无需重新纳管。
-2. 客户端证书轮换复用原私钥，因此轮换不能补救私钥泄露；私钥/secret 泄露必须
-   `agent revoke` 后重新纳管。CA 私钥是最高敏感资产，泄露等于全部身份失守。
-3. 启动时会强校验 CA 与 server 证书的链和 SAN；给 `server_names` 新增地址后，
+2. 启动时会强校验 CA 与 server 证书的链和 SAN；给 `server_names` 新增地址后，
    需要先 `rotate-cert --force` 才能启动（错误信息会点名缺失的 SAN）。
-4. 采集器首次调用只建立基线、不上报（CPU/磁盘 IO 需要差分）。
-5. SQLite 单连接 + 全局锁；32 天 × 20 指标的大查询会阻塞写入，后续需要预聚合/读写分离。
-6. 面板默认只监听 `127.0.0.1` 且是明文 HTTP；远程访问必须显式 `--listen` 并走 VPN/反代。
-   反代场景登录限速仍按直连 IP 统计，反向代理需要自行限速以避免锁定 DoS。
-7. 未认证连接仍可占满 `max_connections`（1024）导致 agent 入口拒绝服务：
-   10s 握手超时可缓解，后续按来源 IP 限流并预留槽位（已记录为待修复）。
-8. 运行中的 hub 执行 `rotate-cert` 后，`/api/v1/system` 报告磁盘新证书而监听器仍用旧证书，
-   重启后一致；并发执行多个 `rotate-cert` 未加文件锁。
-9. 客户端证书只在每会话握手时检查续签阈值；`session_max_hours=0` 且超长连接时可能错过窗口，
-   默认 12 小时重连不存在该问题。
+3. 采集器首次调用只建立基线、不上报（CPU/磁盘 IO 需要差分）。
+4. 连接洪水的来源 IP 上限为 16，但攻击者若控制大量来源 IP（或 IPv6 前缀）仍可能耗尽总
+   `max_connections`；生产环境应在网络层/防火墙做入口限速。
+5. 面板默认只监听 `127.0.0.1` 且是明文 HTTP；远程访问必须显式 `--listen` 并走 VPN/反代。
+   反代场景必须配置 `trusted_proxies` 并确保反代**覆盖**客户端传入的 `X-Forwarded-For`，
+   否则攻击者可轮换伪造 IP 绕过登录失败锁定（已知低危，见渗透报告 L1）。
+6. SQLite 数据库文件默认 0644（目录 0755），库内是指标与 agent 元数据，不含明文 secret；
+   多用户宿主机可手工收紧到 0600/0700。
+7. 客户端证书轮换复用原私钥，因此轮换不能补救私钥泄露；私钥/secret 泄露必须
+   `agent revoke` 后重新纳管。CA 私钥是最高敏感资产，泄露等于全部身份失守。
+8. 管理 API 限速按直连来源 IP 统计；置于反代后所有客户端共享反代 IP 的额度。管理口
+   默认只绑回环，反代场景需自行评估并额外限速。
 
 ## 下一步建议
 
