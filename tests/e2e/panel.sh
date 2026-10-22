@@ -122,7 +122,7 @@ BAD_STATIC_LOG="$TMP_DIR/panel-bad-static.log"
 BAD_STATIC_INIT_LOG="$TMP_DIR/panel-bad-static-init.log"
 BUILD_LOG="$TMP_DIR/build.log"
 COOKIE_FILE="$TMP_DIR/session.cookie"
-XFP_COOKIE_FILE="$TMP_DIR/session-xfp.cookie"
+UNTRUSTED_XFP_COOKIE_FILE="$TMP_DIR/session-untrusted-xfp.cookie"
 BAD_COOKIE_FILE="$TMP_DIR/session-badtoken.cookie"
 INDEX_HTML="$TMP_DIR/index.html"
 LOGIN_HTML="$TMP_DIR/login.html"
@@ -1034,11 +1034,12 @@ check_status "4.10" "带 Cookie GET /api/session 返回 200" 200 "$out"
 check_eq "4.10a" "带 Cookie /api/session authenticated=true" \
   "true" "$(printf '%s' "$out" | json_field authenticated)"
 
+# trusted_proxies 默认为空：未受信来源的 XFP 必须被忽略，Cookie 不能加 Secure。
 out=$(login_call --url "$PANEL_URL/api/login" --password-env RB_E2E_PANEL_PASSWORD \
-  --header 'X-Forwarded-Proto: https' --cookie-out "$XFP_COOKIE_FILE")
-check_status "4.11" "带 X-Forwarded-Proto: https 的正确登录返回 204" 204 "$out"
-check_true "4.12" "X-Forwarded-Proto: https 时 Cookie 带 Secure" \
-  "$(printf '%s' "$out" | json_field secure)"
+  --header 'X-Forwarded-Proto: https' --cookie-out "$UNTRUSTED_XFP_COOKIE_FILE")
+check_status "4.11" "未受信来源带 X-Forwarded-Proto: https 的正确登录返回 204" 204 "$out"
+check_eq "4.12" "未受信 XFP=https 时 Cookie 不带 Secure" \
+  "false" "$(printf '%s' "$out" | json_field secure)"
 
 # ---------------------------------------------------------------------------
 # 5. 登录限速（独立 panel 进程，避免锁住主面板的 127.0.0.1）
