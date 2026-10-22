@@ -33,7 +33,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Semaphore;
 
-/// 登录 / 设置请求体上限。
+/// 登录 / 设置 / 控制面请求体上限。
 const MAX_JSON_BODY: usize = 8 * 1024;
 /// 同时进行的 Argon2 校验上限，避免 64 MiB × N 的内存 DoS。
 const MAX_CONCURRENT_ARGON2: usize = 2;
@@ -49,6 +49,37 @@ const MIN_OVERVIEW_WINDOW_MS: i64 = 1_000;
 const MIN_LATEST_WINDOW_MS: i64 = 1;
 /// `window_ms` 上限 1 小时（overview / latest 相同）。
 const MAX_WINDOW_MS: i64 = 3_600_000;
+/// 控制面 POST 允许的字段白名单。
+///
+/// 面板只校验结构与长度；能力是否开启、目标是否白名单、是否需要 `confirm`
+/// 等业务规则由 hub 统一裁决，避免两处规则不一致。
+const CONTROL_FIELDS: [&str; 9] = [
+    "capability",
+    "action",
+    "target",
+    "pid",
+    "name",
+    "signal",
+    "source",
+    "lines",
+    "confirm",
+];
+/// 控制请求里 target / source / name 的最大字节数。
+const MAX_CONTROL_TARGET_LEN: usize = 128;
+/// 控制请求里 action 的最大字节数。
+const MAX_CONTROL_ACTION_LEN: usize = 32;
+/// 控制请求里 capability / signal 等枚举短值的最大字节数。
+const MAX_CONTROL_ENUM_LEN: usize = 32;
+/// 控制请求里 pid 的上限：协议字段是 u32。
+const MAX_CONTROL_PID: u64 = u32::MAX as u64;
+/// 日志 tail 行数下限。
+const MIN_CONTROL_LINES: u64 = 1;
+/// 日志 tail 行数上限（与 agent 的 `max_log_lines` 上限一致）。
+const MAX_CONTROL_LINES: u64 = 2_000;
+/// 审计分页上限；与 hub 的 `MAX_AUDIT_LIMIT` 对齐（前端默认仍取 100）。
+const MAX_AUDIT_LIMIT: i64 = 200;
+/// 审计 capability 过滤值的最大字节数。
+const MAX_AUDIT_CAPABILITY_LEN: usize = 32;
 /// 面板是明文 HTTP，CSP 只允许同源资源；uPlot 运行时写入的 style 属性靠
 /// `style-src 'unsafe-inline'` 放行，但禁止任何内联/外部脚本注入。
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; \
@@ -254,6 +285,11 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/agents/{id}/settings",
             get(api_settings_get).put(api_settings_put),
         )
+        .route(
+            "/api/agents/{id}/control",
+            get(api_control_get).post(api_control_post),
+        )
+        .route("/api/audit", get(api_audit))
         .route("/api/system", get(api_system))
         .route("/api", any(api_unknown))
         // `/api/` 与 `/api/{*rest}` 必须都显式接住：否则会落到静态 SPA 回退，
@@ -623,6 +659,68 @@ async fn api_settings_put(
     }
 }
 
+/// 读取 agent 的控制能力状态；只读，不写审计。
+async fn api_control_get(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    if !proxy::validate_agent_id(&id) {
+        return bad_request("agent_id 非法");
+    }
+    // 控制状态没有查询参数；显式拒绝未知参数，避免把面板变成参数透传器。
+    let query = match parse_allowed(raw.as_deref(), &[]) {
+        Ok(query) => query,
+        Err(message) => return bad_request(&message),
+    };
+    forward_get(&state, &format!("/api/v1/agents/{id}/control"), &query).await
+}
+
+/// 执行控制动作；结构校验通过后原样转发给 hub。
+async fn api_control_post(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if !proxy::validate_agent_id(&id) {
+        return bad_request("agent_id 非法");
+    }
+    if !is_json_content_type(&headers) {
+        return proxy::json_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "json_required");
+    }
+    let bytes = match axum::body::to_bytes(body, MAX_JSON_BODY).await {
+        Ok(bytes) => bytes,
+        Err(_) => return proxy::json_error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+    };
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return bad_request("请求体必须是 JSON 对象");
+    };
+    if let Err(message) = validate_control_payload(&payload) {
+        return bad_request(&message);
+    }
+    let path = format!("/api/v1/agents/{id}/control");
+    match state.proxy.post_json(&path, &payload).await {
+        Ok(reply) => proxy::hub_reply_to_response(reply),
+        Err(error) => proxy::proxy_error_to_response(&error),
+    }
+}
+
+/// 审计列表；只放行分页与过滤参数。
+async fn api_audit(State(state): State<Arc<AppState>>, RawQuery(raw): RawQuery) -> Response {
+    let query = match parse_allowed(
+        raw.as_deref(),
+        &["limit", "before_id", "agent_id", "capability"],
+    ) {
+        Ok(query) => query,
+        Err(message) => return bad_request(&message),
+    };
+    if let Err(message) = validate_audit_query(&query) {
+        return bad_request(&message);
+    }
+    forward_get(&state, "/api/v1/audit", &query).await
+}
+
 async fn api_system(State(state): State<Arc<AppState>>) -> Response {
     forward_get(&state, "/api/v1/system", &[]).await
 }
@@ -744,6 +842,148 @@ fn validate_series_query(query: &[(String, String)]) -> std::result::Result<(), 
     }
     if to.saturating_sub(from) > MAX_SERIES_SPAN_MS {
         return Err("时间跨度不能超过 32 天".to_string());
+    }
+    Ok(())
+}
+
+/// 读取一个可选的字符串字段：类型错误或超长直接拒绝。
+fn control_string_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    max_len: usize,
+) -> std::result::Result<Option<&'a str>, String> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let text = value
+        .as_str()
+        .ok_or_else(|| format!("{key} 必须是字符串"))?;
+    if text.len() > max_len {
+        return Err(format!("{key} 长度不能超过 {max_len} 字节"));
+    }
+    Ok(Some(text))
+}
+
+/// 控制请求体的结构校验：字段白名单、类型、长度与数值范围。
+///
+/// 这里**不**判断能力是否开启、目标是否在白名单、是否需要 `confirm`；
+/// 这些业务规则由 hub 统一裁决。面板只拒绝明显非法的请求，避免把
+/// 超长字符串、异常数字或未知字段转发给 hub。
+fn validate_control_payload(payload: &serde_json::Value) -> std::result::Result<(), String> {
+    let Some(object) = payload.as_object() else {
+        return Err("请求体必须是 JSON 对象".to_string());
+    };
+    if let Some(unknown) = object
+        .keys()
+        .find(|key| !CONTROL_FIELDS.contains(&key.as_str()))
+    {
+        return Err(format!("不支持的字段: {unknown}"));
+    }
+
+    let capability = control_string_field(object, "capability", MAX_CONTROL_ENUM_LEN)?
+        .ok_or_else(|| "缺少 capability".to_string())?;
+    if capability.is_empty() {
+        return Err("capability 不能为空".to_string());
+    }
+    let action = control_string_field(object, "action", MAX_CONTROL_ACTION_LEN)?
+        .ok_or_else(|| "缺少 action".to_string())?;
+    if action.is_empty() {
+        return Err("action 不能为空".to_string());
+    }
+    for key in ["target", "source", "name"] {
+        control_string_field(object, key, MAX_CONTROL_TARGET_LEN)?;
+    }
+    if control_string_field(object, "signal", MAX_CONTROL_ENUM_LEN)?.is_some_and(str::is_empty) {
+        return Err("signal 不能为空".to_string());
+    }
+
+    if let Some(value) = object.get("pid") {
+        let pid = value
+            .as_u64()
+            .ok_or_else(|| "pid 必须是正整数".to_string())?;
+        if pid == 0 {
+            return Err("pid 必须大于 0".to_string());
+        }
+        if pid > MAX_CONTROL_PID {
+            return Err(format!("pid 不能超过 {MAX_CONTROL_PID}"));
+        }
+    }
+    if let Some(value) = object.get("lines") {
+        let lines = value
+            .as_u64()
+            .ok_or_else(|| "lines 必须是整数".to_string())?;
+        if !(MIN_CONTROL_LINES..=MAX_CONTROL_LINES).contains(&lines) {
+            return Err(format!(
+                "lines 必须在 {MIN_CONTROL_LINES}–{MAX_CONTROL_LINES} 之间"
+            ));
+        }
+    }
+    if object
+        .get("confirm")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err("confirm 必须是布尔值".to_string());
+    }
+    Ok(())
+}
+
+/// 审计查询参数校验：只允许 limit / before_id / agent_id / capability。
+fn validate_audit_query(query: &[(String, String)]) -> std::result::Result<(), String> {
+    let mut limit_seen = false;
+    let mut before_seen = false;
+    let mut agent_seen = false;
+    let mut capability_seen = false;
+    for (key, value) in query {
+        match key.as_str() {
+            "limit" => {
+                if limit_seen {
+                    return Err("limit 不能重复".to_string());
+                }
+                limit_seen = true;
+                let limit = value
+                    .parse::<i64>()
+                    .map_err(|_| "limit 必须是整数".to_string())?;
+                if !(1..=MAX_AUDIT_LIMIT).contains(&limit) {
+                    return Err(format!("limit 必须在 1–{MAX_AUDIT_LIMIT} 之间"));
+                }
+            }
+            "before_id" => {
+                if before_seen {
+                    return Err("before_id 不能重复".to_string());
+                }
+                before_seen = true;
+                let before = value
+                    .parse::<i64>()
+                    .map_err(|_| "before_id 必须是非负整数".to_string())?;
+                if before < 0 {
+                    return Err("before_id 必须是非负整数".to_string());
+                }
+            }
+            "agent_id" => {
+                if agent_seen {
+                    return Err("agent_id 不能重复".to_string());
+                }
+                agent_seen = true;
+                if !proxy::validate_agent_id(value) {
+                    return Err("agent_id 非法".to_string());
+                }
+            }
+            "capability" => {
+                if capability_seen {
+                    return Err("capability 不能重复".to_string());
+                }
+                capability_seen = true;
+                // 与 hub 的过滤规则保持一致：只拒绝空值、超长和控制字符，
+                // 未知能力交给 hub 返回空列表，而不是在面板另造一套枚举。
+                if value.is_empty()
+                    || value.len() > MAX_AUDIT_CAPABILITY_LEN
+                    || value.chars().any(char::is_control)
+                {
+                    return Err("capability 非法".to_string());
+                }
+            }
+            _ => return Err(format!("不支持的查询参数: {key}")),
+        }
     }
     Ok(())
 }
@@ -1171,12 +1411,16 @@ mod tests {
     use axum::body::{to_bytes, Bytes};
     use axum::http::Method;
     use axum::http::Request as HttpRequest;
+    use serde_json::Value;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
     use tower::ServiceExt;
 
     const TEST_PASSWORD: &str = "panel-test-password";
+    /// 面板配置里的 hub token；只允许出现在面板 → hub 的请求里。
+    const TEST_HUB_TOKEN: &str = "test-hub-token";
     static TEST_HASH: OnceLock<String> = OnceLock::new();
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -1216,7 +1460,7 @@ mod tests {
             .clone();
         let cfg = PanelConfig {
             hub_url: "http://127.0.0.1:1".to_string(),
-            token: "test-hub-token".to_string(),
+            token: TEST_HUB_TOKEN.to_string(),
             admin_password_hash: hash,
             // 该地址用于验证 Auto 策略下“可信反代 + XFP=https → Secure”。
             trusted_proxies: vec!["203.0.113.9".to_string()],
@@ -1225,6 +1469,20 @@ mod tests {
         let files = web::StaticFiles::from_root(&site.dir).unwrap();
         let state = Arc::new(AppState::new(cfg, Some(files), None).unwrap());
         (state, site)
+    }
+
+    /// 只装配一个指向 mock hub 的状态，不提供静态资源。
+    fn test_state_with_hub(hub_url: &str) -> Arc<AppState> {
+        let hash = TEST_HASH
+            .get_or_init(|| auth::hash_password(TEST_PASSWORD).unwrap())
+            .clone();
+        let cfg = PanelConfig {
+            hub_url: hub_url.to_string(),
+            token: TEST_HUB_TOKEN.to_string(),
+            admin_password_hash: hash,
+            ..PanelConfig::default()
+        };
+        Arc::new(AppState::new(cfg, None).unwrap())
     }
 
     async fn call(
@@ -1256,6 +1514,104 @@ mod tests {
     fn session_cookie(state: &AppState) -> String {
         let token = state.sessions.create(now_ms());
         format!("rb_session={token}")
+    }
+
+    /// 只服务一次请求的假 hub；返回入站 URL 与已读到的原始请求。
+    fn spawn_mock_hub(status: u16, response: &'static str) -> (String, Arc<Mutex<Vec<u8>>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut request = Vec::new();
+            let mut scratch = [0u8; 4096];
+            loop {
+                match stream.read(&mut scratch) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&scratch[..read]),
+                }
+                if request_complete(&request) {
+                    break;
+                }
+            }
+            *recorded.lock().unwrap() = request;
+            let reason = StatusCode::from_u16(status)
+                .unwrap()
+                .canonical_reason()
+                .unwrap_or("OK");
+            let reply = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            );
+            let _ = stream.write_all(reply.as_bytes());
+            let _ = stream.flush();
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    /// 请求头完整且 `Content-Length` 指定的 body 已全部到达。
+    fn request_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        request.len() >= header_end + 4 + content_length
+    }
+
+    /// 拆分 mock hub 收到的请求，返回（请求头, 请求体）。
+    fn seen_request(seen: &Arc<Mutex<Vec<u8>>>) -> (String, String) {
+        let request = seen.lock().unwrap().clone();
+        let text = String::from_utf8_lossy(&request).to_string();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+        (head.to_string(), body.to_string())
+    }
+
+    /// 断言面板只把 hub token 放进面板 → hub 的 Authorization 头。
+    fn assert_bearer_sent_to_hub(head: &str) {
+        let expected = format!(
+            "authorization: bearer {}",
+            TEST_HUB_TOKEN.to_ascii_lowercase()
+        );
+        assert!(
+            head.to_ascii_lowercase().contains(&expected),
+            "面板 → hub 必须带 Bearer token: {head}"
+        );
+    }
+
+    /// 带登录 Cookie 的控制 POST。
+    async fn control_post(
+        state: &Arc<AppState>,
+        cookie: &str,
+        payload: &str,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        call(
+            state,
+            Method::POST,
+            "/api/agents/hub-self/control",
+            &[("cookie", cookie), ("content-type", "application/json")],
+            Body::from(payload.to_string()),
+            None,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1434,6 +1790,415 @@ mod tests {
                 "application/json",
                 "{path} 不能回退 HTML"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn control_and_audit_require_session() {
+        let (state, _site) = test_state();
+        for (method, path) in [
+            (Method::GET, "/api/agents/hub-self/control"),
+            (Method::GET, "/api/audit?limit=10"),
+            (Method::POST, "/api/agents/hub-self/control"),
+        ] {
+            let (status, headers, body) = call(
+                &state,
+                method,
+                path,
+                &[("content-type", "application/json")],
+                Body::from(r#"{"capability":"systemd","action":"list"}"#),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} 必须要求登录");
+            assert_eq!(
+                headers.get(header::CONTENT_TYPE).unwrap(),
+                "application/json",
+                "{path} 的 401 必须是 JSON"
+            );
+            assert!(String::from_utf8_lossy(&body).contains("unauthorized"));
+        }
+    }
+
+    #[tokio::test]
+    async fn control_get_forwards_to_hub_and_preserves_body() {
+        let hub_body = r#"{"control_enabled":true,"online":true,"capabilities":["systemd"],"hub_capabilities":["systemd"]}"#;
+        let (hub_url, seen) = spawn_mock_hub(200, hub_body);
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let (status, headers, body) = call(
+            &state,
+            Method::GET,
+            "/api/agents/hub-self/control",
+            &[("cookie", &cookie)],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], hub_body.as_bytes());
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        let (head, _) = seen_request(&seen);
+        assert!(
+            head.starts_with("GET /api/v1/agents/hub-self/control HTTP/1.1"),
+            "{head}"
+        );
+        assert_bearer_sent_to_hub(&head);
+    }
+
+    #[tokio::test]
+    async fn control_get_rejects_invalid_agent_and_query() {
+        let (state, _site) = test_state();
+        let cookie = session_cookie(&state);
+        for path in [
+            "/api/agents/../control",
+            "/api/agents/hub%20self/control",
+            "/api/agents/hub-self/control?x=1",
+        ] {
+            let (status, _, _) = call(
+                &state,
+                Method::GET,
+                path,
+                &[("cookie", &cookie)],
+                Body::empty(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn control_post_rejects_malformed_payloads() {
+        let (state, _site) = test_state();
+        let cookie = session_cookie(&state);
+        let cases = [
+            r#"{"capability":"systemd","action":"list","unknown":true}"#.to_string(),
+            "[]".to_string(),
+            "null".to_string(),
+            r#"{"action":"list"}"#.to_string(),
+            r#"{"capability":"systemd"}"#.to_string(),
+            r#"{"capability":"systemd","action":"list","target":123}"#.to_string(),
+            r#"{"capability":"systemd","action":"list","pid":0}"#.to_string(),
+            r#"{"capability":"systemd","action":"list","pid":4294967296}"#.to_string(),
+            r#"{"capability":"systemd","action":"list","pid":1.5}"#.to_string(),
+            r#"{"capability":"systemd","action":"list","lines":0}"#.to_string(),
+            r#"{"capability":"systemd","action":"list","lines":2001}"#.to_string(),
+            r#"{"capability":"systemd","action":"list","confirm":"true"}"#.to_string(),
+            r#"{"capability":"systemd","action":"list","signal":1}"#.to_string(),
+            format!(
+                r#"{{"capability":"{}","action":"list"}}"#,
+                "a".repeat(MAX_CONTROL_ENUM_LEN + 1)
+            ),
+            format!(
+                r#"{{"capability":"systemd","action":"restart","target":"{}"}}"#,
+                "a".repeat(MAX_CONTROL_TARGET_LEN + 1)
+            ),
+            json!({
+                "capability": "systemd",
+                "action": "a".repeat(MAX_CONTROL_ACTION_LEN + 1),
+            })
+            .to_string(),
+            "{not json".to_string(),
+        ];
+        for payload in cases {
+            let (status, _, body) = control_post(&state, &cookie, &payload).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "payload={payload}");
+            assert!(
+                String::from_utf8_lossy(&body).contains("bad_request"),
+                "payload={payload}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn control_post_requires_json_and_limits_body() {
+        let (state, _site) = test_state();
+        let cookie = session_cookie(&state);
+        let (status, _, body) = call(
+            &state,
+            Method::POST,
+            "/api/agents/hub-self/control",
+            &[
+                ("cookie", &cookie),
+                ("host", "panel.test:8080"),
+                ("origin", "http://panel.test:8080"),
+                ("content-type", "text/plain"),
+            ],
+            Body::from(r#"{"capability":"systemd","action":"list"}"#),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(String::from_utf8_lossy(&body).contains("json_required"));
+
+        let huge = format!(
+            r#"{{"capability":"systemd","action":"list","target":"{}"}}"#,
+            "a".repeat(MAX_JSON_BODY)
+        );
+        let (status, _, _) = control_post(&state, &cookie, &huge).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn control_post_forwards_to_hub_and_preserves_response() {
+        let hub_body = r#"{"ok":true,"result":{"type":"action_output","stdout":"","stderr":"","exit_code":0}}"#;
+        let (hub_url, seen) = spawn_mock_hub(200, hub_body);
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let payload = r#"{"capability":"systemd","action":"restart","target":"nginx.service","confirm":true}"#;
+        let (status, headers, body) = control_post(&state, &cookie, payload).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], hub_body.as_bytes());
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let (head, forwarded) = seen_request(&seen);
+        assert!(
+            head.starts_with("POST /api/v1/agents/hub-self/control HTTP/1.1"),
+            "{head}"
+        );
+        assert_bearer_sent_to_hub(&head);
+        let forwarded: Value = serde_json::from_str(&forwarded).unwrap();
+        assert_eq!(
+            forwarded,
+            json!({
+                "capability": "systemd",
+                "action": "restart",
+                "target": "nginx.service",
+                "confirm": true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn control_post_preserves_hub_business_errors() {
+        let hub_body =
+            r#"{"ok":false,"error":{"code":"capability_disabled","message":"控制能力未启用"}}"#;
+        let (hub_url, _seen) = spawn_mock_hub(403, hub_body);
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let (status, _, body) = control_post(
+            &state,
+            &cookie,
+            r#"{"capability":"docker","action":"list"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(&body[..], hub_body.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn audit_get_forwards_whitelisted_query() {
+        let hub_body = r#"{"entries":[],"next_before_id":0}"#;
+        let (hub_url, seen) = spawn_mock_hub(200, hub_body);
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let (status, _, body) = call(
+            &state,
+            Method::GET,
+            "/api/audit?limit=50&before_id=42&agent_id=hub-self&capability=systemd",
+            &[("cookie", &cookie)],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], hub_body.as_bytes());
+        let (head, _) = seen_request(&seen);
+        assert!(
+            head.starts_with(
+                "GET /api/v1/audit?limit=50&before_id=42&agent_id=hub-self&capability=systemd HTTP/1.1"
+            ),
+            "{head}"
+        );
+        assert_bearer_sent_to_hub(&head);
+    }
+
+    #[tokio::test]
+    async fn audit_get_rejects_disallowed_or_malformed_query() {
+        let (state, _site) = test_state();
+        let cookie = session_cookie(&state);
+        let long_agent = format!("agent_id={}", "a".repeat(65));
+        let long_capability = format!("capability={}", "a".repeat(MAX_AUDIT_CAPABILITY_LEN + 1));
+        for query in [
+            "foo=1".to_string(),
+            "limit=0".to_string(),
+            "limit=201".to_string(),
+            "limit=abc".to_string(),
+            "limit=1&limit=2".to_string(),
+            "before_id=-1".to_string(),
+            "before_id=abc".to_string(),
+            "agent_id=".to_string(),
+            "agent_id=../etc/passwd".to_string(),
+            long_agent,
+            "capability=".to_string(),
+            "capability=systemd%0A".to_string(),
+            long_capability,
+        ] {
+            let path = format!("/api/audit?{query}");
+            let (status, _, _) = call(
+                &state,
+                Method::GET,
+                &path,
+                &[("cookie", &cookie)],
+                Body::empty(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        }
+    }
+
+    #[test]
+    fn validates_control_payload_boundaries() {
+        assert!(
+            validate_control_payload(&json!({"capability": "systemd", "action": "list"})).is_ok()
+        );
+        assert!(validate_control_payload(&json!({
+            "capability": "logs",
+            "action": "tail",
+            "source": "s".repeat(MAX_CONTROL_TARGET_LEN),
+            "lines": MAX_CONTROL_LINES,
+        }))
+        .is_ok());
+        assert!(validate_control_payload(&json!({
+            "capability": "process",
+            "action": "kill",
+            "pid": 1,
+            "name": "n".repeat(MAX_CONTROL_TARGET_LEN),
+            "signal": "term",
+            "confirm": true,
+        }))
+        .is_ok());
+        assert!(validate_control_payload(&json!({
+            "capability": "process",
+            "action": "kill",
+            "pid": u32::MAX,
+            "name": "x",
+        }))
+        .is_ok());
+
+        for payload in [
+            json!({"capability": "systemd", "action": "list", "target": "a".repeat(MAX_CONTROL_TARGET_LEN + 1)}),
+            json!({"capability": "systemd", "action": "a".repeat(MAX_CONTROL_ACTION_LEN + 1)}),
+            json!({"capability": "systemd", "action": "list", "pid": 0}),
+            json!({"capability": "systemd", "action": "list", "pid": u64::from(u32::MAX) + 1}),
+            json!({"capability": "systemd", "action": "list", "lines": MIN_CONTROL_LINES - 1}),
+            json!({"capability": "systemd", "action": "list", "lines": MAX_CONTROL_LINES + 1}),
+            json!({"capability": "", "action": "list"}),
+            json!({"capability": "systemd", "action": ""}),
+            json!({"capability": "systemd", "action": "list", "signal": ""}),
+            json!({"capability": "systemd", "action": "list", "confirm": 1}),
+            json!({"capability": "systemd", "action": "list", "extra": true}),
+            json!([]),
+        ] {
+            assert!(
+                validate_control_payload(&payload).is_err(),
+                "应拒绝: {payload}"
+            );
+        }
+    }
+
+    fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
+        values
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn validates_audit_query_boundaries() {
+        assert!(validate_audit_query(&[]).is_ok());
+        assert!(validate_audit_query(&pairs(&[
+            ("limit", "100"),
+            ("before_id", "0"),
+            ("agent_id", "hub-self"),
+            ("capability", "systemd"),
+        ]))
+        .is_ok());
+        assert!(validate_audit_query(&pairs(&[("limit", "1")])).is_ok());
+        assert!(validate_audit_query(&pairs(&[("limit", "200")])).is_ok());
+
+        for query in [
+            pairs(&[("limit", "0")]),
+            pairs(&[("limit", "201")]),
+            pairs(&[("before_id", "-1")]),
+            pairs(&[("agent_id", "a b")]),
+            pairs(&[("capability", "cap\ncontrol")]),
+            pairs(&[("limit", "1"), ("limit", "2")]),
+        ] {
+            assert!(validate_audit_query(&query).is_err(), "应拒绝: {query:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_never_receives_hub_token() {
+        let hub_body =
+            r#"{"control_enabled":false,"online":false,"capabilities":[],"hub_capabilities":[]}"#;
+        let (hub_url, seen) = spawn_mock_hub(200, hub_body);
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let (status, headers, body) = call(
+            &state,
+            Method::GET,
+            "/api/agents/hub-self/control",
+            &[("cookie", &cookie)],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!String::from_utf8_lossy(&body).contains(TEST_HUB_TOKEN));
+        for (name, value) in &headers {
+            assert!(
+                !value.to_str().unwrap_or_default().contains(TEST_HUB_TOKEN),
+                "响应头 {name} 泄露 hub token"
+            );
+        }
+        // token 只允许出现在面板 → hub 的 Authorization 头里。
+        let (head, _) = seen_request(&seen);
+        assert_bearer_sent_to_hub(&head);
+    }
+
+    #[test]
+    fn frontend_sources_never_contain_hub_token() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/src");
+        assert!(root.is_dir(), "找不到前端源码目录: {}", root.display());
+        let mut files = Vec::new();
+        collect_source_files(&root, &mut files);
+        assert!(!files.is_empty(), "前端源码目录为空");
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert!(
+                !text.to_ascii_lowercase().contains("bearer"),
+                "浏览器 bundle 不能带 Bearer 凭据: {}",
+                file.display()
+            );
+            assert!(
+                !text.contains(TEST_HUB_TOKEN),
+                "浏览器 bundle 不能带 hub token: {}",
+                file.display()
+            );
+        }
+    }
+
+    fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_source_files(&path, out);
+            } else if matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("ts" | "tsx")
+            ) {
+                out.push(path);
+            }
         }
     }
 

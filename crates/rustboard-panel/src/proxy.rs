@@ -142,6 +142,27 @@ impl ProxyClient {
             .json(value);
         send(request).await
     }
+
+    /// POST 一个 JSON 请求体到 hub。
+    ///
+    /// 与 [`Self::put_json`] 共用 [`send`]，因此 Bearer、`no_proxy`、超时和
+    /// 8 MiB 响应体上限等约束全部一致；控制面写操作只走这里。
+    pub async fn post_json(
+        &self,
+        path: &str,
+        value: &Value,
+    ) -> std::result::Result<HubReply, ProxyError> {
+        let url = self
+            .endpoint(path, &[])
+            .map_err(|e| ProxyError::Unreachable(e.to_string()))?;
+        let request = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .header(header::ACCEPT, "application/json")
+            .json(value);
+        send(request).await
+    }
 }
 
 async fn send(request: reqwest::RequestBuilder) -> std::result::Result<HubReply, ProxyError> {
