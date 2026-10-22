@@ -243,7 +243,8 @@ cold_exports(id, day, backend, object_key, size_bytes, sha256, status, created_a
 2. 安装命令形如：
    `curl -fsSL https://<hub>:<agent端口>/install.sh | sh -s -- --token <t> --hub <ip:agent端口>`
    安装脚本把 hub 的证书指纹也带进去（自签模式必需）。
-3. agent 首启生成 Ed25519 密钥对 → 用 token 认证 → 提交 CSR → hub 的私有 CA 签发 90 天客户端证书 → 返回 hub CA 证书链。
+3. agent 首启生成 Ed25519 密钥对 → 用 token 认证 → 提交 CSR → hub 的私有 CA 签发客户端证书 → 返回 hub CA 证书链。
+   > v0.1 实现未设置有效期（默认到 4096 年），有效期与自动轮换随 v0.2 交付。
 4. 之后所有连接走 mTLS；agent 每 60 天自动轮换证书。
 5. 吊销：`sd-hub agent revoke <id>`，hub 侧 CRL/内存黑名单立即生效，对应 agent 被拒。
 

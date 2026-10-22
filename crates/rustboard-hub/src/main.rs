@@ -45,6 +45,12 @@ mod session;
 use session::SessionRegistry;
 
 /// 内置本机采集使用的 agent_id，只允许 hub 进程内部写入。
+/// WebSocket 单条消息上限。agent 的正常批次只有几 KB，1 MiB 足够宽裕；
+/// 不设上限时 tungstenite 默认允许 64 MiB，未认证连接可用分片消息打爆内存。
+const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
+/// 单帧上限，防止一个巨大分片占满内存。
+const MAX_WS_FRAME_SIZE: usize = 256 * 1024;
+
 const HUB_SELF_AGENT_ID: &str = "hub-self";
 /// 会话身份与帧内身份不一致。
 const IDENTITY_MISMATCH: &str = "identity_mismatch";
@@ -599,13 +605,15 @@ async fn agent_ws(
         }
     };
 
-    ws.on_upgrade(move |socket| async move {
-        let _permit = permit; // 持有到会话结束
-        if let Err(err) = dispatch(socket, state, peer).await {
-            tracing::warn!(error = %err, "agent 会话结束");
-        }
-    })
-    .into_response()
+    ws.max_message_size(MAX_WS_MESSAGE_SIZE)
+        .max_frame_size(MAX_WS_FRAME_SIZE)
+        .on_upgrade(move |socket| async move {
+            let _permit = permit; // 持有到会话结束
+            if let Err(err) = dispatch(socket, state, peer).await {
+                tracing::warn!(error = %log_safe_error(&err), "agent 会话结束");
+            }
+        })
+        .into_response()
 }
 
 /// 第一条帧决定这条连接是 enrollment 还是正常会话。
@@ -641,6 +649,14 @@ async fn dispatch(mut socket: WebSocket, state: AppState, peer: PeerIdentity) ->
                 reject_and_close(&mut socket, MTLS_REQUIRED, "正式会话必须使用客户端证书").await;
                 bail!("无客户端证书的连接尝试建立正式会话");
             };
+            if !is_valid_agent_id(&hello.agent_id) {
+                reject_and_close(&mut socket, IDENTITY_MISMATCH, "agent_id 非法").await;
+                bail!("agent_id 非法（长度或字符集）");
+            }
+            if !is_log_safe(&hello.hostname, 255) {
+                reject_and_close(&mut socket, IDENTITY_MISMATCH, "hostname 非法").await;
+                bail!("hostname 含控制字符或过长");
+            }
             if hello.agent_id == HUB_SELF_AGENT_ID {
                 reject_and_close(&mut socket, IDENTITY_MISMATCH, "网络侧不允许声明 hub-self").await;
                 bail!("网络侧声明了内置采集身份 hub-self");
@@ -679,6 +695,16 @@ async fn handle_enroll(mut socket: WebSocket, state: AppState, req: EnrollReques
             "enrollment 协议版本不匹配: 收到 {}，需要 {PROTOCOL_VERSION}",
             req.protocol
         );
+    }
+
+    // requested_name 可以为空（agent init 不传 --name 时就是空），hub 实际使用的是 token 名。
+    if !is_log_safe(&req.hostname, 255) || !is_log_safe_optional(&req.requested_name, 128) {
+        send_frame(
+            &mut socket,
+            &problem(codes::ENROLL_DENIED, "hostname 或 name 非法"),
+        )
+        .await?;
+        bail!("enrollment 字段含控制字符或过长");
     }
 
     let now = now_ms();
@@ -909,12 +935,26 @@ async fn handle_message(
             let frame = match Frame::decode(bytes.as_ref()) {
                 Ok(frame) => frame,
                 Err(err) => {
-                    tracing::warn!(agent = %agent_id, error = %err, "帧解码失败，跳过");
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %log_safe_error(&err),
+                        "帧解码失败，跳过"
+                    );
                     return Ok(MessageAction::Continue);
                 }
             };
             match frame {
                 Frame::Batch(batch) => {
+                    // 先校验格式再比较：非法值（超长/控制字符）不能原样进日志。
+                    if !is_valid_agent_id(&batch.agent_id) {
+                        tracing::warn!(
+                            session_agent = %agent_id,
+                            batch_agent_len = batch.agent_id.len(),
+                            "批次 agent_id 非法，拒绝且不 ACK"
+                        );
+                        reject_and_close(socket, IDENTITY_MISMATCH, "批次 agent_id 非法").await;
+                        return Ok(MessageAction::Close);
+                    }
                     // 批次身份一律以会话身份为准，不接受报文里的 agent_id。
                     if batch.agent_id != agent_id {
                         tracing::warn!(
@@ -1139,6 +1179,44 @@ fn protocol_gate(protocol: u16) -> Option<Frame> {
     (protocol != PROTOCOL_VERSION).then(|| problem(codes::BAD_PROTOCOL, "需要 agent ≥ 2"))
 }
 
+/// hub 自己生成的 agent_id 是 UUID；这里只接受安全字符集，避免日志注入与超长字段。
+fn is_valid_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// 用于打日志的字段：限长且不允许控制字符（防换行伪造日志）。
+fn is_log_safe(value: &str, max_len: usize) -> bool {
+    !value.is_empty() && value.len() <= max_len && !value.chars().any(|c| c.is_control())
+}
+
+/// 错误串可能包含攻击者控制的 enum 变体名（serde 报错会回显），
+/// 直接写日志会造成日志注入与放大：统一转义控制字符并截断。
+const MAX_LOG_ERROR_LEN: usize = 128;
+
+fn log_safe_error(err: &impl std::fmt::Display) -> String {
+    let text = err.to_string();
+    let mut out = String::with_capacity(MAX_LOG_ERROR_LEN);
+    for ch in text.chars() {
+        let ch = if ch.is_control() { '?' } else { ch };
+        // 预留 3 字节给省略号，保证最终字节长度严格不超过上限
+        if out.len() + ch.len_utf8() > MAX_LOG_ERROR_LEN - 3 {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// 可选字段：允许为空，非空时同样要满足日志安全约束。
+fn is_log_safe_optional(value: &str, max_len: usize) -> bool {
+    value.is_empty() || is_log_safe(value, max_len)
+}
+
 fn problem(code: &str, message: &str) -> Frame {
     Frame::Problem {
         code: code.to_string(),
@@ -1233,6 +1311,22 @@ fn spawn_self_monitor(storage: Arc<SqliteStorage>, cfg: HubConfig) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decode_error_is_escaped_and_truncated() {
+        let evil = format!(
+            "unknown variant `evil\nINFO forged`, expected one of {}",
+            "x".repeat(500)
+        );
+        let safe = super::log_safe_error(&evil);
+        assert!(!safe.contains('\n'), "不能保留换行");
+        assert!(safe.len() <= super::MAX_LOG_ERROR_LEN, "必须严格截断");
+        let multi = super::log_safe_error(&"中".repeat(500));
+        assert!(
+            multi.len() <= super::MAX_LOG_ERROR_LEN,
+            "多字节字符也必须严格不超限"
+        );
+    }
+
     use super::*;
 
     /// H1：旧协议必须收到 `bad_protocol` + 「需要 agent ≥ 2」，当前协议放行。

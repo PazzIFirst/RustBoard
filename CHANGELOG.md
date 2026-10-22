@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-23
+
 ### Added
 
 - M1 骨架：`rustboard-{common,core,agent,hub,panel}` 五 crate workspace
@@ -18,7 +20,7 @@
 - 本地磁盘缓冲：追加日志、已确认偏移持久化、超限丢弃最旧、损坏尾部自愈；
   新增 24h 时间上限（与 500MB 上限取先到者），避免离线过久的数据撑大判重窗口
 - 传输：TLS 1.3 + 私有 CA，agent 首次连接使用服务端证书 SHA-256 指纹钉扎
-- 纳管：一次性 enrollment token（30 分钟、单次使用）→ CSR → 90 天客户端证书 + 每机独立 secret
+- 纳管：一次性 enrollment token（30 分钟、单次使用）→ CSR → 客户端证书 + 每机独立 secret
 - 吊销：清除 secret、状态锁死 `revoked`，重连被拒
 - 存储：SQLite WAL，批次在 `(agent_id, epoch, seq)` 上幂等
 - 只读 API：`/healthz`、`/api/v1/agents`、`/api/v1/series`
@@ -96,5 +98,5 @@
 
 ### Known limitations
 
-- 客户端证书不会自动轮换（90 天到期需重新纳管）
+- 证书未设置有效期（`notAfter` 到 4096 年），也不会自动轮换；泄露后需 `agent revoke`
 - 面板、控制面、告警、ACME、PostgreSQL 尚未实现

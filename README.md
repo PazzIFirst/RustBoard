@@ -22,7 +22,8 @@
 1. `rustboard-hub init` 生成本地私有 CA 与服务端证书，打印 **SHA-256 指纹**。
 2. `rustboard-hub agent add --name web-01` 生成**一次性** enrollment token（默认 30 分钟）。
 3. agent 首次连接用安装命令里带过来的**指纹钉扎**校验 hub（等价 SSH 的 known_hosts），
-   发送 CSR，hub 用私有 CA 签发 90 天客户端证书，并下发该机器独有的 `agent_secret`。
+   发送 CSR，hub 用私有 CA 签发客户端证书，并下发该机器独有的 `agent_secret`。
+   > 当前实现**未设置证书有效期**（rcgen 默认到 4096 年），自动轮换待实现；泄露后请用 `agent revoke` 吊销。
 4. 之后所有连接走 mTLS；Hello 里再带 `agent_secret` 做身份绑定（防止已纳管机器互相冒名）。
 5. `rustboard-hub agent revoke --id <id>` 立即清除 secret 并拒绝该 agent 重连。
 6. 敏感文件从创建起就是 0600（配置 / 私钥 / secret），证书为 0644；
