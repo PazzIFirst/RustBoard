@@ -27,6 +27,12 @@ pub struct AgentConfig {
     /// 本地缓冲的最长保留小时数（与字节上限取先到者）。
     #[serde(default = "default_buffer_max_age_hours")]
     pub buffer_max_age_hours: u64,
+    /// 客户端证书剩余寿命不超过该天数时自动轮换。
+    #[serde(default = "default_cert_renew_before_days")]
+    pub cert_renew_before_days: u32,
+    /// 主动重连周期（小时），让轮换后的证书与 hub 配置有机会生效；0 表示不主动重连。
+    #[serde(default = "default_session_max_hours")]
+    pub session_max_hours: u64,
     /// 单批最多多少条采样点。
     pub max_batch_samples: usize,
 }
@@ -44,6 +50,8 @@ impl Default for AgentConfig {
             excluded_interfaces: default_excluded_interfaces(),
             buffer_max_bytes: 500 * 1024 * 1024,
             buffer_max_age_hours: 24,
+            cert_renew_before_days: default_cert_renew_before_days(),
+            session_max_hours: default_session_max_hours(),
             max_batch_samples: 512,
         }
     }
@@ -108,6 +116,24 @@ pub struct HubConfig {
     pub retention_raw_days: u32,
     pub retention_1m_days: u32,
     pub retention_1h_days: u32,
+    /// 管理 API 的 Bearer token；由 `hub init` / `hub admin-token` 生成，为空时拒绝启动。
+    #[serde(default)]
+    pub admin_token: String,
+    /// 新建 CA 的有效期（天）。已存在的 CA 不受影响。
+    #[serde(default = "default_ca_validity_days")]
+    pub ca_validity_days: u32,
+    /// 服务端证书有效期（天）。
+    #[serde(default = "default_server_cert_validity_days")]
+    pub server_cert_validity_days: u32,
+    /// agent 客户端证书有效期（天）。
+    #[serde(default = "default_client_cert_validity_days")]
+    pub client_cert_validity_days: u32,
+    /// 剩余寿命不超过该天数时触发续签。
+    #[serde(default = "default_renew_before_days")]
+    pub renew_before_days: u32,
+    /// 服务端证书续签检查周期（秒），最小 1。
+    #[serde(default = "default_cert_check_interval_secs")]
+    pub cert_check_interval_secs: u64,
 }
 
 /// agent 接入层默认的最大并发连接数。
@@ -133,6 +159,12 @@ impl Default for HubConfig {
             retention_raw_days: 7,
             retention_1m_days: 90,
             retention_1h_days: 730,
+            admin_token: String::new(),
+            ca_validity_days: default_ca_validity_days(),
+            server_cert_validity_days: default_server_cert_validity_days(),
+            client_cert_validity_days: default_client_cert_validity_days(),
+            renew_before_days: default_renew_before_days(),
+            cert_check_interval_secs: default_cert_check_interval_secs(),
         }
     }
 }
@@ -163,6 +195,15 @@ pub struct PanelConfig {
     pub hub_url: String,
     /// 面板访问 hub 用的 scoped token。
     pub token: String,
+    /// 单管理员的 Argon2id PHC 密码哈希；`panel init` 生成。
+    #[serde(default)]
+    pub admin_password_hash: String,
+    /// 会话有效期（小时）。
+    #[serde(default = "default_session_ttl_hours")]
+    pub session_ttl_hours: u64,
+    /// 静态资源目录；留空则依次尝试 `web/dist` 与 `/usr/share/rustboard/web`。
+    #[serde(default)]
+    pub static_dir: String,
 }
 
 impl Default for PanelConfig {
@@ -171,6 +212,9 @@ impl Default for PanelConfig {
             listen: format!("0.0.0.0:{}", crate::DEFAULT_PANEL_PORT),
             hub_url: format!("http://127.0.0.1:{}", crate::DEFAULT_ADMIN_PORT),
             token: String::new(),
+            admin_password_hash: String::new(),
+            session_ttl_hours: default_session_ttl_hours(),
+            static_dir: String::new(),
         }
     }
 }
@@ -187,6 +231,38 @@ impl PanelConfig {
 
 fn default_buffer_max_age_hours() -> u64 {
     24
+}
+
+fn default_cert_renew_before_days() -> u32 {
+    30
+}
+
+fn default_session_max_hours() -> u64 {
+    12
+}
+
+fn default_session_ttl_hours() -> u64 {
+    12
+}
+
+fn default_ca_validity_days() -> u32 {
+    3650
+}
+
+fn default_server_cert_validity_days() -> u32 {
+    365
+}
+
+fn default_client_cert_validity_days() -> u32 {
+    90
+}
+
+fn default_renew_before_days() -> u32 {
+    30
+}
+
+fn default_cert_check_interval_secs() -> u64 {
+    6 * 3600
 }
 
 pub fn default_excluded_interfaces() -> Vec<String> {
@@ -208,5 +284,26 @@ mod tests {
 
         let cfg: HubConfig = toml::from_str("max_connections = 32\n").unwrap();
         assert_eq!(cfg.max_connections, 32);
+    }
+
+    /// v0.1 的配置文件没有新增字段，必须全部走默认值而不是解析失败。
+    #[test]
+    fn v02_config_defaults_are_backward_compatible() {
+        let agent: AgentConfig = toml::from_str("").unwrap();
+        assert_eq!(agent.cert_renew_before_days, 30);
+        assert_eq!(agent.session_max_hours, 12);
+
+        let hub: HubConfig = toml::from_str("").unwrap();
+        assert_eq!(hub.ca_validity_days, 3650);
+        assert_eq!(hub.server_cert_validity_days, 365);
+        assert_eq!(hub.client_cert_validity_days, 90);
+        assert_eq!(hub.renew_before_days, 30);
+        assert_eq!(hub.cert_check_interval_secs, 21_600);
+        assert!(hub.admin_token.is_empty());
+
+        let panel: PanelConfig = toml::from_str("").unwrap();
+        assert_eq!(panel.session_ttl_hours, 12);
+        assert!(panel.admin_password_hash.is_empty());
+        assert!(panel.static_dir.is_empty());
     }
 }
