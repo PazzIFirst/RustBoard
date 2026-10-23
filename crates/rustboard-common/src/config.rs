@@ -1169,6 +1169,14 @@ mod tests {
             "/etc/rustboard",
             "/var/lib",
             "/var/tmp",
+            "/var/log",
+            "/var/log/rustboard",
+            "/var/cache/rustboard",
+            "/var/lib/systemd",
+            "/mnt/data",
+            "/media/usb",
+            "/srv/www",
+            "/home/alice",
             "relative/data",
         ] {
             let hub = HubConfig {
