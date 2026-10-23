@@ -45,6 +45,8 @@
 
 - 控制应答编码预算（1 MiB−4 KiB）与 Hub 1 MiB WS 消息上限留出余量；超限只丢结果并回
   `control_result_too_large`，不关闭会话，避免控制动作已执行却返回 `agent_offline`
+- 升级顺序：先升级 hub 到 v0.3.2，再升级 agent。v0.3.1 hub 的单帧上限仍是 256 KiB，
+  新 agent 发送超过 256 KiB 的控制结果仍可能被旧 hub 拒绝并断开会话
 - v0.3.2 未实现 #9 的 scoped token / 管理端强制 TLS；#9/#17/#20/#21 仍 open
 
 ## [0.3.1] - 2026-10-23
