@@ -6,7 +6,7 @@
 #   1. 弱 admin_token 拒绝启动
 #   2. 未知 /api/v1/*：无 token 401，有 token 404
 #   3. 管理 API 每 IP 限速：第 N+1 次 429 + Retry-After
-#   4. hub 管理端口非回环监听的明文 HTTP WARN
+#   4. 管理端口非回环 + admin_tls=off 拒绝启动（v0.3.3 A2 起；init 仍警告）
 #   5. 单 IP 空连接洪水（127.0.0.2）不影响合法 agent
 #   6. 运行中 rotate-cert 热加载 ≤15s（live / disk / 实际 TLS 指纹）
 #   7. 面板 trusted_proxies：XFF 分桶、Secure Cookie；非法/超长/9 跳 XFF 拒绝、
@@ -39,6 +39,15 @@ KEEP=${KEEP_E2E_TMP:-0}
 pass() { PASSES=$((PASSES + 1)); printf 'PASS [%s] %s\n' "$1" "$2"; }
 fail() { FAILS=$((FAILS + 1)); printf 'FAIL [%s] %s\n' "$1" "$2" >&2; }
 die() { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
+
+check_log_has() {
+  local id=$1 log=$2 desc=$3 pattern=$4
+  if [[ -s "$log" ]] && grep -Eiq -- "$pattern" "$log"; then
+    pass "$id" "$desc"
+  else
+    fail "$id" "$desc（日志未匹配 /$pattern/：$log）"
+  fi
+}
 
 command -v "$PYTHON" >/dev/null 2>&1 || die "找不到 python3（需要 3.8+）"
 command -v "$CARGO" >/dev/null 2>&1 || die "找不到 cargo（请放进 PATH 或设置 CARGO=...）"
@@ -502,25 +511,38 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. hub 管理端口非回环监听的明文 HTTP WARN
+# 4. 管理端口非回环 + admin_tls=off 拒绝启动
 # ---------------------------------------------------------------------------
 echo
-echo "==> 4/9 hub 非回环管理监听 WARN"
-"$HUB_BIN" init --config "$NONLOOP_CFG" --data-dir "$NONLOOP_DATA" \
-  --agent-listen "127.0.0.1:$WEAK_AGENT_PORT" \
-  --admin-listen "0.0.0.0:$NONLOOP_ADMIN_PORT" \
-  --san 127.0.0.1 --force > "$TMP_DIR/init-nonloop.log" 2>&1 \
-  || die "非回环 hub init 失败"
-launch_hub "$NONLOOP_CFG" "$NONLOOP_LOG"
-if wait_http_200 "http://127.0.0.1:$NONLOOP_ADMIN_PORT/healthz" 15; then
-  if grep -qiE '明文 HTTP|非回环|VPN|可信反代' "$NONLOOP_LOG"; then
-    pass "4.1" "管理端口 0.0.0.0 启动时打印明文 HTTP WARN"
-  else
-    fail "4.1" "管理端口 0.0.0.0 启动但日志无明文 HTTP WARN"
-  fi
+echo "==> 4/9 hub 非回环 + admin_tls=off 拒绝启动"
+NONLOOP_INIT_LOG="$TMP_DIR/init-nonloop.log"
+if "$HUB_BIN" init --config "$NONLOOP_CFG" --data-dir "$NONLOOP_DATA" \
+    --agent-listen "127.0.0.1:$WEAK_AGENT_PORT" \
+    --admin-listen "0.0.0.0:$NONLOOP_ADMIN_PORT" \
+    --admin-tls off \
+    --san 127.0.0.1 --force > "$NONLOOP_INIT_LOG" 2>&1; then
+  check_log_has "4.1" "$NONLOOP_INIT_LOG" \
+    "非回环 + admin_tls=off 的 init 成功并警告 run 会拒绝" \
+    '警告.*admin_tls="off".*非回环.*启动会拒绝'
 else
-  fail "4.1" "非回环 hub 未就绪（最后状态: $LAST_STATUS）"
+  fail "4.1" "非回环 + admin_tls=off 的 init 失败（应允许先落盘，日志: $NONLOOP_INIT_LOG）"
 fi
+
+# 必须前台 timeout 捕获退出码：用 launch_hub 后台启动会留下仍在运行的 hub。
+set +e
+timeout 10 "$HUB_BIN" run --config "$NONLOOP_CFG" > "$NONLOOP_LOG" 2>&1
+NONLOOP_RC=$?
+set -e
+if (( NONLOOP_RC == 0 || NONLOOP_RC == 124 || NONLOOP_RC == 125 \
+      || NONLOOP_RC == 126 || NONLOOP_RC == 127 )); then
+  fail "4.2" "非回环 + admin_tls=off 未拒绝启动（rc=$NONLOOP_RC；0=仍运行，124=超时，125–127=调用失败）"
+else
+  pass "4.2" "非回环 + admin_tls=off 拒绝启动（rc=$NONLOOP_RC，非 124 超时）"
+fi
+
+check_log_has "4.3" "$NONLOOP_LOG" \
+  "拒绝日志明确 admin_tls=off、回环约束与迁移路径" \
+  'admin_tls="off".*回环.*(required|反代|反向代理)'
 
 # ---------------------------------------------------------------------------
 # 5. 单 IP 空连接洪水不影响合法 agent
