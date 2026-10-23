@@ -244,6 +244,10 @@ impl AppState {
     ///
     /// 只热加载密码哈希，不热加载监听地址 / 可信代理等需要重建监听器的字段；
     /// `reset-password` 只改哈希，因此这一范围足够且不会中断服务。
+    ///
+    /// 哈希真正变化时吊销全部已有会话：旧 Cookie 不能继续用到 TTL。其他字段
+    /// 重载（哈希未变）返回 `false`，不动会话表。为避免锁顺序问题，密码写锁
+    /// 在调用 [`auth::SessionStore::revoke_all`] 之前显式释放。
     fn reload_password_hash(&self) -> Result<bool> {
         let Some(path) = self.config_path.as_ref() else {
             return Ok(false);
@@ -261,7 +265,14 @@ impl AppState {
             return Ok(false);
         }
         *guard = cfg.admin_password_hash;
-        tracing::info!(path = %path.display(), "检测到面板密码变更，已热加载（无需重启）");
+        // 先释放密码写锁，再清会话表：避免持锁做无关操作，也不让两把锁嵌套。
+        drop(guard);
+        let revoked = self.sessions.revoke_all();
+        tracing::info!(
+            path = %path.display(),
+            revoked,
+            "检测到面板密码变更，已热加载新哈希并吊销全部已有会话"
+        );
         Ok(true)
     }
 }
@@ -1505,10 +1516,18 @@ fn init(
     Ok(())
 }
 
+/// `reset-password` 成功后的会话失效提示。
+///
+/// 热加载轮询周期为 1s（最长可能因一次阻塞读取顺延），因此按 ≤2s 承诺；
+/// 精确行为由 e2e 覆盖。
+const RESET_PASSWORD_HINT: &str = "提示: 运行中的面板会在 2 秒内自动加载新密码（无需重启）；\
+     已有面板会话将在 ≤2s 内失效，请用新密码重新登录。";
+
 /// 重置管理员密码：写回新的 Argon2id PHC 哈希（配置保持 0600）。
 ///
 /// 未传 `--password` 时生成 20 位随机密码；stdout 只展示一次。
-/// 已登录会话保存在内存里，不会因改密自动失效（重启面板后清空）。
+/// 已登录会话保存在内存里；运行中的面板检测到新哈希后会吊销全部已有会话
+/// （≤2s），未运行时重启后面板内存表自然为空。
 fn reset_password(config: Option<PathBuf>, password: Option<String>) -> Result<()> {
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_PANEL_CONFIG));
     if !path.exists() {
@@ -1534,7 +1553,7 @@ fn reset_password(config: Option<PathBuf>, password: Option<String>) -> Result<(
     cfg.save(&path)?;
     println!("已重置面板密码（仅显示一次，请立即保存）: {password}");
     println!("配置文件: {}（0600）", path.display());
-    println!("提示: 运行中的面板会在 1 秒内自动加载新密码（无需重启）；已有登录会话仍然有效。");
+    println!("{RESET_PASSWORD_HINT}");
     Ok(())
 }
 
@@ -3111,6 +3130,9 @@ mod tests {
             &saved.admin_password_hash
         ));
         assert!(!auth::verify_password(old, &saved.admin_password_hash));
+        // 成功提示必须明确告知已有会话会失效，且不超过 2s。
+        assert!(RESET_PASSWORD_HINT.contains("≤2s"));
+        assert!(RESET_PASSWORD_HINT.contains("失效"));
 
         #[cfg(unix)]
         {
@@ -3135,6 +3157,24 @@ mod tests {
         cfg.save(&path).unwrap();
         let state = Arc::new(AppState::new(cfg, None, Some(path.clone())).unwrap());
 
+        let now = now_ms();
+        let first = state.sessions.create(now);
+        let second = state.sessions.create(now);
+        assert!(state.sessions.is_authenticated(&first, now));
+        assert!(state.sessions.is_authenticated(&second, now));
+
+        // 其他配置字段变化、哈希未变：reload 返回 false，已有会话不受影响。
+        let mut touched = PanelConfig::load(&path).unwrap();
+        touched.listen = "127.0.0.1:18081".to_string();
+        touched.save(&path).unwrap();
+        assert!(!state.reload_password_hash().unwrap());
+        assert!(
+            state.sessions.is_authenticated(&first, now),
+            "哈希未变时普通重载不得清除会话"
+        );
+        assert!(state.sessions.is_authenticated(&second, now));
+
+        // 密码变化：旧会话全部失效；吊销后新会话可正常创建与认证。
         reset_password(Some(path), Some("new-password".to_string())).unwrap();
         assert!(state.reload_password_hash().unwrap());
         let hash = state
@@ -3144,8 +3184,18 @@ mod tests {
             .clone();
         assert!(auth::verify_password("new-password", &hash));
         assert!(!auth::verify_password(old, &hash));
-        // 内容没再变化时不应重复报告。
+        assert!(!state.sessions.is_authenticated(&first, now));
+        assert!(!state.sessions.is_authenticated(&second, now));
+
+        let fresh = state.sessions.create(now);
+        assert!(state.sessions.is_authenticated(&fresh, now));
+
+        // 内容没再变化时不应重复报告，也不能再次清空会话。
         assert!(!state.reload_password_hash().unwrap());
+        assert!(
+            state.sessions.is_authenticated(&fresh, now),
+            "相同哈希的 reload 不得清除新会话"
+        );
     }
 
     #[tokio::test]
@@ -3162,6 +3212,10 @@ mod tests {
         };
         cfg.save(&path).unwrap();
         let state = Arc::new(AppState::new(cfg, None, Some(path.clone())).unwrap());
+        // 模拟改密前已登录的浏览器；轮询任务应用新哈希后它必须失效。
+        let now = now_ms();
+        let stale = state.sessions.create(now);
+        assert!(state.sessions.is_authenticated(&stale, now));
         spawn_password_reload(state.clone());
 
         reset_password(Some(path.clone()), Some("new-password".to_string())).unwrap();
@@ -3183,6 +3237,14 @@ mod tests {
         })
         .await
         .expect("热加载任务未在 5s 内应用新密码");
+
+        // 轮询任务应用新哈希时已经吊销了改密前的会话。
+        assert!(
+            !state.sessions.is_authenticated(&stale, now),
+            "热加载新密码后旧会话必须失效"
+        );
+        let fresh = state.sessions.create(now);
+        assert!(state.sessions.is_authenticated(&fresh, now));
 
         let current = state
             .password_hash

@@ -148,6 +148,19 @@ impl SessionStore {
         lock(&self.inner).remove(token);
     }
 
+    /// 吊销全部会话，返回被清除的会话数；空表返回 0。
+    ///
+    /// 密码变更后调用：清空后所有旧 Cookie 立即失效，之后仍可正常 [`create`]
+    /// 新会话。持锁期间只做 `clear`，不回调外部代码，避免锁顺序问题。
+    ///
+    /// [`create`]: Self::create
+    pub fn revoke_all(&self) -> usize {
+        let mut sessions = lock(&self.inner);
+        let revoked = sessions.len();
+        sessions.clear();
+        revoked
+    }
+
     /// 清理过期会话。
     pub fn cleanup(&self, now_ms: i64) {
         lock(&self.inner).retain(|_, expires_at| *expires_at > now_ms);
@@ -649,6 +662,55 @@ mod tests {
             store.create(now + i as i64);
         }
         assert!(store.len() <= MAX_SESSIONS);
+    }
+
+    #[test]
+    fn revoke_all_clears_sessions_and_allows_new_ones() {
+        let store = SessionStore::new(12);
+        let now = 1_700_000_000_000;
+        let first = store.create(now);
+        let second = store.create(now);
+        assert_ne!(first, second);
+        assert_eq!(store.len(), 2);
+
+        assert_eq!(store.revoke_all(), 2, "应返回被清除的会话数");
+        assert_eq!(store.len(), 0);
+        assert!(!store.is_authenticated(&first, now));
+        assert!(!store.is_authenticated(&second, now));
+
+        // 空表返回 0，重复调用幂等。
+        assert_eq!(store.revoke_all(), 0);
+
+        // 吊销后新会话可正常创建与认证，旧 token 不会复活。
+        let fresh = store.create(now);
+        assert!(store.is_authenticated(&fresh, now));
+        assert!(!store.is_authenticated(&first, now));
+    }
+
+    #[test]
+    fn revoke_all_is_thread_safe() {
+        use std::sync::Arc;
+
+        let store = Arc::new(SessionStore::new(1));
+        let now = 1_700_000_000_000;
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..16 {
+                    let token = store.create(now);
+                    assert!(store.is_authenticated(&token, now));
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let created = store.len();
+        assert_eq!(created, 8 * 16);
+        assert_eq!(store.revoke_all(), created);
+        assert_eq!(store.len(), 0, "并发创建后 revoke_all 必须清空全部会话");
     }
 
     /// 模拟一次“预占名额 + 密码错误”的完整尝试。
