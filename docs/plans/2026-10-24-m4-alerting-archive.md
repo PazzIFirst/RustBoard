@@ -579,7 +579,8 @@ notify_max_attempts = 3
   backfill 中断可续。
 - retention：三层 cutoff 边界、`0=不删`、分批删除、归档未完成时 raw 不删、
   downsample 水位不足时跳过。
-- query tier：≤6h raw、≤7d 1m、>7d 1h；bucket 过小 400；无 raw 时 1m 回退；
+- query tier：≤6h raw、≤7d 1m、>7d 1h；bucket 过小自动提升到层粒度并在响应
+  回显实际值（不返回 400）；raw 窗口无数据时按 1m/1h 回退；
   点数上限不变。
 - alerts：duration/cooldown/resolve/silence；多 agent/labels；离线 90s；证书
   阈值；磁盘/缓冲指标；规则过滤；事件去重；状态持久化重启；规则数上限。
