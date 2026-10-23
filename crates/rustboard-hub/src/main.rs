@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::task::{Context as TaskContext, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use axum::body::Body;
@@ -2424,9 +2424,18 @@ async fn handle_session(
     );
     // M3：控制命令的 pending 表属于本会话。声明顺序保证会话结束时先 Drop
     // `ControlSession`（给所有等待者回 agent_offline），再注销注册表。
-    let mut control = ControlSession::new(state.cfg.control.max_pending_per_session);
+    // #18：每条 pending 带上本地 deadline；会话每秒清理一次，避免管理 API 超时后
+    // 残留项永久占用 max_pending 名额。
+    let mut control = ControlSession::new(
+        state.cfg.control.max_pending_per_session,
+        Duration::from_millis(state.cfg.control.request_timeout_ms.max(1)),
+    );
     let mut control_rx = handle.control_rx;
     let mut watch_control = true;
+    // 首轮 tick 立即触发（此时 pending 必为空），随后每秒一次；错过的 tick 直接跳过，
+    // 不让慢连接积压出连续清理。
+    let mut control_expire = tokio::time::interval(Duration::from_secs(1));
+    control_expire.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     state.storage.upsert_agent(&record)?;
     // M3：登记 agent 实际启用的控制能力。未知能力在入库前就被忽略，
@@ -2486,6 +2495,7 @@ async fn handle_session(
                 Ok(Some(Err(err))) => SessionEvent::RecvError(err.to_string()),
                 Ok(Some(Ok(message))) => SessionEvent::Message(message),
             },
+            _ = control_expire.tick() => SessionEvent::ControlExpired,
         };
 
         match event {
@@ -2532,6 +2542,13 @@ async fn handle_session(
             SessionEvent::ControlClosed => {
                 tracing::debug!(agent = %agent_id, "控制命令通道已关闭，停止接收控制请求");
                 watch_control = false;
+            }
+            SessionEvent::ControlExpired => {
+                // 只遍历内存 pending 并回 oneshot，不做 I/O，不阻塞采集 / ACK。
+                let expired = control.expire(Instant::now());
+                if expired > 0 {
+                    tracing::debug!(agent = %agent_id, expired, "清理超时的控制请求");
+                }
             }
             SessionEvent::Message(message) => {
                 match handle_message(
@@ -2594,6 +2611,8 @@ enum SessionEvent {
     Control(ControlCommand),
     /// 控制命令通道关闭（注册表已无发送端），后续不再轮询。
     ControlClosed,
+    /// 每秒一次：清理已超过 request_timeout 的 pending。
+    ControlExpired,
     Closed,
     RecvError(String),
     IdleTimeout,
