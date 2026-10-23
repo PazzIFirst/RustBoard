@@ -11,6 +11,7 @@
 | `hardening.sh` | v0.2.1 硬化：弱 token、未知 API 鉴权、管理限速、非回环 WARN、单 IP 连接洪水、rotate 热加载、可信代理 XFF（含非法/超长/9 跳拒绝、不可信来源伪造无效）、Origin、reset-password |
 | `control.sh` | M3 控制面：能力协商、systemd/Docker 白名单、进程 PID+名称、日志 tail/逃逸、审计分页与面板代理、能力关闭/离线 |
 | `v031.sh` | v0.3.1 硬化 #13 / KI-17：过期服务端证书启动自愈（同 CA 重签、成对备份/权限、指纹、原 agent CA 信任重连）；hub/panel 各 30 条半截 header 慢连接下 `/healthz` 仍 200 且按 5s header 超时关闭 |
+| `v032.sh` | v0.3.2 控制面可靠性 #18/#16/#19：pending 超时后清理（fake agent 不回复，连续 4×`504 control_timeout`、不出现 `429 too_many_pending`）、续签窗口 `busy_renewing`（`503` / 固定文案 / 审计 error）、journald tail 保留最新（`--reverse`、`truncated=true`、旧→新、≤256 KiB） |
 
 `security.sh` 是最早的一套，下文细节以它为例；其余脚本的断言清单见各自文件头部注释。
 
@@ -21,7 +22,7 @@
 | Linux | 脚本使用 `mktemp`、`sed -i`、`awk`、`date +%s%3N` 等 GNU 工具 |
 | bash 4.4+ | 使用数组与 `set -euo pipefail` |
 | Python 3.8+ | **仅标准库**（`ssl` / `socket` / `hashlib` / `urllib`）；无需 `pip install`，也不联网。`v031.sh` 额外需要已安装的 `cryptography`（只用于生成过期证书） |
-| cargo / rustc | 用于 `cargo build --locked`（`hardening.sh` / `control.sh` / `v031.sh` 还会构建 panel） |
+| cargo / rustc | 用于 `cargo build --locked`（`hardening.sh` / `control.sh` / `v031.sh` / `v032.sh` 构建 hub/agent，前三套还会构建 panel） |
 | curl | `control.sh` 用 curl 访问 hub 管理 API 与面板 API |
 
 脚本不会安装任何依赖，也不会访问网络。`probe.py` 里自带最小 MessagePack
@@ -104,6 +105,11 @@ e2e 结果: 全部 9 项通过
   无效、锁定 XFF 隔离、Origin 校验与 `reset-password`
 - `control.sh`：M3 控制面回归；使用临时 fake `systemctl` / `docker` / `journalctl`，
   不依赖宿主机服务，也不需要 root
+- `v032.sh` + `v032_agent.py`：v0.3.2 控制面可靠性与 journal tail 回归；
+  `v032_agent.py` 用真实 enrollment 留下的 agent_id / secret / 客户端证书建立
+  mTLS 会话，`ignore` 模式故意不回复 `ControlRequest`（验证 #18 pending 清理），
+  `busy` 模式按请求 id 回 `busy_renewing`（验证 #16 Hub 映射与审计）；
+  场景 3 使用 fake `journalctl`（输出 1000 行 × 约 1KiB 新→旧）验证 #19
 - `probe.py`：TLS + WebSocket + MessagePack 测试客户端；子命令
   `hello` / `batch` / `hold` / `status` / `series-count` / `health`
 
@@ -129,6 +135,15 @@ KEEP_E2E_TMP=1 bash tests/e2e/hardening.sh   # 保留日志与临时证书/数�
 ```bash
 bash tests/e2e/v031.sh
 KEEP_E2E_TMP=1 bash tests/e2e/v031.sh   # 保留临时证书/日志
+```
+
+`v032.sh` 会自行构建 hub / agent，不需要 panel 或 `web/dist`；运行约 10–15s，
+覆盖 #18 pending 超时清理、#16 续签窗口 `busy_renewing` 与 #19 journald
+tail 保留最新。fake agent 只保持在线并选择是否应答，不执行任何控制动作：
+
+```bash
+bash tests/e2e/v032.sh
+KEEP_E2E_TMP=1 bash tests/e2e/v032.sh   # 保留临时日志与 fake journalctl 参数
 ```
 
 ## 范围说明
