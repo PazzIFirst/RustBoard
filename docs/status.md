@@ -13,7 +13,7 @@
 | M3 控制面 | 🟢 完成 | systemd / Docker / 进程 / 日志 + 双端能力开关 + 审计页；单元 379，control e2e 99/99 |
 | v0.3.1 硬化 | 🟢 完成 | #10 缓冲物理上界/崩溃恢复、#12 发送超时、#13 过期证书自愈、#14 会话清理原子化、KI-17 慢连接；单元/集成 420，hardening 34/34，v031 94/94 |
 | v0.3.2 控制面可靠性 | 🟢 完成 | #15/#16/#18/#19、1MiB 控制应答帧预算、45s idle 回归；单元/集成 447，v032 66/66、control 100/100、hardening 34/34、v031 94/94、security 9/9、cert 103/103、panel 159/159 |
-| v0.3.3 管理面安全 | 🟢 完成 | #9 scoped token + 管理端 TLS/ Panel `https`+`hub_ca`、#17 吊销窗口、#20 日志 TOCTOU、#21 systemd 未加载 unit；单元/集成 494，v033 100/100、security 9/9、cert 103/103、hardening 36/36、control 100/100、v031 94/94、v032 66/66、panel 159/159 |
+| v0.3.3 管理面安全 | 🟢 完成 | #9 scoped token + 管理端 TLS/ Panel `https`+`hub_ca`、#17 吊销窗口、#20 日志 TOCTOU、#21 systemd 未加载 unit；单元/集成 495，v033 100/100、security 9/9、cert 103/103、hardening 36/36、control 100/100、v031 94/94、v032 66/66、panel 159/159 |
 | M4 告警与归档 | ⬜ 未开始 | |
 | M5 安装与交付 | ⬜ 未开始 | |
 
@@ -138,7 +138,7 @@
 - [x] #21：systemd 合并 `list-unit-files`，已安装未加载 unit 以
       `not-loaded/inactive/dead` 展示并可 start；两次命令共享总超时，
       输出 >256 KiB 拒绝不完整列表
-- [x] 测试：单元/集成 494；`v033.sh` 100/100、`hardening.sh` 36/36、
+- [x] 测试：单元/集成 495；`v033.sh` 100/100、`hardening.sh` 36/36、
       `security.sh` 9/9、`cert-rotation.sh` 103/103、`control.sh` 100/100、
       `v031.sh` 94/94、`v032.sh` 66/66、`panel.sh` 159/159；web 48/48；
       `cargo audit` 0 漏洞
@@ -204,7 +204,7 @@
 - 面板修改采样间隔后 60s 内 agent 日志出现 `采样间隔已更新`，重连后继续上报；
 - series 多指标、自动分桶、32 天/点数上限与非法参数 400 均验证；
 - 证书轮换失败场景（CA 不配套、缺 ca.key、坏 ca.crt、空 SAN、缺 server.crt）均有 e2e 断言；
-- 测试：`cargo test --workspace` 494 通过；`cargo audit` 0 漏洞；
+- 测试：`cargo test --workspace` 495 通过；`cargo audit` 0 漏洞；
   `security.sh` 9/9、`cert-rotation.sh` 103/103、`panel.sh` 159/159、
   `hardening.sh` 36/36、`v031.sh` 94/94、`control.sh` 100/100、`v032.sh` 66/66、
   `v033.sh` 100/100、web `pnpm test` 48/48。
