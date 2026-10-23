@@ -13,6 +13,7 @@
 | `v031.sh` | v0.3.1 硬化 #13 / KI-17：过期服务端证书启动自愈（同 CA 重签、成对备份/权限、指纹、原 agent CA 信任重连）；hub/panel 各 30 条半截 header 慢连接下 `/healthz` 仍 200 且按 5s header 超时关闭 |
 | `v032.sh` | v0.3.2 控制面可靠性 #18/#16/#19：pending 超时后清理（fake agent 不回复，连续 4×`504 control_timeout`、不出现 `429 too_many_pending`）、续签窗口 `busy_renewing`（`503` / 固定文案 / 审计 error）、journald tail 保留最新（`--reverse`、`truncated=true`、旧→新、≤256 KiB） |
 | `v033.sh` | v0.3.3 管理面安全 #9/#17/#20/#21：scoped token 权限矩阵与审计 actor、admin TLS 与 Panel `https`+`hub_ca`、吊销后 403 `agent_revoked`、systemd 未加载 unit 合并、日志 tail 与跨挂载兼容、日志脱敏 |
+| `v034.sh` | v0.3.4 低风险硬化 KI-26/18/19/21/24：401 失败限速（阈值 5 → 429 + `Retry-After`、旧 `admin_token` 应急旁路、日志不刷屏）、`reset-password` 后 ≤2s 旧会话 401、Hello 元数据 `bad_frame` 且不写库、数据目录/SQLite 权限收紧与重启自愈、多连接能力最新优先/断开回退/旧连接晚到 Hello 不覆盖 |
 
 `security.sh` 是最早的一套，下文细节以它为例；其余脚本的断言清单见各自文件头部注释。
 
@@ -22,9 +23,9 @@
 |---|---|
 | Linux | 脚本使用 `mktemp`、`sed -i`、`awk`、`date +%s%3N` 等 GNU 工具 |
 | bash 4.4+ | 使用数组与 `set -euo pipefail` |
-| Python 3.8+ | **仅标准库**（`ssl` / `socket` / `hashlib` / `urllib`）；无需 `pip install`，也不联网。`v031.sh` 额外需要已安装的 `cryptography`（只用于生成过期证书） |
-| cargo / rustc | 用于 `cargo build --locked`（`hardening.sh` / `control.sh` / `v031.sh` / `v032.sh` / `v033.sh` 构建 hub/agent，前三套与 `v033.sh` 还会构建 panel；`v033.sh` 仅使用隔离 target） |
-| curl | `control.sh` / `v032.sh` / `v033.sh` 用 curl 访问 hub 管理 API（`control.sh` / `v033.sh` 还访问面板 API；`v033.sh` 用 `--cacert` 校验 admin TLS） |
+| Python 3.8+ | **仅标准库**（`ssl` / `socket` / `hashlib` / `urllib`）；无需 `pip install`，也不联网。`v031.sh` 额外需要已安装的 `cryptography`（只用于生成过期证书）；`v034.sh` 的 fake agent (`v034_agent.py`) 复用 `probe.py` |
+| cargo / rustc | 用于 `cargo build --locked`（`hardening.sh` / `control.sh` / `v031.sh` / `v032.sh` / `v033.sh` / `v034.sh` 构建 hub/agent，前三套与 `v033.sh` / `v034.sh` 还会构建 panel；`v033.sh` / `v034.sh` 仅使用隔离 target） |
+| curl | `control.sh` / `v032.sh` / `v033.sh` / `v034.sh` 用 curl 访问 hub 管理 API（`control.sh` / `v033.sh` 还访问面板 API；`v033.sh` 用 `--cacert` 校验 admin TLS；`v034.sh` 用 curl 轮询面板会话失效与 `Retry-After`） |
 
 脚本不会安装任何依赖，也不会访问网络。`probe.py` 里自带最小 MessagePack
 编解码器和 RFC 6455 客户端。
@@ -115,6 +116,13 @@ e2e 结果: 全部 9 项通过
   `admin_tls=required` HTTPS、Panel `https`+`hub_ca`、scoped token 权限矩阵与审计 actor、
   #17 revoke 后 `agent_revoked`、#21 未加载 unit、#20 日志 tail 与日志脱敏；
   使用隔离 `CARGO_TARGET_DIR`，不要与其它 worktree 共用 target
+- `v034.sh` + `v034_agent.py`：v0.3.4 低风险硬化回归；真实 hub/agent/panel +
+  fake mTLS agent（复用 `probe.py`），覆盖 KI-26 未认证 401 限速（第 6 次 429、
+  `Retry-After`、旧 `admin_token` 应急旁路与计数清除、日志不刷屏）、KI-18
+  `reset-password` 后 ≤2s 旧会话失效、KI-19 Hello 元数据 `bad_frame` 且不写库、
+  KI-21 数据目录 0700 / SQLite 三件套 0600 与过宽权限重启收紧、KI-24 多连接能力
+  （最新连接优先、断开回退、旧连接晚到 Hello 不覆盖、控制 sender 指向剩余旧连接）；
+  默认使用 `<repo>/target/v034-t1` 隔离 target
 - `probe.py`：TLS + WebSocket + MessagePack 测试客户端；子命令
   `hello` / `batch` / `hold` / `status` / `series-count` / `health`
 
@@ -164,6 +172,20 @@ export CARGO_TARGET_DIR=/tmp/rustboard-v033-target
 bash tests/e2e/v033.sh
 KEEP_E2E_TMP=1 bash tests/e2e/v033.sh   # 保留临时证书/日志
 ```
+
+`v034.sh` 会构建 hub/agent/panel，并用真实 enrollment 留下的证书 / secret 建立
+mTLS 会话验证 v0.3.4 的 KI-26/18/19/21/24；运行约 25s（不含首次编译），共 97 条
+断言。未显式设置 `CARGO_TARGET_DIR` 时脚本会使用 `<repo>/target/v034-t1` 作为隔离
+target；它不运行既有 8 套 e2e（CI 分别执行）：
+
+```bash
+bash tests/e2e/v034.sh
+KEEP_E2E_TMP=1 bash tests/e2e/v034.sh   # 保留临时证书/数据库/脱敏日志
+```
+
+失败时脚本会打印脱敏后的 hub/agent/panel 日志，并以非零码退出；不会为了通过而
+跳过或弱化断言。KI-21 场景会先用同版本 CLI 打开一次存储触发 SQLite checkpoint，
+再删除 WAL/SHM，确保测的是“权限收紧 + sidecar 重建”，而不是数据丢失。
 
 ## 范围说明
 

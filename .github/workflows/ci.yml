@@ -110,6 +110,9 @@ jobs:
       - name: v0.3.3 管理面安全回归
         run: bash tests/e2e/v033.sh
 
+      - name: v0.3.4 低风险硬化回归
+        run: bash tests/e2e/v034.sh
+
   web:
     name: web / tsc / build
     runs-on: ubuntu-latest
