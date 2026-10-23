@@ -9,7 +9,7 @@ use std::future::Future;
 use std::io::Read;
 use std::str::FromStr;
 use std::sync::Mutex;
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 use flate2::read::GzDecoder;
 use rustboard_core::archive::{
@@ -21,14 +21,7 @@ use rustboard_core::storage::sqlite::SqliteStorage;
 
 /// 单线程 block_on：测试里的 async mock 全部立即就绪，不需要 tokio 运行时。
 fn block_on<F: Future>(future: F) -> F::Output {
-    struct NoopWaker;
-    impl Wake for NoopWaker {
-        fn wake(self: std::sync::Arc<Self>) {}
-        fn wake_by_ref(self: &std::sync::Arc<Self>) {}
-    }
-
-    let waker = Waker::from(std::sync::Arc::new(NoopWaker));
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(Waker::noop());
     let mut future = std::pin::pin!(future);
     match future.as_mut().poll(&mut context) {
         Poll::Ready(value) => value,

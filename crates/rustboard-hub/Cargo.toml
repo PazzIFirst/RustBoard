@@ -21,6 +21,11 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 hmac = { workspace = true }
 reqwest = { workspace = true }
+# object_store 0.14 的 HTTP 传输使用 reqwest 0.13；显式启用 rustls（ring provider），
+# 避免 object_store 的 `aws` feature 拉入 aws-lc-rs。此别名不直接在代码中使用，
+# 只用于给 object_store 的传递依赖打开 TLS feature（provider 在 archive_s3.rs 安装）。
+reqwest13 = { package = "reqwest", version = "0.13.3", default-features = false, features = ["rustls-no-provider", "http2"] }
+object_store = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
 sha2 = { workspace = true }

@@ -55,6 +55,8 @@ use tower::ServiceExt;
 
 mod alerts;
 mod alerts_engine;
+#[allow(dead_code)] // C2b 归档 worker / 下载接线前，S3 ColdStore 暂无调用方
+mod archive_s3;
 mod auth;
 mod cert_rotation;
 mod channels;
