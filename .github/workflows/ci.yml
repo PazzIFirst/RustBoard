@@ -107,6 +107,9 @@ jobs:
       - name: v0.3.2 控制面可靠性回归
         run: bash tests/e2e/v032.sh
 
+      - name: v0.3.3 管理面安全回归
+        run: bash tests/e2e/v033.sh
+
   web:
     name: web / tsc / build
     runs-on: ubuntu-latest
