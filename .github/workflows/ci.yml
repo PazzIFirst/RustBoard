@@ -116,6 +116,9 @@ jobs:
       - name: v0.3.5 安全收口回归
         run: bash tests/e2e/v035.sh
 
+      - name: M4 告警与归档回归
+        run: bash tests/e2e/v040.sh
+
   web:
     name: web / tsc / build
     runs-on: ubuntu-latest
