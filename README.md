@@ -103,12 +103,13 @@ sudo $BIN/rustboard-hub agent add --name web-01
 sudo $BIN/rustboard-agent run &
 sudo $BIN/rustboard-agent info          # 随时查看纳管状态
 
-# 6) 查数据（管理端口用 ports 命令看；M2 起管理 API 需要 Bearer token）
+# 6) 查数据（管理端口用 ports 命令看；v0.3.3 起建议用 scoped token）
 ADMIN=$(sudo $BIN/rustboard-hub ports | awk '/管理 API 端口/{print $NF}')
-TOKEN=$(sudo $BIN/rustboard-hub admin-token)
+TOKEN=$(sudo $BIN/rustboard-hub token create --name panel-prod --scope write)
 curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$ADMIN/api/v1/agents"
 curl -s -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:$ADMIN/api/v1/agents/hub-self/series?metric=cpu.usage&from=0&to=9999999999999"
+# 旧 admin_token 仍兼容：rustboard-hub admin-token
 
 # 7) 构建并启动面板（默认只绑 127.0.0.1；远程访问请走 VPN/反代）
 (cd web && pnpm install --frozen-lockfile && pnpm build)
@@ -127,14 +128,50 @@ sudo $BIN/rustboard-panel ports        # 查看面板端口
   --admin-listen 127.0.0.1:18444 --san 127.0.0.1
 ```
 
+### 管理 API token 与 TLS
+
+v0.3.3 起管理 API 支持三级 scoped token（旧 `admin_token` 仍兼容）：
+
+```bash
+rustboard-hub token create --name panel-prod --scope write   # 明文只输出一次
+rustboard-hub token list                                     # TSV，不含明文/哈希
+rustboard-hub token rotate --name panel-prod                 # 旧 token 立即失效
+rustboard-hub token revoke --name panel-prod                 # 不删行，保留审计
+```
+
+- `read`：所有 GET；`write`：GET + 控制/设置；`admin`：全部（当前无 HTTP 管理接口）。
+- 审计 actor 记录 token name；旧 `admin_token` 固定为 `admin`，因此 `admin`
+  是保留名（大小写不敏感拒绝）。
+- 管理口默认只绑 `127.0.0.1:...` 明文。绑非回环时必须：
+  ```toml
+  admin_listen = "0.0.0.0:8444"
+  admin_tls = "required"       # 复用 server.crt / server.key（server-auth）
+  server_names = ["hub.example.com", "10.0.0.5"]  # 管理端访问名必须在 SAN 内
+  ```
+  否则拒绝启动。修改 `server_names` 后先 `rotate-cert --force`。
+- 管理证书复用 hub 的 `certs/server.crt`；Panel 连私有 CA 时配置 `hub_ca`。
+
 ### 远程面板
 
 面板默认只监听 `127.0.0.1`，且只提供明文 HTTP。推荐三种方式（按安全性排序）：
 
 1. **SSH 隧道（最简单）**：面板仍绑回环，浏览器侧建隧道
    `ssh -L 8080:127.0.0.1:<面板端口> user@hub-host`，然后访问 `http://127.0.0.1:8080`。
-2. **VPN / Tailscale**：只把面板绑到 VPN 地址并只对该网段放行，例如
-   `rustboard-panel init --listen 10.8.0.2:<端口> --hub http://10.8.0.1:<管理端口> --hub-token <token>`。
+   面板到 hub 也可继续走 `http://127.0.0.1:<管理端口>`（回环明文）。
+2. **VPN / Tailscale**：只把面板绑到 VPN 地址并只对该网段放行。v0.3.3 起
+   **非回环的 hub 管理口不允许明文 HTTP**：hub 需 `admin_tls = "required"`，
+   panel 的 `hub_url` 用 `https://...` 并配置 `hub_ca`（hub 的 `certs/ca.crt`），例如：
+   ```toml
+   # hub.toml
+   admin_listen = "10.8.0.1:8444"
+   admin_tls = "required"
+   server_names = ["10.8.0.1", "hub.example.com"]  # 管理端访问 IP 必须在 SAN 内
+
+   # panel.toml
+   hub_url = "https://10.8.0.1:8444"
+   hub_ca  = "/etc/rustboard/hub/certs/ca.crt"
+   ```
+   修改 `server_names` 后需 `rustboard-hub rotate-cert --force` 再重启/热加载。
 3. **同机反代 + TLS**：面板绑回环，由 nginx/Caddy 终止 TLS 并反向代理到面板。
    面板默认**不信任**任何 `X-Forwarded-*`；必须显式配置可信反代地址才采信：
    ```toml
@@ -145,9 +182,8 @@ sudo $BIN/rustboard-panel ports        # 查看面板端口
    反代需设置 `X-Forwarded-Proto: https` 并正确传递 `X-Forwarded-For`；未配置
    `trusted_proxies` 时所有 XFF/XFP 都被忽略，避免伪造头绕过登录限速或 Cookie 安全属性。
 
-已有配置如果仍是 `listen = "0.0.0.0:..."`，启动时只会打印明文 HTTP WARN，不会拒绝；
-请改成回环或 VPN 地址。面板访问 hub 的 HTTP 客户端强制直连（忽略 `HTTP_PROXY`），
-因此不能再依赖企业 HTTP 代理访问 hub。
+面板自身监听仍是明文 HTTP（M5 前不提供面板 TLS）；对外暴露必须走 VPN/SSH/反代。
+面板访问 hub 的 HTTP 客户端强制直连（忽略 `HTTP_PROXY`），且远程 `http://` 会拒绝启动。
 
 ## 端口
 
@@ -157,7 +193,7 @@ sudo $BIN/rustboard-panel ports        # 查看面板端口
 | 用途 | 默认端口 | 协议 | 暴露建议 |
 |---|---|---|---|
 | agent 接入 | 随机五位数 | WSS + mTLS | 必须公网可达 |
-| 管理 API | 随机五位数 | HTTP | 只绑回环/内网，远程面板走 VPN |
+| 管理 API | 随机五位数 | HTTP（回环）/ HTTPS（`admin_tls=required`） | 默认只绑回环；非回环必须 `admin_tls=required`，远程面板走 HTTPS + `hub_ca` |
 | 面板 | 随机五位数 | HTTP | 默认只绑回环；对外必须走 VPN/反代，M5 前不提供面板自身 TLS |
 
 随时在终端查看当前端口：

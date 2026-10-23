@@ -92,7 +92,7 @@
 - [x] KI-03：面板 `trusted_proxies` / `cookie_secure`；不可信 XFF/XFP 完全忽略
 - [x] KI-04：`admin_token` 强度校验（长度 / 字符集 / 多样性 / 占位符）
 - [x] KI-05：管理 API 每 IP 读 60/min、写 10/min，429 + `Retry-After`
-- [x] KI-06：管理端口非回环启动 WARN
+- [x] KI-06：v0.2.1 非回环启动 WARN；v0.3.3 起非回环 + `admin_tls=off` 拒绝启动
 - [x] KI-07：面板变更请求 Origin 同源校验
 - [x] KI-08：未知 `/api/v1/*` 先 Bearer 再 404
 - [x] KI-09：`rustboard-panel reset-password`
