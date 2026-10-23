@@ -60,6 +60,14 @@ x509-parser = "0.16"
 rustboard-common = { path = "crates/rustboard-common" }
 rustboard-core = { path = "crates/rustboard-core" }
 
+# M4-C3：vendored `russh` 0.60.3 + 它使用的 forked `ssh-key`，只删除 optional
+# `rsa` 依赖 / feature（含 `std` 中的弱引用 `rsa?/std` 与 `crypto` feature 里的
+# `rsa`），让 `cargo audit` 不再命中 RUSTSEC-2023-0071（rsa Marvin，无修复版本）。
+# 两个 crate 的 src 与 crates.io 发布包一致；重新生成方式见 vendor/README.md。
+[patch.crates-io]
+russh = { path = "vendor/russh" }
+internal-russh-forked-ssh-key = { path = "vendor/ssh-key" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -2,7 +2,7 @@
 //!
 //! 实现范围（方案 §7.1–7.4 / §10 C1、C2）：
 //!
-//! - [`build_store`]：按配置构造 WebDAV / S3 冷存储；SFTP 属于 C3，显式失败；
+//! - [`build_store`]：按配置构造 WebDAV / S3 / SFTP 冷存储；
 //! - [`spawn_archive_worker`]：仅 `archive.enabled = true` 时启动；每天 UTC
 //!   `schedule_hour_utc` 执行一次，启动时若今天已过计划时间且
 //!   `archive_state.last_archived_ts` 落后则立即补跑。任何错误只 WARN，
@@ -36,6 +36,7 @@ use rustboard_core::downsample::ArchiveGate;
 use rustboard_core::storage::sqlite::{ArchiveRawRow, SqliteStorage};
 use serde::Serialize;
 
+use crate::archive_sftp::SftpColdStore;
 use crate::archive_webdav::WebdavColdStore;
 
 /// `archive_state` 键：已成功归档到的排他时间边界（Unix 毫秒）。
@@ -111,9 +112,10 @@ pub(crate) struct ArchiveStatusOutput {
 
 /// 构建冷存储后端。
 ///
-/// - WebDAV / S3 只校验配置并构造客户端，**不发起网络请求**；
-/// - SFTP 属于 C3，尚未实现，显式失败而不是静默降级；
-/// - 任何构造错误都不包含后端 URL / 凭据（由各后端自身保证）。
+/// - WebDAV / S3 / SFTP 都只校验配置并构造客户端，**不发起网络请求**；
+/// - SFTP 构造时会校验主机密钥指纹格式，但连通性 / 认证由
+///   [`ColdStore::test`] 或 `archive test` 显式触发；
+/// - 任何构造错误都不包含后端 URL / 凭据 / 远端路径（由各后端自身保证）。
 pub(crate) fn build_store(cfg: &ArchiveConfig) -> Result<Arc<dyn ColdStore>> {
     match cfg.backend {
         ArchiveBackend::Webdav => {
@@ -126,7 +128,11 @@ pub(crate) fn build_store(cfg: &ArchiveConfig) -> Result<Arc<dyn ColdStore>> {
             let store = crate::archive_s3::build_s3_store(s3)?;
             Ok(Arc::new(store))
         }
-        ArchiveBackend::Sftp => bail!("归档后端 sftp 尚未实现（计划在 C3 提供）"),
+        ArchiveBackend::Sftp => {
+            let sftp = cfg.sftp.as_ref().context("缺少 [archive.sftp] 配置")?;
+            let store = SftpColdStore::new(sftp)?;
+            Ok(Arc::new(store))
+        }
     }
 }
 
@@ -1187,9 +1193,9 @@ mod tests {
         cfg
     }
 
-    /// S3 builder 只校验配置 / 构造客户端，不联网；`build_store` 应接受它。
+    /// S3 / SFTP builder 只校验配置 / 构造客户端，不联网；`build_store` 应接受它。
     #[test]
-    fn build_store_wires_webdav_and_s3_without_network() {
+    fn build_store_wires_webdav_s3_and_sftp_without_network() {
         let mut cfg = ArchiveConfig {
             enabled: true,
             webdav: Some(rustboard_common::config::ArchiveWebdavConfig {
@@ -1215,12 +1221,18 @@ mod tests {
             "缺少 S3 配置必须明确报错: {error:#}"
         );
 
-        // SFTP 属于 C3，即便配置完整也必须显式失败，不能静默降级。
+        // SFTP 构造只校验本地配置与指纹格式，不联网。
         cfg.backend = ArchiveBackend::Sftp;
-        let error = build_store(&cfg).err().expect("SFTP 必须失败");
+        cfg.sftp = Some(crate::archive_sftp::test_config());
+        let sftp = build_store(&cfg).unwrap();
+        drop(sftp);
+
+        // 缺少 [archive.sftp] 时给出明确错误，且不包含凭据 / 远端路径。
+        cfg.sftp = None;
+        let error = build_store(&cfg).err().expect("缺少 SFTP 配置必须失败");
         assert!(
-            format!("{error:#}").contains("sftp"),
-            "SFTP 必须显式报未实现: {error:#}"
+            format!("{error:#}").contains("archive.sftp"),
+            "缺少 SFTP 配置必须明确报错: {error:#}"
         );
     }
 

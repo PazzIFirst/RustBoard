@@ -27,6 +27,10 @@
   hub 新增 `GET /api/v1/archive/objects` 游标分页与
   `GET /api/v1/archive/objects/{id}/download`（read scope、64 MiB 内存上限、
   固定 502）；面板新增 `/archive` 数据页与 1 GiB 上限的流式下载代理
+- M4-C3：SFTP 冷存储（`russh` + `russh-sftp`，ring 后端）接入
+  `build_store` / `archive test` / `archive run`；支持密码或 ed25519 私钥
+  （私钥优先）、10s 连接超时、30s 空闲超时、逐级创建远端目录、1 GiB 读取
+  上限；主机密钥 `SHA256:` 指纹强校验，不匹配拒绝握手
 - M4 数据页：归档对象列表/下载、sha256/状态展示、`/archive` 页面
 
 ### Changed
@@ -61,13 +65,17 @@
   不进入 API/前端
 - 告警评估资源上限：raw-only 索引查询、每规则序列/状态 5000 上限、单轮预算、
   事件 100k/90 天、静默 1000/7 天
-- SFTP 后端尚未实现：`russh` 依赖在 Rust 1.87+ 仍带 `rsa` medium advisory
-  （RUSTSEC-2023-0071），审计 0 需 patch/vendor 或放弃；v0.4.0 不发布该后端，
-  待维护者决策
+- SFTP 连接强制校验配置的 `host_key_fingerprint`，拒绝任意主机密钥；密码 /
+  私钥 / 远端路径等错误只返回固定 `ArchiveError`，不进入日志或 API
+- SFTP 依赖通过 vendored `russh` + forked `ssh-key` 移除 optional `rsa`
+  （RUSTSEC-2023-0071），`cargo tree -i rsa` 无输出、`cargo audit` 为 0；
+  vendor 只改 manifest，源码与 crates.io 一致，详见 `vendor/README.md`
 
 ### Known
 
-- 归档 SFTP 未实现；WebDAV/S3 已接入，`archive.enabled` 但未配置后端时启动拒绝
+- C3 SFTP 单测不联网（指纹 / 路径 / 错误脱敏 / 构造），需按 M4 方案用真实
+  SFTP 服务器手工验证密码与 ed25519、目录创建、归档上传与下载
+- WebDAV/S3/SFTP 已接入；`archive.enabled` 但未配置对应后端时启动拒绝
 - KI-29 降采样 rowid 复用边界（低风险，v0.4.1）
 
 

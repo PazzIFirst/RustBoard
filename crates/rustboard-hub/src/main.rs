@@ -58,6 +58,7 @@ mod alerts;
 mod alerts_engine;
 mod archive;
 mod archive_s3;
+mod archive_sftp;
 mod archive_webdav;
 mod auth;
 mod cert_rotation;
@@ -812,9 +813,10 @@ fn archive_command(action: ArchiveAction) -> Result<()> {
 
 /// `archive test`：显式测试当前配置的冷存储后端（写入/读取/删除探针对象）。
 ///
-/// 支持 WebDAV 与 S3；成功输出 `{ok, backend}`，`backend` 是配置里的实际值。
-/// 失败返回固定 [`rustboard_core::archive::ArchiveError`]，不打印 URL / 用户名 /
-/// 密码 / 响应正文。测试不会启动 hub，也不需要证书。
+/// 支持 WebDAV、S3 与 SFTP；成功输出 `{ok, backend}`，`backend` 是配置里的
+/// 实际值。失败返回固定 [`rustboard_core::archive::ArchiveError`]，不打印
+/// URL / 用户名 / 密码 / 私钥路径 / 远端路径 / 响应正文。测试不会启动 hub，
+/// 也不需要证书。
 fn archive_test_json(config: Option<PathBuf>) -> Result<String> {
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
     let cfg = load_config(&path)?;
