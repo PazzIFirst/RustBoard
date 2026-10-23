@@ -2482,8 +2482,11 @@ async fn handle_session(
 
     loop {
         // 45s 内收不到任何帧就认为连接已死；agent 每 15s 发一次 Ping。
-        // `timeout_at` 使用固定 deadline，避免 select 其他分支完成时重置空闲计时。
-        let recv = tokio::time::timeout_at(idle.deadline(), socket.recv());
+        // 空闲超时是独立 select 分支：即使 recv / 控制队列 / 清理 tick 持续就绪，
+        // biased 也会在 deadline 时优先关闭连接，不会被其它分支饿死。
+        let recv = socket.recv();
+        let idle_sleep = tokio::time::sleep_until(idle.deadline());
+        tokio::pin!(idle_sleep);
         let event = tokio::select! {
             biased;
             changed = shutdown.changed(), if watch_shutdown => {
@@ -2493,6 +2496,7 @@ async fn handle_session(
                     Err(_) => SessionEvent::WatchClosed,
                 }
             }
+            _ = &mut idle_sleep => SessionEvent::IdleTimeout,
             // 清理优先于新控制命令：持续就绪的控制队列不能把 pending 超时清理
             // 推迟到方案承诺的 ≤2s 之外。shutdown 仍保持最高优先级。
             _ = control_expire.tick() => SessionEvent::ControlExpired,
@@ -2501,10 +2505,9 @@ async fn handle_session(
                 None => SessionEvent::ControlClosed,
             },
             received = recv => match received {
-                Err(_) => SessionEvent::IdleTimeout,
-                Ok(None) => SessionEvent::Closed,
-                Ok(Some(Err(err))) => SessionEvent::RecvError(err.to_string()),
-                Ok(Some(Ok(message))) => SessionEvent::Message(message),
+                None => SessionEvent::Closed,
+                Some(Err(err)) => SessionEvent::RecvError(err.to_string()),
+                Some(Ok(message)) => SessionEvent::Message(message),
             },
         };
 
@@ -3378,29 +3381,34 @@ mod tests {
         assert!(tokio::time::Instant::now() >= idle.deadline());
     }
 
-    /// 评审回归：用接近 `handle_session` 的 select 结构验证——持续 tick 完成时，
-    /// `timeout_at` 仍必须按期触发，不能被 tick 饿死（tokio 虚拟时间）。
+    /// 评审回归：控制命令队列持续就绪时，独立 idle 分支仍必须先触发关闭。
+    /// 用暂停时钟 + 始终就绪的控制 future 复现「biased 若把 idle 排后就被饿死」。
     #[tokio::test(start_paused = true)]
     async fn v032_idle_timeout_fires_despite_control_ticks() {
         let idle = SessionIdle::new(SESSION_IDLE_TIMEOUT);
+        let idle_sleep = tokio::time::sleep_until(idle.deadline());
+        tokio::pin!(idle_sleep);
         let mut ticks = tokio::time::interval(Duration::from_secs(1));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // 显式消费 t0 的即时 tick，避免 paused 时间首次推进的竞态。
-        let _ = ticks.tick().await;
 
         let mut idle_fired = false;
-        for _ in 0..60 {
+        for _ in 0..200 {
             tokio::select! {
                 biased;
-                _ = ticks.tick() => {}
-                _ = tokio::time::timeout_at(idle.deadline(), std::future::pending::<()>()) => {
+                _ = &mut idle_sleep => {
                     idle_fired = true;
                     break;
                 }
+                _ = ticks.tick() => {}
+                // 控制队列始终有命令；没有 timer 可以推进时手动拨动暂停时钟。
+                command = std::future::ready(Some(())) => {
+                    let _ = command;
+                    tokio::time::advance(Duration::from_secs(1)).await;
+                }
             }
         }
-        assert!(idle_fired, "持续 tick 不得饿死空闲超时");
-        // 虚拟时钟必须恰好停在 45s deadline：tick 没有把它推后。
+        assert!(idle_fired, "控制队列持续就绪时 idle 仍必须先触发关闭");
+        // 虚拟时钟必须恰好停在 45s deadline：tick / 控制命令都没有把它推后。
         assert_eq!(
             tokio::time::Instant::now(),
             idle.deadline(),
