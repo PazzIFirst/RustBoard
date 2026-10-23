@@ -240,6 +240,7 @@ docs/                 需求确认稿、实现进度
 ```bash
 cargo test --workspace --locked
 bash tests/e2e/security.sh
+bash tests/e2e/v035.sh   # v0.3.5 安全收口
 ```
 
 单元与集成测试覆盖：CPU/内存解析、计数器重置容纳、磁盘缓冲落盘与恢复、
@@ -251,6 +252,11 @@ SQLite 批次精确幂等与 v1/v2→v3 迁移、跨 epoch 乱序与 48h 判重�
 实际覆盖 9 项：正常采集与 online/offline、无客户端证书 Hello 被拒、
 证书 CN≠agent_id、跨 agent 伪造 Batch、多连接下线的状态语义、
 协议版本 1 收到 `bad_protocol`、吊销后 ≤3s 断开且重连被拒。
+
+`tests/e2e/v035.sh` 覆盖 v0.3.5 安全收口：同源 IP 的 WebSocket 连接上限
+（第 3 条拒绝、另一源 IP 可用、已有 agent 保持 online）、`data_dir` 中间符号链接
+拒绝启动且不触碰链接目标、外置 `database` 的启动 WARN 与 DB 0600、
+`admin_auth_failure_limit_per_min=0` 时错误 Bearer 仍返回 401 且首条 WARN 可见。
 
 ## License
 
