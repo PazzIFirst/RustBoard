@@ -448,7 +448,7 @@ impl<'a> RuleEvaluator<'a> {
                 .iter()
                 .any(|silence| silence.matches(&self.rule.id, agent_id, self.now));
             self.batch.events.push(alerts::new_alert_event(
-                self.rule, agent_id, kind, value, self.now, silenced,
+                self.rule, agent_id, series_key, kind, value, self.now, silenced,
             ));
             match kind {
                 AlertStateKind::Firing => self.batch.firing_events += 1,
@@ -815,6 +815,10 @@ mod tests {
             assert!(!event.silenced);
             assert!(event.message.contains("规则-disk"));
             assert!(!event.message.contains("mount"), "message 不能写 labels");
+            assert!(
+                !event.series_key.is_empty(),
+                "metric 事件必须携带当前序列键"
+            );
         }
 
         // 下一轮仍然超阈值：不重复产生 firing 事件。
@@ -1066,6 +1070,7 @@ mod tests {
         let events = storage.list_alert_events(10, None).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].agent_id, "a1");
+        assert_eq!(events[0].series_key, "", "合成规则事件序列键必须为空");
         assert!(events[0].message.contains("离线"));
         assert!(events[0].message.contains("120"));
 
@@ -1118,6 +1123,7 @@ mod tests {
         assert_eq!(state.state, AlertStateKind::Firing);
         assert_eq!(state.last_value, Some(47.0));
         let event = storage.list_alert_events(1, None).unwrap().pop().unwrap();
+        assert_eq!(event.series_key, "", "hub_cert 事件序列键必须为空");
         assert!(event.message.contains("证书"), "{event:?}");
         assert!(event.message.contains("47 小时"), "{event:?}");
         assert!(!event.message.contains('天'), "{event:?}");
@@ -1272,6 +1278,7 @@ mod tests {
                 rule_id: "gone".into(),
                 rule_name: "旧规则".into(),
                 agent_id: "a1".into(),
+                series_key: String::new(),
                 state: AlertStateKind::Resolved,
                 value: Some(1.0),
                 message: "旧事件".into(),
@@ -1570,6 +1577,7 @@ mod tests {
             rule_id: "gone".into(),
             rule_name: "旧规则".into(),
             agent_id: "a1".into(),
+            series_key: String::new(),
             state: AlertStateKind::Resolved,
             value: Some(1.0),
             message: "旧事件".into(),

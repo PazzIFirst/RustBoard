@@ -9,7 +9,8 @@
 //! - 每 tick 最多 [`NOTIFY_BATCH_LIMIT`] 条；tick 固定 5s，独立于评估间隔，
 //!   避免评估周期变大时通知延迟被同步放大；
 //! - 无规则 / 无渠道 / 渠道全禁用 / 冷却中 / 静默 / 恢复通知关闭都不会阻塞后续
-//!   事件：事件标记 `notified = 1` 并写入固定原因，不再永久重试；
+//!   事件：事件标记 `notified = 1` 并写入固定原因，不再永久重试；事件落库后新建
+//!   的静默在发送前重新检查，命中写 `silenced_late`；
 //! - 每个启用渠道独立发送；至少一个成功即视为已通知并更新
 //!   `alert_states.last_notified_at`；全部失败也标记，错误摘要只含渠道名与固定
 //!   错误码（≤512 字节），不含 secret / URL；
@@ -254,6 +255,20 @@ async fn process_event(
         return Ok(EventOutcome::Skipped);
     };
 
+    // 发送前重新检查当前生效静默：事件落库时还没静默、之后才创建的静默也必须
+    // 阻止发送。命中后标记 processed，避免下一轮重复检查。
+    let silences = {
+        let storage = storage.clone();
+        blocking(storage, move |storage| storage.list_active_silences(now)).await?
+    };
+    if silences
+        .iter()
+        .any(|silence| silence.matches(&event.rule_id, &event.agent_id, now))
+    {
+        mark_skipped(storage, event.id, "silenced_late").await?;
+        return Ok(EventOutcome::Skipped);
+    }
+
     // 恢复通知关闭：事件仍保留给面板，但不发送、不重试。
     if event.state == AlertStateKind::Resolved && !rule.notify_on_resolve {
         mark_skipped(storage, event.id, "resolve_disabled").await?;
@@ -261,26 +276,20 @@ async fn process_event(
     }
 
     // 冷却只限制 firing：恢复通知按方案 §6.3 不受 cooldown 限制。
-    // 事件表没有 series_key，因此同一 (rule_id, agent_id) 下取最近一次通知时间；
-    // 单规则多序列时冷却窗口按该 agent 的最保守值计算（见报告的已知边界）。
+    // 精确按 (rule_id, agent_id, series_key) 读取状态：同一 agent 的其它序列
+    // 刚发送过通知，不能阻断本序列的首次 firing。
     if event.state == AlertStateKind::Firing && rule.cooldown_secs > 0 {
-        let rule_id = rule.id.clone();
-        let states = {
+        let rule_id = event.rule_id.clone();
+        let agent_id = event.agent_id.clone();
+        let series_key = event.series_key.clone();
+        let state = {
             let storage = storage.clone();
             blocking(storage, move |storage| {
-                storage.list_alert_states_for_rule(
-                    &rule_id,
-                    crate::alerts_engine::MAX_ALERT_STATES_PER_RULE,
-                )
+                storage.get_alert_state(&rule_id, &agent_id, &series_key)
             })
             .await?
         };
-        let last_notified_at = states
-            .iter()
-            .filter(|state| state.agent_id == event.agent_id)
-            .filter_map(|state| state.last_notified_at)
-            .max();
-        if let Some(last_notified_at) = last_notified_at {
+        if let Some(last_notified_at) = state.and_then(|state| state.last_notified_at) {
             let cooldown_ms = i64::from(rule.cooldown_secs).saturating_mul(1_000);
             if now.saturating_sub(last_notified_at) < cooldown_ms {
                 mark_skipped(storage, event.id, "cooldown").await?;
@@ -349,31 +358,16 @@ async fn process_event(
 
     if successes > 0 {
         // 只有 firing 的通知时间参与冷却；恢复通知不刷新 cooldown 锚点。
+        // 只更新事件自身的序列，绝不扩散到同一 agent 的其它 series。
         if event.state == AlertStateKind::Firing {
-            let rule_id = rule.id.clone();
-            let states = {
-                let storage = storage.clone();
-                blocking(storage, move |storage| {
-                    storage.list_alert_states_for_rule(
-                        &rule_id,
-                        crate::alerts_engine::MAX_ALERT_STATES_PER_RULE,
-                    )
-                })
-                .await?
-            };
-            for state in states
-                .into_iter()
-                .filter(|state| state.agent_id == event.agent_id)
-            {
-                let storage = storage.clone();
-                let rule_id = state.rule_id.clone();
-                let agent_id = state.agent_id.clone();
-                let series_key = state.series_key.clone();
-                blocking(storage, move |storage| {
-                    storage.update_alert_state_notified(&rule_id, &agent_id, &series_key, now)
-                })
-                .await?;
-            }
+            let rule_id = event.rule_id.clone();
+            let agent_id = event.agent_id.clone();
+            let series_key = event.series_key.clone();
+            let storage = storage.clone();
+            blocking(storage, move |storage| {
+                storage.update_alert_state_notified(&rule_id, &agent_id, &series_key, now)
+            })
+            .await?;
         }
         let storage = storage.clone();
         let event_id = event.id;
@@ -433,7 +427,7 @@ where
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use rustboard_core::alerts::{AlertRule, AlertSource, AlertState, Comparator};
+    use rustboard_core::alerts::{AlertRule, AlertSilence, AlertSource, AlertState, Comparator};
     use rustboard_core::channels::{ChannelConfig, ChannelKind, Secret};
     use rustboard_core::storage::sqlite::SqliteStorage;
     use rustboard_core::storage::Storage;
@@ -483,13 +477,20 @@ mod tests {
         }
     }
 
-    fn event(rule_id: &str, agent_id: &str, state: AlertStateKind, silenced: bool) -> AlertEvent {
+    fn event(
+        rule_id: &str,
+        agent_id: &str,
+        series_key: &str,
+        state: AlertStateKind,
+        silenced: bool,
+    ) -> AlertEvent {
         AlertEvent {
             id: 0,
             ts: NOW,
             rule_id: rule_id.to_string(),
             rule_name: format!("规则-{rule_id}"),
             agent_id: agent_id.to_string(),
+            series_key: series_key.to_string(),
             state,
             value: Some(95.0),
             message: "测试事件".to_string(),
@@ -520,11 +521,16 @@ mod tests {
         storage.create_notification_channel(channel).unwrap();
     }
 
-    fn firing_state(rule_id: &str, agent_id: &str, last_notified_at: Option<i64>) -> AlertState {
+    fn firing_state(
+        rule_id: &str,
+        agent_id: &str,
+        series_key: &str,
+        last_notified_at: Option<i64>,
+    ) -> AlertState {
         AlertState {
             rule_id: rule_id.to_string(),
             agent_id: agent_id.to_string(),
-            series_key: "series-1".to_string(),
+            series_key: series_key.to_string(),
             state: AlertStateKind::Firing,
             since: NOW - 10_000,
             last_eval_at: NOW,
@@ -546,11 +552,23 @@ mod tests {
 
         let first = insert_event(
             &storage,
-            event("rule-old", "agent-1", AlertStateKind::Firing, false),
+            event(
+                "rule-old",
+                "agent-1",
+                "series-1",
+                AlertStateKind::Firing,
+                false,
+            ),
         );
         let second = insert_event(
             &storage,
-            event("rule-old", "agent-1", AlertStateKind::Firing, false),
+            event(
+                "rule-old",
+                "agent-1",
+                "series-1",
+                AlertStateKind::Firing,
+                false,
+            ),
         );
         let cursor = initialize_notify_cursor(&storage, NOW).unwrap();
         assert_eq!(cursor, second);
@@ -568,7 +586,13 @@ mod tests {
         // 新事件正常发送并推进游标。
         let third = insert_event(
             &storage,
-            event("rule-old", "agent-1", AlertStateKind::Firing, false),
+            event(
+                "rule-old",
+                "agent-1",
+                "series-1",
+                AlertStateKind::Firing,
+                false,
+            ),
         );
         let report = notify_once(storage.clone(), mock.clone(), report.cursor, NOW + 1)
             .await
@@ -607,13 +631,19 @@ mod tests {
         seed_rule(&storage, &rule);
         seed_channel(&storage, &channel);
         storage
-            .upsert_alert_state(&firing_state(&rule.id, "agent-1", None))
+            .upsert_alert_state(&firing_state(&rule.id, "agent-1", "series-1", None))
             .unwrap();
 
         let cursor = initialize_notify_cursor(&storage, NOW).unwrap();
         let event_id = insert_event(
             &storage,
-            event(&rule.id, "agent-1", AlertStateKind::Firing, false),
+            event(
+                &rule.id,
+                "agent-1",
+                "series-1",
+                AlertStateKind::Firing,
+                false,
+            ),
         );
         let report = notify_once(storage.clone(), mock.clone(), cursor, NOW + 1)
             .await
@@ -648,13 +678,24 @@ mod tests {
         seed_rule(&storage, &rule);
         seed_channel(&storage, &channel);
         storage
-            .upsert_alert_state(&firing_state(&rule.id, "agent-1", Some(NOW - 1_000)))
+            .upsert_alert_state(&firing_state(
+                &rule.id,
+                "agent-1",
+                "series-1",
+                Some(NOW - 1_000),
+            ))
             .unwrap();
 
         let cursor = initialize_notify_cursor(&storage, NOW).unwrap();
         let firing = insert_event(
             &storage,
-            event(&rule.id, "agent-1", AlertStateKind::Firing, false),
+            event(
+                &rule.id,
+                "agent-1",
+                "series-1",
+                AlertStateKind::Firing,
+                false,
+            ),
         );
         let report = notify_once(storage.clone(), mock.clone(), cursor, NOW + 1)
             .await
@@ -666,12 +707,18 @@ mod tests {
         assert_eq!(stored.notify_error, "cooldown");
 
         // 恢复通知不受 cooldown 限制；发送成功后也不更新 last_notified_at。
-        let mut resolved_state = firing_state(&rule.id, "agent-1", Some(NOW - 1_000));
+        let mut resolved_state = firing_state(&rule.id, "agent-1", "series-1", Some(NOW - 1_000));
         resolved_state.state = AlertStateKind::Resolved;
         storage.upsert_alert_state(&resolved_state).unwrap();
         let resolved = insert_event(
             &storage,
-            event(&rule.id, "agent-1", AlertStateKind::Resolved, false),
+            event(
+                &rule.id,
+                "agent-1",
+                "series-1",
+                AlertStateKind::Resolved,
+                false,
+            ),
         );
         let report = notify_once(storage.clone(), mock.clone(), report.cursor, NOW + 2)
             .await
@@ -713,26 +760,40 @@ mod tests {
         let ids = [
             insert_event(
                 &storage,
-                event(&no_channel.id, "agent-1", AlertStateKind::Firing, false),
-            ),
-            insert_event(
-                &storage,
                 event(
-                    &missing_channel.id,
+                    &no_channel.id,
                     "agent-1",
+                    "series-1",
                     AlertStateKind::Firing,
                     false,
                 ),
             ),
             insert_event(
                 &storage,
-                event(&disabled.id, "agent-1", AlertStateKind::Firing, false),
+                event(
+                    &missing_channel.id,
+                    "agent-1",
+                    "series-1",
+                    AlertStateKind::Firing,
+                    false,
+                ),
+            ),
+            insert_event(
+                &storage,
+                event(
+                    &disabled.id,
+                    "agent-1",
+                    "series-1",
+                    AlertStateKind::Firing,
+                    false,
+                ),
             ),
             insert_event(
                 &storage,
                 event(
                     "rule-does-not-exist",
                     "agent-1",
+                    "series-1",
                     AlertStateKind::Firing,
                     false,
                 ),
@@ -771,7 +832,7 @@ mod tests {
         partial.channel_ids = vec![first.id.clone(), second.id.clone()];
         seed_rule(&storage, &partial);
         storage
-            .upsert_alert_state(&firing_state(&partial.id, "agent-1", None))
+            .upsert_alert_state(&firing_state(&partial.id, "agent-1", "series-1", None))
             .unwrap();
 
         let cursor = initialize_notify_cursor(&storage, NOW).unwrap();
@@ -779,7 +840,13 @@ mod tests {
         mock.push_result(Err(NotifyError::Timeout));
         let event_id = insert_event(
             &storage,
-            event(&partial.id, "agent-1", AlertStateKind::Firing, false),
+            event(
+                &partial.id,
+                "agent-1",
+                "series-1",
+                AlertStateKind::Firing,
+                false,
+            ),
         );
         let report = notify_once(storage.clone(), mock.clone(), cursor, NOW + 1)
             .await
@@ -804,11 +871,17 @@ mod tests {
         all_fail.channel_ids = vec![first.id.clone(), second.id.clone()];
         seed_rule(&storage, &all_fail);
         storage
-            .upsert_alert_state(&firing_state(&all_fail.id, "agent-1", None))
+            .upsert_alert_state(&firing_state(&all_fail.id, "agent-1", "series-1", None))
             .unwrap();
         let failed_id = insert_event(
             &storage,
-            event(&all_fail.id, "agent-1", AlertStateKind::Firing, false),
+            event(
+                &all_fail.id,
+                "agent-1",
+                "series-1",
+                AlertStateKind::Firing,
+                false,
+            ),
         );
         let report = notify_once(storage.clone(), failing.clone(), report.cursor, NOW + 2)
             .await
@@ -850,12 +923,24 @@ mod tests {
 
         let silenced = insert_event(
             &storage,
-            event(&rule.id, "agent-1", AlertStateKind::Firing, true),
+            event(
+                &rule.id,
+                "agent-1",
+                "series-1",
+                AlertStateKind::Firing,
+                true,
+            ),
         );
         for _ in 0..(NOTIFY_BATCH_LIMIT + 1) {
             insert_event(
                 &storage,
-                event(&rule.id, "agent-1", AlertStateKind::Firing, false),
+                event(
+                    &rule.id,
+                    "agent-1",
+                    "series-1",
+                    AlertStateKind::Firing,
+                    false,
+                ),
             );
         }
 
@@ -876,6 +961,109 @@ mod tests {
         assert_eq!(mock.send_count(), NOTIFY_BATCH_LIMIT + 1);
     }
 
+    /// 冷却按 (rule, agent, series) 精确比较：同 agent 的 A 序列发送后，B 序列
+    /// 首次 firing 不能被 A 的通知时间误判成冷却中。
+    #[tokio::test]
+    async fn m4_b2b_worker_cooldown_is_per_series() {
+        let storage = Arc::new(SqliteStorage::open_in_memory().unwrap());
+        let mock = Arc::new(MockNotifier::new());
+        let mut rule = rule("rule-two-series", 1_800);
+        let channel = channel("双序列渠道", true);
+        rule.channel_ids = vec![channel.id.clone()];
+        seed_rule(&storage, &rule);
+        seed_channel(&storage, &channel);
+        storage
+            .upsert_alert_state(&firing_state(&rule.id, "agent-1", "series-a", None))
+            .unwrap();
+        storage
+            .upsert_alert_state(&firing_state(&rule.id, "agent-1", "series-b", None))
+            .unwrap();
+
+        let cursor = initialize_notify_cursor(&storage, NOW).unwrap();
+        let a = insert_event(
+            &storage,
+            event(
+                &rule.id,
+                "agent-1",
+                "series-a",
+                AlertStateKind::Firing,
+                false,
+            ),
+        );
+        let b = insert_event(
+            &storage,
+            event(
+                &rule.id,
+                "agent-1",
+                "series-b",
+                AlertStateKind::Firing,
+                false,
+            ),
+        );
+        let report = notify_once(storage.clone(), mock.clone(), cursor, NOW + 1)
+            .await
+            .unwrap();
+        assert_eq!(report.sent, 2, "两个序列都必须发送");
+        assert_eq!(mock.send_count(), 2);
+        assert!(stored_event(&storage, a).notified);
+        assert!(stored_event(&storage, b).notified);
+        for series in ["series-a", "series-b"] {
+            let state = storage
+                .get_alert_state(&rule.id, "agent-1", series)
+                .unwrap()
+                .expect("状态必须存在");
+            assert_eq!(
+                state.last_notified_at,
+                Some(NOW + 1),
+                "{series} 必须在自己的序列上记录通知时间"
+            );
+        }
+    }
+
+    /// 事件落库后新建的静默：发送前重新检查当前生效静默，命中不发送。
+    #[tokio::test]
+    async fn m4_b2b_worker_rechecks_late_silence_before_send() {
+        let storage = Arc::new(SqliteStorage::open_in_memory().unwrap());
+        let mock = Arc::new(MockNotifier::new());
+        let mut rule = rule("rule-late-silence", 0);
+        let channel = channel("晚到静默渠道", true);
+        rule.channel_ids = vec![channel.id.clone()];
+        seed_rule(&storage, &rule);
+        seed_channel(&storage, &channel);
+
+        let cursor = initialize_notify_cursor(&storage, NOW).unwrap();
+        let event_id = insert_event(
+            &storage,
+            event(
+                &rule.id,
+                "agent-1",
+                "series-1",
+                AlertStateKind::Firing,
+                false,
+            ),
+        );
+        // 先事件、后静默：事件落库时还未命中静默。
+        storage
+            .create_alert_silence(&AlertSilence {
+                id: 0,
+                rule_id: Some(rule.id.clone()),
+                agent_id: Some("agent-1".to_string()),
+                until_ts: NOW + 60_000,
+                created_by: "admin".to_string(),
+                created_at: NOW + 1,
+            })
+            .unwrap();
+
+        let report = notify_once(storage.clone(), mock.clone(), cursor, NOW + 2)
+            .await
+            .unwrap();
+        assert_eq!(report.skipped, 1);
+        assert_eq!(mock.send_count(), 0, "晚到静默必须阻止发送");
+        let stored = stored_event(&storage, event_id);
+        assert!(stored.notified);
+        assert_eq!(stored.notify_error, "silenced_late");
+    }
+
     /// 恢复通知关闭：标记 resolve_disabled，不发送。
     #[tokio::test]
     async fn m4_b2b_worker_resolve_disabled_is_marked() {
@@ -890,14 +1078,20 @@ mod tests {
         storage
             .upsert_alert_state(&AlertState {
                 state: AlertStateKind::Resolved,
-                ..firing_state(&rule.id, "agent-1", None)
+                ..firing_state(&rule.id, "agent-1", "series-1", None)
             })
             .unwrap();
 
         let cursor = initialize_notify_cursor(&storage, NOW).unwrap();
         let id = insert_event(
             &storage,
-            event(&rule.id, "agent-1", AlertStateKind::Resolved, false),
+            event(
+                &rule.id,
+                "agent-1",
+                "series-1",
+                AlertStateKind::Resolved,
+                false,
+            ),
         );
         let report = notify_once(storage.clone(), mock.clone(), cursor, NOW + 1)
             .await

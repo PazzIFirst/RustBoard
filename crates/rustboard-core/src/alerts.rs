@@ -753,6 +753,11 @@ pub struct AlertEvent {
     pub rule_name: String,
     /// agent id；全局事件为空字符串。
     pub agent_id: String,
+    /// 产生事件的状态序列键；合成规则（agent_offline / hub_cert）为空字符串。
+    ///
+    /// 通知 worker 用 `(rule_id, agent_id, series_key)` 精确定位
+    /// `alert_states.last_notified_at`，避免同一 agent 的多序列互相触发冷却。
+    pub series_key: String,
     /// 事件状态：firing / resolved。
     pub state: AlertStateKind,
     /// 触发 / 恢复时的观测值。
@@ -1065,6 +1070,7 @@ pub fn next_alert_state(
 pub fn new_alert_event(
     rule: &AlertRule,
     agent_id: &str,
+    series_key: &str,
     state: AlertStateKind,
     value: f64,
     now: i64,
@@ -1080,6 +1086,7 @@ pub fn new_alert_event(
         rule_id: rule.id.clone(),
         rule_name: rule.name.clone(),
         agent_id: agent_id.to_string(),
+        series_key: series_key.to_string(),
         state,
         value: value.is_finite().then_some(value),
         message: alert_event_message(rule, agent_id, state, value),
@@ -1898,12 +1905,21 @@ mod tests {
     #[test]
     fn m4_b1b_new_event_defaults_to_not_notified() {
         let rule = base_rule();
-        let event = new_alert_event(&rule, "agent-1", AlertStateKind::Firing, 95.0, 7_000, true);
+        let event = new_alert_event(
+            &rule,
+            "agent-1",
+            "series-1",
+            AlertStateKind::Firing,
+            95.0,
+            7_000,
+            true,
+        );
         assert_eq!(event.id, 0);
         assert_eq!(event.ts, 7_000);
         assert_eq!(event.rule_id, "rule-1");
         assert_eq!(event.rule_name, "磁盘告警");
         assert_eq!(event.agent_id, "agent-1");
+        assert_eq!(event.series_key, "series-1");
         assert_eq!(event.state, AlertStateKind::Firing);
         assert_eq!(event.value, Some(95.0));
         assert!(!event.notified);
@@ -1913,6 +1929,7 @@ mod tests {
         let nan = new_alert_event(
             &rule,
             "agent-1",
+            "series-1",
             AlertStateKind::Resolved,
             f64::NAN,
             7_000,

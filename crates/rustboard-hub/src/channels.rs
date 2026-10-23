@@ -248,12 +248,12 @@ pub(crate) async fn delete_channel(
 
 /// `POST /api/v1/alerts/channels/{id}/test`：用已保存配置发送固定测试消息。
 ///
-/// 成功 200 `{"ok":true}`；任何发送失败统一 502 `notify_failed`，日志只记录
-/// 渠道 id / kind / 固定错误码，不记录 URL、token 或上游响应正文。
+/// 成功 204；任何发送失败统一 502 `notify_failed`，日志只记录渠道 id / kind /
+/// 固定错误码，不记录 URL、token 或上游响应正文。
 pub(crate) async fn test_channel(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<StatusCode, ApiError> {
     let storage = state.storage.clone();
     let channel = run_blocking(move || storage.get_notification_channel(&id)).await?;
     let Some(channel) = channel else {
@@ -261,7 +261,7 @@ pub(crate) async fn test_channel(
     };
 
     match state.notifier.test(&channel).await {
-        Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
         Err(error) => {
             tracing::warn!(
                 channel_id = %channel.id,
@@ -652,8 +652,8 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, json!({"ok": true}));
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(body, Value::Null);
         let sent = mock.sent();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].channel_id, id);

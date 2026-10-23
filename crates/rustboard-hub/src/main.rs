@@ -2917,6 +2917,11 @@ fn build_series_response(
 enum ApiError {
     Internal(anyhow::Error),
     BadRequest(String),
+    /// 请求体字段验证失败且需要稳定错误码（例如引用不存在的通知渠道）。
+    BadRequestCode {
+        code: &'static str,
+        message: String,
+    },
     NotFound(String),
     /// 已认证但操作被业务规则拒绝（例如删除内置告警规则）：403 + 固定错误码。
     Forbidden {
@@ -2941,6 +2946,13 @@ enum ApiError {
 impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self::BadRequest(message.into())
+    }
+
+    fn bad_request_code(code: &'static str, message: impl Into<String>) -> Self {
+        Self::BadRequestCode {
+            code,
+            message: message.into(),
+        }
     }
 
     fn not_found(message: impl Into<String>) -> Self {
@@ -3001,6 +3013,11 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(message) => (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": "bad_request", "message": message })),
+            )
+                .into_response(),
+            ApiError::BadRequestCode { code, message } => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": code, "message": message })),
             )
                 .into_response(),
             ApiError::NotFound(message) => (

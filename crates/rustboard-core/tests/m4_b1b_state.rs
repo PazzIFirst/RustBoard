@@ -132,6 +132,7 @@ fn manual_event(ts: i64, rule_name: &str) -> AlertEvent {
         rule_id: "rule-cpu".to_string(),
         rule_name: rule_name.to_string(),
         agent_id: "agent-01".to_string(),
+        series_key: "series-1".to_string(),
         state: AlertStateKind::Firing,
         value: Some(95.0),
         message: format!("规则「{rule_name}」触发：CPU 使用率过高"),
@@ -713,7 +714,15 @@ fn alert_events_roundtrip_pagination_and_prune_order() {
     );
 
     // new_alert_event：字段完整性、silenced 往返、B1b 默认 notified=false / 空错误。
-    let generated = new_alert_event(&rule, "agent-01", AlertStateKind::Firing, 95.5, now, true);
+    let generated = new_alert_event(
+        &rule,
+        "agent-01",
+        "series-1",
+        AlertStateKind::Firing,
+        95.5,
+        now,
+        true,
+    );
     assert_eq!(generated.id, 0, "新事件 id 必须为 0，由存储层回填");
     assert!(!generated.notified, "B1b 新事件 notified 必须为 false");
     assert_eq!(
@@ -1303,7 +1312,15 @@ fn alert_event_state_retry_is_at_least_once_and_events_stay_immutable() {
         .clone()
         .expect("首次满足必须写入 firing 状态");
     assert_eq!(transition.event, Some(AlertStateKind::Firing));
-    let event = new_alert_event(&rule, agent, AlertStateKind::Firing, 95.0, now, false);
+    let event = new_alert_event(
+        &rule,
+        agent,
+        series,
+        AlertStateKind::Firing,
+        95.0,
+        now,
+        false,
+    );
     let first_event_id = storage
         .insert_alert_event(&event)
         .expect("插入第一轮事件失败");
@@ -1326,7 +1343,15 @@ fn alert_event_state_retry_is_at_least_once_and_events_stay_immutable() {
         "同一输入重试必须得到相同状态"
     );
     assert_eq!(retry.event, Some(AlertStateKind::Firing));
-    let retry_event = new_alert_event(&rule, agent, AlertStateKind::Firing, 95.0, now, false);
+    let retry_event = new_alert_event(
+        &rule,
+        agent,
+        series,
+        AlertStateKind::Firing,
+        95.0,
+        now,
+        false,
+    );
     let second_event_id = storage
         .insert_alert_event(&retry_event)
         .expect("插入重试事件失败");
@@ -1406,6 +1431,7 @@ fn alert_event_state_retry_is_at_least_once_and_events_stay_immutable() {
     let resolved_event = new_alert_event(
         &renamed,
         agent,
+        series,
         AlertStateKind::Resolved,
         10.0,
         now + 30_000,

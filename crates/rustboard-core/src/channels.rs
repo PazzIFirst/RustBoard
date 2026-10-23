@@ -762,6 +762,7 @@ mod tests {
             rule_id: "rule-1".to_string(),
             rule_name: "磁盘告警".to_string(),
             agent_id: "agent-1".to_string(),
+            series_key: "series-1".to_string(),
             state,
             value: Some(91.5),
             message: "agent agent-1 指标「disk.used_percent」当前值 91.5，阈值 >= 90".to_string(),

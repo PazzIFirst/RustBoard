@@ -701,7 +701,7 @@ fn v7_key_columns_primary_keys_and_unique_constraints() {
     assert_default(&rule_cols, "is_builtin", "0");
     assert_default(&rule_cols, "updated_by", "");
 
-    // 告警事件表：方案 §4.2 的全部 11 列（id 同样是未显式 NOT NULL 的主键）。
+    // 告警事件表：方案 §4.2 的 11 列 + B2b 的 series_key（共 12 列）。
     assert_columns(
         &conn,
         "alert_events",
@@ -711,6 +711,7 @@ fn v7_key_columns_primary_keys_and_unique_constraints() {
             ("rule_id", "TEXT", true),
             ("rule_name", "TEXT", true),
             ("agent_id", "TEXT", true),
+            ("series_key", "TEXT", true),
             ("state", "TEXT", true),
             ("value", "REAL", false),
             ("message", "TEXT", true),
@@ -720,6 +721,8 @@ fn v7_key_columns_primary_keys_and_unique_constraints() {
         ],
     );
     assert_primary_key(&conn, "alert_events", &["id"]);
+    let event_cols = columns(&conn, "alert_events");
+    assert_default(&event_cols, "series_key", "");
 
     // 归档对象表：方案 §4.3 的全部 14 列（id 同样是未显式 NOT NULL 的主键）。
     assert_columns(
@@ -1173,4 +1176,57 @@ fn m4_a1_samples_1m_primary_key_rejects_duplicate() {
         .query_row("SELECT COUNT(*) FROM samples_1m", [], |row| row.get(0))
         .expect("统计 samples_1m 行数失败");
     assert_eq!(count, 3);
+}
+
+// ---------------------------------------------------------------------------
+// 用例 5：B2b 首版 v7 的 alert_events 缺 series_key，打开时纯新增补齐。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v7_alert_events_gains_series_key_on_existing_database() {
+    let dir = TempDbDir::new("event-series-key");
+    {
+        let conn = Connection::open(dir.db_path()).expect("创建旧 v7 库失败");
+        conn.execute_batch(
+            r#"
+            PRAGMA user_version = 7;
+            CREATE TABLE alert_events (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts           INTEGER NOT NULL,
+                rule_id      TEXT NOT NULL,
+                rule_name    TEXT NOT NULL,
+                agent_id     TEXT NOT NULL DEFAULT '',
+                state        TEXT NOT NULL,
+                value        REAL,
+                message      TEXT NOT NULL DEFAULT '',
+                notified     INTEGER NOT NULL DEFAULT 0,
+                notify_error TEXT NOT NULL DEFAULT '',
+                silenced     INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO alert_events
+                (ts, rule_id, rule_name, agent_id, state, value, message, notified, notify_error, silenced)
+            VALUES
+                (1700000000000, 'rule-old', '旧规则', 'agent-1', 'firing', 95.0, '旧事件', 0, '', 0);
+            "#,
+        )
+        .expect("建旧 v7 alert_events 失败");
+    }
+
+    let storage = open_storage(&dir);
+    let events = storage
+        .list_alert_events(10, None)
+        .expect("读取迁移后事件失败");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].series_key, "", "旧事件必须补空序列键");
+    assert_eq!(events[0].rule_id, "rule-old");
+    drop(storage);
+
+    let conn = Connection::open(dir.db_path()).expect("打开迁移后库失败");
+    assert_eq!(user_version(&conn), 7, "补列不得提升 schema 版本");
+    let event_cols = columns(&conn, "alert_events");
+    assert!(
+        event_cols.iter().any(|column| column.name == "series_key"),
+        "旧 v7 库必须自动补 series_key 列"
+    );
+    assert_default(&event_cols, "series_key", "");
 }

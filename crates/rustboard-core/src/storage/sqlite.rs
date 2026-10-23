@@ -280,6 +280,7 @@ CREATE TABLE IF NOT EXISTS alert_events (
     rule_id      TEXT NOT NULL,
     rule_name    TEXT NOT NULL,
     agent_id     TEXT NOT NULL DEFAULT '',
+    series_key   TEXT NOT NULL DEFAULT '',
     state        TEXT NOT NULL,
     value        REAL,
     message      TEXT NOT NULL DEFAULT '',
@@ -1020,6 +1021,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     // v7：M4 降采样 / 告警 / 归档 / 维护水位表。纯新增，旧版本二进制忽略这些表；
     // 带 IF NOT EXISTS，迁移中断或重复打开都不会重复建表。
     tx.execute_batch(M4_SCHEMA)?;
+    // 旧 v7 库（B2b 首次落地）的 alert_events 没有 series_key；纯新增列，
+    // 不提升 user_version，历史事件自动补空串，通知 worker 按空序列处理。
+    ensure_alert_events_series_key(&tx)?;
 
     if version < SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1030,6 +1034,22 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         );
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// 为旧 v7 库补 `alert_events.series_key`（`CREATE TABLE IF NOT EXISTS` 不会
+/// 修改已存在的表）。每次打开都检查 `PRAGMA table_info`，列已存在时零写入。
+fn ensure_alert_events_series_key(tx: &Transaction<'_>) -> Result<()> {
+    let columns = {
+        let mut stmt = tx.prepare("PRAGMA table_info(alert_events)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if columns.iter().any(|column| column == "series_key") {
+        return Ok(());
+    }
+    tx.execute_batch("ALTER TABLE alert_events ADD COLUMN series_key TEXT NOT NULL DEFAULT ''")?;
+    tracing::info!("alert_events 已补充 series_key 列（历史事件补空串）");
     Ok(())
 }
 
@@ -2110,16 +2130,17 @@ const ALERT_STATE_COLUMNS: &str =
     "rule_id, agent_id, series_key, state, since, last_eval_at, last_value, last_notified_at";
 
 /// `alert_events` 的 SELECT 列表；列顺序与 [`alert_event_from_row`] 一一对应。
-const ALERT_EVENT_COLUMNS: &str = "id, ts, rule_id, rule_name, agent_id, state, value, message, \
-     notified, notify_error, silenced";
+const ALERT_EVENT_COLUMNS: &str = "id, ts, rule_id, rule_name, agent_id, series_key, state, \
+     value, message, notified, notify_error, silenced";
 
 /// `alert_silences` 的 SELECT 列表；列顺序与 [`alert_silence_from_row`] 一一对应。
 const ALERT_SILENCE_COLUMNS: &str = "id, rule_id, agent_id, until_ts, created_by, created_at";
 
 /// 插入一条事件；单条插入与批量事务共用。
 const ALERT_EVENT_INSERT_SQL: &str = "INSERT INTO alert_events
-        (ts, rule_id, rule_name, agent_id, state, value, message, notified, notify_error, silenced)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+        (ts, rule_id, rule_name, agent_id, series_key, state, value, message, notified,
+         notify_error, silenced)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
 
 /// 插入或整行更新一条状态；单条 upsert 与批量事务共用。
 const ALERT_STATE_UPSERT_SQL: &str = "INSERT INTO alert_states
@@ -2196,6 +2217,7 @@ fn insert_alert_transitions(
                 event.rule_id,
                 event.rule_name,
                 event.agent_id,
+                event.series_key,
                 event.state.as_str(),
                 event.value,
                 event.message,
@@ -2281,23 +2303,24 @@ fn alert_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertState>
 
 /// 一行 `alert_events` 映射成 [`AlertEvent`]；`state` 只允许 firing / resolved。
 fn alert_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertEvent> {
-    let state: String = row.get(5)?;
+    let state: String = row.get(6)?;
     let state = AlertStateKind::parse(&state)
         .filter(|state| state.is_event())
-        .ok_or_else(|| alert_table_column_error("alert_events", "state", 5))?;
-    let notified: i64 = row.get(8)?;
-    let silenced: i64 = row.get(10)?;
+        .ok_or_else(|| alert_table_column_error("alert_events", "state", 6))?;
+    let notified: i64 = row.get(9)?;
+    let silenced: i64 = row.get(11)?;
     Ok(AlertEvent {
         id: row.get(0)?,
         ts: row.get(1)?,
         rule_id: row.get(2)?,
         rule_name: row.get(3)?,
         agent_id: row.get(4)?,
+        series_key: row.get(5)?,
         state,
-        value: row.get(6)?,
-        message: row.get(7)?,
+        value: row.get(7)?,
+        message: row.get(8)?,
         notified: notified != 0,
-        notify_error: row.get(9)?,
+        notify_error: row.get(10)?,
         silenced: silenced != 0,
     })
 }
@@ -2424,6 +2447,7 @@ impl SqliteStorage {
                 event.rule_id,
                 event.rule_name,
                 event.agent_id,
+                event.series_key,
                 event.state.as_str(),
                 event.value,
                 event.message,
@@ -6684,6 +6708,7 @@ mod tests {
             rule_id: "rule-1".into(),
             rule_name: "磁盘告警".into(),
             agent_id: "agent-1".into(),
+            series_key: "series-1".into(),
             state,
             value: Some(95.0),
             message:
@@ -7511,6 +7536,7 @@ mod tests {
             rule_id: "rule-1".into(),
             rule_name: "规则".into(),
             agent_id: "agent-1".into(),
+            series_key: "series-1".into(),
             state: AlertStateKind::Firing,
             value: Some(91.0),
             message: "触发".into(),
@@ -7568,6 +7594,7 @@ mod tests {
             rule_id: "rule-1".into(),
             rule_name: "规则".into(),
             agent_id: "agent-1".into(),
+            series_key: "series-1".into(),
             state: AlertStateKind::Firing,
             value: Some(91.0),
             message: "触发".into(),

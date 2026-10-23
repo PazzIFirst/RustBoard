@@ -22,6 +22,8 @@
 //! - 事件响应包含 `silenced` / `notified` / `notify_error`，但 B1b 的 `notified`
 //!   恒为 false，且不包含任何 secret。
 
+use std::sync::Arc;
+
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Path, RawQuery, State};
 use axum::http::StatusCode;
@@ -32,6 +34,7 @@ use rustboard_core::alerts::{
     AlertEvent, AlertRule, AlertRuleInput, AlertRuleStoreError, AlertSilence, AlertSilenceInput,
     AlertSilenceStoreError, AlertSource, Comparator, MAX_ALERT_RULES, MAX_ALERT_SILENCES,
 };
+use rustboard_core::storage::sqlite::SqliteStorage;
 use rustboard_core::storage::Storage;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -149,6 +152,53 @@ pub(crate) async fn list_rules(
     Ok(Json(rules))
 }
 
+/// 规则引用的渠道校验结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleChannelIssue {
+    Missing,
+    Disabled,
+}
+
+/// 保存 / 更新规则前校验 `channel_ids`：每个渠道必须存在且处于启用状态。
+///
+/// 渠道被删除时存储层会拒绝（409 `channel_in_use`），但直接提交一个不存在的
+/// 渠道 id 仍会生成永不发送的规则；这里在写规则前显式拒绝。返回固定错误码，
+/// 不回显渠道 id 或配置。
+async fn validate_rule_channels(
+    storage: Arc<SqliteStorage>,
+    channel_ids: &[String],
+) -> Result<(), ApiError> {
+    if channel_ids.is_empty() {
+        return Ok(());
+    }
+    let ids = channel_ids.to_vec();
+    let issue = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<RuleChannelIssue>> {
+        for id in ids {
+            match storage.get_notification_channel(&id)? {
+                None => return Ok(Some(RuleChannelIssue::Missing)),
+                Some(channel) if !channel.enabled => return Ok(Some(RuleChannelIssue::Disabled)),
+                Some(_) => {}
+            }
+        }
+        Ok(None)
+    })
+    .await
+    .map_err(ApiError::from)?
+    .map_err(ApiError::from)?;
+
+    match issue {
+        Some(RuleChannelIssue::Missing) => Err(ApiError::bad_request_code(
+            "channel_not_found",
+            "告警规则引用的通知渠道不存在",
+        )),
+        Some(RuleChannelIssue::Disabled) => Err(ApiError::bad_request_code(
+            "channel_disabled",
+            "告警规则引用的通知渠道已禁用",
+        )),
+        None => Ok(()),
+    }
+}
+
 /// `POST /api/v1/alerts/rules`：新建自定义规则，id 由服务端生成 UUID。
 pub(crate) async fn create_rule(
     State(state): State<AppState>,
@@ -166,6 +216,7 @@ pub(crate) async fn create_rule(
     rule.validate_semantics().map_err(ApiError::bad_request)?;
 
     let storage = state.storage.clone();
+    validate_rule_channels(storage.clone(), &rule.channel_ids).await?;
     let to_store = rule.clone();
     run_blocking(move || storage.create_alert_rule(&to_store)).await?;
     Ok(Json(rule))
@@ -199,6 +250,7 @@ pub(crate) async fn update_rule(
     rule.validate_semantics().map_err(ApiError::bad_request)?;
     rule.updated_by = updated_by;
     rule.updated_at = now_ms();
+    validate_rule_channels(storage.clone(), &rule.channel_ids).await?;
 
     // 任何“更新后仍为禁用”的写入都顺带清空该规则的 alert_states：既处理本次
     // 启用 → 禁用，也能清理修复前遗留的孤儿状态。启用中的规则不清。
@@ -380,6 +432,7 @@ mod tests {
     use axum::Router;
     use rustboard_common::config::HubConfig;
     use rustboard_core::alerts::{builtin_rules, AlertRuleStoreError, BUILTIN_AGENT_OFFLINE};
+    use rustboard_core::channels::{ChannelConfig, ChannelKind, NotificationChannel, Secret};
     use rustboard_core::storage::sqlite::SqliteStorage;
     use serde_json::{json, Value};
     use tower::ServiceExt;
@@ -466,6 +519,26 @@ mod tests {
         (status, value)
     }
 
+    /// 直接种一个合法渠道，供规则 `channel_ids` 引用校验使用。
+    fn seed_alert_channel(state: &AppState, id: &str, enabled: bool) {
+        state
+            .storage
+            .create_notification_channel(&NotificationChannel {
+                id: id.to_string(),
+                name: format!("渠道-{id}"),
+                kind: ChannelKind::Telegram,
+                config: ChannelConfig::Telegram {
+                    bot_token: Secret::new("123456789:AAH_alerts-test-token_01"),
+                    chat_id: "-1001234567890".to_string(),
+                },
+                enabled,
+                updated_by: "admin".to_string(),
+                created_at: now_ms(),
+                updated_at: now_ms(),
+            })
+            .unwrap();
+    }
+
     fn seed_builtins(state: &AppState) -> usize {
         let now = now_ms();
         state
@@ -478,6 +551,7 @@ mod tests {
     #[tokio::test]
     async fn m4_b1_alert_rule_crud_and_scope_matrix() {
         let state = alerts_state();
+        seed_alert_channel(&state, "channel-a", true);
         let read = seed_token(&state, "alerts-read", "read");
         let write = seed_token(&state, "alerts-write", "write");
         let router = admin_router(state.clone());
@@ -600,6 +674,83 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "not_found");
         assert_eq!(state.storage.alert_rule_count().unwrap(), 0);
+    }
+
+    /// 规则保存 / 更新必须引用存在且启用的渠道：不存在 / 禁用都返回 400 固定码。
+    #[tokio::test]
+    async fn m4_b2b_alert_rule_channels_must_exist_and_be_enabled() {
+        let state = alerts_state();
+        seed_alert_channel(&state, "disabled-channel", false);
+        let write = seed_token(&state, "alerts-write", "write");
+        let router = admin_router(state.clone());
+
+        let body = |channel_ids: Value| {
+            json!({
+                "name": format!("渠道校验规则-{}", channel_ids),
+                "source": "metric",
+                "metric": "disk.used_percent",
+                "comparator": "gte",
+                "threshold": 90,
+                "channel_ids": channel_ids,
+            })
+            .to_string()
+        };
+
+        // 不存在 → 400 channel_not_found。
+        let (status, response) = call(
+            &router,
+            "POST",
+            "/api/v1/alerts/rules",
+            Some(&write),
+            Some(&body(json!(["missing-channel"]))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "channel_not_found");
+
+        // 禁用 → 400 channel_disabled。
+        let (status, response) = call(
+            &router,
+            "POST",
+            "/api/v1/alerts/rules",
+            Some(&write),
+            Some(&body(json!(["disabled-channel"]))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "channel_disabled");
+
+        // 存在且启用 → 创建成功。
+        seed_alert_channel(&state, "enabled-channel", true);
+        let (status, created) = call(
+            &router,
+            "POST",
+            "/api/v1/alerts/rules",
+            Some(&write),
+            Some(&body(json!(["enabled-channel"]))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "创建失败: {created}");
+        let id = created["id"].as_str().unwrap();
+
+        // 更新为不存在 / 禁用渠道同样拒绝，原规则保持不变。
+        for (channel_ids, code) in [
+            (json!(["missing-channel"]), "channel_not_found"),
+            (json!(["disabled-channel"]), "channel_disabled"),
+        ] {
+            let (status, response) = call(
+                &router,
+                "PUT",
+                &format!("/api/v1/alerts/rules/{id}"),
+                Some(&write),
+                Some(&json!({ "channel_ids": channel_ids }).to_string()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(response["error"], code);
+        }
+        let stored = state.storage.get_alert_rule(id).unwrap().unwrap();
+        assert_eq!(stored.channel_ids, vec!["enabled-channel".to_string()]);
     }
 
     /// 旧 admin_token 兼容：`updated_by` 固定为 "admin"。
@@ -938,6 +1089,7 @@ mod tests {
                 rule_id: "rule-1".into(),
                 rule_name: "事件规则".into(),
                 agent_id: "agent-1".into(),
+                series_key: "series-1".into(),
                 state: AlertStateKind::Firing,
                 value: Some(1.5),
                 message: "规则「事件规则」触发：agent agent-1 指标「disk.used_percent」当前值 95，阈值 > 90".into(),
