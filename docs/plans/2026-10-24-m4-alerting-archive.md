@@ -647,6 +647,10 @@ notify_max_attempts = 3
   对 `russh` 做 **最小 vendor/patch 删除 optional `rsa` 依赖**；否则只能
   放弃 C3，或显式接受一条未编译的 rsa 中危 allowlist。**不得静默 `--ignore`。**
   该选择需在 C3 开工前由维护者确认；C1/C2 不受影响。
+- **集成前置**：根 workspace 当前 `resolver = "2"` / `rust-version = "1.80"`；
+  加 C2 依赖时必须同步改为 `resolver = "3"`、`rust-version = "1.85"`（若保留
+  C3 则 1.87），并用对应工具链重新生成/校验 `Cargo.lock`，否则最新的传递依赖
+  会重新拉到更高 MSRV。此改动单独提交并在 CHANGELOG 标注 MSRV 提升。
 - 报告：分支 `chore/m4-dep-spike` 的
   `spikes/m4-deps{,-185,-187}/REPORT*.md`（未合入 main）。
 
