@@ -23,7 +23,7 @@
 | bash 4.4+ | 使用数组与 `set -euo pipefail` |
 | Python 3.8+ | **仅标准库**（`ssl` / `socket` / `hashlib` / `urllib`）；无需 `pip install`，也不联网。`v031.sh` 额外需要已安装的 `cryptography`（只用于生成过期证书） |
 | cargo / rustc | 用于 `cargo build --locked`（`hardening.sh` / `control.sh` / `v031.sh` / `v032.sh` 构建 hub/agent，前三套还会构建 panel） |
-| curl | `control.sh` 用 curl 访问 hub 管理 API 与面板 API |
+| curl | `control.sh` / `v032.sh` 用 curl 访问 hub 管理 API（`control.sh` 还访问面板 API） |
 
 脚本不会安装任何依赖，也不会访问网络。`probe.py` 里自带最小 MessagePack
 编解码器和 RFC 6455 客户端。
@@ -145,6 +145,10 @@ tail 保留最新。fake agent 只保持在线并选择是否应答，不执行�
 bash tests/e2e/v032.sh
 KEEP_E2E_TMP=1 bash tests/e2e/v032.sh   # 保留临时日志与 fake journalctl 参数
 ```
+
+说明：#15 的 Panel 控制专用 70s 超时与 `control_result_unknown` 由 panel 单元测试
+覆盖，不做 31s 长 e2e；#16 的真实 `renew_client_cert()` 续签循环由 agent 单元测试
+覆盖，本脚本只验证 Hub 的 `503 busy_renewing` 映射与审计。
 
 ## 范围说明
 

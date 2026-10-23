@@ -34,6 +34,7 @@ B_PID=""
 C_PID=""
 PANEL_PID=""
 TEST_PID=""
+STARTED_AGENT_PID=""
 
 pass() {
   PASSES=$((PASSES + 1))
@@ -410,13 +411,15 @@ stop_hub() {
   fi
 }
 
+# 启动 agent 并等待 enrollment。PID 通过全局 STARTED_AGENT_PID 返回：若在
+# `A_PID=$(start_agent ...)` 里执行，PIDS 的增补只发生在子 shell 中，进程会泄漏；
+# 因此调用方必须在当前 shell 直接调用本函数，再把全局变量赋给对应 PID。
 start_agent() {
   local cfg=$1 log=$2 data=$3
   RUST_LOG=rustboard_agent=info "$AGENT_BIN" run --config "$cfg" > "$log" 2>&1 &
-  local pid=$!
-  PIDS+=("$pid")
+  STARTED_AGENT_PID=$!
+  PIDS+=("$STARTED_AGENT_PID")
   wait_file "$data/agent_id" 20 || die "agent 未在 20s 内完成 enrollment（$(basename "$log")）"
-  printf '%s' "$pid"
 }
 
 # ---------------------------------------------------------------------------
@@ -475,8 +478,9 @@ chmod 0755 "$FAKE_DIR/docker"
 cat > "$FAKE_DIR/journalctl" <<EOF
 #!/bin/sh
 printf '%s\\n' "\$*" >> "${JOURNAL_LOG}"
-printf '2026-10-23T00:00:01+0000 fake nginx line one\\n'
+# v0.3.2 契约：agent 用 --reverse 调用，journalctl 输出为新→旧（two 最新）。
 printf '2026-10-23T00:00:02+0000 fake nginx line two\\n'
+printf '2026-10-23T00:00:01+0000 fake nginx line one\\n'
 exit 0
 EOF
 chmod 0755 "$FAKE_DIR/journalctl"
@@ -595,9 +599,12 @@ set_control_table "$C_CFG" "$TMP_DIR/control-c.toml"
 # B 保持旧式配置：完全没有 [control]，模拟 v0.2 agent。
 
 echo "==> 启动 agent A（全能力）/ B（旧式）/ C（缺 systemd）"
-A_PID=$(start_agent "$A_CFG" "$A_LOG" "$A_DATA")
-B_PID=$(start_agent "$B_CFG" "$B_LOG" "$B_DATA")
-C_PID=$(start_agent "$C_CFG" "$C_LOG" "$C_DATA")
+start_agent "$A_CFG" "$A_LOG" "$A_DATA"
+A_PID=$STARTED_AGENT_PID
+start_agent "$B_CFG" "$B_LOG" "$B_DATA"
+B_PID=$STARTED_AGENT_PID
+start_agent "$C_CFG" "$C_LOG" "$C_DATA"
+C_PID=$STARTED_AGENT_PID
 A_ID=$(tr -d '[:space:]' < "$A_DATA/agent_id")
 B_ID=$(tr -d '[:space:]' < "$B_DATA/agent_id")
 C_ID=$(tr -d '[:space:]' < "$C_DATA/agent_id")
@@ -835,6 +842,9 @@ if grep -Eiq 'symbolic|symlink|符号链接' "$D_LOG"; then
 else
   fail "5.17 启动日志未说明符号链接"
 fi
+
+# v0.3.2 #19 契约：journalctl 必须带 --reverse，fake 也据此按新→旧输出。
+check_contains "5.18 journalctl 使用 --reverse" "$JOURNAL_ARGS" "--reverse"
 
 # ---------------------------------------------------------------------------
 # 6. 审计
