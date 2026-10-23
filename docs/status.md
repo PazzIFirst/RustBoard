@@ -11,6 +11,7 @@
 | M2 面板 | 🟢 完成 | React/TS 前端、登录与代理、概览/详情四类图表、多指标分桶查询、采样间隔下发 |
 | v0.2.1 硬化 | 🟢 完成 | 修复 known-issues KI-01 ~ KI-12；单元/集成 259 个，hardening e2e 29/29 |
 | M3 控制面 | 🟢 完成 | systemd / Docker / 进程 / 日志 + 双端能力开关 + 审计页；单元 379，control e2e 99/99 |
+| v0.3.1 硬化 | 🟢 完成 | #10 缓冲物理上界/崩溃恢复、#12 发送超时、#13 过期证书自愈、#14 会话清理原子化、KI-17 慢连接；单元/集成 420，hardening 34/34，v031 94/94 |
 | M4 告警与归档 | ⬜ 未开始 | |
 | M5 安装与交付 | ⬜ 未开始 | |
 
@@ -116,6 +117,27 @@
 - [x] 测试：单元/集成 379；`control.sh` 99/99；`cargo audit` 0 漏洞
 - [x] 独立评审 + 渗透：无高危；审计信任边界与低危限制已记录
 
+## v0.3.1 硬化明细
+
+已完成（对应 GitHub #10 / #12 / #13 / #14、KI-17，#9/#11 复验）：
+
+- [x] #10：DiskBuffer 原子持久化 `read_offset`；物理文件压实水位
+      `max(2*max_bytes, max_bytes+1MiB)`；`recover()` 后重新限额；单条超大记录策略；
+      子进程崩溃注入覆盖“淘汰后 meta 落盘前”和“compact rename 后 meta 落盘前”
+- [x] #12：`AgentConfig.send_timeout_secs`（默认 15，1–120）；所有 WS 写路径超时；
+      真实假 hub 停读 + `session_max_hours=0` 下 1.0s 退出会话（独立测试）
+- [x] #13：仅过期证书启动自愈；CA/SAN/CN/key 异常仍拒绝；`CertLock` 内复核、
+      成对备份、自检失败回滚；e2e 验证原 agent 用原 CA 自动重连
+- [x] #14：`SessionRegistry` 两级锁（global map → per-agent slot）；最后连接注销与
+      offline/revoked 写库在 slot 锁内原子完成；Barrier/mpsc 确定性交错 + 100 轮并发
+- [x] KI-17：管理 API / 面板手工 HTTP/1 accept，5s header 超时 + 10s 请求体总超时，
+      全局 256 / 每 IP 32，
+      拒绝即关 TCP；30 条半截 header 5.0s 内全部关闭，`/healthz` 期间/之后均 200
+- [x] #11 复验：hardening 7.6–7.10（非法/超长/9 跳 XFF 400、不可信来源伪造无效、
+      锁定隔离）通过；#9 仅补认证/限速/告警证据，scoped token 与管理端 TLS 仍未实现
+- [x] 测试：单元/集成 420；hardening 34/34、v031 94/94、security/panel/cert/control
+      全量回归；`cargo audit` 0 漏洞
+
 ## 已验证（2026-10-23，本机）
 
 - `rustboard-hub init` 生成 CA + 服务端证书并打印指纹，同时生成管理 API token；
@@ -128,9 +150,9 @@
 - 面板修改采样间隔后 60s 内 agent 日志出现 `采样间隔已更新`，重连后继续上报；
 - series 多指标、自动分桶、32 天/点数上限与非法参数 400 均验证；
 - 证书轮换失败场景（CA 不配套、缺 ca.key、坏 ca.crt、空 SAN、缺 server.crt）均有 e2e 断言；
-- 测试：`cargo test --workspace` 379 通过；`cargo audit` 0 漏洞；
+- 测试：`cargo test --workspace` 420 通过；`cargo audit` 0 漏洞；
   `security.sh` 9/9、`cert-rotation.sh` 103/103、`panel.sh` 159/159、
-  `hardening.sh` 29/29、`control.sh` 99/99、web `pnpm test` 46/46。
+  `hardening.sh` 34/34、`v031.sh` 92/92、`control.sh` 99/99、web `pnpm test` 46/46。
 
 ## 已知限制
 
@@ -152,17 +174,15 @@
    `agent revoke` 后重新纳管。CA 私钥是最高敏感资产，泄露等于全部身份失守。
 8. 管理 API 限速按直连来源 IP 统计；置于反代后所有客户端共享反代 IP 的额度。管理口
    默认只绑回环，反代场景需自行评估并额外限速。
-9. 管理 API / 面板的 HTTP 监听仍未加 header 读超时与连接上限，未认证慢速连接可占用 fd；
-   默认仅回环，对外暴露必须经带超时的可信反代（KI-17，v0.2.2 修复）。
-10. `reset-password` 只热加载新密码，不吊销已有会话 Cookie；若怀疑会话泄露，重置密码后
-   仍需等待 TTL 或重启面板（KI-18，v0.2.2 修复）。
-11. **控制面信任边界**：agent 是 systemd/Docker/进程动作的实际执行者与结果来源。拿到
+9. `reset-password` 只热加载新密码，不吊销已有会话 Cookie；若怀疑会话泄露，重置密码后
+   仍需等待 TTL 或重启面板（KI-18，后续版本修复）。
+10. **控制面信任边界**：agent 是 systemd/Docker/进程动作的实际执行者与结果来源。拿到
     agent 证书 + secret 的主体可以伪造执行结果；hub 审计不能抵抗被控 agent。能力默认关闭、
    白名单与操作确认是主要防线（KI-25）。
-12. `nginx*` 这类前缀白名单会匹配 `nginx-evil`；需要更精确时请写完整 unit 名或更细前缀。
+11. `nginx*` 这类前缀白名单会匹配 `nginx-evil`；需要更精确时请写完整 unit 名或更细前缀。
     日志白名单文件的硬链接不会被 openat2 拦截（需日志目录写权限，KI-22）。
-13. 同 agent 多连接时，能力缓存以最新 Hello 为准；旧连接断开后可能短暂陈旧（KI-24，
-    v0.3.1 修复）。
+12. 同 agent 多连接时，能力缓存以最新 Hello 为准；旧连接断开后可能短暂陈旧（KI-24，
+    后续版本修复）。
 
 ## 下一步建议
 

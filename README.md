@@ -12,7 +12,7 @@
 已知问题见 [docs/known-issues.md](docs/known-issues.md)。
 协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **当前状态：M1/M2 与 v0.2.1 安全硬化已完成；M3 控制面已完成（v0.3.0）。**
+> **当前状态：M1/M2、v0.2.1 安全硬化与 M3 控制面已完成；v0.3.1 可靠性/慢连接硬化已完成。**
 > 告警与归档尚未实现。证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。
 >
 > 线协议版本为 **2**：hub 与 agent 必须严格一致。版本不符时 hub 回 `bad_protocol`

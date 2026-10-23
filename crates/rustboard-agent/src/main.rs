@@ -52,6 +52,87 @@ const SAMPLE_INTERVAL_SLICE: Duration = Duration::from_secs(1);
 const MIN_SAMPLE_INTERVAL_MS: u64 = 1_000;
 const MAX_SAMPLE_INTERVAL_MS: u64 = 300_000;
 
+/// WebSocket 写超时。连接大概率已半死，调用方必须结束会话而不是继续等待。
+#[derive(Debug)]
+struct SendTimeoutError {
+    frame_kind: &'static str,
+    timeout_secs: u64,
+}
+
+impl fmt::Display for SendTimeoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "WebSocket 发送超时（帧 {}，{}s）",
+            self.frame_kind, self.timeout_secs
+        )
+    }
+}
+
+impl std::error::Error for SendTimeoutError {}
+
+/// 判断错误是否为 WebSocket 写超时（证书续签路径据此决定是否结束会话）。
+fn is_send_timeout_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<SendTimeoutError>().is_some()
+}
+
+/// 对一次 WebSocket 写操作施加独立超时，超时后返回可重试错误。
+///
+/// 只记录帧类型与超时秒数，绝不记录帧内容：`Enroll` / `RenewCert` 含 CSR，
+/// `Hello` 含 agent secret。
+async fn write_with_timeout<F, E>(
+    write: F,
+    frame_kind: &'static str,
+    timeout: Duration,
+) -> Result<()>
+where
+    F: std::future::Future<Output = std::result::Result<(), E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match tokio::time::timeout(timeout, write).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(anyhow::Error::new(err).context(format!("发送 {frame_kind} 帧失败"))),
+        Err(_) => {
+            tracing::warn!(
+                frame = frame_kind,
+                timeout_secs = timeout.as_secs(),
+                "WebSocket 发送超时，结束当前会话"
+            );
+            Err(anyhow::Error::new(SendTimeoutError {
+                frame_kind,
+                timeout_secs: timeout.as_secs(),
+            }))
+        }
+    }
+}
+
+/// 发送一帧，并给整次写入（poll_ready + start_send + flush）施加独立超时。
+///
+/// 超时错误会向上传播，由会话主循环断开并走重连退避；不得 panic 或吞错。
+async fn send_frame_with_timeout<Si>(sink: &mut Si, frame: &Frame, timeout: Duration) -> Result<()>
+where
+    Si: Sink<Message, Error = WsError> + Unpin,
+{
+    let bytes = frame.encode()?;
+    write_with_timeout(sink.send(Message::Binary(bytes)), frame.kind(), timeout).await
+}
+
+/// 用配置里的 `send_timeout_secs` 发送一帧，减少各写路径的重复。
+async fn send_frame_with_config<Si>(sink: &mut Si, frame: &Frame, cfg: &AgentConfig) -> Result<()>
+where
+    Si: Sink<Message, Error = WsError> + Unpin,
+{
+    send_frame_with_timeout(sink, frame, Duration::from_secs(cfg.send_timeout_secs)).await
+}
+
+/// 关闭 WebSocket 同样限时：半死连接上的 `close()` 也可能永久阻塞。
+async fn close_with_timeout<Si>(sink: &mut Si, timeout: Duration) -> Result<()>
+where
+    Si: Sink<Message, Error = WsError> + Unpin,
+{
+    write_with_timeout(sink.close(), "Close", timeout).await
+}
+
 /// H1：hub 明确拒绝协议版本。重试不会自愈，必须退出让运维升级。
 #[derive(Debug)]
 struct BadProtocolError {
@@ -549,11 +630,9 @@ async fn try_enroll(cfg: &AgentConfig) -> std::result::Result<(), EnrollError> {
         hostname: hostname(),
         protocol: PROTOCOL_VERSION,
     });
-    sink.send(Message::Binary(
-        request.encode().map_err(|e| EnrollError::Fatal(e.into()))?,
-    ))
-    .await
-    .map_err(|e| EnrollError::Retry(e.into()))?;
+    send_frame_with_config(&mut sink, &request, cfg)
+        .await
+        .map_err(EnrollError::Retry)?;
 
     let frame = tokio::time::timeout(Duration::from_secs(20), recv_frame(&mut stream))
         .await
@@ -636,7 +715,7 @@ where
         secret,
         capabilities: control::enabled_capabilities(&cfg.control),
     });
-    sink.send(Message::Binary(hello.encode()?)).await?;
+    send_frame_with_config(sink, &hello, cfg).await?;
 
     match tokio::time::timeout(Duration::from_secs(10), recv_frame(stream)).await {
         Err(_) => bail!("等待 Welcome 超时"),
@@ -842,16 +921,14 @@ where
         std::fs::read_to_string(&key_path).context("读取客户端私钥失败，可能需要重新纳管")?;
     let csr_pem = tls::make_csr_with_key(&key_pem)?;
 
-    sink.send(Message::Binary(Frame::RenewCert { csr_pem }.encode()?))
-        .await?;
+    send_frame_with_config(sink, &Frame::RenewCert { csr_pem }, cfg).await?;
     let cert_pem = tokio::time::timeout(CERT_RENEW_TIMEOUT, async {
         loop {
             match recv_frame(stream).await? {
                 Frame::CertRenewed { cert_pem } => return Ok::<String, anyhow::Error>(cert_pem),
                 // 等待期间 hub 可能发来心跳，必须回应。
                 Frame::Ping { ts } => {
-                    sink.send(Message::Binary(Frame::Pong { ts }.encode()?))
-                        .await?;
+                    send_frame_with_config(sink, &Frame::Pong { ts }, cfg).await?;
                 }
                 Frame::Problem { code, message } => {
                     bail!("hub 拒绝续签: {code} {message}");
@@ -929,6 +1006,7 @@ where
 async fn handle_side_frame<Si>(
     sink: &mut Si,
     dispatcher: &control::ControlDispatcher,
+    send_timeout: Duration,
     incoming: IncomingFrame,
 ) -> Result<()>
 where
@@ -936,8 +1014,7 @@ where
 {
     match incoming {
         IncomingFrame::Frame(Frame::Ping { ts }) => {
-            sink.send(Message::Binary(Frame::Pong { ts }.encode()?))
-                .await?;
+            send_frame_with_timeout(sink, &Frame::Pong { ts }, send_timeout).await?;
         }
         IncomingFrame::Frame(Frame::ControlRequest(request)) => {
             // ControlRequest 的 Debug 只输出 id 与变体名，参数不会进日志。
@@ -964,6 +1041,7 @@ async fn wait_for_ack<Si, St>(
     stream: &mut St,
     control_rx: &mut tokio::sync::mpsc::Receiver<ControlResponse>,
     dispatcher: &control::ControlDispatcher,
+    send_timeout: Duration,
     batch_epoch: u64,
     batch_seq: u64,
 ) -> Result<()>
@@ -990,11 +1068,18 @@ where
                         }
                         bail!("hub 报错: {code} {message}");
                     }
-                    Ok(Ok(incoming)) => handle_side_frame(sink, dispatcher, incoming).await?,
+                    Ok(Ok(incoming)) => {
+                        handle_side_frame(sink, dispatcher, send_timeout, incoming).await?
+                    }
                 }
             }
             Some(response) = control_rx.recv() => {
-                sink.send(Message::Binary(Frame::ControlResponse(response).encode()?)).await?;
+                send_frame_with_timeout(
+                    sink,
+                    &Frame::ControlResponse(response),
+                    send_timeout,
+                )
+                .await?;
             }
         }
     }
@@ -1007,6 +1092,8 @@ async fn session(
     notify: &Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     let (mut sink, mut stream) = ws.split();
+    // #12：所有写操作统一使用配置里的独立超时；半死连接不能把会话永久卡住。
+    let send_timeout = Duration::from_secs(ctx.cfg.send_timeout_secs);
     let welcome_interval_ms = handshake(
         &mut sink,
         &mut stream,
@@ -1027,7 +1114,11 @@ async fn session(
     }
 
     // A5：握手后检查客户端证书，必要时在会话内续签；失败只告警，不影响采集上报。
+    // 但写超时说明连接可能已半死，必须向上传播并重连，不能只告警后继续。
     if let Err(err) = maybe_renew_client_cert(&mut sink, &mut stream, ctx.cfg, ctx.agent_id).await {
+        if is_send_timeout_error(&err) {
+            return Err(err);
+        }
         tracing::warn!(
             error = %err,
             "客户端证书续签失败，本次会话继续（证书通常仍有足够寿命）"
@@ -1058,7 +1149,8 @@ async fn session(
         if batches.is_empty() {
             tokio::select! {
                 _ = ping_timer.tick() => {
-                    sink.send(Message::Binary(Frame::Ping { ts: now_ms() }.encode()?)).await?;
+                    send_frame_with_config(&mut sink, &Frame::Ping { ts: now_ms() }, ctx.cfg)
+                        .await?;
                 }
                 _ = cert_timer.tick() => {
                     // 只在无在途批次（本分支）检查，避免与 ACK 等待争抢同一个 stream。
@@ -1077,6 +1169,9 @@ async fn session(
                                 )
                                 .await
                                 {
+                                    if is_send_timeout_error(&err) {
+                                        return Err(err);
+                                    }
                                     tracing::warn!(error = %err, "周期证书续签失败，本次会话继续");
                                 }
                             } else {
@@ -1090,7 +1185,12 @@ async fn session(
                 }
                 _ = notify.notified() => {}
                 Some(response) = control_rx.recv() => {
-                    sink.send(Message::Binary(Frame::ControlResponse(response).encode()?)).await?;
+                    send_frame_with_config(
+                        &mut sink,
+                        &Frame::ControlResponse(response),
+                        ctx.cfg,
+                    )
+                    .await?;
                 }
                 incoming = stream.next() => {
                     match incoming {
@@ -1099,6 +1199,7 @@ async fn session(
                             handle_side_frame(
                                 &mut sink,
                                 &dispatcher,
+                                send_timeout,
                                 classify_incoming(bytes.as_ref()),
                             )
                             .await?;
@@ -1113,13 +1214,14 @@ async fn session(
 
         for batch in batches {
             let (batch_epoch, batch_seq) = (batch.epoch, batch.seq);
-            sink.send(Message::Binary(Frame::Batch(batch).encode()?))
-                .await?;
+            send_frame_with_config(&mut sink, &Frame::Batch(batch), ctx.cfg).await?;
+            // ACK 的 20s 预算从 Batch 写成功之后开始，不受发送超时影响。
             wait_for_ack(
                 &mut sink,
                 &mut stream,
                 &mut control_rx,
                 &dispatcher,
+                send_timeout,
                 batch_epoch,
                 batch_seq,
             )
@@ -1248,8 +1350,10 @@ async fn renew_once(cfg: &AgentConfig) -> Result<()> {
     .await?;
     renew_client_cert(&mut sink, &mut stream, cfg, &agent_id).await?;
     // 主动关连接：否则 hub 侧只能看到 TCP 直接断开（close_notify 缺失），日志里会出现
-    // 一条误导性的接收失败。关闭失败不影响已经落盘的结果。
-    if let Err(err) = sink.close().await {
+    // 一条误导性的接收失败。关闭失败（含半死连接上的超时）不影响已经落盘的结果。
+    if let Err(err) =
+        close_with_timeout(&mut sink, Duration::from_secs(cfg.send_timeout_secs)).await
+    {
         tracing::debug!(error = %err, "关闭 WebSocket 失败（证书已落盘）");
     }
 
@@ -1323,6 +1427,64 @@ mod tests {
         ) -> Poll<std::result::Result<(), WsError>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    /// 单测用的卡死 sink：`poll_ready` 永不就绪，模拟服务端不读导致的写阻塞。
+    struct PendingSink;
+
+    impl Sink<Message> for PendingSink {
+        type Error = WsError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), WsError>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> std::result::Result<(), WsError> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), WsError>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), WsError>> {
+            Poll::Pending
+        }
+    }
+
+    /// #12：`poll_ready` 永不就绪时，发送 helper 必须在短超时后返回错误，
+    /// 错误信息只带帧类型，不能带帧内容/CSR/secret。
+    #[tokio::test]
+    async fn v031_send_frame_with_timeout_aborts_stuck_sink() {
+        let mut sink = PendingSink;
+        let frame = Frame::Ping { ts: 1 };
+        let timeout = Duration::from_millis(50);
+        let started = tokio::time::Instant::now();
+        let err = send_frame_with_timeout(&mut sink, &frame, timeout)
+            .await
+            .expect_err("poll_ready 永不就绪必须超时");
+        let elapsed = started.elapsed();
+
+        assert!(err.to_string().contains("发送超时"), "错误信息: {err}");
+        assert!(
+            err.to_string().contains("Ping"),
+            "错误信息应包含帧类型: {err}"
+        );
+        assert!(is_send_timeout_error(&err), "超时错误必须可被识别");
+        assert!(elapsed >= timeout, "必须等满超时才返回: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "短超时必须在 2s 内返回，实际 {elapsed:?}"
+        );
     }
 
     /// 造一个「已纳管」的 data_dir：CA 签发的客户端证书 + 复用私钥 + agent_id。
@@ -1820,3 +1982,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "send_timeout_tests.rs"]
+mod send_timeout_tests;

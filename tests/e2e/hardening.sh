@@ -9,7 +9,8 @@
 #   4. hub 管理端口非回环监听的明文 HTTP WARN
 #   5. 单 IP 空连接洪水（127.0.0.2）不影响合法 agent
 #   6. 运行中 rotate-cert 热加载 ≤15s（live / disk / 实际 TLS 指纹）
-#   7. 面板 trusted_proxies：XFF 分桶、Secure Cookie
+#   7. 面板 trusted_proxies：XFF 分桶、Secure Cookie；非法/超长/9 跳 XFF 拒绝、
+#      非可信直连伪造 XFF 无效、锁定 XFF 不影响其他可信客户端
 #   8. 跨源 POST 403 origin_mismatch，同源正常
 #   9. reset-password：旧密码失效、新密码可用
 #
@@ -336,9 +337,10 @@ wait_samples_at_least() {
 }
 
 panel_login() {
-  # $1 密码，$2 XFF（可空），$3 XFP（可空），$4 cookie 输出（可空）
+  # $1 密码，$2 XFF（可空），$3 XFP（可空），$4 cookie 输出（可空），
+  # $5 源 IP（可空；用于模拟非可信直连来源）
   # 可选参数必须用 ${n:-}：7.4 只传 3 个参数，裸 $4 在 set -u 下会直接退出。
-  local password=$1 xff=${2:-} xfp=${3:-} cookie_out=${4:-}
+  local password=$1 xff=${2:-} xfp=${3:-} cookie_out=${4:-} source_ip=${5:-}
   local args=(login --url "$PANEL_URL/api/login" --password "$password")
   # 注意：不能用 `[[ ... ]] && args+=(...)`，条件为假时整个 && 列表返回 1，
   # 在 set -e 下会让函数在 probe 执行前直接退出（无 cookie_out 的调用必踩）。
@@ -350,6 +352,9 @@ panel_login() {
   fi
   if [[ -n "$cookie_out" ]]; then
     args+=(--cookie-out "$cookie_out")
+  fi
+  if [[ -n "$source_ip" ]]; then
+    args+=(--source-ip "$source_ip")
   fi
   if "$PYTHON" "$PANEL_PROBE" "${args[@]}"; then
     return 0
@@ -700,6 +705,7 @@ fi
 # 可信代理 + XFP=https：Secure；XFF 决定限速桶。
 IP_A="203.0.113.10"
 IP_B="203.0.113.20"
+IP_C="203.0.113.30"
 out=$(panel_login "$OLD_PASSWORD" "$IP_A" "https" "$TMP_DIR/cookie-a.txt" 2>/dev/null || true)
 status=$(printf '%s' "$out" | json_get status || true)
 secure=$(printf '%s' "$out" | json_get secure || true)
@@ -737,6 +743,85 @@ if [[ "$status" == "204" && ( "$secure" == "True" || "$secure" == "true" || "$se
   pass "7.5" "不同可信 XFF 独立分桶（IP B 登录 204 + Secure）"
 else
   fail "7.5" "不同 XFF 未独立分桶（status=$status secure=${secure:-none}）"
+fi
+
+# 7.6 非法 XFF：可信直连（127.0.0.1）携带非法 XFF 必须 400。
+# 用正确密码发请求，确保“400”不是密码错误导致的；若实现回退到共享桶会得到 204。
+out=$(panel_login "$OLD_PASSWORD" "not-an-ip" "" "" "127.0.0.1" 2>/dev/null || true)
+status=$(printf '%s' "$out" | json_get status || true)
+body=$(printf '%s' "$out" | json_get body || true)
+if [[ "$status" == "400" ]]; then
+  pass "7.6" "可信直连非法 XFF（not-an-ip）返回 400（$body）"
+else
+  fail "7.6" "可信直连非法 XFF 返回 $status / $body（期望 400，不能回退到共享桶）"
+fi
+
+# 7.7 超长 XFF：> MAX_XFF_BYTES(4096) 必须被拒。允许 400（面板校验）
+# 或 431（HTTP 层 header 上限）；绝不允许 204（登录成功）或 401（被当作普通失败）。
+LONG_XFF=$("$PYTHON" -c 'print("a" * 5000)')
+out=$(panel_login "$OLD_PASSWORD" "$LONG_XFF" "" "" "127.0.0.1" 2>/dev/null || true)
+status=$(printf '%s' "$out" | json_get status || true)
+set_cookie_count=$(printf '%s' "$out" | json_get set_cookie_count || true)
+if [[ ( "$status" == "400" || "$status" == "431" ) && "${set_cookie_count:-0}" == "0" ]]; then
+  pass "7.7" "超长 XFF（5000 字节）被拒绝（status=$status，允许集合 400/431，无 Set-Cookie）"
+else
+  fail "7.7" "超长 XFF 返回 $status / set_cookie_count=${set_cookie_count:-none}（期望 400 或 431 且无 Cookie）"
+fi
+
+# 7.8 9 跳 XFF：MAX_XFF_HOPS=8，第 9 跳必须被拒绝（400），不能取最右 hop 继续登录。
+NINE_HOPS="203.0.113.1, 203.0.113.2, 203.0.113.3, 203.0.113.4, 203.0.113.5, 203.0.113.6, 203.0.113.7, 203.0.113.8, 203.0.113.9"
+out=$(panel_login "$OLD_PASSWORD" "$NINE_HOPS" "" "" "127.0.0.1" 2>/dev/null || true)
+status=$(printf '%s' "$out" | json_get status || true)
+body=$(printf '%s' "$out" | json_get body || true)
+if [[ "$status" == "400" ]]; then
+  pass "7.8" "9 跳 XFF（超过 MAX_XFF_HOPS=8）返回 400（$body）"
+else
+  fail "7.8" "9 跳 XFF 返回 $status / $body（期望 400）"
+fi
+
+# 7.9 非可信直连来源（127.0.0.2，不在 trusted_proxies）伪造 XFF 无效：
+# 5 次错误密码各带不同 XFF 仍应按 127.0.0.2 分桶（401，第 5 次可为 401/429）；
+# 随后正确密码 + 另一个 XFF 应 429（键是直连 IP，不是 XFF）；
+# 可信直连 127.0.0.1 的正确密码（无 XFF）仍应 204（共享桶未被污染）。
+UNTRUSTED_SOURCE="127.0.0.2"
+UNTRUSTED_STATUSES=()
+for last_octet in 10 11 12 13 14; do
+  out=$(panel_login "$WRONG_PASSWORD" "198.51.100.$last_octet" "" "" "$UNTRUSTED_SOURCE" 2>/dev/null || true)
+  status=$(printf '%s' "$out" | json_get status || true)
+  UNTRUSTED_STATUSES+=("${status:-000}")
+done
+out=$(panel_login "$OLD_PASSWORD" "198.51.100.15" "" "" "$UNTRUSTED_SOURCE" 2>/dev/null || true)
+UNTRUSTED_AFTER_LOCK=$(printf '%s' "$out" | json_get status || true)
+UNTRUSTED_AFTER_LOCK=${UNTRUSTED_AFTER_LOCK:-000}
+out=$(panel_login "$OLD_PASSWORD" "" "" "" "127.0.0.1" 2>/dev/null || true)
+TRUSTED_DIRECT=$(printf '%s' "$out" | json_get status || true)
+TRUSTED_DIRECT=${TRUSTED_DIRECT:-000}
+
+UNTRUSTED_OK=1
+for untrusted_status in "${UNTRUSTED_STATUSES[@]}"; do
+  if [[ "$untrusted_status" != "401" && "$untrusted_status" != "429" ]]; then
+    UNTRUSTED_OK=0
+  fi
+done
+if (( UNTRUSTED_OK == 1 )) \
+   && [[ "$UNTRUSTED_AFTER_LOCK" == "429" && "$TRUSTED_DIRECT" == "204" ]]; then
+  pass "7.9" "非可信来源 127.0.0.2 伪造 XFF 无效（前 5 次 ${UNTRUSTED_STATUSES[*]}，第 6 次 429，可信直连 204）"
+else
+  fail "7.9" "非可信来源伪造 XFF 未按直连 IP 分桶（前 5 次 ${UNTRUSTED_STATUSES[*]:-none}，第 6 次 $UNTRUSTED_AFTER_LOCK，可信直连 $TRUSTED_DIRECT；期望 401/429..., 429, 204）"
+fi
+
+# 7.10 锁定的 XFF 客户端不影响其他可信 XFF：IP_A（7.4 已锁定）正确密码仍 429，
+# 未失败的 IP_C 正确密码仍可 204。
+out=$(panel_login "$OLD_PASSWORD" "$IP_A" "https" 2>/dev/null || true)
+IP_A_STATUS=$(printf '%s' "$out" | json_get status || true)
+IP_A_STATUS=${IP_A_STATUS:-000}
+out=$(panel_login "$OLD_PASSWORD" "$IP_C" "https" 2>/dev/null || true)
+IP_C_STATUS=$(printf '%s' "$out" | json_get status || true)
+IP_C_STATUS=${IP_C_STATUS:-000}
+if [[ "$IP_A_STATUS" == "429" && "$IP_C_STATUS" == "204" ]]; then
+  pass "7.10" "锁定 XFF IP A 仍 429，其他可信 XFF IP C 登录 204"
+else
+  fail "7.10" "锁定隔离断言失败（IP A=$IP_A_STATUS，IP C=$IP_C_STATUS；期望 429 / 204）"
 fi
 
 # ---------------------------------------------------------------------------
@@ -787,7 +872,7 @@ else
   fail "9.2" "重置密码后面板未就绪（最后状态: $LAST_STATUS）"
 fi
 
-IP_C="203.0.113.30"
+# IP_C 在 7.10 已定义（203.0.113.30）。
 out=$(panel_login "$OLD_PASSWORD" "$IP_C" "" 2>/dev/null || true)
 OLD_STATUS=$(printf '%s' "$out" | json_get status || true)
 out=$(panel_login "$NEW_PASSWORD" "$IP_C" "" "$TMP_DIR/cookie-new.txt" 2>/dev/null || true)

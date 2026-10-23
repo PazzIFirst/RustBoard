@@ -34,7 +34,7 @@
 | KI-10 | 低 | 证书轮换 | 已修复 | v0.2.1 | 运行中 `rotate-cert` 不生效；`/api/v1/system` 报磁盘证书而非监听器实际证书 |
 | KI-11 | 低 | 证书轮换 | 已修复 | v0.2.1 | 并发执行 `rotate-cert` 没有文件锁，可能交错写坏 key/cert |
 | KI-12 | 低 | agent 证书 | 已修复 | v0.2.1 | `session_max_hours=0` 且连接超长时，客户端续签检查只发生在握手 |
-| KI-17 | 中 | hub/panel HTTP | 待修复 | v0.3.1 | 管理 API / 面板监听没有 header 读超时与连接上限，未认证慢速连接可长期占 fd |
+| KI-17 | 中 | hub/panel HTTP | 已修复 | v0.3.1 | 管理 API / 面板监听没有 header 读超时与连接上限，未认证慢速连接可长期占 fd |
 | KI-18 | 低 | panel 会话 | 待修复 | v0.3.1 | `reset-password` 不吊销已有会话 Cookie，最多可继续使用一个 TTL |
 | KI-19 | 低 | hub Hello | 待修复 | v0.3.1 | `name` / `os` / `arch` / `version` 未做长度与控制字符校验 |
 | KI-20 | 低 | 安装命令 | 待修复 | v0.3.1 | `agent add --name` 打印的安装命令未对 name 做 shell 转义 |
@@ -169,6 +169,14 @@
 - **验收标准**：`session_max_hours=0` 的会话在阈值到达后能触发续签；续签失败不影响上报；定时器不会与 ACK 等待争抢同一 stream；单测覆盖到期计算。
 - **关联**：status.md 已知限制 9。
 
+### KI-17 管理 API / 面板慢连接
+
+- **现象**：hub 管理口与 panel 直接使用 `axum::serve`，没有 header 读超时与全局/每 IP 连接上限；半截 header 的 TCP 可长期占用 fd。
+- **修复方案**：手工 hyper HTTP/1 accept；5s `header_read_timeout`；请求体一次性 10s 总 deadline（慢 body 不能无限占用）；全局 256、每来源 IP 32 并发上限，超限立即关闭 TCP；`ConnectInfo` 逐请求注入；计数归零删键、来源表容量 4096。
+- **验收标准**：30 条半截 header 在 10s 内全部关闭，期间/之后 `/healthz` 仍 200；单 IP 第 33 条立即关闭；hub 与 panel 各有单测/e2e。
+- **回归**：`cargo test -p rustboard-hub` / `-p rustboard-panel`；`tests/e2e/v031.sh` 阶段 7。
+- **关联**：GitHub #9 的剩余部署风险（管理端强制 TLS 仍未实现）。
+
 ### KI-13 ~ KI-16 设计/部署限制（不修复）
 
 - **KI-13**：v0.1 agent 仍用指纹钉扎，服务端证书轮换后失联。升级到 v0.2+ 或重新纳管；发布说明与 status.md 保留。
@@ -181,3 +189,4 @@
 | 日期 | 版本 | 条目 | 提交 | 回归 |
 |---|---|---|---|---|
 | 2026-10-23 | v0.2.1 | KI-01 ~ KI-12 | `42c98c9`..`f8136ef` | 单元 259；hardening 29/29；security 9/9；cert 103/103；panel 159/159 |
+| 2026-10-23 | v0.3.1 | KI-17 | `258f3b9` | 单元 420；v031 94/94；hardening 34/34 |

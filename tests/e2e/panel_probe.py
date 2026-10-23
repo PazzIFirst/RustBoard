@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -101,14 +102,29 @@ def _write_private_file(path: str, data: bytes) -> None:
     os.replace(tmp, path)
 
 
-def _request(url, method, headers, body, timeout, raw_path=None):
+def _source_address(raw):
+    """把 --source-ip 转成 http.client 的 source_address 元组；空值保持默认行为。"""
+    if not raw:
+        return None
+    try:
+        address = ipaddress.ip_address(raw)
+    except ValueError as exc:
+        raise ProbeError(f"--source-ip 不是合法 IP 地址: {raw!r}") from exc
+    if address.version != 4:
+        raise ProbeError("--source-ip 目前只支持 IPv4")
+    return (str(address), 0)
+
+
+def _request(url, method, headers, body, timeout, raw_path=None, source_address=None):
     host, port, path = _split_url(url)
     if raw_path is not None:
         if not raw_path.startswith("/"):
             raise ProbeError(f"--raw-path 必须以 / 开头: {raw_path!r}")
         path = raw_path
 
-    connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    connection = http.client.HTTPConnection(
+        host, port, timeout=timeout, source_address=source_address
+    )
     try:
         connection.putrequest(
             method, path, skip_accept_encoding=True, skip_host=False
@@ -329,7 +345,14 @@ def cmd_login(args) -> int:
     ]
     headers.extend(_parse_header_args(args.header))
     body = json.dumps({"password": password}).encode("utf-8")
-    response, data = _request(args.url, "POST", headers, body, args.timeout)
+    response, data = _request(
+        args.url,
+        "POST",
+        headers,
+        body,
+        args.timeout,
+        source_address=_source_address(args.source_ip),
+    )
     if len(data) > args.max_body:
         raise ProbeError(f"响应体过大（{len(data)} > {args.max_body}）")
 
@@ -698,6 +721,8 @@ def build_parser() -> argparse.ArgumentParser:
     login.add_argument("--header", action="append", default=[])
     login.add_argument("--cookie-out", default=None,
                        help="把 rb_session Cookie 写入该文件（0600）")
+    login.add_argument("--source-ip", default=None,
+                       help="绑定 IPv4 源地址（如 127.0.0.2，用于模拟非可信直连来源）")
     login.add_argument("--timeout", type=float, default=5.0)
     login.add_argument("--max-body", type=int, default=8 * 1024 * 1024)
     login.set_defaults(func=cmd_login)

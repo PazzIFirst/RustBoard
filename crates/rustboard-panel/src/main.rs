@@ -8,9 +8,13 @@ mod auth;
 mod proxy;
 mod web;
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -22,6 +26,10 @@ use axum::response::Response;
 use axum::routing::{any, get, post};
 use axum::Router;
 use clap::{Parser, Subcommand};
+use http_body::{Body as HttpBody, Frame as BodyFrame, SizeHint};
+use hyper::body::Incoming;
+use hyper_util::rt::TokioIo;
+use hyper_util::service::TowerToHyperService;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use rustboard_common::config::{HubConfig, PanelConfig};
@@ -31,12 +39,28 @@ use rustboard_common::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::Semaphore;
+use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tower::ServiceExt;
 
 /// 登录 / 设置 / 控制面请求体上限。
 const MAX_JSON_BODY: usize = 8 * 1024;
 /// 同时进行的 Argon2 校验上限，避免 64 MiB × N 的内存 DoS。
 const MAX_CONCURRENT_ARGON2: usize = 2;
+/// 面板 HTTP 全局并发连接上限；超出后 accept 到的 TCP 立即关闭。
+const ADMIN_MAX_CONNECTIONS: usize = 256;
+/// 面板 HTTP 单来源 IP 并发连接上限；只绑回环时同样生效。
+const ADMIN_MAX_CONNECTIONS_PER_IP: usize = 32;
+/// HTTP/1 请求头读取超时，抵挡 slowloris 一类慢速攻击。
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// 请求体总读取超时（从 header 读完开始一次性计时，不随 frame 重置）。
+///
+/// header 超时只能挡住半截 header；`/api/login` 等读 body 的端点如果遇到
+/// 「header 完整 + Content-Length 很大 + 不发 body」的客户端，会一直挂住并占满
+/// 每 IP 连接槽位（反代后所有用户共享一个代理 IP）。10s 是正常请求的宽裕上限。
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// 单 IP 连接表容量：超过后清理空项并拒绝新来源，防止无限增长。
+const MAX_IP_CONNECTION_ENTRIES: usize = 4096;
 /// 自动生成的密码长度。
 const GENERATED_PASSWORD_LEN: usize = 20;
 /// 密码最短长度（仅约束 init 写入的密码）。
@@ -1031,6 +1055,276 @@ fn rate_limited_response(retry_after: u64) -> Response {
     response
 }
 
+/// 单 IP 并发连接计数（KI-17）。
+///
+/// 与 hub 的 `ConnectionLimiter` 语义一致：计数归零立即删键、来源表有硬上限。
+/// hub 与 panel 是两个进程，把这份逻辑放进 `rustboard-common` 会把 tokio/hyper
+/// 依赖带进公共 crate，因此保留两份实现；改动时两处必须同步。
+struct ConnectionLimiter {
+    max_per_ip: usize,
+    max_ip_entries: usize,
+    per_ip: StdMutex<HashMap<IpAddr, usize>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionLimitRejection {
+    /// 该来源 IP 已达并发上限。
+    PerIp,
+    /// 来源 IP 表已满（大量不同来源）。
+    TableFull,
+}
+
+/// 一条连接持有的限额凭证；Drop 时归还 per-IP 计数。
+struct ConnectionPermit {
+    limiter: Arc<ConnectionLimiter>,
+    ip: IpAddr,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let mut per_ip = match self.limiter.per_ip.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(count) = per_ip.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                // 计数归零立即删键：长时间运行不会积累已断开的来源。
+                per_ip.remove(&self.ip);
+            }
+        }
+    }
+}
+
+impl ConnectionLimiter {
+    fn new(max_per_ip: usize) -> Self {
+        Self::with_ip_capacity(max_per_ip, MAX_IP_CONNECTION_ENTRIES)
+    }
+
+    fn with_ip_capacity(max_per_ip: usize, max_ip_entries: usize) -> Self {
+        Self {
+            max_per_ip: max_per_ip.max(1),
+            max_ip_entries: max_ip_entries.max(1),
+            per_ip: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn try_acquire(
+        self: &Arc<Self>,
+        ip: IpAddr,
+    ) -> std::result::Result<ConnectionPermit, ConnectionLimitRejection> {
+        let mut per_ip = match self.per_ip.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let current = per_ip.get(&ip).copied().unwrap_or(0);
+        if current >= self.max_per_ip {
+            return Err(ConnectionLimitRejection::PerIp);
+        }
+        if current == 0 {
+            if per_ip.len() >= self.max_ip_entries {
+                // 正常情况下计数归零即删键，这里只清理异常残留。
+                per_ip.retain(|_, count| *count > 0);
+                if per_ip.len() >= self.max_ip_entries {
+                    return Err(ConnectionLimitRejection::TableFull);
+                }
+            }
+            per_ip.insert(ip, 1);
+        } else {
+            per_ip.insert(ip, current + 1);
+        }
+        Ok(ConnectionPermit {
+            limiter: self.clone(),
+            ip,
+        })
+    }
+
+    #[cfg(test)]
+    fn tracked_ips(&self) -> usize {
+        match self.per_ip.lock() {
+            Ok(guard) => guard.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+}
+
+/// 尝试占用一个全局连接许可；返回 None 表示已达上限，调用方应关闭 TCP。
+fn try_acquire_connection(permits: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    permits.clone().try_acquire_owned().ok()
+}
+
+/// boxed body error，axum 的 `Body::new` 也接受这个错误类型。
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// 请求体总读取超时错误。
+#[derive(Debug)]
+struct BodyReadTimeout;
+
+impl std::fmt::Display for BodyReadTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("请求体读取超时")
+    }
+}
+
+impl std::error::Error for BodyReadTimeout {}
+
+/// 请求体总超时包装（KI-17 剩余缺口）。
+///
+/// 从请求进入（header 读完）启动**一次性** deadline，不随每个 frame 重置，
+/// 因此逐字节 drip 也无法延长；超时后向 axum 返回 body 错误，连接随请求结束关闭。
+/// 用 `Pin<Box<_>>` 避免引入 pin-project 依赖。
+struct DeadlineBody<B> {
+    inner: Pin<Box<B>>,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    timed_out: bool,
+}
+
+impl<B> DeadlineBody<B> {
+    fn new(inner: B, timeout: Duration) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            deadline: Box::pin(tokio::time::sleep(timeout)),
+            timed_out: false,
+        }
+    }
+}
+
+impl<B> HttpBody for DeadlineBody<B>
+where
+    B: HttpBody + Send + 'static,
+    B::Error: Into<BoxError>,
+{
+    type Data = B::Data;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<BodyFrame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.timed_out {
+            return Poll::Ready(None);
+        }
+        // 先检查一次性 deadline：即使 inner 永远 Pending，也会在 10s 时返回错误。
+        if this.deadline.as_mut().poll(cx).is_ready() {
+            this.timed_out = true;
+            return Poll::Ready(Some(Err(Box::new(BodyReadTimeout))));
+        }
+        match this.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        // 超时后对上层表现为流已结束，避免被误判为还有 body。
+        self.timed_out || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// 面板 HTTP 的 accept 循环（KI-17）。
+///
+/// 不用 `axum::serve`：它没有 header 读超时，也拿不到连接数。这里手工 accept，
+/// 做「全局 + 每来源 IP」并发限制、HTTP/1 header 超时与请求体总超时；半截
+/// header 的慢连接最多占用 [`HEADER_READ_TIMEOUT`]，慢 body 最多占用
+/// [`BODY_READ_TIMEOUT`]，洪水下 `/healthz` 仍可用。
+async fn serve_panel_listener(app: Router, listener: TcpListener) -> Result<()> {
+    let local = listener.local_addr().context("读取面板监听地址失败")?;
+    // 与 Argon2 的 `state.argon2_slots` 完全独立，不能混用许可。
+    let permits = Arc::new(Semaphore::new(ADMIN_MAX_CONNECTIONS.max(1)));
+    let limits = Arc::new(ConnectionLimiter::new(ADMIN_MAX_CONNECTIONS_PER_IP));
+    tracing::info!(
+        listen = %local,
+        max_connections = ADMIN_MAX_CONNECTIONS,
+        max_connections_per_ip = ADMIN_MAX_CONNECTIONS_PER_IP,
+        "面板连接限制已启用"
+    );
+
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) => {
+                // 单个 accept 失败（例如 fd 瞬时耗尽）不应让整个面板退出。
+                tracing::warn!(error = %err, "面板 accept 失败，100ms 后重试");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+
+        // 先占全局槽位，拿不到立即关 TCP（不读请求、不回响应）。
+        let permit = match try_acquire_connection(&permits) {
+            Some(permit) => permit,
+            None => {
+                tracing::warn!(
+                    %peer,
+                    max_connections = ADMIN_MAX_CONNECTIONS,
+                    "面板连接数已达上限，直接关闭 TCP"
+                );
+                continue;
+            }
+        };
+
+        // 再占来源 IP 槽位；计数归零时删键，表容量有上限。
+        let connection = match limits.try_acquire(peer.ip()) {
+            Ok(connection) => connection,
+            Err(ConnectionLimitRejection::PerIp) => {
+                tracing::warn!(
+                    ip = %peer.ip(),
+                    max_connections_per_ip = ADMIN_MAX_CONNECTIONS_PER_IP,
+                    "面板来源 IP 并发连接已达上限，直接关闭 TCP"
+                );
+                continue;
+            }
+            Err(ConnectionLimitRejection::TableFull) => {
+                tracing::warn!(ip = %peer.ip(), "面板连接来源表已满，拒绝新来源");
+                continue;
+            }
+        };
+
+        if let Err(err) = tcp.set_nodelay(true) {
+            tracing::debug!(%peer, error = %err, "设置 TCP_NODELAY 失败");
+        }
+
+        let app = app.clone();
+        tokio::spawn(async move {
+            // 许可跟随连接生命周期；连接关闭（含超时）后自动归还。
+            let _permit = permit;
+            let _connection = connection;
+
+            // 登录限速 / 可信反代取 IP 依赖 ConnectInfo<SocketAddr>，逐请求注入。
+            // KI-17：请求体套一次性总 deadline，慢 body 最多占 10s，不随 frame 重置。
+            let service = tower::service_fn(move |req: hyper::Request<Incoming>| {
+                let (mut parts, incoming) = req.into_parts();
+                parts.extensions.insert(ConnectInfo(peer));
+                let body = Body::new(DeadlineBody::new(incoming, BODY_READ_TIMEOUT));
+                let req = hyper::Request::from_parts(parts, body);
+                let app = app.clone();
+                async move { app.oneshot(req).await }
+            });
+
+            // 不用 hyper-util 的 auto builder：它的 HTTP 版本嗅探阶段没有超时。
+            // http1 Builder 只对「读 header」计时；body 由 DeadlineBody 的 10s 总
+            // deadline 单独约束，不会因为 header 超时被提前杀掉。
+            if let Err(err) = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(HEADER_READ_TIMEOUT)
+                .serve_connection(TokioIo::new(tcp), TowerToHyperService::new(service))
+                .with_upgrades()
+                .await
+            {
+                // 只记录来源与错误，不记录请求头。
+                tracing::debug!(%peer, error = %err, "面板连接结束");
+            }
+        });
+    }
+}
+
 fn run(config: Option<PathBuf>, listen: Option<String>, hub: Option<String>) -> Result<()> {
     let explicit = config.is_some();
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_PANEL_CONFIG));
@@ -1083,7 +1377,7 @@ fn run(config: Option<PathBuf>, listen: Option<String>, hub: Option<String>) -> 
     runtime.block_on(async move {
         spawn_password_reload(reload_state);
         let app = build_router(state);
-        let listener = tokio::net::TcpListener::bind(&listen)
+        let listener = TcpListener::bind(&listen)
             .await
             .with_context(|| format!("监听 {listen} 失败"))?;
         if !loopback {
@@ -1094,12 +1388,8 @@ fn run(config: Option<PathBuf>, listen: Option<String>, hub: Option<String>) -> 
             );
         }
         tracing::info!(listen = %listen, hub = %hub, "面板已启动");
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await?;
-        Ok(())
+        // KI-17：手工 accept，带 header 读超时与全局 / 每 IP 连接上限。
+        serve_panel_listener(app, listener).await
     })
 }
 
@@ -2908,5 +3198,276 @@ mod tests {
         .unwrap();
         assert!(!old_ok, "旧密码必须失效");
         assert!(new_ok, "新密码必须可用");
+    }
+
+    // ------------------------------------------------------------------
+    // KI-17：面板慢速连接防护（A1）
+    // ------------------------------------------------------------------
+
+    /// KI-17：per-IP 上限、计数归零删键、来源表容量与陈旧项清理。
+    #[test]
+    fn connection_limiter_per_ip_cleanup_and_table_capacity() {
+        use std::net::IpAddr;
+
+        let limiter = Arc::new(ConnectionLimiter::with_ip_capacity(2, 2));
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        let ip3: IpAddr = "10.0.0.3".parse().unwrap();
+
+        let first = limiter.try_acquire(ip1).expect("第 1 条连接必须允许");
+        let second = limiter.try_acquire(ip1).expect("第 2 条连接必须允许");
+        assert!(
+            matches!(
+                limiter.try_acquire(ip1),
+                Err(ConnectionLimitRejection::PerIp)
+            ),
+            "同一 IP 第 3 条连接必须被拒绝"
+        );
+        assert_eq!(limiter.tracked_ips(), 1);
+
+        let other = limiter.try_acquire(ip2).expect("其他 IP 不受影响");
+        assert!(
+            matches!(
+                limiter.try_acquire(ip3),
+                Err(ConnectionLimitRejection::TableFull)
+            ),
+            "来源表满时必须拒绝新 IP"
+        );
+
+        // 计数归零后立即删键，新 IP 可以进入。
+        drop(first);
+        drop(second);
+        let third = limiter.try_acquire(ip3).expect("清理归零项后应有空间");
+        drop(other);
+        assert_eq!(limiter.tracked_ips(), 1, "ip3 仍在线");
+        drop(third);
+        assert_eq!(limiter.tracked_ips(), 0, "全部断开后表必须清空");
+    }
+
+    /// KI-17：header 超时与连接上限的取值必须符合方案（30 条慢连接测试依赖它们）。
+    #[test]
+    fn header_read_timeout_and_connection_limits() {
+        assert_eq!(HEADER_READ_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(BODY_READ_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(ADMIN_MAX_CONNECTIONS, 256);
+        assert_eq!(ADMIN_MAX_CONNECTIONS_PER_IP, 32);
+    }
+
+    /// 测试路由：验证手工 accept 循环给请求注入了 `ConnectInfo<SocketAddr>`。
+    async fn test_peer_ip(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> String {
+        peer.ip().to_string()
+    }
+
+    /// 测试路由：完整读取请求体（验证 body 总超时只作用于真正读 body 的请求）。
+    async fn test_consume_body(_body: Bytes) -> &'static str {
+        "ok"
+    }
+
+    /// 启动一个只提供 `/healthz`、`/peer`、`/consume` 的最小面板口，返回地址与 server 任务。
+    async fn spawn_test_panel_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定测试端口");
+        let addr = listener.local_addr().expect("读取测试端口");
+        let app = Router::new()
+            .route("/healthz", get(healthz))
+            .route("/peer", get(test_peer_ip))
+            .route("/consume", post(test_consume_body));
+        let server = tokio::spawn(async move {
+            let _ = serve_panel_listener(app, listener).await;
+        });
+        (addr, server)
+    }
+
+    /// 发一个完整的 `GET` 请求（带 `Connection: close`），返回原始响应文本。
+    async fn test_http_get(addr: SocketAddr, path: &str) -> std::io::Result<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok(String::from_utf8_lossy(&response).into_owned())
+    }
+
+    /// KI-17：30 条只发半截 header 的 TCP 必须在 10s 内全部被关闭，
+    /// 且慢连接存续期间与关闭之后 `/healthz` 都仍返回 200。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn slow_header_connections_are_closed_and_healthz_available() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (addr, server) = spawn_test_panel_server().await;
+        let response = test_http_get(addr, "/healthz")
+            .await
+            .expect("启动后的健康检查失败");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "启动后 /healthz 必须 200: {response}"
+        );
+
+        // 手工 accept 循环必须继续注入 ConnectInfo（登录限速/可信反代依赖它）。
+        let peer = test_http_get(addr, "/peer")
+            .await
+            .expect("ConnectInfo 测试请求失败");
+        assert!(
+            peer.contains("127.0.0.1"),
+            "手工 accept 必须注入 ConnectInfo<SocketAddr>: {peer}"
+        );
+
+        let partial = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nX-Slow: ";
+        let mut slow = Vec::new();
+        for _ in 0..30 {
+            let mut stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("连接面板");
+            stream.write_all(partial).await.expect("写半截 header");
+            slow.push(stream);
+        }
+        // 让 accept 循环把这些连接登记进限额表。
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 慢连接仍占用 fd 时，健康检查必须可用（30 < 全局 / 每 IP 上限）。
+        let response = test_http_get(addr, "/healthz")
+            .await
+            .expect("慢连接存续期间健康检查失败");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "慢连接存续期间 /healthz 必须仍 200: {response}"
+        );
+
+        let started = std::time::Instant::now();
+        let mut readers = Vec::new();
+        for mut stream in slow {
+            readers.push(tokio::spawn(async move {
+                let mut buf = [0u8; 128];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                }
+            }));
+        }
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            for reader in readers {
+                let _ = reader.await;
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "30 条半截 header 连接必须在 10s 内被关闭");
+        assert!(
+            started.elapsed() <= Duration::from_secs(10),
+            "连接关闭耗时 {:?} 超过 10s",
+            started.elapsed()
+        );
+
+        let response = test_http_get(addr, "/healthz")
+            .await
+            .expect("慢连接关闭后健康检查失败");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "慢连接关闭后 /healthz 必须仍 200: {response}"
+        );
+
+        server.abort();
+    }
+
+    /// KI-17 剩余缺口：header 完整、`Content-Length` 很大但永不发送 body 的连接，
+    /// 必须在请求体总超时后关闭（或收到非 2xx），且不能影响 `/healthz`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn body_read_timeout_closes_connection_without_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (addr, server) = spawn_test_panel_server().await;
+        // 先确认 server 已就绪。
+        let health = test_http_get(addr, "/healthz")
+            .await
+            .expect("启动后健康检查失败");
+        assert!(
+            health.starts_with("HTTP/1.1 200"),
+            "启动后 /healthz 必须 200: {health}"
+        );
+
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("连接面板");
+        // header 完整，声明 8192 字节 body，但一个 body 字节都不发。
+        stream
+            .write_all(
+                b"POST /consume HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8192\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .await
+            .expect("写完整 header");
+
+        let started = std::time::Instant::now();
+        let reader = tokio::spawn(async move {
+            let mut response = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        response.extend_from_slice(&buf[..n]);
+                        // 400/413 响应很小；读到上限只是为了不在异常情况下无限读。
+                        if response.len() >= 16 * 1024 {
+                            break;
+                        }
+                    }
+                }
+            }
+            response
+        });
+
+        // 慢 body 连接存续期间，/healthz 必须仍然可用。
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let health = test_http_get(addr, "/healthz")
+            .await
+            .expect("慢 body 连接存续期间健康检查失败");
+        assert!(
+            health.starts_with("HTTP/1.1 200"),
+            "慢 body 连接存续期间 /healthz 必须仍 200: {health}"
+        );
+
+        let response = tokio::time::timeout(Duration::from_secs(12), reader)
+            .await
+            .expect("header 完整但没有 body 的连接必须在 12s 内关闭或返回响应")
+            .expect("读取任务不得 panic");
+        let elapsed = started.elapsed();
+        // 必须真的等到 body deadline 才关闭：防止路由/提取器提前 404 让用例假通过。
+        assert!(
+            elapsed >= BODY_READ_TIMEOUT.saturating_sub(Duration::from_secs(1)),
+            "连接过早关闭（{elapsed:?}），没有等到请求体 deadline"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(12),
+            "连接关闭耗时 {elapsed:?} 超过 12s"
+        );
+        if !response.is_empty() {
+            let text = String::from_utf8_lossy(&response);
+            assert!(
+                !text.starts_with("HTTP/1.1 2"),
+                "请求体超时不得返回 2xx（实际响应: {text}）"
+            );
+        }
+        eprintln!(
+            "面板请求体超时：{elapsed:?} 后关闭，收到 {} 字节响应",
+            response.len()
+        );
+
+        let health = test_http_get(addr, "/healthz")
+            .await
+            .expect("超时关闭后健康检查失败");
+        assert!(
+            health.starts_with("HTTP/1.1 200"),
+            "超时关闭后 /healthz 必须仍 200: {health}"
+        );
+
+        server.abort();
     }
 }

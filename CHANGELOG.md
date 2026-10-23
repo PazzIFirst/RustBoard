@@ -10,6 +10,46 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-23
+
+### Added
+
+- 管理 API 与面板的 HTTP accept 层：5s header 读超时、10s 请求体总超时、全局 256 / 每来源 IP 32 并发连接上限，
+  超限立即关闭 TCP；半截 header 的慢连接不再长期占用 fd（KI-17）
+- agent 配置 `send_timeout_secs`（默认 15，范围 1–120）：Hello / Batch / Ping / Pong / 续签 /
+  控制应答 / Enroll / close 的每次 WebSocket 写都有独立超时
+- 服务端证书**仅因过期**时的启动自愈：持 `CertLock` 用当前 CA 重签、成对备份、自检失败回滚；
+  CA/SAN/CN/密钥异常仍拒绝启动
+- 会话注册表新增 `unregister_last_and_run`：最后一条连接注销与 offline/revoked 单行写库
+  在 per-agent slot 锁内原子完成
+- DiskBuffer 物理文件压实水位、淘汰偏移原子持久化、重启后重新限额；新增确定性崩溃注入测试
+- 新增 `tests/e2e/v031.sh`：#13 过期证书启动自愈 + 原 agent 自动重连、KI-17 管理口/面板慢连接
+
+### Changed
+
+- 管理 API 与面板改为手工 `hyper` HTTP/1 accept + `TowerToHyperService`，不再使用无 header
+  超时/无连接上限的 `axum::serve`；请求体套一次性 10s deadline（不随 frame 重置），
+  `ConnectInfo` 逐请求注入，限速与可信代理行为不变
+- agent 会话内证书续签遇到**发送超时**时结束当前会话并重连；普通续签失败仍只告警
+- `SessionCleanup` 不再“先注销、再 has_active、再写 offline”；状态写入与同 agent 新连接注册串行化
+- DiskBuffer 压实改为 rename 前先打开新文件句柄，避免 rename 后打开失败仍持有旧 inode
+- 发布门槛更新：单元/集成 420 个，hardening 34 项、v031 94 项、security/panel/cert/control 全量回归
+
+### Fixed
+
+- Agent 本地缓冲物理文件可无限增长、淘汰偏移未落盘、重启后已淘汰记录复活（#10）
+- Agent 对端停止读取时 WebSocket 写可永久挂起，`session_max_hours=0` 无兜底（#12）
+- 服务端证书过期导致 hub 启动失败、自动续签任务无法运行（#13）
+- 旧会话清理可把新会话的 `online` 覆盖成 `offline`（#14）
+- 管理 API / 面板无 header 超时与连接上限，慢速连接可耗尽 fd（KI-17）
+
+### Security
+
+- 复验 #11：非法/超长/9 跳 `X-Forwarded-For` 返回 400；不可信直连来源伪造 XFF 不影响限速分桶；
+  锁定一个可信客户端不影响其他客户端（hardening 7.6–7.10）
+- #9 的 Bearer 鉴权、弱 token 拒绝、未知 API 先鉴权、非回环告警由本轮 hardening 再次验证；
+  **scoped read/write token 与管理端强制 TLS 仍未实现**，不宣称 #9 全部完成
+
 ## [0.3.0] - 2026-10-23
 
 ### Added
