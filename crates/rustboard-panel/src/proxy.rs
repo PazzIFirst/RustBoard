@@ -70,47 +70,124 @@ impl ProxyError {
     }
 }
 
+/// 判断 host 是否只指向本机回环。
+///
+/// `Url::host_str()` 对 IPv6 返回带方括号的形式（例如 `[::1]`），必须先去掉方括号
+/// 再交给 `IpAddr` 解析，否则合法回环地址会被误判为非回环。
+fn is_loopback_host(host: &str) -> bool {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
 /// hub 管理 API 客户端。
 #[derive(Clone)]
 pub struct ProxyClient {
     client: reqwest::Client,
     base: Url,
     token: String,
+    /// 配置的私有 CA 路径；仅用于错误提示，请求已由 reqwest 内置信任库持有。
+    hub_ca: Option<String>,
 }
 
 impl ProxyClient {
-    pub fn new(hub_url: &str, token: &str) -> Result<Self> {
+    /// 构造 hub 客户端。
+    ///
+    /// 安全约束（v0.3.3）：
+    /// - `http://` 只允许回环 host（`localhost`、127.0.0.0/8、`::1`）：面板会把 Bearer token
+    ///   发给 hub，明文链路不能出本机；远程 hub 必须 `https://`。
+    /// - `https://` 允许任意 host；`hub_ca` 非空时只信任该 PEM（可含多张证书），
+    ///   系统根证书不参与校验；为空时使用系统根证书。
+    /// - `http://` + `hub_ca` 是配置矛盾：不会加密，必须拒绝，避免误以为已启用 TLS。
+    pub fn new(hub_url: &str, token: &str, hub_ca: &str) -> Result<Self> {
         if token.trim().is_empty() {
             bail!("hub token 为空，面板无法访问管理 API");
         }
         let base =
             Url::parse(hub_url.trim()).with_context(|| format!("hub 地址非法: {hub_url}"))?;
-        if base.scheme() != "http" {
-            bail!(
-                "M2 面板只支持 http:// 的 hub 地址（当前 {}）",
-                base.scheme()
-            );
+        let scheme = base.scheme();
+        if scheme != "http" && scheme != "https" {
+            bail!("hub 地址只支持 http:// 或 https://（当前 {scheme}）");
         }
-        if base.host_str().is_none() {
+        let Some(host) = base.host_str() else {
             bail!("hub 地址缺少主机名: {hub_url}");
+        };
+        if scheme == "http" && !is_loopback_host(host) {
+            bail!(
+                "hub 地址 {hub_url} 是非回环的明文 http：面板会把 hub token 发到网络上；\
+                 请改用 https://（私有 CA 需同时配置 hub_ca），或只连回环地址\
+                 （localhost、127.0.0.0/8、::1）"
+            );
         }
         if base.query().is_some() || base.fragment().is_some() {
             bail!("hub 地址不能带查询串或片段: {hub_url}");
         }
-        let client = reqwest::Client::builder()
+
+        let ca_path = hub_ca.trim();
+        if !ca_path.is_empty() && scheme != "https" {
+            bail!(
+                "hub_ca 只能与 https:// 的 hub 地址一起使用（当前 {scheme}）；\
+                 明文 http 配了 CA 不会加密，请先把 hub_url 改成 https://"
+            );
+        }
+
+        let mut builder = reqwest::Client::builder()
             // 面板 → hub 是固定的服务端地址，且请求带 `Authorization: Bearer`。
             // 必须禁用 reqwest 默认的 HTTP_PROXY/ALL_PROXY 环境代理：否则运维机器/
             // 容器里一个全局代理变量就会把 hub 管理 token 发给环境代理。
             .no_proxy()
             .redirect(Policy::none())
-            .timeout(UPSTREAM_TIMEOUT)
-            .build()
-            .context("构建 hub HTTP 客户端失败")?;
+            .timeout(UPSTREAM_TIMEOUT);
+        let hub_ca = if ca_path.is_empty() {
+            builder = builder.tls_built_in_root_certs(true);
+            None
+        } else {
+            // 配了私有 CA 就只信任它：不叠加系统根/公共 CA，避免本应只被私有 CA
+            // 保护的 hub 被任意公网证书冒充。空 PEM、非 PEM 与无法解析的证书都在启动期拒绝。
+            builder = builder.tls_built_in_root_certs(false);
+            let pem = std::fs::read_to_string(ca_path)
+                .with_context(|| format!("读取 hub_ca 失败: {ca_path}"))?;
+            let certs = rustboard_common::tls::load_certs(&pem)
+                .with_context(|| format!("hub_ca 不是有效的 PEM 证书: {ca_path}"))?;
+            for cert in certs {
+                let cert = reqwest::Certificate::from_der(cert.as_ref())
+                    .with_context(|| format!("hub_ca 中的证书无法载入: {ca_path}"))?;
+                builder = builder.add_root_certificate(cert);
+            }
+            Some(ca_path.to_string())
+        };
+        if let Some(ca_path) = hub_ca.as_deref() {
+            tracing::info!(
+                hub_ca = ca_path,
+                "hub 使用私有 CA：仅信任 hub_ca，系统根证书不参与校验"
+            );
+        }
+        let client = builder.build().context("构建 hub HTTP 客户端失败")?;
         Ok(Self {
             client,
             base,
             token: token.to_string(),
+            hub_ca,
         })
+    }
+
+    /// 网络错误详情：配置私有 CA 时明确提示系统根不参与，便于排查证书链问题。
+    ///
+    /// 只追加固定说明与 CA 路径，不包含 token。
+    fn describe_error(&self, error: &reqwest::Error) -> String {
+        let detail = redact_url(&error.to_string());
+        match self.hub_ca.as_deref() {
+            Some(ca_path) => {
+                format!("{detail}（已配置 hub_ca={ca_path}：仅信任该 CA，系统根证书不参与校验）")
+            }
+            None => detail,
+        }
     }
 
     /// 由固定的 API 路径与白名单查询参数构造上游 URL。
@@ -138,7 +215,7 @@ impl ProxyClient {
             .get(url)
             .bearer_auth(&self.token)
             .header(header::ACCEPT, "application/json");
-        send(request).await
+        send(self, request).await
     }
 
     pub async fn put_json(
@@ -155,7 +232,7 @@ impl ProxyClient {
             .bearer_auth(&self.token)
             .header(header::ACCEPT, "application/json")
             .json(value);
-        send(request).await
+        send(self, request).await
     }
 
     /// POST 一个 JSON 请求体到 hub。
@@ -190,15 +267,18 @@ impl ProxyClient {
             .bearer_auth(&self.token)
             .header(header::ACCEPT, "application/json")
             .json(value);
-        send_with_timeout(request, timeout).await
+        send_with_timeout(self, request, timeout).await
     }
 }
 
-async fn send(request: reqwest::RequestBuilder) -> std::result::Result<HubReply, ProxyError> {
+async fn send(
+    client: &ProxyClient,
+    request: reqwest::RequestBuilder,
+) -> std::result::Result<HubReply, ProxyError> {
     let response = request
         .send()
         .await
-        .map_err(|e| ProxyError::Unreachable(redact_url(&e.to_string())))?;
+        .map_err(|e| ProxyError::Unreachable(client.describe_error(&e)))?;
     collect_reply(response).await
 }
 
@@ -209,15 +289,15 @@ async fn send(request: reqwest::RequestBuilder) -> std::result::Result<HubReply,
 /// 已收到响应头、读 body 阶段才超时时，`read_body_limited` 返回
 /// [`ProxyError::BodyTimeout`]；控制路径同样视为“结果未知”，统一转成 `Timeout`。
 async fn send_with_timeout(
+    client: &ProxyClient,
     request: reqwest::RequestBuilder,
     timeout: Duration,
 ) -> std::result::Result<HubReply, ProxyError> {
     let response = request.timeout(timeout).send().await.map_err(|e| {
-        let detail = redact_url(&e.to_string());
         if e.is_timeout() {
-            ProxyError::Timeout(detail)
+            ProxyError::Timeout(redact_url(&e.to_string()))
         } else {
-            ProxyError::Unreachable(detail)
+            ProxyError::Unreachable(client.describe_error(&e))
         }
     })?;
     collect_reply(response).await.map_err(|error| match error {
@@ -444,21 +524,149 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::*;
     use axum::body::to_bytes;
     use rustboard_common::control::MAX_REQUEST_TIMEOUT_MS;
+    use rustboard_common::tls::{cert_dir, ensure_hub_material, server_config, CertPolicy};
 
     fn client() -> ProxyClient {
-        ProxyClient::new("http://127.0.0.1:8444", "test-token").unwrap()
+        ProxyClient::new("http://127.0.0.1:8444", "test-token", "").unwrap()
+    }
+
+    /// 回环 http 继续可用（同机部署不需要证书）。
+    #[test]
+    fn accepts_loopback_http_hub_urls() {
+        for url in [
+            "http://127.0.0.1:8444",
+            "http://127.0.0.1:8444/",
+            "http://127.10.20.30:8444",
+            "http://localhost:8444",
+            "http://LOCALHOST:8444",
+            "http://[::1]:8444",
+        ] {
+            assert!(
+                ProxyClient::new(url, "t", "").is_ok(),
+                "回环 http 地址必须被接受: {url}"
+            );
+        }
+    }
+
+    /// 远程/容器部署的明文 http 会把 Bearer token 发到网络上，启动必须失败并提示 https。
+    #[test]
+    fn rejects_non_loopback_http_hub_urls() {
+        for url in [
+            "http://hub.example.com:8444",
+            "http://192.168.1.10:8444",
+            "http://10.0.0.5:8444",
+            "http://0.0.0.0:8444",
+            "http://[2001:db8::1]:8444",
+        ] {
+            let error = ProxyClient::new(url, "super-secret-token", "")
+                .err()
+                .expect("非回环明文 http 必须拒绝");
+            let text = error.to_string();
+            assert!(
+                text.contains("https://"),
+                "错误信息必须提示改用 https://: {text}"
+            );
+            assert!(
+                !text.contains("super-secret-token"),
+                "错误信息不得回显 token: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_https_hub_urls() {
+        for url in [
+            "https://127.0.0.1:8444",
+            "https://hub.example.com",
+            "https://10.1.2.3:8444",
+            "https://[2001:db8::1]:8444",
+        ] {
+            assert!(
+                ProxyClient::new(url, "t", "").is_ok(),
+                "https 允许任意主机: {url}"
+            );
+        }
     }
 
     #[test]
     fn rejects_bad_hub_urls() {
-        assert!(ProxyClient::new("https://127.0.0.1:8444", "t").is_err());
-        assert!(ProxyClient::new("ftp://127.0.0.1:8444", "t").is_err());
-        assert!(ProxyClient::new("http://127.0.0.1:8444?x=1", "t").is_err());
-        assert!(ProxyClient::new("http://127.0.0.1:8444", "  ").is_err());
-        assert!(ProxyClient::new("http://127.0.0.1:8444/", "t").is_ok());
+        assert!(ProxyClient::new("ftp://127.0.0.1:8444", "t", "").is_err());
+        assert!(ProxyClient::new("http://127.0.0.1:8444?x=1", "t", "").is_err());
+        assert!(ProxyClient::new("http://127.0.0.1:8444#frag", "t", "").is_err());
+        assert!(ProxyClient::new("http://127.0.0.1:8444", "  ", "").is_err());
+        assert!(ProxyClient::new("not a url", "t", "").is_err());
+        assert!(ProxyClient::new("", "t", "").is_err());
+    }
+
+    /// `http` + `hub_ca` 是配置矛盾：不会加密，必须拒绝，避免误以为已启用 TLS。
+    #[test]
+    fn rejects_http_with_hub_ca() {
+        let error = ProxyClient::new("http://127.0.0.1:8444", "t", "/does/not/exist.crt")
+            .err()
+            .expect("http + hub_ca 必须拒绝，而不是静默忽略 CA");
+        let text = error.to_string();
+        assert!(text.contains("hub_ca"), "错误信息: {text}");
+        assert!(text.contains("https"), "错误信息: {text}");
+    }
+
+    #[test]
+    fn rejects_missing_hub_ca_file() {
+        let dir = TempDir::new("missing-ca");
+        let path = dir.path().join("nope.crt");
+        let error = ProxyClient::new("https://127.0.0.1:8444", "t", path.to_str().unwrap())
+            .err()
+            .expect("hub_ca 文件不存在必须启动失败");
+        assert!(
+            error.to_string().contains(path.to_str().unwrap()),
+            "错误信息必须给出 CA 路径: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_pem_hub_ca() {
+        let dir = TempDir::new("non-pem-ca");
+        let path = dir.path().join("ca.crt");
+        std::fs::write(&path, "this is not a certificate\n").unwrap();
+        let error = ProxyClient::new("https://127.0.0.1:8444", "t", path.to_str().unwrap())
+            .err()
+            .expect("非 PEM 的 hub_ca 必须启动失败");
+        assert!(error.to_string().contains("PEM"), "错误信息: {error}");
+    }
+
+    #[test]
+    fn rejects_empty_pem_hub_ca() {
+        let dir = TempDir::new("empty-ca");
+        let path = dir.path().join("ca.crt");
+        std::fs::write(&path, "  \n\n").unwrap();
+        let error = ProxyClient::new("https://127.0.0.1:8444", "t", path.to_str().unwrap())
+            .err()
+            .expect("空 PEM 的 hub_ca 必须启动失败");
+        assert!(error.to_string().contains("PEM"), "错误信息: {error}");
+    }
+
+    /// 私有 CA 支持 bundle（多张证书），客户端构建成功；字段记录用于错误提示。
+    #[test]
+    fn accepts_https_with_private_ca_bundle() {
+        let (_dir_a, ca_a) = test_ca_material("ca-a");
+        let (_dir_b, ca_b) = test_ca_material("ca-b");
+        let bundle_dir = TempDir::new("ca-bundle");
+        let bundle = bundle_dir.path().join("bundle.pem");
+        let mut pem = std::fs::read_to_string(&ca_a).unwrap();
+        pem.push_str(&std::fs::read_to_string(&ca_b).unwrap());
+        std::fs::write(&bundle, pem).unwrap();
+
+        let client =
+            ProxyClient::new("https://127.0.0.1:8444", "t", bundle.to_str().unwrap()).unwrap();
+        assert_eq!(
+            client.hub_ca.as_deref(),
+            Some(bundle.to_str().unwrap()),
+            "配置了私有 CA 时必须记录路径，供错误提示说明系统根不参与"
+        );
     }
 
     #[test]
@@ -587,7 +795,7 @@ mod tests {
             Duration::from_millis(100),
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_vec(),
         );
-        let client = ProxyClient::new(&url, "test-token").unwrap();
+        let client = ProxyClient::new(&url, "test-token", "").unwrap();
         let error = client
             .post_json_with_timeout(
                 "/api/v1/agents/hub-self/control",
@@ -627,7 +835,7 @@ mod tests {
             Duration::from_millis(100),
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_vec(),
         );
-        let client = ProxyClient::new(&url, "test-token").unwrap();
+        let client = ProxyClient::new(&url, "test-token", "").unwrap();
         let reply = client
             .post_json_with_timeout(
                 "/api/v1/agents/hub-self/control",
@@ -670,7 +878,7 @@ mod tests {
             b"}".to_vec(),
             Duration::from_millis(200),
         );
-        let client = ProxyClient::new(&url, "test-token").unwrap();
+        let client = ProxyClient::new(&url, "test-token", "").unwrap();
         let error = client
             .post_json_with_timeout(
                 "/api/v1/agents/hub-self/control",
@@ -721,6 +929,134 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("hub_body_error"));
+    }
+
+    /// 测试用临时目录：进程 id + 自增序号，Drop 时清理。
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("rb-panel-{}-{tag}-{seq}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// 生成一套真实 CA + 服务端证书（SAN=127.0.0.1）；返回临时目录与 CA 证书路径。
+    fn test_ca_material(tag: &str) -> (TempDir, PathBuf) {
+        let dir = TempDir::new(tag);
+        ensure_hub_material(
+            dir.path(),
+            &["127.0.0.1".to_string()],
+            CertPolicy::default(),
+        )
+        .unwrap();
+        let ca_path = cert_dir(dir.path()).join(rustboard_common::tls::CA_CERT_FILE);
+        (dir, ca_path)
+    }
+
+    /// 起一个只服务一次请求的 TLS mock hub（TLS 1.3，服务端证书由测试 CA 签发）。
+    async fn spawn_tls_hub(data_dir: &Path) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config(data_dir).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut tls) = acceptor.accept(stream).await else {
+                // 客户端使用错误 CA 时握手在服务端也会失败；这里不 panic，
+                // 让测试通过客户端错误断言握手确实被拒绝。
+                return;
+            };
+            let mut request = Vec::new();
+            let mut scratch = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match tls.read(&mut scratch).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&scratch[..read]),
+                }
+            }
+            let _ = tls
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                      Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await;
+            let _ = tls.flush().await;
+            let _ = tls.shutdown().await;
+        });
+        (address, handle)
+    }
+
+    /// 正确 CA：真实 TLS 握手必须成功，并完成一次 GET。
+    #[tokio::test]
+    async fn https_with_private_ca_handshakes_against_tls_hub() {
+        let (dir, ca_path) = test_ca_material("tls-ok");
+        let (address, handle) = spawn_tls_hub(dir.path()).await;
+        let client = ProxyClient::new(
+            &format!("https://{address}"),
+            "test-token",
+            ca_path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let reply = client
+            .get("/api/v1/system", &[])
+            .await
+            .expect("正确 hub_ca 必须完成 TLS 握手并读到响应");
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.body, b"{}");
+        handle.await.unwrap();
+    }
+
+    /// 错误 CA：真实 TLS 握手必须失败，且错误详情说明只信任 hub_ca。
+    #[tokio::test]
+    async fn https_with_wrong_private_ca_fails_handshake() {
+        let (server_dir, _) = test_ca_material("tls-server");
+        let (_client_dir, client_ca) = test_ca_material("tls-client");
+        let (address, handle) = spawn_tls_hub(server_dir.path()).await;
+        let client = ProxyClient::new(
+            &format!("https://{address}"),
+            "test-token",
+            client_ca.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let error = client
+            .get("/api/v1/system", &[])
+            .await
+            .expect_err("错误 hub_ca 必须握手失败，不能退化为明文或信任系统根");
+        assert!(
+            matches!(error, ProxyError::Unreachable(_)),
+            "错误 CA 必须映射为 Unreachable，实际: {error:?}"
+        );
+        if let ProxyError::Unreachable(detail) = &error {
+            assert!(
+                detail.contains("系统根证书不参与校验"),
+                "错误详情应说明只信任 hub_ca: {detail}"
+            );
+        }
+        handle.await.unwrap();
     }
 
     /// 起一个只服务一次请求的原始 HTTP 服务器；返回 URL。
@@ -939,7 +1275,8 @@ mod tests {
             ("https_proxy", None),
         ]);
 
-        let client = ProxyClient::new(&format!("http://{hub_address}"), "test-hub-token").unwrap();
+        let client =
+            ProxyClient::new(&format!("http://{hub_address}"), "test-hub-token", "").unwrap();
         let reply = client.get("/api/v1/system", &[]).await.unwrap();
         assert_eq!(reply.status, StatusCode::OK, "请求应直连 hub，而不是假代理");
         assert_eq!(

@@ -32,3 +32,7 @@ tower = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 include_dir = { workspace = true, optional = true }
+
+[dev-dependencies]
+# 真实 TLS mock hub：只在测试构建启用，不进入发布二进制。
+tokio-rustls = { workspace = true }

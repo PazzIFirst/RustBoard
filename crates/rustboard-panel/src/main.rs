@@ -220,8 +220,8 @@ impl AppState {
         if cfg.listen.trim().is_empty() {
             bail!("listen 不能为空");
         }
-        let proxy =
-            proxy::ProxyClient::new(&cfg.hub_url, &cfg.token).context("初始化 hub 客户端失败")?;
+        let proxy = proxy::ProxyClient::new(&cfg.hub_url, &cfg.token, &cfg.hub_ca)
+            .context("初始化 hub 客户端失败")?;
         let ttl_hours = cfg.session_ttl_hours.max(1);
         if cfg.session_ttl_hours == 0 {
             tracing::warn!("session_ttl_hours=0 非法，已按 1 小时处理");
@@ -1618,7 +1618,12 @@ fn load_hub_config_hint() -> Option<HubConfig> {
     }
 }
 
-/// 把 `127.0.0.1:8444` / `0.0.0.0:8444` / `http://...` 统一成面板可用的 hub 地址。
+/// 把 `127.0.0.1:8444` / `0.0.0.0:8444` / `http://...` / `https://...` 统一成面板可用的 hub 地址。
+///
+/// 无 scheme 时仍默认 `http://`（兼容旧 CLI 用法与同机回环部署）；
+/// `https://` 原样保留。是否允许明文 http 由 [`proxy::ProxyClient::new`] 在启动时按
+/// host 是否为回环裁决——这样 `panel init` 可以先把远程地址写进配置，
+/// 由运行时给出统一的安全错误。
 fn normalize_hub_url(raw: &str) -> Result<String> {
     let raw = raw.trim().trim_end_matches('/');
     if raw.is_empty() {
@@ -1629,9 +1634,6 @@ fn normalize_hub_url(raw: &str) -> Result<String> {
     } else {
         format!("http://{raw}")
     };
-    if normalized.starts_with("https://") {
-        bail!("M2 面板只支持 http:// 的 hub 地址；https 由 M5 的反代方案承接");
-    }
     Ok(normalized)
 }
 
@@ -2870,7 +2872,11 @@ mod tests {
             normalize_hub_url("http://127.0.0.1:8444/").unwrap(),
             "http://127.0.0.1:8444"
         );
-        assert!(normalize_hub_url("https://127.0.0.1:8444").is_err());
+        assert_eq!(
+            normalize_hub_url("https://hub.example.com:8444/").unwrap(),
+            "https://hub.example.com:8444",
+            "v0.3.3 起 https:// 必须原样保留"
+        );
         assert!(normalize_hub_url("  ").is_err());
 
         assert_eq!(
