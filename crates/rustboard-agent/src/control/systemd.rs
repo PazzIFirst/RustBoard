@@ -6,6 +6,7 @@
 //! 自身、systemd/dbus 关键服务）优先于白名单，配置层与执行层各校验一次。
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use rustboard_common::config::ControlConfig;
 use rustboard_common::control::{
@@ -37,28 +38,56 @@ pub const SYSTEMCTL_LIST_UNIT_FILES_ARGS: [&str; 5] = [
 
 /// 列出白名单内（且不在禁止列表）的 service unit。
 ///
-/// 两次 `systemctl` 都使用既有 [`exec::run`] 与 `command_timeout_secs` 派生的
-/// 超时；任一非零退出都直接返回 `control_failed`，绝不静默退化成只有一份列表。
+/// 两次 `systemctl` 共享同一个总 deadline（`command_timeout_secs`），避免两次
+/// 各自用满超时导致最坏耗时翻倍；任一非零退出或输出被截断都直接返回
+/// `control_failed`，绝不静默退化成只有一份列表或“看似完整”的残列表。
 pub fn list(cfg: &ControlConfig) -> Result<ControlResult, ControlError> {
     let tool = exec::resolve_tool(&cfg.systemctl_path, "systemctl")?;
     let timeout = exec::command_timeout(cfg);
+    let deadline = Instant::now() + timeout;
 
     let loaded = exec::run(&tool, &SYSTEMCTL_LIST_ARGS, timeout, MAX_OUTPUT_BYTES)?;
     exec::ensure_success(&loaded, "systemctl list-units")?;
+    ensure_output_complete(&loaded, "systemctl list-units")?;
 
+    let remaining = remaining_budget(deadline)?;
     let installed = exec::run(
         &tool,
         &SYSTEMCTL_LIST_UNIT_FILES_ARGS,
-        timeout,
+        remaining,
         MAX_OUTPUT_BYTES,
     )?;
     exec::ensure_success(&installed, "systemctl list-unit-files")?;
+    ensure_output_complete(&installed, "systemctl list-unit-files")?;
 
     Ok(ControlResult::SystemdUnits(merge_units(
         &loaded.stdout,
         &installed.stdout,
         &cfg.systemd_units,
     )))
+}
+
+/// 第二次命令可用的剩余预算：两次 `systemctl` 共享 [`list`] 里的总 deadline。
+///
+/// 第一次已经花掉的时间必须扣掉；预算耗尽时直接报固定错误，不再启动子进程。
+fn remaining_budget(deadline: Instant) -> Result<Duration, ControlError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ControlError::control_failed("systemctl 列表总超时"));
+    }
+    Ok(remaining)
+}
+
+/// `exec::run` 只保留 stdout 前 [`MAX_OUTPUT_BYTES`] 字节；被截断时列表可能
+/// 静默丢掉尾部 unit，因此宁可报 `control_failed`，也不返回不完整列表。
+fn ensure_output_complete(output: &exec::ExecOutput, what: &str) -> Result<(), ControlError> {
+    if output.stdout_truncated {
+        return Err(ControlError::control_failed(format!(
+            "{what} 输出超过 {} KiB 上限，已截断，拒绝返回不完整列表",
+            MAX_OUTPUT_BYTES / 1024
+        )));
+    }
+    Ok(())
 }
 
 /// 对白名单 unit 执行 start / stop / restart。
@@ -455,6 +484,71 @@ malformed line
             !units.iter().any(|unit| unit.unit == "zz0511.service"),
             "必须按 unit 名升序排序后再截断"
         );
+    }
+
+    #[test]
+    fn truncated_systemctl_output_is_control_failed() {
+        let _guard = exec::test_serial_guard();
+        let huge_units = "nginx.service loaded active running Nginx\n".repeat(7000);
+        let huge_files = "demo.service enabled\n".repeat(15000);
+        assert!(huge_units.len() > MAX_OUTPUT_BYTES);
+        assert!(huge_files.len() > MAX_OUTPUT_BYTES);
+
+        // list-units 超出 256 KiB：不能返回被截断的残列表。
+        let dir = temp_dir("truncated-units");
+        let script = fake_systemctl(&dir, &huge_units, "nginx.service enabled\n");
+        let cfg = ControlConfig {
+            enabled: true,
+            systemd: true,
+            systemd_units: patterns(&["nginx*", "demo*"]),
+            systemctl_path: script.to_str().unwrap().to_string(),
+            ..ControlConfig::default()
+        };
+        let err = list(&cfg).unwrap_err();
+        assert_eq!(err.code, control::codes::CONTROL_FAILED);
+        assert!(err.message.contains("list-units"), "{}", err.message);
+        assert!(err.message.contains("256"), "{}", err.message);
+        assert!(err.message.contains("截断"), "{}", err.message);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // list-unit-files 超出 256 KiB：同样必须失败，不能只返回已加载部分。
+        let dir = temp_dir("truncated-files");
+        let script = fake_systemctl(
+            &dir,
+            "nginx.service loaded active running Nginx\n",
+            &huge_files,
+        );
+        let cfg = ControlConfig {
+            enabled: true,
+            systemd: true,
+            systemd_units: patterns(&["nginx*", "demo*"]),
+            systemctl_path: script.to_str().unwrap().to_string(),
+            ..ControlConfig::default()
+        };
+        let err = list(&cfg).unwrap_err();
+        assert_eq!(err.code, control::codes::CONTROL_FAILED);
+        assert!(err.message.contains("list-unit-files"), "{}", err.message);
+        assert!(err.message.contains("256"), "{}", err.message);
+        assert!(err.message.contains("截断"), "{}", err.message);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remaining_budget_rejects_expired_deadline() {
+        // 刚创建的 1s deadline 应返回接近 1s 的剩余预算，供第二次命令使用。
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let remaining = remaining_budget(deadline).unwrap();
+        assert!(remaining <= Duration::from_secs(1));
+        assert!(
+            remaining >= Duration::from_millis(100),
+            "剩余预算不应瞬间耗尽: {remaining:?}"
+        );
+
+        // deadline 已过：不再启动第二次命令，直接返回固定的总超时错误。
+        let expired = Instant::now() - Duration::from_millis(1);
+        let err = remaining_budget(expired).unwrap_err();
+        assert_eq!(err.code, control::codes::CONTROL_FAILED);
+        assert!(err.message.contains("总超时"), "{}", err.message);
     }
 
     #[test]
