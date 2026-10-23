@@ -133,7 +133,9 @@
 - [x] `database` 在 data_dir 外/相对路径时启动 WARN 一次，不收紧父目录、DB 仍 0600
 - [x] 测试：Rust 569（agent 100、common 113、core 73、hub 180、panel 103）；
       `v035.sh` 48/48；既有 9 套 e2e 全绿；`cargo audit` 0
-- [x] 独立评审：A1 无 [严重]（建议的 guard 释放顺序/注释已处理）；A2/A3 待回填
+- [x] 独立评审：A1、A2/A3 均无 [严重]；A1 建议的 guard 释放顺序/注释已处理；
+      A2/A3 建议的“静态预检不覆盖祖先权限”和“O_RDONLY 极严目录会 EACCES”已写入限制，
+      非 root owner 测试跳过、DB 外置 WARN 由 `v035.sh` 覆盖
 - [x] 独立渗透：待回填
 - [x] 兼容：协议 v2 / DB schema v6 / 证书格式不变；data_dir owner 规则收紧需发布说明
 
@@ -276,9 +278,12 @@
    共享/系统目录、sticky 目录、相对路径、任一祖先或最终组件为符号链接、他人拥有的
    最终目录都会拒绝启动。root 服务只能使用 root 拥有的最终目录，非 root 必须使用
    自己拥有的最终目录；root-owned sticky 目录（`/tmp`、`/var/tmp`）只能作为祖先。
-   非 Linux 平台仍保留静态路径检查，完整 fd 保证仅 Linux。数据库位于 `data_dir`
-   外时会打一次 WARN，但不收紧其父目录（DB 文件仍 0600）。证书目录 0700 后，同机
-   以不同用户运行且直接读 hub `ca.crt` 的 Panel 需复制 CA 或以同用户运行。
+   非 Linux 平台仍保留静态路径检查，完整 fd 保证仅 Linux。配置阶段的静态预检只做
+   路径形状 / 符号链接 / 最终 owner；祖先 owner 与可写性在 fd 打开时校验，预检可能
+   放过运行期会拒绝的路径（fail-closed）。最终目录用 `O_RDONLY` 打开后 `fchmod`，
+   因此 0300/0100 这类 owner 不可读的极严目录会 EACCES，需先恢复读权限。数据库位于
+   `data_dir` 外时会打一次 WARN，但不收紧其父目录（DB 文件仍 0600）。证书目录 0700
+   后，同机以不同用户运行且直接读 hub `ca.crt` 的 Panel 需复制 CA 或以同用户运行。
 7. 客户端证书轮换复用原私钥，因此轮换不能补救私钥泄露；私钥/secret 泄露必须
    `agent revoke` 后重新纳管。CA 私钥是最高敏感资产，泄露等于全部身份失守。
 8. 管理 API 限速按直连来源 IP 统计；置于反代后所有客户端共享反代 IP 的额度。管理口
