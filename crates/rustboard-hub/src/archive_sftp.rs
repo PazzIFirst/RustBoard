@@ -10,24 +10,36 @@
 //!   `AcceptAnyServerKey` 一类降级，也不读取 `known_hosts` 或用户 SSH 配置。
 //! - 认证优先使用 `private_key_path`（只接受 ed25519），其次 `password`；
 //!   认证失败统一映射为固定错误，不区分“用户不存在 / 密码错 / 密钥错”，避免
-//!   账号枚举。
+//!   账号枚举。私钥文件在构造（启动）与每次连接前校验：Unix 上 group/other
+//!   不得有权限，否则固定失败。
+//! - **密钥类型限制**：vendored 去 `rsa` 后，**不支持 RSA 用户密钥，也不支持
+//!   RSA 主机密钥**；用户私钥仅 ed25519，主机密钥需为 ed25519 或 ECDSA。
+//!   配置中的主机指纹仍只接受 `SHA256:<base64>`（不接受 MD5 / SHA1）。仅提供
+//!   RSA 主机密钥的旧服务器会握手失败。
 //! - 所有对外错误都是 [`ArchiveError`] 的固定分类：`Display` 不包含 host、
 //!   端口、用户名、密码、私钥路径、远端目录、协议响应正文或 SFTP 状态消息。
-//!   连接 / 主机密钥 / 认证 / 协议 / IO 在内部用 [`SftpFailure`] 分别归类，
-//!   对外只暴露固定错误的 `ArchiveError`（`NotFound` 除外）。
+//!   连接 / 主机密钥 / 认证 / 私钥权限 / 协议 / IO 在内部用 [`SftpFailure`]
+//!   分别归类，对外只暴露固定错误的 `ArchiveError`（`NotFound` 除外）。
 //! - 对象 key 在拼接前重新校验：拒绝绝对路径、`..`、`.` 段、反斜杠、控制字符
 //!   与空段；远端路径固定为 `remote_dir.trim_end_matches('/') + "/" + key`。
 //! - `put` 会按 key 逐级创建父目录（SFTP 没有 `mkdir -p`）；`get` 先查远端
 //!   大小再流式读取，硬上限 1 GiB，防止异常对象打爆 hub 内存。
-//! - `test` 只在 `health/<uuid>.probe` 下写读删探针，失败也会尽力删除。
+//! - `test` 只在 `health/<uuid>.probe` 下写读删探针，失败也会尽力删除；删除
+//!   probe 后尝试删除空的 `health/` 目录，非空 / 失败一律忽略。
 //!
 //! 连接策略：每次 `ColdStore` 操作建立一条新 SSH 连接并在结束时断开，避免
 //! 共享可变会话、半开连接和跨请求重连状态；`test` 的写读删复用同一条连接。
 //! 连接超时 10s，russh 空闲超时 30s，底层 SFTP 请求超时使用库默认 10s。
 //!
-//! 验证说明：单元测试只覆盖指纹、路径、错误脱敏与构造，不建立真实 SFTP
-//! 连接；C3 交付前需按 `docs/plans/2026-10-24-m4-alerting-archive.md` 用手工
-//! 环境对真实服务器验证密码 / ed25519、目录创建、写入与下载。
+//! 缺失路径语义：SFTP v3 只有 `SSH_FX_NO_SUCH_FILE`；`russh-sftp 3.0.1` 的
+//! [`StatusCode`] 没有 v6 的 `NoSuchPath` variant（未知码会被反序列化成协议
+//! 错误）。因此 `head` / `get` / `delete` 对缺失文件或父目录统一按
+//! `None` / `NotFound` / 幂等成功处理，测试覆盖该映射。
+//!
+//! 验证说明：单元测试只覆盖指纹、路径、私钥权限、错误脱敏与构造，不建立真实
+//! SFTP 连接；C3 交付前需按 `docs/plans/2026-10-24-m4-alerting-archive.md` 用
+//! 手工环境对真实服务器验证密码 / ed25519、ed25519 或 ECDSA 主机密钥、目录
+//! 创建、写入与下载。
 
 use std::fmt;
 use std::sync::Arc;
@@ -38,6 +50,7 @@ use base64::Engine as _;
 use russh::client::{Handle, Handler};
 use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg, PublicKey};
 use russh_sftp::client::error::Error as SftpError;
+use russh_sftp::client::fs::Metadata;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::StatusCode;
 use rustboard_common::config::ArchiveSftpConfig;
@@ -81,6 +94,8 @@ enum SftpFailure {
     HostKey,
     /// 密码或 ed25519 私钥认证失败。
     Auth,
+    /// 私钥文件权限不安全（Unix: group/other 有权限）或不是普通文件。
+    KeyPermissions,
     /// SFTP 子系统 / 协议初始化失败。
     Protocol,
     /// 读写、删文件、建目录等 SFTP 操作失败。
@@ -98,6 +113,7 @@ impl SftpFailure {
             Self::Connect => "connect",
             Self::HostKey => "host_key",
             Self::Auth => "auth",
+            Self::KeyPermissions => "key_permissions",
             Self::Protocol => "protocol",
             Self::Io => "io",
             Self::NotFound => "not_found",
@@ -209,6 +225,27 @@ fn decode_host_key_fingerprint(fingerprint: &str) -> Option<[u8; 32]> {
     decoded.try_into().ok()
 }
 
+/// 校验私钥文件权限；Unix 上 group/other 不得有任何权限（等价 OpenSSH 的
+/// `bad permissions` 检查），且必须是普通文件。Windows 不做 POSIX 权限检查。
+#[cfg(unix)]
+fn check_private_key_permissions(path: &str) -> Result<(), SftpFailure> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::metadata(path).map_err(|_| SftpFailure::KeyPermissions)?;
+    if !metadata.is_file() {
+        return Err(SftpFailure::KeyPermissions);
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(SftpFailure::KeyPermissions);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_private_key_permissions(_path: &str) -> Result<(), SftpFailure> {
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 冷存储实现
 // ---------------------------------------------------------------------------
@@ -222,9 +259,9 @@ pub struct SftpColdStore {
 }
 
 impl SftpColdStore {
-    /// 构造后端；只做本地配置校验，不发起网络请求。
+    /// 构造后端；只做本地配置 / 指纹 / 私钥权限校验，不发起网络请求。
     ///
-    /// 配置不合法（含指纹格式错误）统一返回
+    /// 配置不合法、指纹格式错误或私钥权限不安全统一返回
     /// [`ArchiveError::BackendUnavailable`]，不拼接字段值。
     pub fn new(config: &ArchiveSftpConfig) -> ArchiveResult<Self> {
         config
@@ -232,6 +269,9 @@ impl SftpColdStore {
             .map_err(|_| ArchiveError::BackendUnavailable)?;
         let expected_fingerprint = decode_host_key_fingerprint(&config.host_key_fingerprint)
             .ok_or(ArchiveError::BackendUnavailable)?;
+        if !config.private_key_path.is_empty() {
+            check_private_key_permissions(&config.private_key_path)?;
+        }
         Ok(Self {
             config: config.clone(),
             expected_fingerprint,
@@ -247,6 +287,23 @@ impl SftpColdStore {
 
     /// 建立 SSH 连接并完成认证；私钥优先，其次密码。
     async fn connect_and_auth(&self) -> Result<Handle<SftpHostKeyHandler>, SftpFailure> {
+        // 在发起 TCP 连接前完成私钥权限校验与加载：配置错误不应触达远端，
+        // 也避免“连接成功后才因本地私钥失败”的误导。
+        let private_key = if !self.config.private_key_path.is_empty() {
+            check_private_key_permissions(&self.config.private_key_path)?;
+            // 配置没有 passphrase 字段，不支持加密私钥。只允许 ed25519：
+            // rsa feature 已被 vendor patch 删除，ECDSA / RSA 不作为 C3
+            // 用户私钥支持范围。
+            let key = load_secret_key(&self.config.private_key_path, None)
+                .map_err(|_| SftpFailure::Auth)?;
+            if !key.algorithm().is_ed25519() {
+                return Err(SftpFailure::Auth);
+            }
+            Some(key)
+        } else {
+            None
+        };
+
         let ssh_config = Arc::new(russh::client::Config {
             inactivity_timeout: Some(INACTIVITY_TIMEOUT),
             ..Default::default()
@@ -266,15 +323,7 @@ impl SftpColdStore {
         .map_err(|_| SftpFailure::Connect)?
         .map_err(ClientError::into_failure)?;
 
-        let auth = if !self.config.private_key_path.is_empty() {
-            // 私钥路径由配置校验保证非空；这里不接受不存在的文件，也不支持
-            // passphrase（配置没有该字段）。只允许 ed25519：rsa feature 已被
-            // vendor patch 删除，其余算法不作为 C3 支持范围。
-            let key = load_secret_key(&self.config.private_key_path, None)
-                .map_err(|_| SftpFailure::Auth)?;
-            if !key.algorithm().is_ed25519() {
-                return Err(SftpFailure::Auth);
-            }
+        let auth = if let Some(key) = private_key {
             session
                 .authenticate_publickey(
                     self.config.username.as_str(),
@@ -425,13 +474,9 @@ impl SftpColdStore {
         Ok(out)
     }
 
-    /// 幂等删除对象；不存在视为成功。
+    /// 幂等删除对象；文件或父目录不存在视为成功。
     async fn remove_object(&self, sftp: &SftpSession, path: &str) -> ArchiveResult<()> {
-        match sftp.remove_file(path.to_string()).await {
-            Ok(()) => Ok(()),
-            Err(error) if is_not_found(&error) => Ok(()),
-            Err(_) => Err(SftpFailure::Io.into()),
-        }
+        map_delete_result(sftp.remove_file(path.to_string()).await)
     }
 
     async fn put_inner(&self, key: &str, data: &[u8]) -> ArchiveResult<()> {
@@ -461,17 +506,14 @@ impl SftpColdStore {
     async fn head_inner(&self, key: &str) -> ArchiveResult<Option<ColdObjectMeta>> {
         let path = self.object_path(key)?;
         let (session, sftp) = self.connect_sftp().await?;
-        let result = match sftp.metadata(path.to_string()).await {
-            Ok(meta) => match meta.size {
-                Some(size) => Ok(Some(ColdObjectMeta { size })),
-                // 无法确认大小时返回固定错误，避免上传校验把对象误判成 0 字节。
-                None => Err(SftpFailure::Protocol.into()),
-            },
-            Err(error) if is_not_found(&error) => Ok(None),
-            Err(_) => Err(SftpFailure::Io.into()),
-        };
+        let result = map_head_result(sftp.metadata(path.to_string()).await);
         self.close_sftp(&session, &sftp).await;
         result
+    }
+
+    /// 探针所在目录：`<remote_dir>/health`（`remote_dir = "/"` 时为 `/health`）。
+    fn health_dir(&self) -> String {
+        format!("{}/health", self.config.remote_dir.trim_end_matches('/'))
     }
 
     async fn test_inner(&self) -> ArchiveResult<()> {
@@ -499,6 +541,8 @@ impl SftpColdStore {
 
         // 无论探针成功与否都尝试删除；不存在（例如 write 失败）按幂等成功处理。
         let cleanup = self.remove_object(&sftp, &path).await;
+        // 仅当 health/ 为空时 remove_dir 才成功；非空（并发探针）或失败一律忽略。
+        let _ = sftp.remove_dir(self.health_dir()).await;
         self.close_sftp(&session, &sftp).await;
         match (probe, cleanup) {
             (Ok(()), Ok(())) => Ok(()),
@@ -566,7 +610,13 @@ fn validate_object_key(key: &str) -> ArchiveResult<()> {
     Ok(())
 }
 
-/// 判断 SFTP 错误是否为 `SSH_FX_NO_SUCH_FILE`。
+/// 判断 SFTP 错误是否表示文件 / 父目录不存在。
+///
+/// `russh-sftp 3.0.1` 只实现 SFTP v3，`StatusCode` 中只有
+/// `SSH_FX_NO_SUCH_FILE`（2），没有 v6 的 `SSH_FX_NO_SUCH_PATH`（10）；
+/// 该版本遇到未知状态码会在反序列化阶段返回协议错误，不会构造 `Status`。
+/// 因此这里只能匹配 `NoSuchFile`：OpenSSH 等 v3 服务器对缺失文件或缺失父
+/// 目录均返回该码。升级到支持 `NoSuchPath` 的依赖时需要在此同步扩展。
 fn is_not_found(error: &SftpError) -> bool {
     matches!(
         error,
@@ -580,6 +630,28 @@ fn map_sftp_error(error: SftpError) -> SftpFailure {
         SftpFailure::NotFound
     } else {
         SftpFailure::Io
+    }
+}
+
+/// `head` 的 metadata 结果映射：文件或父目录不存在 → `Ok(None)`。
+fn map_head_result(result: Result<Metadata, SftpError>) -> ArchiveResult<Option<ColdObjectMeta>> {
+    match result {
+        Ok(meta) => match meta.size {
+            Some(size) => Ok(Some(ColdObjectMeta { size })),
+            // 无法确认大小时返回固定错误，避免上传校验把对象误判成 0 字节。
+            None => Err(SftpFailure::Protocol.into()),
+        },
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(_) => Err(SftpFailure::Io.into()),
+    }
+}
+
+/// `delete` 的 remove_file 结果映射：文件或父目录不存在 → 幂等成功。
+fn map_delete_result(result: Result<(), SftpError>) -> ArchiveResult<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if is_not_found(&error) => Ok(()),
+        Err(_) => Err(SftpFailure::Io.into()),
     }
 }
 
@@ -609,11 +681,21 @@ pub(crate) fn test_config() -> ArchiveSftpConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use russh_sftp::protocol::Status;
 
     fn handler_for(fingerprint: &str) -> SftpHostKeyHandler {
         SftpHostKeyHandler {
             expected: decode_host_key_fingerprint(fingerprint).expect("测试指纹必须可解析"),
         }
+    }
+
+    fn status_error(code: StatusCode, message: &str) -> SftpError {
+        SftpError::Status(Status {
+            id: 1,
+            status_code: code,
+            error_message: message.to_string(),
+            language_tag: "en".to_string(),
+        })
     }
 
     fn store() -> SftpColdStore {
@@ -722,6 +804,124 @@ mod tests {
         }
     }
 
+    /// 探针目录必须固定落在 remote_dir 下（remote_dir="/" 时退化为 /health）。
+    #[test]
+    fn health_probe_dir_is_under_remote_dir() {
+        assert_eq!(store().health_dir(), "/backup/rustboard/health");
+
+        let mut config = test_config();
+        config.remote_dir = "/".to_string();
+        let root = SftpColdStore::new(&config).expect("remote_dir=/ 必须合法");
+        assert_eq!(root.health_dir(), "/health");
+    }
+
+    /// 缺失文件 / 父目录（SFTP v3 统一为 `NoSuchFile`）在 head/get/delete 中按
+    /// 不存在处理；status 描述文本不参与判定。
+    #[test]
+    fn missing_file_or_parent_is_absent_for_head_get_delete() {
+        for message in ["No such file", "No such file or directory", "No such path"] {
+            let error = status_error(StatusCode::NoSuchFile, message);
+            assert!(is_not_found(&error));
+            assert_eq!(map_head_result(Err(error.clone())).unwrap(), None);
+            assert!(map_delete_result(Err(error.clone())).is_ok());
+            assert_eq!(
+                ArchiveError::from(map_sftp_error(error)),
+                ArchiveError::NotFound
+            );
+        }
+
+        let meta = Metadata {
+            size: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            map_head_result(Ok(meta)).unwrap(),
+            Some(ColdObjectMeta { size: 7 })
+        );
+        assert_eq!(
+            map_head_result(Ok(Metadata::default())).unwrap_err(),
+            ArchiveError::BackendUnavailable
+        );
+    }
+
+    /// 非缺失状态码（包括 Failure）一律按后端错误处理，不能因描述文本伪装成
+    /// 缺失对象。
+    #[test]
+    fn non_missing_statuses_are_backend_errors() {
+        for code in [
+            StatusCode::PermissionDenied,
+            StatusCode::Failure,
+            StatusCode::OpUnsupported,
+            StatusCode::NoConnection,
+        ] {
+            let error = status_error(code, "No such file");
+            assert!(!is_not_found(&error), "状态码 {code:?} 不能按缺失处理");
+            assert_eq!(
+                map_head_result(Err(error.clone())).unwrap_err(),
+                ArchiveError::BackendUnavailable
+            );
+            assert_eq!(
+                map_delete_result(Err(error.clone())).unwrap_err(),
+                ArchiveError::BackendUnavailable
+            );
+            assert_eq!(
+                ArchiveError::from(map_sftp_error(error)),
+                ArchiveError::BackendUnavailable
+            );
+        }
+    }
+
+    /// Unix 上私钥必须只能由 owner 访问；0644 在构造期即固定失败。
+    #[cfg(unix)]
+    #[test]
+    fn private_key_permissions_must_be_owner_only() {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let path = std::env::temp_dir().join(format!(
+            "rustboard-sftp-key-{}.tmp",
+            Uuid::new_v4().simple()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("创建临时私钥失败");
+        file.write_all(b"not-a-real-private-key").unwrap();
+        drop(file);
+
+        let path_text = path.to_str().expect("临时目录必须为 UTF-8").to_string();
+        assert_eq!(check_private_key_permissions(&path_text), Ok(()));
+
+        let mut config = test_config();
+        config.password = String::new();
+        config.private_key_path = path_text.clone();
+        assert!(SftpColdStore::new(&config).is_ok());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            check_private_key_permissions(&path_text),
+            Err(SftpFailure::KeyPermissions)
+        );
+        let error = SftpColdStore::new(&config)
+            .err()
+            .expect("0644 私钥必须拒绝");
+        assert_eq!(error, ArchiveError::BackendUnavailable);
+        assert_eq!(error.to_string(), "冷存储后端不可用");
+
+        let missing = std::env::temp_dir().join(format!(
+            "rustboard-sftp-missing-{}.tmp",
+            Uuid::new_v4().simple()
+        ));
+        assert_eq!(
+            check_private_key_permissions(missing.to_str().expect("临时目录必须为 UTF-8")),
+            Err(SftpFailure::KeyPermissions)
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
     /// 构造错误只返回固定文案，绝不回显 host / 用户名 / 密码 / 私钥路径 /
     /// 远端目录 / 指纹。
     #[test]
@@ -757,6 +957,7 @@ mod tests {
             SftpFailure::Connect,
             SftpFailure::HostKey,
             SftpFailure::Auth,
+            SftpFailure::KeyPermissions,
             SftpFailure::Protocol,
             SftpFailure::Io,
             SftpFailure::TooLarge,

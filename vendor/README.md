@@ -44,6 +44,23 @@ russh = { path = "vendor/russh" }
 internal-russh-forked-ssh-key = { path = "vendor/ssh-key" }
 ```
 
+## 限制：RSA 密钥不再支持
+
+删除 optional `rsa` 后，russh / ssh-key 的 RSA 代码路径不再编译。SFTP 后端
+因此明确：
+
+- **用户私钥只支持 ed25519**（不支持 RSA，也不支持 ECDSA 用户私钥）；
+  加密私钥不支持（配置没有 passphrase 字段）；密码认证仍可用。
+- **主机密钥只支持 ed25519 / ECDSA**；仅提供 RSA 主机密钥的旧服务器会在
+  握手阶段失败，不会降级到 RSA。
+- **主机指纹只接受 `SHA256:<base64>`**（不接受 MD5 / SHA1），且必须显式配置；
+  ECDSA 主机密钥同样用 SHA256 指纹固定。
+- 私钥文件在 Unix 上必须 group/other 无权限（0600），否则启动 / 连接前固定
+  失败。
+
+这样做是为了 `cargo audit` 0，不提供“只用 RSA 的兼容开关”。若部署环境只有
+RSA 主机密钥，需要升级服务器或改用 WebDAV / S3 后端，不能通过关闭校验绕过。
+
 ## 文件清理
 
 为减小仓库体积，两个目录都只保留构建所需的 `src/`、`Cargo.toml`、`README.md`

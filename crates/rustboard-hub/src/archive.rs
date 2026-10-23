@@ -113,7 +113,7 @@ pub(crate) struct ArchiveStatusOutput {
 /// 构建冷存储后端。
 ///
 /// - WebDAV / S3 / SFTP 都只校验配置并构造客户端，**不发起网络请求**；
-/// - SFTP 构造时会校验主机密钥指纹格式，但连通性 / 认证由
+/// - SFTP 构造时会校验主机密钥指纹格式与私钥文件权限，但连通性 / 认证由
 ///   [`ColdStore::test`] 或 `archive test` 显式触发；
 /// - 任何构造错误都不包含后端 URL / 凭据 / 远端路径（由各后端自身保证）。
 pub(crate) fn build_store(cfg: &ArchiveConfig) -> Result<Arc<dyn ColdStore>> {

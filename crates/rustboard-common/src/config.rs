@@ -860,19 +860,25 @@ impl ArchiveS3Config {
 ///
 /// `password` 与 `private_key_path` 的 `Debug` 均为 `<redacted>`；
 /// `host_key_fingerprint` 是公钥指纹（非 secret），用于防中间人，必须显式配置。
+///
+/// 密钥类型限制：vendored `russh` / `ssh-key` 已删除 optional `rsa`，因此
+/// **不支持 RSA 用户私钥，也不支持仅提供 RSA 主机密钥的服务器**。用户私钥只
+/// 接受 ed25519；主机密钥需为 ed25519 或 ECDSA；指纹只接受 SHA256。
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ArchiveSftpConfig {
     pub host: String,
     pub port: u16,
     pub username: String,
-    /// 密码认证；与 `private_key_path` 至少填写一个。
+    /// 密码认证；与 `private_key_path` 至少填写一个，私钥优先。
     pub password: String,
-    /// 私钥文件路径；Debug 恒为 `<redacted>`。
+    /// ed25519 私钥文件路径；Unix 上 group/other 不得有权限（0600）。
+    /// 不支持加密私钥 / RSA / ECDSA 用户私钥；Debug 恒为 `<redacted>`。
     pub private_key_path: String,
-    /// 远端目录，必须是绝对路径。
+    /// 远端目录，必须是绝对路径，且不能含反斜杠、控制字符或 `..` 段。
     pub remote_dir: String,
     /// 服务器主机公钥的 SHA256 指纹（`SHA256:<base64>`，可带一个末尾 `=`）。
+    /// 不接受 MD5 / SHA1；主机密钥需为 ed25519 或 ECDSA（RSA 不支持）。
     pub host_key_fingerprint: String,
 }
 
@@ -1012,7 +1018,7 @@ fn validate_archive_http_url(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// SFTP 远端目录：绝对路径、不含 `..` 段、不含控制字符。
+/// SFTP 远端目录：绝对路径、不含反斜杠 / `..` 段、不含控制字符。
 fn validate_archive_remote_dir(remote_dir: &str) -> Result<()> {
     if remote_dir.is_empty() {
         return Err(Error::InvalidConfig(
@@ -1032,6 +1038,13 @@ fn validate_archive_remote_dir(remote_dir: &str) -> Result<()> {
     if remote_dir.chars().any(char::is_control) {
         return Err(Error::InvalidConfig(
             "archive.sftp.remote_dir 不能包含控制字符".into(),
+        ));
+    }
+    // 反斜杠在 Windows SFTP 服务端是路径分隔符，可能绕过 `..` 段检查；
+    // 与对象 key 的白名单保持一致，直接拒绝。
+    if remote_dir.contains('\\') {
+        return Err(Error::InvalidConfig(
+            "archive.sftp.remote_dir 不能包含反斜杠".into(),
         ));
     }
     if remote_dir.split('/').any(|segment| segment == "..") {
@@ -3120,6 +3133,11 @@ name = ""
                 "remote_dir",
             ),
             (
+                "password = \"secret\"\nremote_dir = \"/backup\\\\windows\"\n\
+                 host_key_fingerprint = \"SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"\n",
+                "remote_dir",
+            ),
+            (
                 "remote_dir = \"/backup\"\n\
                  host_key_fingerprint = \"SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"\n",
                 "password",
@@ -3137,6 +3155,16 @@ name = ""
                 .to_string();
             assert!(err.contains(needle), "错误必须点名 {needle}: {err}");
         }
+    }
+
+    /// SFTP remote_dir 必须拒绝反斜杠（Windows 服务端可能把它当分隔符）。
+    #[test]
+    fn archive_sftp_remote_dir_rejects_backslash() {
+        let error = validate_archive_remote_dir(r"/backup\windows")
+            .expect_err("含反斜杠的 remote_dir 必须拒绝")
+            .to_string();
+        assert!(error.contains("反斜杠"), "错误必须点名反斜杠: {error}");
+        assert!(validate_archive_remote_dir("/backup/rustboard").is_ok());
     }
 
     /// M4-C1a：配置 Debug 不得打印 password / secret / key / 私钥路径。
