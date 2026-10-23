@@ -1189,7 +1189,7 @@ impl Storage for SqliteStorage {
 
         // 每 512 次成功插入清理一次 48h 前的判重记录，避免每批都 DELETE。
         let completed = self.inserted_batches.fetch_add(1, Ordering::Relaxed) + 1;
-        if completed % INGEST_CLEANUP_EVERY == 0 {
+        if completed.is_multiple_of(INGEST_CLEANUP_EVERY) {
             prune_ingest_batches(&tx, rustboard_common::util::now_ms())?;
         }
 
@@ -1625,7 +1625,7 @@ impl Storage for SqliteStorage {
 
         // 每 1000 条成功写入清理一次 180 天前的记录，避免每条都 DELETE。
         let written = self.audit_writes.fetch_add(1, Ordering::Relaxed) + 1;
-        if written % AUDIT_CLEANUP_EVERY == 0 {
+        if written.is_multiple_of(AUDIT_CLEANUP_EVERY) {
             let cutoff = rustboard_common::util::now_ms().saturating_sub(AUDIT_RETENTION_MS);
             match conn.execute("DELETE FROM audit_log WHERE ts < ?1", params![cutoff]) {
                 Ok(removed) if removed > 0 => {
