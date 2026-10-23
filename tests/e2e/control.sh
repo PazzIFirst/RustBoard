@@ -57,9 +57,16 @@ die() {
 
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/rustboard-control.XXXXXX")
 FAKE_DIR="$TMP_DIR/fake"
-LOG_DIR="$TMP_DIR/logs"
-mkdir -p "$FAKE_DIR" "$LOG_DIR"
-chmod 700 "$TMP_DIR" "$FAKE_DIR" "$LOG_DIR"
+mkdir -p "$FAKE_DIR"
+chmod 700 "$TMP_DIR" "$FAKE_DIR"
+
+# #20：agent 从根 fd 单次 openat2 打开日志文件，带 RESOLVE_NO_XDEV，日志文件必须与
+# `/` 同挂载点。/tmp 通常是独立 tmpfs，放在那里会在启动校验时被 EXDEV 拒绝，因此
+# fake 日志源单独放在工作区 target 下（与 `/` 同一挂载点），用 mktemp 保证唯一。
+# 配置、进程日志等仍留在 TMP_DIR，保持原有调试习惯。
+mkdir -p "$ROOT/target"
+LOG_DIR=$(mktemp -d "$ROOT/target/rustboard-control-logs.XXXXXX")
+chmod 700 "$LOG_DIR"
 
 HUB_CFG="$TMP_DIR/hub.toml"
 HUB_DATA="$TMP_DIR/hub"
@@ -117,8 +124,16 @@ cleanup() {
 
   if [[ "${KEEP_E2E_TMP:-0}" == "1" ]]; then
     echo "临时目录已保留: $TMP_DIR" >&2
+    echo "日志目录已保留: $LOG_DIR" >&2
   else
     rm -rf "$TMP_DIR"
+    # LOG_DIR 在 target/ 下，只删本次 mktemp 出来的唯一目录；前缀校验避免误删
+    # 工作区其它 target 内容。
+    if [[ -n "${LOG_DIR:-}" && "$LOG_DIR" == "$ROOT/target/rustboard-control-logs."* ]]; then
+      rm -rf -- "$LOG_DIR"
+    else
+      echo "警告: LOG_DIR 路径异常，跳过删除: ${LOG_DIR:-<unset>}" >&2
+    fi
   fi
   exit "$code"
 }
