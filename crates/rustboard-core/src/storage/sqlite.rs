@@ -12,7 +12,10 @@ use rusqlite::{
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 use rustboard_common::util::now_ms;
 
-use crate::alerts::{AlertRule, AlertRuleStoreError, AlertSource, Comparator, MAX_ALERT_RULES};
+use crate::alerts::{
+    AlertEvent, AlertRule, AlertRuleStoreError, AlertSilence, AlertSource, AlertState,
+    AlertStateKind, Comparator, MAX_ALERT_RULES,
+};
 
 use super::{
     AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, DownsampleRangeResult,
@@ -2003,6 +2006,322 @@ impl SqliteStorage {
         tx.execute("DELETE FROM alert_rules WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M4-B1b：告警状态 / 事件 / 静默（schema v7 `alert_states` / `alert_events` /
+// `alert_silences`）
+// ---------------------------------------------------------------------------
+
+/// `alert_states` 的 SELECT 列表；列顺序与 [`alert_state_from_row`] 一一对应。
+const ALERT_STATE_COLUMNS: &str =
+    "rule_id, agent_id, series_key, state, since, last_eval_at, last_value, last_notified_at";
+
+/// `alert_events` 的 SELECT 列表；列顺序与 [`alert_event_from_row`] 一一对应。
+const ALERT_EVENT_COLUMNS: &str = "id, ts, rule_id, rule_name, agent_id, state, value, message, \
+     notified, notify_error, silenced";
+
+/// `alert_silences` 的 SELECT 列表；列顺序与 [`alert_silence_from_row`] 一一对应。
+const ALERT_SILENCE_COLUMNS: &str = "id, rule_id, agent_id, until_ts, created_by, created_at";
+
+/// 数据库里出现未知枚举值时产生的错误（不静默降级成默认值）。
+#[derive(Debug)]
+struct AlertTableColumnError {
+    table: &'static str,
+    field: &'static str,
+}
+
+impl std::fmt::Display for AlertTableColumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{} 字段值非法", self.table, self.field)
+    }
+}
+
+impl std::error::Error for AlertTableColumnError {}
+
+/// 把告警表的列值损坏翻译成 rusqlite 错误，让上层拿到明确失败。
+fn alert_table_column_error(
+    table: &'static str,
+    field: &'static str,
+    column: usize,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        rusqlite::types::Type::Text,
+        Box::new(AlertTableColumnError { table, field }),
+    )
+}
+
+/// 一行 `alert_states` 映射成 [`AlertState`]。
+fn alert_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertState> {
+    let state: String = row.get(3)?;
+    Ok(AlertState {
+        rule_id: row.get(0)?,
+        agent_id: row.get(1)?,
+        series_key: row.get(2)?,
+        state: AlertStateKind::parse(&state)
+            .ok_or_else(|| alert_table_column_error("alert_states", "state", 3))?,
+        since: row.get(4)?,
+        last_eval_at: row.get(5)?,
+        last_value: row.get(6)?,
+        last_notified_at: row.get(7)?,
+    })
+}
+
+/// 一行 `alert_events` 映射成 [`AlertEvent`]；`state` 只允许 firing / resolved。
+fn alert_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertEvent> {
+    let state: String = row.get(5)?;
+    let state = AlertStateKind::parse(&state)
+        .filter(|state| state.is_event())
+        .ok_or_else(|| alert_table_column_error("alert_events", "state", 5))?;
+    let notified: i64 = row.get(8)?;
+    let silenced: i64 = row.get(10)?;
+    Ok(AlertEvent {
+        id: row.get(0)?,
+        ts: row.get(1)?,
+        rule_id: row.get(2)?,
+        rule_name: row.get(3)?,
+        agent_id: row.get(4)?,
+        state,
+        value: row.get(6)?,
+        message: row.get(7)?,
+        notified: notified != 0,
+        notify_error: row.get(9)?,
+        silenced: silenced != 0,
+    })
+}
+
+/// 一行 `alert_silences` 映射成 [`AlertSilence`]。
+fn alert_silence_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertSilence> {
+    Ok(AlertSilence {
+        id: row.get(0)?,
+        rule_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        until_ts: row.get(3)?,
+        created_by: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
+impl SqliteStorage {
+    /// 列出全部告警状态，按 `(rule_id, agent_id, series_key)` 稳定排序。
+    pub fn list_alert_states(&self) -> Result<Vec<AlertState>> {
+        let conn = self.lock_read();
+        let sql = format!(
+            "SELECT {ALERT_STATE_COLUMNS} FROM alert_states \
+             ORDER BY rule_id ASC, agent_id ASC, series_key ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], alert_state_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 按主键读取一条告警状态；不存在返回 `None`。
+    pub fn get_alert_state(
+        &self,
+        rule_id: &str,
+        agent_id: &str,
+        series_key: &str,
+    ) -> Result<Option<AlertState>> {
+        let sql = format!(
+            "SELECT {ALERT_STATE_COLUMNS} FROM alert_states \
+             WHERE rule_id = ?1 AND agent_id = ?2 AND series_key = ?3"
+        );
+        Ok(self
+            .lock_read()
+            .query_row(
+                &sql,
+                params![rule_id, agent_id, series_key],
+                alert_state_from_row,
+            )
+            .optional()?)
+    }
+
+    /// 插入或整行更新一条告警状态（主键冲突时覆盖状态、时间与值）。
+    pub fn upsert_alert_state(&self, state: &AlertState) -> Result<()> {
+        self.lock_write().execute(
+            "INSERT INTO alert_states
+                (rule_id, agent_id, series_key, state, since, last_eval_at, last_value,
+                 last_notified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(rule_id, agent_id, series_key) DO UPDATE SET
+                state = excluded.state,
+                since = excluded.since,
+                last_eval_at = excluded.last_eval_at,
+                last_value = excluded.last_value,
+                last_notified_at = excluded.last_notified_at",
+            params![
+                state.rule_id,
+                state.agent_id,
+                state.series_key,
+                state.state.as_str(),
+                state.since,
+                state.last_eval_at,
+                state.last_value,
+                state.last_notified_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 删除一条告警状态，返回受影响行数（0 = 本来不存在）。
+    pub fn delete_alert_state(
+        &self,
+        rule_id: &str,
+        agent_id: &str,
+        series_key: &str,
+    ) -> Result<usize> {
+        Ok(self.lock_write().execute(
+            "DELETE FROM alert_states WHERE rule_id = ?1 AND agent_id = ?2 AND series_key = ?3",
+            params![rule_id, agent_id, series_key],
+        )?)
+    }
+
+    /// 清理 `resolved` 状态：只删 `state = 'resolved'` 且 `last_eval_at < resolved_before`
+    /// 的行，返回删除行数。
+    ///
+    /// pending / firing 无论多旧都不删：它们代表仍然存在的告警，删除会导致下一次
+    /// 评估重复产生 firing 事件。
+    pub fn prune_alert_states(&self, resolved_before: i64) -> Result<usize> {
+        Ok(self.lock_write().execute(
+            "DELETE FROM alert_states WHERE state = 'resolved' AND last_eval_at < ?1",
+            params![resolved_before],
+        )?)
+    }
+
+    /// 插入一条告警事件，返回自增 id。
+    ///
+    /// `event.id` 被忽略：主键始终由 SQLite 生成。
+    pub fn insert_alert_event(&self, event: &AlertEvent) -> Result<i64> {
+        let conn = self.lock_write();
+        conn.execute(
+            "INSERT INTO alert_events
+                (ts, rule_id, rule_name, agent_id, state, value, message, notified,
+                 notify_error, silenced)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                event.ts,
+                event.rule_id,
+                event.rule_name,
+                event.agent_id,
+                event.state.as_str(),
+                event.value,
+                event.message,
+                event.notified as i64,
+                event.notify_error,
+                event.silenced as i64,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 按 id 倒序（最新在前）分页列出事件；`before_id` 是排他游标。
+    ///
+    /// `limit == 0` 返回空列表，避免上层把 0 当成「无限制」。
+    pub fn list_alert_events(
+        &self,
+        limit: usize,
+        before_id: Option<i64>,
+    ) -> Result<Vec<AlertEvent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut sql = format!("SELECT {ALERT_EVENT_COLUMNS} FROM alert_events");
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(before_id) = before_id {
+            sql.push_str(" WHERE id < ?");
+            values.push(rusqlite::types::Value::Integer(before_id));
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        values.push(rusqlite::types::Value::Integer(
+            i64::try_from(limit).unwrap_or(i64::MAX),
+        ));
+
+        let conn = self.lock_read();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), alert_event_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 清理告警事件：先按时间删 `ts < before_ts`，再按 id 从旧到新删到只剩 `max_rows` 行。
+    ///
+    /// `max_rows == 0` 表示清空全部事件。两步在同一个写事务内完成，返回删除总数。
+    pub fn prune_alert_events(&self, before_ts: i64, max_rows: usize) -> Result<usize> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut removed =
+            tx.execute("DELETE FROM alert_events WHERE ts < ?1", params![before_ts])?;
+        let remaining: i64 =
+            tx.query_row("SELECT COUNT(*) FROM alert_events", [], |row| row.get(0))?;
+        let max_rows = i64::try_from(max_rows).unwrap_or(i64::MAX);
+        if remaining > max_rows {
+            let excess = remaining - max_rows;
+            removed += tx.execute(
+                "DELETE FROM alert_events WHERE id IN \
+                 (SELECT id FROM alert_events ORDER BY id ASC LIMIT ?1)",
+                params![excess],
+            )?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// 创建一条静默，返回自增 id；`silence.id` 被忽略。
+    pub fn create_alert_silence(&self, silence: &AlertSilence) -> Result<i64> {
+        let conn = self.lock_write();
+        conn.execute(
+            "INSERT INTO alert_silences (rule_id, agent_id, until_ts, created_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                silence.rule_id,
+                silence.agent_id,
+                silence.until_ts,
+                silence.created_by,
+                silence.created_at,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 列出 `now` 时刻仍生效的静默（`until_ts > now`），最新创建的在前。
+    pub fn list_active_silences(&self, now: i64) -> Result<Vec<AlertSilence>> {
+        let sql = format!(
+            "SELECT {ALERT_SILENCE_COLUMNS} FROM alert_silences \
+             WHERE until_ts > ?1 ORDER BY id DESC"
+        );
+        let conn = self.lock_read();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![now], alert_silence_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 删除一条静默，返回 `false` 表示 id 不存在（API 映射 404）。
+    pub fn delete_alert_silence(&self, id: i64) -> Result<bool> {
+        let removed = self
+            .lock_write()
+            .execute("DELETE FROM alert_silences WHERE id = ?1", params![id])?;
+        Ok(removed > 0)
+    }
+
+    /// 清理到期静默（`until_ts <= before_ts`），返回删除行数。
+    pub fn prune_alert_silences(&self, before_ts: i64) -> Result<usize> {
+        Ok(self.lock_write().execute(
+            "DELETE FROM alert_silences WHERE until_ts <= ?1",
+            params![before_ts],
+        )?)
+    }
+
+    /// 列出启用的规则（评估引擎使用）；排序与 [`Self::list_alert_rules`] 一致。
+    pub fn list_enabled_alert_rules(&self) -> Result<Vec<AlertRule>> {
+        let conn = self.lock_read();
+        let sql = format!(
+            "SELECT {ALERT_RULE_COLUMNS} FROM alert_rules WHERE enabled != 0 \
+             ORDER BY is_builtin DESC, name ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], alert_rule_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
 
@@ -5220,5 +5539,234 @@ mod tests {
         let err = s.create_alert_rule(&alert_rule("超额")).unwrap_err();
         assert_eq!(store_error(err), AlertRuleStoreError::LimitReached);
         assert_eq!(s.alert_rule_count().unwrap(), MAX_ALERT_RULES);
+    }
+
+    // ------------------------------------------------------------------
+    // M4-B1b：告警状态 / 事件 / 静默存储
+    // ------------------------------------------------------------------
+
+    use crate::alerts::{AlertEvent, AlertSilence, AlertState, AlertStateKind};
+
+    fn alert_state(rule: &str, agent: &str, key: &str) -> AlertState {
+        AlertState {
+            rule_id: rule.to_string(),
+            agent_id: agent.to_string(),
+            series_key: key.to_string(),
+            state: AlertStateKind::Pending,
+            since: 1_000,
+            last_eval_at: 1_000,
+            last_value: Some(1.5),
+            last_notified_at: None,
+        }
+    }
+
+    fn alert_event(ts: i64, state: AlertStateKind, silenced: bool) -> AlertEvent {
+        AlertEvent {
+            id: 0,
+            ts,
+            rule_id: "rule-1".into(),
+            rule_name: "磁盘告警".into(),
+            agent_id: "agent-1".into(),
+            state,
+            value: Some(95.0),
+            message:
+                "规则「磁盘告警」触发：agent agent-1 指标「disk.used_percent」当前值 95，阈值 > 90"
+                    .into(),
+            notified: false,
+            notify_error: String::new(),
+            silenced,
+        }
+    }
+
+    /// 状态往返 / upsert / 删除 / 只清理旧 resolved。
+    #[test]
+    fn m4_b1b_alert_state_roundtrip_upsert_and_prune() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let mut state = alert_state("rule-1", "agent-1", "series-1");
+        assert_eq!(
+            s.get_alert_state("rule-1", "agent-1", "series-1").unwrap(),
+            None
+        );
+        s.upsert_alert_state(&state).unwrap();
+        assert_eq!(
+            s.get_alert_state("rule-1", "agent-1", "series-1").unwrap(),
+            Some(state.clone())
+        );
+
+        state.state = AlertStateKind::Firing;
+        state.since = 2_000;
+        state.last_eval_at = 2_100;
+        state.last_value = None;
+        state.last_notified_at = Some(2_050);
+        s.upsert_alert_state(&state).unwrap();
+        assert_eq!(
+            s.get_alert_state("rule-1", "agent-1", "series-1").unwrap(),
+            Some(state.clone()),
+            "upsert 必须覆盖状态、时间与值"
+        );
+
+        let mut second = alert_state("rule-1", "agent-2", "");
+        second.state = AlertStateKind::Resolved;
+        second.since = 500;
+        second.last_eval_at = 500;
+        s.upsert_alert_state(&second).unwrap();
+        let states = s.list_alert_states().unwrap();
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0], state, "按 (rule, agent, series) 稳定排序");
+        assert_eq!(states[1], second);
+
+        // 只删 resolved 且 last_eval_at 早于 cutoff 的状态。
+        assert_eq!(s.prune_alert_states(1_000).unwrap(), 1);
+        assert_eq!(s.get_alert_state("rule-1", "agent-2", "").unwrap(), None);
+        assert!(s
+            .get_alert_state("rule-1", "agent-1", "series-1")
+            .unwrap()
+            .is_some());
+        assert_eq!(s.prune_alert_states(i64::MAX).unwrap(), 0);
+
+        assert_eq!(
+            s.delete_alert_state("rule-1", "agent-1", "series-1")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.delete_alert_state("rule-1", "agent-1", "series-1")
+                .unwrap(),
+            0
+        );
+        assert!(s.list_alert_states().unwrap().is_empty());
+    }
+
+    /// 事件往返 / 分页（before_id 排他）/ 按时间与行数上限清理。
+    #[test]
+    fn m4_b1b_alert_event_pagination_and_prune() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        for (index, ts) in [1_000, 2_000, 3_000, 4_000, 5_000].into_iter().enumerate() {
+            let event = alert_event(
+                ts,
+                if index % 2 == 0 {
+                    AlertStateKind::Firing
+                } else {
+                    AlertStateKind::Resolved
+                },
+                index == 4,
+            );
+            assert_eq!(s.insert_alert_event(&event).unwrap(), index as i64 + 1);
+        }
+
+        let first = s.list_alert_events(2, None).unwrap();
+        assert_eq!(
+            first.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![5, 4]
+        );
+        assert_eq!(first[0].ts, 5_000);
+        assert!(first[0].silenced);
+        assert!(!first[0].notified);
+        assert!(first[0].notify_error.is_empty());
+        assert_eq!(
+            first[0].message,
+            alert_event(5_000, AlertStateKind::Firing, true).message
+        );
+
+        let second = s.list_alert_events(2, Some(4)).unwrap();
+        assert_eq!(
+            second.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        let last = s.list_alert_events(2, Some(2)).unwrap();
+        assert_eq!(
+            last.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(s.list_alert_events(0, None).unwrap().is_empty());
+
+        // 先按时间删：ts < 3000 的 2 条。
+        assert_eq!(s.prune_alert_events(3_000, 100).unwrap(), 2);
+        assert_eq!(s.list_alert_events(10, None).unwrap().len(), 3);
+        // 再按行数上限从旧删到 max_rows：剩 3 条只保留最新 1 条。
+        assert_eq!(s.prune_alert_events(0, 1).unwrap(), 2);
+        let remaining = s.list_alert_events(10, None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, 5);
+        // max_rows = 0 表示清空。
+        assert_eq!(s.prune_alert_events(0, 0).unwrap(), 1);
+        assert!(s.list_alert_events(10, None).unwrap().is_empty());
+    }
+
+    /// 静默往返 / 生效窗口 / 删除 / 过期清理。
+    #[test]
+    fn m4_b1b_alert_silence_crud_active_window_and_prune() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let global = AlertSilence {
+            id: 0,
+            rule_id: None,
+            agent_id: None,
+            until_ts: 2_000,
+            created_by: "admin".into(),
+            created_at: 1_000,
+        };
+        assert_eq!(s.create_alert_silence(&global).unwrap(), 1);
+
+        let mut rule_only = global.clone();
+        rule_only.rule_id = Some("rule-1".into());
+        rule_only.until_ts = 5_000;
+        assert_eq!(s.create_alert_silence(&rule_only).unwrap(), 2);
+
+        let mut both = global.clone();
+        both.rule_id = Some("rule-1".into());
+        both.agent_id = Some("agent-1".into());
+        both.until_ts = 10_000;
+        assert_eq!(s.create_alert_silence(&both).unwrap(), 3);
+
+        // now=3000：until=2000 已过期；最新创建的在前。
+        let active = s.list_active_silences(3_000).unwrap();
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].id, 3);
+        assert_eq!(active[1].id, 2);
+        assert_eq!(active[0].rule_id.as_deref(), Some("rule-1"));
+        assert_eq!(active[0].agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(active[1].rule_id.as_deref(), Some("rule-1"));
+        assert_eq!(active[1].agent_id, None);
+
+        // 到期时刻（until_ts == now）不再生效。
+        let boundary = s.list_active_silences(2_000).unwrap();
+        assert_eq!(boundary.len(), 2);
+        assert!(boundary.iter().all(|silence| silence.until_ts > 2_000));
+
+        assert!(s.delete_alert_silence(2).unwrap());
+        assert!(
+            !s.delete_alert_silence(2).unwrap(),
+            "重复删除必须返回 false"
+        );
+        assert_eq!(s.list_active_silences(3_000).unwrap().len(), 1);
+
+        // until_ts <= before_ts 的静默全部清理（含边界）。
+        assert_eq!(s.prune_alert_silences(10_000).unwrap(), 2);
+        assert!(s.list_active_silences(0).unwrap().is_empty());
+        assert_eq!(s.prune_alert_silences(10_000).unwrap(), 0);
+    }
+
+    /// 评估引擎只应看到 enabled 规则。
+    #[test]
+    fn m4_b1b_list_enabled_alert_rules_filters_disabled() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let mut enabled = alert_rule("启用规则");
+        enabled.id = "rule-enabled".into();
+        enabled.metric = "disk.used_percent".into();
+        enabled.enabled = true;
+        s.create_alert_rule(&enabled).unwrap();
+
+        let mut disabled = alert_rule("禁用规则");
+        disabled.id = "rule-disabled".into();
+        disabled.metric = "disk.used_percent".into();
+        s.create_alert_rule(&disabled).unwrap();
+
+        let rules = s.list_enabled_alert_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, "rule-enabled");
+
+        enabled.enabled = false;
+        s.update_alert_rule(&enabled).unwrap();
+        assert!(s.list_enabled_alert_rules().unwrap().is_empty());
     }
 }

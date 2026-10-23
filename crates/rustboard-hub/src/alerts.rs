@@ -1,29 +1,44 @@
-//! M4-B1a：告警规则管理 API。
+//! M4-B1：告警规则、事件与静默管理 API。
 //!
-//! 只实现规则 CRUD；告警评估、事件、静默与通知渠道属于 B1b / B2。
+//! 规则 CRUD 属于 B1a；事件查询与静默创建 / 撤销属于 B1b。告警评估由
+//! `alerts_engine` 后台任务执行，通知渠道属于 B2（本模块不发送任何通知）。
 //!
 //! 路由（写在 `admin_router` 的受保护路由树里，统一先过 Bearer 鉴权）：
-//! - `GET    /api/v1/alerts/rules`      read
-//! - `POST   /api/v1/alerts/rules`      write
-//! - `PUT    /api/v1/alerts/rules/{id}` write
-//! - `DELETE /api/v1/alerts/rules/{id}` write
+//! - `GET    /api/v1/alerts/rules`          read
+//! - `POST   /api/v1/alerts/rules`          write
+//! - `PUT    /api/v1/alerts/rules/{id}`     write
+//! - `DELETE /api/v1/alerts/rules/{id}`     write
+//! - `GET    /api/v1/alerts/events`         read（`limit` 1–200，`before_id` 排他游标）
+//! - `GET    /api/v1/alerts/silences`       read（只返回生效中的静默）
+//! - `POST   /api/v1/alerts/silences`       write
+//! - `DELETE /api/v1/alerts/silences/{id}`  write
 //!
 //! 安全约定：
 //! - 请求体 `deny_unknown_fields`，错误一律 400，不回显 serde 原文；
-//! - 错误信息只描述规则，不回显用户输入；`is_builtin` / `id` / `created_at`
+//! - 错误信息只描述资源，不回显用户输入；`is_builtin` / `id` / `created_at`
 //!   只能由服务端维护，内置规则只允许禁停与修改，不允许删除；
-//! - `updated_by` 取 [`AuthPrincipal::name`]（旧 admin token 为 `"admin"`）。
+//! - `updated_by` / `created_by` 取 [`AuthPrincipal::name`]（旧 admin token 为
+//!   `"admin"`）；
+//! - 事件响应包含 `silenced` / `notified` / `notify_error`，但 B1b 的 `notified`
+//!   恒为 false，且不包含任何 secret。
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::Json;
 use rustboard_common::model::Labels;
 use rustboard_common::util::now_ms;
 use rustboard_core::alerts::{
-    AlertRule, AlertRuleInput, AlertRuleStoreError, AlertSource, Comparator, MAX_ALERT_RULES,
+    AlertEvent, AlertRule, AlertRuleInput, AlertRuleStoreError, AlertSilence, AlertSilenceInput,
+    AlertSource, Comparator, MAX_ALERT_RULES,
 };
+use serde::de::DeserializeOwned;
 use uuid::Uuid;
+
+/// 事件分页默认条数。
+const DEFAULT_ALERT_EVENT_LIMIT: usize = 100;
+/// 事件分页单页上限（B1b 约定 1..=200）。
+const MAX_ALERT_EVENT_LIMIT: usize = 200;
 
 use crate::auth::AuthPrincipal;
 use crate::{ApiError, AppState};
@@ -90,9 +105,7 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
 }
 
 /// 解析请求体：未知字段 / 非法枚举 / 超大请求体都走固定错误码。
-fn parse_body(
-    body: Result<Json<AlertRuleInput>, JsonRejection>,
-) -> Result<AlertRuleInput, ApiError> {
+fn parse_body<T: DeserializeOwned>(body: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
     match body {
         Ok(Json(input)) => Ok(input),
         Err(rejection) => {
@@ -190,6 +203,139 @@ pub(crate) async fn delete_rule(
 ) -> Result<StatusCode, ApiError> {
     let storage = state.storage.clone();
     run_blocking(move || storage.delete_alert_rule(&id)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 事件分页响应：`events` 按 id 倒序；`next_before_id` 是下一页的排他游标。
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct AlertEventListResponse {
+    events: Vec<AlertEvent>,
+    /// 本页满时返回最后一条 id；没有更多数据为 `null`。
+    next_before_id: Option<i64>,
+}
+
+/// 取单值查询参数；重复出现视为参数错误（不猜客户端意图）。
+fn single_query_value<'a>(
+    pairs: &'a [(String, String)],
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    let mut found: Option<&str> = None;
+    for (name, value) in pairs {
+        if name == key {
+            if found.is_some() {
+                return Err(format!("查询参数 {key} 重复"));
+            }
+            found = Some(value.as_str());
+        }
+    }
+    Ok(found)
+}
+
+/// 解析 `limit`：缺省 100，范围 1..=200。
+fn parse_event_limit(pairs: &[(String, String)]) -> Result<usize, String> {
+    let Some(raw) = single_query_value(pairs, "limit")? else {
+        return Ok(DEFAULT_ALERT_EVENT_LIMIT);
+    };
+    let limit: usize = raw.parse().map_err(|_| "limit 必须是正整数".to_string())?;
+    if !(1..=MAX_ALERT_EVENT_LIMIT).contains(&limit) {
+        return Err(format!("limit 必须在 1–{MAX_ALERT_EVENT_LIMIT} 之间"));
+    }
+    Ok(limit)
+}
+
+/// 解析排他游标 `before_id`：必须是正整数。
+fn parse_before_id(pairs: &[(String, String)]) -> Result<Option<i64>, String> {
+    let Some(raw) = single_query_value(pairs, "before_id")? else {
+        return Ok(None);
+    };
+    let value: i64 = raw
+        .parse()
+        .map_err(|_| "before_id 必须是正整数".to_string())?;
+    if value <= 0 {
+        return Err("before_id 必须是正整数".to_string());
+    }
+    Ok(Some(value))
+}
+
+/// `GET /api/v1/alerts/events`：按 id 倒序分页查询事件。
+pub(crate) async fn list_events(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<AlertEventListResponse>, ApiError> {
+    let pairs = crate::parse_query_pairs(raw.as_deref()).map_err(ApiError::bad_request)?;
+    let limit = parse_event_limit(&pairs).map_err(ApiError::bad_request)?;
+    let before_id = parse_before_id(&pairs).map_err(ApiError::bad_request)?;
+
+    let storage = state.storage.clone();
+    let events = run_blocking(move || storage.list_alert_events(limit, before_id)).await?;
+    // 排他游标：本页满时下一页从最后一条 id 继续（严格小于），不会漏也不会重。
+    let next_before_id = if events.len() == limit {
+        events.last().map(|event| event.id).filter(|id| *id > 1)
+    } else {
+        None
+    };
+    Ok(Json(AlertEventListResponse {
+        events,
+        next_before_id,
+    }))
+}
+
+/// `GET /api/v1/alerts/silences`：列出当前生效的静默（`until_ts > now`）。
+pub(crate) async fn list_silences(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<AlertSilence>>, ApiError> {
+    let now = now_ms();
+    let storage = state.storage.clone();
+    let silences = run_blocking(move || storage.list_active_silences(now)).await?;
+    Ok(Json(silences))
+}
+
+/// `POST /api/v1/alerts/silences`：创建静默。
+///
+/// `rule_id` / `agent_id` 缺省或 null 表示全部；给出 `rule_id` 时规则必须存在
+/// （404），避免为拼错的 id 建立永不命中的静默。`created_by` 取当前认证主体。
+pub(crate) async fn create_silence(
+    State(state): State<AppState>,
+    principal: Option<Extension<AuthPrincipal>>,
+    body: Result<Json<AlertSilenceInput>, JsonRejection>,
+) -> Result<Json<AlertSilence>, ApiError> {
+    let input = parse_body(body)?;
+    input.validate().map_err(ApiError::bad_request)?;
+    let created_by = principal_name(principal)?;
+
+    if let Some(rule_id) = input.rule_id.clone() {
+        let storage = state.storage.clone();
+        let existing = run_blocking(move || storage.get_alert_rule(&rule_id)).await?;
+        if existing.is_none() {
+            return Err(ApiError::not_found("告警规则不存在"));
+        }
+    }
+
+    let now = now_ms();
+    let mut silence = input.into_silence(now, created_by);
+    let storage = state.storage.clone();
+    let to_store = silence.clone();
+    let id = run_blocking(move || storage.create_alert_silence(&to_store)).await?;
+    silence.id = id;
+    Ok(Json(silence))
+}
+
+/// `DELETE /api/v1/alerts/silences/{id}`：撤销一条静默；不存在 / 非法 id 均为 404。
+pub(crate) async fn delete_silence(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let Ok(id) = id.parse::<i64>() else {
+        return Err(ApiError::not_found("静默不存在"));
+    };
+    if id <= 0 {
+        return Err(ApiError::not_found("静默不存在"));
+    }
+    let storage = state.storage.clone();
+    let deleted = run_blocking(move || storage.delete_alert_silence(id)).await?;
+    if !deleted {
+        return Err(ApiError::not_found("静默不存在"));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -736,6 +882,303 @@ mod tests {
             "builtin-buffer-backlog",
         ] {
             assert!(ids.iter().any(|value| value == id), "缺少内置规则 {id}");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // M4-B1b：事件 / 静默 API
+    // ------------------------------------------------------------------
+
+    use rustboard_core::alerts::AlertStateKind;
+
+    fn seed_event(state: &AppState, ts: i64, silenced: bool) -> i64 {
+        state
+            .storage
+            .insert_alert_event(&AlertEvent {
+                id: 0,
+                ts,
+                rule_id: "rule-1".into(),
+                rule_name: "事件规则".into(),
+                agent_id: "agent-1".into(),
+                state: AlertStateKind::Firing,
+                value: Some(1.5),
+                message: "规则「事件规则」触发：agent agent-1 指标「disk.used_percent」当前值 95，阈值 > 90".into(),
+                notified: false,
+                notify_error: String::new(),
+                silenced,
+            })
+            .unwrap()
+    }
+
+    /// 事件分页：limit / before_id、排他游标、字段完整性、非法参数 400。
+    #[tokio::test]
+    async fn m4_b1b_alert_events_pagination_and_validation() {
+        let state = alerts_state();
+        let read = seed_token(&state, "events-read", "read");
+        let router = admin_router(state.clone());
+        let now = now_ms();
+        for index in 0..5 {
+            seed_event(&state, now + index, index == 4);
+        }
+
+        let (status, body) = call(&router, "GET", "/api/v1/alerts/events", Some(&read), None).await;
+        assert_eq!(status, StatusCode::OK, "响应: {body}");
+        assert_eq!(body["events"].as_array().unwrap().len(), 5);
+        assert_eq!(body["next_before_id"], Value::Null);
+        let newest = &body["events"][0];
+        assert_eq!(newest["id"], 5, "最新事件必须排在最前");
+        assert_eq!(newest["state"], "firing");
+        assert_eq!(newest["silenced"], json!(true));
+        assert_eq!(newest["notified"], json!(false), "B1b 不发送通知");
+        assert_eq!(newest["notify_error"], "");
+        assert_eq!(newest["rule_id"], "rule-1");
+        assert_eq!(newest["agent_id"], "agent-1");
+        assert!(newest["message"].as_str().unwrap().contains("事件规则"));
+
+        let (status, page) = call(
+            &router,
+            "GET",
+            "/api/v1/alerts/events?limit=2",
+            Some(&read),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            page["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![5, 4]
+        );
+        assert_eq!(page["next_before_id"], 4);
+
+        let (status, page) = call(
+            &router,
+            "GET",
+            "/api/v1/alerts/events?limit=2&before_id=4",
+            Some(&read),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            page["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        assert_eq!(page["next_before_id"], 2);
+
+        let (status, page) = call(
+            &router,
+            "GET",
+            "/api/v1/alerts/events?limit=2&before_id=2",
+            Some(&read),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["events"].as_array().unwrap().len(), 1);
+        assert_eq!(page["events"][0]["id"], 1);
+        assert_eq!(page["next_before_id"], Value::Null);
+
+        // 未认证先 401。
+        let (status, body) = call(&router, "GET", "/api/v1/alerts/events", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "unauthorized");
+
+        // 非法分页参数：固定 400 bad_request，不回显原始值。
+        for uri in [
+            "/api/v1/alerts/events?limit=0",
+            "/api/v1/alerts/events?limit=201",
+            "/api/v1/alerts/events?limit=abc",
+            "/api/v1/alerts/events?limit=1&limit=2",
+            "/api/v1/alerts/events?before_id=0",
+            "/api/v1/alerts/events?before_id=-1",
+            "/api/v1/alerts/events?before_id=abc",
+        ] {
+            let (status, body) = call(&router, "GET", uri, Some(&read), None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "uri={uri} body={body}");
+            assert_eq!(body["error"], "bad_request", "uri={uri}");
+        }
+    }
+
+    /// 静默 CRUD：scope 矩阵、规则存在校验、时长 / 字段校验、404 与生效窗口。
+    #[tokio::test]
+    async fn m4_b1b_alert_silence_crud_scope_and_validation() {
+        let state = alerts_state();
+        let read = seed_token(&state, "silence-read", "read");
+        let write = seed_token(&state, "silence-write", "write");
+        let router = admin_router(state.clone());
+
+        let mut target = default_rule(now_ms(), "test".into());
+        target.name = "静默目标".into();
+        target.metric = "disk.used_percent".into();
+        state.storage.create_alert_rule(&target).unwrap();
+
+        // 未认证 401；read 可查不可写。
+        let (status, _) = call(&router, "GET", "/api/v1/alerts/silences", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) =
+            call(&router, "GET", "/api/v1/alerts/silences", Some(&read), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!([]));
+        let (status, body) = call(
+            &router,
+            "POST",
+            "/api/v1/alerts/silences",
+            Some(&read),
+            Some(r#"{"duration_secs":60}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "forbidden_scope");
+        let (status, body) = call(
+            &router,
+            "DELETE",
+            "/api/v1/alerts/silences/1",
+            Some(&read),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "forbidden_scope");
+
+        // 指定规则 + agent：created_by 取 token name，until_ts = created_at + 时长。
+        let body = json!({
+            "rule_id": target.id,
+            "agent_id": "agent-1",
+            "duration_secs": 60
+        })
+        .to_string();
+        let (status, created) = call(
+            &router,
+            "POST",
+            "/api/v1/alerts/silences",
+            Some(&write),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "创建静默失败: {created}");
+        let first_id = created["id"].as_i64().expect("必须返回 id");
+        assert!(first_id > 0);
+        assert_eq!(created["rule_id"], target.id);
+        assert_eq!(created["agent_id"], "agent-1");
+        assert_eq!(created["created_by"], "silence-write");
+        assert_eq!(
+            created["until_ts"].as_i64().unwrap(),
+            created["created_at"].as_i64().unwrap() + 60_000
+        );
+
+        // 全局静默（rule_id/agent_id 缺省）与 legacy admin 的 created_by。
+        let (status, global) = call(
+            &router,
+            "POST",
+            "/api/v1/alerts/silences",
+            Some(LEGACY_TOKEN),
+            Some(r#"{"duration_secs":1}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "创建全局静默失败: {global}");
+        assert_eq!(global["rule_id"], Value::Null);
+        assert_eq!(global["agent_id"], Value::Null);
+        assert_eq!(global["created_by"], "admin");
+
+        let (status, list) =
+            call(&router, "GET", "/api/v1/alerts/silences", Some(&read), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list.as_array().unwrap().len(), 2);
+        assert!(list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|silence| silence["id"] == first_id));
+
+        // 参数错误：固定 400；规则不存在：404。
+        for body in [
+            r#"{"duration_secs":0}"#,
+            r#"{"duration_secs":604801}"#,
+            r#"{"rule_id":"some-rule"}"#,
+            r#"{"duration_secs":60,"unknown":true}"#,
+            r#"{"duration_secs":60,"agent_id":"bad agent"}"#,
+            r#"{"duration_secs":60,"rule_id":""}"#,
+        ] {
+            let (status, value) = call(
+                &router,
+                "POST",
+                "/api/v1/alerts/silences",
+                Some(&write),
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body={body} resp={value}");
+            assert_eq!(value["error"], "bad_request", "body={body}");
+        }
+        let (status, value) = call(
+            &router,
+            "POST",
+            "/api/v1/alerts/silences",
+            Some(&write),
+            Some(r#"{"rule_id":"missing-rule","duration_secs":60}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(value["error"], "not_found");
+
+        // 过期静默不出现在 GET（直接写库构造）。
+        state
+            .storage
+            .create_alert_silence(&AlertSilence {
+                id: 0,
+                rule_id: None,
+                agent_id: None,
+                until_ts: now_ms() - 1_000,
+                created_by: "seed".into(),
+                created_at: now_ms() - 2_000,
+            })
+            .unwrap();
+        let (status, list) =
+            call(&router, "GET", "/api/v1/alerts/silences", Some(&read), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list.as_array().unwrap().len(), 2, "过期静默不能被返回");
+
+        // 撤销：成功 204；再次删除 / 非法 id 都 404。
+        let (status, _) = call(
+            &router,
+            "DELETE",
+            &format!("/api/v1/alerts/silences/{first_id}"),
+            Some(&write),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &router,
+            "DELETE",
+            &format!("/api/v1/alerts/silences/{first_id}"),
+            Some(&write),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(value["error"], "not_found");
+        for id in ["abc", "0", "-1", "999999"] {
+            let (status, value) = call(
+                &router,
+                "DELETE",
+                &format!("/api/v1/alerts/silences/{id}"),
+                Some(&write),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "id={id} resp={value}");
+            assert_eq!(value["error"], "not_found");
         }
     }
 }

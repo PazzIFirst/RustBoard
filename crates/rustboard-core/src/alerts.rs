@@ -618,6 +618,529 @@ fn builtin_rule(
     }
 }
 
+// ---------------------------------------------------------------------------
+// M4-B1b：评估状态、事件与静默
+// ---------------------------------------------------------------------------
+
+/// `alert_states.series_key` 的最大字节数。
+///
+/// labels 是 agent 上报的任意键值对，长度没有强约束；状态表主键必须有上限，
+/// 超长序列键会退化成 SHA-256 摘要（见 [`series_key`]）。
+pub const MAX_SERIES_KEY_BYTES: usize = 512;
+
+/// 事件 `message` 的最大字节数（与方案 §6.2 一致）。
+pub const MAX_ALERT_MESSAGE_BYTES: usize = 512;
+
+/// 静默最短时长（秒）。
+pub const MIN_SILENCE_DURATION_SECS: u64 = 1;
+/// 静默最长时长（秒）：7 天。
+pub const MAX_SILENCE_DURATION_SECS: u64 = 604_800;
+
+/// 静默中的规则 id 最大字节数（内置 id 与 UUID 都远小于此值）。
+pub const MAX_SILENCE_RULE_ID_BYTES: usize = 64;
+
+/// 告警状态机的三个状态，与 `alert_states.state` 的取值一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertStateKind {
+    /// 条件已满足，但尚未达到 `duration_secs`。
+    Pending,
+    /// 条件持续满足，已触发。
+    Firing,
+    /// 条件不再满足；保留状态用于重新计时。
+    Resolved,
+}
+
+impl AlertStateKind {
+    /// 数据库 / API 使用的稳定字符串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Firing => "firing",
+            Self::Resolved => "resolved",
+        }
+    }
+
+    /// 解析稳定字符串；未知值返回 `None`（不静默降级）。
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "firing" => Some(Self::Firing),
+            "resolved" => Some(Self::Resolved),
+            _ => None,
+        }
+    }
+
+    /// 是否能作为事件状态（`alert_events.state` 只允许 firing / resolved）。
+    pub fn is_event(self) -> bool {
+        matches!(self, Self::Firing | Self::Resolved)
+    }
+}
+
+/// 一条告警状态（`alert_states` 的一行）。
+///
+/// 主键是 `(rule_id, agent_id, series_key)`：metric 规则每个序列独立一行，
+/// agent_offline 规则每个 agent 一行（`series_key` 为空），hub_cert 规则全局一行
+/// （`agent_id` / `series_key` 都为空）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertState {
+    /// 规则 id。
+    pub rule_id: String,
+    /// agent id；全局规则为空字符串。
+    pub agent_id: String,
+    /// 序列键；合成规则为空字符串。
+    pub series_key: String,
+    /// 当前状态。
+    pub state: AlertStateKind,
+    /// 进入当前状态的时间（Unix 毫秒）。
+    pub since: i64,
+    /// 最近一次评估时间（Unix 毫秒）。
+    pub last_eval_at: i64,
+    /// 最近一次观测值；非有限值（NaN / Infinity）存 `None`。
+    pub last_value: Option<f64>,
+    /// 最近一次通知时间；B1b 不发送通知，恒为 `None`，留给 B2。
+    pub last_notified_at: Option<i64>,
+}
+
+/// 一条告警事件（`alert_events` 的一行，JSON 即管理 API 结构）。
+///
+/// B1b 只落库、不发送通知：新事件的 `notified` 恒为 `false`、
+/// `notify_error` 恒为空串；`silenced` 表示命中静默。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertEvent {
+    /// 自增主键；新事件插入前为 0。
+    pub id: i64,
+    /// 事件时间（Unix 毫秒）。
+    pub ts: i64,
+    /// 规则 id。
+    pub rule_id: String,
+    /// 事件产生时的规则名快照（规则改名不改变历史事件）。
+    pub rule_name: String,
+    /// agent id；全局事件为空字符串。
+    pub agent_id: String,
+    /// 事件状态：firing / resolved。
+    pub state: AlertStateKind,
+    /// 触发 / 恢复时的观测值。
+    pub value: Option<f64>,
+    /// 中文可读描述；≤512 字节，不含 labels 全量与任何 secret。
+    pub message: String,
+    /// 是否已通知；B1b 恒为 false（B2 才可能为 true）。
+    pub notified: bool,
+    /// 通知失败原因；B1b 恒为空串。
+    pub notify_error: String,
+    /// 事件产生时是否命中静默。
+    pub silenced: bool,
+}
+
+/// 一条静默（`alert_silences` 的一行）。
+///
+/// `rule_id` / `agent_id` 为 `None` 表示匹配全部规则 / 全部 agent。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertSilence {
+    /// 自增主键；新建时为 0，落库后由存储层填入。
+    pub id: i64,
+    /// 规则 id；`None` = 全部规则。
+    pub rule_id: Option<String>,
+    /// agent id；`None` = 全部 agent。
+    pub agent_id: Option<String>,
+    /// 静默截止时间（Unix 毫秒，排他：`until_ts > now` 才生效）。
+    pub until_ts: i64,
+    /// 创建者（旧 admin token 为 `"admin"`）。
+    pub created_by: String,
+    /// 创建时间（Unix 毫秒）。
+    pub created_at: i64,
+}
+
+impl AlertSilence {
+    /// 在 `now` 时刻是否仍生效。
+    pub fn is_active_at(&self, now: i64) -> bool {
+        self.until_ts > now
+    }
+
+    /// 是否命中给定规则 / agent（尚未检查时间窗口）。
+    pub fn matches_target(&self, rule_id: &str, agent_id: &str) -> bool {
+        let rule_matches = match &self.rule_id {
+            None => true,
+            Some(candidate) => candidate == rule_id,
+        };
+        let agent_matches = match &self.agent_id {
+            None => true,
+            Some(candidate) => candidate == agent_id,
+        };
+        rule_matches && agent_matches
+    }
+
+    /// 在 `now` 时刻是否命中给定规则 / agent。
+    pub fn matches(&self, rule_id: &str, agent_id: &str, now: i64) -> bool {
+        self.is_active_at(now) && self.matches_target(rule_id, agent_id)
+    }
+}
+
+/// 创建静默的请求体；字段缺省即 `None`（= 全部）。
+///
+/// `deny_unknown_fields`：字段名拼错直接 400，不静默忽略。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlertSilenceInput {
+    /// 规则 id；缺省 / `null` = 全部规则。
+    #[serde(default)]
+    pub rule_id: Option<String>,
+    /// agent id；缺省 / `null` = 全部 agent。
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// 静默时长（秒），1–604800。
+    pub duration_secs: u64,
+}
+
+impl AlertSilenceInput {
+    /// 校验请求字段；错误信息为中文，不回显用户输入原文。
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(rule_id) = &self.rule_id {
+            validate_silence_rule_id(rule_id)?;
+        }
+        if let Some(agent_id) = &self.agent_id {
+            validate_filter_agent_id(agent_id)?;
+        }
+        if !(MIN_SILENCE_DURATION_SECS..=MAX_SILENCE_DURATION_SECS).contains(&self.duration_secs) {
+            return Err(format!(
+                "duration_secs 必须在 {MIN_SILENCE_DURATION_SECS}–{MAX_SILENCE_DURATION_SECS} 之间"
+            ));
+        }
+        Ok(())
+    }
+
+    /// 转成待落库的静默；`id` 由存储层回填。
+    ///
+    /// 调用方必须先执行 [`Self::validate`]，并校验 `rule_id` 对应的规则存在。
+    pub fn into_silence(&self, now: i64, created_by: String) -> AlertSilence {
+        let duration_ms = self
+            .duration_secs
+            .saturating_mul(1_000)
+            .min(i64::MAX as u64) as i64;
+        AlertSilence {
+            id: 0,
+            rule_id: self.rule_id.clone(),
+            agent_id: self.agent_id.clone(),
+            until_ts: now.saturating_add(duration_ms),
+            created_by,
+            created_at: now,
+        }
+    }
+}
+
+/// 静默规则 id 校验：1–64 字节的 `[A-Za-z0-9_.-]`。
+pub fn validate_silence_rule_id(rule_id: &str) -> Result<(), String> {
+    let valid = !rule_id.is_empty()
+        && rule_id.len() <= MAX_SILENCE_RULE_ID_BYTES
+        && rule_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if !valid {
+        return Err("rule_id 格式非法".to_string());
+    }
+    Ok(())
+}
+
+/// 比较符对 `f64` 求值。
+///
+/// 安全边界：
+/// - 任何一侧是 NaN 一律返回 `false`（包括 `ne`：NaN 不代表“不相等”）；
+/// - 阈值不是有限数一律返回 `false`（配置坏掉时宁可不告警，不能误告警）；
+/// - `eq` / `ne` 使用 `f64` 精确比较，由规则作者自行承担浮点误差。
+pub fn evaluate_condition(comparator: Comparator, threshold: f64, value: f64) -> bool {
+    if !threshold.is_finite() || value.is_nan() {
+        return false;
+    }
+    match comparator {
+        Comparator::Gt => value > threshold,
+        Comparator::Gte => value >= threshold,
+        Comparator::Lt => value < threshold,
+        Comparator::Lte => value <= threshold,
+        Comparator::Eq => value == threshold,
+        Comparator::Ne => value != threshold,
+    }
+}
+
+/// labels 过滤：`filter` 必须是 `labels` 的精确子集（键与值都相等）。
+pub fn labels_match_filter(filter: &Labels, labels: &Labels) -> bool {
+    filter
+        .iter()
+        .all(|(key, value)| labels.get(key).is_some_and(|actual| actual == value))
+}
+
+/// 生成稳定的序列键：`metric` + 按字典序排列的 labels 的 JSON。
+///
+/// `Labels` 是 `BTreeMap`，序列化顺序天然稳定；超过 [`MAX_SERIES_KEY_BYTES`]
+/// 时退化为「metric 前 64 字节 + SHA-256」，避免超长 labels 撑大状态表主键。
+/// 同一条序列在任何进程、任何重启后都得到相同键。
+pub fn series_key(metric: &str, labels: &Labels) -> String {
+    #[derive(Serialize)]
+    struct Canonical<'a> {
+        metric: &'a str,
+        labels: &'a Labels,
+    }
+
+    let encoded =
+        serde_json::to_string(&Canonical { metric, labels }).unwrap_or_else(|_| metric.to_string());
+    if encoded.len() <= MAX_SERIES_KEY_BYTES {
+        return encoded;
+    }
+    let digest = rustboard_common::tls::sha256_hex(&encoded);
+    let metric_prefix = {
+        let mut end = metric.len().min(64);
+        while end > 0 && !metric.is_char_boundary(end) {
+            end -= 1;
+        }
+        &metric[..end]
+    };
+    format!("{metric_prefix}#sha256:{digest}")
+}
+
+/// 一次状态机推进的结果。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AlertTransition {
+    /// 需要写入的状态；`None` 表示「无状态 + 条件不满足」，不创建行。
+    pub state: Option<AlertState>,
+    /// 本轮产生的状态转换事件；`None` 表示没有状态转换。
+    pub event: Option<AlertStateKind>,
+}
+
+/// 状态机纯函数：根据既有状态与本次观测推进一轮。
+///
+/// 规则（与方案 §6.2 一致）：
+/// - 无状态 + 条件满足 → pending；`duration_secs == 0` 时同一轮直接 firing 并产生事件；
+/// - pending + 条件满足且 `now - since >= duration_secs * 1000` → firing + 事件；
+///   未到时长只刷新 `last_eval_at` / `last_value`，`since` 保持不变；
+/// - pending / firing + 条件不满足 → resolved；只有 firing 产生 resolved 事件；
+/// - firing + 条件满足 → 状态不变，**不重复**产生 firing 事件；
+/// - resolved + 条件满足 → pending 重新计时；`duration_secs == 0` 时同一轮 firing；
+/// - resolved + 条件不满足 → 保持 resolved。
+///
+/// 调用方负责「无样本 / 评估失败不进状态机」，因此这里永远拿到一个真实观测值。
+/// `last_notified_at` 原样保留：B1b 不发通知，留给 B2 维护。
+pub fn next_alert_state(
+    existing: Option<&AlertState>,
+    rule: &AlertRule,
+    agent_id: &str,
+    series_key: &str,
+    value: f64,
+    now: i64,
+) -> AlertTransition {
+    let condition_met = evaluate_condition(rule.comparator, rule.threshold, value);
+    if existing.is_none() && !condition_met {
+        return AlertTransition::default();
+    }
+
+    let previous = existing.map(|state| (state.state, state.since));
+    let duration_ms = i64::from(rule.duration_secs).saturating_mul(1_000);
+    let mut next = AlertState {
+        rule_id: rule.id.clone(),
+        agent_id: agent_id.to_string(),
+        series_key: series_key.to_string(),
+        state: AlertStateKind::Pending,
+        since: now,
+        last_eval_at: now,
+        last_value: value.is_finite().then_some(value),
+        last_notified_at: existing.and_then(|state| state.last_notified_at),
+    };
+
+    match previous {
+        // 首次满足：duration 为 0 立即触发，否则进入 pending 计时。
+        None => {
+            if duration_ms == 0 {
+                next.state = AlertStateKind::Firing;
+                AlertTransition {
+                    state: Some(next),
+                    event: Some(AlertStateKind::Firing),
+                }
+            } else {
+                next.state = AlertStateKind::Pending;
+                AlertTransition {
+                    state: Some(next),
+                    event: None,
+                }
+            }
+        }
+        Some((AlertStateKind::Pending, since)) if condition_met => {
+            if now.saturating_sub(since) >= duration_ms {
+                next.state = AlertStateKind::Firing;
+                AlertTransition {
+                    state: Some(next),
+                    event: Some(AlertStateKind::Firing),
+                }
+            } else {
+                next.state = AlertStateKind::Pending;
+                next.since = since;
+                AlertTransition {
+                    state: Some(next),
+                    event: None,
+                }
+            }
+        }
+        Some((AlertStateKind::Pending, _)) => {
+            // pending → resolved 不产生事件：从未触发过的抖动不值得打扰用户。
+            next.state = AlertStateKind::Resolved;
+            AlertTransition {
+                state: Some(next),
+                event: None,
+            }
+        }
+        Some((AlertStateKind::Firing, since)) if condition_met => {
+            next.state = AlertStateKind::Firing;
+            next.since = since;
+            AlertTransition {
+                state: Some(next),
+                event: None,
+            }
+        }
+        Some((AlertStateKind::Firing, _)) => {
+            next.state = AlertStateKind::Resolved;
+            AlertTransition {
+                state: Some(next),
+                event: Some(AlertStateKind::Resolved),
+            }
+        }
+        Some((AlertStateKind::Resolved, _)) if condition_met => {
+            next.state = if duration_ms == 0 {
+                AlertStateKind::Firing
+            } else {
+                AlertStateKind::Pending
+            };
+            let event = (duration_ms == 0).then_some(AlertStateKind::Firing);
+            AlertTransition {
+                state: Some(next),
+                event,
+            }
+        }
+        Some((AlertStateKind::Resolved, since)) => {
+            next.state = AlertStateKind::Resolved;
+            next.since = since;
+            AlertTransition {
+                state: Some(next),
+                event: None,
+            }
+        }
+    }
+}
+
+/// 构造一条待落库的告警事件（`id = 0`，由存储层回填）。
+///
+/// `notified` 恒为 `false`：B1b 不发送任何通知，B2 才更新；`silenced` 由调用方
+/// 按本轮静默快照判定。`state` 只接受 firing / resolved（debug 构建断言）。
+pub fn new_alert_event(
+    rule: &AlertRule,
+    agent_id: &str,
+    state: AlertStateKind,
+    value: f64,
+    now: i64,
+    silenced: bool,
+) -> AlertEvent {
+    debug_assert!(
+        state.is_event(),
+        "告警事件状态只能是 firing / resolved，实际 {state:?}"
+    );
+    AlertEvent {
+        id: 0,
+        ts: now,
+        rule_id: rule.id.clone(),
+        rule_name: rule.name.clone(),
+        agent_id: agent_id.to_string(),
+        state,
+        value: value.is_finite().then_some(value),
+        message: alert_event_message(rule, agent_id, state, value),
+        notified: false,
+        notify_error: String::new(),
+        silenced,
+    }
+}
+
+/// 生成中文事件描述。
+///
+/// 只包含规则名、agent、metric、观测值与阈值；**不写 labels 全量**，也不包含
+/// 任何 secret。总长度严格 ≤ [`MAX_ALERT_MESSAGE_BYTES`]，超长按字符边界截断并
+/// 追加省略号（不会切坏 UTF-8）。
+pub fn alert_event_message(
+    rule: &AlertRule,
+    agent_id: &str,
+    state: AlertStateKind,
+    value: f64,
+) -> String {
+    let subject = if agent_id.is_empty() {
+        "全局".to_string()
+    } else {
+        format!("agent {agent_id}")
+    };
+    let value_text = format_number(value);
+    let threshold = format_number(rule.threshold);
+    let comparator = rule.comparator.symbol();
+    let detail = match rule.source {
+        AlertSource::Metric => format!(
+            "{subject} 指标「{}」当前值 {value_text}，阈值 {comparator} {threshold}",
+            rule.metric
+        ),
+        AlertSource::AgentOffline => {
+            format!("{subject} 离线时长 {value_text} 秒，阈值 {comparator} {threshold} 秒")
+        }
+        AlertSource::HubCert => format!(
+            "{subject} Hub 服务端证书剩余 {value_text} 天，阈值 {comparator} {threshold} 天"
+        ),
+    };
+    let verb = match state {
+        AlertStateKind::Pending => "状态更新",
+        AlertStateKind::Firing => "触发",
+        AlertStateKind::Resolved => "恢复",
+    };
+    truncate_alert_message(format!("规则「{}」{verb}：{detail}", rule.name))
+}
+
+/// 阈值展示用的比较符符号。
+impl Comparator {
+    /// API / 事件描述里的符号形式。
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Gt => ">",
+            Self::Gte => ">=",
+            Self::Lt => "<",
+            Self::Lte => "<=",
+            Self::Eq => "==",
+            Self::Ne => "!=",
+        }
+    }
+}
+
+/// 数值展示：最多两位小数，去掉多余的 `.0`；非有限值给出中文占位。
+fn format_number(value: f64) -> String {
+    if !value.is_finite() {
+        return "非数值".to_string();
+    }
+    let rounded = (value * 100.0).round() / 100.0;
+    format!("{rounded}")
+}
+
+/// 按 UTF-8 字符边界截断到 `max` 字节以内（不加省略号）。
+fn alert_message_truncate(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+/// 把事件描述夹到 [`MAX_ALERT_MESSAGE_BYTES`] 以内；截断时保留省略号。
+fn truncate_alert_message(text: String) -> String {
+    if text.len() <= MAX_ALERT_MESSAGE_BYTES {
+        return text;
+    }
+    let ellipsis = '…';
+    let budget = MAX_ALERT_MESSAGE_BYTES - ellipsis.len_utf8();
+    let mut truncated = alert_message_truncate(&text, budget);
+    truncated.push(ellipsis);
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -967,5 +1490,444 @@ mod tests {
             assert!(!text.is_empty());
             assert!(!text.contains('\n'));
         }
+    }
+
+    // ------------------------------------------------------------------
+    // M4-B1b：比较符 / 状态机 / 事件 / 静默
+    // ------------------------------------------------------------------
+
+    fn state_at(kind: AlertStateKind, since: i64) -> AlertState {
+        AlertState {
+            rule_id: "rule-1".into(),
+            agent_id: "agent-1".into(),
+            series_key: "series-1".into(),
+            state: kind,
+            since,
+            last_eval_at: since,
+            last_value: Some(1.0),
+            last_notified_at: Some(since - 5),
+        }
+    }
+
+    /// 六种比较符的边界；NaN / 非有限阈值一律 false（包括 ne）。
+    #[test]
+    fn m4_b1b_evaluate_condition_boundaries() {
+        assert!(evaluate_condition(Comparator::Gt, 90.0, 90.01));
+        assert!(!evaluate_condition(Comparator::Gt, 90.0, 90.0));
+        assert!(evaluate_condition(Comparator::Gte, 90.0, 90.0));
+        assert!(!evaluate_condition(Comparator::Gte, 90.0, 89.99));
+        assert!(evaluate_condition(Comparator::Lt, 48.0, 47.99));
+        assert!(!evaluate_condition(Comparator::Lt, 48.0, 48.0));
+        assert!(evaluate_condition(Comparator::Lte, 48.0, 48.0));
+        assert!(!evaluate_condition(Comparator::Lte, 48.0, 48.01));
+        assert!(evaluate_condition(Comparator::Eq, 1.5, 1.5));
+        assert!(!evaluate_condition(Comparator::Eq, 1.5, 1.500_001));
+        assert!(evaluate_condition(Comparator::Ne, 1.5, 1.500_001));
+        assert!(!evaluate_condition(Comparator::Ne, 1.5, 1.5));
+
+        for comparator in [
+            Comparator::Gt,
+            Comparator::Gte,
+            Comparator::Lt,
+            Comparator::Lte,
+            Comparator::Eq,
+            Comparator::Ne,
+        ] {
+            assert!(
+                !evaluate_condition(comparator, 1.0, f64::NAN),
+                "NaN value 必须 false: {comparator:?}"
+            );
+            assert!(
+                !evaluate_condition(comparator, f64::NAN, 1.0),
+                "NaN threshold 必须 false: {comparator:?}"
+            );
+            assert!(
+                !evaluate_condition(comparator, f64::INFINITY, 1.0),
+                "非有限阈值必须 false: {comparator:?}"
+            );
+            assert!(
+                !evaluate_condition(comparator, f64::NEG_INFINITY, 1.0),
+                "非有限阈值必须 false: {comparator:?}"
+            );
+        }
+    }
+
+    /// labels 精确子集：多出的 label 不影响，值不同不匹配。
+    #[test]
+    fn m4_b1b_labels_match_filter_is_exact_subset() {
+        let mut filter = Labels::new();
+        filter.insert("mount".into(), "/".into());
+        let mut labels = Labels::new();
+        labels.insert("mount".into(), "/".into());
+        labels.insert("fs".into(), "ext4".into());
+        assert!(labels_match_filter(&filter, &labels));
+        assert!(
+            labels_match_filter(&Labels::new(), &labels),
+            "空过滤匹配全部"
+        );
+
+        let mut wrong = labels.clone();
+        wrong.insert("mount".into(), "/data".into());
+        assert!(!labels_match_filter(&filter, &wrong));
+        assert!(
+            !labels_match_filter(&filter, &Labels::new()),
+            "缺少键不匹配"
+        );
+    }
+
+    /// 序列键稳定（labels 顺序无关）、可区分、超长时有上限。
+    #[test]
+    fn m4_b1b_series_key_is_stable_and_bounded() {
+        let mut first = Labels::new();
+        first.insert("mount".into(), "/".into());
+        first.insert("fs".into(), "ext4".into());
+        let mut second = Labels::new();
+        second.insert("fs".into(), "ext4".into());
+        second.insert("mount".into(), "/".into());
+        let key = series_key("disk.used_percent", &first);
+        assert_eq!(key, series_key("disk.used_percent", &second));
+        assert!(key.contains("disk.used_percent"));
+        assert!(
+            key.find("\"fs\"").unwrap() < key.find("\"mount\"").unwrap(),
+            "labels 必须按字典序编码: {key}"
+        );
+        assert_ne!(key, series_key("disk.used_percent", &Labels::new()));
+
+        let mut huge = Labels::new();
+        huge.insert("blob".into(), "x".repeat(4_096));
+        let huge_key = series_key("disk.used_percent", &huge);
+        assert!(huge_key.len() <= MAX_SERIES_KEY_BYTES);
+        assert_eq!(huge_key, series_key("disk.used_percent", &huge));
+        assert!(huge_key.contains("sha256:"));
+
+        let mut other = Labels::new();
+        other.insert("blob".into(), "y".repeat(4_096));
+        assert_ne!(huge_key, series_key("disk.used_percent", &other));
+    }
+
+    /// 无状态 + 条件满足：duration=0 立即 firing 并产生事件；否则先 pending。
+    #[test]
+    fn m4_b1b_first_observation_enters_pending_or_firing() {
+        let mut rule = base_rule();
+        rule.duration_secs = 300;
+        let transition = next_alert_state(None, &rule, "agent-1", "series-1", 95.0, 1_000);
+        let state = transition.state.expect("必须创建 pending 状态");
+        assert_eq!(state.state, AlertStateKind::Pending);
+        assert_eq!(state.since, 1_000);
+        assert_eq!(state.last_eval_at, 1_000);
+        assert_eq!(state.last_value, Some(95.0));
+        assert_eq!(state.rule_id, "rule-1");
+        assert_eq!(state.agent_id, "agent-1");
+        assert_eq!(state.series_key, "series-1");
+        assert_eq!(transition.event, None);
+
+        rule.duration_secs = 0;
+        let transition = next_alert_state(None, &rule, "agent-1", "series-1", 95.0, 1_000);
+        let state = transition.state.expect("必须创建 firing 状态");
+        assert_eq!(state.state, AlertStateKind::Firing);
+        assert_eq!(state.since, 1_000);
+        assert_eq!(transition.event, Some(AlertStateKind::Firing));
+
+        // 无状态 + 条件不满足：不创建状态，也不产生事件。
+        let rule = base_rule();
+        let transition = next_alert_state(None, &rule, "agent-1", "series-1", 10.0, 1_000);
+        assert_eq!(transition, AlertTransition::default());
+    }
+
+    /// pending 持续满足：未到 duration 不触发，到 duration 触发一次且不重复。
+    #[test]
+    fn m4_b1b_pending_waits_for_duration_then_fires_once() {
+        let mut rule = base_rule();
+        rule.duration_secs = 300;
+        let start = 1_700_000_000_000;
+        let pending = next_alert_state(None, &rule, "agent-1", "series-1", 95.0, start)
+            .state
+            .unwrap();
+
+        let before = next_alert_state(
+            Some(&pending),
+            &rule,
+            "agent-1",
+            "series-1",
+            95.0,
+            start + 299_999,
+        );
+        let before_state = before.state.unwrap();
+        assert_eq!(before_state.state, AlertStateKind::Pending);
+        assert_eq!(before_state.since, start, "未到时长必须保持首次满足时间");
+        assert_eq!(before_state.last_eval_at, start + 299_999);
+        assert_eq!(before.event, None);
+
+        let firing = next_alert_state(
+            Some(&before_state),
+            &rule,
+            "agent-1",
+            "series-1",
+            97.0,
+            start + 300_000,
+        );
+        let firing_state = firing.state.unwrap();
+        assert_eq!(firing_state.state, AlertStateKind::Firing);
+        assert_eq!(firing_state.since, start + 300_000);
+        assert_eq!(firing.event, Some(AlertStateKind::Firing));
+        assert_eq!(
+            firing_state.last_notified_at, None,
+            "由无状态创建的 pending 从未通知过"
+        );
+
+        // 已有状态里的 last_notified_at（B2 写入）在推进时必须原样保留。
+        let notified_pending = state_at(AlertStateKind::Pending, start);
+        assert_eq!(notified_pending.last_notified_at, Some(start - 5));
+        let fired = next_alert_state(
+            Some(&notified_pending),
+            &rule,
+            "agent-1",
+            "series-1",
+            95.0,
+            start + 300_000,
+        );
+        assert_eq!(
+            fired.state.unwrap().last_notified_at,
+            Some(start - 5),
+            "last_notified_at 必须保留"
+        );
+
+        let again = next_alert_state(
+            Some(&firing_state),
+            &rule,
+            "agent-1",
+            "series-1",
+            98.0,
+            start + 315_000,
+        );
+        let again_state = again.state.unwrap();
+        assert_eq!(again_state.state, AlertStateKind::Firing);
+        assert_eq!(again_state.since, start + 300_000, "firing 不重置 since");
+        assert_eq!(again.event, None, "firing 不能重复产生事件");
+    }
+
+    /// 恢复：firing → resolved 产生事件；pending → resolved 不产生事件。
+    #[test]
+    fn m4_b1b_recovery_events_only_after_firing() {
+        let rule = base_rule();
+
+        let pending = state_at(AlertStateKind::Pending, 1_000);
+        let resolved = next_alert_state(Some(&pending), &rule, "agent-1", "series-1", 10.0, 2_000);
+        let resolved_state = resolved.state.unwrap();
+        assert_eq!(resolved_state.state, AlertStateKind::Resolved);
+        assert_eq!(resolved_state.since, 2_000);
+        assert_eq!(resolved.event, None, "pending 恢复不产生事件");
+
+        let firing = state_at(AlertStateKind::Firing, 1_000);
+        let resolved = next_alert_state(Some(&firing), &rule, "agent-1", "series-1", 10.0, 2_000);
+        let resolved_state = resolved.state.unwrap();
+        assert_eq!(resolved_state.state, AlertStateKind::Resolved);
+        assert_eq!(resolved.event, Some(AlertStateKind::Resolved));
+
+        // resolved + 条件仍不满足：状态不变、since 不变，只刷新评估时间。
+        let again = next_alert_state(
+            Some(&resolved_state),
+            &rule,
+            "agent-1",
+            "series-1",
+            9.0,
+            3_000,
+        );
+        let again_state = again.state.unwrap();
+        assert_eq!(again_state.state, AlertStateKind::Resolved);
+        assert_eq!(again_state.since, 2_000);
+        assert_eq!(again_state.last_eval_at, 3_000);
+        assert_eq!(again.event, None);
+    }
+
+    /// 重触发：resolved + 条件满足 → pending 重新计时；duration=0 时同轮 firing。
+    #[test]
+    fn m4_b1b_resolved_retriggers_with_fresh_duration() {
+        let mut rule = base_rule();
+        rule.duration_secs = 60;
+        let resolved = state_at(AlertStateKind::Resolved, 1_000);
+
+        let retrigger =
+            next_alert_state(Some(&resolved), &rule, "agent-1", "series-1", 95.0, 5_000);
+        let retrigger_state = retrigger.state.unwrap();
+        assert_eq!(retrigger_state.state, AlertStateKind::Pending);
+        assert_eq!(retrigger_state.since, 5_000, "必须重新计时");
+        assert_eq!(retrigger.event, None);
+
+        let firing = next_alert_state(
+            Some(&retrigger_state),
+            &rule,
+            "agent-1",
+            "series-1",
+            95.0,
+            65_000,
+        );
+        assert_eq!(firing.state.unwrap().state, AlertStateKind::Firing);
+        assert_eq!(firing.event, Some(AlertStateKind::Firing));
+
+        rule.duration_secs = 0;
+        let immediate =
+            next_alert_state(Some(&resolved), &rule, "agent-1", "series-1", 95.0, 5_000);
+        let immediate_state = immediate.state.unwrap();
+        assert_eq!(immediate_state.state, AlertStateKind::Firing);
+        assert_eq!(immediate.event, Some(AlertStateKind::Firing));
+    }
+
+    /// 事件描述：中文、含规则名 / agent / 值 / 阈值、不含 labels 与换行，≤512 字节。
+    #[test]
+    fn m4_b1b_event_message_is_safe_and_bounded() {
+        let mut rule = base_rule();
+        rule.filter_labels
+            .insert("mount".into(), "/secret-mount".into());
+        let message = alert_event_message(&rule, "agent-1", AlertStateKind::Firing, 95.5);
+        assert!(message.contains("磁盘告警"), "必须包含规则名: {message}");
+        assert!(message.contains("agent-1"), "必须包含 agent: {message}");
+        assert!(message.contains("95.5"), "必须包含观测值: {message}");
+        assert!(message.contains("90"), "必须包含阈值: {message}");
+        assert!(message.contains('>'), "必须包含比较符: {message}");
+        assert!(
+            !message.contains("secret-mount"),
+            "不能写完整 labels: {message}"
+        );
+        assert!(!message.contains('\n'));
+
+        let resolved = alert_event_message(&rule, "agent-1", AlertStateKind::Resolved, 12.0);
+        assert!(resolved.contains("恢复"));
+        assert!(resolved.contains("12"));
+
+        rule.source = AlertSource::AgentOffline;
+        rule.metric.clear();
+        let offline = alert_event_message(&rule, "agent-1", AlertStateKind::Firing, 120.0);
+        assert!(offline.contains("离线") && offline.contains("120"));
+
+        rule.source = AlertSource::HubCert;
+        let cert = alert_event_message(&rule, "", AlertStateKind::Firing, 20.0);
+        assert!(cert.contains("证书") && cert.contains("全局"), "{cert}");
+
+        // 超长消息：严格按 UTF-8 边界截断到 512 字节以内。
+        let mut long = base_rule();
+        long.name = "超长规则名称".repeat(9);
+        let long_message =
+            alert_event_message(&long, "agent-1", AlertStateKind::Firing, 1.234_567_89e300);
+        assert!(long_message.len() <= MAX_ALERT_MESSAGE_BYTES);
+        assert!(long_message.ends_with('…'));
+    }
+
+    /// 事件构造：notified 恒 false、notify_error 空、silenced 透传、值非有限存 None。
+    #[test]
+    fn m4_b1b_new_event_defaults_to_not_notified() {
+        let rule = base_rule();
+        let event = new_alert_event(&rule, "agent-1", AlertStateKind::Firing, 95.0, 7_000, true);
+        assert_eq!(event.id, 0);
+        assert_eq!(event.ts, 7_000);
+        assert_eq!(event.rule_id, "rule-1");
+        assert_eq!(event.rule_name, "磁盘告警");
+        assert_eq!(event.agent_id, "agent-1");
+        assert_eq!(event.state, AlertStateKind::Firing);
+        assert_eq!(event.value, Some(95.0));
+        assert!(!event.notified);
+        assert!(event.notify_error.is_empty());
+        assert!(event.silenced);
+
+        let nan = new_alert_event(
+            &rule,
+            "agent-1",
+            AlertStateKind::Resolved,
+            f64::NAN,
+            7_000,
+            false,
+        );
+        assert_eq!(nan.value, None);
+        assert!(!nan.silenced);
+    }
+
+    /// 静默匹配：NULL 通配、规则 / agent 精确、until_ts 排他边界。
+    #[test]
+    fn m4_b1b_silence_matching_window_and_wildcards() {
+        let silence = AlertSilence {
+            id: 1,
+            rule_id: None,
+            agent_id: None,
+            until_ts: 10_000,
+            created_by: "admin".into(),
+            created_at: 1_000,
+        };
+        assert!(silence.matches("rule-1", "agent-1", 9_999));
+        assert!(
+            !silence.matches("rule-1", "agent-1", 10_000),
+            "到期时刻不生效"
+        );
+        assert!(!silence.matches("rule-1", "agent-1", 10_001));
+
+        let rule_only = AlertSilence {
+            rule_id: Some("rule-1".into()),
+            agent_id: None,
+            ..silence.clone()
+        };
+        assert!(rule_only.matches("rule-1", "any-agent", 1_000));
+        assert!(!rule_only.matches("rule-2", "any-agent", 1_000));
+
+        let agent_only = AlertSilence {
+            rule_id: None,
+            agent_id: Some("agent-1".into()),
+            ..silence.clone()
+        };
+        assert!(agent_only.matches("any-rule", "agent-1", 1_000));
+        assert!(!agent_only.matches("any-rule", "agent-2", 1_000));
+
+        let both = AlertSilence {
+            rule_id: Some("rule-1".into()),
+            agent_id: Some("agent-1".into()),
+            ..silence.clone()
+        };
+        assert!(both.matches("rule-1", "agent-1", 1_000));
+        assert!(!both.matches("rule-1", "agent-2", 1_000));
+    }
+
+    /// 静默请求校验：时长边界、rule / agent 格式、未知字段、into_silence 时间计算。
+    #[test]
+    fn m4_b1b_silence_input_validation_and_build() {
+        let input: AlertSilenceInput =
+            serde_json::from_str(r#"{"rule_id":"builtin-disk-percent","duration_secs":60}"#)
+                .unwrap();
+        input.validate().unwrap();
+        let silence = input.into_silence(1_000, "admin".into());
+        assert_eq!(silence.id, 0);
+        assert_eq!(silence.rule_id.as_deref(), Some("builtin-disk-percent"));
+        assert_eq!(silence.agent_id, None);
+        assert_eq!(silence.until_ts, 61_000);
+        assert_eq!(silence.created_at, 1_000);
+        assert_eq!(silence.created_by, "admin");
+
+        for body in [
+            // 缺少 duration_secs（必填）。
+            r#"{"rule_id":"rule-1"}"#,
+            // 未知字段。
+            r#"{"duration_secs":60,"created_by":"attacker"}"#,
+            // 时长边界。
+            r#"{"duration_secs":0}"#,
+            r#"{"duration_secs":604801}"#,
+            // 非法 rule / agent。
+            r#"{"duration_secs":60,"rule_id":""}"#,
+            r#"{"duration_secs":60,"rule_id":"bad id"}"#,
+            r#"{"duration_secs":60,"agent_id":"bad agent"}"#,
+            r#"{"duration_secs":60,"agent_id":""}"#,
+        ] {
+            let result = serde_json::from_str::<AlertSilenceInput>(body)
+                .map_err(|err| err.to_string())
+                .and_then(|input| input.validate());
+            assert!(result.is_err(), "body 必须被拒绝: {body}");
+        }
+
+        let max: AlertSilenceInput =
+            serde_json::from_str(r#"{"duration_secs":604800,"rule_id":null,"agent_id":null}"#)
+                .unwrap();
+        max.validate().unwrap();
+        let silence = max.into_silence(0, "admin".into());
+        assert_eq!(silence.until_ts, 604_800_000);
+
+        let min: AlertSilenceInput = serde_json::from_str(r#"{"duration_secs":1}"#).unwrap();
+        min.validate().unwrap();
+        assert_eq!(min.into_silence(0, "admin".into()).until_ts, 1_000);
     }
 }

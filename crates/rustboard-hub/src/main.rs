@@ -23,7 +23,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, RawQu
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, put};
+use axum::routing::{any, delete, get, put};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
 use http_body::{Body as HttpBody, Frame as BodyFrame, SizeHint};
@@ -54,6 +54,7 @@ use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 
 mod alerts;
+mod alerts_engine;
 mod auth;
 mod cert_rotation;
 mod control;
@@ -1231,6 +1232,9 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         // M4：降采样 + 保留期后台任务。启动后先睡一个周期，不做同步 backfill，
         // 不阻塞监听；每轮在 spawn_blocking 内串行执行。
         spawn_maintenance(storage.clone(), cfg.clone());
+        // M4-B1b：告警评估任务。`alerts.enabled = false` 时只记日志不启动；
+        // 启动后同样先睡一个周期，避免与监听 / 维护任务抢写锁。
+        alerts_engine::spawn_alert_engine(storage.clone(), cfg.clone());
 
         let agent_app = Router::new()
             .route("/agent/ws", get(agent_ws))
@@ -1702,7 +1706,7 @@ fn admin_router(state: AppState) -> Router {
         )
         // 审计只读接口。
         .route("/api/v1/audit", get(control::audit_list))
-        // M4-B1：告警规则 CRUD。事件 / 静默 / 渠道留给 B1b / B2。
+        // M4-B1：告警规则 CRUD、事件分页、静默创建 / 撤销。渠道留给 B2。
         .route(
             "/api/v1/alerts/rules",
             get(alerts::list_rules).post(alerts::create_rule),
@@ -1710,6 +1714,15 @@ fn admin_router(state: AppState) -> Router {
         .route(
             "/api/v1/alerts/rules/{id}",
             put(alerts::update_rule).delete(alerts::delete_rule),
+        )
+        .route("/api/v1/alerts/events", get(alerts::list_events))
+        .route(
+            "/api/v1/alerts/silences",
+            get(alerts::list_silences).post(alerts::create_silence),
+        )
+        .route(
+            "/api/v1/alerts/silences/{id}",
+            delete(alerts::delete_silence),
         )
         // KI-08：未知 /api/v1/* 也要先过 Bearer 再 404，不能泄露路由是否存在。
         .route("/api/v1", any(api_not_found))

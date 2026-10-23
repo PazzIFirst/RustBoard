@@ -583,8 +583,10 @@ pub(crate) fn required_scope(method: &Method, path: &str) -> Option<TokenScope> 
             | "/api/v1/series"
             | "/api/v1/overview"
             | "/api/v1/audit"
-            // M4-B1：规则列表只读；增删改在下面单独映射为 Write。
+            // M4-B1：规则 / 事件 / 静默查询只读；写操作在下面单独映射为 Write。
             | "/api/v1/alerts/rules"
+            | "/api/v1/alerts/events"
+            | "/api/v1/alerts/silences"
     ) || ["/latest", "/series", "/settings", "/control"]
         .iter()
         .any(|suffix| is_agent_subroute(path, suffix));
@@ -596,6 +598,13 @@ pub(crate) fn required_scope(method: &Method, path: &str) -> Option<TokenScope> 
         return Some(TokenScope::Write);
     }
     if (*method == Method::PUT || *method == Method::DELETE) && is_alert_rule_subroute(path) {
+        return Some(TokenScope::Write);
+    }
+    // M4-B1b：创建 / 撤销静默都需要 Write；事件只读。
+    if *method == Method::POST && path == "/api/v1/alerts/silences" {
+        return Some(TokenScope::Write);
+    }
+    if *method == Method::DELETE && is_alert_silence_subroute(path) {
         return Some(TokenScope::Write);
     }
     if *method == Method::POST && is_agent_subroute(path, "/control") {
@@ -611,6 +620,12 @@ pub(crate) fn required_scope(method: &Method, path: &str) -> Option<TokenScope> 
 /// `builtin-*`，自定义是 UUID，都只有一段）。
 fn is_alert_rule_subroute(path: &str) -> bool {
     path.strip_prefix("/api/v1/alerts/rules/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// 匹配 `/api/v1/alerts/silences/<id>`；`<id>` 必须是非空单段。
+fn is_alert_silence_subroute(path: &str) -> bool {
+    path.strip_prefix("/api/v1/alerts/silences/")
         .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
@@ -707,6 +722,8 @@ mod tests {
             "/api/v1/agents/a1/settings",
             "/api/v1/agents/a1/control",
             "/api/v1/alerts/rules",
+            "/api/v1/alerts/events",
+            "/api/v1/alerts/silences",
         ] {
             assert_eq!(
                 required_scope(&Method::GET, path),
@@ -737,6 +754,9 @@ mod tests {
                 &Method::DELETE,
                 "/api/v1/alerts/rules/builtin-agent-offline",
             ),
+            // M4-B1b：静默创建 / 撤销必须 Write。
+            (&Method::POST, "/api/v1/alerts/silences"),
+            (&Method::DELETE, "/api/v1/alerts/silences/12"),
         ] {
             assert_eq!(
                 required_scope(method, path),
@@ -753,8 +773,18 @@ mod tests {
             (&Method::DELETE, "/api/v1/alerts/rules/a/b"),
             (&Method::POST, "/api/v1/alerts/rules/rule-1"),
             (&Method::GET, "/api/v1/alerts/rules/rule-1"),
-            (&Method::GET, "/api/v1/alerts/events"),
-            (&Method::POST, "/api/v1/alerts/silences"),
+            // 事件 / 静默集合只接受已声明的方法。
+            (&Method::PUT, "/api/v1/alerts/events"),
+            (&Method::POST, "/api/v1/alerts/events"),
+            (&Method::DELETE, "/api/v1/alerts/events"),
+            (&Method::PUT, "/api/v1/alerts/silences"),
+            (&Method::DELETE, "/api/v1/alerts/silences"),
+            // 静默子路径只允许 DELETE，且必须是单段。
+            (&Method::GET, "/api/v1/alerts/silences/12"),
+            (&Method::POST, "/api/v1/alerts/silences/12"),
+            (&Method::DELETE, "/api/v1/alerts/silences/"),
+            (&Method::DELETE, "/api/v1/alerts/silences/a/b"),
+            (&Method::GET, "/api/v1/alerts/events/1"),
         ] {
             assert_eq!(
                 required_scope(method, path),
