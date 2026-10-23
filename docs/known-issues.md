@@ -269,21 +269,18 @@
   插入迟到行”回归。查询/告警/归档功能不受影响。
 - **关联**：M4-A2 复审建议；v0.4.0 发布说明。
 
-### KI-30 SFTP 归档后端依赖审计阻塞（v0.4.0 已知）
+### KI-30 SFTP 归档后端依赖审计阻塞（v0.4.0 已修复）
 
-- **现象**：SFTP 所需的 `russh` 在 Rust 1.87+ 的 `Cargo.lock` 中仍带 optional
-  `rsa 0.10.0-rc.16`（RUSTSEC-2023-0071，medium 5.9）；实际未启用 `rsa` feature、
-  未编译，但 `cargo audit` 会扫描 lock。Rust 1.85 + 旧版 `russh` 另有 ctutils
-  高危，不能作为回退。
-- **影响**：v0.4.0 不提供 SFTP 后端；WebDAV/S3 不受影响。配置 `backend="sftp"`
-  会在启动/`archive test|run` 明确失败，不静默降级或改调外部 `sftp` 进程。
-- **修复方案（需维护者决策）**：
-  1. fork/vendor `russh` 删除 optional `rsa` 依赖（不是仅关闭 feature），保持
-     `cargo audit` 0；或
-  2. 明确接受该 medium advisory 并以文档/发布说明记录例外；或
-  3. 放弃 SFTP，仅保留 S3/WebDAV。
-- **关联**：`spikes/m4-deps-185/REPORT.md`、`spikes/m4-deps-187/REPORT.md`；
-  CHANGELOG `[Unreleased]` Security。
+- **原现象**：`russh` 的 optional `rsa 0.10.0-rc.16` 进入 Cargo.lock，
+  `cargo audit` 报 RUSTSEC-2023-0071（medium），即使未启用 `rsa` feature。
+- **修复（v0.4.0）**：`vendor/russh` + `vendor/ssh-key` 删除 optional `rsa`
+  feature/依赖（不是只关 feature），根 `[patch.crates-io]` 指向本地副本；
+  `cargo tree -i rsa` 无包、`cargo audit` 0。SFTP 使用 ring + ed25519，
+  不支持 RSA 用户密钥/仅 RSA 主机密钥的旧服务器。
+- **验证**：`cargo test --workspace`、`cargo audit`、`v040.sh`；真实 SFTP
+  服务器的手工密码/ed25519 连通测试仍待部署环境执行。
+- **关联**：`vendor/README.md`、CHANGELOG `[Unreleased]`；原 spike
+  `spikes/m4-deps-185`、`spikes/m4-deps-187`。
 
 ### KI-13 ~ KI-16 设计/部署限制（不修复）
 
