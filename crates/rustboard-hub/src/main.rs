@@ -2493,13 +2493,13 @@ async fn handle_session(
                     Err(_) => SessionEvent::WatchClosed,
                 }
             }
+            // 清理优先于新控制命令：持续就绪的控制队列不能把 pending 超时清理
+            // 推迟到方案承诺的 ≤2s 之外。shutdown 仍保持最高优先级。
+            _ = control_expire.tick() => SessionEvent::ControlExpired,
             command = control_rx.recv(), if watch_control => match command {
                 Some(command) => SessionEvent::Control(command),
                 None => SessionEvent::ControlClosed,
             },
-            // 放在 recv 前保证消息洪泛下也不会延迟 pending 清理：biased 模式按声明
-            // 顺序轮询，若排在 recv 之后，持续有入站消息时 timer 可能永远轮不到。
-            _ = control_expire.tick() => SessionEvent::ControlExpired,
             received = recv => match received {
                 Err(_) => SessionEvent::IdleTimeout,
                 Ok(None) => SessionEvent::Closed,
@@ -5951,7 +5951,7 @@ mod tests {
         );
     }
 
-    /// 评审严重回归：hub 的 WS 消息上限必须大于 agent 的控制应答预算，
+    /// 评审严重回归：hub 的 WS 单帧 / 单消息上限必须大于 agent 的控制应答预算，
     /// 避免未来常量漂移后合法应答在 hub 侧被拒绝并断开会话。
     #[test]
     fn v032_ws_message_limit_covers_control_response_budget() {
@@ -5959,6 +5959,10 @@ mod tests {
         assert!(
             MAX_WS_MESSAGE_SIZE > budget,
             "WS 消息上限 {MAX_WS_MESSAGE_SIZE} 必须大于控制应答预算 {budget}"
+        );
+        assert!(
+            MAX_WS_FRAME_SIZE > budget,
+            "WS 单帧上限 {MAX_WS_FRAME_SIZE} 必须大于控制应答预算 {budget}"
         );
     }
 

@@ -213,7 +213,7 @@ fn fit_response_budget(response: ControlResponse) -> ControlResponse {
                 limit = MAX_CONTROL_RESPONSE_BYTES,
                 "控制结果超过单帧预算，改为错误应答"
             );
-            ControlResponse::failure(id, ControlError::control_failed("控制结果过大，已丢弃"))
+            ControlResponse::failure(id, ControlError::result_too_large())
         }
         Err(err) => {
             // 编码失败同样不能 panic / 发半帧；回一个可解释的固定错误。
@@ -256,7 +256,8 @@ fn decode_control_probe(bytes: &[u8]) -> std::result::Result<u64, rmp_serde::dec
 mod tests {
     use super::*;
     use rustboard_common::control::{
-        codes, ControlError, KillSignal, LogSourceInfo, MAX_LOG_TARGET_BYTES, MAX_OUTPUT_BYTES,
+        codes, ControlError, KillSignal, LogSourceInfo, ProcessInfo, MAX_CMDLINE_BYTES,
+        MAX_LOG_TARGET_BYTES, MAX_NAME_LEN, MAX_OUTPUT_BYTES, MAX_PROCESS_ITEMS,
     };
     use rustboard_common::wire::Frame;
 
@@ -489,9 +490,9 @@ mod tests {
         assert!(fitted.result.is_none(), "超限结果必须被丢弃");
         let encoded_after = Frame::ControlResponse(fitted.clone()).encode().unwrap();
         let error = fitted.error.as_ref().expect("必须返回错误");
-        assert_eq!(error.code, codes::CONTROL_FAILED);
+        assert_eq!(error.code, codes::RESULT_TOO_LARGE);
         assert!(
-            error.message.contains("过大"),
+            error.message.contains("核对状态"),
             "错误信息: {}",
             error.message
         );
@@ -558,6 +559,32 @@ mod tests {
         validate_io(&cfg).expect("logs 关闭时不应做文件校验");
     }
 
+    /// Processes 最坏值：200 条 × 4096B cmdline 编码后仍在预算内，不得被改写。
+    #[test]
+    fn v032_processes_worst_case_pass_budget_unchanged() {
+        let processes: Vec<ProcessInfo> = (0..MAX_PROCESS_ITEMS)
+            .map(|index| ProcessInfo {
+                pid: index as u32 + 2,
+                name: "p".repeat(MAX_NAME_LEN),
+                cmdline: "c".repeat(MAX_CMDLINE_BYTES),
+                uid: 0,
+                rss_kb: 0,
+            })
+            .collect();
+        let response = ControlResponse::success(9, ControlResult::Processes(processes));
+        let encoded = Frame::ControlResponse(response.clone()).encode().unwrap();
+        assert!(
+            encoded.len() <= MAX_CONTROL_RESPONSE_BYTES,
+            "200 条 × 4096B cmdline 应仍在预算内，实际 {}",
+            encoded.len()
+        );
+        assert_eq!(
+            fit_response_budget(response.clone()),
+            response,
+            "预算内的 Processes 结果不得被改写"
+        );
+    }
+
     #[test]
     fn control_error_helpers_use_stable_codes() {
         assert_eq!(
@@ -577,5 +604,9 @@ mod tests {
             codes::CONTROL_FAILED
         );
         assert_eq!(ControlError::unsupported("x").code, codes::UNSUPPORTED);
+        assert_eq!(
+            ControlError::result_too_large().code,
+            codes::RESULT_TOO_LARGE
+        );
     }
 }

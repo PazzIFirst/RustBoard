@@ -754,6 +754,14 @@ fn reject_from_agent_error(error: &ControlError) -> Reject {
             message: "agent 正在续签证书，请稍后重试".to_string(),
             audit_result: AUDIT_ERROR,
         },
+        // 控制结果过大：动作可能已经执行，只是结果无法回传。必须给出专用错误码与
+        // 「请核对状态」文案，不能复用 control_failed（会误导为未执行而诱发重试）。
+        control_codes::RESULT_TOO_LARGE => Reject {
+            status: StatusCode::BAD_GATEWAY,
+            code: control_codes::RESULT_TOO_LARGE,
+            message: "控制结果过大，动作可能已执行，请核对状态".to_string(),
+            audit_result: AUDIT_ERROR,
+        },
         _ => Reject {
             status: StatusCode::BAD_GATEWAY,
             code: control_codes::CONTROL_FAILED,
@@ -1954,6 +1962,22 @@ mod tests {
         // 不能落到 502 / 504。
         assert_ne!(reject.status, StatusCode::BAD_GATEWAY);
         assert_ne!(reject.status, StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    /// 控制结果过大：动作可能已执行，必须映射为 502 + 专用错误码与固定文案，
+    /// 不能复用 control_failed / control_timeout（会误导为未执行而诱发重试）。
+    #[test]
+    fn result_too_large_maps_to_502_with_fixed_message() {
+        let error = ControlError::new(control_codes::RESULT_TOO_LARGE, "agent 侧详情不应被采用");
+        let reject = reject_from_agent_error(&error);
+        assert_eq!(reject.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(reject.code, control_codes::RESULT_TOO_LARGE);
+        assert_eq!(reject.code, "control_result_too_large");
+        assert_eq!(reject.message, "控制结果过大，动作可能已执行，请核对状态");
+        assert!(!reject.message.contains("详情"), "不得回显 agent 错误详情");
+        assert_eq!(reject.audit_result, AUDIT_ERROR);
+        assert_ne!(reject.code, control_codes::CONTROL_FAILED);
+        assert_ne!(reject.code, hub_codes::CONTROL_TIMEOUT);
     }
 
     #[test]
