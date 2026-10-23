@@ -2489,13 +2489,15 @@ async fn handle_session(
                 Some(command) => SessionEvent::Control(command),
                 None => SessionEvent::ControlClosed,
             },
+            // 放在 recv 前保证消息洪泛下也不会延迟 pending 清理：biased 模式按声明
+            // 顺序轮询，若排在 recv 之后，持续有入站消息时 timer 可能永远轮不到。
+            _ = control_expire.tick() => SessionEvent::ControlExpired,
             received = recv => match received {
                 Err(_) => SessionEvent::IdleTimeout,
                 Ok(None) => SessionEvent::Closed,
                 Ok(Some(Err(err))) => SessionEvent::RecvError(err.to_string()),
                 Ok(Some(Ok(message))) => SessionEvent::Message(message),
             },
-            _ = control_expire.tick() => SessionEvent::ControlExpired,
         };
 
         match event {
