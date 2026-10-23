@@ -1,6 +1,7 @@
 //! 采集器与本地缓冲、存储实现。
 
 pub mod alerts;
+pub mod archive;
 pub mod buffer;
 pub mod channels;
 pub mod collect;

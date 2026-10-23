@@ -21,6 +21,7 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 futures-util = "0.3"
 hex = "0.4"
 hmac = "0.12"

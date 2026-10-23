@@ -16,6 +16,7 @@ use crate::alerts::{
     AlertEvent, AlertRule, AlertRuleStoreError, AlertSilence, AlertSilenceStoreError, AlertSource,
     AlertState, AlertStateKind, Comparator, MAX_ALERT_RULES, MAX_ALERT_SILENCES,
 };
+use crate::archive::{ArchiveObject, ArchiveStatus, ArchiveStoreError};
 use crate::channels::{ChannelConfig, ChannelKind, NotificationChannel};
 
 use super::{
@@ -3564,6 +3565,247 @@ pub(crate) struct AggregateRowForTest {
     pub avg_value: f64,
     pub last_value: f64,
     pub count: i64,
+}
+
+// ---------------------------------------------------------------------------
+// M4-C1：归档对象与归档水位（schema v7 的 archive_objects / archive_state）
+// ---------------------------------------------------------------------------
+
+/// `archive_objects` 的 SELECT 列表；列下标与 [`row_to_archive_object`] 一一对应。
+const ARCHIVE_OBJECT_COLUMNS: &str = "id, backend, object_key, manifest_key, from_ts, to_ts, \
+     rows, bytes, sha256, status, error, created_at, uploaded_at, deleted_at";
+
+/// 数据库里出现非法状态 / 负数行数时产生的错误（不静默降级成默认值）。
+#[derive(Debug)]
+struct ArchiveObjectColumnError(&'static str);
+
+impl std::fmt::Display for ArchiveObjectColumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "archive_objects.{} 字段值非法", self.0)
+    }
+}
+
+impl std::error::Error for ArchiveObjectColumnError {}
+
+/// 把损坏的列值翻译成 rusqlite 错误，让上层拿到明确失败而不是被默认值掩盖。
+fn archive_object_column_error(column: usize, field: &'static str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        rusqlite::types::Type::Text,
+        Box::new(ArchiveObjectColumnError(field)),
+    )
+}
+
+/// 非负计数列必须能放进 `u64`；负数说明数据损坏，读取即失败。
+fn archive_count_from_row(value: i64, column: usize, field: &'static str) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|_| archive_object_column_error(column, field))
+}
+
+/// 一行 `archive_objects` 映射成 [`ArchiveObject`]。
+fn row_to_archive_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveObject> {
+    let status: String = row.get(9)?;
+    let rows: i64 = row.get(6)?;
+    let bytes: i64 = row.get(7)?;
+    Ok(ArchiveObject {
+        id: row.get(0)?,
+        backend: row.get(1)?,
+        object_key: row.get(2)?,
+        manifest_key: row.get(3)?,
+        from_ts: row.get(4)?,
+        to_ts: row.get(5)?,
+        rows: archive_count_from_row(rows, 6, "rows")?,
+        bytes: archive_count_from_row(bytes, 7, "bytes")?,
+        sha256: row.get(8)?,
+        status: ArchiveStatus::parse(&status)
+            .ok_or_else(|| archive_object_column_error(9, "status"))?,
+        error: row.get(10)?,
+        created_at: row.get(11)?,
+        uploaded_at: row.get(12)?,
+        deleted_at: row.get(13)?,
+    })
+}
+
+/// 把 `archive_objects.object_key` 的唯一约束冲突翻译成领域错误，不透传 SQL。
+fn map_archive_object_unique_error(err: rusqlite::Error) -> anyhow::Error {
+    if let rusqlite::Error::SqliteFailure(inner, Some(message)) = &err {
+        if inner.code == rusqlite::ErrorCode::ConstraintViolation
+            && message.contains("archive_objects.object_key")
+        {
+            return ArchiveStoreError::ObjectExists.into();
+        }
+    }
+    tracing::debug!(error = %err, "写入归档对象失败（非 object_key 唯一约束错误）");
+    anyhow::anyhow!("写入归档对象失败（数据库错误，详见日志）")
+}
+
+impl SqliteStorage {
+    /// 插入一条归档对象记录，返回数据库生成的自增 id。
+    ///
+    /// `object.id` 被忽略；`object_key` 有 UNIQUE 约束，重复插入返回
+    /// [`ArchiveStoreError::ObjectExists`]，不会覆盖已有记录。
+    pub fn insert_archive_object(&self, object: &ArchiveObject) -> Result<i64> {
+        let rows = i64::try_from(object.rows).context("归档对象行数超出 SQLite INTEGER 范围")?;
+        let bytes =
+            i64::try_from(object.bytes).context("归档对象字节数超出 SQLite INTEGER 范围")?;
+        let conn = self.lock_write();
+        let result = conn.execute(
+            "INSERT INTO archive_objects
+                (backend, object_key, manifest_key, from_ts, to_ts, rows, bytes, sha256,
+                 status, error, created_at, uploaded_at, deleted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                object.backend,
+                object.object_key,
+                object.manifest_key,
+                object.from_ts,
+                object.to_ts,
+                rows,
+                bytes,
+                object.sha256,
+                object.status.as_str(),
+                object.error,
+                object.created_at,
+                object.uploaded_at,
+                object.deleted_at,
+            ],
+        );
+        match result {
+            Ok(_) => Ok(conn.last_insert_rowid()),
+            Err(err) => Err(map_archive_object_unique_error(err)),
+        }
+    }
+
+    /// 按 id 读取归档对象；不存在返回 `None`。
+    pub fn get_archive_object(&self, id: i64) -> Result<Option<ArchiveObject>> {
+        let conn = self.lock_read();
+        let sql = format!("SELECT {ARCHIVE_OBJECT_COLUMNS} FROM archive_objects WHERE id = ?1");
+        Ok(conn
+            .query_row(&sql, params![id], row_to_archive_object)
+            .optional()?)
+    }
+
+    /// 按 `object_key` 读取归档对象；不存在返回 `None`。
+    ///
+    /// 上传前先查这个 key 可以避免重复 PUT 同一对象（方案 §7.2）。
+    pub fn find_archive_object_by_key(&self, object_key: &str) -> Result<Option<ArchiveObject>> {
+        let conn = self.lock_read();
+        let sql =
+            format!("SELECT {ARCHIVE_OBJECT_COLUMNS} FROM archive_objects WHERE object_key = ?1");
+        Ok(conn
+            .query_row(&sql, params![object_key], row_to_archive_object)
+            .optional()?)
+    }
+
+    /// 按 id 倒序分页列出归档对象，最多 `limit` 条；`before_id` 用于翻页。
+    ///
+    /// `limit == 0` 返回空列表；`before_id` 是上一页最后一条的 id（排他）。
+    pub fn list_archive_objects(
+        &self,
+        limit: usize,
+        before_id: Option<i64>,
+    ) -> Result<Vec<ArchiveObject>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.lock_read();
+        let sql = format!(
+            "SELECT {ARCHIVE_OBJECT_COLUMNS} FROM archive_objects \
+             WHERE (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![before_id, limit], row_to_archive_object)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 更新归档对象状态，并校验合法迁移。
+    ///
+    /// - 允许 `pending -> uploaded -> local_deleted`，以及 `pending` / `uploaded`
+    ///   -> `failed`；`failed` 可重试回 `pending` 或直接 `uploaded`；
+    /// - `local_deleted` 是终态，任何回退都返回
+    ///   [`ArchiveStoreError::InvalidTransition`]；
+    /// - `error` 按传入值覆盖（成功时调用方传空串）；
+    /// - `uploaded_at` / `deleted_at` 为 `None` 时保留原值，局部更新不会清空
+    ///   已有时间戳；
+    /// - id 不存在返回 [`ArchiveStoreError::NotFound`]。
+    pub fn update_archive_object_status(
+        &self,
+        id: i64,
+        status: ArchiveStatus,
+        error: &str,
+        uploaded_at: Option<i64>,
+        deleted_at: Option<i64>,
+    ) -> Result<()> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT status FROM archive_objects WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let current = match current {
+            Some(value) => ArchiveStatus::parse(&value)
+                .ok_or_else(|| anyhow::anyhow!("archive_objects.status 字段值非法"))?,
+            None => return Err(ArchiveStoreError::NotFound.into()),
+        };
+        if !current.can_transition_to(status) {
+            return Err(ArchiveStoreError::InvalidTransition.into());
+        }
+        tx.execute(
+            "UPDATE archive_objects SET status = ?2, error = ?3, \
+             uploaded_at = COALESCE(?4, uploaded_at), \
+             deleted_at = COALESCE(?5, deleted_at) WHERE id = ?1",
+            params![id, status.as_str(), error, uploaded_at, deleted_at],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 读取归档水位；键不存在返回 `None`。
+    pub fn get_archive_state(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.lock_read();
+        Ok(conn
+            .query_row(
+                "SELECT value FROM archive_state WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// 写入 / 更新归档水位（UPSERT）；`updated_at` 由调用方提供。
+    pub fn set_archive_state(&self, key: &str, value: &str, updated_at: i64) -> Result<()> {
+        self.lock_write().execute(
+            "INSERT INTO archive_state (key, value, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value,
+                 updated_at = excluded.updated_at",
+            params![key, value, updated_at],
+        )?;
+        Ok(())
+    }
+
+    /// 列出时间范围与 `[from_ts, to_ts]` 有交集的归档对象。
+    ///
+    /// 交集判定为 `from_ts <= to_ts（查询上界）` 且 `to_ts >= from_ts（查询下界）`，
+    /// 两端都包含；结果按 `from_ts, id` 升序，供下载 / 清理按对象顺序处理。
+    pub fn list_archive_objects_in_range(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+    ) -> Result<Vec<ArchiveObject>> {
+        let conn = self.lock_read();
+        let sql = format!(
+            "SELECT {ARCHIVE_OBJECT_COLUMNS} FROM archive_objects \
+             WHERE from_ts <= ?2 AND to_ts >= ?1 ORDER BY from_ts ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![from_ts, to_ts], row_to_archive_object)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
 }
 
 /// 按字节截断 UTF-8 字符串，保证不会切出半个字符。

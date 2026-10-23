@@ -1,5 +1,7 @@
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fmt;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -590,6 +592,497 @@ impl HubAlertsConfig {
     }
 }
 
+/// 归档后端类型。对应 `archive.backend`，字符串稳定为 `webdav` / `s3` / `sftp`。
+///
+/// 该字符串同时写入 `archive_objects.backend` 与 API 响应，不能随意改名。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArchiveBackend {
+    /// WebDAV（C1b 实现）。
+    #[default]
+    Webdav,
+    /// S3 / MinIO（C2）。
+    S3,
+    /// SFTP（C3）。
+    Sftp,
+}
+
+impl ArchiveBackend {
+    /// 稳定字符串表示。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Webdav => "webdav",
+            Self::S3 => "s3",
+            Self::Sftp => "sftp",
+        }
+    }
+}
+
+/// hub 端冷归档配置。对应 `hub.toml` 的 `[archive]`。
+///
+/// 全部字段有默认值：旧配置（完全没有 `[archive]`）可直接启动，归档默认关闭。
+///
+/// 安全约定：
+/// - 后端 secret 只存在 `hub.toml`（0600），不会进入数据库 / API / 面板；
+/// - [`ArchiveConfig`] 与各后端配置的 `Debug` 均为自定义实现，secret 统一输出
+///   `<redacted>`，不会随日志或错误信息泄露；
+/// - 对象 key 只由配置里的 `prefix` + UTC 日期 + 分片生成，不接受外部输入。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArchiveConfig {
+    /// 归档总开关。关闭时不执行任何归档任务，其它字段仍做范围校验。
+    pub enabled: bool,
+    /// 后端类型；`enabled = true` 时必须配置对应后端段。
+    pub backend: ArchiveBackend,
+    /// raw 数据至少保留多少天才允许归档，1–365；不得大于 `retention_raw_days`
+    ///（后者为 0 表示 raw 永不自动删除，不受该约束）。
+    pub after_days: u32,
+    /// 每天执行归档任务的 UTC 小时（0–23）。
+    pub schedule_hour_utc: u8,
+    /// 单个归档对象压缩后的字节上限，1 MiB–1 GiB。
+    pub max_object_bytes: u64,
+    /// 对象 key 前缀，只允许 `[A-Za-z0-9._-]`、非空、≤64 字节且不含 `..`。
+    pub prefix: String,
+    /// WebDAV 后端配置；仅在 `backend = "webdav"` 且 `enabled = true` 时必填。
+    pub webdav: Option<ArchiveWebdavConfig>,
+    /// S3 / MinIO 后端配置；仅在 `backend = "s3"` 且 `enabled = true` 时必填。
+    pub s3: Option<ArchiveS3Config>,
+    /// SFTP 后端配置；仅在 `backend = "sftp"` 且 `enabled = true` 时必填。
+    pub sftp: Option<ArchiveSftpConfig>,
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: ArchiveBackend::Webdav,
+            after_days: 7,
+            schedule_hour_utc: 3,
+            max_object_bytes: 33_554_432,
+            prefix: "rustboard".to_string(),
+            webdav: None,
+            s3: None,
+            sftp: None,
+        }
+    }
+}
+
+impl fmt::Debug for ArchiveConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArchiveConfig")
+            .field("enabled", &self.enabled)
+            .field("backend", &self.backend)
+            .field("after_days", &self.after_days)
+            .field("schedule_hour_utc", &self.schedule_hour_utc)
+            .field("max_object_bytes", &self.max_object_bytes)
+            .field("prefix", &self.prefix)
+            .field("webdav", &self.webdav)
+            .field("s3", &self.s3)
+            .field("sftp", &self.sftp)
+            .finish()
+    }
+}
+
+impl ArchiveConfig {
+    /// 配置自洽性校验；不依赖 `HubConfig` 的其它字段。
+    ///
+    /// 即使 `enabled = false` 也校验取值范围与 prefix：配置写错应在启动时暴露，
+    /// 而不是等管理员打开归档开关后才失败。后端连通性不在这里测试（避免启动
+    /// 阻塞），由 `archive test` / 面板显式触发。
+    pub fn validate(&self) -> Result<()> {
+        if !(MIN_ARCHIVE_AFTER_DAYS..=MAX_ARCHIVE_AFTER_DAYS).contains(&self.after_days) {
+            return Err(Error::InvalidConfig(format!(
+                "archive.after_days 必须在 {MIN_ARCHIVE_AFTER_DAYS}–\
+                 {MAX_ARCHIVE_AFTER_DAYS} 天之间，实际 {}",
+                self.after_days
+            )));
+        }
+        if self.schedule_hour_utc > MAX_ARCHIVE_SCHEDULE_HOUR_UTC {
+            return Err(Error::InvalidConfig(format!(
+                "archive.schedule_hour_utc 必须在 0–{MAX_ARCHIVE_SCHEDULE_HOUR_UTC} 之间，实际 {}",
+                self.schedule_hour_utc
+            )));
+        }
+        if !(MIN_ARCHIVE_OBJECT_BYTES..=MAX_ARCHIVE_OBJECT_BYTES).contains(&self.max_object_bytes) {
+            return Err(Error::InvalidConfig(format!(
+                "archive.max_object_bytes 必须在 {MIN_ARCHIVE_OBJECT_BYTES}–\
+                 {MAX_ARCHIVE_OBJECT_BYTES} 字节之间，实际 {}",
+                self.max_object_bytes
+            )));
+        }
+        validate_archive_prefix(&self.prefix)?;
+
+        if !self.enabled {
+            return Ok(());
+        }
+        match self.backend {
+            ArchiveBackend::Webdav => self
+                .webdav
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "archive.enabled = true 但缺少 [archive.webdav] 配置".into(),
+                    )
+                })?
+                .validate(),
+            ArchiveBackend::S3 => self
+                .s3
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::InvalidConfig("archive.enabled = true 但缺少 [archive.s3] 配置".into())
+                })?
+                .validate(),
+            ArchiveBackend::Sftp => self
+                .sftp
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::InvalidConfig("archive.enabled = true 但缺少 [archive.sftp] 配置".into())
+                })?
+                .validate(),
+        }
+    }
+
+    /// 校验 `after_days` 与 raw 保留期的关系。
+    ///
+    /// `retention_raw_days = 0` 表示 raw 永不自动删除，此时不存在「还没归档就被
+    /// 保留期删掉」的风险，不做上限约束；非 0 时必须 `after_days <= retention_raw_days`。
+    pub fn validate_against_retention(&self, retention_raw_days: u32) -> Result<()> {
+        self.validate()?;
+        if retention_raw_days != 0 && self.after_days > retention_raw_days {
+            return Err(Error::InvalidConfig(format!(
+                "archive.after_days（{}）不能大于 retention_raw_days（{}）：\
+                 否则 raw 会在归档前被保留期删除；请调大 retention_raw_days 或调小 after_days",
+                self.after_days, retention_raw_days
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// WebDAV 后端配置。对应 `[archive.webdav]`。
+///
+/// `password` 只参与 Basic auth；`Debug` 输出 `<redacted>`。
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArchiveWebdavConfig {
+    /// 目录 URL；只允许 `http://` / `https://`。
+    pub url: String,
+    pub username: String,
+    /// Basic auth 密码；Debug 恒为 `<redacted>`。
+    pub password: String,
+}
+
+impl fmt::Debug for ArchiveWebdavConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArchiveWebdavConfig")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ArchiveWebdavConfig {
+    pub fn validate(&self) -> Result<()> {
+        validate_archive_http_url("archive.webdav.url", &self.url)?;
+        validate_archive_required_text("archive.webdav.username", &self.username, 1_024)?;
+        validate_archive_required_text("archive.webdav.password", &self.password, 4_096)?;
+        Ok(())
+    }
+}
+
+/// S3 / MinIO 后端配置。对应 `[archive.s3]`。
+///
+/// `access_key_id` 与 `secret_access_key` 的 `Debug` 均为 `<redacted>`。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArchiveS3Config {
+    pub bucket: String,
+    pub region: String,
+    /// 留空表示 AWS；兼容 MinIO 时填写自有 endpoint。
+    pub endpoint: String,
+    pub access_key_id: String,
+    /// 签名密钥；Debug 恒为 `<redacted>`。
+    pub secret_access_key: String,
+    /// MinIO 等自建服务通常需要 path-style 寻址。
+    pub path_style: bool,
+}
+
+impl Default for ArchiveS3Config {
+    fn default() -> Self {
+        Self {
+            bucket: String::new(),
+            region: String::new(),
+            endpoint: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            path_style: true,
+        }
+    }
+}
+
+impl fmt::Debug for ArchiveS3Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArchiveS3Config")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &"<redacted>")
+            .field("secret_access_key", &"<redacted>")
+            .field("path_style", &self.path_style)
+            .finish()
+    }
+}
+
+impl ArchiveS3Config {
+    pub fn validate(&self) -> Result<()> {
+        validate_archive_required_text("archive.s3.bucket", &self.bucket, 255)?;
+        if self.bucket.contains('/') || self.bucket.contains("..") {
+            return Err(Error::InvalidConfig(
+                "archive.s3.bucket 不能包含 '/' 或 '..'".into(),
+            ));
+        }
+        validate_archive_required_text("archive.s3.region", &self.region, 64)?;
+        if !self.endpoint.is_empty() {
+            validate_archive_http_url("archive.s3.endpoint", &self.endpoint)?;
+        }
+        validate_archive_required_text("archive.s3.access_key_id", &self.access_key_id, 1_024)?;
+        validate_archive_required_text(
+            "archive.s3.secret_access_key",
+            &self.secret_access_key,
+            4_096,
+        )?;
+        Ok(())
+    }
+}
+
+/// SFTP 后端配置。对应 `[archive.sftp]`。
+///
+/// `password` 与 `private_key_path` 的 `Debug` 均为 `<redacted>`；
+/// `host_key_fingerprint` 是公钥指纹（非 secret），用于防中间人，必须显式配置。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArchiveSftpConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    /// 密码认证；与 `private_key_path` 至少填写一个。
+    pub password: String,
+    /// 私钥文件路径；Debug 恒为 `<redacted>`。
+    pub private_key_path: String,
+    /// 远端目录，必须是绝对路径。
+    pub remote_dir: String,
+    /// 服务器主机公钥的 SHA256 指纹（`SHA256:<base64>`，可带一个末尾 `=`）。
+    pub host_key_fingerprint: String,
+}
+
+impl Default for ArchiveSftpConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: 22,
+            username: String::new(),
+            password: String::new(),
+            private_key_path: String::new(),
+            remote_dir: String::new(),
+            host_key_fingerprint: String::new(),
+        }
+    }
+}
+
+impl fmt::Debug for ArchiveSftpConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArchiveSftpConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("private_key_path", &"<redacted>")
+            .field("remote_dir", &self.remote_dir)
+            .field("host_key_fingerprint", &self.host_key_fingerprint)
+            .finish()
+    }
+}
+
+impl ArchiveSftpConfig {
+    pub fn validate(&self) -> Result<()> {
+        validate_archive_required_text("archive.sftp.host", &self.host, 255)?;
+        if self
+            .host
+            .chars()
+            .any(|c| c.is_whitespace() || c == '/' || c == '\\')
+        {
+            return Err(Error::InvalidConfig(
+                "archive.sftp.host 不能包含空白或路径分隔符".into(),
+            ));
+        }
+        if self.port == 0 {
+            return Err(Error::InvalidConfig(
+                "archive.sftp.port 必须在 1–65535 之间".into(),
+            ));
+        }
+        validate_archive_required_text("archive.sftp.username", &self.username, 255)?;
+        if self.password.is_empty() && self.private_key_path.is_empty() {
+            return Err(Error::InvalidConfig(
+                "archive.sftp 必须配置 password 或 private_key_path 之一".into(),
+            ));
+        }
+        if !self.password.is_empty() {
+            validate_archive_required_text("archive.sftp.password", &self.password, 4_096)?;
+        }
+        if !self.private_key_path.is_empty() {
+            validate_archive_required_text(
+                "archive.sftp.private_key_path",
+                &self.private_key_path,
+                4_096,
+            )?;
+        }
+        validate_archive_remote_dir(&self.remote_dir)?;
+        validate_archive_host_key_fingerprint(&self.host_key_fingerprint)?;
+        Ok(())
+    }
+}
+
+/// 归档 prefix：`[A-Za-z0-9._-]`、非空、≤64 字节、不含 `..`。
+fn validate_archive_prefix(prefix: &str) -> Result<()> {
+    if prefix.is_empty() {
+        return Err(Error::InvalidConfig("archive.prefix 不能为空".into()));
+    }
+    if prefix.len() > MAX_ARCHIVE_PREFIX_BYTES {
+        return Err(Error::InvalidConfig(format!(
+            "archive.prefix 不能超过 {MAX_ARCHIVE_PREFIX_BYTES} 字节，实际 {}",
+            prefix.len()
+        )));
+    }
+    if prefix.contains("..") {
+        return Err(Error::InvalidConfig(
+            "archive.prefix 不能包含 \"..\"（防止路径穿越）".into(),
+        ));
+    }
+    if !prefix
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(Error::InvalidConfig(
+            "archive.prefix 只允许 [A-Za-z0-9._-]".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// 非空文本字段的通用校验：非空、≤`max_bytes`、不含控制字符。
+fn validate_archive_required_text(field: &str, value: &str, max_bytes: usize) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::InvalidConfig(format!("{field} 不能为空")));
+    }
+    if value.len() > max_bytes {
+        return Err(Error::InvalidConfig(format!(
+            "{field} 不能超过 {max_bytes} 字节，实际 {}",
+            value.len()
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(Error::InvalidConfig(format!("{field} 不能包含控制字符")));
+    }
+    Ok(())
+}
+
+/// WebDAV URL / S3 endpoint 只允许 `http` / `https`，且必须有主机名。
+fn validate_archive_http_url(field: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::InvalidConfig(format!("{field} 不能为空")));
+    }
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(Error::InvalidConfig(format!(
+            "{field} 不能包含空白或控制字符"
+        )));
+    }
+    let rest = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "{field} 必须以 http:// 或 https:// 开头，实际 {value:?}"
+            ))
+        })?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err(Error::InvalidConfig(format!("{field} 缺少主机名")));
+    }
+    Ok(())
+}
+
+/// SFTP 远端目录：绝对路径、不含 `..` 段、不含控制字符。
+fn validate_archive_remote_dir(remote_dir: &str) -> Result<()> {
+    if remote_dir.is_empty() {
+        return Err(Error::InvalidConfig(
+            "archive.sftp.remote_dir 不能为空".into(),
+        ));
+    }
+    if remote_dir.len() > 1_024 {
+        return Err(Error::InvalidConfig(
+            "archive.sftp.remote_dir 不能超过 1024 字节".into(),
+        ));
+    }
+    if !remote_dir.starts_with('/') {
+        return Err(Error::InvalidConfig(
+            "archive.sftp.remote_dir 必须是绝对路径".into(),
+        ));
+    }
+    if remote_dir.chars().any(char::is_control) {
+        return Err(Error::InvalidConfig(
+            "archive.sftp.remote_dir 不能包含控制字符".into(),
+        ));
+    }
+    if remote_dir.split('/').any(|segment| segment == "..") {
+        return Err(Error::InvalidConfig(
+            "archive.sftp.remote_dir 不能包含 \"..\" 段（防止路径穿越）".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// SSH 主机公钥指纹：`SHA256:<43/44 base64>`，解码后必须是 32 字节。
+///
+/// 43 字符是去掉末尾 `=` 的标准 base64；44 字符必须恰好以一个 `=` 结尾。
+fn validate_archive_host_key_fingerprint(fingerprint: &str) -> Result<()> {
+    const FIELD: &str = "archive.sftp.host_key_fingerprint";
+    let rest = fingerprint.strip_prefix("SHA256:").ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "{FIELD} 必须以 SHA256: 开头（例如 SHA256:<base64>），拒绝空值或任意主机密钥"
+        ))
+    })?;
+    if rest.is_empty() {
+        return Err(Error::InvalidConfig(format!("{FIELD} 不能为空")));
+    }
+    let padded = match rest.len() {
+        43 => format!("{rest}="),
+        44 if rest.ends_with('=') => rest.to_string(),
+        _ => {
+            return Err(Error::InvalidConfig(format!(
+                "{FIELD} 必须是 SHA256: 加 43 或 44 个 base64 字符（44 时末尾为 '='），实际 {:?}",
+                fingerprint
+            )));
+        }
+    };
+    if !rest
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+    {
+        return Err(Error::InvalidConfig(format!("{FIELD} 含非 base64 字符")));
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(padded)
+        .map_err(|_| Error::InvalidConfig(format!("{FIELD} 不是合法的 base64")))?;
+    if decoded.len() != 32 {
+        return Err(Error::InvalidConfig(format!(
+            "{FIELD} 解码后必须是 32 字节的 SHA-256 摘要，实际 {} 字节",
+            decoded.len()
+        )));
+    }
+    Ok(())
+}
+
 /// hub 端配置。对应 `/etc/rustboard/hub.toml`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -675,6 +1168,9 @@ pub struct HubConfig {
     /// M4 告警配置；旧配置缺 `[alerts]` 时使用默认值。
     #[serde(default)]
     pub alerts: HubAlertsConfig,
+    /// M4 冷归档配置；旧配置缺 `[archive]` 时使用默认值（归档关闭）。
+    #[serde(default)]
+    pub archive: ArchiveConfig,
 }
 
 /// agent 接入层默认的最大并发连接数。
@@ -740,6 +1236,7 @@ impl Default for HubConfig {
             cert_check_interval_secs: default_cert_check_interval_secs(),
             control: HubControlConfig::default(),
             alerts: HubAlertsConfig::default(),
+            archive: ArchiveConfig::default(),
         }
     }
 }
@@ -839,6 +1336,8 @@ impl HubConfig {
         self.validate_maintenance_interval()?;
         self.control.validate()?;
         self.alerts.validate()?;
+        self.archive
+            .validate_against_retention(self.retention_raw_days)?;
         Ok(())
     }
 
@@ -1117,6 +1616,14 @@ const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 60;
 fn default_maintenance_interval_secs() -> u64 {
     DEFAULT_MAINTENANCE_INTERVAL_SECS
 }
+
+/// M4 归档配置的取值范围（与方案 §7.1 一致）。
+const MIN_ARCHIVE_AFTER_DAYS: u32 = 1;
+const MAX_ARCHIVE_AFTER_DAYS: u32 = 365;
+const MAX_ARCHIVE_SCHEDULE_HOUR_UTC: u8 = 23;
+const MIN_ARCHIVE_OBJECT_BYTES: u64 = 1_048_576;
+const MAX_ARCHIVE_OBJECT_BYTES: u64 = 1_073_741_824;
+const MAX_ARCHIVE_PREFIX_BYTES: usize = 64;
 
 /// M4 告警配置的各字段允许范围（与方案 §8.2 一致）。
 const MIN_ALERTS_EVALUATION_INTERVAL_SECS: u64 = 1;
@@ -2374,5 +2881,306 @@ name = ""
         }
         .validate()
         .expect("hub 控制面边界值必须合法");
+    }
+
+    /// M4-C1a：`[archive]` 缺省值、旧配置兼容、字段边界与 after_days 关系。
+    #[test]
+    fn m4c1_archive_defaults_legacy_toml_and_bounds() {
+        // 旧配置完全没有 `[archive]`：默认关闭，行为与显式默认值一致。
+        let hub: HubConfig = toml::from_str("").unwrap();
+        assert_eq!(hub.archive, ArchiveConfig::default());
+        assert!(!hub.archive.enabled);
+        assert_eq!(hub.archive.backend, ArchiveBackend::Webdav);
+        assert_eq!(hub.archive.backend.as_str(), "webdav");
+        assert_eq!(ArchiveBackend::S3.as_str(), "s3");
+        assert_eq!(ArchiveBackend::Sftp.as_str(), "sftp");
+        assert_eq!(hub.archive.after_days, 7);
+        assert_eq!(hub.archive.schedule_hour_utc, 3);
+        assert_eq!(hub.archive.max_object_bytes, 33_554_432);
+        assert_eq!(hub.archive.prefix, "rustboard");
+        assert!(hub.archive.webdav.is_none());
+        assert!(hub.archive.s3.is_none());
+        assert!(hub.archive.sftp.is_none());
+        hub.validate().expect("旧配置缺 [archive] 必须合法");
+
+        // 只写部分字段：其余保持默认，后端类型字符串稳定。
+        let hub: HubConfig =
+            toml::from_str("[archive]\nbackend = \"s3\"\nafter_days = 3\nprefix = \"rb-01\"\n")
+                .unwrap();
+        assert_eq!(hub.archive.backend, ArchiveBackend::S3);
+        assert_eq!(hub.archive.after_days, 3);
+        assert_eq!(hub.archive.prefix, "rb-01");
+        assert_eq!(hub.archive.schedule_hour_utc, 3);
+        hub.validate().expect("关闭归档时只写部分字段必须合法");
+
+        // after_days / schedule_hour_utc / max_object_bytes 的上下边界。
+        for (line, ok) in [
+            ("after_days = 1", true),
+            ("after_days = 365", true),
+            ("after_days = 0", false),
+            ("after_days = 366", false),
+            ("schedule_hour_utc = 0", true),
+            ("schedule_hour_utc = 23", true),
+            ("schedule_hour_utc = 24", false),
+            ("max_object_bytes = 1048576", true),
+            ("max_object_bytes = 1073741824", true),
+            ("max_object_bytes = 1048575", false),
+            ("max_object_bytes = 1073741825", false),
+        ] {
+            let hub: HubConfig =
+                toml::from_str(&format!("[archive]\n{line}\n")).expect("TOML 必须可解析");
+            // after_days 的上限与默认 raw 保留期（7 天）无关，这里只测字段范围。
+            let result = hub.archive.validate();
+            assert_eq!(
+                result.is_ok(),
+                ok,
+                "{line} 的校验结果不符合预期: {result:?}"
+            );
+        }
+
+        // prefix：仅 [A-Za-z0-9._-]、非空、≤64、不含 ".."。
+        for (prefix, ok) in [
+            ("rustboard", true),
+            ("a", true),
+            ("A-1_2.3", true),
+            (&"a".repeat(64), true),
+            (&"a".repeat(65), false),
+            ("", false),
+            ("bad/prefix", false),
+            ("bad prefix", false),
+            ("../evil", false),
+            ("rustboard..", false),
+            ("中文", false),
+        ] {
+            let hub = HubConfig {
+                archive: ArchiveConfig {
+                    prefix: prefix.to_string(),
+                    ..ArchiveConfig::default()
+                },
+                ..HubConfig::default()
+            };
+            let result = hub.archive.validate();
+            assert_eq!(result.is_ok(), ok, "prefix {prefix:?} 的校验结果不符合预期");
+        }
+
+        // after_days 必须 <= retention_raw_days；retention_raw_days=0 不受约束。
+        let hub: HubConfig =
+            toml::from_str("retention_raw_days = 3\n[archive]\nafter_days = 4\n").unwrap();
+        let err = hub
+            .validate()
+            .expect_err("after_days > retention_raw_days 必须拒绝");
+        let err = err.to_string();
+        assert!(
+            err.contains("archive.after_days"),
+            "错误必须点名字段: {err}"
+        );
+        assert!(
+            err.contains("retention_raw_days"),
+            "错误必须说明与保留期的关系: {err}"
+        );
+
+        let hub: HubConfig =
+            toml::from_str("retention_raw_days = 3\n[archive]\nafter_days = 3\n").unwrap();
+        hub.validate()
+            .expect("after_days == retention_raw_days 必须合法");
+
+        let hub: HubConfig =
+            toml::from_str("retention_raw_days = 0\n[archive]\nafter_days = 365\n").unwrap();
+        hub.validate()
+            .expect("retention_raw_days=0（永不删除）时 after_days 只受 365 上限约束");
+    }
+
+    /// M4-C1a：enabled 时对应后端必填，URL scheme / 端口 / 指纹格式严格校验。
+    #[test]
+    fn m4c1_archive_enabled_requires_valid_backend() {
+        const GOOD_FP: &str = "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+
+        // 缺少所选后端配置。
+        for (backend, needle) in [
+            ("webdav", "[archive.webdav]"),
+            ("s3", "[archive.s3]"),
+            ("sftp", "[archive.sftp]"),
+        ] {
+            let hub: HubConfig = toml::from_str(&format!(
+                "[archive]\nenabled = true\nbackend = \"{backend}\"\n"
+            ))
+            .unwrap();
+            let err = hub
+                .validate()
+                .expect_err("缺少后端配置必须拒绝")
+                .to_string();
+            assert!(err.contains(needle), "错误必须点名 {needle}: {err}");
+        }
+
+        // WebDAV：合法配置通过；非 http(s) URL、空用户名/密码拒绝。
+        let webdav_toml = "[archive]\nenabled = true\nbackend = \"webdav\"\n\
+             [archive.webdav]\nurl = \"https://dav.example.com/rustboard\"\n\
+             username = \"ops\"\npassword = \"secret\"\n";
+        let hub: HubConfig = toml::from_str(webdav_toml).unwrap();
+        hub.validate().expect("合法 WebDAV 配置必须通过");
+
+        for (toml, needle) in [
+            (
+                "[archive]\nenabled = true\nbackend = \"webdav\"\n\
+                 [archive.webdav]\nurl = \"ftp://dav.example.com\"\n\
+                 username = \"ops\"\npassword = \"secret\"\n"
+                    .to_string(),
+                "archive.webdav.url",
+            ),
+            (
+                "[archive]\nenabled = true\nbackend = \"webdav\"\n\
+                 [archive.webdav]\nurl = \"https://\"\n\
+                 username = \"ops\"\npassword = \"secret\"\n"
+                    .to_string(),
+                "archive.webdav.url",
+            ),
+            (
+                "[archive]\nenabled = true\nbackend = \"webdav\"\n\
+                 [archive.webdav]\nurl = \"https://dav.example.com\"\n\
+                 username = \"\"\npassword = \"secret\"\n"
+                    .to_string(),
+                "archive.webdav.username",
+            ),
+            (
+                "[archive]\nenabled = true\nbackend = \"webdav\"\n\
+                 [archive.webdav]\nurl = \"https://dav.example.com\"\n\
+                 username = \"ops\"\npassword = \"\"\n"
+                    .to_string(),
+                "archive.webdav.password",
+            ),
+        ] {
+            let hub: HubConfig = toml::from_str(&toml).unwrap();
+            let err = hub
+                .validate()
+                .expect_err("非法 WebDAV 配置必须拒绝")
+                .to_string();
+            assert!(err.contains(needle), "错误必须点名 {needle}: {err}");
+        }
+
+        // S3：合法配置；endpoint 必须是 http(s)。
+        let hub: HubConfig = toml::from_str(
+            "[archive]\nenabled = true\nbackend = \"s3\"\n\
+             [archive.s3]\nbucket = \"rustboard-archive\"\nregion = \"us-east-1\"\n\
+             access_key_id = \"access\"\nsecret_access_key = \"secret\"\npath_style = true\n",
+        )
+        .unwrap();
+        hub.validate().expect("合法 S3 配置必须通过");
+
+        let hub: HubConfig = toml::from_str(
+            "[archive]\nenabled = true\nbackend = \"s3\"\n\
+             [archive.s3]\nbucket = \"rustboard-archive\"\nregion = \"us-east-1\"\n\
+             endpoint = \"ftp://minio.example.com\"\n\
+             access_key_id = \"access\"\nsecret_access_key = \"secret\"\n",
+        )
+        .unwrap();
+        let err = hub.validate().expect_err("非 http(s) endpoint 必须拒绝");
+        assert!(err.to_string().contains("archive.s3.endpoint"));
+
+        // SFTP：合法配置（私钥认证 + 44 字符指纹）；43 字符无填充指纹也合法。
+        let sftp_prefix = "[archive]\nenabled = true\nbackend = \"sftp\"\n[archive.sftp]\n\
+                            host = \"sftp.example.com\"\nusername = \"ops\"\n";
+        let hub: HubConfig = toml::from_str(&format!(
+            "{sftp_prefix}private_key_path = \"/etc/rustboard/id_ed25519\"\n\
+             remote_dir = \"/backup/rustboard\"\nhost_key_fingerprint = \"{GOOD_FP}\"\n"
+        ))
+        .unwrap();
+        hub.validate().expect("合法 SFTP 配置必须通过");
+
+        let hub: HubConfig = toml::from_str(&format!(
+            "{sftp_prefix}password = \"secret\"\nremote_dir = \"/backup\"\n\
+             host_key_fingerprint = \"{}\"\n",
+            GOOD_FP.trim_end_matches('=')
+        ))
+        .unwrap();
+        hub.validate().expect("43 字符无填充指纹必须合法");
+
+        for (extra, needle) in [
+            (
+                "password = \"secret\"\nremote_dir = \"/backup\"\nhost_key_fingerprint = \"\"\n",
+                "host_key_fingerprint",
+            ),
+            (
+                "password = \"secret\"\nremote_dir = \"/backup\"\n\
+                 host_key_fingerprint = \"MD5:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"\n",
+                "host_key_fingerprint",
+            ),
+            (
+                "password = \"secret\"\nremote_dir = \"/backup\"\n\
+                 host_key_fingerprint = \"SHA256:too-short\"\n",
+                "host_key_fingerprint",
+            ),
+            (
+                "password = \"secret\"\nremote_dir = \"backup\"\n\
+                 host_key_fingerprint = \"SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"\n",
+                "remote_dir",
+            ),
+            (
+                "password = \"secret\"\nremote_dir = \"/backup/../etc\"\n\
+                 host_key_fingerprint = \"SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"\n",
+                "remote_dir",
+            ),
+            (
+                "remote_dir = \"/backup\"\n\
+                 host_key_fingerprint = \"SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"\n",
+                "password",
+            ),
+            (
+                "port = 0\npassword = \"secret\"\nremote_dir = \"/backup\"\n\
+                 host_key_fingerprint = \"SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"\n",
+                "port",
+            ),
+        ] {
+            let hub: HubConfig = toml::from_str(&format!("{sftp_prefix}{extra}")).unwrap();
+            let err = hub
+                .validate()
+                .expect_err("非法 SFTP 配置必须拒绝")
+                .to_string();
+            assert!(err.contains(needle), "错误必须点名 {needle}: {err}");
+        }
+    }
+
+    /// M4-C1a：配置 Debug 不得打印 password / secret / key / 私钥路径。
+    #[test]
+    fn m4c1_archive_debug_redacts_secrets() {
+        let hub: HubConfig = toml::from_str(
+            "[archive]\nenabled = true\nbackend = \"webdav\"\nprefix = \"rb\"\n\
+             [archive.webdav]\nurl = \"https://dav.example.com/rb\"\n\
+             username = \"ops\"\npassword = \"webdav-password-plaintext\"\n\
+             [archive.s3]\nbucket = \"bucket\"\nregion = \"us-east-1\"\n\
+             access_key_id = \"AKIA-PLAINTEXT-ACCESS\"\n\
+             secret_access_key = \"s3-secret-key-plaintext\"\n\
+             [archive.sftp]\nhost = \"sftp.example.com\"\nusername = \"ops\"\n\
+             private_key_path = \"/etc/rustboard/private-ed25519\"\n\
+             remote_dir = \"/backup\"\n\
+             host_key_fingerprint = \"SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"\n",
+        )
+        .unwrap();
+        hub.validate().expect("用于 Debug 测试的配置本身必须合法");
+
+        let debug = format!("{hub:?}");
+        for secret in [
+            "webdav-password-plaintext",
+            "AKIA-PLAINTEXT-ACCESS",
+            "s3-secret-key-plaintext",
+            "/etc/rustboard/private-ed25519",
+        ] {
+            assert!(
+                !debug.contains(secret),
+                "HubConfig Debug 不得包含 {secret}: {debug}"
+            );
+        }
+        assert!(
+            debug.matches("<redacted>").count() >= 4,
+            "所有 secret 字段都必须标记 <redacted>: {debug}"
+        );
+
+        // 直接 Debug 单个后端结构也不能泄露。
+        let s3_debug = format!("{:?}", hub.archive.s3.as_ref().unwrap());
+        assert!(!s3_debug.contains("AKIA-PLAINTEXT-ACCESS"));
+        assert!(!s3_debug.contains("s3-secret-key-plaintext"));
+        let sftp_debug = format!("{:?}", hub.archive.sftp.as_ref().unwrap());
+        assert!(!sftp_debug.contains("/etc/rustboard/private-ed25519"));
+        let webdav_debug = format!("{:?}", hub.archive.webdav.as_ref().unwrap());
+        assert!(!webdav_debug.contains("webdav-password-plaintext"));
     }
 }
