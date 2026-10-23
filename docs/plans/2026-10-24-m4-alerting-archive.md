@@ -264,6 +264,8 @@ CREATE TABLE archive_state (
   - `≤6h` → raw；
   - `≤7d` → 1m（若 1m 保留期更短，取可用范围）；
   - 更长 → 1h。
+- 现有 `series` 最大跨度只有 32 天，与 1h 默认保留 730 天冲突；M4 放宽到
+  **730 天**，仍受单次 20,000 点 / 50 序列上限约束。超出 730 天返回参数错误。
 - 显式 `bucket_ms`：小于当前层粒度时**自动提升**到层粒度（例如 30d 查询请求
   60s → 实际 1h），响应回显实际值；不返回 400，避免旧面板/客户端长跨度请求
   突然失败。响应保留 `points: [[ts,value]]`，新增 `tier: "raw"|"1m"|"1h"` 与
@@ -393,6 +395,9 @@ username = "..."
 password = ""               # 或 private_key_path
 private_key_path = "/etc/rustboard/id_ed25519"
 remote_dir = "/backup/rustboard"
+# 必填：服务器主机公钥的 SHA256 指纹（`SHA256:<base64>`，不含末尾 `=`）。
+# 禁止空值 / 接受任意主机密钥；不匹配立即拒绝连接，防中间人。
+host_key_fingerprint = "SHA256:..."
 ```
 
 - 后端 secret 只在 hub.toml（0600）中，不进入 DB/API/前端；面板只显示
@@ -405,6 +410,9 @@ remote_dir = "/backup/rustboard"
   `prefix + 日期 + 分片` 生成，不接受 API 输入。
 - `after_days` 默认 7，必须 `<= retention_raw_days`（retention_raw_days=0 除外）；
   否则拒绝启动，防止“还没归档就被保留期删除”。
+- SFTP **必须**配置 `host_key_fingerprint` 并在 SSH 握手时校验；空值、格式错误或
+  不匹配一律失败，禁止 `AcceptAnyServerKey` 一类降级。主机密钥轮换需管理员显式
+  更新配置。
 
 ### 7.2 文件与上传
 
@@ -438,8 +446,8 @@ trait ColdStore: Send + Sync {
 
 - S3：`object_store`（AWS feature，rustls），MinIO 用 endpoint/path_style。
 - WebDAV：现有 `reqwest`（rustls），PUT/GET/DELETE/HEAD + Basic auth。
-- SFTP：`russh` + `russh-sftp`（纯 Rust），私钥优先，密码可选；禁止拉起 `ssh`
-  子进程。
+- SFTP：`russh` + `russh-sftp`（纯 Rust），私钥优先，密码可选；**必须校验
+  `host_key_fingerprint`**，禁止接受任意主机密钥；禁止拉起 `ssh` 子进程。
 - 压缩：`flate2` + rust_backend；签名：`hmac` + 已有 `sha2`；异步 trait：
   `async-trait`。
 - 新增依赖必须先跑 §12 的 spike；不得引入 openssl/cmake 或改变 rustls/ring
@@ -539,7 +547,7 @@ notify_max_attempts = 3
 | 任务 | 内容 | 文件边界 | 依赖 |
 |---|---|---|---|
 | A1 | schema v7、迁移、`maintenance_state`、Storage trait | `core/storage/{mod,sqlite}.rs` | 无 |
-| A2 | downsample/retention worker、选层查询、CLI | `core/downsample.rs`、`hub/main.rs`、`common/config.rs` | A1 |
+| A2 | downsample/retention worker、选层查询、CLI；实施拆为 A2a（worker/CLI）与 A2b（选层查询）两个提交 | `core/downsample.rs`、`core/storage/*`、`hub/main.rs`、`common/config.rs` | A1 |
 | B1 | 告警表/状态机/内置规则/规则 API、agent 新指标 | `core/alerts.rs`、`core/storage/*`、`hub/{alerts,main,auth}.rs`、`agent/main.rs`、`core/collect/disk.rs` | A1 |
 | B2 | 四渠道通知、测试、重试、脱敏 | `hub/notify.rs`、`hub/main.rs` | B1 |
 | B3 | 面板告警 API/页面 | `panel/{main,proxy}.rs`、`web/src/*` | B1/B2 |
