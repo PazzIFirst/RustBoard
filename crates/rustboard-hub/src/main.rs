@@ -38,7 +38,7 @@ use rustboard_common::tls;
 use rustboard_common::util::{
     arch, boot_id, hostname, now_ms, os_pretty_name, pick_free_port_excluding, port_of,
 };
-use rustboard_common::wire::{codes, EnrollRequest, Frame, Welcome};
+use rustboard_common::wire::{codes, AgentHello, EnrollRequest, Frame, Welcome};
 use rustboard_common::{DEFAULT_HUB_CONFIG, PROTOCOL_VERSION, VERSION};
 use rustboard_core::collect::default_collectors;
 use rustboard_core::storage::sqlite::SqliteStorage;
@@ -2612,13 +2612,11 @@ async fn dispatch(mut socket: WebSocket, state: AppState, peer: PeerIdentity) ->
                 reject_and_close(&mut socket, MTLS_REQUIRED, "正式会话必须使用客户端证书").await;
                 bail!("无客户端证书的连接尝试建立正式会话");
             };
-            if !is_valid_agent_id(&hello.agent_id) {
-                reject_and_close(&mut socket, IDENTITY_MISMATCH, "agent_id 非法").await;
-                bail!("agent_id 非法（长度或字符集）");
-            }
-            if !is_log_safe(&hello.hostname, 255) {
-                reject_and_close(&mut socket, IDENTITY_MISMATCH, "hostname 非法").await;
-                bail!("hostname 含控制字符或过长");
+            // KI-19：长度 / 控制字符校验必须在比较 CN、写日志与任何 DB 写入之前。
+            // 失败只记静态字段名，绝不回显原始字段值（防日志注入与放大）。
+            if let Err(field) = validate_hello_metadata(&hello) {
+                reject_and_close(&mut socket, codes::BAD_FRAME, "Hello 元数据非法").await;
+                bail!("Hello 元数据非法: {field}");
             }
             if hello.agent_id == HUB_SELF_AGENT_ID {
                 reject_and_close(&mut socket, IDENTITY_MISMATCH, "网络侧不允许声明 hub-self").await;
@@ -2760,11 +2758,14 @@ async fn handle_enroll(mut socket: WebSocket, state: AppState, req: EnrollReques
     Ok(())
 }
 
-async fn handle_session(
-    mut socket: WebSocket,
-    state: AppState,
-    hello: rustboard_common::wire::AgentHello,
-) -> Result<()> {
+async fn handle_session(mut socket: WebSocket, state: AppState, hello: AgentHello) -> Result<()> {
+    // KI-19 纵深防御：dispatch 已校验一次，但任何进入会话的路径都不得把非法
+    // 元数据写进 DB / 日志。失败同样只记静态字段名。
+    if let Err(field) = validate_hello_metadata(&hello) {
+        reject_and_close(&mut socket, codes::BAD_FRAME, "Hello 元数据非法").await;
+        bail!("Hello 元数据非法: {field}");
+    }
+
     let agent_id = hello.agent_id.clone();
 
     if protocol_gate(hello.protocol).is_some() {
@@ -3646,6 +3647,40 @@ fn is_log_safe_optional(value: &str, max_len: usize) -> bool {
     value.is_empty() || is_log_safe(value, max_len)
 }
 
+/// KI-19：Hello 元数据长度与控制字符校验。
+///
+/// - 长度按 UTF-8 **字节数**计算；
+/// - 所有字段拒绝控制字符（含 `\n`、`\t`、NUL），防止日志注入；
+/// - `agent_id` 沿用更严格的 [`is_valid_agent_id`]（非空、≤64 字节、ASCII 安全字符集）；
+/// - `name` / `os` / `arch` / `version` / `boot_id` 允许为空，`hostname` 不允许为空。
+///
+/// 出错时返回首个非法字段的**静态**名称，仅供内部日志使用；绝不携带字段值，
+/// 避免把攻击者可控内容写进日志。
+fn validate_hello_metadata(hello: &AgentHello) -> Result<(), &'static str> {
+    if !is_valid_agent_id(&hello.agent_id) {
+        return Err("agent_id");
+    }
+    if !is_log_safe_optional(&hello.name, 128) {
+        return Err("name");
+    }
+    if !is_log_safe(&hello.hostname, 255) {
+        return Err("hostname");
+    }
+    if !is_log_safe_optional(&hello.os, 64) {
+        return Err("os");
+    }
+    if !is_log_safe_optional(&hello.arch, 32) {
+        return Err("arch");
+    }
+    if !is_log_safe_optional(&hello.version, 64) {
+        return Err("version");
+    }
+    if !is_log_safe_optional(&hello.boot_id, 128) {
+        return Err("boot_id");
+    }
+    Ok(())
+}
+
 fn problem(code: &str, message: &str) -> Frame {
     Frame::Problem {
         code: code.to_string(),
@@ -3774,6 +3809,132 @@ mod tests {
             }
         }
         assert!(protocol_gate(PROTOCOL_VERSION).is_none());
+    }
+
+    /// KI-19：构造一份全字段合法的 Hello，供边界测试改写单个字段。
+    fn valid_hello() -> AgentHello {
+        AgentHello {
+            agent_id: "agent-1".to_string(),
+            name: "测试节点".to_string(),
+            hostname: "node-1.example".to_string(),
+            os: "Linux".to_string(),
+            arch: "x86_64".to_string(),
+            version: "0.3.4".to_string(),
+            protocol: PROTOCOL_VERSION,
+            boot_id: "boot-1".to_string(),
+            epoch: 7,
+            secret: "s".repeat(64),
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn set_hello_field(hello: &mut AgentHello, field: &'static str, value: String) {
+        match field {
+            "agent_id" => hello.agent_id = value,
+            "name" => hello.name = value,
+            "hostname" => hello.hostname = value,
+            "os" => hello.os = value,
+            "arch" => hello.arch = value,
+            "version" => hello.version = value,
+            "boot_id" => hello.boot_id = value,
+            other => panic!("未知 Hello 字段: {other}"),
+        }
+    }
+
+    /// KI-19：全字段合法（name 为 UTF-8 中文）的 Hello 必须通过。
+    #[test]
+    fn ki19_hello_accepts_full_valid_metadata() {
+        assert_eq!(validate_hello_metadata(&valid_hello()), Ok(()));
+    }
+
+    /// KI-19：每个字段按 UTF-8 字节长度卡边界，max 通过、max+1 拒绝；
+    /// `agent_id` 沿用 64 字节的 ASCII 安全字符集规则（不放宽到 128）。
+    #[test]
+    fn ki19_hello_field_length_limits() {
+        for (field, max) in [
+            ("agent_id", 64),
+            ("name", 128),
+            ("hostname", 255),
+            ("os", 64),
+            ("arch", 32),
+            ("version", 64),
+            ("boot_id", 128),
+        ] {
+            let mut hello = valid_hello();
+            set_hello_field(&mut hello, field, "a".repeat(max));
+            assert_eq!(
+                validate_hello_metadata(&hello),
+                Ok(()),
+                "{field} 恰好 {max} 字节必须通过"
+            );
+
+            set_hello_field(&mut hello, field, "a".repeat(max + 1));
+            assert_eq!(
+                validate_hello_metadata(&hello),
+                Err(field),
+                "{field} 超过 {max} 字节必须拒绝"
+            );
+        }
+    }
+
+    /// KI-19：`agent_id` / `hostname` 空值必须拒绝；`name` / `os` / `arch` /
+    /// `version` / `boot_id` 允许为空。
+    #[test]
+    fn ki19_hello_empty_field_rules() {
+        let mut hello = valid_hello();
+        hello.agent_id.clear();
+        assert_eq!(validate_hello_metadata(&hello), Err("agent_id"));
+
+        let mut hello = valid_hello();
+        hello.hostname.clear();
+        assert_eq!(validate_hello_metadata(&hello), Err("hostname"));
+
+        for field in ["name", "os", "arch", "version", "boot_id"] {
+            let mut hello = valid_hello();
+            set_hello_field(&mut hello, field, String::new());
+            assert_eq!(validate_hello_metadata(&hello), Ok(()), "{field} 允许为空");
+        }
+    }
+
+    /// KI-19：所有字段都拒绝控制字符；返回值只能是静态字段名，
+    /// 不得包含任何攻击者提供的原始内容。
+    #[test]
+    fn ki19_hello_rejects_control_chars_without_echoing_values() {
+        for field in [
+            "agent_id", "name", "hostname", "os", "arch", "version", "boot_id",
+        ] {
+            for control in ['\n', '\t', '\0', '\r'] {
+                let mut hello = valid_hello();
+                let evil = format!("evil{control}INFO forged");
+                set_hello_field(&mut hello, field, evil.clone());
+
+                let err =
+                    validate_hello_metadata(&hello).expect_err("含控制字符的元数据必须被拒绝");
+                assert_eq!(err, field, "{field} 必须返回自身的静态字段名");
+                assert!(
+                    !err.contains(&control.to_string()),
+                    "{field} 的错误串不得包含控制字符"
+                );
+                assert!(!err.contains("evil"), "{field} 的错误串不得回显原值");
+                assert!(!err.contains("INFO forged"), "{field} 的错误串不得回显原值");
+                assert!(!evil.contains(err), "错误串不得是攻击者可控内容的一部分");
+            }
+        }
+    }
+
+    /// KI-19：长度按 UTF-8 字节而不是字符数计算；合法中文 name 必须通过。
+    #[test]
+    fn ki19_hello_length_is_utf8_bytes() {
+        let mut hello = valid_hello();
+        // 42 个「中」= 126 字节，再补 2 个 ASCII，恰好 128 字节。
+        hello.name = format!("{}ab", "中".repeat(42));
+        assert_eq!(hello.name.len(), 128);
+        assert_eq!(validate_hello_metadata(&hello), Ok(()));
+
+        // 43 个「中」= 129 字节：字符数只有 43，但按字节已超限。
+        hello.name = "中".repeat(43);
+        assert_eq!(hello.name.len(), 129);
+        assert_eq!(validate_hello_metadata(&hello), Err("name"));
     }
 
     /// M4：写操作永不完成时必须在超时后返回错误，不能把会话任务挂死。
