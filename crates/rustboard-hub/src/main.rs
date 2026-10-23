@@ -2561,9 +2561,6 @@ async fn handle_session(
                 }
             }
             SessionEvent::Message(message) => {
-                // 只有 agent 的入站帧才续期空闲 deadline；控制命令 / 清理 tick /
-                // shutdown 都不算心跳，不能让静默连接永远在线。
-                idle.on_frame();
                 match handle_message(
                     &mut socket,
                     &state,
@@ -2574,7 +2571,12 @@ async fn handle_session(
                 )
                 .await?
                 {
-                    MessageAction::Continue => {}
+                    MessageAction::Continue => {
+                        // 只有完整处理完一帧才续期：慢批次入库 / 证书签发等
+                        // 处理耗时不能被计入下一个空闲窗口，否则处理完立即被误杀。
+                        // 控制命令 / 清理 tick / shutdown 都不算心跳，不续期。
+                        idle.on_frame();
+                    }
                     MessageAction::Close => break,
                 }
             }
@@ -3342,57 +3344,52 @@ mod tests {
     }
 
     /// 评审回归：每秒的控制清理 tick 不得重置 45s 空闲 deadline；
-    /// 只有收到入站帧（`on_frame`）才顺延。测试把时间压缩为 200ms 超时 / 20ms tick。
-    #[tokio::test]
+    /// 只有收到入站帧（`on_frame`）才顺延。用 tokio 虚拟时间，避免 CI 抖动。
+    #[tokio::test(start_paused = true)]
     async fn v032_session_idle_deadline_survives_control_ticks() {
-        const TIMEOUT: Duration = Duration::from_millis(200);
-        const TICK: Duration = Duration::from_millis(20);
+        let start = tokio::time::Instant::now();
+        let mut idle = SessionIdle::new(SESSION_IDLE_TIMEOUT);
+        assert_eq!(idle.deadline(), start + SESSION_IDLE_TIMEOUT);
 
-        let mut idle = SessionIdle::new(TIMEOUT);
-        let initial = idle.deadline();
-
-        // 模拟持续每秒 tick（压缩为 20ms），总 100ms：tick 不续期。
-        for _ in 0..5 {
-            tokio::time::sleep(TICK).await;
+        // 模拟 44 次每秒 tick：tick 不续期，deadline 必须保持首次建立时的值。
+        for _ in 0..44 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
         assert_eq!(
             idle.deadline(),
-            initial,
+            start + SESSION_IDLE_TIMEOUT,
             "control_expire tick 不得重置空闲 deadline"
         );
         assert!(tokio::time::Instant::now() < idle.deadline());
 
-        // 等过原 deadline：空闲超时必须生效。
-        tokio::time::sleep_until(idle.deadline()).await;
+        // 第 45 秒到期。
+        tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(tokio::time::Instant::now() >= idle.deadline());
 
-        // 收到入站帧后才顺延整个窗口。
-        let frame_at = tokio::time::Instant::now();
+        // 收到入站帧后才顺延整个 45s 窗口。
         idle.on_frame();
-        assert!(idle.deadline() >= frame_at + TIMEOUT);
-        assert!(idle.deadline() > initial, "入站帧必须顺延 deadline");
-        tokio::time::sleep(TIMEOUT / 2).await;
-        assert!(
-            tokio::time::Instant::now() < idle.deadline(),
-            "续期后不应提前到期"
+        assert_eq!(
+            idle.deadline(),
+            tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT
         );
-        tokio::time::sleep_until(idle.deadline()).await;
+        tokio::time::sleep(Duration::from_secs(44)).await;
+        assert!(tokio::time::Instant::now() < idle.deadline());
+        tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(tokio::time::Instant::now() >= idle.deadline());
     }
 
     /// 评审回归：用接近 `handle_session` 的 select 结构验证——持续 tick 完成时，
-    /// `timeout_at` 仍必须按期触发，不能被 tick 饿死。
-    #[tokio::test]
+    /// `timeout_at` 仍必须按期触发，不能被 tick 饿死（tokio 虚拟时间）。
+    #[tokio::test(start_paused = true)]
     async fn v032_idle_timeout_fires_despite_control_ticks() {
-        const TIMEOUT: Duration = Duration::from_millis(200);
-        const TICK: Duration = Duration::from_millis(20);
-
-        let idle = SessionIdle::new(TIMEOUT);
-        let mut ticks = tokio::time::interval(TICK);
+        let idle = SessionIdle::new(SESSION_IDLE_TIMEOUT);
+        let mut ticks = tokio::time::interval(Duration::from_secs(1));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // 显式消费 t0 的即时 tick，避免 paused 时间首次推进的竞态。
+        let _ = ticks.tick().await;
 
         let mut idle_fired = false;
-        for _ in 0..50 {
+        for _ in 0..60 {
             tokio::select! {
                 biased;
                 _ = ticks.tick() => {}
@@ -3403,6 +3400,35 @@ mod tests {
             }
         }
         assert!(idle_fired, "持续 tick 不得饿死空闲超时");
+        // 虚拟时钟必须恰好停在 45s deadline：tick 没有把它推后。
+        assert_eq!(
+            tokio::time::Instant::now(),
+            idle.deadline(),
+            "空闲超时必须恰好在 deadline 触发"
+        );
+    }
+
+    /// 评审回归：续期必须发生在整帧处理完成之后；处理耗时不得挤占下一个
+    /// 45s 空闲窗口（helper 级断言，不必真等 45s）。
+    #[tokio::test(start_paused = true)]
+    async fn v032_session_idle_renews_after_slow_processing() {
+        let frame_at = tokio::time::Instant::now();
+        let mut idle = SessionIdle::new(SESSION_IDLE_TIMEOUT);
+
+        // 模拟一帧处理了 50s 才完成，已超过原 deadline。
+        tokio::time::sleep(Duration::from_secs(50)).await;
+        assert!(tokio::time::Instant::now() >= idle.deadline());
+
+        // 若按“帧到达时续期”，这里已经过期；必须处理完再续期，拿到完整 45s。
+        idle.on_frame();
+        assert_eq!(
+            idle.deadline(),
+            tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT
+        );
+        assert!(
+            idle.deadline() > frame_at + SESSION_IDLE_TIMEOUT,
+            "处理耗时不得挤占续期后的空闲窗口"
+        );
     }
 
     /// H2：连接数达到上限后不再发放许可，释放一条后恢复。
