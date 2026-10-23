@@ -5,12 +5,13 @@
 //!   以根目录 fd 为基准在**一次** `openat2(2)` 内解析全部父目录与最终文件。父路径不再
 //!   先 `open()` 再用其结果打开文件名，因此父目录在两次 syscall 之间被替换为符号链接的
 //!   TOCTOU 窗口不存在；
-//! - `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV`：
-//!   任一分量是符号链接、经过 magic link 或跨越挂载点都会被拒绝；
+//! - `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`：
+//!   任一分量是符号链接、经过 magic link 或借 `..` 逃逸根目录都会被拒绝；不限制跨挂载点
+//!   （兼容独立 `/var` 分区、bind mount 与 `/tmp`），跨挂载本身不构成路径逃逸；
 //! - `O_NONBLOCK` 打开后再 `fstat`，只接受普通文件；FIFO / 设备 / 目录一律拒绝，
 //!   避免日志文件被替换成 FIFO 后永久阻塞控制线程；
 //! - 内核不支持 `openat2`（ENOSYS）时直接失败并返回错误，**不降级**到 `fs::read`；
-//! - 文件不存在允许启动（logrotate 场景），但父目录不存在 / 是符号链接 / 跨挂载点
+//! - 文件不存在允许启动（logrotate 场景），但父目录不存在 / 是符号链接
 //!   会在启动时报清晰错误；每次 tail 都重新打开，不缓存 fd；
 //! - 只从文件尾部倒读，最多 2000 行、单行 4096 字节、总输出 256 KiB。
 
@@ -34,7 +35,6 @@ use super::exec;
 const READ_CHUNK: usize = 32 * 1024;
 
 // `openat2(2)` 的 resolve 标志；libc crate 只暴露 SYS_openat2，不暴露这些常量。
-const RESOLVE_NO_XDEV: u64 = 0x01;
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
@@ -73,7 +73,7 @@ fn validate_file_source(target: &str) -> anyhow::Result<()> {
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             // 文件尚未创建是允许的（例如 logrotate 正在轮转），但父目录必须存在、
-            // 不是符号链接且不跨挂载点，否则运行期永远读不到日志。
+            // 不是符号链接，否则运行期永远读不到日志。
             validate_parent_dir(path)
                 .with_context(|| format!("日志来源父目录校验失败: {}", path.display()))
         }
@@ -82,10 +82,6 @@ fn validate_file_source(target: &str) -> anyhow::Result<()> {
                 Some(libc::ELOOP) => {
                     format!("日志路径包含符号链接（openat2 拒绝）: {}", path.display())
                 }
-                Some(libc::EXDEV) => format!(
-                    "日志路径跨挂载点（RESOLVE_NO_XDEV 拒绝）: {}",
-                    path.display()
-                ),
                 Some(libc::ENOTDIR) => {
                     format!("日志路径中的父目录不是目录: {}", path.display())
                 }
@@ -96,7 +92,7 @@ fn validate_file_source(target: &str) -> anyhow::Result<()> {
     }
 }
 
-/// 文件尚不存在时单独确认父目录：必须存在、是目录、不是符号链接且与 `/` 同挂载点。
+/// 文件尚不存在时单独确认父目录：必须存在、是目录、不是符号链接。
 ///
 /// 只用于启动校验，且仅在文件缺失（logrotate 场景）时执行；正常读取路径仍然只做
 /// 一次完整的 `openat2`。
@@ -123,10 +119,6 @@ fn validate_parent_dir(path: &Path) -> anyhow::Result<()> {
                 parent.display()
             ),
             Some(libc::ELOOP) => bail!("父目录是符号链接或被替换为符号链接: {}", parent.display()),
-            Some(libc::EXDEV) => bail!(
-                "父目录跨挂载点（RESOLVE_NO_XDEV 拒绝）: {}",
-                parent.display()
-            ),
             Some(libc::ENOTDIR) => bail!("父目录路径中有分量不是目录: {}", parent.display()),
             _ => Err(anyhow::Error::new(err))
                 .with_context(|| format!("打开父目录失败（openat2）: {}", parent.display())),
@@ -399,8 +391,9 @@ fn cap_output(lines: Vec<String>) -> (Vec<String>, bool) {
 /// 打开绝对路径日志文件：从根目录 fd 出发，用一次 `openat2(2)` 解析完整路径。
 ///
 /// 父目录与文件名在同一次 syscall 内解析，避免“先打开父目录、再打开文件”之间父目录
-/// 被替换成符号链接的 TOCTOU 窗口。路径中任一分量是符号链接、magic link，或跨越挂载点
-/// 都会被拒绝；内核不支持 `openat2` 时直接失败，不降级。
+/// 被替换成符号链接的 TOCTOU 窗口。路径中任一分量是符号链接、magic link，或借 `..`
+/// 逃逸根目录都会被拒绝；跨挂载点不受限制（独立 `/var` 分区等部署仍可用）。
+/// 内核不支持 `openat2` 时直接失败，不降级。
 fn open_log_path_absolute(path: &Path) -> io::Result<File> {
     let file = open_absolute_at_root(
         path,
@@ -437,7 +430,7 @@ fn open_absolute_at_root(path: &Path, flags: libc::c_int) -> io::Result<File> {
     let how = OpenHow {
         flags: flags as u64,
         mode: 0,
-        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
     };
     // SAFETY: openat2(2) 只读取 how 指向的 POD 结构；root fd 与 name_c 在调用期间有效。
     let fd = unsafe {
@@ -510,19 +503,11 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
-    /// 本机 `/tmp` 是独立 tmpfs，`RESOLVE_NO_XDEV` 会拒绝其下的测试文件；
-    /// 因此测试目录固定放在与 `/` 同挂载点的工作区 `target/` 下。
-    fn test_root() -> PathBuf {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/rb-agent-logs-tests");
-        std::fs::create_dir_all(&root).unwrap();
-        // 去掉 `../../` 并确认路径不经过符号链接，保证 openat2 能正常解析。
-        std::fs::canonicalize(&root).unwrap()
-    }
-
     fn temp_dir(tag: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = test_root().join(format!("{}-{tag}-{seq}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rb-agent-logs-{}-{tag}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1012,41 +997,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `RESOLVE_NO_XDEV`：跨挂载点必须被拒绝，而不是降级成普通读取。
+    /// 兼容性回归：日志路径允许跨挂载点（独立 `/var` 分区、bind mount、tmpfs）。
+    ///
+    /// 单次 `openat2` + `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_BENEATH`
+    /// 仍然完整关闭父路径 TOCTOU / 符号链接逃逸；跨挂载本身不构成路径逃逸。
     #[test]
-    fn cross_mount_log_path_is_rejected() {
+    fn cross_mount_log_path_is_readable() {
         use std::os::unix::fs::MetadataExt;
 
         let root_dev = std::fs::metadata("/").unwrap().dev();
-        let tmp_base =
-            std::env::temp_dir().join(format!("rb-agent-logs-xdev-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp_base);
-        std::fs::create_dir_all(&tmp_base).unwrap();
-        let tmp_base = std::fs::canonicalize(&tmp_base).unwrap();
-        if std::fs::metadata(&tmp_base).unwrap().dev() == root_dev {
-            eprintln!("临时目录与 `/` 同挂载点，跳过跨挂载点用例");
-            let _ = std::fs::remove_dir_all(&tmp_base);
-            return;
+        let content = b"cross-mount-line\n";
+        let mut checked = false;
+        // 优先 /dev/shm（通常是独立 tmpfs），其次 $TMPDIR。
+        for base in [PathBuf::from("/dev/shm"), std::env::temp_dir()] {
+            let Ok(base) = std::fs::canonicalize(&base) else {
+                continue;
+            };
+            let Ok(metadata) = std::fs::metadata(&base) else {
+                continue;
+            };
+            if !metadata.is_dir() || metadata.dev() == root_dev {
+                continue;
+            }
+            let dir = base.join(format!("rb-agent-logs-xdev-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            if std::fs::create_dir_all(&dir).is_err() {
+                continue;
+            }
+            let log = dir.join("app.log");
+            if std::fs::write(&log, content).is_err() {
+                let _ = std::fs::remove_dir_all(&dir);
+                continue;
+            }
+            // 确认场景有效：文件确实位于与 `/` 不同的 st_dev。
+            assert_ne!(
+                std::fs::metadata(&log).unwrap().dev(),
+                root_dev,
+                "跨挂载用例必须落在不同设备上"
+            );
+
+            open_log_path_absolute(&log).expect("跨挂载点的普通文件必须能打开");
+            let cfg = cfg_with(vec![file_source("xdev", &log)]);
+            validate_sources_io(&cfg).expect("跨挂载点日志不应阻止启动");
+            match tail(&cfg, &cfg.log_sources[0], 10).unwrap() {
+                ControlResult::LogLines {
+                    lines, size_bytes, ..
+                } => {
+                    assert_eq!(lines, ["cross-mount-line"]);
+                    assert_eq!(size_bytes, content.len() as u64);
+                }
+                other => panic!("意外结果: {other:?}"),
+            }
+            checked = true;
+            eprintln!("跨挂载兼容用例实际使用: {}", dir.display());
+            let _ = std::fs::remove_dir_all(&dir);
+            break;
         }
-        let log = tmp_base.join("app.log");
-        std::fs::write(&log, b"cross-mount\n").unwrap();
-
-        let err = open_log_path_absolute(&log).unwrap_err();
-        assert_eq!(
-            err.raw_os_error(),
-            Some(libc::EXDEV),
-            "跨挂载点必须被 openat2 拒绝: {err:?}"
-        );
-
-        let cfg = cfg_with(vec![file_source("xdev", &log)]);
-        let err = format!("{:#}", validate_sources_io(&cfg).unwrap_err());
-        assert!(err.contains("跨挂载点"), "{err}");
-        let err = tail(&cfg, &cfg.log_sources[0], 10).expect_err("跨挂载点 tail 必须失败");
-        assert_eq!(err.code, control::codes::CONTROL_FAILED);
-        let _ = std::fs::remove_dir_all(&tmp_base);
+        if !checked {
+            eprintln!("找不到与 `/` 不同 st_dev 的可写目录，跳过跨挂载兼容用例");
+        }
     }
 
-    /// 目录与设备（字符设备）都必须被 fstat 拒绝；无 CAP_MKNOD 时跳过设备部分。
+    /// 目录与设备（`/dev/null` 字符设备）都必须被 fstat 拒绝。
     #[test]
     fn non_regular_targets_are_rejected() {
         let dir = temp_dir("non-regular");
@@ -1057,37 +1069,19 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("不是普通文件"), "{err}");
 
-        let device = dir.join("null.dev");
-        let device_c = CString::new(device.as_os_str().as_bytes()).unwrap();
-        // Linux dev_t 编码：null 为 major=1, minor=3，即 (1 << 8) | 3。
-        let device_id = (1u64 << 8) | 3;
-        // SAFETY: device_c 是以 NUL 结尾的合法路径，mknod(2) 只读取该 C 字符串。
-        let rc = unsafe { libc::mknod(device_c.as_ptr(), libc::S_IFCHR | 0o600, device_id) };
-        if rc == 0 {
-            let err = open_log_path_absolute(&device).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err:?}");
-            assert!(err.to_string().contains("不是普通文件"), "{err}");
+        // `/dev` 是独立挂载点；跨挂载已允许，因此这里会真正打开设备后由 fstat 拒绝。
+        // 这样无需 CAP_MKNOD，CI 非 root 也能覆盖设备路径。
+        let device = Path::new("/dev/null");
+        let err = open_log_path_absolute(device).expect_err("设备节点不能被当作普通日志文件打开");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err:?}");
+        assert!(err.to_string().contains("不是普通文件"), "{err}");
 
-            let cfg = cfg_with(vec![file_source("dev", &device)]);
-            let err = format!("{:#}", validate_sources_io(&cfg).unwrap_err());
-            assert!(err.contains("不是普通文件"), "{err}");
-            let err = tail(&cfg, &cfg.log_sources[0], 10).expect_err("设备必须被拒绝");
-            assert_eq!(err.code, control::codes::CONTROL_FAILED);
-        } else {
-            // 无 CAP_MKNOD（例如 CI 非 root）时退而验证系统设备节点同样不可读：
-            // /dev 通常独立挂载，会先被 RESOLVE_NO_XDEV 拒绝；同挂载点则由 fstat 拒绝。
-            eprintln!(
-                "mknod 不可用（{}），改用 /dev/null 验证设备节点拒绝",
-                io::Error::last_os_error()
-            );
-            let err = open_log_path_absolute(Path::new("/dev/null"))
-                .expect_err("设备节点不能被当作普通日志文件打开");
-            let code = err.raw_os_error();
-            assert!(
-                code == Some(libc::EXDEV) || err.kind() == io::ErrorKind::InvalidInput,
-                "/dev/null 必须以跨挂载点或非普通文件被拒绝: {err:?}"
-            );
-        }
+        let cfg = cfg_with(vec![file_source("dev", device)]);
+        let err = format!("{:#}", validate_sources_io(&cfg).unwrap_err());
+        assert!(err.contains("不是普通文件"), "{err}");
+        let err = tail(&cfg, &cfg.log_sources[0], 10).expect_err("设备必须被拒绝");
+        assert_eq!(err.code, control::codes::CONTROL_FAILED);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
