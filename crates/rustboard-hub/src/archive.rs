@@ -68,8 +68,8 @@ const SAFE_LAST_ERROR_TEXTS: [&str; 7] = [
     "归档对象不存在",
 ];
 
-/// `last_error` 允许的最大字符数；超长内容视为异常，不做截断展示。
-const MAX_LAST_ERROR_CHARS: usize = 64;
+/// `last_error` 允许透传的固定错误码（精确集合，不接受任意 `*_failed`）。
+const SAFE_LAST_ERROR_CODES: [&str; 1] = [LAST_ERROR_RUN_FAILED];
 
 /// 新失败写入的固定码：不含后端 URL / 凭据 / 响应正文。
 const LAST_ERROR_RUN_FAILED: &str = "archive_run_failed";
@@ -247,25 +247,17 @@ pub(crate) fn status(storage: &SqliteStorage, cfg: &HubConfig) -> Result<Archive
     })
 }
 
-/// 判断是否为 `[a-z0-9_]*_failed` 形式的固定错误码。
-fn is_failed_code(value: &str) -> bool {
-    value.len() <= MAX_LAST_ERROR_CHARS
-        && value.ends_with("_failed")
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-}
-
 /// `archive_state.last_error` 的展示脱敏。
 ///
-/// 只允许固定中文文案或 `*_failed` 固定码；其余内容（URL、凭据、路径、超长
-/// 错误或任意旧版本 `{err:#}`）一律返回 `archive_error`，不做截断展示。
+/// 只允许固定中文文案或 [`SAFE_LAST_ERROR_CODES`] 中的精确固定码；其余内容
+/// （URL、凭据、路径、超长错误或任意旧版本 `{err:#}`）一律返回
+/// `archive_error`，不做截断展示。不接受任意 `*_failed` 形式。
 fn sanitize_last_error(raw: &str) -> String {
     let value = raw.trim();
     if value.is_empty() {
         return String::new();
     }
-    if SAFE_LAST_ERROR_TEXTS.contains(&value) || is_failed_code(value) {
+    if SAFE_LAST_ERROR_TEXTS.contains(&value) || SAFE_LAST_ERROR_CODES.contains(&value) {
         value.to_string()
     } else {
         LAST_ERROR_MASKED.to_string()
@@ -1076,7 +1068,7 @@ mod tests {
         let storage = SqliteStorage::open_in_memory().unwrap();
         let cfg = test_cfg();
 
-        let long = "a".repeat(MAX_LAST_ERROR_CHARS + 1);
+        let long = "a".repeat(512);
         for unsafe_value in [
             "https://minio.internal/secret-bucket?X-Amz-Credential=AKIA_LEAK",
             "user:password@dav.example.com/rustboard",
@@ -1097,7 +1089,6 @@ mod tests {
 
         for safe_value in [
             "archive_run_failed",
-            "archive_upload_failed",
             "冷存储后端不可用",
             "归档对象 key 非法",
             "归档未启用（archive.enabled = false）",
@@ -1119,20 +1110,27 @@ mod tests {
         assert!(status(&storage, &cfg).unwrap().last_error.is_none());
     }
 
-    /// 固定码 / 固定中文的白名单不能把任意带 `_failed` 的大写或含符号串放行。
+    /// 固定码白名单必须精确匹配，不能把任意 `*_failed` 形式放行。
     #[test]
-    fn last_error_code_whitelist_is_strict() {
+    fn last_error_code_whitelist_is_exact() {
         for value in [
+            "archive_upload_failed",
             "Archive_failed",
             "archive_failed!",
             "../../etc/passwd_failed",
             "x@_failed",
             "archive_ failed",
         ] {
-            assert!(!is_failed_code(value), "value={value:?}");
+            assert_eq!(
+                sanitize_last_error(value),
+                LAST_ERROR_MASKED,
+                "value={value:?}"
+            );
         }
-        assert!(is_failed_code("archive_run_failed"));
-        assert!(is_failed_code("archive_upload_failed"));
+        assert_eq!(
+            sanitize_last_error("archive_run_failed"),
+            LAST_ERROR_RUN_FAILED
+        );
     }
 
     #[test]

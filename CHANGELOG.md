@@ -41,9 +41,10 @@
 ### Fixed
 
 - 归档下载内存安全：单对象下载上限降为 64 MiB（超限 413
-  `archive_too_large`），读取用 1 permit 串行化，`get` 后校验长度与 SHA-256；
-  面板下载在 EOF 校验累计字节与 `Content-Length`，短读让 body 报错
-- 归档 `status` 的 `last_error` 改为固定码写入 + 读取白名单掩码，历史库里的
+  `archive_too_large`），读取用 1 permit 串行化且许可持有到响应 body 结束，
+  `get` 后校验长度与 SHA-256；面板下载在 EOF 校验累计字节与
+  `Content-Length`，短读让 body 报错
+- 归档 `status` 的 `last_error` 改为固定码写入 + 读取精确白名单掩码，历史库里的
   URL / 凭据 / 路径 / 超长内容统一显示 `archive_error`
 
 ### Security

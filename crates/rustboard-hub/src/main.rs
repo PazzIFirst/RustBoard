@@ -17,7 +17,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, RawQuery, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
@@ -2127,7 +2127,8 @@ async fn archive_object_download(
 
     // 单并发：get 必须整对象读入内存，峰值由 64 MiB 上限 + 1 个许可共同约束。
     // `acquire_owned` 的等待 future 取消安全：请求被取消时不会拿走许可。
-    let _download_permit = state
+    // 许可随后移入响应 body：body 未读完 / 未 drop 时，下一个下载继续等待。
+    let download_permit = state
         .archive_download_slots
         .clone()
         .acquire_owned()
@@ -2135,7 +2136,7 @@ async fn archive_object_download(
         .map_err(|_| archive_unavailable())?;
 
     let store = archive::build_store(&state.cfg.archive).map_err(|_| archive_unavailable())?;
-    archive_download_response(&state.cfg, &object, store.as_ref()).await
+    archive_download_response(&state.cfg, &object, store.as_ref(), download_permit).await
 }
 
 /// 固定 502：下载后端不可用；不携带后端细节。
@@ -2161,17 +2162,22 @@ async fn archive_download_response(
     cfg: &HubConfig,
     object: &ArchiveObject,
     store: &dyn ColdStore,
+    permit: OwnedSemaphorePermit,
 ) -> Result<Response, ApiError> {
     let limit = cfg.archive.max_object_bytes.min(MAX_ARCHIVE_DOWNLOAD_BYTES);
-    archive_download_response_with_limit(object, store, limit).await
+    archive_download_response_with_limit(object, store, limit, permit).await
 }
 
 /// 带可调上限的下载响应实现；生产上限固定为
 /// `min(archive.max_object_bytes, 64 MiB)`，测试用小上限覆盖边界。
+///
+/// 成功时把 `permit` 移入 [`ArchiveDownloadBody`]，由 body 的生命周期持有；
+/// 任何错误返回都会在这里 drop permit，不会泄漏。
 async fn archive_download_response_with_limit(
     object: &ArchiveObject,
     store: &dyn ColdStore,
     limit: u64,
+    permit: OwnedSemaphorePermit,
 ) -> Result<Response, ApiError> {
     // 先看数据库记录：超限完全不触碰后端，避免把异常对象读进内存。
     if object.bytes > limit {
@@ -2206,7 +2212,12 @@ async fn archive_download_response_with_limit(
         .map_err(|_| archive_unavailable())?;
     let length =
         HeaderValue::from_str(&data.len().to_string()).map_err(|_| archive_unavailable())?;
-    let mut response = Response::new(Body::from(data));
+    let body = ArchiveDownloadBody {
+        data: Bytes::from(data),
+        offset: 0,
+        _permit: permit,
+    };
+    let mut response = Response::new(Body::new(body));
     *response.status_mut() = StatusCode::OK;
     let headers = response.headers_mut();
     headers.insert(
@@ -2220,6 +2231,56 @@ async fn archive_download_response_with_limit(
         HeaderValue::from_static("private, no-store"),
     );
     Ok(response)
+}
+
+/// 下载 body 的分块大小；body 被 hyper 读完之前一直持有下载许可。
+///
+/// 读完最后一块后 body 才可能被 drop，此时最多只剩最后一块（64 KiB）在传输，
+/// 不会出现多个 64 MiB 对象同时驻留内存。
+const ARCHIVE_DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
+
+/// 持有下载许可的归档响应 body。
+///
+/// `ColdStore::get` 返回完整 `Vec<u8>`，转换为 `Bytes` 后由本 body 持有；
+/// 只有 body 读完 / 被 drop 时 `OwnedSemaphorePermit` 才释放。
+struct ArchiveDownloadBody {
+    data: Bytes,
+    offset: usize,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl HttpBody for ArchiveDownloadBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<BodyFrame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.offset >= this.data.len() {
+            return Poll::Ready(None);
+        }
+        let end = this
+            .offset
+            .saturating_add(ARCHIVE_DOWNLOAD_CHUNK_BYTES)
+            .min(this.data.len());
+        // 复制到独立 Bytes：hyper 若在 permit 释放后仍缓冲某些 frame，也不会
+        // 通过 slice 的引用计数把整个 64 MiB 对象继续留在内存里。
+        let chunk = Bytes::copy_from_slice(&this.data[this.offset..end]);
+        this.offset = end;
+        Poll::Ready(Some(Ok(BodyFrame::data(chunk))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.offset >= self.data.len()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let mut hint = SizeHint::default();
+        hint.set_exact((self.data.len() - self.offset) as u64);
+        hint
+    }
 }
 
 /// 管理 API 全部响应禁止缓存（含 token 的 401 与实时指标）。
@@ -5899,6 +5960,20 @@ mod tests {
             .unwrap()
             .to_vec();
         (status, headers, bytes)
+    }
+
+    /// 与 [`admin_call`] 相同，但**不读取响应 body**。
+    ///
+    /// 用于验证下载许可是否持有到 body 生命周期结束：调用方拿到 `Response`
+    /// 后可以只读一帧或直接 drop。
+    async fn admin_response(router: &Router, method: &str, uri: &str, token: &str) -> Response {
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        call_router(router, request).await
     }
 
     /// 给原始请求注入 ConnectInfo 后直接调用 Router；非 loopback 管理调用缺这个扩展
@@ -10012,6 +10087,13 @@ mod tests {
         }
     }
 
+    /// 直接测试下载响应构造时使用的独立许可（body 生命周期由测试控制）。
+    fn download_permit() -> OwnedSemaphorePermit {
+        Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("新建信号量必有 1 个许可")
+    }
+
     /// M4-C2b：对象列表按 id 倒序分页；error 只透传固定错误码，不泄露 URL。
     #[tokio::test]
     async fn m4c2b_archive_objects_list_paginates_and_sanitizes() {
@@ -10285,6 +10367,88 @@ mod tests {
         );
     }
 
+    /// M4-C4：许可必须持有到响应 body 结束；慢读 / 取消都不能提前归还。
+    #[tokio::test]
+    async fn m4c4_archive_download_permit_held_until_body_dropped() {
+        use crate::archive_webdav::test_support::MockDav;
+
+        let mock = MockDav::spawn().await;
+        let mut cfg = HubConfig::default();
+        cfg.archive.backend = rustboard_common::config::ArchiveBackend::Webdav;
+        cfg.archive.webdav = Some(mock.config());
+        let state = hub_state_with(cfg);
+        let read = v6_seed_token(&state, "archive-dl-body", "read");
+        let router = admin_router(state.clone());
+
+        let key = "rustboard/2026/10/24/part-00001.csv.gz";
+        // 大于 64 KiB：body 会产生多个 chunk，便于验证“部分读取仍持有许可”。
+        let data = vec![0x1f_u8; 200_000];
+        mock.inner
+            .lock()
+            .unwrap()
+            .objects
+            .insert(key.to_string(), data.clone());
+        let mut object = archive_object_record(key, ArchiveStatus::Uploaded, "");
+        object.bytes = data.len() as u64;
+        object.sha256 = sha256_hex(&data);
+        let id = state.storage.insert_archive_object(&object).unwrap();
+        let uri = format!("/api/v1/archive/objects/{id}/download");
+
+        // 第一个响应不读 body：许可应仍在 body 里。
+        let first = admin_response(&router, "GET", &uri, &read).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            state.archive_download_slots.available_permits(),
+            0,
+            "body 未读时许可不得提前释放"
+        );
+
+        // 第二个下载必须等待第一个 body 结束。
+        let second = {
+            let router = router.clone();
+            let read = read.clone();
+            let uri = uri.clone();
+            tokio::spawn(async move { admin_response(&router, "GET", &uri, &read).await })
+        };
+        let mut second = second;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "第一个 body 未读完时第二个下载必须等待"
+        );
+
+        // 慢读：只取一帧，许可仍由第一个 body 持有。
+        let mut first_body = Box::pin(first.into_body());
+        let frame = std::future::poll_fn(|cx| first_body.as_mut().poll_frame(cx)).await;
+        assert!(frame.is_some(), "应能读到第一帧");
+        assert_eq!(
+            state.archive_download_slots.available_permits(),
+            0,
+            "部分读取期间许可不得释放"
+        );
+
+        // 取消第二个等待请求：它不能占走 / 泄漏许可。
+        second.abort();
+        let _ = second.await;
+        assert_eq!(state.archive_download_slots.available_permits(), 0);
+
+        // drop 第一个 body → 许可归还。
+        drop(first_body);
+        assert_eq!(
+            state.archive_download_slots.available_permits(),
+            1,
+            "body drop 后许可必须归还"
+        );
+
+        // 再次下载成功；其 body 存活期间同样占用许可，drop 后归还。
+        let third = admin_response(&router, "GET", &uri, &read).await;
+        assert_eq!(third.status(), StatusCode::OK);
+        assert_eq!(state.archive_download_slots.available_permits(), 0);
+        drop(third);
+        assert_eq!(state.archive_download_slots.available_permits(), 1);
+    }
+
     /// M4-C2b：下载的状态码与路径 id 校验；后端不可用时固定 502，不泄露细节。
     #[tokio::test]
     async fn m4c2b_archive_download_maps_404_409_502_and_rejects_bad_ids() {
@@ -10384,7 +10548,7 @@ mod tests {
 
         // 缺失对象 → 502。
         let object = archive_object_record(key, ArchiveStatus::Uploaded, "");
-        let error = archive_download_response(&cfg, &object, &store)
+        let error = archive_download_response(&cfg, &object, &store, download_permit())
             .await
             .map(|_| ())
             .expect_err("缺失对象必须失败");
@@ -10399,7 +10563,7 @@ mod tests {
         // 数据库记录超过 64 MiB → 413；对象不存在也必须是 413（证明未 get）。
         let mut oversized = archive_object_record(key, ArchiveStatus::Uploaded, "");
         oversized.bytes = MAX_ARCHIVE_DOWNLOAD_BYTES + 1;
-        let error = archive_download_response(&cfg, &oversized, &store)
+        let error = archive_download_response(&cfg, &oversized, &store, download_permit())
             .await
             .map(|_| ())
             .expect_err("超限对象必须失败");
@@ -10419,10 +10583,11 @@ mod tests {
         };
         let mut small_record = archive_object_record(key, ArchiveStatus::Uploaded, "");
         small_record.bytes = 1;
-        let error = archive_download_response_with_limit(&small_record, &head_store, 16)
-            .await
-            .map(|_| ())
-            .expect_err("HEAD 超限必须失败");
+        let error =
+            archive_download_response_with_limit(&small_record, &head_store, 16, download_permit())
+                .await
+                .map(|_| ())
+                .expect_err("HEAD 超限必须失败");
         assert!(matches!(
             error,
             ApiError::TooLarge {
@@ -10442,10 +10607,11 @@ mod tests {
         let mut short_record = archive_object_record(key, ArchiveStatus::Uploaded, "");
         short_record.bytes = 10;
         short_record.sha256 = sha256_hex(&data);
-        let error = archive_download_response_with_limit(&short_record, &store, 1024)
-            .await
-            .map(|_| ())
-            .expect_err("短读必须失败");
+        let error =
+            archive_download_response_with_limit(&short_record, &store, 1024, download_permit())
+                .await
+                .map(|_| ())
+                .expect_err("短读必须失败");
         assert!(matches!(
             error,
             ApiError::BadGateway {
@@ -10458,10 +10624,11 @@ mod tests {
         let mut tampered = archive_object_record(key, ArchiveStatus::Uploaded, "");
         tampered.bytes = data.len() as u64;
         tampered.sha256 = "0".repeat(64);
-        let error = archive_download_response_with_limit(&tampered, &store, 1024)
-            .await
-            .map(|_| ())
-            .expect_err("SHA-256 不符必须失败");
+        let error =
+            archive_download_response_with_limit(&tampered, &store, 1024, download_permit())
+                .await
+                .map(|_| ())
+                .expect_err("SHA-256 不符必须失败");
         assert!(matches!(
             error,
             ApiError::BadGateway {
@@ -10476,7 +10643,7 @@ mod tests {
             ArchiveStatus::Uploaded,
             "",
         );
-        let error = archive_download_response(&cfg, &weird, &store)
+        let error = archive_download_response(&cfg, &weird, &store, download_permit())
             .await
             .map(|_| ())
             .expect_err("非标准 key 必须失败");
