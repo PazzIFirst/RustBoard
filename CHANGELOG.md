@@ -25,7 +25,7 @@
   后端、按 UTC 天/分片 worker、`archive test|status|run`、retention 归档门禁
 - M4-C2b/C4：S3 冷存储接入归档 worker / `archive test` / `archive run`；
   hub 新增 `GET /api/v1/archive/objects` 游标分页与
-  `GET /api/v1/archive/objects/{id}/download`（read scope、32 MiB 上限、
+  `GET /api/v1/archive/objects/{id}/download`（read scope、64 MiB 内存上限、
   固定 502）；面板新增 `/archive` 数据页与 1 GiB 上限的流式下载代理
 - M4 数据页：归档对象列表/下载、sha256/状态展示、`/archive` 页面
 
