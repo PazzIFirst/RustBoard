@@ -31,7 +31,7 @@ use hyper::body::Incoming;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use rustboard_common::config::HubConfig;
+use rustboard_common::config::{AdminTlsMode, HubConfig};
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 use rustboard_common::tls;
 use rustboard_common::util::{
@@ -93,6 +93,12 @@ const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const ADMIN_MAX_CONNECTIONS: usize = 256;
 /// 管理 API 单来源 IP 并发连接上限；只绑回环时同样生效。
 const ADMIN_MAX_CONNECTIONS_PER_IP: usize = 32;
+/// 管理 API TLS 握手超时：半开 TLS 连接最多占用 10s。
+const ADMIN_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 管理端 TLS 热加载轮询周期：跟踪 mTLS 监听器已经验证并切换过的 live 证书。
+const ADMIN_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(2);
+/// 管理端 TLS 热加载构建失败的最小告警间隔，避免坏证书每 2s 刷日志。
+const ADMIN_TLS_RELOAD_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// 单条 WebSocket 帧的写超时；写不出去说明对端已经不读了，直接清理会话。
 const SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// 客户端续签请求里 CSR 的 PEM 长度上限（16 KiB）。
@@ -191,6 +197,9 @@ enum Cmd {
         agent_listen: Option<String>,
         #[arg(long)]
         admin_listen: Option<String>,
+        /// 管理 API 传输模式：off（仅回环明文，默认）或 required（HTTPS）。
+        #[arg(long, value_parser = ["off", "required"])]
+        admin_tls: Option<String>,
         /// 追加到服务端证书 SAN 的地址，可重复。
         #[arg(long = "san")]
         sans: Vec<String>,
@@ -332,6 +341,7 @@ fn main() -> Result<()> {
             data_dir,
             agent_listen,
             admin_listen,
+            admin_tls,
             sans,
             advertise,
             ca_days,
@@ -344,6 +354,7 @@ fn main() -> Result<()> {
             data_dir,
             agent_listen,
             admin_listen,
+            admin_tls,
             sans,
             advertise,
             ca_days,
@@ -587,6 +598,7 @@ fn init(
     data_dir: Option<PathBuf>,
     agent_listen: Option<String>,
     admin_listen: Option<String>,
+    admin_tls: Option<String>,
     sans: Vec<String>,
     advertise: Option<String>,
     ca_days: Option<u32>,
@@ -600,6 +612,10 @@ fn init(
         bail!("{} 已存在，使用 --force 覆盖", path.display());
     }
     let mut cfg = HubConfig::default();
+    // 默认 off；`required` 复用随后签发的 server.crt / server.key。
+    if admin_tls.as_deref() == Some("required") {
+        cfg.admin_tls = AdminTlsMode::Required;
+    }
     if let Some(d) = data_dir {
         cfg.database = format!("sqlite://{}/rustboard.db", d.display());
         cfg.data_dir = d;
@@ -669,7 +685,27 @@ fn init(
         cfg.renew_before_days
     );
     println!("agent 接入监听: {}", cfg.agent_listen);
-    println!("管理 API 监听: {}", cfg.admin_listen);
+    println!(
+        "管理 API 监听: {}（{}）",
+        cfg.admin_listen,
+        match cfg.admin_tls {
+            AdminTlsMode::Off => "HTTP",
+            AdminTlsMode::Required => "HTTPS",
+        }
+    );
+    if cfg.admin_tls == AdminTlsMode::Off {
+        // init 允许先落盘（便于之后改配置），但必须明确告知随后 run 会拒绝。
+        if let Ok(true) = admin_listen_is_non_loopback(&cfg.admin_listen) {
+            println!(
+                "警告: admin_tls=\"off\" 且管理 API 监听在非回环地址 {}；\
+                 启动会拒绝。请改用 --admin-tls required，或只绑回环 + TLS 反向代理。",
+                cfg.admin_listen
+            );
+        }
+    } else {
+        println!("管理 API HTTPS：复用 server.crt / server.key（server-auth，不要求客户端证书）");
+        println!("  证书 SAN 必须包含管理端访问地址；变更 server_names 后需执行 rotate-cert。");
+    }
     println!("管理 API token: {}", cfg.admin_token);
     println!("  面板/脚本访问管理 API 时使用 Authorization: Bearer <token>；");
     println!("  可随时用 `rustboard-hub admin-token` 查看（为空时会重新生成）。");
@@ -694,7 +730,13 @@ fn print_ports(config: Option<PathBuf>) -> Result<()> {
     println!("  监听: {}", cfg.agent_listen);
     println!("  对外: wss://<公网IP>:{agent_port}/agent/ws");
     println!("管理 API 端口: {admin_port}");
-    println!("  本机: http://127.0.0.1:{admin_port}");
+    println!(
+        "  本机: {}://127.0.0.1:{admin_port}",
+        match cfg.admin_tls {
+            AdminTlsMode::Off => "http",
+            AdminTlsMode::Required => "https",
+        }
+    );
     if let Some(host) = &cfg.advertise_host {
         println!("agent 连接地址: wss://{host}:{agent_port}/agent/ws");
     }
@@ -864,6 +906,9 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
     validate_hub_sample_interval(&cfg)?;
     // M2：管理 API 全部要求 Bearer token，空 token 不允许启动。
     require_admin_token(&cfg)?;
+    // v0.3.3：非回环管理监听禁止明文；required 时校验绑定 IP 在证书 SAN 内。
+    // 必须发生在任何监听 / 证书加载之前。
+    validate_admin_tls(&cfg)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -908,6 +953,9 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
             tls::fingerprint_of_pem(&pem)?
         };
         tracing::info!(fingerprint, "TLS 已启用");
+        // 管理端 watcher 以「启动时实际构建配置的证书」为基线，而不是启动后读 live：
+        // 避免极端竞态下把启动后才切换的指纹误当成已加载。
+        let initial_admin_fingerprint = fingerprint.clone();
 
         let sessions = SessionRegistry::new();
         let state = AppState {
@@ -930,7 +978,26 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         let (tls_tx, tls_rx) = watch::channel(tls_config);
         cert_rotation::spawn_server_renewal(state.cfg.clone(), tls_tx.clone(), live_cert.clone());
         // KI-10：每 10s 轮询磁盘证书，运行中 rotate 后 ≤10s 热加载（≤15s 验收）。
-        cert_rotation::spawn_cert_file_watcher(state.cfg.clone(), tls_tx, live_cert);
+        cert_rotation::spawn_cert_file_watcher(state.cfg.clone(), tls_tx, live_cert.clone());
+
+        // v0.3.3：管理端可选 HTTPS。复用 agent 入口的 server.crt/server.key，
+        // 但为 server-auth（不要求客户端证书）；watcher 轮询 live_cert 指纹，
+        // 换证成功后新连接使用新配置，构建失败保留旧配置。
+        let admin_tls = match cfg.admin_tls {
+            AdminTlsMode::Off => None,
+            AdminTlsMode::Required => {
+                let config = tls::admin_server_config(&cfg.data_dir, &cfg.server_names)
+                    .context("构建管理 API TLS 配置失败")?;
+                let (admin_tx, admin_rx) = watch::channel(config);
+                spawn_admin_tls_watcher(
+                    state.cfg.clone(),
+                    admin_tx,
+                    live_cert.clone(),
+                    initial_admin_fingerprint.clone(),
+                );
+                Some(admin_rx)
+            }
+        };
 
         if cfg.self_monitor {
             spawn_self_monitor(storage.clone(), cfg.clone());
@@ -946,7 +1013,14 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         let agent_addr = cfg.agent_listen.clone();
         let admin_addr = cfg.admin_listen.clone();
         tracing::info!(%agent_addr, "agent 接入监听（TLS）");
-        tracing::info!(%admin_addr, "管理 API 监听（HTTP，请只绑内网）");
+        match cfg.admin_tls {
+            AdminTlsMode::Off => {
+                tracing::info!(%admin_addr, "管理 API 监听（HTTP，仅回环）");
+            }
+            AdminTlsMode::Required => {
+                tracing::info!(%admin_addr, "管理 API 监听（HTTPS，server-auth）");
+            }
+        }
 
         tokio::try_join!(
             serve_tls(
@@ -956,38 +1030,75 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
                 cfg.max_connections,
                 cfg.max_connections_per_ip
             ),
-            serve(admin_app, admin_addr)
+            serve(admin_app, admin_addr, admin_tls)
         )?;
         Ok(())
     })
 }
 
-/// 管理监听地址是否需要非回环安全告警（KI-06）。
+/// 管理监听是否绑在非回环地址；解析失败与 bind 一样视为启动错误。
 ///
-/// 解析失败与 bind 一样视为启动错误；回环地址（127.0.0.0/8、::1）不告警。
-fn admin_listen_needs_warning(addr: &str) -> Result<bool> {
+/// 回环范围沿用 `IpAddr::is_loopback`（IPv4 127.0.0.0/8、IPv6 ::1）。
+fn admin_listen_is_non_loopback(addr: &str) -> Result<bool> {
     let sock: SocketAddr = addr
         .parse()
         .with_context(|| format!("管理 API 监听地址非法: {addr}"))?;
     Ok(!sock.ip().is_loopback())
 }
 
-async fn serve(app: Router, addr: String) -> Result<()> {
+/// 启动前校验管理 API 的传输安全；任何失败都发生在监听之前。
+///
+/// - `off` 只允许回环：非回环直接拒绝（v0.3.3 有意的安全收紧）。
+/// - `required`：非通配绑定 IP 必须在 `server_names` 里，否则证书 SAN 不覆盖该地址，
+///   提示先更新 server_names 再 rotate-cert；`0.0.0.0` / `::` 通配绑定跳过该检查。
+fn validate_admin_tls(cfg: &HubConfig) -> Result<()> {
+    let sock: SocketAddr = cfg
+        .admin_listen
+        .parse()
+        .with_context(|| format!("管理 API 监听地址非法: {}", cfg.admin_listen))?;
+    match cfg.admin_tls {
+        AdminTlsMode::Off => {
+            if !sock.ip().is_loopback() {
+                bail!(
+                    "admin_tls=\"off\" 只允许管理 API 绑定回环地址（127.0.0.0/8、::1），\
+                     当前为 {}；请改用 admin_tls=\"required\"，或只绑回环 + TLS 反向代理",
+                    cfg.admin_listen
+                );
+            }
+        }
+        AdminTlsMode::Required => {
+            let ip = sock.ip();
+            if ip.is_unspecified() {
+                return Ok(());
+            }
+            let covered = cfg.server_names.iter().any(|name| {
+                name.parse::<IpAddr>()
+                    .is_ok_and(|candidate| candidate == ip)
+            });
+            if !covered {
+                bail!(
+                    "admin_tls=\"required\" 且管理 API 绑定 {ip}，但 server_names 中没有该 IP SAN；\
+                     请先把 {ip} 加入 server_names，再执行 `rustboard-hub rotate-cert --force` \
+                     重签服务端证书"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn serve(
+    app: Router,
+    addr: String,
+    tls: Option<watch::Receiver<Arc<rustls::ServerConfig>>>,
+) -> Result<()> {
     let sock: SocketAddr = addr
         .parse()
         .with_context(|| format!("管理 API 监听地址非法: {addr}"))?;
-    // KI-06：管理 API 是明文 HTTP，绑到非回环必须显式告警。
-    if admin_listen_needs_warning(&addr)? {
-        tracing::warn!(
-            %sock,
-            "管理 API 监听在非回环地址，且为明文 HTTP：只应置于 VPN / 可信反向代理之后，\
-             禁止直接暴露到公网"
-        );
-    }
     let listener = TcpListener::bind(sock)
         .await
         .with_context(|| format!("监听 {sock} 失败"))?;
-    serve_admin_listener(app, listener).await
+    serve_admin_listener(app, listener, tls).await
 }
 
 /// boxed body error，axum 的 `Body::new` 也接受这个错误类型。
@@ -1070,12 +1181,20 @@ where
 /// 不用 `axum::serve`：它没有 header 读超时，也拿不到连接数。这里手工 accept，
 /// 与 agent 的 mTLS 入口同款地做「全局 + 每来源 IP」并发限制、HTTP/1 header 超时，
 /// 保证半截 header 的慢连接最多占用 [`HEADER_READ_TIMEOUT`]，洪水下 `/healthz` 仍可用。
-async fn serve_admin_listener(app: Router, listener: TcpListener) -> Result<()> {
+///
+/// `tls` 为 `Some` 时每条新连接先做 TLS 握手（10s 超时），底层流随后交给
+/// [`serve_admin_connection`]；`None` 保持原有明文 HTTP 行为。
+async fn serve_admin_listener(
+    app: Router,
+    listener: TcpListener,
+    tls: Option<watch::Receiver<Arc<rustls::ServerConfig>>>,
+) -> Result<()> {
     let sock = listener.local_addr().context("读取管理 API 监听地址失败")?;
     let permits = Arc::new(Semaphore::new(ADMIN_MAX_CONNECTIONS.max(1)));
     let limits = Arc::new(ConnectionLimiter::new(ADMIN_MAX_CONNECTIONS_PER_IP));
     tracing::info!(
         %sock,
+        tls = tls.is_some(),
         max_connections = ADMIN_MAX_CONNECTIONS,
         max_connections_per_ip = ADMIN_MAX_CONNECTIONS_PER_IP,
         "管理 API 连接限制已启用"
@@ -1127,37 +1246,177 @@ async fn serve_admin_listener(app: Router, listener: TcpListener) -> Result<()> 
         }
 
         let app = app.clone();
+        // 每条新连接取一次最新 TLS 配置：watcher 换证只影响之后的新连接。
+        let tls_rx = tls.clone();
         tokio::spawn(async move {
             // 许可跟随连接生命周期；连接关闭（含超时）后自动归还。
             let _permit = permit;
             let _connection = connection;
 
-            // KI-05：管理限速 / 鉴权依赖 ConnectInfo<SocketAddr>，逐请求注入。
-            // KI-17：请求体套一次性总 deadline，慢 body 最多占 10s，不随 frame 重置。
-            let service = tower::service_fn(move |req: Request<Incoming>| {
-                let (mut parts, incoming) = req.into_parts();
-                parts.extensions.insert(ConnectInfo(peer));
-                let body = Body::new(DeadlineBody::new(incoming, BODY_READ_TIMEOUT));
-                let req = Request::from_parts(parts, body);
-                let app = app.clone();
-                async move { app.oneshot(req).await }
-            });
-
-            // 与 agent 入口一致：不用 hyper-util 的 auto builder（它有一个无超时的
-            // HTTP 版本嗅探阶段）；http1 Builder 只对「读 header」计时，header 超时
-            // 不会限制 body（body 由 DeadlineBody 的 10s 总 deadline 单独约束）。
-            if let Err(err) = hyper::server::conn::http1::Builder::new()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(HEADER_READ_TIMEOUT)
-                .serve_connection(TokioIo::new(tcp), TowerToHyperService::new(service))
-                .with_upgrades()
-                .await
-            {
-                // 只记录来源与错误，不记录请求头。
-                tracing::debug!(%peer, error = %err, "管理 API 连接结束");
+            match tls_rx {
+                None => serve_admin_connection(tcp, peer, app).await,
+                Some(rx) => {
+                    let config = rx.borrow().clone();
+                    let acceptor = TlsAcceptor::from(config);
+                    let stream = match tokio::time::timeout(
+                        ADMIN_TLS_HANDSHAKE_TIMEOUT,
+                        acceptor.accept(tcp),
+                    )
+                    .await
+                    {
+                        Ok(Ok(stream)) => stream,
+                        // 明文请求打到 HTTPS 端口、SNI/ALPN 错误等都只记 debug：
+                        // 未认证连接的错误细节不应进入 info 日志。
+                        Ok(Err(err)) => {
+                            tracing::debug!(%peer, error = %err, "管理 API TLS 握手失败");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::debug!(%peer, "管理 API TLS 握手超时");
+                            return;
+                        }
+                    };
+                    serve_admin_connection(stream, peer, app).await;
+                }
             }
         });
     }
+}
+
+/// 明文 TCP 与 TLS 流共用的管理连接服务。
+///
+/// 负责逐请求注入 `ConnectInfo<SocketAddr>`、套一次性 body deadline，并用 hyper
+/// HTTP/1 跑 axum。TLS 握手与 TLS 配置选择由调用方在 accept 循环完成。
+async fn serve_admin_connection<S>(stream: S, peer: SocketAddr, app: Router)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    // KI-05：管理限速 / 鉴权依赖 ConnectInfo<SocketAddr>，逐请求注入。
+    // KI-17：请求体套一次性总 deadline，慢 body 最多占 10s，不随 frame 重置。
+    let service = tower::service_fn(move |req: Request<Incoming>| {
+        let (mut parts, incoming) = req.into_parts();
+        parts.extensions.insert(ConnectInfo(peer));
+        let body = Body::new(DeadlineBody::new(incoming, BODY_READ_TIMEOUT));
+        let req = Request::from_parts(parts, body);
+        let app = app.clone();
+        async move { app.oneshot(req).await }
+    });
+
+    // 与 agent 入口一致：不用 hyper-util 的 auto builder（它有一个无超时的
+    // HTTP 版本嗅探阶段）；http1 Builder 只对「读 header」计时，header 超时
+    // 不会限制 body（body 由 DeadlineBody 的 10s 总 deadline 单独约束）。
+    if let Err(err) = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service))
+        .with_upgrades()
+        .await
+    {
+        // 只记录来源与错误，不记录请求头。
+        tracing::debug!(%peer, error = %err, "管理 API 连接结束");
+    }
+}
+
+/// 管理端 TLS 热加载 watcher。
+///
+/// 只跟随 mTLS 监听器已经校验并切换到的 live 证书指纹（2s 轮询），不重复实现磁盘
+/// 轮询；指纹变化后用同一对 server.crt/server.key 重建 server-auth 配置并通过 watch
+/// 推给 accept 循环。构建失败只 warn（每分钟最多一条）并保留旧配置。
+fn spawn_admin_tls_watcher(
+    cfg: Arc<HubConfig>,
+    tx: watch::Sender<Arc<rustls::ServerConfig>>,
+    live: Arc<RwLock<CertStatus>>,
+    initial_fingerprint: String,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(ADMIN_TLS_RELOAD_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_fingerprint = initial_fingerprint;
+        // 第一次 tick 立即完成：启动路径刚构建并校验过配置，直接跳过。
+        ticker.tick().await;
+
+        let mut last_warn: Option<Instant> = None;
+        loop {
+            ticker.tick().await;
+            let check_cfg = cfg.clone();
+            let check_tx = tx.clone();
+            let check_live = live.clone();
+            let last = last_fingerprint.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                reload_admin_tls_if_changed(&check_cfg, &check_tx, &check_live, &last)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(Some(fingerprint))) => {
+                    last_fingerprint = fingerprint;
+                    tracing::info!(
+                        fingerprint = %last_fingerprint,
+                        "管理 API TLS 证书已热加载（新连接生效）"
+                    );
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(err)) => {
+                    if should_warn_admin_tls(&mut last_warn) {
+                        tracing::warn!(
+                            error = %format!("{err:#}"),
+                            "管理 API TLS 证书热加载失败，保留旧配置（每分钟最多告警一次）"
+                        );
+                    }
+                }
+                Err(err) => {
+                    if should_warn_admin_tls(&mut last_warn) {
+                        tracing::warn!(error = %err, "管理 API TLS 热加载任务失败，下个周期重试");
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn live_fingerprint(live: &RwLock<CertStatus>) -> String {
+    live.read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .fingerprint
+        .clone()
+}
+
+/// 管理端 TLS 失败告警节流：返回 `true` 表示本次应告警并记录时间。
+fn should_warn_admin_tls(last_warn: &mut Option<Instant>) -> bool {
+    let now = Instant::now();
+    match last_warn {
+        Some(last) if now.duration_since(*last) < ADMIN_TLS_RELOAD_WARN_INTERVAL => false,
+        _ => {
+            *last_warn = Some(now);
+            true
+        }
+    }
+}
+
+/// 一次管理端 TLS 热加载尝试（独立函数便于单测）。
+///
+/// `last_fingerprint` 是 accept 循环当前配置对应的证书指纹；仅在 live 指纹变化且
+/// 新配置构建成功时推送，并返回新指纹。构建失败返回 `Err`，调用方保留旧配置。
+fn reload_admin_tls_if_changed(
+    cfg: &HubConfig,
+    tx: &watch::Sender<Arc<rustls::ServerConfig>>,
+    live: &RwLock<CertStatus>,
+    last_fingerprint: &str,
+) -> Result<Option<String>> {
+    let current = live_fingerprint(live);
+    if current == last_fingerprint {
+        return Ok(None);
+    }
+    let config = tls::admin_server_config(&cfg.data_dir, &cfg.server_names)
+        .context("管理 API TLS 配置构建失败")?;
+    // 构建期间证书可能又被 rotate：与 mTLS 热加载一致，本周期跳过，下周期重试。
+    let confirmed = cert_rotation::read_disk_cert_status(cfg)?;
+    if confirmed.fingerprint != current {
+        tracing::debug!("证书在管理端热加载过程中再次变化，本周期跳过");
+        return Ok(None);
+    }
+    tx.send_replace(config);
+    Ok(Some(confirmed.fingerprint))
 }
 
 /// 组装管理 API：`/healthz` 放行，`/api/v1/*` 统一 Bearer 鉴权 + 限速 + 64 KiB 请求体上限。
@@ -4017,6 +4276,7 @@ mod tests {
             Some(data_dir.clone()),
             Some("127.0.0.1:0".to_string()),
             Some("127.0.0.1:0".to_string()),
+            None,
             vec!["bad name".to_string()],
             None,
             None,
@@ -4102,6 +4362,7 @@ mod tests {
                 Some(data.clone()),
                 Some("127.0.0.1:0".to_string()),
                 Some("127.0.0.1:0".to_string()),
+                None,
                 Vec::new(),
                 None,
                 None,
@@ -5394,30 +5655,52 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    /// KI-06：只有非回环管理监听需要告警；非法地址启动失败。
+    /// v0.3.3：off 只允许回环；required 要求非通配绑定 IP 有对应 SAN；非法地址启动失败。
     #[test]
-    fn v021_admin_listen_warns_only_for_non_loopback() {
+    fn v033_admin_tls_startup_validation() {
+        let with = |listen: &str, mode: AdminTlsMode| HubConfig {
+            admin_listen: listen.to_string(),
+            admin_tls: mode,
+            ..HubConfig::default()
+        };
+
+        // off + 回环：保持原有明文行为。
         for addr in ["127.0.0.1:8444", "127.1.2.3:1", "[::1]:8444"] {
-            assert!(
-                !admin_listen_needs_warning(addr).unwrap(),
-                "回环地址不应告警: {addr}"
-            );
+            validate_admin_tls(&with(addr, AdminTlsMode::Off))
+                .unwrap_or_else(|err| panic!("回环明文必须放行 {addr}: {err:#}"));
         }
+        // off + 非回环：v0.3.3 起拒绝启动，错误信息给出两条迁移路径。
         for addr in [
             "0.0.0.0:8444",
             "192.168.1.10:8444",
             "8.8.8.8:8444",
             "[::]:8444",
         ] {
-            assert!(
-                admin_listen_needs_warning(addr).unwrap(),
-                "非回环地址必须告警: {addr}"
-            );
+            let err = validate_admin_tls(&with(addr, AdminTlsMode::Off))
+                .expect_err("非回环明文必须拒绝启动");
+            let text = format!("{err:#}");
+            assert!(text.contains("admin_tls=\"required\""), "错误信息: {text}");
+            assert!(text.contains("回环"), "错误信息: {text}");
         }
         assert!(
-            admin_listen_needs_warning("not-an-address").is_err(),
+            validate_admin_tls(&with("not-an-address", AdminTlsMode::Off)).is_err(),
             "非法监听地址必须与 bind 一样启动失败"
         );
+
+        // required：绑定 IP 必须在 server_names 里（默认含 127.0.0.1）。
+        validate_admin_tls(&with("127.0.0.1:8444", AdminTlsMode::Required))
+            .expect("127.0.0.1 默认在 server_names，required 必须放行");
+        let err = validate_admin_tls(&with("127.0.0.2:8444", AdminTlsMode::Required))
+            .expect_err("缺失 IP SAN 必须拒绝启动");
+        let text = format!("{err:#}");
+        assert!(text.contains("server_names"), "错误信息: {text}");
+        assert!(text.contains("rotate-cert"), "错误信息: {text}");
+
+        // 通配绑定跳过 SAN 检查（由客户端 hostname/反代决定访问名）。
+        for addr in ["0.0.0.0:8444", "[::]:8444"] {
+            validate_admin_tls(&with(addr, AdminTlsMode::Required))
+                .unwrap_or_else(|err| panic!("通配绑定必须放行 {addr}: {err:#}"));
+        }
     }
 
     /// KI-10：`/api/v1/system` 保留旧字段并新增 live/disk，顶层等于 live。
@@ -6620,7 +6903,7 @@ mod tests {
             .route("/peer", get(test_peer_ip))
             .route("/consume", axum::routing::post(test_consume_body));
         let server = tokio::spawn(async move {
-            let _ = serve_admin_listener(app, listener).await;
+            let _ = serve_admin_listener(app, listener, None).await;
         });
         (addr, server)
     }
@@ -7300,5 +7583,245 @@ mod tests {
             !entries[0].actor.contains(&token),
             "审计 actor 不能包含 token 明文"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // v0.3.3 A2：管理端 TLS
+    // ------------------------------------------------------------------
+
+    /// 管理端 TLS 测试材料：同一套 server.crt/key + 指定 SAN。
+    fn admin_tls_test_config(tag: &str, listen: &str, sans: &[&str]) -> HubConfig {
+        let dir = temp_dir(tag);
+        let server_names: Vec<String> = sans.iter().map(|san| (*san).to_string()).collect();
+        tls::ensure_hub_material(&dir, &server_names, tls::CertPolicy::default()).unwrap();
+        HubConfig {
+            data_dir: dir,
+            admin_listen: listen.to_string(),
+            admin_tls: AdminTlsMode::Required,
+            server_names,
+            ..HubConfig::default()
+        }
+    }
+
+    /// 用测试证书目录里的 CA 构建 server-auth 客户端（不携带客户端证书）。
+    fn admin_tls_client_config(data_dir: &std::path::Path) -> Arc<rustls::ClientConfig> {
+        let ca_pem = std::fs::read_to_string(tls::cert_dir(data_dir).join(tls::CA_CERT_FILE))
+            .expect("读取测试 CA");
+        let mut roots = rustls::RootCertStore::empty();
+        let (added, _) = roots.add_parsable_certificates(tls::load_certs(&ca_pem).unwrap());
+        assert!(added > 0, "测试 CA 必须能载入信任库");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Arc::new(config)
+    }
+
+    fn der_fingerprint(der: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(der))
+    }
+
+    /// 起一个只含 `/healthz` 的 HTTPS 管理监听，返回连接信息与热加载句柄。
+    async fn spawn_test_admin_tls_server(
+        sans: &[&str],
+    ) -> (
+        SocketAddr,
+        Arc<RwLock<CertStatus>>,
+        watch::Sender<Arc<rustls::ServerConfig>>,
+        HubConfig,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let cfg = admin_tls_test_config("admin-tls", "127.0.0.1:0", sans);
+        let config = tls::admin_server_config(&cfg.data_dir, &cfg.server_names).unwrap();
+        let (tx, rx) = watch::channel(config);
+        let live = Arc::new(RwLock::new(
+            cert_rotation::read_disk_cert_status(&cfg).unwrap(),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定测试端口");
+        let addr = listener.local_addr().expect("读取测试端口");
+        let app = Router::new().route("/healthz", get(healthz));
+        let server = tokio::spawn(async move {
+            let _ = serve_admin_listener(app, listener, Some(rx)).await;
+        });
+        (addr, live, tx, cfg, server)
+    }
+
+    /// 发起一次 HTTPS GET，返回响应文本与该连接实际看到的服务端证书。
+    async fn test_https_get(
+        addr: SocketAddr,
+        config: Arc<rustls::ClientConfig>,
+        path: &str,
+    ) -> std::io::Result<(String, Vec<Vec<u8>>)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let server_name =
+            rustls::pki_types::ServerName::try_from("127.0.0.1").expect("测试 server name 合法");
+        let connector = tokio_rustls::TlsConnector::from(config);
+        let mut stream = connector.connect(server_name, tcp).await?;
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let peer_certs = stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .map(|certs| certs.iter().map(|cert| cert.as_ref().to_vec()).collect())
+            .unwrap_or_default();
+        Ok((String::from_utf8_lossy(&response).into_owned(), peer_certs))
+    }
+
+    /// required：HTTPS `/healthz` 200；明文 TCP 发同一请求拿不到 HTTP 200。
+    #[tokio::test]
+    async fn v033_admin_tls_required_serves_https_only() {
+        // 握手超时是安全边界，锁定 10s。
+        assert_eq!(ADMIN_TLS_HANDSHAKE_TIMEOUT, Duration::from_secs(10));
+
+        let (addr, _live, _tx, cfg, server) =
+            spawn_test_admin_tls_server(&["localhost", "127.0.0.1"]).await;
+        let client = admin_tls_client_config(&cfg.data_dir);
+        let (response, certs) = test_https_get(addr, client, "/healthz")
+            .await
+            .expect("HTTPS 请求失败");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "HTTPS /healthz 必须 200: {response}"
+        );
+        assert!(!certs.is_empty(), "客户端必须收到服务端证书");
+        assert_eq!(
+            der_fingerprint(&certs[0]),
+            cert_rotation::read_disk_cert_status(&cfg)
+                .unwrap()
+                .fingerprint,
+            "HTTPS 必须使用 server.crt"
+        );
+
+        // 明文请求直接打进 TLS 端口：握手失败/连接关闭，绝不能拿到 HTTP 200。
+        if let Ok(text) = test_http_get(addr, "/healthz").await {
+            assert!(
+                !text.starts_with("HTTP/1.1 200"),
+                "明文请求不得拿到 HTTP 200: {text}"
+            );
+        }
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&cfg.data_dir);
+    }
+
+    /// 证书轮换：watcher 重建 server-auth 配置后，新连接使用新证书。
+    #[tokio::test]
+    async fn v033_admin_tls_hot_reload_uses_new_certificate() {
+        let (addr, live, tx, cfg, server) =
+            spawn_test_admin_tls_server(&["localhost", "127.0.0.1"]).await;
+        let client = admin_tls_client_config(&cfg.data_dir);
+        let old_fingerprint = cert_rotation::read_disk_cert_status(&cfg)
+            .unwrap()
+            .fingerprint;
+
+        let (_, certs) = test_https_get(addr, client.clone(), "/healthz")
+            .await
+            .expect("轮换前 HTTPS 请求失败");
+        assert_eq!(der_fingerprint(&certs[0]), old_fingerprint);
+
+        // 同一 CA / 同一 SAN 重签：客户端信任链不变，只有指纹变化。
+        let renewed = cert_rotation::renew_server_cert_files(&cfg, true, None)
+            .unwrap()
+            .expect("--force 必须重签");
+        assert_ne!(renewed.fingerprint, old_fingerprint);
+        let new_fingerprint = renewed.fingerprint;
+
+        // 模拟 mTLS watcher 已成功切换 live；管理端 watcher 只跟随这个指纹。
+        *live.write().unwrap() = cert_rotation::read_disk_cert_status(&cfg).unwrap();
+        let (_, certs) = test_https_get(addr, client.clone(), "/healthz")
+            .await
+            .expect("推送前 HTTPS 请求失败");
+        assert_eq!(
+            der_fingerprint(&certs[0]),
+            old_fingerprint,
+            "watch 未推送前 accept 循环必须继续使用旧配置"
+        );
+
+        let pushed = reload_admin_tls_if_changed(&cfg, &tx, &live, &old_fingerprint).unwrap();
+        assert_eq!(pushed.as_deref(), Some(new_fingerprint.as_str()));
+
+        let (response, certs) = test_https_get(addr, client, "/healthz")
+            .await
+            .expect("热加载后 HTTPS 请求失败");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(
+            der_fingerprint(&certs[0]),
+            new_fingerprint,
+            "新连接必须使用轮换后的证书"
+        );
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&cfg.data_dir);
+    }
+
+    /// init 持久化 `--admin-tls`；非回环 + off 仍成功落盘（run 时才拒绝）。
+    #[test]
+    fn v033_init_persists_admin_tls_mode() {
+        let dir = temp_dir("init-admin-tls");
+        let cfg_path = dir.join("hub.toml");
+        let data_dir = dir.join("data");
+        init(
+            Some(cfg_path.clone()),
+            Some(data_dir.clone()),
+            Some("127.0.0.1:0".to_string()),
+            Some("127.0.0.1:0".to_string()),
+            Some("required".to_string()),
+            vec!["127.0.0.1".to_string()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("init --admin-tls required 必须成功");
+        let cfg = HubConfig::load(&cfg_path).unwrap();
+        assert_eq!(cfg.admin_tls, AdminTlsMode::Required);
+        assert_eq!(cfg.admin_listen, "127.0.0.1:0");
+        assert!(tls::cert_dir(&data_dir)
+            .join(tls::SERVER_CERT_FILE)
+            .exists());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 非回环 + 默认 off：init 仍成功（随后 run 会拒绝），便于先落盘再改。
+        let dir = temp_dir("init-admin-tls-off");
+        let cfg_path = dir.join("hub.toml");
+        init(
+            Some(cfg_path.clone()),
+            Some(dir.join("data")),
+            Some("127.0.0.1:0".to_string()),
+            Some("0.0.0.0:0".to_string()),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("非回环 off 的 init 必须成功且打印警告");
+        let cfg = HubConfig::load(&cfg_path).unwrap();
+        assert_eq!(cfg.admin_tls, AdminTlsMode::Off);
+        assert!(
+            validate_admin_tls(&cfg).is_err(),
+            "该配置在 run 时必须被拒绝"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
