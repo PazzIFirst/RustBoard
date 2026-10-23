@@ -14,14 +14,12 @@
 //! - 响应体解析按渠道校验 `ok` / `errcode` / `code`，并把读取上限卡在 64 KiB；
 //! - `reqwest` 固定 `.no_proxy()`、总超时、禁止重定向、仅 HTTPS。
 //!
-//! 生产代码只通过 [`HttpNotifier::new`] 构造；测试用 [`MockNotifier`] 或模块内
-//! 的 fake transport，不需要、也不允许把任意 URL 暴露到配置/API。
-
-// B2a 只落地发送器，B2b 才会在告警路由/队列中接线；接线前允许未使用。
-#![allow(dead_code)]
+//! 生产代码只通过 [`HttpNotifier::new`] 构造；测试用 [`MockNotifier`]（仅
+//! `cfg(test)`）或模块内的 fake transport，不需要、也不允许把任意 URL 暴露到
+//! 配置/API。
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -74,7 +72,12 @@ pub enum NotifyError {
     Transport,
     /// 上游返回非 2xx。
     HttpStatus(u16),
-    /// 上游 2xx 但响应体不是该渠道的成功结构。
+    /// 上游 2xx 但业务状态码非 0（例如企业微信 `errcode=40014`）。
+    ///
+    /// 这类响应说明请求格式 / 凭据被上游明确拒绝，重试不会成功；与
+    /// [`Self::ResponseInvalid`]（响应结构本身不可解析）区分开。
+    Rejected,
+    /// 上游 2xx 但响应体不是该渠道的成功结构（JSON 损坏 / 缺字段）。
     ResponseInvalid,
 }
 
@@ -88,19 +91,20 @@ impl NotifyError {
             Self::Timeout => "timeout",
             Self::Transport => "transport",
             Self::HttpStatus(_) => "http_status",
+            Self::Rejected => "rejected",
             Self::ResponseInvalid => "response_invalid",
         }
     }
 
     /// 是否值得重试。
     ///
-    /// 配置/文本错误与 4xx（除 408/429）重试也不会成功；超时、网络错误、
-    /// 响应异常、429 与 5xx 是瞬态失败，按 `max_attempts` 退避重试。
+    /// 配置/文本错误、业务拒绝与 4xx（除 408/429）重试也不会成功；超时、网络
+    /// 错误、响应异常、429 与 5xx 是瞬态失败，按 `max_attempts` 退避重试。
     pub fn is_retryable(self) -> bool {
         match self {
             Self::Timeout | Self::Transport | Self::ResponseInvalid => true,
             Self::HttpStatus(status) => matches!(status, 408 | 429) || status >= 500,
-            Self::InvalidConfig | Self::InvalidText | Self::ClientBuild => false,
+            Self::InvalidConfig | Self::InvalidText | Self::ClientBuild | Self::Rejected => false,
         }
     }
 }
@@ -114,6 +118,7 @@ impl fmt::Display for NotifyError {
             Self::Timeout => f.write_str("通知请求超时"),
             Self::Transport => f.write_str("通知请求失败"),
             Self::HttpStatus(status) => write!(f, "通知端点返回 HTTP {status}"),
+            Self::Rejected => f.write_str("通知端点拒绝了请求"),
             Self::ResponseInvalid => f.write_str("通知端点响应异常"),
         }
     }
@@ -381,27 +386,39 @@ fn hmac_sha256_base64(key: &[u8], message: &[u8]) -> String {
 }
 
 /// 校验上游 2xx 响应的成功结构。
+///
+/// 区分两类失败：
+/// - 结构合法但业务码非 0（Telegram `ok=false`、企微 / 钉钉 `errcode != 0`、
+///   飞书 `code != 0`）→ [`NotifyError::Rejected`]，**不重试**；
+/// - 响应不是合法 JSON / 缺少期望字段 / 字段类型不对 → [`NotifyError::ResponseInvalid`]，
+///   可能是代理或上游异常，按瞬态失败重试。
 fn classify_response(kind: ChannelKind, response: TransportResponse) -> Result<(), NotifyError> {
     if !(200..=299).contains(&response.status) {
         return Err(NotifyError::HttpStatus(response.status));
     }
     let value: Value =
         serde_json::from_slice(&response.body).map_err(|_| NotifyError::ResponseInvalid)?;
-    let success = match kind {
-        ChannelKind::Telegram => value.get("ok").and_then(Value::as_bool) == Some(true),
-        ChannelKind::Wecom | ChannelKind::Dingtalk => {
-            value.get("errcode").and_then(Value::as_i64) == Some(0)
-        }
-        ChannelKind::Feishu => value.get("code").and_then(Value::as_i64) == Some(0),
-    };
-    if success {
-        Ok(())
-    } else {
-        Err(NotifyError::ResponseInvalid)
+    match kind {
+        ChannelKind::Telegram => match value.get("ok").and_then(Value::as_bool) {
+            Some(true) => Ok(()),
+            Some(false) => Err(NotifyError::Rejected),
+            None => Err(NotifyError::ResponseInvalid),
+        },
+        ChannelKind::Wecom | ChannelKind::Dingtalk => match value.get("errcode") {
+            Some(code) if code.as_i64() == Some(0) => Ok(()),
+            Some(code) if code.as_i64().is_some() => Err(NotifyError::Rejected),
+            _ => Err(NotifyError::ResponseInvalid),
+        },
+        ChannelKind::Feishu => match value.get("code") {
+            Some(code) if code.as_i64() == Some(0) => Ok(()),
+            Some(code) if code.as_i64().is_some() => Err(NotifyError::Rejected),
+            _ => Err(NotifyError::ResponseInvalid),
+        },
     }
 }
 
 /// 测试用通知记录（只含渠道标识与文本，不含配置 / secret）。
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentNotification {
     /// 渠道 id。
@@ -414,6 +431,7 @@ pub struct SentNotification {
     pub text: String,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct MockState {
     sent: Vec<SentNotification>,
@@ -424,15 +442,17 @@ struct MockState {
 /// 可注入的假通知器：记录调用并按队列返回成功/失败。
 ///
 /// 用于 B2b/B3 的路由、队列与 API 测试；不会发起任何网络请求。
+#[cfg(test)]
 pub struct MockNotifier {
-    state: Mutex<MockState>,
+    state: std::sync::Mutex<MockState>,
 }
 
+#[cfg(test)]
 impl MockNotifier {
     /// 全部发送成功。
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(MockState::default()),
+            state: std::sync::Mutex::new(MockState::default()),
         }
     }
 
@@ -475,12 +495,14 @@ impl MockNotifier {
     }
 }
 
+#[cfg(test)]
 impl Default for MockNotifier {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl Notifier for MockNotifier {
     async fn send(&self, channel: &NotificationChannel, text: &str) -> Result<(), NotifyError> {
@@ -767,14 +789,27 @@ mod tests {
 
     #[tokio::test]
     async fn m4_b2a_errors_never_contain_secrets_or_urls() {
-        for (channel, secret_values) in [
-            (telegram(), vec![TELEGRAM_TOKEN]),
-            (wecom(), vec![WECOM_KEY]),
+        for (channel, secret_values, hosts) in [
+            (
+                telegram(),
+                vec![TELEGRAM_TOKEN],
+                vec!["api.telegram.org", "https://"],
+            ),
+            (
+                wecom(),
+                vec![WECOM_KEY],
+                vec!["qyapi.weixin.qq.com", "https://"],
+            ),
             (
                 dingtalk(),
                 vec![DINGTALK_TOKEN, DINGTALK_SECRET, DINGTALK_SIGN],
+                vec!["oapi.dingtalk.com", "https://"],
             ),
-            (feishu(), vec![FEISHU_TOKEN, FEISHU_SECRET, FEISHU_SIGN]),
+            (
+                feishu(),
+                vec![FEISHU_TOKEN, FEISHU_SECRET, FEISHU_SIGN],
+                vec!["open.feishu.cn", "https://"],
+            ),
         ] {
             for status in [500, 401] {
                 let transport = RecordingTransport::new(vec![Ok(response(status, b""))]);
@@ -785,8 +820,9 @@ mod tests {
                     .expect_err("非 2xx 必须失败");
                 let rendered = format!("{error} {error:?}");
                 assert_eq!(error, NotifyError::HttpStatus(status));
-                assert!(!rendered.contains("https://"));
-                assert!(!rendered.contains("api.telegram.org"));
+                for host in &hosts {
+                    assert!(!rendered.contains(host), "错误泄露了端点: {rendered}");
+                }
                 for secret in &secret_values {
                     assert!(!rendered.contains(secret), "错误泄露了 secret: {rendered}");
                 }
@@ -797,6 +833,25 @@ mod tests {
             let error = notifier.send(&channel, text()).await.unwrap_err();
             let rendered = format!("{error} {error:?}");
             assert_eq!(error, NotifyError::Timeout);
+            for host in &hosts {
+                assert!(!rendered.contains(host), "错误泄露了端点: {rendered}");
+            }
+            for secret in &secret_values {
+                assert!(!rendered.contains(secret));
+            }
+
+            // 业务拒绝同样只暴露固定错误码。
+            let transport = RecordingTransport::new(vec![Ok(response(
+                200,
+                br#"{"errcode":40014,"errmsg":"invalid token"}"#,
+            ))]);
+            let notifier = notifier_with(transport, 1);
+            let error = notifier.send(&channel, text()).await.unwrap_err();
+            let rendered = format!("{error} {error:?}");
+            assert!(!rendered.contains("invalid token"));
+            for host in &hosts {
+                assert!(!rendered.contains(host));
+            }
             for secret in &secret_values {
                 assert!(!rendered.contains(secret));
             }
@@ -841,6 +896,33 @@ mod tests {
         assert_eq!(transport.requests().len(), 1);
     }
 
+    /// 企业微信 / 钉钉的 `errcode=40014` 是「access_token 不合法」这类业务拒绝：
+    /// 2xx 但业务码非 0，重试只会重复失败，必须只发送一次。
+    #[tokio::test]
+    async fn m4_b2a_business_rejection_errcode_40014_is_attempted_once() {
+        let transport = RecordingTransport::new(vec![
+            Ok(response(
+                200,
+                br#"{"errcode":40014,"errmsg":"invalid token"}"#,
+            )),
+            Ok(response(
+                200,
+                br#"{"errcode":40014,"errmsg":"invalid token"}"#,
+            )),
+            Ok(response(
+                200,
+                br#"{"errcode":40014,"errmsg":"invalid token"}"#,
+            )),
+        ]);
+        let notifier = notifier_with(transport.clone(), 3);
+        assert_eq!(
+            notifier.send(&wecom(), text()).await.unwrap_err(),
+            NotifyError::Rejected
+        );
+        assert_eq!(transport.requests().len(), 1);
+        assert!(!NotifyError::Rejected.is_retryable());
+    }
+
     #[tokio::test]
     async fn m4_b2a_invalid_config_does_not_call_transport() {
         let mut channel = telegram();
@@ -860,7 +942,7 @@ mod tests {
         assert_eq!(
             classify_response(ChannelKind::Telegram, response(200, br#"{"ok":false}"#))
                 .unwrap_err(),
-            NotifyError::ResponseInvalid
+            NotifyError::Rejected
         );
         assert_eq!(
             classify_response(ChannelKind::Telegram, response(200, b"not-json")).unwrap_err(),
@@ -871,7 +953,11 @@ mod tests {
             assert!(classify_response(kind, response(200, br#"{"errcode":0}"#)).is_ok());
             assert_eq!(
                 classify_response(kind, response(200, br#"{"errcode":1}"#)).unwrap_err(),
-                NotifyError::ResponseInvalid
+                NotifyError::Rejected
+            );
+            assert_eq!(
+                classify_response(kind, response(200, br#"{"errcode":40014}"#)).unwrap_err(),
+                NotifyError::Rejected
             );
             assert_eq!(
                 classify_response(kind, response(200, br#"{"msg":"ok"}"#)).unwrap_err(),
@@ -883,7 +969,7 @@ mod tests {
         assert_eq!(
             classify_response(ChannelKind::Feishu, response(200, br#"{"code":19001}"#))
                 .unwrap_err(),
-            NotifyError::ResponseInvalid
+            NotifyError::Rejected
         );
         assert_eq!(
             classify_response(ChannelKind::Feishu, response(500, b"")).unwrap_err(),
@@ -931,12 +1017,21 @@ mod tests {
     }
 
     #[test]
-    fn m4_b2a_attempt_count_is_clamped() {
-        // 这里只验证夹取逻辑；不构造 reqwest client，避免测试依赖系统根证书。
-        let clamp = |attempts: u32| attempts.clamp(1, MAX_ATTEMPTS_LIMIT);
-        assert_eq!(clamp(0), 1);
-        assert_eq!(clamp(3), 3);
-        assert_eq!(clamp(99), MAX_ATTEMPTS_LIMIT);
+    fn m4_b2a_http_notifier_new_clamps_max_attempts() {
+        // 真正走一遍 `HttpNotifier::new`，确保构造器本身使用夹取后的值，而不只是
+        // 测试里另写一份 clamp。构建 reqwest client 不发起网络请求。
+        for (requested, expected) in [
+            (0, 1),
+            (1, 1),
+            (3, 3),
+            (MAX_ATTEMPTS_LIMIT, MAX_ATTEMPTS_LIMIT),
+            (MAX_ATTEMPTS_LIMIT + 1, MAX_ATTEMPTS_LIMIT),
+            (99, MAX_ATTEMPTS_LIMIT),
+        ] {
+            let notifier = HttpNotifier::new(Duration::from_secs(1), requested)
+                .expect("固定 HTTPS 端点应能构造 HTTP 客户端");
+            assert_eq!(notifier.max_attempts, expected, "requested={requested}");
+        }
     }
 
     #[test]
@@ -966,7 +1061,7 @@ mod tests {
         let notifier = notifier_with(transport, 1);
         let error = notifier.send(&telegram(), text()).await.unwrap_err();
         let rendered = format!("{error} {error:?}");
-        assert_eq!(error, NotifyError::ResponseInvalid);
+        assert_eq!(error, NotifyError::Rejected);
         assert!(!rendered.contains(TELEGRAM_TOKEN));
         assert!(!rendered.contains("description"));
     }

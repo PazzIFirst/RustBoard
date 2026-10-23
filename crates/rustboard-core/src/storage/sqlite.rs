@@ -16,6 +16,7 @@ use crate::alerts::{
     AlertEvent, AlertRule, AlertRuleStoreError, AlertSilence, AlertSilenceStoreError, AlertSource,
     AlertState, AlertStateKind, Comparator, MAX_ALERT_RULES, MAX_ALERT_SILENCES,
 };
+use crate::channels::{ChannelConfig, ChannelKind, NotificationChannel};
 
 use super::{
     AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, DownsampleRangeResult,
@@ -46,6 +47,9 @@ const AUDIT_CLEANUP_EVERY: u64 = 1_000;
 
 /// 审计 `params` 的存储上限（字节）；调用方已限长，这里是最后一道防线。
 const MAX_AUDIT_PARAMS_BYTES: usize = 1_024;
+
+/// 通知渠道总数硬上限（方案 §8.1 / B2 验收标准）。
+pub const MAX_NOTIFICATION_CHANNELS: usize = 50;
 
 /// `ingest_batches` 判重记录保留 48 小时；过期后重放视为新批次。
 const INGEST_BATCH_TTL_MS: i64 = 48 * 60 * 60 * 1000;
@@ -2698,6 +2702,59 @@ impl SqliteStorage {
         Ok(removed)
     }
 
+    /// 当前最大告警事件 id；没有事件时返回 0。
+    ///
+    /// B2 通知 worker 首次启动用它建立「上线水位」，避免把 B1b 阶段积压的历史
+    /// 事件全部补发出去。
+    pub fn max_alert_event_id(&self) -> Result<i64> {
+        Ok(self.lock_read().query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM alert_events",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// B2 通知队列：只取 `id > after_id` 且未通知、未静默的事件。
+    ///
+    /// 与 [`Self::list_pending_notification_events`] 的区别是带**持久化游标**：
+    /// worker 只处理首次上线之后的新事件，崩溃重启后从 `maintenance_state` 的
+    /// 水位继续，不会重放历史事件。`after_id` 由调用方保证非负。
+    pub fn list_pending_notification_events_after(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<AlertEvent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT {ALERT_EVENT_COLUMNS} FROM alert_events \
+             WHERE id > ?1 AND notified = 0 AND silenced = 0 ORDER BY id ASC LIMIT ?2"
+        );
+        let conn = self.lock_read();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![after_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+            alert_event_from_row,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// B2：把事件标记为「已处理」并保留固定原因（`no_channel` / `cooldown` 等）。
+    ///
+    /// [`Self::mark_notification_result`] 在 `notified = true` 时会清空错误（那是
+    /// 「发送成功」的语义），但通知 worker 需要对**跳过或全部失败**的事件同时写入
+    /// `notified = 1`（不再重试）与固定原因。原因由调用方保证已脱敏，存储层再做
+    /// 一次 UTF-8 字节截断。返回 `false` 表示事件 id 不存在。
+    pub fn mark_notification_processed(&self, id: i64, notify_error: &str) -> Result<bool> {
+        let stored_error = truncate_utf8(notify_error, MAX_ALERT_NOTIFY_ERROR_BYTES);
+        let updated = self.lock_write().execute(
+            "UPDATE alert_events SET notified = 1, notify_error = ?2 WHERE id = ?1",
+            params![id, stored_error],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// B2 通知队列：取未通知且未静默的事件，按 id 升序（先发生先发）。
     ///
     /// **silenced 事件永不返回**：静默只影响通知，事件本身仍保留给面板。
@@ -2764,6 +2821,289 @@ impl SqliteStorage {
             params![rule_id, agent_id, series_key, last_notified_at],
         )?;
         Ok(updated > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M4-B2b：通知渠道（schema v7 `notification_channels` 表）
+// ---------------------------------------------------------------------------
+
+/// `notification_channels` 的 SELECT 列表；列顺序与 [`notification_channel_from_row`]
+/// 一一对应。
+const NOTIFICATION_CHANNEL_COLUMNS: &str =
+    "id, name, kind, config_json, enabled, updated_by, created_at, updated_at";
+
+/// 通知渠道存储的领域错误；hub 映射成固定 HTTP 错误码。
+///
+/// 不携带名称 / id / 配置等用户输入，避免错误信息回显到响应或日志。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelStoreError {
+    /// 渠道不存在（404）。
+    NotFound,
+    /// 渠道名称重复（409 `channel_name_exists`）。
+    NameExists,
+    /// 渠道总数达到 [`MAX_NOTIFICATION_CHANNELS`]（409 `channel_limit`）。
+    LimitReached,
+    /// 渠道仍被 `alert_rules.channel_ids` 引用（409 `channel_in_use`）。
+    InUse,
+    /// 渠道配置 / 类型不合法（400）；消息是固定的中文原因。
+    Invalid(&'static str),
+}
+
+impl std::fmt::Display for ChannelStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "通知渠道不存在"),
+            Self::NameExists => write!(f, "通知渠道名称已存在"),
+            Self::LimitReached => write!(f, "通知渠道数量已达上限 {MAX_NOTIFICATION_CHANNELS} 条"),
+            Self::InUse => write!(f, "通知渠道仍被告警规则引用"),
+            Self::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ChannelStoreError {}
+
+/// 数据库里出现未知渠道类型 / 配置 JSON 损坏时产生的错误（不静默降级）。
+#[derive(Debug)]
+struct NotificationChannelColumnError(&'static str);
+
+impl std::fmt::Display for NotificationChannelColumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "notification_channels.{} 字段值非法", self.0)
+    }
+}
+
+impl std::error::Error for NotificationChannelColumnError {}
+
+fn notification_channel_column_error(column: usize, field: &'static str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        rusqlite::types::Type::Text,
+        Box::new(NotificationChannelColumnError(field)),
+    )
+}
+
+/// 一行 `notification_channels` 映射成 [`NotificationChannel`]。
+///
+/// `kind` 列与 `config_json.kind` 必须一致；任何一侧非法都返回明确错误，
+/// 不把损坏的行静默降级成默认渠道。
+fn notification_channel_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NotificationChannel> {
+    let kind_raw: String = row.get(2)?;
+    let kind = ChannelKind::parse(&kind_raw)
+        .ok_or_else(|| notification_channel_column_error(2, "kind"))?;
+    let config_json: String = row.get(3)?;
+    let config: ChannelConfig = serde_json::from_str(&config_json)
+        .map_err(|_| notification_channel_column_error(3, "config_json"))?;
+    if config.kind() != kind {
+        return Err(notification_channel_column_error(2, "kind"));
+    }
+    let enabled: i64 = row.get(4)?;
+    Ok(NotificationChannel {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind,
+        config,
+        enabled: enabled != 0,
+        updated_by: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+/// 把 `notification_channels.name` 的唯一约束冲突翻译成领域错误，不透传 SQL。
+fn map_notification_channel_unique_error(err: rusqlite::Error) -> anyhow::Error {
+    if let rusqlite::Error::SqliteFailure(inner, Some(message)) = &err {
+        if inner.code == rusqlite::ErrorCode::ConstraintViolation
+            && message.contains("notification_channels.name")
+        {
+            return ChannelStoreError::NameExists.into();
+        }
+    }
+    tracing::debug!(error = %err, "写入通知渠道失败（非名称唯一约束错误）");
+    anyhow::anyhow!("写入通知渠道失败（数据库错误，详见日志）")
+}
+
+/// 校验渠道可在存储层落库；错误固定为中文，不回显配置原文。
+fn validate_channel_for_store(channel: &NotificationChannel) -> Result<()> {
+    channel
+        .validate()
+        .map_err(|_| ChannelStoreError::Invalid("通知渠道配置不合法"))?;
+    Ok(())
+}
+
+impl SqliteStorage {
+    /// 列出全部通知渠道，按名称升序（名称 UNIQUE，顺序稳定）。
+    ///
+    /// 返回完整 [`NotificationChannel`]（含 secret），只允许 hub 内部使用；
+    /// API 响应必须走 `ChannelView`。
+    pub fn list_notification_channels(&self) -> Result<Vec<NotificationChannel>> {
+        let conn = self.lock_read();
+        let sql = format!(
+            "SELECT {NOTIFICATION_CHANNEL_COLUMNS} FROM notification_channels ORDER BY name ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], notification_channel_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 按 id 读取一条渠道；不存在返回 `None`。
+    pub fn get_notification_channel(&self, id: &str) -> Result<Option<NotificationChannel>> {
+        let sql = format!(
+            "SELECT {NOTIFICATION_CHANNEL_COLUMNS} FROM notification_channels WHERE id = ?1"
+        );
+        let conn = self.lock_read();
+        Ok(conn
+            .query_row(&sql, params![id], notification_channel_from_row)
+            .optional()?)
+    }
+
+    /// 渠道总数（供上限检查与面板统计）。
+    pub fn notification_channel_count(&self) -> Result<usize> {
+        let count: i64 = self.lock_read().query_row(
+            "SELECT COUNT(*) FROM notification_channels",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    /// 新建一条渠道。
+    ///
+    /// 事务内先查总数与名称，再写入；并发下仍由 `name UNIQUE` 兜底：
+    /// - 达到 [`MAX_NOTIFICATION_CHANNELS`] → [`ChannelStoreError::LimitReached`]；
+    /// - 名称重复 → [`ChannelStoreError::NameExists`]；
+    /// - `kind` 与 `config.kind` 不一致或字段非法 → [`ChannelStoreError::Invalid`]。
+    pub fn create_notification_channel(&self, channel: &NotificationChannel) -> Result<()> {
+        validate_channel_for_store(channel)?;
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM notification_channels", [], |row| {
+            row.get(0)
+        })?;
+        if count >= MAX_NOTIFICATION_CHANNELS as i64 {
+            return Err(ChannelStoreError::LimitReached.into());
+        }
+        let name_exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM notification_channels WHERE name = ?1",
+                params![channel.name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if name_exists.is_some() {
+            return Err(ChannelStoreError::NameExists.into());
+        }
+        let config_json = serde_json::to_string(&channel.config)?;
+        tx.execute(
+            "INSERT INTO notification_channels \
+             (id, name, kind, config_json, enabled, updated_by, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                channel.id,
+                channel.name,
+                channel.kind.as_str(),
+                config_json,
+                channel.enabled as i64,
+                channel.updated_by,
+                channel.created_at,
+                channel.updated_at,
+            ],
+        )
+        .map_err(map_notification_channel_unique_error)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 更新一条渠道的可写字段。
+    ///
+    /// - `id` 是定位键，`created_at` 保持数据库原值；
+    /// - 不存在 → [`ChannelStoreError::NotFound`]；
+    /// - 改成与其它渠道重名 → [`ChannelStoreError::NameExists`]；
+    /// - `kind` / `config.kind` 不一致或配置非法 → [`ChannelStoreError::Invalid`]。
+    ///
+    /// secret 保留语义由调用方用 `ChannelConfigInput::resolve` 完成，存储层只
+    /// 接收合并后的完整配置。
+    pub fn update_notification_channel(&self, channel: &NotificationChannel) -> Result<()> {
+        validate_channel_for_store(channel)?;
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM notification_channels WHERE id = ?1",
+                params![channel.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(ChannelStoreError::NotFound.into());
+        }
+        let name_exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM notification_channels WHERE name = ?1 AND id != ?2",
+                params![channel.name, channel.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if name_exists.is_some() {
+            return Err(ChannelStoreError::NameExists.into());
+        }
+        let config_json = serde_json::to_string(&channel.config)?;
+        tx.execute(
+            "UPDATE notification_channels SET name = ?2, kind = ?3, config_json = ?4, \
+             enabled = ?5, updated_by = ?6, updated_at = ?7 WHERE id = ?1",
+            params![
+                channel.id,
+                channel.name,
+                channel.kind.as_str(),
+                config_json,
+                channel.enabled as i64,
+                channel.updated_by,
+                channel.updated_at,
+            ],
+        )
+        .map_err(map_notification_channel_unique_error)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 删除一条渠道；仍被 `alert_rules.channel_ids` 引用时返回
+    /// [`ChannelStoreError::InUse`]，绝不留下悬空引用。
+    ///
+    /// 引用检查与 DELETE 在同一个 `IMMEDIATE` 事务内完成，避免检查通过后另一
+    /// 条规则写入引用造成竞态。`channel_ids` 是 JSON 数组，损坏时返回错误而不
+    /// 是放行删除。
+    pub fn delete_notification_channel(&self, id: &str) -> Result<()> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM notification_channels WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(ChannelStoreError::NotFound.into());
+        }
+        let references: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT id, channel_ids FROM alert_rules")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (rule_id, channel_ids) in references {
+            let ids: Vec<String> = serde_json::from_str(&channel_ids)
+                .with_context(|| format!("告警规则 {rule_id} 的 channel_ids 损坏，拒绝删除渠道"))?;
+            if ids.iter().any(|channel_id| channel_id == id) {
+                return Err(ChannelStoreError::InUse.into());
+            }
+        }
+        tx.execute(
+            "DELETE FROM notification_channels WHERE id = ?1",
+            params![id],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -6766,5 +7106,244 @@ mod tests {
                 .any(|line| line.trim() == "SCAN samples"),
             "不得出现全表扫描: {single_agent}"
         );
+    }
+    // ------------------------------------------------------------------
+    // M4-B2b：通知渠道存储
+    // ------------------------------------------------------------------
+
+    use crate::channels::{ChannelConfig, NotificationChannel, Secret};
+
+    fn notification_channel(name: &str) -> NotificationChannel {
+        static CHANNEL_SEQ: AtomicU64 = AtomicU64::new(1);
+        let seq = CHANNEL_SEQ.fetch_add(1, Ordering::Relaxed);
+        NotificationChannel {
+            id: format!("00000000-0000-4000-8000-{seq:012}"),
+            name: name.to_string(),
+            kind: ChannelKind::Telegram,
+            config: ChannelConfig::Telegram {
+                bot_token: Secret::new("123456789:AAH_test-token_0123456789"),
+                chat_id: "-1001234567890".to_string(),
+            },
+            enabled: true,
+            updated_by: "admin".to_string(),
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_001_000,
+        }
+    }
+
+    fn channel_store_error(err: anyhow::Error) -> ChannelStoreError {
+        *err.downcast_ref::<ChannelStoreError>()
+            .expect("必须是可映射的通知渠道领域错误")
+    }
+
+    /// CRUD 往返：配置原样读回、created_at 不被更新覆盖、删除后计数归零。
+    #[test]
+    fn m4_b2b_notification_channel_crud_roundtrip() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let channel = notification_channel("运维通知");
+        s.create_notification_channel(&channel).unwrap();
+        assert_eq!(s.notification_channel_count().unwrap(), 1);
+        assert_eq!(
+            s.get_notification_channel(&channel.id).unwrap(),
+            Some(channel.clone())
+        );
+        assert_eq!(s.get_notification_channel("missing").unwrap(), None);
+        assert_eq!(
+            s.list_notification_channels().unwrap(),
+            vec![channel.clone()]
+        );
+
+        let mut updated = channel.clone();
+        updated.name = "运维通知-2".to_string();
+        updated.enabled = false;
+        updated.updated_by = "write-token".to_string();
+        updated.updated_at = 1_700_000_999_000;
+        updated.config = ChannelConfig::Telegram {
+            bot_token: Secret::new("123456789:AAH_new-token_0123456789"),
+            chat_id: "-1009999999999".to_string(),
+        };
+        s.update_notification_channel(&updated).unwrap();
+        let stored = s.get_notification_channel(&channel.id).unwrap().unwrap();
+        assert_eq!(stored, updated);
+        assert_eq!(
+            stored.created_at, channel.created_at,
+            "created_at 不能被更新覆盖"
+        );
+
+        s.delete_notification_channel(&channel.id).unwrap();
+        assert_eq!(s.notification_channel_count().unwrap(), 0);
+        assert_eq!(s.get_notification_channel(&channel.id).unwrap(), None);
+
+        // 重复名称（含更新时改成别人的名字）→ NameExists。
+        let first = notification_channel("渠道-A");
+        s.create_notification_channel(&first).unwrap();
+        let mut duplicate = notification_channel("渠道-B");
+        duplicate.name = first.name.clone();
+        assert_eq!(
+            channel_store_error(s.create_notification_channel(&duplicate).unwrap_err()),
+            ChannelStoreError::NameExists
+        );
+        let mut rename = notification_channel("渠道-B");
+        s.create_notification_channel(&rename).unwrap();
+        rename.name = first.name.clone();
+        assert_eq!(
+            channel_store_error(s.update_notification_channel(&rename).unwrap_err()),
+            ChannelStoreError::NameExists
+        );
+        assert_eq!(s.notification_channel_count().unwrap(), 2);
+
+        // 不存在 / 类型不匹配 → 明确领域错误。
+        assert_eq!(
+            channel_store_error(s.update_notification_channel(&channel).unwrap_err()),
+            ChannelStoreError::NotFound
+        );
+        let mut wrong_kind = notification_channel("类型错误");
+        wrong_kind.kind = ChannelKind::Wecom;
+        assert_eq!(
+            channel_store_error(s.create_notification_channel(&wrong_kind).unwrap_err()),
+            ChannelStoreError::Invalid("通知渠道配置不合法")
+        );
+    }
+
+    /// 渠道上限 50：第 51 条拒绝写入，已有数据不受影响。
+    #[test]
+    fn m4_b2b_notification_channel_limit_is_enforced() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        for index in 0..MAX_NOTIFICATION_CHANNELS {
+            s.create_notification_channel(&notification_channel(&format!("渠道-{index}")))
+                .unwrap();
+        }
+        assert_eq!(
+            s.notification_channel_count().unwrap(),
+            MAX_NOTIFICATION_CHANNELS
+        );
+        let over = notification_channel("渠道-50");
+        assert_eq!(
+            channel_store_error(s.create_notification_channel(&over).unwrap_err()),
+            ChannelStoreError::LimitReached
+        );
+        assert_eq!(
+            s.notification_channel_count().unwrap(),
+            MAX_NOTIFICATION_CHANNELS,
+            "超限请求不能写库"
+        );
+    }
+
+    /// 删除前在同一事务内检查 `alert_rules.channel_ids`；引用存在时必须 409，
+    /// 解除引用后才能删除。
+    #[test]
+    fn m4_b2b_notification_channel_delete_rejects_in_use() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let channel = notification_channel("被引用渠道");
+        s.create_notification_channel(&channel).unwrap();
+        let mut rule = alert_rule("引用渠道规则");
+        rule.channel_ids = vec![channel.id.clone()];
+        s.create_alert_rule(&rule).unwrap();
+
+        assert_eq!(
+            channel_store_error(s.delete_notification_channel(&channel.id).unwrap_err()),
+            ChannelStoreError::InUse
+        );
+        assert!(
+            s.get_notification_channel(&channel.id).unwrap().is_some(),
+            "被引用渠道不能删除"
+        );
+
+        rule.channel_ids.clear();
+        s.update_alert_rule(&rule).unwrap();
+        s.delete_notification_channel(&channel.id).unwrap();
+        assert_eq!(s.get_notification_channel(&channel.id).unwrap(), None);
+        assert_eq!(
+            channel_store_error(s.delete_notification_channel(&channel.id).unwrap_err()),
+            ChannelStoreError::NotFound
+        );
+    }
+
+    /// B2 游标查询：只返回 `id > cursor` 且未通知、未静默的事件。
+    #[test]
+    fn m4_b2b_pending_notification_events_respect_cursor_and_silence() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let event = |ts: i64, silenced: bool| AlertEvent {
+            id: 0,
+            ts,
+            rule_id: "rule-1".into(),
+            rule_name: "规则".into(),
+            agent_id: "agent-1".into(),
+            state: AlertStateKind::Firing,
+            value: Some(91.0),
+            message: "触发".into(),
+            notified: false,
+            notify_error: String::new(),
+            silenced,
+        };
+        let first = s.insert_alert_event(&event(1_000, false)).unwrap();
+        let silenced = s.insert_alert_event(&event(2_000, true)).unwrap();
+        let last = s.insert_alert_event(&event(3_000, false)).unwrap();
+        assert_eq!(s.max_alert_event_id().unwrap(), last);
+
+        let pending = s.list_pending_notification_events_after(0, 10).unwrap();
+        assert_eq!(
+            pending.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![first, last]
+        );
+        assert_eq!(
+            s.list_pending_notification_events_after(first, 1)
+                .unwrap()
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            vec![last],
+            "静默事件必须被排除，且 cursor 排他"
+        );
+        assert!(s
+            .list_pending_notification_events_after(last, 10)
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .list_pending_notification_events_after(0, 0)
+            .unwrap()
+            .is_empty());
+        assert!(silenced > first);
+        assert_eq!(s.max_alert_event_id().unwrap(), last);
+
+        // 空表最大 id 为 0。
+        assert_eq!(
+            SqliteStorage::open_in_memory()
+                .unwrap()
+                .max_alert_event_id()
+                .unwrap(),
+            0
+        );
+    }
+
+    /// 已处理但未发送的事件：`notified = 1` 且保留固定原因（不会被清空）。
+    #[test]
+    fn m4_b2b_mark_notification_processed_keeps_reason() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let event = AlertEvent {
+            id: 0,
+            ts: 1_000,
+            rule_id: "rule-1".into(),
+            rule_name: "规则".into(),
+            agent_id: "agent-1".into(),
+            state: AlertStateKind::Firing,
+            value: Some(91.0),
+            message: "触发".into(),
+            notified: false,
+            notify_error: String::new(),
+            silenced: false,
+        };
+        let id = s.insert_alert_event(&event).unwrap();
+        assert!(s.mark_notification_processed(id, "no_channel").unwrap());
+        let stored = s.list_alert_events(10, None).unwrap().remove(0);
+        assert!(stored.notified);
+        assert_eq!(stored.notify_error, "no_channel");
+        assert!(!s
+            .mark_notification_processed(999_999, "no_channel")
+            .unwrap());
+        assert!(s
+            .list_pending_notification_events_after(0, 10)
+            .unwrap()
+            .is_empty());
     }
 }

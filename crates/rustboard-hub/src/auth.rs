@@ -587,6 +587,8 @@ pub(crate) fn required_scope(method: &Method, path: &str) -> Option<TokenScope> 
             | "/api/v1/alerts/rules"
             | "/api/v1/alerts/events"
             | "/api/v1/alerts/silences"
+            // M4-B2b：渠道列表只读；CRUD / 测试发送为 Write。
+            | "/api/v1/alerts/channels"
     ) || ["/latest", "/series", "/settings", "/control"]
         .iter()
         .any(|suffix| is_agent_subroute(path, suffix));
@@ -605,6 +607,17 @@ pub(crate) fn required_scope(method: &Method, path: &str) -> Option<TokenScope> 
         return Some(TokenScope::Write);
     }
     if *method == Method::DELETE && is_alert_silence_subroute(path) {
+        return Some(TokenScope::Write);
+    }
+    // M4-B2b：渠道集合只接受 GET / POST；单段子路径接受 PUT / DELETE；
+    // `{id}/test` 只接受 POST。未知组合保持 None，认证后交给路由 404/405。
+    if *method == Method::POST && path == "/api/v1/alerts/channels" {
+        return Some(TokenScope::Write);
+    }
+    if (*method == Method::PUT || *method == Method::DELETE) && is_alert_channel_subroute(path) {
+        return Some(TokenScope::Write);
+    }
+    if *method == Method::POST && is_alert_channel_test_subroute(path) {
         return Some(TokenScope::Write);
     }
     if *method == Method::POST && is_agent_subroute(path, "/control") {
@@ -626,6 +639,19 @@ fn is_alert_rule_subroute(path: &str) -> bool {
 /// 匹配 `/api/v1/alerts/silences/<id>`；`<id>` 必须是非空单段。
 fn is_alert_silence_subroute(path: &str) -> bool {
     path.strip_prefix("/api/v1/alerts/silences/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// 匹配 `/api/v1/alerts/channels/<id>`；`<id>` 必须是非空单段。
+fn is_alert_channel_subroute(path: &str) -> bool {
+    path.strip_prefix("/api/v1/alerts/channels/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// 匹配 `/api/v1/alerts/channels/<id>/test`；`<id>` 必须是非空单段。
+fn is_alert_channel_test_subroute(path: &str) -> bool {
+    path.strip_prefix("/api/v1/alerts/channels/")
+        .and_then(|rest| rest.strip_suffix("/test"))
         .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
@@ -724,6 +750,7 @@ mod tests {
             "/api/v1/alerts/rules",
             "/api/v1/alerts/events",
             "/api/v1/alerts/silences",
+            "/api/v1/alerts/channels",
         ] {
             assert_eq!(
                 required_scope(&Method::GET, path),
@@ -757,6 +784,20 @@ mod tests {
             // M4-B1b：静默创建 / 撤销必须 Write。
             (&Method::POST, "/api/v1/alerts/silences"),
             (&Method::DELETE, "/api/v1/alerts/silences/12"),
+            // M4-B2b：渠道 CRUD 与测试发送必须 Write。
+            (&Method::POST, "/api/v1/alerts/channels"),
+            (
+                &Method::PUT,
+                "/api/v1/alerts/channels/0b6f9a2e-6a1d-4c5e-9f3a-1d2c3b4a5e6f",
+            ),
+            (
+                &Method::DELETE,
+                "/api/v1/alerts/channels/0b6f9a2e-6a1d-4c5e-9f3a-1d2c3b4a5e6f",
+            ),
+            (
+                &Method::POST,
+                "/api/v1/alerts/channels/0b6f9a2e-6a1d-4c5e-9f3a-1d2c3b4a5e6f/test",
+            ),
         ] {
             assert_eq!(
                 required_scope(method, path),
@@ -785,6 +826,16 @@ mod tests {
             (&Method::DELETE, "/api/v1/alerts/silences/"),
             (&Method::DELETE, "/api/v1/alerts/silences/a/b"),
             (&Method::GET, "/api/v1/alerts/events/1"),
+            // 渠道：集合不接 PUT / DELETE，子路径只接 PUT / DELETE，测试只接 POST。
+            (&Method::PUT, "/api/v1/alerts/channels"),
+            (&Method::DELETE, "/api/v1/alerts/channels"),
+            (&Method::GET, "/api/v1/alerts/channels/abc"),
+            (&Method::PUT, "/api/v1/alerts/channels/"),
+            (&Method::DELETE, "/api/v1/alerts/channels/a/b"),
+            (&Method::GET, "/api/v1/alerts/channels/abc/test"),
+            (&Method::PUT, "/api/v1/alerts/channels/abc/test"),
+            (&Method::DELETE, "/api/v1/alerts/channels/abc/test"),
+            (&Method::POST, "/api/v1/alerts/channels/a/b/test"),
         ] {
             assert_eq!(
                 required_scope(method, path),

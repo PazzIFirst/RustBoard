@@ -23,7 +23,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, RawQu
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, delete, get, put};
+use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
 use http_body::{Body as HttpBody, Frame as BodyFrame, SizeHint};
@@ -57,8 +57,10 @@ mod alerts;
 mod alerts_engine;
 mod auth;
 mod cert_rotation;
+mod channels;
 mod control;
 mod notify;
+mod notify_worker;
 mod session;
 use auth::{AuthFailureLimiter, TokenScope};
 use cert_rotation::CertStatus;
@@ -116,6 +118,9 @@ const MAX_CSR_PEM_LEN: usize = 16 * 1024;
 
 /// 管理 API 请求体上限（64 KiB）。管理端只有 settings 一个写接口。
 const MAX_ADMIN_BODY_SIZE: usize = 64 * 1024;
+/// 通知渠道请求体上限（1 MiB）：渠道配置含少量 secret，远小于此；单独放宽是
+/// 为了与告警规则等 64 KiB 路由解耦，同时仍给解析器一个明确硬上限。
+const MAX_CHANNEL_BODY_SIZE: usize = 1024 * 1024;
 /// `overview` 固定 60s 窗口：允许 1s–60s 覆盖，避免大窗口扫描拖垮 latest_samples。
 const OVERVIEW_WINDOW_MS: i64 = 60_000;
 const OVERVIEW_MIN_WINDOW_MS: i64 = 1_000;
@@ -378,6 +383,8 @@ struct AppState {
     admin_rate: Arc<AdminRateLimiter>,
     /// 未认证 401 的每来源 IP 固定窗口失败限速（KI-26）。
     auth_failures: Arc<AuthFailureLimiter>,
+    /// 通知发送器；渠道测试接口与通知 worker 共用，测试可注入 MockNotifier。
+    notifier: Arc<dyn notify::Notifier>,
 }
 
 /// 由 TLS accept 层注入到每个请求扩展里的对端身份。
@@ -1191,6 +1198,15 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         let initial_admin_fingerprint = fingerprint.clone();
 
         let sessions = SessionRegistry::new();
+        // B2：固定四家端点 + 固定超时/重试次数；`notify_max_attempts` 在构造器内
+        // 夹到 1..=10。构造失败意味着系统 TLS 根证书不可用，直接启动失败更安全。
+        let notifier: Arc<dyn notify::Notifier> = Arc::new(
+            notify::HttpNotifier::new(
+                Duration::from_secs(cfg.alerts.notify_timeout_secs),
+                cfg.alerts.notify_max_attempts,
+            )
+            .context("初始化通知发送器失败")?,
+        );
         let state = AppState {
             storage: storage.clone(),
             cfg: Arc::new(cfg.clone()),
@@ -1204,6 +1220,7 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
             auth_failures: Arc::new(AuthFailureLimiter::new(
                 cfg.admin_auth_failure_limit_per_min,
             )),
+            notifier: notifier.clone(),
         };
 
         spawn_revoke_watcher(storage.clone(), sessions);
@@ -1244,6 +1261,9 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         // M4-B1b：告警评估任务。`alerts.enabled = false` 时只记日志不启动；
         // 启动后同样先睡一个周期，避免与监听 / 维护任务抢写锁。
         alerts_engine::spawn_alert_engine(storage.clone(), cfg.clone());
+        // M4-B2b：通知 worker 在评估引擎之后启动。首次启动以当前最大事件 id 为
+        // 水位（不补发 B1b 存量事件）；`alerts.enabled = false` 时不启动。
+        notify_worker::spawn_notify_worker(storage.clone(), cfg.clone(), notifier.clone());
 
         let agent_app = Router::new()
             .route("/agent/ws", get(agent_ws))
@@ -1695,6 +1715,26 @@ fn reload_admin_tls_if_changed(
     Ok(Some(confirmed.fingerprint))
 }
 
+/// 通知渠道路由：单独挂 1 MiB 请求体上限（其余管理 API 仍为 64 KiB）。
+///
+/// `DefaultBodyLimit` 是请求扩展：内层路由设置的值会覆盖外层全局 64 KiB。
+fn channel_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/v1/alerts/channels",
+            get(channels::list_channels).post(channels::create_channel),
+        )
+        .route(
+            "/api/v1/alerts/channels/{id}",
+            put(channels::update_channel).delete(channels::delete_channel),
+        )
+        .route(
+            "/api/v1/alerts/channels/{id}/test",
+            post(channels::test_channel),
+        )
+        .layer(DefaultBodyLimit::max(MAX_CHANNEL_BODY_SIZE))
+}
+
 /// 组装管理 API：`/healthz` 放行，`/api/v1/*` 统一 Bearer 鉴权 + 限速 + 64 KiB 请求体上限。
 fn admin_router(state: AppState) -> Router {
     let protected = Router::new()
@@ -1733,6 +1773,8 @@ fn admin_router(state: AppState) -> Router {
             "/api/v1/alerts/silences/{id}",
             delete(alerts::delete_silence),
         )
+        // M4-B2b：通知渠道 CRUD 与测试发送。渠道请求体单独放宽到 1 MiB。
+        .merge(channel_routes())
         // KI-08：未知 /api/v1/* 也要先过 Bearer 再 404，不能泄露路由是否存在。
         .route("/api/v1", any(api_not_found))
         .route("/api/v1/{*rest}", any(api_not_found))
@@ -2887,6 +2929,11 @@ enum ApiError {
         message: String,
     },
     PayloadTooLarge,
+    /// 上游依赖失败（例如渠道测试发送失败）：502 + 固定错误码，不回显上游内容。
+    BadGateway {
+        code: &'static str,
+        message: String,
+    },
     /// 查询结果超过存储层硬上限：这是客户端可调整的参数问题，不是服务端错误。
     QueryTooLarge,
 }
@@ -2909,6 +2956,13 @@ impl ApiError {
 
     fn conflict(code: &'static str, message: impl Into<String>) -> Self {
         Self::Conflict {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn bad_gateway(code: &'static str, message: impl Into<String>) -> Self {
+        Self::BadGateway {
             code,
             message: message.into(),
         }
@@ -2967,6 +3021,11 @@ impl IntoResponse for ApiError {
             ApiError::PayloadTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(serde_json::json!({ "error": "payload_too_large" })),
+            )
+                .into_response(),
+            ApiError::BadGateway { code, message } => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": code, "message": message })),
             )
                 .into_response(),
             ApiError::QueryTooLarge => (
@@ -4950,6 +5009,7 @@ mod tests {
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
             auth_failures,
+            notifier: Arc::new(crate::notify::MockNotifier::new()),
         };
         let token = "enroll-token-bad-csr";
         let now = now_ms();
@@ -5008,6 +5068,7 @@ mod tests {
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
             auth_failures,
+            notifier: Arc::new(crate::notify::MockNotifier::new()),
         };
 
         let token = "enroll-token-value";
@@ -5303,6 +5364,7 @@ mod tests {
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
             auth_failures,
+            notifier: Arc::new(crate::notify::MockNotifier::new()),
         }
     }
 
