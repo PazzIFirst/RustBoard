@@ -49,6 +49,9 @@
   Panel 最后升级并使用 `https://` + `hub_ca`。旧 `admin_token` 仍可用
 - 回滚到 v0.3.2 前必须先把 `admin_listen` 改回回环：旧二进制不识别 `admin_tls`，
   非回环配置会按明文 HTTP 启动
+- 已知中危 KI-26（计划 v0.3.4）：未认证 401 不受管理限速，错误 token 可驱动
+  SQLite 查询与 WARN 日志；管理口默认回环，非回环必须置于 VPN/防火墙后，
+  `admin_tls` 只加密不认证客户端
 
 ## [0.3.2] - 2026-10-23
 
