@@ -30,8 +30,8 @@ const V7_TABLES: [&str; 10] = [
     "archive_state",
 ];
 
-/// 方案 §4 规定的 9 个索引，以及每个索引必须挂载的表。
-const V7_INDEXES: [(&str, &str); 9] = [
+/// 方案 §4 规定的 9 个索引 + B1b 新增的通知 / 状态清理 / 静默索引，共 12 个。
+const V7_INDEXES: [(&str, &str); 12] = [
     ("idx_samples_1m_lookup", "samples_1m"),
     ("idx_samples_1m_ts", "samples_1m"),
     ("idx_samples_1h_lookup", "samples_1h"),
@@ -39,6 +39,9 @@ const V7_INDEXES: [(&str, &str); 9] = [
     ("idx_alert_events_ts", "alert_events"),
     ("idx_alert_events_rule_ts", "alert_events"),
     ("idx_alert_events_agent_ts", "alert_events"),
+    ("idx_alert_events_pending", "alert_events"),
+    ("idx_alert_states_state_eval", "alert_states"),
+    ("idx_alert_silences_until", "alert_silences"),
     ("idx_archive_objects_range", "archive_objects"),
     ("idx_archive_objects_status", "archive_objects"),
 ];
@@ -324,7 +327,7 @@ fn assert_default(columns: &[ColumnInfo], name: &str, expected: &str) {
     );
 }
 
-/// 断言方案 §4 的 10 张表与 9 个索引全部存在，且索引挂在正确的表上。
+/// 断言方案 §4 的 10 张表与 12 个索引全部存在，且索引挂在正确的表上。
 fn assert_v7_objects(conn: &Connection) {
     for table in V7_TABLES {
         assert!(object_exists(conn, "table", table), "缺少 v7 表 {table}");
@@ -590,7 +593,7 @@ fn create_v6_database(path: &Path) -> (TableSqlSnapshot, TableCountSnapshot) {
 }
 
 // ---------------------------------------------------------------------------
-// 用例 1：fresh 库的版本、10 张表、9 个索引；重复打开不重复建表。
+// 用例 1：fresh 库的版本、10 张表、12 个索引；重复打开不重复建表。
 // ---------------------------------------------------------------------------
 
 #[test]

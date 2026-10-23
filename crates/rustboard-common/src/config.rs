@@ -489,6 +489,11 @@ pub struct HubAlertsConfig {
     pub enabled: bool,
     /// 评估轮询间隔（秒），1–3600。
     pub evaluation_interval_secs: u64,
+    /// 单轮评估的时间预算（毫秒），100–60000。
+    ///
+    /// 超预算后引擎停止评估本轮剩余规则（下一轮继续），避免超大规则集占住
+    /// `spawn_blocking` 线程、拖慢 ingest 与其它后台任务。
+    pub evaluation_budget_ms: u64,
     /// agent 离线判定阈值（秒），1–3600；内置离线规则默认 90 秒。
     pub offline_after_secs: u64,
     /// hub / agent 证书剩余寿命告警阈值（小时），1–720。
@@ -508,6 +513,7 @@ impl Default for HubAlertsConfig {
         Self {
             enabled: true,
             evaluation_interval_secs: 15,
+            evaluation_budget_ms: 5_000,
             offline_after_secs: 90,
             cert_warn_hours: 48,
             event_retention_days: 90,
@@ -530,6 +536,12 @@ impl HubAlertsConfig {
                 self.evaluation_interval_secs,
                 MIN_ALERTS_EVALUATION_INTERVAL_SECS,
                 MAX_ALERTS_EVALUATION_INTERVAL_SECS,
+            ),
+            (
+                "evaluation_budget_ms",
+                self.evaluation_budget_ms,
+                MIN_ALERTS_EVALUATION_BUDGET_MS,
+                MAX_ALERTS_EVALUATION_BUDGET_MS,
             ),
             (
                 "offline_after_secs",
@@ -1109,6 +1121,8 @@ fn default_maintenance_interval_secs() -> u64 {
 /// M4 告警配置的各字段允许范围（与方案 §8.2 一致）。
 const MIN_ALERTS_EVALUATION_INTERVAL_SECS: u64 = 1;
 const MAX_ALERTS_EVALUATION_INTERVAL_SECS: u64 = 3_600;
+const MIN_ALERTS_EVALUATION_BUDGET_MS: u64 = 100;
+const MAX_ALERTS_EVALUATION_BUDGET_MS: u64 = 60_000;
 const MIN_ALERTS_OFFLINE_AFTER_SECS: u64 = 1;
 const MAX_ALERTS_OFFLINE_AFTER_SECS: u64 = 3_600;
 const MIN_ALERTS_CERT_WARN_HOURS: u64 = 1;
@@ -1364,6 +1378,7 @@ mod tests {
         let alerts = &hub.alerts;
         assert!(alerts.enabled);
         assert_eq!(alerts.evaluation_interval_secs, 15);
+        assert_eq!(alerts.evaluation_budget_ms, 5_000);
         assert_eq!(alerts.offline_after_secs, 90);
         assert_eq!(alerts.cert_warn_hours, 48);
         assert_eq!(alerts.event_retention_days, 90);
@@ -1376,6 +1391,7 @@ mod tests {
         let hub: HubConfig = toml::from_str("[alerts]\nenabled = false\n").unwrap();
         assert!(!hub.alerts.enabled);
         assert_eq!(hub.alerts.evaluation_interval_secs, 15);
+        assert_eq!(hub.alerts.evaluation_budget_ms, 5_000);
         hub.validate().expect("关闭告警时默认值仍合法");
 
         // 全部字段取合法边界。
@@ -1383,6 +1399,7 @@ mod tests {
             "[alerts]\n\
              enabled = true\n\
              evaluation_interval_secs = 1\n\
+             evaluation_budget_ms = 100\n\
              offline_after_secs = 3600\n\
              cert_warn_hours = 720\n\
              event_retention_days = 3650\n\
@@ -1396,6 +1413,7 @@ mod tests {
         let hub: HubConfig = toml::from_str(
             "[alerts]\n\
              evaluation_interval_secs = 3600\n\
+             evaluation_budget_ms = 60000\n\
              offline_after_secs = 1\n\
              cert_warn_hours = 1\n\
              event_retention_days = 1\n\
@@ -1413,6 +1431,8 @@ mod tests {
                 "evaluation_interval_secs = 3601",
                 "evaluation_interval_secs",
             ),
+            ("evaluation_budget_ms = 99", "evaluation_budget_ms"),
+            ("evaluation_budget_ms = 60001", "evaluation_budget_ms"),
             ("offline_after_secs = 0", "offline_after_secs"),
             ("offline_after_secs = 3601", "offline_after_secs"),
             ("cert_warn_hours = 0", "cert_warn_hours"),

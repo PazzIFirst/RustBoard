@@ -511,6 +511,25 @@ impl fmt::Display for AlertRuleStoreError {
 
 impl std::error::Error for AlertRuleStoreError {}
 
+/// 静默存储的领域错误；hub 映射成固定 409 `silence_limit`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertSilenceStoreError {
+    /// 生效中的静默数量达到 [`MAX_ALERT_SILENCES`]。
+    LimitReached,
+}
+
+impl fmt::Display for AlertSilenceStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LimitReached => {
+                write!(f, "生效中的静默数量已达上限 {MAX_ALERT_SILENCES} 条")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AlertSilenceStoreError {}
+
 /// 内置规则固定 id（升级 / 重启后不变，面板与文档依赖它们）。
 pub const BUILTIN_AGENT_OFFLINE: &str = "builtin-agent-offline";
 pub const BUILTIN_DISK_PERCENT: &str = "builtin-disk-percent";
@@ -648,6 +667,12 @@ pub const MAX_SILENCE_DURATION_SECS: u64 = 604_800;
 
 /// 静默中的规则 id 最大字节数（内置 id 与 UUID 都远小于此值）。
 pub const MAX_SILENCE_RULE_ID_BYTES: usize = 64;
+
+/// 同时生效的静默数量上限。
+///
+/// 静默是低频运维操作；1000 条已经远超正常使用量。限制上限防止误用 / 恶意
+/// 请求把 `alert_silences` 撑成无界表，也保证事件产生时的静默匹配保持廉价。
+pub const MAX_ALERT_SILENCES: usize = 1_000;
 
 /// 告警状态机的三个状态，与 `alert_states.state` 的取值一致。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

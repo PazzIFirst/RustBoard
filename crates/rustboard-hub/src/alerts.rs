@@ -8,7 +8,7 @@
 //! - `POST   /api/v1/alerts/rules`          write
 //! - `PUT    /api/v1/alerts/rules/{id}`     write
 //! - `DELETE /api/v1/alerts/rules/{id}`     write
-//! - `GET    /api/v1/alerts/events`         read（`limit` 1–200，`before_id` 排他游标）
+//! - `GET    /api/v1/alerts/events`         read（`limit` 1–100，`before_id` 排他游标）
 //! - `GET    /api/v1/alerts/silences`       read（只返回生效中的静默）
 //! - `POST   /api/v1/alerts/silences`       write
 //! - `DELETE /api/v1/alerts/silences/{id}`  write
@@ -30,15 +30,16 @@ use rustboard_common::model::Labels;
 use rustboard_common::util::now_ms;
 use rustboard_core::alerts::{
     AlertEvent, AlertRule, AlertRuleInput, AlertRuleStoreError, AlertSilence, AlertSilenceInput,
-    AlertSource, Comparator, MAX_ALERT_RULES,
+    AlertSilenceStoreError, AlertSource, Comparator, MAX_ALERT_RULES, MAX_ALERT_SILENCES,
 };
+use rustboard_core::storage::Storage;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 /// 事件分页默认条数。
 const DEFAULT_ALERT_EVENT_LIMIT: usize = 100;
-/// 事件分页单页上限（B1b 约定 1..=200）。
-const MAX_ALERT_EVENT_LIMIT: usize = 200;
+/// 事件分页单页上限（方案 §8.1：1..=100）。
+const MAX_ALERT_EVENT_LIMIT: usize = 100;
 
 use crate::auth::AuthPrincipal;
 use crate::{ApiError, AppState};
@@ -99,6 +100,14 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
             AlertRuleStoreError::BuiltinRule => {
                 ApiError::forbidden("builtin_rule", "内置规则不允许删除")
             }
+        };
+    }
+    if let Some(store_error) = err.downcast_ref::<AlertSilenceStoreError>() {
+        return match store_error {
+            AlertSilenceStoreError::LimitReached => ApiError::conflict(
+                "silence_limit",
+                format!("生效中的静默数量已达上限 {MAX_ALERT_SILENCES} 条"),
+            ),
         };
     }
     ApiError::from(err)
@@ -191,18 +200,30 @@ pub(crate) async fn update_rule(
     rule.updated_by = updated_by;
     rule.updated_at = now_ms();
 
+    // 任何“更新后仍为禁用”的写入都顺带清空该规则的 alert_states：既处理本次
+    // 启用 → 禁用，也能清理修复前遗留的孤儿状态。启用中的规则不清。
+    let clear_states = !rule.enabled;
     let to_store = rule.clone();
-    run_blocking(move || storage.update_alert_rule(&to_store)).await?;
+    run_blocking(move || {
+        if clear_states {
+            storage.update_alert_rule_and_clear_states(&to_store)
+        } else {
+            storage.update_alert_rule(&to_store)
+        }
+    })
+    .await?;
     Ok(Json(rule))
 }
 
 /// `DELETE /api/v1/alerts/rules/{id}`：删除自定义规则；内置规则 403 `builtin_rule`。
+///
+/// 删除与清理该规则的 alert_states 在同一事务内完成。
 pub(crate) async fn delete_rule(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let storage = state.storage.clone();
-    run_blocking(move || storage.delete_alert_rule(&id)).await?;
+    run_blocking(move || storage.delete_alert_rule_and_clear_states(&id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -231,7 +252,7 @@ fn single_query_value<'a>(
     Ok(found)
 }
 
-/// 解析 `limit`：缺省 100，范围 1..=200。
+/// 解析 `limit`：缺省 100，范围 1..=100。
 fn parse_event_limit(pairs: &[(String, String)]) -> Result<usize, String> {
     let Some(raw) = single_query_value(pairs, "limit")? else {
         return Ok(DEFAULT_ALERT_EVENT_LIMIT);
@@ -308,6 +329,15 @@ pub(crate) async fn create_silence(
         let existing = run_blocking(move || storage.get_alert_rule(&rule_id)).await?;
         if existing.is_none() {
             return Err(ApiError::not_found("告警规则不存在"));
+        }
+    }
+    // 拒绝未知 agent：拼错的 agent_id 会建立一条永远不命中的静默，用户会误以为
+    // 已经静默。agent_id 为 NULL 表示全部 agent，不需要校验。
+    if let Some(agent_id) = input.agent_id.clone() {
+        let storage = state.storage.clone();
+        let existing = run_blocking(move || storage.get_agent(&agent_id)).await?;
+        if existing.is_none() {
+            return Err(ApiError::not_found("agent 不存在"));
         }
     }
 
@@ -864,6 +894,10 @@ mod tests {
             ApiError::Forbidden { code, .. } => assert_eq!(code, "builtin_rule"),
             other => panic!("应为 403 Forbidden: {other:?}"),
         }
+        match map_store_error(AlertSilenceStoreError::LimitReached.into()) {
+            ApiError::Conflict { code, .. } => assert_eq!(code, "silence_limit"),
+            other => panic!("应为 409 Conflict: {other:?}"),
+        }
         assert!(matches!(
             map_store_error(anyhow::anyhow!("boom")),
             ApiError::Internal(_)
@@ -892,7 +926,7 @@ mod tests {
     // M4-B1b：事件 / 静默 API
     // ------------------------------------------------------------------
 
-    use rustboard_core::alerts::AlertStateKind;
+    use rustboard_core::alerts::{AlertState, AlertStateKind};
 
     fn seed_event(state: &AppState, ts: i64, silenced: bool) -> i64 {
         state
@@ -999,7 +1033,7 @@ mod tests {
         // 非法分页参数：固定 400 bad_request，不回显原始值。
         for uri in [
             "/api/v1/alerts/events?limit=0",
-            "/api/v1/alerts/events?limit=201",
+            "/api/v1/alerts/events?limit=101",
             "/api/v1/alerts/events?limit=abc",
             "/api/v1/alerts/events?limit=1&limit=2",
             "/api/v1/alerts/events?before_id=0",
@@ -1024,6 +1058,22 @@ mod tests {
         target.name = "静默目标".into();
         target.metric = "disk.used_percent".into();
         state.storage.create_alert_rule(&target).unwrap();
+        // 静默创建会校验 agent 存在：先种一台 agent。
+        state
+            .storage
+            .upsert_agent(&rustboard_common::model::AgentRecord {
+                agent_id: "agent-1".into(),
+                name: "agent-1".into(),
+                hostname: "host".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                version: "test".into(),
+                boot_id: "boot".into(),
+                status: "online".into(),
+                last_seen_at: now_ms(),
+                created_at: now_ms(),
+            })
+            .unwrap();
 
         // 未认证 401；read 可查不可写。
         let (status, _) = call(&router, "GET", "/api/v1/alerts/silences", None, None).await;
@@ -1134,6 +1184,18 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(value["error"], "not_found");
 
+        // 未知 agent 同样 404，避免创建永不命中的静默。
+        let (status, value) = call(
+            &router,
+            "POST",
+            "/api/v1/alerts/silences",
+            Some(&write),
+            Some(r#"{"agent_id":"missing-agent","duration_secs":60}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(value["error"], "not_found");
+
         // 过期静默不出现在 GET（直接写库构造）。
         state
             .storage
@@ -1183,5 +1245,100 @@ mod tests {
             assert_eq!(status, StatusCode::NOT_FOUND, "id={id} resp={value}");
             assert_eq!(value["error"], "not_found");
         }
+    }
+
+    /// 规则禁用 / 删除必须清掉该规则的 alert_states（B1b 评审建议）。
+    #[tokio::test]
+    async fn m4_b1b_disabling_or_deleting_rule_clears_alert_states() {
+        let state = alerts_state();
+        let router = admin_router(state.clone());
+
+        // 新建并启用一条规则。
+        let (status, created) = call(
+            &router,
+            "POST",
+            "/api/v1/alerts/rules",
+            Some(LEGACY_TOKEN),
+            Some(
+                r#"{"name":"待禁用规则","source":"metric","metric":"disk.used_percent","enabled":true}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "创建失败: {created}");
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let state_row = |rule_id: &str, key: &str| AlertState {
+            rule_id: rule_id.to_string(),
+            agent_id: "agent-1".into(),
+            series_key: key.to_string(),
+            state: AlertStateKind::Firing,
+            since: now_ms() - 1_000,
+            last_eval_at: now_ms() - 1_000,
+            last_value: Some(95.0),
+            last_notified_at: None,
+        };
+        state
+            .storage
+            .upsert_alert_state(&state_row(&id, "series-1"))
+            .unwrap();
+        assert!(state
+            .storage
+            .get_alert_state(&id, "agent-1", "series-1")
+            .unwrap()
+            .is_some());
+
+        // 禁用 → 状态清空；规则本身仍存在且 enabled=false。
+        let (status, disabled) = call(
+            &router,
+            "PUT",
+            &format!("/api/v1/alerts/rules/{id}"),
+            Some(LEGACY_TOKEN),
+            Some(r#"{"enabled":false}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "禁用失败: {disabled}");
+        assert_eq!(disabled["enabled"], json!(false));
+        assert!(
+            state
+                .storage
+                .get_alert_state(&id, "agent-1", "series-1")
+                .unwrap()
+                .is_none(),
+            "禁用规则必须清理 alert_states"
+        );
+        assert!(state.storage.get_alert_rule(&id).unwrap().is_some());
+
+        // 重新启用并写入状态，再删除规则 → 状态同样清空。
+        let (status, _) = call(
+            &router,
+            "PUT",
+            &format!("/api/v1/alerts/rules/{id}"),
+            Some(LEGACY_TOKEN),
+            Some(r#"{"enabled":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        state
+            .storage
+            .upsert_alert_state(&state_row(&id, "series-2"))
+            .unwrap();
+        let (status, _) = call(
+            &router,
+            "DELETE",
+            &format!("/api/v1/alerts/rules/{id}"),
+            Some(LEGACY_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            state
+                .storage
+                .get_alert_state(&id, "agent-1", "series-2")
+                .unwrap()
+                .is_none(),
+            "删除规则必须清理 alert_states"
+        );
+        assert!(state.storage.list_alert_states().unwrap().is_empty());
     }
 }
