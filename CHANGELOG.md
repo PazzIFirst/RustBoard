@@ -34,8 +34,8 @@
 
 ### Fixed
 
-- #17 `agent revoke` 后控制 API/会话窗口内仍可能投递命令；现在返回 403
-  `agent_revoked`、审计 `denied`，不再出现吊销后的成功审计
+- #17 `agent revoke` 之后新发起的控制请求返回 403 `agent_revoked`、审计 `denied`；
+  已进入会话的最后 1 条在途命令仍可能执行（写帧最多等 5s），审计按实际结果记录
 - #20 日志父目录在启动校验后被替换为符号链接的 TOCTOU 窗口
 - #21 已安装未加载的 systemd service 在面板不可见、无法 start
 - token CLI 的 stdout 与日志分离（日志固定 stderr），避免脚本捕获 token 时混入日志
@@ -44,9 +44,11 @@
 
 - scoped token 只存 SHA-256 哈希，明文仅 `create/rotate` 输出一次；`admin` 为审计
   actor 保留名，禁止作为 token 名称
-- 管理端 HTTPS 与非回环明文拒绝、Panel 私有 CA 严格信任，关闭管理面明文传输路径
+- 管理端 HTTPS 与非回环明文拒绝、Panel 私有 CA 严格信任，关闭非回环管理面明文路径
 - 升级顺序：先升级 hub 到 v0.3.3（自动迁移 DB v6），再按需启用 `admin_tls`；
   Panel 最后升级并使用 `https://` + `hub_ca`。旧 `admin_token` 仍可用
+- 回滚到 v0.3.2 前必须先把 `admin_listen` 改回回环：旧二进制不识别 `admin_tls`，
+  非回环配置会按明文 HTTP 启动
 
 ## [0.3.2] - 2026-10-23
 
