@@ -12,8 +12,8 @@ use rusqlite::{
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 
 use super::{
-    AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, IngestOutcome, NewAuditEntry,
-    QueryTooLarge, RejectReason, Storage, AUDIT_RETENTION_MS,
+    AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, IngestOutcome,
+    MaintenanceStateEntry, NewAuditEntry, QueryTooLarge, RejectReason, Storage, AUDIT_RETENTION_MS,
 };
 
 /// 默认只读连接池大小（与 `HubConfig::read_pool_size` 默认值一致）。
@@ -26,8 +26,9 @@ pub const MAX_READ_POOL_SIZE: usize = 16;
 /// v2 = `(agent_id, epoch)`，v3 = 新增 `ingest_batches` 精确判重，
 /// v4 = 新增 `agent_settings`（每台 agent 的采样间隔，纯新增表），
 /// v5 = 新增 `agent_control` / `audit_log`（M3 控制面，纯新增表），
-/// v6 = 新增 `api_tokens`（管理 API scoped token，纯新增表）。
-const SCHEMA_VERSION: i64 = 6;
+/// v6 = 新增 `api_tokens`（管理 API scoped token，纯新增表），
+/// v7 = 新增 M4 降采样 / 告警 / 通知 / 归档 / 维护水位表（纯新增表与索引）。
+const SCHEMA_VERSION: i64 = 7;
 
 /// `last_used_at` 的写入节流窗口：同一 token 60s 内只写一次，避免每个管理
 /// 请求都抢写连接；首次鉴权（`last_used_at IS NULL`）一定会写。
@@ -178,6 +179,145 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     revoked_at   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
+"#;
+
+/// v7 新增表：M4 降采样、告警、通知渠道、冷归档与维护水位。
+///
+/// 全部为 `CREATE TABLE / INDEX IF NOT EXISTS`，不重写 v1–v6 任何表或数据；
+/// v0.3.5 等旧版本二进制会忽略这些表，可安全回滚。
+///
+/// `alert_rules.channel_ids` 按方案**刻意不加外键**：渠道引用完整性由 hub 在
+/// 保存规则、删除渠道时校验，SQLite 侧只存 JSON 数组。
+const M4_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS samples_1m (
+    agent_id   TEXT NOT NULL,
+    metric     TEXT NOT NULL,
+    labels     TEXT NOT NULL DEFAULT '{}',
+    bucket_ts  INTEGER NOT NULL,
+    min_value  REAL NOT NULL,
+    max_value  REAL NOT NULL,
+    avg_value  REAL NOT NULL,
+    last_value REAL NOT NULL,
+    count      INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, metric, labels, bucket_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_samples_1m_lookup ON samples_1m(agent_id, metric, bucket_ts);
+CREATE INDEX IF NOT EXISTS idx_samples_1m_ts ON samples_1m(bucket_ts);
+
+CREATE TABLE IF NOT EXISTS samples_1h (
+    agent_id   TEXT NOT NULL,
+    metric     TEXT NOT NULL,
+    labels     TEXT NOT NULL DEFAULT '{}',
+    bucket_ts  INTEGER NOT NULL,
+    min_value  REAL NOT NULL,
+    max_value  REAL NOT NULL,
+    avg_value  REAL NOT NULL,
+    last_value REAL NOT NULL,
+    count      INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, metric, labels, bucket_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_samples_1h_lookup ON samples_1h(agent_id, metric, bucket_ts);
+CREATE INDEX IF NOT EXISTS idx_samples_1h_ts ON samples_1h(bucket_ts);
+
+CREATE TABLE IF NOT EXISTS maintenance_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL UNIQUE,
+    enabled           INTEGER NOT NULL DEFAULT 0,
+    source            TEXT NOT NULL DEFAULT 'metric',
+    metric            TEXT NOT NULL DEFAULT '',
+    comparator        TEXT NOT NULL DEFAULT 'gt',
+    threshold         REAL NOT NULL DEFAULT 0,
+    duration_secs     INTEGER NOT NULL DEFAULT 0,
+    cooldown_secs     INTEGER NOT NULL DEFAULT 1800,
+    filter_agent_id   TEXT,
+    filter_labels     TEXT NOT NULL DEFAULT '{}',
+    channel_ids       TEXT NOT NULL DEFAULT '[]',
+    notify_on_resolve INTEGER NOT NULL DEFAULT 1,
+    is_builtin        INTEGER NOT NULL DEFAULT 0,
+    updated_by        TEXT NOT NULL DEFAULT '',
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alert_states (
+    rule_id          TEXT NOT NULL,
+    agent_id         TEXT NOT NULL DEFAULT '',
+    series_key       TEXT NOT NULL DEFAULT '',
+    state            TEXT NOT NULL DEFAULT 'pending',
+    since            INTEGER NOT NULL,
+    last_eval_at     INTEGER NOT NULL,
+    last_value       REAL,
+    last_notified_at INTEGER,
+    PRIMARY KEY (rule_id, agent_id, series_key)
+);
+
+CREATE TABLE IF NOT EXISTS alert_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           INTEGER NOT NULL,
+    rule_id      TEXT NOT NULL,
+    rule_name    TEXT NOT NULL,
+    agent_id     TEXT NOT NULL DEFAULT '',
+    state        TEXT NOT NULL,
+    value        REAL,
+    message      TEXT NOT NULL DEFAULT '',
+    notified     INTEGER NOT NULL DEFAULT 0,
+    notify_error TEXT NOT NULL DEFAULT '',
+    silenced     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_alert_events_ts ON alert_events(ts);
+CREATE INDEX IF NOT EXISTS idx_alert_events_rule_ts ON alert_events(rule_id, ts);
+CREATE INDEX IF NOT EXISTS idx_alert_events_agent_ts ON alert_events(agent_id, ts);
+
+CREATE TABLE IF NOT EXISTS alert_silences (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id    TEXT,
+    agent_id   TEXT,
+    until_ts   INTEGER NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notification_channels (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    updated_by  TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS archive_objects (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    backend      TEXT NOT NULL,
+    object_key   TEXT NOT NULL UNIQUE,
+    manifest_key TEXT NOT NULL,
+    from_ts      INTEGER NOT NULL,
+    to_ts        INTEGER NOT NULL,
+    rows         INTEGER NOT NULL,
+    bytes        INTEGER NOT NULL,
+    sha256       TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    error        TEXT NOT NULL DEFAULT '',
+    created_at   INTEGER NOT NULL,
+    uploaded_at  INTEGER,
+    deleted_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_archive_objects_range ON archive_objects(from_ts, to_ts);
+CREATE INDEX IF NOT EXISTS idx_archive_objects_status ON archive_objects(status);
+
+CREATE TABLE IF NOT EXISTS archive_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 "#;
 
 pub struct SqliteStorage {
@@ -597,7 +737,8 @@ fn prepare_reader(conn: Connection) -> Result<Connection> {
 }
 
 /// 把 `ingest_state` 从 v1（agent_id 主键）迁移到 v2（agent_id + epoch 主键），
-/// 为 v3 建好 `ingest_batches` 精确判重表，为 v4 建好 `agent_settings` 表。
+/// 为 v3 建好 `ingest_batches` 精确判重表，为 v4 建好 `agent_settings` 表，
+/// 为 v5–v7 建好 M3/M4 的纯新增表。旧行原样保留。
 ///
 /// v1 代码从未写过 `user_version`，所以只靠版本号无法区分「空库」和「v1 库」：
 /// 版本号不足 2 时再看表是否存在。整个迁移在一个 `BEGIN IMMEDIATE` 事务里完成，
@@ -644,13 +785,16 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     tx.execute_batch(CONTROL_AUDIT_SCHEMA)?;
     // v6：管理 API scoped token 表。纯新增，旧版本二进制忽略这张表。
     tx.execute_batch(API_TOKENS_SCHEMA)?;
+    // v7：M4 降采样 / 告警 / 归档 / 维护水位表。纯新增，旧版本二进制忽略这些表；
+    // 带 IF NOT EXISTS，迁移中断或重复打开都不会重复建表。
+    tx.execute_batch(M4_SCHEMA)?;
 
     if version < SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tracing::info!(
             from = version,
             to = SCHEMA_VERSION,
-            "数据库已迁移：新增 api_tokens（scoped token）"
+            "数据库已迁移：新增 M4 schema v7（降采样、告警、通知、归档、维护水位表）"
         );
     }
     tx.commit()?;
@@ -1237,6 +1381,43 @@ impl Storage for SqliteStorage {
             .lock_write()
             .execute("DELETE FROM audit_log WHERE ts < ?1", params![before_ts])?;
         Ok(removed)
+    }
+
+    fn get_maintenance_state(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.lock_read();
+        Ok(conn
+            .query_row(
+                "SELECT value FROM maintenance_state WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn set_maintenance_state(&self, key: &str, value: &str, updated_at: i64) -> Result<()> {
+        self.lock_write().execute(
+            "INSERT INTO maintenance_state (key, value, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value,
+                 updated_at = excluded.updated_at",
+            params![key, value, updated_at],
+        )?;
+        Ok(())
+    }
+
+    fn list_maintenance_state(&self) -> Result<Vec<MaintenanceStateEntry>> {
+        let conn = self.lock_read();
+        let mut stmt =
+            conn.prepare("SELECT key, value, updated_at FROM maintenance_state ORDER BY key ASC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(MaintenanceStateEntry {
+                key: row.get(0)?,
+                value: row.get(1)?,
+                updated_at: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
 
@@ -2160,6 +2341,57 @@ mod tests {
         dir.join("rustboard.db")
     }
 
+    /// v7 的 10 张新表（与方案 §4 一一对应）。
+    const V7_TABLES: [&str; 10] = [
+        "samples_1m",
+        "samples_1h",
+        "maintenance_state",
+        "alert_rules",
+        "alert_states",
+        "alert_events",
+        "alert_silences",
+        "notification_channels",
+        "archive_objects",
+        "archive_state",
+    ];
+
+    /// v7 的 9 个显式索引。
+    const V7_INDEXES: [&str; 9] = [
+        "idx_samples_1m_lookup",
+        "idx_samples_1m_ts",
+        "idx_samples_1h_lookup",
+        "idx_samples_1h_ts",
+        "idx_alert_events_ts",
+        "idx_alert_events_rule_ts",
+        "idx_alert_events_agent_ts",
+        "idx_archive_objects_range",
+        "idx_archive_objects_status",
+    ];
+
+    /// 查询 sqlite_master 中指定类型（table / index）的对象是否存在。
+    fn sqlite_object_exists(s: &SqliteStorage, kind: &str, name: &str) -> bool {
+        let exists: i64 = s
+            .lock_read()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)",
+                params![kind, name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        exists == 1
+    }
+
+    /// sqlite_master 中表 + 索引的对象总数，用于断言重复打开不重复建表。
+    fn sqlite_object_count(s: &SqliteStorage) -> i64 {
+        s.lock_read()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'index')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
     #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -2937,5 +3169,176 @@ mod tests {
 
         // 轮换后只有一行，不新建记录。
         assert_eq!(s.list_api_tokens().unwrap().len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // v7：M4 schema（降采样 / 告警 / 归档 / 维护水位）
+    // ------------------------------------------------------------------
+
+    /// fresh 库：方案 §4 的 10 张新表与 9 个索引全部存在，版本号为 7。
+    #[test]
+    fn v7_schema_creates_all_tables_and_indexes() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let version: i64 = s
+            .lock_read()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        for table in V7_TABLES {
+            assert!(
+                sqlite_object_exists(&s, "table", table),
+                "缺少 v7 表: {table}"
+            );
+        }
+        for index in V7_INDEXES {
+            assert!(
+                sqlite_object_exists(&s, "index", index),
+                "缺少 v7 索引: {index}"
+            );
+        }
+    }
+
+    /// v6 库升级到 v7：只建新表，旧 agents / samples / api_tokens 数据不变，
+    /// 连续打开两次不报错、不重复建表，`user_version=7`。
+    #[test]
+    fn v7_v6_schema_upgrades_preserves_old_data_and_is_idempotent() {
+        let path = temp_db("v7-migration");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agents (
+                     agent_id      TEXT PRIMARY KEY,
+                     name          TEXT NOT NULL,
+                     hostname      TEXT NOT NULL,
+                     os            TEXT NOT NULL DEFAULT '',
+                     arch          TEXT NOT NULL DEFAULT '',
+                     version       TEXT NOT NULL DEFAULT '',
+                     boot_id       TEXT NOT NULL DEFAULT '',
+                     status        TEXT NOT NULL DEFAULT 'offline',
+                     last_seen_at  INTEGER NOT NULL DEFAULT 0,
+                     created_at    INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO agents VALUES
+                     ('a1', '老 agent', 'old-host', 'linux', 'x86_64', '0.3.5', 'boot',
+                      'online', 123, 100);
+                 CREATE TABLE samples (
+                     agent_id TEXT NOT NULL,
+                     metric   TEXT NOT NULL,
+                     labels   TEXT NOT NULL DEFAULT '{}',
+                     ts       INTEGER NOT NULL,
+                     value    REAL NOT NULL
+                 );
+                 INSERT INTO samples VALUES ('a1', 'cpu.usage', '{}', 1000, 12.5);
+                 INSERT INTO samples VALUES ('a1', 'mem.used', '{}', 1000, 1024.0);
+                 CREATE TABLE api_tokens (
+                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                     name         TEXT NOT NULL UNIQUE,
+                     token_hash   TEXT NOT NULL UNIQUE,
+                     scope        TEXT NOT NULL CHECK (scope IN ('read','write','admin')),
+                     created_at   INTEGER NOT NULL,
+                     last_used_at INTEGER,
+                     revoked_at   INTEGER
+                 );
+                 INSERT INTO api_tokens (name, token_hash, scope, created_at)
+                     VALUES ('legacy', 'hash-legacy', 'read', 50);
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        }
+
+        let mut first_object_count = None;
+        for round in 0..2 {
+            let s = SqliteStorage::open(&path).unwrap_or_else(|err| {
+                panic!("第 {round} 次打开 v6 库失败（v6→v7 迁移必须幂等）: {err}")
+            });
+            let version: i64 = s
+                .lock_read()
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION, "必须升级到 v7");
+
+            // 旧数据逐字段保留。
+            let agent = s.get_agent("a1").unwrap().expect("旧 agent 必须保留");
+            assert_eq!(agent.hostname, "old-host");
+            assert_eq!(agent.version, "0.3.5");
+            assert_eq!(agent.status, "online");
+            assert_eq!(s.sample_count("a1").unwrap(), 2);
+            let value: f64 = s
+                .lock_read()
+                .query_row(
+                    "SELECT value FROM samples WHERE metric = 'cpu.usage'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(value, 12.5);
+            let tokens = s.list_api_tokens().unwrap();
+            assert_eq!(tokens.len(), 1);
+            assert_eq!(tokens[0].name, "legacy");
+            assert_eq!(tokens[0].scope, "read");
+
+            // 新表全部建好。
+            for table in V7_TABLES {
+                assert!(
+                    sqlite_object_exists(&s, "table", table),
+                    "第 {round} 次打开缺少表 {table}"
+                );
+            }
+
+            let count = sqlite_object_count(&s);
+            match first_object_count {
+                None => first_object_count = Some(count),
+                Some(first) => assert_eq!(count, first, "重复打开不得重复建表/索引"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// maintenance_state：缺失返回 None；set 覆盖刷新 value/updated_at；
+    /// list 按 key 升序；含引号的键值走参数化 SQL。
+    #[test]
+    fn v7_maintenance_state_upsert_list_and_none() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        assert_eq!(s.get_maintenance_state("last_archived_ts").unwrap(), None);
+
+        s.set_maintenance_state("last_archived_ts", "100", 1_000)
+            .unwrap();
+        s.set_maintenance_state("last_downsample_ts", "50", 900)
+            .unwrap();
+        assert_eq!(
+            s.get_maintenance_state("last_archived_ts").unwrap(),
+            Some("100".to_string())
+        );
+
+        // 覆盖写：同一 key 不新增行，value 与 updated_at 刷新。
+        s.set_maintenance_state("last_archived_ts", "200", 2_000)
+            .unwrap();
+        assert_eq!(
+            s.list_maintenance_state().unwrap(),
+            vec![
+                MaintenanceStateEntry {
+                    key: "last_archived_ts".into(),
+                    value: "200".into(),
+                    updated_at: 2_000,
+                },
+                MaintenanceStateEntry {
+                    key: "last_downsample_ts".into(),
+                    value: "50".into(),
+                    updated_at: 900,
+                },
+            ],
+            "必须按 key 升序且覆盖写不产生重复行"
+        );
+
+        // 参数化：引号 / SQL 片段按字面量存取，不会被当作 SQL 执行。
+        let key = "k'quote";
+        let value = "v'; DROP TABLE maintenance_state; --";
+        s.set_maintenance_state(key, value, 3_000).unwrap();
+        assert_eq!(
+            s.get_maintenance_state(key).unwrap(),
+            Some(value.to_string())
+        );
+        assert_eq!(s.list_maintenance_state().unwrap().len(), 3);
+        assert!(sqlite_object_exists(&s, "table", "maintenance_state"));
     }
 }

@@ -40,6 +40,20 @@ pub struct ApiTokenRecord {
     pub revoked_at: Option<i64>,
 }
 
+/// 一条维护水位记录（schema v7 `maintenance_state` 表）。
+///
+/// 用于保存降采样、保留期与归档任务的进度水位（例如 `last_archived_ts`）。
+/// `value` 是字符串，编码由调用方约定；存储层只做原样读写。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceStateEntry {
+    /// 水位键，例如 `last_archived_ts`。
+    pub key: String,
+    /// 水位值（字符串编码，便于后续扩展）。
+    pub value: String,
+    /// 最近一次写入时间（Unix 毫秒）。
+    pub updated_at: i64,
+}
+
 /// 一条待写入的审计记录（没有自增 `id`）。
 ///
 /// `params` 只放 `target` / `pid` / `name` / `signal` / `lines`，
@@ -240,4 +254,15 @@ pub trait Storage: Send + Sync {
 
     /// 删除 `ts < before_ts` 的审计记录，返回删除行数。
     fn prune_audit(&self, before_ts: i64) -> Result<usize>;
+
+    // ---- M4 维护水位（schema v7） ----
+
+    /// 读取维护水位；key 不存在返回 `None`。
+    fn get_maintenance_state(&self, key: &str) -> Result<Option<String>>;
+
+    /// 覆盖写入维护水位：不存在则插入，已存在则刷新 value 与 updated_at。
+    fn set_maintenance_state(&self, key: &str, value: &str, updated_at: i64) -> Result<()>;
+
+    /// 列出全部维护水位，按 key 升序。
+    fn list_maintenance_state(&self) -> Result<Vec<MaintenanceStateEntry>>;
 }
