@@ -504,6 +504,7 @@ trait ColdStore: Send + Sync {
 [alerts]
 enabled = true
 evaluation_interval_secs = 15
+evaluation_budget_ms = 5000
 offline_after_secs = 90
 cert_warn_hours = 48
 event_retention_days = 90
