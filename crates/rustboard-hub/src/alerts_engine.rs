@@ -64,6 +64,16 @@ const METRIC_LOOKBACK_INTERVALS: u64 = 3;
 /// 过滤过宽。引擎截断并 WARN，而不是让查询失败或把整轮评估拖死。
 pub(crate) const MAX_ALERT_SERIES_PER_RULE: usize = 5_000;
 
+/// 每规则最多保留 / 单轮最多加载的状态行数。
+///
+/// 与观测序列上限一致：状态表按规则硬上限，避免 label churn 或 series 消失导致
+/// 历史状态无限累积，同时保证 engine 单轮加载的内存有界。超出部分每轮按
+/// 「非 resolved 优先保留、再按 last_eval_at 新→旧」淘汰。
+pub(crate) const MAX_ALERT_STATES_PER_RULE: usize = 5_000;
+
+/// 序列循环中每处理多少条检查一次时间预算。
+const BUDGET_CHECK_EVERY: usize = 64;
+
 /// resolved 状态保留 30 天（方案 §6.2）。
 pub(crate) const RESOLVED_STATE_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
@@ -109,6 +119,14 @@ pub(crate) struct EvaluationReport {
     pub truncated_rules: usize,
     /// 因时间预算耗尽而跳过的规则数。
     pub rules_skipped_budget: usize,
+    /// 本轮是否因时间预算耗尽提前结束。
+    pub budget_exhausted: bool,
+    /// 本轮从存储加载的状态行数；每规则 ≤ [`MAX_ALERT_STATES_PER_RULE`]。
+    pub states_loaded: usize,
+    /// 本轮因每规则状态硬上限淘汰的状态行数。
+    pub states_evicted: usize,
+    /// 因预算耗尽而未处理的序列数（估算值）。
+    pub series_skipped_budget: usize,
     /// 清理的事件数。
     pub pruned_events: usize,
     /// 清理的 resolved 状态数。
@@ -193,8 +211,9 @@ where
     let mut cert_hours_cache: Option<Option<i64>> = None;
 
     for (index, rule) in rules.iter().take(MAX_ALERT_RULES).enumerate() {
-        if started.elapsed() >= budget {
+        if budget_exhausted(started, budget) {
             report.rules_skipped_budget = rule_count.saturating_sub(index);
+            report.budget_exhausted = true;
             tracing::warn!(
                 budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
                 skipped = report.rules_skipped_budget,
@@ -203,9 +222,17 @@ where
             break;
         }
 
-        // 每条规则只读一次状态；后续全部状态推进在内存里完成。
-        let existing_states = storage.list_alert_states_for_rule(&rule.id)?;
+        // 每规则最多加载 N 条状态；若正好加载到上限，说明可能还有更旧的历史行，
+        // 先按硬上限淘汰。单轮内存因此始终 ≤ N，不受历史 churn 影响。
+        let existing_states =
+            storage.list_alert_states_for_rule(&rule.id, MAX_ALERT_STATES_PER_RULE)?;
+        report.states_loaded += existing_states.len();
+        if existing_states.len() == MAX_ALERT_STATES_PER_RULE {
+            report.states_evicted +=
+                storage.prune_alert_states_for_rule(&rule.id, MAX_ALERT_STATES_PER_RULE)?;
+        }
         let mut evaluator = RuleEvaluator::new(rule, now, &silences, existing_states);
+        let mut budget_hit = false;
 
         let truncated = match rule.source {
             AlertSource::Metric => {
@@ -229,12 +256,25 @@ where
                         continue;
                     }
                 };
-                for row in &snapshot.rows {
-                    if !alerts::labels_match_filter(&rule.filter_labels, &row.labels) {
-                        continue;
+                // 查询返回后立刻检查预算：大查询本身不可中断，但不能再把 5000 条
+                // 序列全部算完才停。
+                if budget_exhausted(started, budget) {
+                    budget_hit = true;
+                    report.series_skipped_budget += snapshot.rows.len();
+                } else {
+                    for (row_index, row) in snapshot.rows.iter().enumerate() {
+                        if row_index % BUDGET_CHECK_EVERY == 0 && budget_exhausted(started, budget)
+                        {
+                            budget_hit = true;
+                            report.series_skipped_budget += snapshot.rows.len() - row_index;
+                            break;
+                        }
+                        if !alerts::labels_match_filter(&rule.filter_labels, &row.labels) {
+                            continue;
+                        }
+                        let key = alerts::series_key(&row.metric, &row.labels);
+                        evaluator.observe(&row.agent_id, &key, row.value);
                     }
-                    let key = alerts::series_key(&row.metric, &row.labels);
-                    evaluator.observe(&row.agent_id, &key, row.value);
                 }
                 snapshot.truncated
             }
@@ -242,24 +282,37 @@ where
                 if agents.is_none() {
                     agents = Some(storage.list_agents()?);
                 }
-                for agent in agents.as_deref().unwrap_or(&[]) {
-                    // 吊销是终态：不再产生 / 恢复告警，避免误报。
-                    if agent.status == "revoked" {
-                        continue;
-                    }
-                    // last_seen_at = 0 表示从未成功握手（刚入库 / 种子数据）：
-                    // 状态未知，不能当成“已经离线很久”而立刻告警。
-                    if agent.last_seen_at <= 0 {
-                        continue;
-                    }
-                    if let Some(filter) = &rule.filter_agent_id {
-                        if filter != &agent.agent_id {
+                let candidates = agents.as_deref().unwrap_or(&[]);
+                if budget_exhausted(started, budget) {
+                    budget_hit = true;
+                    report.series_skipped_budget += candidates.len();
+                } else {
+                    for (agent_index, agent) in candidates.iter().enumerate() {
+                        if agent_index % BUDGET_CHECK_EVERY == 0
+                            && budget_exhausted(started, budget)
+                        {
+                            budget_hit = true;
+                            report.series_skipped_budget += candidates.len() - agent_index;
+                            break;
+                        }
+                        // 吊销是终态：不再产生 / 恢复告警，避免误报。
+                        if agent.status == "revoked" {
                             continue;
                         }
+                        // last_seen_at = 0 表示从未成功握手（刚入库 / 种子数据）：
+                        // 状态未知，不能当成“已经离线很久”而立刻告警。
+                        if agent.last_seen_at <= 0 {
+                            continue;
+                        }
+                        if let Some(filter) = &rule.filter_agent_id {
+                            if filter != &agent.agent_id {
+                                continue;
+                            }
+                        }
+                        let elapsed_ms = now.saturating_sub(agent.last_seen_at).max(0);
+                        let elapsed_secs = elapsed_ms as f64 / 1_000.0;
+                        evaluator.observe(&agent.agent_id, "", elapsed_secs);
                     }
-                    let elapsed_ms = now.saturating_sub(agent.last_seen_at).max(0);
-                    let elapsed_secs = elapsed_ms as f64 / 1_000.0;
-                    evaluator.observe(&agent.agent_id, "", elapsed_secs);
                 }
                 false
             }
@@ -283,7 +336,10 @@ where
                         loaded
                     }
                 };
-                if let Some(hours) = cached {
+                if budget_exhausted(started, budget) {
+                    budget_hit = true;
+                    report.series_skipped_budget += 1;
+                } else if let Some(hours) = cached {
                     evaluator.observe("", "", hours as f64);
                 }
                 false
@@ -299,15 +355,38 @@ where
             );
         }
 
+        // 批量写前再检查一次预算：只落盘已算出的部分，然后停止后续规则。
+        if !budget_hit && budget_exhausted(started, budget) {
+            budget_hit = true;
+        }
+
         let batch = evaluator.finish();
-        // 单事务批量写入：事件先、状态后；一条规则只抢一次写锁。
-        storage.apply_alert_transitions(&batch.events, &batch.states)?;
+        if !batch.events.is_empty() || !batch.states.is_empty() {
+            // 状态写入与每规则硬上限裁剪在同一事务内完成。
+            report.states_evicted += storage.apply_alert_evaluation(
+                &rule.id,
+                &batch.events,
+                &batch.states,
+                MAX_ALERT_STATES_PER_RULE,
+            )?;
+        }
         report.rules_evaluated += 1;
         report.series_evaluated += batch.series_evaluated;
         report.state_writes += batch.states.len();
         report.firing_events += batch.firing_events;
         report.resolved_events += batch.resolved_events;
         report.silenced_events += batch.silenced_events;
+
+        if budget_hit {
+            report.budget_exhausted = true;
+            report.rules_skipped_budget = rule_count.saturating_sub(index + 1);
+            tracing::warn!(
+                budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+                skipped = report.rules_skipped_budget,
+                "告警评估时间预算耗尽，已写入当前规则的部分结果并停止后续规则"
+            );
+            break;
+        }
     }
 
     prune_history_if_due(storage, cfg, now, &mut report);
@@ -401,6 +480,11 @@ fn state_key(agent_id: &str, series_key: &str) -> String {
     key.push_str(agent_id);
     key.push_str(series_key);
     key
+}
+
+/// 单轮预算是否已耗尽；独立函数便于单测构造已过期的 `Instant`。
+fn budget_exhausted(started: Instant, budget: Duration) -> bool {
+    started.elapsed() >= budget
 }
 
 /// 按小时执行一次清理；水位存 `maintenance_state`，重启后继续遵守。
@@ -1365,8 +1449,111 @@ mod tests {
         .unwrap();
         assert_eq!(report.rules_evaluated, 0);
         assert_eq!(report.rules_skipped_budget, 2);
+        assert!(report.budget_exhausted);
         assert_eq!(report.series_evaluated, 0);
         assert_eq!(report.firing_events, 0);
+    }
+
+    /// 预算比较使用单调 `Instant`，已过期的起点必须判定为耗尽。
+    #[test]
+    fn m4_b1b_budget_exhaustion_helper() {
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("构造过期 Instant");
+        assert!(budget_exhausted(expired, Duration::from_millis(100)));
+        assert!(!budget_exhausted(Instant::now(), Duration::from_secs(60)));
+    }
+
+    /// 10k 历史状态 + 5k 新观测：加载 ≤ 硬上限、旧状态被逐出、重复评估不重复事件。
+    #[test]
+    fn m4_b1b_state_load_is_capped_and_old_states_evicted() {
+        let storage = SqliteStorage::open_in_memory().unwrap();
+        let cfg = test_cfg();
+        let now = 1_700_000_000_000;
+        let day_ms = 24 * 60 * 60 * 1_000;
+        store(&storage, &metric_rule("state-cap", 90.0, 0));
+
+        // 20 天前的 10k 状态（未到 30 天陈旧保留期，不会被 prune_history 提前删）。
+        let old_states: Vec<AlertState> = (0..10_000)
+            .map(|index| AlertState {
+                rule_id: "state-cap".into(),
+                agent_id: format!("old-{index}"),
+                series_key: format!("s{index}"),
+                state: AlertStateKind::Firing,
+                since: now - 20 * day_ms,
+                last_eval_at: now - 20 * day_ms + i64::from(index),
+                last_value: Some(95.0),
+                last_notified_at: None,
+            })
+            .collect();
+        storage.apply_alert_transitions(&[], &old_states).unwrap();
+        assert_eq!(
+            storage
+                .list_alert_states_for_rule("state-cap", 20_000)
+                .unwrap()
+                .len(),
+            10_000
+        );
+
+        // 5000 个新序列（同 agent 不同 labels），全部超阈值。
+        let samples: Vec<Sample> = (0..5_000)
+            .map(|index| {
+                let mut labels = Labels::new();
+                labels.insert("instance".into(), format!("new-{index}"));
+                Sample {
+                    metric: "disk.used_percent".into(),
+                    labels,
+                    ts: now - 1_000,
+                    value: 95.0,
+                }
+            })
+            .collect();
+        storage
+            .insert_batch(&SampleBatch {
+                agent_id: "churn".into(),
+                epoch: 1,
+                seq: 1,
+                boot_id: "boot".into(),
+                sent_at: now,
+                samples,
+            })
+            .unwrap();
+
+        let report = evaluate_once(&storage, &cfg, now).unwrap();
+        assert_eq!(
+            report.states_loaded, MAX_ALERT_STATES_PER_RULE,
+            "单轮加载必须被硬上限截断"
+        );
+        assert_eq!(report.series_evaluated, 5_000);
+        assert_eq!(report.firing_events, 5_000);
+        assert!(
+            report.states_evicted >= 5_000,
+            "旧状态必须被逐出: {}",
+            report.states_evicted
+        );
+
+        let states = storage
+            .list_alert_states_for_rule("state-cap", 20_000)
+            .unwrap();
+        assert_eq!(states.len(), MAX_ALERT_STATES_PER_RULE);
+        assert!(
+            states.iter().all(|state| state.agent_id == "churn"),
+            "旧 agent 的状态必须被淘汰"
+        );
+        assert_eq!(
+            storage.list_alert_events(20_000, None).unwrap().len(),
+            5_000
+        );
+
+        // 相同序列仍在窗口内：加载 ≤ 上限，状态已在，不能重复 firing 事件。
+        let report = evaluate_once(&storage, &cfg, now + 15_000).unwrap();
+        assert_eq!(report.states_loaded, MAX_ALERT_STATES_PER_RULE);
+        assert_eq!(report.firing_events, 0);
+        assert_eq!(report.series_evaluated, 5_000);
+        assert_eq!(
+            storage.list_alert_events(20_000, None).unwrap().len(),
+            5_000
+        );
     }
 
     /// 清理按小时节流：一轮内不重复 COUNT / DELETE，一小时后恢复。

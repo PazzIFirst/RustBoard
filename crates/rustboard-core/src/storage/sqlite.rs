@@ -232,6 +232,9 @@ CREATE TABLE IF NOT EXISTS maintenance_state (
     updated_at INTEGER NOT NULL
 );
 
+-- 告警 raw-only 查询按 metric + 时间范围扫描；没有它只能走 ts 索引后逐行过滤 metric。
+CREATE INDEX IF NOT EXISTS idx_samples_metric_ts ON samples(metric, ts);
+
 CREATE TABLE IF NOT EXISTS alert_rules (
     id                TEXT PRIMARY KEY,
     name              TEXT NOT NULL UNIQUE,
@@ -2140,6 +2143,93 @@ pub struct AlertSeriesSnapshot {
     pub truncated: bool,
 }
 
+/// 每规则状态硬上限的 SQL：保留最近 `keep` 条（非 resolved 优先，其次更新）。
+const ALERT_STATE_PRUNE_FOR_RULE_SQL: &str = "DELETE FROM alert_states
+     WHERE rule_id = ?1 AND rowid NOT IN (
+         SELECT rowid FROM alert_states WHERE rule_id = ?1
+         ORDER BY (state = 'resolved') ASC, last_eval_at DESC, rowid DESC LIMIT ?2
+     )";
+
+/// 构造 `latest_alert_series` 的 SQL；`has_agent` 只影响占位符数量。
+///
+/// 单独抽出来是为了 EXPLAIN QUERY PLAN 测试能断言走 `(metric, ts)` 索引。
+fn latest_alert_series_sql(has_agent: bool) -> String {
+    // 索引名来自固定分支；`INDEXED BY` 保证无统计信息时也走预期索引，避免
+    // 优化器误选 `idx_samples_ts` 后逐行过滤 metric（全窗口扫描）。
+    let index = if has_agent {
+        "idx_samples_lookup"
+    } else {
+        "idx_samples_metric_ts"
+    };
+    let mut sql = format!(
+        "SELECT agent_id, metric, labels, ts, value FROM (
+             SELECT agent_id, metric, labels, ts, value,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY agent_id, labels ORDER BY ts DESC, rowid DESC
+                    ) AS rn
+             FROM samples INDEXED BY {index}
+             WHERE metric = ?1 AND ts >= ?2"
+    );
+    if has_agent {
+        sql.push_str(" AND agent_id = ?");
+    }
+    sql.push_str(") WHERE rn = 1 ORDER BY agent_id ASC, labels ASC LIMIT ?");
+    sql
+}
+
+/// 在既有事务内插入事件、upsert 状态；事件先于状态。
+fn insert_alert_transitions(
+    tx: &Transaction<'_>,
+    events: &[AlertEvent],
+    states: &[AlertState],
+) -> Result<()> {
+    {
+        let mut insert = tx.prepare(ALERT_EVENT_INSERT_SQL)?;
+        for event in events {
+            insert.execute(params![
+                event.ts,
+                event.rule_id,
+                event.rule_name,
+                event.agent_id,
+                event.state.as_str(),
+                event.value,
+                event.message,
+                event.notified as i64,
+                event.notify_error,
+                event.silenced as i64,
+            ])?;
+        }
+    }
+    {
+        let mut upsert = tx.prepare(ALERT_STATE_UPSERT_SQL)?;
+        for state in states {
+            upsert.execute(params![
+                state.rule_id,
+                state.agent_id,
+                state.series_key,
+                state.state.as_str(),
+                state.since,
+                state.last_eval_at,
+                state.last_value,
+                state.last_notified_at,
+            ])?;
+        }
+    }
+    Ok(())
+}
+
+/// 在既有事务内做每规则状态裁剪，返回删除行数。
+fn prune_alert_states_for_rule_in_tx(
+    tx: &Transaction<'_>,
+    rule_id: &str,
+    keep: usize,
+) -> rusqlite::Result<usize> {
+    tx.execute(
+        ALERT_STATE_PRUNE_FOR_RULE_SQL,
+        params![rule_id, i64::try_from(keep).unwrap_or(i64::MAX)],
+    )
+}
+
 /// 数据库里出现未知枚举值时产生的错误（不静默降级成默认值）。
 #[derive(Debug)]
 struct AlertTableColumnError {
@@ -2463,16 +2553,44 @@ impl SqliteStorage {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// 列出指定规则的全部状态（引擎每轮只读一次，避免逐序列抢读锁）。
-    pub fn list_alert_states_for_rule(&self, rule_id: &str) -> Result<Vec<AlertState>> {
+    /// 列出指定规则最近更新的 `limit` 条状态（引擎每轮只读一次）。
+    ///
+    /// 按 `last_eval_at DESC, rowid DESC` 排序并强制 `LIMIT`：即使规则积累了大量
+    /// 历史状态（label churn / series 消失），单轮加载内存也不会无界增长。调用方
+    /// 应在返回条数达到上限时配合 [`Self::prune_alert_states_for_rule`] 淘汰旧行。
+    /// `limit == 0` 返回空列表。
+    pub fn list_alert_states_for_rule(
+        &self,
+        rule_id: &str,
+        limit: usize,
+    ) -> Result<Vec<AlertState>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let sql = format!(
             "SELECT {ALERT_STATE_COLUMNS} FROM alert_states WHERE rule_id = ?1 \
-             ORDER BY agent_id ASC, series_key ASC"
+             ORDER BY last_eval_at DESC, rowid DESC LIMIT ?2"
         );
         let conn = self.lock_read();
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![rule_id], alert_state_from_row)?;
+        let rows = stmt.query_map(
+            params![rule_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+            alert_state_from_row,
+        )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 每规则状态硬上限清理：只保留最近 `keep` 条，返回删除行数。
+    ///
+    /// 保留优先级：非 resolved 优先于 resolved（避免把仍在告警的 Pending/Firing
+    /// 先删掉），同类按 `last_eval_at` 新→旧；相同时间按 rowid 新→旧。`keep == 0`
+    /// 清空该规则全部状态。
+    pub fn prune_alert_states_for_rule(&self, rule_id: &str, keep: usize) -> Result<usize> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = prune_alert_states_for_rule_in_tx(&tx, rule_id, keep)?;
+        tx.commit()?;
+        Ok(removed)
     }
 
     /// 告警评估专用的 **raw-only** 最新序列查询。
@@ -2504,24 +2622,14 @@ impl SqliteStorage {
             });
         }
         let conn = self.lock_read();
-        let mut sql = String::from(
-            "SELECT agent_id, metric, labels, ts, value FROM (
-                 SELECT agent_id, metric, labels, ts, value,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY agent_id, labels ORDER BY ts DESC, rowid DESC
-                        ) AS rn
-                 FROM samples
-                 WHERE metric = ?1 AND ts >= ?2",
-        );
+        let sql = latest_alert_series_sql(agent.is_some());
         let mut params: Vec<rusqlite::types::Value> = vec![
             rusqlite::types::Value::Text(metric.to_string()),
             rusqlite::types::Value::Integer(since),
         ];
         if let Some(agent_id) = agent {
-            sql.push_str(" AND agent_id = ?");
             params.push(rusqlite::types::Value::Text(agent_id.to_string()));
         }
-        sql.push_str(") WHERE rn = 1 ORDER BY agent_id ASC, labels ASC LIMIT ?");
         // 多取一条用于判断是否被截断；溢出时退回 usize::MAX 会被 SQLite 当成
         // 极大值处理，实际不可能有那么多序列。
         let sql_limit = limit.saturating_add(1);
@@ -2564,40 +2672,30 @@ impl SqliteStorage {
         }
         let mut conn = self.lock_write();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        {
-            let mut insert = tx.prepare(ALERT_EVENT_INSERT_SQL)?;
-            for event in events {
-                insert.execute(params![
-                    event.ts,
-                    event.rule_id,
-                    event.rule_name,
-                    event.agent_id,
-                    event.state.as_str(),
-                    event.value,
-                    event.message,
-                    event.notified as i64,
-                    event.notify_error,
-                    event.silenced as i64,
-                ])?;
-            }
-        }
-        {
-            let mut upsert = tx.prepare(ALERT_STATE_UPSERT_SQL)?;
-            for state in states {
-                upsert.execute(params![
-                    state.rule_id,
-                    state.agent_id,
-                    state.series_key,
-                    state.state.as_str(),
-                    state.since,
-                    state.last_eval_at,
-                    state.last_value,
-                    state.last_notified_at,
-                ])?;
-            }
-        }
+        insert_alert_transitions(&tx, events, states)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// 引擎单规则落库：事件 + 状态 + **规则状态硬上限**在同一事务内完成。
+    ///
+    /// `keep_states` 是写完后该规则最多保留的状态数；超出部分（优先 resolved，
+    /// 其次更旧）当场删除。这样即使每轮大量新 series 持续 churn，状态表也不会
+    /// 无限增长，下一次加载仍 ≤ `MAX_ALERT_STATES_PER_RULE`。
+    /// 返回本事务淘汰的状态行数。
+    pub fn apply_alert_evaluation(
+        &self,
+        rule_id: &str,
+        events: &[AlertEvent],
+        states: &[AlertState],
+        keep_states: usize,
+    ) -> Result<usize> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_alert_transitions(&tx, events, states)?;
+        let removed = prune_alert_states_for_rule_in_tx(&tx, rule_id, keep_states)?;
+        tx.commit()?;
+        Ok(removed)
     }
 
     /// B2 通知队列：取未通知且未静默的事件，按 id 升序（先发生先发）。
@@ -3874,13 +3972,14 @@ mod tests {
         "archive_state",
     ];
 
-    /// v7 的 12 个显式索引（方案 §4 的 9 个 + B1b 的待通知 / 状态清理 / 静默
-    /// 到期索引）。
-    const V7_INDEXES: [&str; 12] = [
+    /// v7 的 13 个显式索引（方案 §4 的 9 个 + B1b 的待通知 / 状态清理 / 静默
+    /// 到期 / 告警 metric 查询索引）。
+    const V7_INDEXES: [&str; 13] = [
         "idx_samples_1m_lookup",
         "idx_samples_1m_ts",
         "idx_samples_1h_lookup",
         "idx_samples_1h_ts",
+        "idx_samples_metric_ts",
         "idx_alert_events_ts",
         "idx_alert_events_rule_ts",
         "idx_alert_events_agent_ts",
@@ -4698,7 +4797,7 @@ mod tests {
     // v7：M4 schema（降采样 / 告警 / 归档 / 维护水位）
     // ------------------------------------------------------------------
 
-    /// fresh 库：方案 §4 的 10 张新表与 12 个索引全部存在，版本号为 7。
+    /// fresh 库：方案 §4 的 10 张新表与 13 个索引全部存在，版本号为 7。
     #[test]
     fn v7_schema_creates_all_tables_and_indexes() {
         let s = SqliteStorage::open_in_memory().unwrap();
@@ -4731,7 +4830,8 @@ mod tests {
                 .execute_batch(
                     "DROP INDEX idx_alert_events_pending;
                      DROP INDEX idx_alert_states_state_eval;
-                     DROP INDEX idx_alert_silences_until;",
+                     DROP INDEX idx_alert_silences_until;
+                     DROP INDEX idx_samples_metric_ts;",
                 )
                 .unwrap();
             assert!(!sqlite_object_exists(
@@ -4746,6 +4846,7 @@ mod tests {
                 "idx_alert_events_pending",
                 "idx_alert_states_state_eval",
                 "idx_alert_silences_until",
+                "idx_samples_metric_ts",
             ] {
                 assert!(
                     sqlite_object_exists(&s, "index", index),
@@ -6541,6 +6642,129 @@ mod tests {
                 "resolved".to_string()
             ],
             "resolved / 边界 / 新状态不能被陈旧清理删除"
+        );
+    }
+
+    /// 每规则状态加载上限、淘汰优先级（非 resolved 优先）与写事务内硬上限。
+    #[test]
+    fn m4_b1b_rule_state_load_limit_and_prune_priority() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let rule_id = "rule-cap";
+        let seed = |key: &str, kind: AlertStateKind, last_eval_at: i64| {
+            let mut state = alert_state(rule_id, "agent-1", key);
+            state.state = kind;
+            state.last_eval_at = last_eval_at;
+            s.upsert_alert_state(&state).unwrap();
+        };
+        seed("firing-100", AlertStateKind::Firing, 100);
+        seed("firing-200", AlertStateKind::Firing, 200);
+        seed("pending-300", AlertStateKind::Pending, 300);
+        seed("firing-400", AlertStateKind::Firing, 400);
+        seed("resolved-500", AlertStateKind::Resolved, 500);
+        seed("resolved-600", AlertStateKind::Resolved, 600);
+
+        // 加载按 last_eval_at 新→旧，且硬 LIMIT。
+        let loaded = s.list_alert_states_for_rule(rule_id, 3).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|state| state.series_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["resolved-600", "resolved-500", "firing-400"]
+        );
+        assert_eq!(s.list_alert_states_for_rule(rule_id, 0).unwrap(), vec![]);
+
+        // 保留 3 条：非 resolved 优先保留，即使 resolved 更新。
+        assert_eq!(s.prune_alert_states_for_rule(rule_id, 3).unwrap(), 3);
+        let kept = s.list_alert_states_for_rule(rule_id, 10).unwrap();
+        assert_eq!(kept.len(), 3);
+        assert!(kept
+            .iter()
+            .all(|state| state.state != AlertStateKind::Resolved));
+        assert_eq!(
+            kept.iter()
+                .map(|state| state.last_eval_at)
+                .collect::<Vec<_>>(),
+            vec![400, 300, 200],
+            "keep 3 应保留最新的非 resolved 状态"
+        );
+
+        // 批量评估写入 + 同事务硬上限：新状态最新，淘汰最旧一条。
+        let mut new_state = alert_state(rule_id, "agent-1", "firing-700");
+        new_state.state = AlertStateKind::Firing;
+        new_state.last_eval_at = 700;
+        assert_eq!(
+            s.apply_alert_evaluation(rule_id, &[], &[new_state], 3)
+                .unwrap(),
+            1
+        );
+        let after = s.list_alert_states_for_rule(rule_id, 10).unwrap();
+        assert_eq!(
+            after
+                .iter()
+                .map(|state| state.last_eval_at)
+                .collect::<Vec<_>>(),
+            vec![700, 400, 300]
+        );
+
+        assert_eq!(s.prune_alert_states_for_rule(rule_id, 0).unwrap(), 3);
+        assert!(s
+            .list_alert_states_for_rule(rule_id, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// 告警 raw 查询必须走 `(metric, ts)` / `(agent, metric, ts)` 索引，不能全表扫描。
+    #[test]
+    fn m4_b1b_latest_alert_series_uses_index_without_full_scan() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let conn = s.lock_read();
+        let plan_for = |has_agent: bool| -> Vec<String> {
+            let sql = format!("EXPLAIN QUERY PLAN {}", latest_alert_series_sql(has_agent));
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let values: Vec<rusqlite::types::Value> = if has_agent {
+                vec![
+                    rusqlite::types::Value::Text("disk.used_percent".into()),
+                    rusqlite::types::Value::Integer(0),
+                    rusqlite::types::Value::Text("a1".into()),
+                    rusqlite::types::Value::Integer(10),
+                ]
+            } else {
+                vec![
+                    rusqlite::types::Value::Text("disk.used_percent".into()),
+                    rusqlite::types::Value::Integer(0),
+                    rusqlite::types::Value::Integer(10),
+                ]
+            };
+            stmt.query_map(rusqlite::params_from_iter(values), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+
+        let all_agents = plan_for(false).join("\n");
+        assert!(
+            all_agents.contains("idx_samples_metric_ts"),
+            "跨 agent 查询必须使用 idx_samples_metric_ts: {all_agents}"
+        );
+        assert!(
+            !all_agents.lines().any(|line| line.trim() == "SCAN samples"),
+            "不得出现全表扫描: {all_agents}"
+        );
+
+        let single_agent = plan_for(true).join("\n");
+        assert!(
+            single_agent.contains("idx_samples_lookup"),
+            "单 agent 查询必须使用 idx_samples_lookup: {single_agent}"
+        );
+        assert!(
+            !single_agent
+                .lines()
+                .any(|line| line.trim() == "SCAN samples"),
+            "不得出现全表扫描: {single_agent}"
         );
     }
 }
