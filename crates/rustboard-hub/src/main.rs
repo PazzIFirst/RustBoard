@@ -5925,6 +5925,17 @@ mod tests {
         );
     }
 
+    /// 评审严重回归：hub 的 WS 消息上限必须大于 agent 的控制应答预算，
+    /// 避免未来常量漂移后合法应答在 hub 侧被拒绝并断开会话。
+    #[test]
+    fn v032_ws_message_limit_covers_control_response_budget() {
+        let budget = rustboard_common::control::MAX_CONTROL_RESPONSE_BYTES;
+        assert!(
+            MAX_WS_MESSAGE_SIZE > budget,
+            "WS 消息上限 {MAX_WS_MESSAGE_SIZE} 必须大于控制应答预算 {budget}"
+        );
+    }
+
     /// 控制结果在 hub 侧按 max_output_bytes 截断，不信任 agent 长度。
     #[tokio::test]
     async fn m3_control_result_is_capped_by_hub_max_output_bytes() {

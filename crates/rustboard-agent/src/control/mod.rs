@@ -14,8 +14,10 @@ use std::time::Duration;
 
 use rustboard_common::config::ControlConfig;
 use rustboard_common::control::{
-    self, ControlError, ControlOp, ControlRequest, ControlResponse, ControlResult, MAX_LOG_LINES,
+    self, ControlError, ControlOp, ControlRequest, ControlResponse, ControlResult,
+    MAX_CONTROL_RESPONSE_BYTES, MAX_LOG_LINES,
 };
+use rustboard_common::wire::Frame;
 use tokio::sync::{mpsc, Semaphore};
 
 /// 单个会话最多同时执行的控制操作数；超限立即回错误，避免无限 spawn。
@@ -177,6 +179,9 @@ impl ControlDispatcher {
                     ControlResponse::failure(id, ControlError::control_failed("控制操作执行超时"))
                 }
             };
+            // 配置驱动的大结果（例如 512 条 LogSources）编码后可能超过 hub 的
+            // 1 MiB WS 消息上限；超限时回固定小错误，不能发出去导致断连。
+            let response = fit_response_budget(response);
             // 会话结束时接收端已 drop，发送失败直接忽略。
             let _ = tx.send(response).await;
         });
@@ -188,6 +193,33 @@ impl ControlDispatcher {
             id,
             ControlError::unsupported(message),
         ));
+    }
+}
+
+/// 控制应答编码后的预算兜底。
+///
+/// 结果大小由配置 / 系统状态决定（例如 512 条 `LogSources`、超长 target），
+/// 编码后可能超过 hub 的 1 MiB WebSocket 消息上限。超限时必须回固定小错误：
+/// 把超限帧发出去只会让 hub 以 `Message too long` 关闭整个会话，结果仍然丢失，
+/// 而且 agent 会被迫重连。id 必须保留，hub 才能把错误匹配回对应请求。
+fn fit_response_budget(response: ControlResponse) -> ControlResponse {
+    let id = response.id;
+    match Frame::ControlResponse(response.clone()).encode() {
+        Ok(encoded) if encoded.len() <= MAX_CONTROL_RESPONSE_BYTES => response,
+        Ok(encoded) => {
+            tracing::warn!(
+                id,
+                encoded_bytes = encoded.len(),
+                limit = MAX_CONTROL_RESPONSE_BYTES,
+                "控制结果超过单帧预算，改为错误应答"
+            );
+            ControlResponse::failure(id, ControlError::control_failed("控制结果过大，已丢弃"))
+        }
+        Err(err) => {
+            // 编码失败同样不能 panic / 发半帧；回一个可解释的固定错误。
+            tracing::warn!(id, error = %err, "控制应答编码失败，改为错误应答");
+            ControlResponse::failure(id, ControlError::control_failed("控制结果编码失败"))
+        }
     }
 }
 
@@ -223,7 +255,9 @@ fn decode_control_probe(bytes: &[u8]) -> std::result::Result<u64, rmp_serde::dec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustboard_common::control::{codes, ControlError, KillSignal};
+    use rustboard_common::control::{
+        codes, ControlError, KillSignal, LogSourceInfo, MAX_LOG_TARGET_BYTES, MAX_OUTPUT_BYTES,
+    };
     use rustboard_common::wire::Frame;
 
     fn cfg() -> ControlConfig {
@@ -426,6 +460,85 @@ mod tests {
         let response = rx.recv().await.expect("应收到错误应答");
         assert_eq!(response.id, 42);
         assert_eq!(response.error.unwrap().code, codes::UNSUPPORTED);
+    }
+
+    /// 评审严重回归：约 300 条超长 `LogSources` 编码后 >1 MiB，必须改为
+    /// `control_failed` 小错误，不能发出超限帧导致 hub 断开会话。
+    #[test]
+    fn v032_oversized_control_response_is_replaced_with_error() {
+        let sources: Vec<LogSourceInfo> = (0..300)
+            .map(|index| LogSourceInfo {
+                id: format!("src-{index}"),
+                kind: rustboard_common::config::LogSourceKind::File,
+                target: "t".repeat(MAX_LOG_TARGET_BYTES),
+                name: "n".repeat(128),
+            })
+            .collect();
+        let response = ControlResponse::success(7, ControlResult::LogSources(sources));
+        let encoded_before = Frame::ControlResponse(response.clone())
+            .encode()
+            .expect("测试响应必须可编码");
+        assert!(
+            encoded_before.len() > 1024 * 1024,
+            "测试数据编码后必须超过 hub 1 MiB 消息上限，实际 {}",
+            encoded_before.len()
+        );
+
+        let fitted = fit_response_budget(response);
+        assert_eq!(fitted.id, 7, "id 必须保留");
+        assert!(fitted.result.is_none(), "超限结果必须被丢弃");
+        let encoded_after = Frame::ControlResponse(fitted.clone()).encode().unwrap();
+        let error = fitted.error.as_ref().expect("必须返回错误");
+        assert_eq!(error.code, codes::CONTROL_FAILED);
+        assert!(
+            error.message.contains("过大"),
+            "错误信息: {}",
+            error.message
+        );
+        assert!(
+            encoded_after.len() < 4096,
+            "错误应答必须远小于预算，实际 {}",
+            encoded_after.len()
+        );
+    }
+
+    /// 正常小响应原样通过；合法的 256 KiB stdout + 256 KiB stderr 也不会被误杀。
+    #[test]
+    fn v032_legal_control_responses_pass_budget_unchanged() {
+        let small = ControlResponse::success(
+            1,
+            ControlResult::LogSources(vec![LogSourceInfo {
+                id: "app".into(),
+                kind: rustboard_common::config::LogSourceKind::File,
+                target: "/var/log/app.log".into(),
+                name: "app".into(),
+            }]),
+        );
+        assert_eq!(
+            fit_response_budget(small.clone()),
+            small,
+            "小响应必须原样通过"
+        );
+
+        let output = ControlResponse::success(
+            2,
+            ControlResult::ActionOutput {
+                stdout: "o".repeat(MAX_OUTPUT_BYTES),
+                stderr: "e".repeat(MAX_OUTPUT_BYTES),
+                exit_code: Some(0),
+            },
+        );
+        let encoded = Frame::ControlResponse(output.clone()).encode().unwrap();
+        assert!(
+            encoded.len() <= MAX_CONTROL_RESPONSE_BYTES,
+            "合法的双 256 KiB 输出应在预算内，实际 {}",
+            encoded.len()
+        );
+        assert_eq!(
+            fit_response_budget(output.clone()),
+            output,
+            "预算内的合法输出不得被误杀"
+        );
     }
 
     /// 未启用日志时不做文件 I/O 预检（旧配置里的过期路径不应阻止启动）。

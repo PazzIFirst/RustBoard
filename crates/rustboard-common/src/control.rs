@@ -60,6 +60,13 @@ pub const MAX_LIST_ITEMS: usize = 512;
 pub const MAX_PROCESS_ITEMS: usize = 200;
 /// 单条命令 stdout / stderr 各自的输出上限（字节）。
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// agent 发送控制应答前的编码后字节预算（比 hub 的 1 MiB WS 消息上限小 4 KiB）。
+///
+/// `LogSources` 等由配置驱动的结果可能远超 256 KiB；超过预算时 agent 必须回
+/// 固定小错误，绝不能把超限帧发出去——hub 会因 `Message too long` 关闭整个
+/// 会话，命令结果反而全部丢失。留 4 KiB 给 MessagePack / 传输层开销，并保证
+/// `MAX_CONTROL_RESPONSE_BYTES < hub 的 MAX_WS_MESSAGE_SIZE`。
+pub const MAX_CONTROL_RESPONSE_BYTES: usize = 1024 * 1024 - 4096;
 /// 命令输出被截断时附加到 ActionOutput 的标记。
 pub const TRUNCATED_MARKER: &str = "\n...[truncated]...\n";
 
