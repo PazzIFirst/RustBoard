@@ -317,6 +317,7 @@ def command_event_find(args) -> None:
             json_bool(event.get("notified")),
             json_bool(event.get("silenced")),
             str(event.get("agent_id", "")),
+            str(event.get("notify_error", "")),
         ]
         print("\t".join(fields))
         return

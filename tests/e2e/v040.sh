@@ -7,8 +7,9 @@
 #             重名 → 409 rule_name_exists；PUT 只发 {enabled:false} → 回读 false；
 #             DELETE 自定义规则 → 204 且列表移除。
 #   事件：    PUT 全部字段重新启用规则，≤30s 内出现 firing 事件；事件含
-#             rule_id、非空 series_key、notified=false；limit/before_id 分页
-#             严格排他，非法参数 400。
+#             rule_id、非空 series_key、silenced=false；notified 允许 false，
+#             也允许 B2b 通知 worker 在无渠道时标记的 true/no_channel；
+#             limit/before_id 分页严格排他，非法参数 400。
 #   静默：    POST 静默 200、GET 列表包含；禁用/启用规则制造新的 firing 事件，
 #             该事件 silenced=true 且 notified=false；DELETE 静默 204 且列表移除。
 #   渠道：    POST Telegram（假 token / chat_id）200；响应与 GET 列表全文不含
@@ -565,16 +566,26 @@ else
   BASELINE_ID=0
 fi
 if wait_alert_event "$RULE_ID" "${BASELINE_ID:-0}" firing false 30; then
-  IFS=$'\t' read -r EV_ID EV_STATE EV_SERIES EV_NOTIFIED EV_SILENCED EV_AGENT <<< "$FOUND_EVENT"
+  IFS=$'\t' read -r EV_ID EV_STATE EV_SERIES EV_NOTIFIED EV_SILENCED EV_AGENT EV_NOTIFY_ERROR <<< "$FOUND_EVENT"
   if [[ "$EV_STATE" == "firing" && -n "$EV_SERIES" ]]; then
     pass "2.2" "≤30s 出现 firing 事件（id=$EV_ID，rule_id/非空 series_key 均命中）"
   else
     fail "2.2" "firing 事件字段异常（state=$EV_STATE series_key=$EV_SERIES）"
   fi
-  if [[ "$EV_NOTIFIED" == "false" && "$EV_SILENCED" == "false" && "$EV_AGENT" == "$AGENT_ID" ]]; then
-    pass "2.3" "事件 notified=false、未被静默，agent_id 与规则过滤一致"
+  # B2b 通知 worker 可能已在 5s tick 内把无渠道事件标记为 notified=1 + no_channel；
+  # 因此这里只要求事件存在且字段自洽，不把“尚未通知”当作事件产生的必要条件。
+  NOTIFY_STATE_OK=0
+  if [[ "$EV_SILENCED" == "false" && "$EV_AGENT" == "$AGENT_ID" ]]; then
+    if [[ "$EV_NOTIFIED" == "false" && -z "$EV_NOTIFY_ERROR" ]]; then
+      NOTIFY_STATE_OK=1
+    elif [[ "$EV_NOTIFIED" == "true" && "$EV_NOTIFY_ERROR" == "no_channel" ]]; then
+      NOTIFY_STATE_OK=1
+    fi
+  fi
+  if (( NOTIFY_STATE_OK == 1 )); then
+    pass "2.3" "事件 silenced=false、agent_id 与过滤一致；notified=$EV_NOTIFIED（true 时为固定码 no_channel）"
   else
-    fail "2.3" "事件通知/静默/agent 字段异常（notified=$EV_NOTIFIED silenced=$EV_SILENCED agent=$EV_AGENT）"
+    fail "2.3" "事件静默/agent/通知字段异常（notified=$EV_NOTIFIED notify_error=$EV_NOTIFY_ERROR silenced=$EV_SILENCED agent=$EV_AGENT）"
   fi
 else
   fail "2.2" "30s 内未出现 firing 事件（最后请求状态: ${LAST_STATUS:-<empty>}）"
@@ -661,7 +672,7 @@ REENABLE_STATUS=$STATUS
 SILENCED_OK=0
 if [[ "$DISABLE_STATUS" == "200" && "$REENABLE_STATUS" == "200" ]]; then
   if wait_alert_event "$RULE_ID" "${SILENCE_BASE_ID:-0}" firing true 30; then
-    IFS=$'\t' read -r S_ID S_STATE S_SERIES S_NOTIFIED S_SILENCED S_AGENT <<< "$FOUND_EVENT"
+    IFS=$'\t' read -r S_ID S_STATE S_SERIES S_NOTIFIED S_SILENCED S_AGENT S_NOTIFY_ERROR <<< "$FOUND_EVENT"
     if [[ "$S_STATE" == "firing" && "$S_SILENCED" == "true" && "$S_NOTIFIED" == "false" && -n "$S_SERIES" ]]; then
       SILENCED_OK=1
     fi
