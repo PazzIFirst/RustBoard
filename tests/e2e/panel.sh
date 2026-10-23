@@ -1414,8 +1414,8 @@ check_series_400 "7.9" "from == to 返回 400 JSON" \
   "metric=cpu.usage&from=$NOW&to=$NOW"
 check_series_400 "7.10" "from > to 返回 400 JSON" \
   "metric=cpu.usage&from=$NOW&to=$((NOW - 1000))"
-check_series_400 "7.11" "跨度 > 32 天返回 400 JSON" \
-  "metric=cpu.usage&from=$((NOW - 33 * 86400000))&to=$NOW"
+check_series_400 "7.11" "跨度 > 730 天返回 400 JSON" \
+  "metric=cpu.usage&from=$((NOW - 731 * 86400000))&to=$NOW"
 check_series_400 "7.12" "metric 含非法字符返回 400 JSON" \
   "metric=cpu%20usage&from=$((NOW - 3600000))&to=$NOW"
 check_series_400 "7.13" "21 个 metric 返回 400 JSON" \

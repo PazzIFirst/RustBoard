@@ -254,7 +254,7 @@
 - 错误指纹 / 无客户端证书 / 过期证书 / 别的 CA 证书 / TLS 1.2 均被拒；
 - 面板登录、5 次失败锁定、Cookie、登出、未登录 401 均验证；
 - 面板修改采样间隔后 60s 内 agent 日志出现 `采样间隔已更新`，重连后继续上报；
-- series 多指标、自动分桶、32 天/点数上限与非法参数 400 均验证；
+- series 多指标、自动分桶、730 天/点数上限与非法参数 400 均验证；
 - 证书轮换失败场景（CA 不配套、缺 ca.key、坏 ca.crt、空 SAN、缺 server.crt）均有 e2e 断言；
 - 测试：`cargo test --workspace` 495 通过；`cargo audit` 0 漏洞；
   `security.sh` 9/9、`cert-rotation.sh` 103/103、`panel.sh` 159/159、

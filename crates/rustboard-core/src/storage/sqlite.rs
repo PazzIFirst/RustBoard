@@ -10,6 +10,7 @@ use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
+use rustboard_common::util::now_ms;
 
 use super::{
     AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, DownsampleRangeResult,
@@ -700,7 +701,12 @@ impl SqliteStorage {
 
     /// 聚合表回退：取 `since` 之后某层每个序列的最新桶。
     ///
-    /// 用 `bucket_ts + 层粒度 > since` 放宽一个层粒度，覆盖跨窗口边界的桶；
+    /// 谓词写成 `bucket_ts > since - 层粒度 AND bucket_ts <= now`：
+    /// - 前一项等价于「桶与窗口重叠」（严格大于，桶结束恰好等于 since 的旧桶
+    ///   不算），且不再对列做表达式运算，可走 `idx_samples_1m_lookup` /
+    ///   `idx_samples_1m_ts` 的范围扫描；
+    /// - 后一项排除未来桶，避免时钟异常/脏数据把扫描拖到全表尾部。
+    ///
     /// 返回 `bucket_ts` 作为 `ts`、`last_value` 作为 `value`。行数上限、agent /
     /// metrics 过滤与按序列去重的语义都与 raw 路径一致。
     fn latest_tier_samples(
@@ -720,26 +726,17 @@ impl SqliteStorage {
         let conn = self.lock_read();
 
         // 表名来自上面的固定分支，不接受外部输入；其余值全部参数绑定。
-        let mut sql = format!(
-            "SELECT agent_id, metric, labels, bucket_ts, last_value FROM {table}
-             WHERE bucket_ts + ?1 > ?2"
-        );
+        let sql = latest_tier_sql(table, agent.is_some(), metrics.len());
         let mut params: Vec<rusqlite::types::Value> = vec![
-            rusqlite::types::Value::Integer(granularity),
-            rusqlite::types::Value::Integer(since),
+            rusqlite::types::Value::Integer(since.saturating_sub(granularity)),
+            rusqlite::types::Value::Integer(now_ms()),
         ];
         if let Some(agent_id) = agent {
-            sql.push_str(" AND agent_id = ?");
             params.push(rusqlite::types::Value::Text(agent_id.to_string()));
         }
-        if !metrics.is_empty() {
-            let holders = vec!["?"; metrics.len()].join(",");
-            sql.push_str(&format!(" AND metric IN ({holders})"));
-            for metric in metrics {
-                params.push(rusqlite::types::Value::Text(metric.clone()));
-            }
+        for metric in metrics {
+            params.push(rusqlite::types::Value::Text(metric.clone()));
         }
-        sql.push_str(" ORDER BY agent_id, metric, labels, bucket_ts ASC LIMIT ?");
         params.push(rusqlite::types::Value::Integer(
             i64::try_from(LATEST_SAMPLES_SQL_LIMIT).unwrap_or(i64::MAX),
         ));
@@ -759,6 +756,64 @@ impl SqliteStorage {
         let rows: Vec<AgentSeriesRow> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         dedupe_latest_samples(rows, LATEST_SAMPLES_SQL_LIMIT, since, metrics, agent, tier)
     }
+}
+
+/// 构造 1m/1h 时间桶聚合 SQL。
+///
+/// `table` 只能来自 [`SampleTier`] 的固定分支，不接收外部输入；metric 过滤器
+/// 只改变占位符数量，值全部由调用方绑定。`bucket_ts > ?2` 是
+/// `bucket_ts + 层粒度 > from` 的等价改写（`?2 = from - 层粒度`），让 SQLite
+/// 能对 `bucket_ts` 做索引范围扫描，而不是逐行计算表达式。
+///
+/// 用 `INDEXED BY` 固定走 `(agent_id, metric, bucket_ts)` 复合索引：没有
+/// ANALYZE 统计时优化器可能选 PRIMARY KEY 自动索引或全表扫描，这里显式锁定
+/// 与查询形状匹配的索引（索引名与表名一一对应，均来自固定分支）。
+fn tiered_query_sql(table: &'static str, metric_count: usize) -> String {
+    let mut sql = format!(
+        "SELECT metric, labels, (bucket_ts / ?4) * ?4 AS query_ts,
+                CAST(SUM(avg_value * count) AS REAL) / SUM(count)
+         FROM {table} INDEXED BY idx_{table}_lookup
+         WHERE agent_id = ?1 AND bucket_ts > ?2 AND bucket_ts <= ?3"
+    );
+    if metric_count > 0 {
+        let holders: Vec<String> = (0..metric_count).map(|i| format!("?{}", 5 + i)).collect();
+        sql.push_str(&format!(" AND metric IN ({})", holders.join(",")));
+    }
+    let limit_idx = 5 + metric_count;
+    sql.push_str(&format!(
+        " GROUP BY metric, labels, query_ts
+          ORDER BY metric, labels, query_ts
+          LIMIT ?{limit_idx}"
+    ));
+    sql
+}
+
+/// 构造 latest_samples 的 1m/1h 回退 SQL。
+///
+/// 条件同样保持列上无表达式：`bucket_ts > since - 层粒度 AND bucket_ts <= now`。
+/// 前一项与「桶结束晚于 since」（`bucket_ts + 层粒度 > since`）等价，且保持
+/// 严格不包含「桶结束恰好等于 since」的旧桶。
+/// 带 agent 过滤时走复合索引（先按 agent 收窄），跨 agent 查询走 `bucket_ts`
+/// 单列索引；两条路径都用 `INDEXED BY` 固定，避免无统计信息时全表扫描。
+fn latest_tier_sql(table: &'static str, has_agent: bool, metric_count: usize) -> String {
+    let index = if has_agent {
+        format!("idx_{table}_lookup")
+    } else {
+        format!("idx_{table}_ts")
+    };
+    let mut sql = format!(
+        "SELECT agent_id, metric, labels, bucket_ts, last_value FROM {table} INDEXED BY {index}
+         WHERE bucket_ts > ? AND bucket_ts <= ?"
+    );
+    if has_agent {
+        sql.push_str(" AND agent_id = ?");
+    }
+    if metric_count > 0 {
+        let holders = vec!["?"; metric_count].join(",");
+        sql.push_str(&format!(" AND metric IN ({holders})"));
+    }
+    sql.push_str(" ORDER BY agent_id, metric, labels, bucket_ts ASC LIMIT ?");
+    sql
 }
 
 /// `latest_samples` 各条路径共用的上限检查与按序列去重。
@@ -1271,36 +1326,19 @@ impl Storage for SqliteStorage {
         // 表名来自固定分支，不接受外部输入；值全部参数绑定。
         // - 请求桶起点 = floor(bucket_ts / bucket_ms) * bucket_ms；别名不能叫
         //   bucket_ts（会与源列同名，GROUP BY 解析到源列而拆散聚合）；
-        // - 与 [from, to] 有重叠即纳入：bucket_ts + 层粒度 > from 且 bucket_ts <= to；
+        // - 与 [from, to] 有重叠即纳入；`bucket_ts > from - 层粒度` 是
+        //   `bucket_ts + 层粒度 > from` 的等价改写，避免列上表达式导致全表扫描；
         // - value 必须按 count 加权平均，不能对各层均值再取简单平均。
-        let mut sql = format!(
-            "SELECT metric, labels, (bucket_ts / ?4) * ?4 AS query_ts,
-                    CAST(SUM(avg_value * count) AS REAL) / SUM(count)
-             FROM {table}
-             WHERE agent_id = ?1 AND bucket_ts + ?5 > ?2 AND bucket_ts <= ?3"
-        );
+        let sql = tiered_query_sql(table, query.metrics.len());
         let mut params: Vec<rusqlite::types::Value> = vec![
             rusqlite::types::Value::Text(query.agent_id.clone()),
-            rusqlite::types::Value::Integer(query.from),
+            rusqlite::types::Value::Integer(query.from.saturating_sub(tier_granularity)),
             rusqlite::types::Value::Integer(query.to),
             rusqlite::types::Value::Integer(bucket_ms),
-            rusqlite::types::Value::Integer(tier_granularity),
         ];
-        if !query.metrics.is_empty() {
-            let holders: Vec<String> = (0..query.metrics.len())
-                .map(|i| format!("?{}", 6 + i))
-                .collect();
-            sql.push_str(&format!(" AND metric IN ({})", holders.join(",")));
-            for metric in &query.metrics {
-                params.push(rusqlite::types::Value::Text(metric.clone()));
-            }
+        for metric in &query.metrics {
+            params.push(rusqlite::types::Value::Text(metric.clone()));
         }
-        let limit_idx = params.len() + 1;
-        sql.push_str(&format!(
-            " GROUP BY metric, labels, query_ts
-              ORDER BY metric, labels, query_ts
-              LIMIT ?{limit_idx}"
-        ));
         params.push(rusqlite::types::Value::Integer(i64::from(query.limit)));
 
         let mut stmt = conn.prepare(&sql)?;
@@ -4514,7 +4552,8 @@ mod tests {
             "1m 回退：按 (agent,metric,labels) 去重且用 last_value"
         );
 
-        // since 放宽一个层粒度：跨窗口边界的桶仍可见；超过桶尾则不可见。
+        // since 放宽一个层粒度：跨窗口边界的桶仍可见；桶结束恰好等于 since
+        // （base + 60s）时必须不可见。
         let rows = s
             .latest_samples(base + 30_000, &["cpu.usage".into()], Some("a1"))
             .unwrap();
@@ -4541,7 +4580,7 @@ mod tests {
         assert_eq!(rows[0].ts, hour);
         assert!((rows[0].value - 88.0).abs() < 1e-9);
 
-        // 1h 的 since 同样放宽一个层粒度。
+        // 1h 的 since 同样放宽一个层粒度；桶结束恰好等于 since 时不可见。
         assert_eq!(
             s.latest_samples(hour + 1_800_000, &[], None).unwrap().len(),
             1
@@ -4550,5 +4589,79 @@ mod tests {
             .latest_samples(hour + BUCKET_1H_MS, &[], None)
             .unwrap()
             .is_empty());
+    }
+
+    /// EXPLAIN QUERY PLAN：tiered / latest 回退都必须走聚合表索引（范围受限），
+    /// 不能因为列上表达式退化成全表扫描。
+    #[test]
+    fn m4b_tiered_queries_use_tier_indexes() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        // EXPLAIN 不执行查询，但 rusqlite 仍要求占位符数量匹配；绑定 NULL 即可。
+        let plan = |sql: &str, params_len: usize| -> Vec<String> {
+            let conn = s.lock_read();
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let nulls = vec![rusqlite::types::Value::Null; params_len];
+            stmt.query_map(rusqlite::params_from_iter(nulls), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let assert_indexed = |sql: &str, params_len: usize, index: &str| {
+            let plan = plan(sql, params_len);
+            assert!(
+                plan.iter().any(|detail| detail.contains(index)),
+                "{index} 未被使用: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail == "SCAN samples_1m" || detail == "SCAN samples_1h"),
+                "不得全表扫描: {plan:?}"
+            );
+        };
+
+        // 路由主查询总是带 metric，走 (agent_id, metric, bucket_ts) 复合索引。
+        // 占位符：4 个基础参数 + metric + limit。
+        for table in ["samples_1m", "samples_1h"] {
+            assert_indexed(
+                &tiered_query_sql(table, 1),
+                6,
+                &format!("idx_{table}_lookup"),
+            );
+        }
+        // latest 回退：带 agent 时可用 lookup，不带 agent 时用 bucket_ts 单列索引。
+        assert_indexed(
+            &latest_tier_sql("samples_1m", true, 0),
+            4,
+            "idx_samples_1m_lookup",
+        );
+        assert_indexed(
+            &latest_tier_sql("samples_1h", false, 1),
+            4,
+            "idx_samples_1h_ts",
+        );
+    }
+
+    /// latest 回退必须有 `bucket_ts <= now` 上界，未来桶不能顶掉正常最新点。
+    #[test]
+    fn m4b_latest_tier_ignores_future_buckets() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let now = now_ms();
+        let base = (now - 10 * BUCKET_1M_MS).div_euclid(BUCKET_1M_MS) * BUCKET_1M_MS;
+        insert_tier_rows(
+            &s,
+            "samples_1m",
+            "a1",
+            &[
+                ("cpu.usage", "{}", base, 1.0, 1.0, 1),
+                // 未来桶：没有上界时 ts 更大，会在去重时顶掉正常点。
+                ("cpu.usage", "{}", now + 86_400_000, 9.0, 9.0, 1),
+            ],
+        );
+
+        let rows = s.latest_samples(0, &[], None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ts, base, "未来桶必须被 bucket_ts <= now 排除");
+        assert!((rows[0].value - 1.0).abs() < 1e-9);
     }
 }

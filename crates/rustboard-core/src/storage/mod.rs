@@ -91,6 +91,17 @@ impl SampleTier {
             SampleTier::OneHour => BUCKET_1H_MS,
         }
     }
+
+    /// 更粗的一层（Raw→1m→1h）；1h 已是最粗层，返回 `None`。
+    ///
+    /// 查询在所选层没有数据时可回退一层，但最多到 1h。
+    pub fn next_coarser(self) -> Option<SampleTier> {
+        match self {
+            SampleTier::Raw => Some(SampleTier::OneMinute),
+            SampleTier::OneMinute => Some(SampleTier::OneHour),
+            SampleTier::OneHour => None,
+        }
+    }
 }
 
 /// 单次降采样聚合的结果。

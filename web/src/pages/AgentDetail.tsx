@@ -47,12 +47,16 @@ const PRESET_RANGES = [
   { key: "6h", label: "6 小时", ms: 6 * 3_600_000 },
   { key: "24h", label: "24 小时", ms: 24 * 3_600_000 },
   { key: "7d", label: "7 天", ms: 7 * 24 * 3_600_000 },
+  { key: "30d", label: "30 天", ms: 30 * 24 * 3_600_000 },
+  { key: "90d", label: "90 天", ms: 90 * 24 * 3_600_000 },
+  { key: "365d", label: "365 天", ms: 365 * 24 * 3_600_000 },
 ] as const;
 
 type PresetKey = (typeof PRESET_RANGES)[number]["key"];
 type RangeKey = PresetKey | "custom";
 
-const MAX_RANGE_MS = 32 * 24 * 3_600_000;
+/// 与 hub / panel 的 series 上限一致：1h 层默认保留 730 天，自定义范围也允许到 730 天。
+const MAX_RANGE_MS = 730 * 24 * 3_600_000;
 
 const CPU_COLORS = ["#58a6ff", "#d29922"];
 const MEMORY_COLORS = ["#58a6ff", "#8b949e", "#bc8cff"];
@@ -170,7 +174,7 @@ export default function AgentDetailPage() {
       return;
     }
     if (to - from > MAX_RANGE_MS) {
-      setRangeError("时间跨度不能超过 32 天");
+      setRangeError("时间跨度不能超过 730 天");
       return;
     }
     setRangeError(null);

@@ -25,7 +25,7 @@ use serde_json::Value;
 /// hub 的 series 正常响应远小于此（单曲线 ≤2000 点、总线数 ≤50），8 MiB 足够；
 /// 读取时用 `chunk()` 流式累计，超过上限立即中止，而不是先 `bytes()` 全量读入。
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-/// 面板 → hub 的普通请求超时。series 查询最多 32 天，留足时间。
+/// 面板 → hub 的普通请求超时。series 查询最多 730 天（1h 自动分桶），留足时间。
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// 控制 POST 专用的上游超时。
 ///

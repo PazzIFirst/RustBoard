@@ -144,11 +144,13 @@ const MAX_IP_CONNECTION_ENTRIES: usize = 4096;
 const ADMIN_RATE_WINDOW_MS: i64 = 60_000;
 /// 管理 API 限速表容量（按 IP 计数）。
 const ADMIN_RATE_TABLE_CAPACITY: usize = 4096;
+/// 一天的毫秒数；series 跨度与保留期换算共用。
+const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 /// `series` 查询最大跨度 730 天，与 1h 层默认保留期（730 天）一致。
 ///
 /// M4-A2b 从 32 天放宽：1h 明细保留 730 天，若仍限制 32 天，长跨度历史数据
 /// 将无法查询。超出仍按参数错误（400）拒绝，避免无界扫描。
-const MAX_SERIES_SPAN_MS: i64 = 730 * 24 * 60 * 60 * 1000;
+const MAX_SERIES_SPAN_MS: i64 = 730 * MS_PER_DAY;
 /// 选层边界：跨度 ≤6h 用 raw，≤7d 用 1m，更长用 1h（方案 §5.2）。
 const SERIES_RAW_MAX_SPAN_MS: i64 = 6 * 60 * 60 * 1000;
 const SERIES_ONE_MINUTE_MAX_SPAN_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -2356,7 +2358,9 @@ async fn agent_series(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<SeriesResponse>, ApiError> {
     validate_agent_path(&agent_id)?;
-    let parsed = parse_series_query(raw.as_deref()).map_err(ApiError::bad_request)?;
+    let now = now_ms();
+    let retention = SeriesRetention::from_config(&state.cfg, now);
+    let parsed = parse_series_query(raw.as_deref(), retention).map_err(ApiError::bad_request)?;
     let bucket_ms = parsed.bucket_ms;
     let tier = parsed.tier;
     let query = SeriesQuery {
@@ -2370,20 +2374,47 @@ async fn agent_series(
 
     // 与 settings 一致：不存在的 agent 返回 404；存在性检查与查询放在同一次
     // spawn_blocking 里，避免两次往返之间 agent 被删除造成不一致。
-    let rows = tokio::task::spawn_blocking(move || -> Result<Option<Vec<SeriesRow>>> {
-        if state.storage.get_agent(&query.agent_id)?.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(
-            state.storage.query_series_tiered(&query, bucket_ms, tier)?,
-        ))
-    })
+    //
+    // 空结果回退：backfill 未追平 / 保留期刚删过时，所选层可能暂时为空；
+    // 逐层向更粗层重试直到 1h（1h 已是最粗层，最多 2 次），每次按更粗层
+    // 粒度重新夹 bucket。只有回退层查到数据才更新回显的 tier/bucket；所有层
+    // 都为空时保留初始选层结果，避免把「确实无数据」误报成退了层。
+    let rows = tokio::task::spawn_blocking(
+        move || -> Result<Option<(Vec<SeriesRow>, SampleTier, i64)>> {
+            if state.storage.get_agent(&query.agent_id)?.is_none() {
+                return Ok(None);
+            }
+            let mut actual_tier = tier;
+            let mut actual_bucket_ms = bucket_ms;
+            let mut rows =
+                state
+                    .storage
+                    .query_series_tiered(&query, actual_bucket_ms, actual_tier)?;
+            let mut probe_tier = tier;
+            while rows.is_empty() {
+                let Some(coarser) = probe_tier.next_coarser() else {
+                    break;
+                };
+                probe_tier = coarser;
+                let probe_bucket_ms = bucket_ms.max(coarser.granularity_ms());
+                rows = state
+                    .storage
+                    .query_series_tiered(&query, probe_bucket_ms, probe_tier)?;
+                if !rows.is_empty() {
+                    actual_tier = probe_tier;
+                    actual_bucket_ms = probe_bucket_ms;
+                }
+            }
+            Ok(Some((rows, actual_tier, actual_bucket_ms)))
+        },
+    )
     .await
     .map_err(ApiError::from)??;
-    let Some(rows) = rows else {
+    let Some((rows, actual_tier, actual_bucket_ms)) = rows else {
         return Err(ApiError::not_found("agent 不存在"));
     };
-    let response = build_series_response(bucket_ms, tier, rows).map_err(ApiError::bad_request)?;
+    let response = build_series_response(actual_bucket_ms, actual_tier, rows)
+        .map_err(ApiError::bad_request)?;
     Ok(Json(response))
 }
 
@@ -2577,12 +2608,64 @@ struct ParsedSeriesQuery {
     to: i64,
     /// 实际生效的桶宽：显式值或自动档位，且不小于所选层的粒度。
     bucket_ms: i64,
-    /// 按跨度选中的数据层。
+    /// 按跨度与保留期选中的数据层。
     tier: SampleTier,
 }
 
+/// 各层保留期换算出的可用下界（Unix 毫秒）。
+///
+/// `None` 表示该层 `retention_*_days = 0`（不自动删除，永久可用）。查询起点
+/// 早于某层下界时，该层数据可能已被 retention 任务删除，选层要退到更粗的层。
+#[derive(Debug, Clone, Copy)]
+struct SeriesRetention {
+    raw_since: Option<i64>,
+    one_minute_since: Option<i64>,
+}
+
+impl SeriesRetention {
+    fn from_config(cfg: &HubConfig, now: i64) -> Self {
+        let since = |days: u32| -> Option<i64> {
+            (days != 0).then(|| now.saturating_sub(i64::from(days) * MS_PER_DAY))
+        };
+        Self {
+            raw_since: since(cfg.retention_raw_days),
+            one_minute_since: since(cfg.retention_1m_days),
+        }
+    }
+
+    /// 测试用：不限制各层，只验证跨度规则。
+    #[cfg(test)]
+    fn unlimited() -> Self {
+        Self {
+            raw_since: None,
+            one_minute_since: None,
+        }
+    }
+
+    /// `from` 起点之后的数据是否可能仍在 `tier` 层。
+    ///
+    /// 1h 是最粗层，没有更粗层可退，始终按 1h 查询（超出保留期自然为空）。
+    fn available(self, tier: SampleTier, from: i64) -> bool {
+        let since = match tier {
+            SampleTier::Raw => self.raw_since,
+            SampleTier::OneMinute => self.one_minute_since,
+            SampleTier::OneHour => return true,
+        };
+        match since {
+            None => true,
+            Some(since) => from >= since,
+        }
+    }
+}
+
 /// `series` 参数校验与自动 bucket 选择（全部为纯函数，便于单测边界）。
-fn parse_series_query(raw: Option<&str>) -> std::result::Result<ParsedSeriesQuery, String> {
+///
+/// `retention` 由调用方按当前时间从 [`HubConfig`] 换算：跨度先给出候选层，
+/// 若查询起点早于该层保留下界（数据可能已删），自动退到更粗的层。
+fn parse_series_query(
+    raw: Option<&str>,
+    retention: SeriesRetention,
+) -> std::result::Result<ParsedSeriesQuery, String> {
     let pairs = parse_query_pairs(raw)?;
     let mut metrics = Vec::new();
     let mut from = None;
@@ -2628,7 +2711,7 @@ fn parse_series_query(raw: Option<&str>) -> std::result::Result<ParsedSeriesQuer
         return Err("时间跨度不能超过 730 天".to_string());
     }
 
-    let tier = series_tier_for_span(span_ms);
+    let tier = series_tier_for_query(span_ms, from, retention);
     // 显式 bucket 过小时提升到层粒度而不是返回 400：旧面板/客户端的长跨度
     // 请求仍然可用，响应 `bucket_ms` 回显实际值。自动档位同样夹到层粒度。
     let tier_granularity = tier.granularity_ms();
@@ -2653,6 +2736,22 @@ fn series_tier_for_span(span_ms: i64) -> SampleTier {
         SampleTier::OneMinute
     } else {
         SampleTier::OneHour
+    }
+}
+
+/// 在跨度候选层的基础上，根据保留期下界退到更粗的可用层。
+///
+/// 例：跨度 1h（候选 raw）但查询起点在 10 天前（raw 只保留 7 天）→ 1m；
+/// 跨度 1d（候选 1m）但起点在 100 天前（1m 只保留 90 天）→ 1h。
+fn series_tier_for_query(span_ms: i64, from: i64, retention: SeriesRetention) -> SampleTier {
+    match series_tier_for_span(span_ms) {
+        SampleTier::Raw if retention.available(SampleTier::Raw, from) => SampleTier::Raw,
+        SampleTier::Raw | SampleTier::OneMinute
+            if retention.available(SampleTier::OneMinute, from) =>
+        {
+            SampleTier::OneMinute
+        }
+        _ => SampleTier::OneHour,
     }
 }
 
@@ -4169,6 +4268,12 @@ mod tests {
     use rustboard_common::model::Sample;
     use std::sync::mpsc;
 
+    /// 测试用：不限制各层保留期，只验证跨度选层与 bucket 规则；
+    /// 保留期对选层的影响由 `m4a_series_tier_selection_respects_retention` 覆盖。
+    fn parse_query(raw: Option<&str>) -> std::result::Result<ParsedSeriesQuery, String> {
+        super::parse_series_query(raw, SeriesRetention::unlimited())
+    }
+
     /// H1：旧协议必须收到 `bad_protocol` + 「需要 agent ≥ 2」，当前协议放行。
     #[test]
     fn h1_protocol_gate_rejects_mismatched_version() {
@@ -5520,7 +5625,7 @@ mod tests {
         let from = 1_700_000_000_000_i64;
         let to = from + MAX_SERIES_SPAN_MS;
         let valid = format!("metric=cpu.usage&metric=mem.used&from={from}&to={to}");
-        let parsed = parse_series_query(Some(&valid)).expect("合法参数必须通过");
+        let parsed = parse_query(Some(&valid)).expect("合法参数必须通过");
         assert_eq!(parsed.metrics, vec!["cpu.usage", "mem.used"]);
         assert_eq!(parsed.from, from);
         assert_eq!(parsed.to, to);
@@ -5529,37 +5634,37 @@ mod tests {
 
         // 730 天请求显式 60s：自动提升到 1h 层粒度，不返回 400。
         let explicit = format!("metric=cpu.usage&from={from}&to={to}&bucket_ms=60000");
-        let parsed = parse_series_query(Some(&explicit)).unwrap();
+        let parsed = parse_query(Some(&explicit)).unwrap();
         assert_eq!(parsed.bucket_ms, 3_600_000);
         assert_eq!(parsed.tier, SampleTier::OneHour);
 
         // 时间参数。
-        assert!(parse_series_query(Some("metric=cpu.usage&from=1&to=1")).is_err());
-        assert!(parse_series_query(Some("metric=cpu.usage&from=2&to=1")).is_err());
+        assert!(parse_query(Some("metric=cpu.usage&from=1&to=1")).is_err());
+        assert!(parse_query(Some("metric=cpu.usage&from=2&to=1")).is_err());
         let too_wide = format!(
             "metric=cpu.usage&from={}&to={}",
             from,
             from + MAX_SERIES_SPAN_MS + 1
         );
-        assert!(parse_series_query(Some(&too_wide)).is_err());
-        assert!(parse_series_query(Some("metric=cpu.usage&to=10")).is_err());
-        assert!(parse_series_query(Some("metric=cpu.usage")).is_err());
-        assert!(parse_series_query(Some("metric=cpu.usage&from=1&from=2&to=3")).is_err());
-        assert!(parse_series_query(Some("metric=cpu.usage&from=1&to=3&bucket_ms=0")).is_err());
+        assert!(parse_query(Some(&too_wide)).is_err());
+        assert!(parse_query(Some("metric=cpu.usage&to=10")).is_err());
+        assert!(parse_query(Some("metric=cpu.usage")).is_err());
+        assert!(parse_query(Some("metric=cpu.usage&from=1&from=2&to=3")).is_err());
+        assert!(parse_query(Some("metric=cpu.usage&from=1&to=3&bucket_ms=0")).is_err());
 
         // metric 数量 / 字符集 / 长度 / 空值。
-        assert!(parse_series_query(Some("from=1&to=3")).is_err());
+        assert!(parse_query(Some("from=1&to=3")).is_err());
         let many: String = (0..=MAX_SERIES_METRICS)
             .map(|i| format!("metric=m{i}&"))
             .collect();
-        assert!(parse_series_query(Some(&format!("{many}from=1&to=3"))).is_err());
-        assert!(parse_series_query(Some("metric=CPU.usage&from=1&to=3")).is_err());
-        assert!(parse_series_query(Some("metric=cpu usage&from=1&to=3")).is_err());
-        assert!(parse_series_query(Some("metric=a/b&from=1&to=3")).is_err());
+        assert!(parse_query(Some(&format!("{many}from=1&to=3"))).is_err());
+        assert!(parse_query(Some("metric=CPU.usage&from=1&to=3")).is_err());
+        assert!(parse_query(Some("metric=cpu usage&from=1&to=3")).is_err());
+        assert!(parse_query(Some("metric=a/b&from=1&to=3")).is_err());
         let long = "a".repeat(MAX_METRIC_LEN + 1);
-        assert!(parse_series_query(Some(&format!("metric={long}&from=1&to=3"))).is_err());
-        assert!(parse_series_query(Some("metric=&from=1&to=3")).is_err());
-        assert!(parse_series_query(Some("metric=cpu.usage&from=1&to=3&bogus=1")).is_err());
+        assert!(parse_query(Some(&format!("metric={long}&from=1&to=3"))).is_err());
+        assert!(parse_query(Some("metric=&from=1&to=3")).is_err());
+        assert!(parse_query(Some("metric=cpu.usage&from=1&to=3&bogus=1")).is_err());
     }
 
     /// M4-A2b：跨度边界选层、显式/自动 bucket 夹到层粒度、730 天上限。
@@ -5571,7 +5676,7 @@ mod tests {
             if let Some(bucket) = bucket {
                 raw.push_str(&format!("&bucket_ms={bucket}"));
             }
-            parse_series_query(Some(&raw))
+            parse_query(Some(&raw))
         };
 
         // ≤6h → raw；显式小桶保持原值（raw 层粒度是 1ms）。
@@ -5584,9 +5689,10 @@ mod tests {
         }
         assert_eq!(parse(6 * 3_600_000, Some(1_000)).unwrap().bucket_ms, 1_000);
 
-        // 6h + 1ms → 1m；1s 被提升到 1m 粒度，60s 保持。
+        // 6h + 1ms → 1m；自动档位 30s 被提升到 1m 粒度，显式 1s 同样提升。
         let parsed = parse(6 * 3_600_000 + 1, None).unwrap();
         assert_eq!(parsed.tier, SampleTier::OneMinute);
+        assert_eq!(parsed.bucket_ms, 60_000, "自动档位必须夹到 1m 粒度");
         assert_eq!(
             parse(6 * 3_600_000 + 1, Some(1_000)).unwrap().bucket_ms,
             60_000
@@ -5596,13 +5702,12 @@ mod tests {
             60_000
         );
 
-        // 7d 边界：等于 7d 仍是 1m，+1ms → 1h。
+        // 7d 边界：等于 7d 仍是 1m，+1ms → 1h；自动档位 900s 夹到 1h 粒度。
         let seven_days = 7 * 24 * 3_600_000;
         assert_eq!(parse(seven_days, None).unwrap().tier, SampleTier::OneMinute);
-        assert_eq!(
-            parse(seven_days + 1, None).unwrap().tier,
-            SampleTier::OneHour
-        );
+        let parsed = parse(seven_days + 1, None).unwrap();
+        assert_eq!(parsed.tier, SampleTier::OneHour);
+        assert_eq!(parsed.bucket_ms, 3_600_000, "自动档位必须夹到 1h 粒度");
 
         // 30 天查询显式 60s：提升到 1h 层粒度，响应回显实际值；显式大桶保留。
         let parsed = parse(30 * 24 * 3_600_000, Some(60_000)).unwrap();
@@ -5624,6 +5729,72 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.contains("730"), "错误信息必须说明 730 天上限: {err}");
+    }
+
+    /// M4-A2b：选层必须参考 retention 可用下界，而不是只看跨度。
+    #[test]
+    fn m4a_series_tier_selection_respects_retention() {
+        let now = 1_700_000_000_000i64;
+        let cfg = HubConfig {
+            retention_raw_days: 7,
+            retention_1m_days: 90,
+            retention_1h_days: 730,
+            ..HubConfig::default()
+        };
+        let retention = SeriesRetention::from_config(&cfg, now);
+        assert_eq!(retention.raw_since, Some(now - 7 * MS_PER_DAY));
+        assert_eq!(retention.one_minute_since, Some(now - 90 * MS_PER_DAY));
+
+        let parse_at = |span: i64, from: i64| {
+            let raw = format!("metric=cpu.usage&from={from}&to={}", from + span);
+            super::parse_series_query(Some(&raw), retention).unwrap()
+        };
+
+        // 3 天前的 1h 窗口：raw 仍在保留期内。
+        assert_eq!(
+            parse_at(3_600_000, now - 3 * MS_PER_DAY).tier,
+            SampleTier::Raw
+        );
+
+        // 10 天前的 1h 窗口：raw 已过 7 天保留期 → 1m，bucket 夹到 60s。
+        let parsed = parse_at(3_600_000, now - 10 * MS_PER_DAY);
+        assert_eq!(parsed.tier, SampleTier::OneMinute);
+        assert_eq!(parsed.bucket_ms, 60_000);
+
+        // 100 天前的 1d 窗口：1m 也已过 90 天保留期 → 1h，bucket 夹到 1h。
+        let parsed = parse_at(MS_PER_DAY, now - 100 * MS_PER_DAY);
+        assert_eq!(parsed.tier, SampleTier::OneHour);
+        assert_eq!(parsed.bucket_ms, 3_600_000);
+
+        // 边界：from 恰好等于保留下界仍算可用。
+        assert_eq!(
+            parse_at(3_600_000, now - 7 * MS_PER_DAY).tier,
+            SampleTier::Raw
+        );
+
+        // retention=0 表示该层永久可用：10 天前仍选 raw。
+        let unlimited = SeriesRetention::from_config(
+            &HubConfig {
+                retention_raw_days: 0,
+                retention_1m_days: 0,
+                retention_1h_days: 730,
+                ..HubConfig::default()
+            },
+            now,
+        );
+        assert_eq!(unlimited.raw_since, None);
+        assert_eq!(unlimited.one_minute_since, None);
+        let raw = format!(
+            "metric=cpu.usage&from={}&to={}",
+            now - 10 * MS_PER_DAY - 3_600_000,
+            now - 10 * MS_PER_DAY
+        );
+        assert_eq!(
+            super::parse_series_query(Some(&raw), unlimited)
+                .unwrap()
+                .tier,
+            SampleTier::Raw
+        );
     }
 
     /// M4-A2b：30 天查询选 1h 层；响应 JSON 含 tier 且 bucket_ms 是实际值。
@@ -5735,6 +5906,130 @@ mod tests {
         let expected_ts = sample_ts.div_euclid(3_600_000) * 3_600_000;
         assert_eq!(body["series"][0]["points"][0][0], expected_ts);
         assert_eq!(body["series"][0]["points"][0][1], 42.0);
+    }
+
+    /// 写一个 `cpu.usage` raw 点（单批 seq=0，测试内只调用一次）。
+    fn seed_cpu_point(state: &AppState, ts: i64, value: f64) {
+        state
+            .storage
+            .insert_batch(&SampleBatch {
+                agent_id: "agent-1".to_string(),
+                epoch: 1,
+                seq: 0,
+                boot_id: "boot".to_string(),
+                sent_at: ts,
+                samples: vec![Sample::new("cpu.usage", ts, value)],
+            })
+            .unwrap();
+    }
+
+    /// M4-A2b：跨度 >6h 选 1m 层；删除 raw 后仍必须从 1m 表取数。
+    #[tokio::test]
+    async fn m4a_series_route_reads_1m_tier() {
+        let state = hub_state("token");
+        state.storage.upsert_agent(&test_agent("agent-1")).unwrap();
+        let router = admin_router(state.clone());
+
+        let now = now_ms();
+        let to = now;
+        let from = now - MS_PER_DAY;
+        let sample_ts = now - 2 * 3_600_000;
+        let minute = sample_ts.div_euclid(60_000) * 60_000;
+        seed_cpu_point(&state, sample_ts, 33.0);
+        state
+            .storage
+            .downsample_1m_range(minute, minute + 60_000)
+            .unwrap();
+        state.storage.prune_samples_before(i64::MAX).unwrap();
+        assert_eq!(state.storage.raw_stats().unwrap().rows, 0);
+        assert_eq!(state.storage.samples_1m_stats().unwrap().rows, 1);
+
+        let uri = format!("/api/v1/agents/agent-1/series?metric=cpu.usage&from={from}&to={to}");
+        let (status, _, body) = admin_call(&router, "GET", &uri, Some("token"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = json_body(&body);
+        assert_eq!(body["tier"], "1m");
+        assert_eq!(body["bucket_ms"], 60_000);
+        assert_eq!(body["series"][0]["points"][0][0], minute);
+        assert_eq!(body["series"][0]["points"][0][1], 33.0);
+    }
+
+    /// M4-A2b：raw 已过保留期被删时，按 retention 下界选 1m 并返回 1m 桶。
+    #[tokio::test]
+    async fn m4a_series_route_uses_1m_when_raw_pruned() {
+        let state = hub_state("token");
+        state.storage.upsert_agent(&test_agent("agent-1")).unwrap();
+        let router = admin_router(state.clone());
+
+        // 10 天前的 1h 窗口：跨度仍是 raw 档，但 raw 只保留 7 天，必须选 1m。
+        let now = now_ms();
+        let to = now - 10 * MS_PER_DAY;
+        let from = to - 3_600_000;
+        let sample_ts = from + 1_000;
+        let minute = sample_ts.div_euclid(60_000) * 60_000;
+        seed_cpu_point(&state, sample_ts, 42.0);
+        state
+            .storage
+            .downsample_1m_range(minute, minute + 60_000)
+            .unwrap();
+        state.storage.prune_samples_before(i64::MAX).unwrap();
+        assert_eq!(state.storage.raw_stats().unwrap().rows, 0);
+        assert_eq!(state.storage.samples_1m_stats().unwrap().rows, 1);
+
+        let uri = format!("/api/v1/agents/agent-1/series?metric=cpu.usage&from={from}&to={to}");
+        let (status, _, body) = admin_call(&router, "GET", &uri, Some("token"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = json_body(&body);
+        assert_eq!(body["tier"], "1m");
+        assert_eq!(body["bucket_ms"], 60_000, "1h 跨度自动 5s 必须夹到 1m");
+        assert_eq!(body["series"][0]["points"][0][0], minute);
+        assert_eq!(body["series"][0]["points"][0][1], 42.0);
+    }
+
+    /// M4-A2b：空结果逐层回退到 1h。
+    ///
+    /// retention=0 时跨度 1h 先选 raw；把 raw / 1m 都 prune、仅保留 8 天前
+    /// 的 1h 桶，路由必须回退两次到 1h，并把 bucket 重新夹到 1h 粒度。
+    #[tokio::test]
+    async fn m4a_series_route_falls_back_to_1h_when_coarser_empty() {
+        let state = hub_state_with(HubConfig {
+            admin_token: "token".to_string(),
+            retention_raw_days: 0,
+            retention_1m_days: 0,
+            retention_1h_days: 730,
+            ..HubConfig::default()
+        });
+        state.storage.upsert_agent(&test_agent("agent-1")).unwrap();
+        let router = admin_router(state.clone());
+
+        let now = now_ms();
+        let to = now - 8 * MS_PER_DAY;
+        let from = to - 3_600_000;
+        let sample_ts = from + 1_000;
+        seed_cpu_point(&state, sample_ts, 7.0);
+        state
+            .storage
+            .downsample_1m_range(from, from + 3_600_000)
+            .unwrap();
+        state
+            .storage
+            .downsample_1h_range(from, from + 3_600_000)
+            .unwrap();
+        state.storage.prune_samples_before(i64::MAX).unwrap();
+        state.storage.prune_samples_1m_before(i64::MAX).unwrap();
+        assert_eq!(state.storage.raw_stats().unwrap().rows, 0);
+        assert_eq!(state.storage.samples_1m_stats().unwrap().rows, 0);
+        assert_eq!(state.storage.samples_1h_stats().unwrap().rows, 1);
+
+        let uri = format!("/api/v1/agents/agent-1/series?metric=cpu.usage&from={from}&to={to}");
+        let (status, _, body) = admin_call(&router, "GET", &uri, Some("token"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = json_body(&body);
+        assert_eq!(body["tier"], "1h");
+        assert_eq!(body["bucket_ms"], 3_600_000);
+        let expected_ts = sample_ts.div_euclid(3_600_000) * 3_600_000;
+        assert_eq!(body["series"][0]["points"][0][0], expected_ts);
+        assert_eq!(body["series"][0]["points"][0][1], 7.0);
     }
 
     /// 单次响应的点数 / 序列数上限：超限必须返回 400（这里验证纯函数返回错误）。
