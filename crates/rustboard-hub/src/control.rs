@@ -81,6 +81,8 @@ pub mod hub_codes {
     pub const INTERNAL: &str = "internal_error";
     pub const AGENT_NOT_FOUND: &str = "agent_not_found";
     pub const PAYLOAD_TOO_LARGE: &str = "payload_too_large";
+    /// #17：agent 已吊销（与 `agent_offline` 区分，避免误判为可重试）。
+    pub const AGENT_REVOKED: &str = "agent_revoked";
 }
 
 /// 审计 `result` 取值，与面板 `auditResultClass` 的识别范围一致。
@@ -455,6 +457,16 @@ impl Reject {
         }
     }
 
+    /// #17：agent 已吊销，固定 403 + `agent_revoked`；审计必须记 denied。
+    fn revoked() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: hub_codes::AGENT_REVOKED,
+            message: "agent 已被吊销".to_string(),
+            audit_result: AUDIT_DENIED,
+        }
+    }
+
     fn too_many_pending() -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -498,6 +510,30 @@ impl Reject {
             code: hub_codes::PAYLOAD_TOO_LARGE,
             message: "请求体超过管理 API 的 64 KiB 上限".to_string(),
             audit_result: AUDIT_DENIED,
+        }
+    }
+}
+
+/// #17：控制投递前的吊销门禁。
+///
+/// `Ok(())` 才允许继续读取能力 / 投递；命中吊销返回 [`Reject::revoked`]，
+/// 查询失败返回 [`Reject::internal`]（fail closed，绝不猜测未吊销）。
+async fn ensure_agent_not_revoked(
+    state: &AppState,
+    agent_id: &str,
+) -> std::result::Result<(), Reject> {
+    let storage = state.storage.clone();
+    let agent = agent_id.to_string();
+    match tokio::task::spawn_blocking(move || storage.is_revoked(&agent)).await {
+        Ok(Ok(false)) => Ok(()),
+        Ok(Ok(true)) => Err(Reject::revoked()),
+        Ok(Err(err)) => {
+            tracing::warn!(agent = %agent_id, error = %err, "查询 agent 吊销状态失败，拒绝控制命令");
+            Err(Reject::internal())
+        }
+        Err(err) => {
+            tracing::warn!(agent = %agent_id, error = %err, "查询 agent 吊销状态任务失败，拒绝控制命令");
+            Err(Reject::internal())
         }
     }
 }
@@ -571,6 +607,11 @@ pub(crate) async fn control_action(
     audit.target = clip_label(&prepared.target);
     audit.params = prepared.params.clone();
 
+    // #17：第一道吊销门禁（读取能力之前）。查询失败也拒绝，不向已吊销 agent 投递。
+    if let Err(reject) = ensure_agent_not_revoked(&state, &agent_id).await {
+        return finish_error(&state, audit, started, &reject).await;
+    }
+
     // agent 上报的能力：必须以 Hello 上报并落库的为准，hub 不替 agent 做主。
     let reported = tokio::task::spawn_blocking({
         let storage = state.storage.clone();
@@ -623,6 +664,11 @@ pub(crate) async fn control_action(
     let Some(sender) = state.sessions.control_sender(&agent_id) else {
         return finish_error(&state, audit, started, &Reject::offline()).await;
     };
+
+    // #17：第二道吊销门禁（try_send 之前），尽量缩小 revoke 与投递之间的竞态。
+    if let Err(reject) = ensure_agent_not_revoked(&state, &agent_id).await {
+        return finish_error(&state, audit, started, &reject).await;
+    }
 
     let (reply_tx, reply_rx) = oneshot::channel();
     match sender.try_send(ControlCommand {
@@ -738,6 +784,8 @@ fn reject_from_agent_error(error: &ControlError) -> Reject {
         hub_codes::AGENT_OFFLINE => Reject::offline(),
         hub_codes::CONTROL_TIMEOUT => Reject::timeout(),
         hub_codes::INTERNAL => Reject::internal(),
+        // #17：吊销窗口内会话侧兜底门禁回的错误，不能落成 502 / agent_offline。
+        hub_codes::AGENT_REVOKED => Reject::revoked(),
         control_codes::CAPABILITY_DISABLED => Reject {
             status: StatusCode::FORBIDDEN,
             code: control_codes::CAPABILITY_DISABLED,
@@ -1837,6 +1885,16 @@ mod tests {
             assert_eq!(reject.code, code);
             assert_eq!(reject.audit_result, AUDIT_ERROR);
         }
+
+        // #17：吊销错误是 403 + denied，不能与 agent_offline（503）混淆。
+        let reject = reject_from_agent_error(&ControlError::new(
+            hub_codes::AGENT_REVOKED,
+            "这里的内容不该被使用",
+        ));
+        assert_eq!(reject.status, StatusCode::FORBIDDEN);
+        assert_eq!(reject.code, hub_codes::AGENT_REVOKED);
+        assert_eq!(reject.audit_result, AUDIT_DENIED);
+        assert_eq!(reject.message, "agent 已被吊销");
     }
 
     #[test]

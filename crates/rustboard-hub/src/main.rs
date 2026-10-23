@@ -32,6 +32,7 @@ use hyper::Request;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use rustboard_common::config::{AdminTlsMode, HubConfig};
+use rustboard_common::control::ControlError;
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 use rustboard_common::tls;
 use rustboard_common::util::{
@@ -2901,6 +2902,12 @@ async fn handle_session(
                 break;
             }
             SessionEvent::Control(command) => {
+                // #17：dispatch 前再查一次吊销。命中/查询失败都只回错误，
+                // 绝不把 ControlCommand 投递给 agent；随后 continue 等 watcher 关闭。
+                if let Err(error) = control_revocation_gate(&state, &agent_id).await {
+                    let _ = command.reply.send(Err(error));
+                    continue;
+                }
                 // 分配会话内 id 并发送 ControlRequest；容量超限时 dispatch 已回错误。
                 control.dispatch(&mut socket, command).await?;
             }
@@ -3470,6 +3477,40 @@ impl SessionCleanup {
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
         self.finish();
+    }
+}
+
+/// #17：会话侧控制命令的吊销兜底门禁。
+///
+/// 管理 API 已检查两次，但 revoke 仍可能恰好插在「API 检查后、命令入队」之间；
+/// 会话在 dispatch 前再查一次库，确保吊销后绝不向 agent 发送 ControlRequest。
+/// 命中吊销 → `agent_revoked`；查询失败 → `internal_error`（fail closed）。
+async fn control_revocation_gate(
+    state: &AppState,
+    agent_id: &str,
+) -> std::result::Result<(), ControlError> {
+    let storage = state.storage.clone();
+    let agent = agent_id.to_string();
+    match tokio::task::spawn_blocking(move || storage.is_revoked(&agent)).await {
+        Ok(Ok(false)) => Ok(()),
+        Ok(Ok(true)) => Err(ControlError::new(
+            control::hub_codes::AGENT_REVOKED,
+            "agent 已被吊销",
+        )),
+        Ok(Err(err)) => {
+            tracing::warn!(agent = %agent_id, error = %err, "查询 agent 吊销状态失败，拒绝控制命令");
+            Err(ControlError::new(
+                control::hub_codes::INTERNAL,
+                "无法确认 agent 吊销状态",
+            ))
+        }
+        Err(err) => {
+            tracing::warn!(agent = %agent_id, error = %err, "查询 agent 吊销状态任务失败，拒绝控制命令");
+            Err(ControlError::new(
+                control::hub_codes::INTERNAL,
+                "无法确认 agent 吊销状态",
+            ))
+        }
     }
 }
 
@@ -7625,6 +7666,89 @@ mod tests {
             !entries[0].actor.contains(&token),
             "审计 actor 不能包含 token 明文"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // v0.3.3 B：#17 吊销窗口内拒绝控制命令
+    // ------------------------------------------------------------------
+
+    /// 已吊销 agent：POST control 固定 403 `agent_revoked`，审计 denied，
+    /// 且会话队列里绝不能出现 ControlCommand。
+    #[tokio::test]
+    async fn v033_revoked_agent_control_returns_403_without_dispatch() {
+        let state = m3_state(m3_control_cfg());
+        let mut handle = m3_register_agent(&state, "a1", &["systemd"]);
+        let router = admin_router(state.clone());
+        state.storage.revoke_agent("a1", now_ms()).unwrap();
+
+        let (status, body) =
+            m3_post(&router, "a1", r#"{"capability":"systemd","action":"list"}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "agent_revoked");
+        assert_eq!(body["error"]["message"], "agent 已被吊销");
+
+        // API 必须在投递前拒绝：会话队列保持为空。
+        assert!(
+            handle.control_rx.try_recv().is_err(),
+            "吊销后不得向会话投递 ControlCommand"
+        );
+
+        // 审计最后一条必须是 denied + agent_revoked，不能出现 ok。
+        let entries = m3_audit(&state);
+        assert_eq!(entries.len(), 1, "拒绝路径也必须写一条审计");
+        assert_eq!(entries[0].result, "denied");
+        assert_eq!(entries[0].error_code, "agent_revoked");
+        assert!(
+            entries.iter().all(|entry| entry.result != "ok"),
+            "吊销后不得出现成功审计"
+        );
+    }
+
+    /// 确定性并发：命令先入队，随后 revoke，再运行会话 gate。
+    /// gate 必须回 agent_revoked，且会话只回错误、不 dispatch。
+    #[tokio::test]
+    async fn v033_control_revocation_gate_blocks_queued_command_after_revoke() {
+        let state = m3_state(m3_control_cfg());
+        let mut handle = m3_register_agent(&state, "a1", &["systemd"]);
+
+        // revoke 前 gate 放行（未吊销 agent 仍正常投递，既有测试继续覆盖完整成功路径）。
+        control_revocation_gate(&state, "a1")
+            .await
+            .expect("未吊销 agent 的 gate 必须放行");
+
+        // 命令先进入会话队列：模拟管理 API 已完成两次检查并成功 try_send。
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        state
+            .sessions
+            .control_sender("a1")
+            .expect("会话必须在线")
+            .try_send(ControlCommand {
+                op: rustboard_common::control::ControlOp::SystemdList,
+                reply: reply_tx,
+            })
+            .expect("队列应能接收命令");
+
+        // revoke 在入队之后、会话 dispatch 之前生效。
+        state.storage.revoke_agent("a1", now_ms()).unwrap();
+
+        let gate_error = control_revocation_gate(&state, "a1")
+            .await
+            .expect_err("吊销后 gate 必须拒绝");
+        assert_eq!(gate_error.code, control::hub_codes::AGENT_REVOKED);
+        assert_eq!(gate_error.message, "agent 已被吊销");
+
+        // 与生产 session loop 相同：命令出队后只回错误，绝不调用 dispatch。
+        let command = handle.control_rx.try_recv().expect("命令必须已进入队列");
+        command.reply.send(Err(gate_error)).expect("等待者应仍在");
+
+        match reply_rx.await.expect("应收到拒绝回复") {
+            Ok(_) => panic!("吊销后的命令绝不能返回成功"),
+            Err(error) => {
+                assert_eq!(error.code, control::hub_codes::AGENT_REVOKED);
+                assert_eq!(error.message, "agent 已被吊销");
+            }
+        }
     }
 
     // ------------------------------------------------------------------
