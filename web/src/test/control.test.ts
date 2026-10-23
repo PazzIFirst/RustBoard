@@ -315,6 +315,21 @@ describe("控制错误文案", () => {
       "超时",
     );
   });
+
+  it("control_result_unknown 提示结果未知且不诱导直接重试", () => {
+    const text = describeControlError(
+      { code: "control_result_unknown", message: "" },
+      504,
+    );
+    expect(text).toContain("结果未知");
+    expect(text).toContain("动作可能已执行");
+    expect(text).toContain("不要直接重试");
+    expect(text).toContain("systemd");
+    expect(text).toContain("进程");
+    expect(text).toContain("容器");
+    // 不能出现“请稍后重试”这类会诱导用户直接重试的措辞。
+    expect(text).not.toMatch(/稍后重试|自动重试|重试即可/);
+  });
 });
 
 describe("审计过滤参数编码", () => {

@@ -308,6 +308,10 @@ export function describeControlError(error: ControlError, status?: number): stri
       return "agent 不在线，无法执行控制操作";
     case "control_timeout":
       return "控制请求超时：agent 未在限定时间内响应";
+    case "control_result_unknown":
+      // 面板等待超过 Hub 的最大控制等待：结果未知，动作可能已经执行。
+      // 不能引导用户直接重试，否则可能重复执行危险动作。
+      return "控制请求结果未知：动作可能已执行，不要直接重试；请先刷新并核对 systemd / 进程 / 容器状态";
     case "too_many_pending":
       return "待处理命令过多，请稍后重试";
     case "rate_limited":
