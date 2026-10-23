@@ -10,7 +10,7 @@
 #      未登录 /api/* 为 401 JSON；
 #   4. 登录：错误密码 401；连续 5 次失败后正确密码 429（独立 panel 进程，不等待 15 分钟）；
 #      正确密码 204 + rb_session Cookie 属性；带 Cookie /api/session=true、/api/overview=200；
-#   5. series 多指标、bucket_ms、points 形状/上限；非法参数（from>=to、>32d、非法 metric、
+#   5. series 多指标、bucket_ms、points 形状/上限；非法参数（from>=to、>730d、非法 metric、
 #      21 个 metric）均为 400；
 #   6. settings 默认值、PUT 10000 生效、agent 日志 60s 内出现 `采样间隔已更新 ms=10000`、
 #      重连后 online 且数据继续增长；999/300001/非数字 400；不存在的 agent 404；
