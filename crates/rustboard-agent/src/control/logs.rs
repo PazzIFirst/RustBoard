@@ -1,19 +1,23 @@
-//! 只读日志：白名单文件 tail（`openat2` 防逃逸）与 journald tail。
+//! 只读日志：白名单文件 tail（`openat2` 单次完整路径解析）与 journald tail。
 //!
 //! 文件日志的防护：
-//! - 启动时校验父目录存在、不是符号链接、路径不经过符号链接；target 本身也必须是
-//!   普通文件（不存在则允许，读取时报错）；
-//! - 读取时以父目录 fd + 文件名调用 Linux `openat2(2)`，使用
-//!   `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV`；
+//! - 每次打开（启动校验与运行期 tail 共用同一 helper）都把配置的绝对路径去掉前导 `/`，
+//!   以根目录 fd 为基准在**一次** `openat2(2)` 内解析全部父目录与最终文件。父路径不再
+//!   先 `open()` 再用其结果打开文件名，因此父目录在两次 syscall 之间被替换为符号链接的
+//!   TOCTOU 窗口不存在；
+//! - `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV`：
+//!   任一分量是符号链接、经过 magic link 或跨越挂载点都会被拒绝；
 //! - `O_NONBLOCK` 打开后再 `fstat`，只接受普通文件；FIFO / 设备 / 目录一律拒绝，
 //!   避免日志文件被替换成 FIFO 后永久阻塞控制线程；
 //! - 内核不支持 `openat2`（ENOSYS）时直接失败并返回错误，**不降级**到 `fs::read`；
+//! - 文件不存在允许启动（logrotate 场景），但父目录不存在 / 是符号链接 / 跨挂载点
+//!   会在启动时报清晰错误；每次 tail 都重新打开，不缓存 fd；
 //! - 只从文件尾部倒读，最多 2000 行、单行 4096 字节、总输出 256 KiB。
 
-use std::ffi::{CString, OsStr};
+use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -58,45 +62,76 @@ pub fn validate_sources_io(cfg: &ControlConfig) -> anyhow::Result<()> {
 
 fn validate_file_source(target: &str) -> anyhow::Result<()> {
     let path = Path::new(target);
-    let Some(parent) = path.parent() else {
-        bail!("日志路径没有父目录");
-    };
-
-    let parent_meta = std::fs::symlink_metadata(parent)
-        .with_context(|| format!("父目录不存在或不可访问: {}", parent.display()))?;
-    if parent_meta.file_type().is_symlink() {
-        bail!("父目录是符号链接: {}", parent.display());
+    if !path.is_absolute() {
+        bail!("日志路径必须是绝对路径: {}", path.display());
     }
-    if !parent_meta.is_dir() {
-        bail!("父目录不是目录: {}", parent.display());
-    }
-    // 父目录的任一祖先是符号链接时，canonicalize 结果会与配置路径不同。
-    let canonical = std::fs::canonicalize(parent)
-        .with_context(|| format!("父目录无法规范化: {}", parent.display()))?;
-    if canonical.as_path() != parent {
-        bail!(
-            "父目录路径经过符号链接或包含非规范分量: {}（实际 {}）",
-            parent.display(),
-            canonical.display()
-        );
-    }
-
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                bail!("日志文件是符号链接: {}", path.display());
-            }
-            if !meta.is_file() {
-                bail!("日志文件不是普通文件: {}", path.display());
-            }
+    match open_log_path_absolute(path) {
+        Ok(file) => {
+            // 与运行期 tail 使用同一 helper；启动校验只打开并立即关闭，不缓存 fd。
+            drop(file);
+            Ok(())
         }
-        // 文件尚未创建是允许的（例如 logrotate 正在轮转），真正读取时再报错。
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            // 文件尚未创建是允许的（例如 logrotate 正在轮转），但父目录必须存在、
+            // 不是符号链接且不跨挂载点，否则运行期永远读不到日志。
+            validate_parent_dir(path)
+                .with_context(|| format!("日志来源父目录校验失败: {}", path.display()))
+        }
         Err(err) => {
-            return Err(err).with_context(|| format!("检查日志文件失败: {}", path.display()))
+            let message = match err.raw_os_error() {
+                Some(libc::ELOOP) => {
+                    format!("日志路径包含符号链接（openat2 拒绝）: {}", path.display())
+                }
+                Some(libc::EXDEV) => format!(
+                    "日志路径跨挂载点（RESOLVE_NO_XDEV 拒绝）: {}",
+                    path.display()
+                ),
+                Some(libc::ENOTDIR) => {
+                    format!("日志路径中的父目录不是目录: {}", path.display())
+                }
+                _ => format!("打开日志文件失败（openat2）: {}", path.display()),
+            };
+            Err(anyhow::Error::new(err)).with_context(|| message)
         }
     }
-    Ok(())
+}
+
+/// 文件尚不存在时单独确认父目录：必须存在、是目录、不是符号链接且与 `/` 同挂载点。
+///
+/// 只用于启动校验，且仅在文件缺失（logrotate 场景）时执行；正常读取路径仍然只做
+/// 一次完整的 `openat2`。
+fn validate_parent_dir(path: &Path) -> anyhow::Result<()> {
+    let Some(parent) = path.parent() else {
+        bail!("日志路径没有父目录: {}", path.display());
+    };
+    if parent.as_os_str().is_empty() {
+        bail!("日志路径没有父目录: {}", path.display());
+    }
+    if parent == Path::new("/") {
+        // 根目录必然存在；openat2 不接受去掉前导 `/` 后的空相对路径。
+        drop(open_root_dir()?);
+        return Ok(());
+    }
+    match open_directory_absolute(parent) {
+        Ok(dir) => {
+            drop(dir);
+            Ok(())
+        }
+        Err(err) => match err.raw_os_error() {
+            Some(libc::ENOENT) => bail!(
+                "父目录不存在: {}（文件可由 logrotate 稍后创建，但父目录必须已存在）",
+                parent.display()
+            ),
+            Some(libc::ELOOP) => bail!("父目录是符号链接或被替换为符号链接: {}", parent.display()),
+            Some(libc::EXDEV) => bail!(
+                "父目录跨挂载点（RESOLVE_NO_XDEV 拒绝）: {}",
+                parent.display()
+            ),
+            Some(libc::ENOTDIR) => bail!("父目录路径中有分量不是目录: {}", parent.display()),
+            _ => Err(anyhow::Error::new(err))
+                .with_context(|| format!("打开父目录失败（openat2）: {}", parent.display())),
+        },
+    }
 }
 
 /// 只返回配置中的日志来源，不读取文件内容。
@@ -139,14 +174,9 @@ fn tail_file(
     max_lines: usize,
 ) -> Result<ControlResult, ControlError> {
     let path = Path::new(target);
-    let parent = path
-        .parent()
-        .ok_or_else(|| ControlError::control_failed("日志路径没有父目录"))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| ControlError::control_failed("日志路径没有文件名"))?;
-
-    let mut file = open_beneath(parent, file_name).map_err(|err| {
+    // 每次 tail 都重新解析完整路径并打开，不缓存父目录 fd 或文件 fd：日志轮转/替换后
+    // 立即读取新文件，同时父目录被替换成符号链接会被 openat2 拒绝。
+    let mut file = open_log_path_absolute(path).map_err(|err| {
         ControlError::control_failed(format!("打开日志文件失败（openat2）: {err}"))
     })?;
     let size = file
@@ -366,61 +396,18 @@ fn cap_output(lines: Vec<String>) -> (Vec<String>, bool) {
     (kept, truncated)
 }
 
-/// 以父目录 fd 为基准打开文件，禁止 `..`、绝对路径、符号链接与跨挂载点。
-fn open_beneath(parent: &Path, file_name: &OsStr) -> io::Result<File> {
-    if !parent.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "父目录必须是绝对路径",
-        ));
-    }
-    if file_name.is_empty() || file_name == OsStr::new(".") || file_name == OsStr::new("..") {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "文件名非法"));
-    }
-    let parent_c = CString::new(parent.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "父目录包含 NUL"))?;
-    let name_c = CString::new(file_name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "文件名包含 NUL"))?;
-
-    // SAFETY: parent_c 是以 NUL 结尾的合法路径；open(2) 只读取该 C 字符串。
-    let dirfd = unsafe {
-        libc::open(
-            parent_c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if dirfd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let how = OpenHow {
+/// 打开绝对路径日志文件：从根目录 fd 出发，用一次 `openat2(2)` 解析完整路径。
+///
+/// 父目录与文件名在同一次 syscall 内解析，避免“先打开父目录、再打开文件”之间父目录
+/// 被替换成符号链接的 TOCTOU 窗口。路径中任一分量是符号链接、magic link，或跨越挂载点
+/// 都会被拒绝；内核不支持 `openat2` 时直接失败，不降级。
+fn open_log_path_absolute(path: &Path) -> io::Result<File> {
+    let file = open_absolute_at_root(
+        path,
         // O_NONBLOCK：日志文件若被替换成 FIFO，open 不会因为没有写端而永久阻塞；
         // 打开后再用 fstat 拒绝任何非普通文件。
-        flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK) as u64,
-        mode: 0,
-        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV,
-    };
-    // SAFETY: openat2(2) 只读取 how 指向的 POD 结构；dirfd 与 name_c 在调用期间有效。
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            dirfd,
-            name_c.as_ptr(),
-            &how as *const OpenHow,
-            std::mem::size_of::<OpenHow>(),
-        )
-    };
-    let open_err = io::Error::last_os_error();
-    // SAFETY: dirfd 由本函数创建，尚未关闭，且没有其他持有者。
-    unsafe {
-        libc::close(dirfd);
-    }
-    if fd < 0 {
-        // 注意：ENOSYS 也走到这里，按方案不做任何降级读取。
-        return Err(open_err);
-    }
-    // SAFETY: fd 由 openat2(2) 返回，是唯一所有者的文件描述符，交给 File 管理。
-    let file = unsafe { File::from_raw_fd(fd as libc::c_int) };
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    )?;
     // 只允许普通文件：FIFO / 设备 / 目录即使被放进白名单目录也要拒绝。
     // 这是 O_NONBLOCK 打开后的二次确认，保证后续 read/seek 不会永久阻塞。
     let metadata = file.metadata()?;
@@ -433,6 +420,88 @@ fn open_beneath(parent: &Path, file_name: &OsStr) -> io::Result<File> {
     Ok(file)
 }
 
+/// 启动校验用：打开绝对路径目录。仅在文件尚不存在、需要确认父目录时使用。
+fn open_directory_absolute(path: &Path) -> io::Result<File> {
+    open_absolute_at_root(
+        path,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+    )
+}
+
+/// 以根目录 fd 为基准，单次 `openat2(2)` 打开绝对路径。
+fn open_absolute_at_root(path: &Path, flags: libc::c_int) -> io::Result<File> {
+    let relative = path_beneath_root(path)?;
+    let name_c = CString::new(relative)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "日志路径包含 NUL"))?;
+    let root = open_root_dir()?;
+    let how = OpenHow {
+        flags: flags as u64,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV,
+    };
+    // SAFETY: openat2(2) 只读取 how 指向的 POD 结构；root fd 与 name_c 在调用期间有效。
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            name_c.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        let err = io::Error::last_os_error();
+        // 明确拒绝降级：旧内核 / 不允许 openat2 的 sandbox 直接报错。
+        if err.raw_os_error() == Some(libc::ENOSYS) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "内核不支持 openat2(2)，拒绝降级读取日志文件",
+            ));
+        }
+        return Err(err);
+    }
+    // SAFETY: fd 由 openat2(2) 返回，是唯一所有者的文件描述符，交给 File 管理。
+    Ok(unsafe { File::from_raw_fd(fd as libc::c_int) })
+}
+
+/// 打开根目录 fd；`openat2` 的 dirfd 固定为 `/`。
+fn open_root_dir() -> io::Result<File> {
+    // SAFETY: `c"/"` 是合法的以 NUL 结尾的 C 字符串；open(2) 只读取该字符串。
+    let fd = unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd 由 open(2) 返回且没有其他持有者。
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// 将绝对路径转换成相对根目录的字节串；保留 `..`，由 `RESOLVE_BENEATH` 拒绝逃逸。
+fn path_beneath_root(path: &Path) -> io::Result<&[u8]> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "日志路径必须是绝对路径",
+        ));
+    }
+    let bytes = path.as_os_str().as_bytes();
+    let mut relative = bytes;
+    while relative.first() == Some(&b'/') {
+        relative = &relative[1..];
+    }
+    if relative.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "日志路径必须指向文件",
+        ));
+    }
+    Ok(relative)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,11 +510,19 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
+    /// 本机 `/tmp` 是独立 tmpfs，`RESOLVE_NO_XDEV` 会拒绝其下的测试文件；
+    /// 因此测试目录固定放在与 `/` 同挂载点的工作区 `target/` 下。
+    fn test_root() -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/rb-agent-logs-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        // 去掉 `../../` 并确认路径不经过符号链接，保证 openat2 能正常解析。
+        std::fs::canonicalize(&root).unwrap()
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("rb-agent-logs-{}-{tag}-{seq}", std::process::id()));
+        let dir = test_root().join(format!("{}-{tag}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -515,7 +592,8 @@ mod tests {
         // 父目录不存在。
         let missing = dir.join("missing-dir").join("app.log");
         let cfg = cfg_with(vec![file_source("missing", &missing)]);
-        assert!(validate_sources_io(&cfg).is_err());
+        let err = format!("{:#}", validate_sources_io(&cfg).unwrap_err());
+        assert!(err.contains("父目录不存在"), "{err}");
 
         // 父目录本身是符号链接。
         let link_dir = dir.join("link-dir");
@@ -537,6 +615,23 @@ mod tests {
         assert!(err.contains("不是普通文件"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_io_allows_missing_file_but_requires_existing_parent() {
+        let dir = temp_dir("io-missing-file");
+        let log = dir.join("rotating.log");
+        let cfg = cfg_with(vec![file_source("rotating", &log)]);
+        // 文件尚未创建（logrotate 场景）允许启动。
+        validate_sources_io(&cfg).expect("父目录存在时缺失文件应允许启动");
+        // 但运行期 tail 必须报错，而不是静默返回空内容。
+        let err = tail(&cfg, &cfg.log_sources[0], 10).expect_err("文件不存在时 tail 必须失败");
+        assert_eq!(err.code, control::codes::CONTROL_FAILED);
+
+        // 父目录随后被删除：启动校验必须失败。
+        std::fs::remove_dir_all(&dir).unwrap();
+        let err = format!("{:#}", validate_sources_io(&cfg).unwrap_err());
+        assert!(err.contains("父目录不存在"), "{err}");
     }
 
     #[test]
@@ -638,45 +733,367 @@ mod tests {
     }
 
     #[test]
-    fn openat2_rejects_parent_absolute_and_symlink_escapes() {
+    fn open_absolute_rejects_relative_escape_symlink_and_directory() {
         let dir = temp_dir("escape");
-        std::fs::write(dir.join("ok.log"), b"ok\n").unwrap();
-        open_beneath(&dir, OsStr::new("ok.log")).expect("白名单文件必须能打开");
+        let ok = dir.join("ok.log");
+        std::fs::write(&ok, b"ok\n").unwrap();
+        open_log_path_absolute(&ok).expect("绝对路径普通文件必须能打开");
 
-        for name in ["../etc/passwd", "/etc/passwd", "sub/../../etc/passwd"] {
-            assert!(
-                open_beneath(&dir, OsStr::new(name)).is_err(),
-                "{name} 必须被拒绝"
-            );
+        // 相对路径与根目录本身都不是可读取的日志文件，必须在 syscall 前拒绝。
+        for bad in [Path::new("relative/x.log"), Path::new("/")] {
+            let err = open_log_path_absolute(bad).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}: {err}");
         }
 
-        std::os::unix::fs::symlink("/etc/hostname", dir.join("evil.log")).unwrap();
-        let err = open_beneath(&dir, OsStr::new("evil.log")).unwrap_err();
-        assert!(
-            matches!(
-                err.raw_os_error(),
-                Some(libc::ELOOP) | Some(libc::EXDEV) | Some(libc::EACCES)
-            ),
-            "符号链接必须被 openat2 拒绝，实际: {err:?}"
+        // 从根向上 `..` 逃逸必须被 RESOLVE_BENEATH 拒绝。
+        let err = open_log_path_absolute(Path::new("/../etc/passwd")).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EXDEV),
+            "`..` 逃逸必须被拒绝: {err:?}"
         );
 
-        // 父目录不是绝对路径时直接拒绝。
-        assert!(open_beneath(Path::new("relative"), OsStr::new("x")).is_err());
-
-        // 目录同样不是普通文件，打开后必须被拒绝。
-        std::fs::create_dir(dir.join("subdir")).unwrap();
-        assert!(
-            open_beneath(&dir, OsStr::new("subdir")).is_err(),
-            "目录必须被拒绝"
+        // 最终分量是符号链接（绝对目标）。
+        let victim = dir.join("victim.log");
+        std::fs::write(&victim, b"victim\n").unwrap();
+        let final_link = dir.join("final-link.log");
+        std::os::unix::fs::symlink(&victim, &final_link).unwrap();
+        let err = open_log_path_absolute(&final_link).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "最终文件符号链接必须被拒绝: {err:?}"
         );
+
+        // 中间父目录是符号链接（相对目标）。
+        let victim_dir = dir.join("victim-dir");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        std::fs::write(victim_dir.join("app.log"), b"victim\n").unwrap();
+        let mid_link = dir.join("mid-link");
+        std::os::unix::fs::symlink("victim-dir", &mid_link).unwrap();
+        let err = open_log_path_absolute(&mid_link.join("app.log")).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "中间父目录符号链接必须被拒绝: {err:?}"
+        );
+
+        // 目录不是普通文件。
+        let subdir = dir.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        let err = open_log_path_absolute(&subdir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("普通文件"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 把 `path` 改名为 `<name>-real`，再在原名处创建符号链接。
+    fn rename_to_real_and_link(path: &Path, target: &Path) {
+        let real = path.with_file_name(format!(
+            "{}-real",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::rename(path, &real).unwrap();
+        std::os::unix::fs::symlink(target, path).unwrap();
+    }
+
+    fn assert_victim_sentinel_readable(victim_log: &Path) {
+        let cfg = cfg_with(vec![file_source("victim", victim_log)]);
+        match tail(&cfg, &cfg.log_sources[0], 10).unwrap() {
+            ControlResult::LogLines { lines, .. } => {
+                assert_eq!(lines, ["VICTIM-SENTINEL"], "victim 场景构造必须有效");
+            }
+            other => panic!("意外结果: {other:?}"),
+        }
+    }
+
+    /// TOCTOU 核心回归：启动校验通过后，把多级中间父目录替换为指向 victim 的符号链接。
+    fn exercise_intermediate_parent_swap(tag: &str, relative_link: bool) {
+        let dir = temp_dir(tag);
+        let victim = dir.join("victim");
+        let victim_logs = victim.join("three");
+        std::fs::create_dir_all(&victim_logs).unwrap();
+        std::fs::write(victim_logs.join("app.log"), b"VICTIM-SENTINEL\n").unwrap();
+
+        let deep = dir.join("one").join("two").join("three");
+        std::fs::create_dir_all(&deep).unwrap();
+        let log = deep.join("app.log");
+        std::fs::write(&log, b"real-line\n").unwrap();
+        let cfg = cfg_with(vec![file_source("app", &log)]);
+
+        // 启动校验与正常运行都先通过。
+        validate_sources_io(&cfg).expect("正常多级目录应通过启动校验");
+        match tail(&cfg, &cfg.log_sources[0], 10).unwrap() {
+            ControlResult::LogLines { lines, .. } => assert_eq!(lines, ["real-line"]),
+            other => panic!("意外结果: {other:?}"),
+        }
+
+        // 攻击：`one/two` 改为指向 victim 的符号链接（绝对或相对目标）。
+        let link = if relative_link {
+            PathBuf::from("../victim")
+        } else {
+            victim.clone()
+        };
+        rename_to_real_and_link(&dir.join("one").join("two"), &link);
+
+        // 启动策略与运行期策略必须一致拒绝，且绝不能返回 victim 内容。
+        let err = format!("{:#}", validate_sources_io(&cfg).unwrap_err());
+        assert!(err.contains("符号链接"), "{err}");
+        let err = tail(&cfg, &cfg.log_sources[0], 10)
+            .expect_err("中间父目录变成符号链接后 tail 必须失败");
+        assert_eq!(err.code, control::codes::CONTROL_FAILED);
+        assert!(err.message.contains("openat2"), "{err:?}");
+        assert!(
+            !err.message.contains("VICTIM-SENTINEL"),
+            "不能回显 victim 内容: {err:?}"
+        );
+
+        // 证明 victim 的 sentinel 本身可读：若跟随符号链接就会泄露。
+        assert_victim_sentinel_readable(&victim_logs.join("app.log"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tail_rejects_intermediate_parent_symlink_after_validation() {
+        exercise_intermediate_parent_swap("toctou-mid-abs", false);
+        exercise_intermediate_parent_swap("toctou-mid-rel", true);
+    }
+
+    /// 最终父目录（文件名所在目录）被替换为符号链接，tail 必须失败。
+    fn exercise_final_parent_swap(tag: &str, relative_link: bool) {
+        let dir = temp_dir(tag);
+        let victim = dir.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("app.log"), b"VICTIM-SENTINEL\n").unwrap();
+
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let log = logs.join("app.log");
+        std::fs::write(&log, b"real-line\n").unwrap();
+        let cfg = cfg_with(vec![file_source("app", &log)]);
+        validate_sources_io(&cfg).expect("正常路径应通过启动校验");
+        match tail(&cfg, &cfg.log_sources[0], 10).unwrap() {
+            ControlResult::LogLines { lines, .. } => assert_eq!(lines, ["real-line"]),
+            other => panic!("意外结果: {other:?}"),
+        }
+
+        let link = if relative_link {
+            PathBuf::from("victim")
+        } else {
+            victim.clone()
+        };
+        rename_to_real_and_link(&logs, &link);
+
+        let err = format!("{:#}", validate_sources_io(&cfg).unwrap_err());
+        assert!(err.contains("符号链接"), "{err}");
+        let err =
+            tail(&cfg, &cfg.log_sources[0], 10).expect_err("最终父目录变成符号链接后必须失败");
+        assert_eq!(err.code, control::codes::CONTROL_FAILED);
+        assert!(
+            !err.message.contains("VICTIM-SENTINEL"),
+            "不能回显 victim 内容: {err:?}"
+        );
+
+        assert_victim_sentinel_readable(&victim.join("app.log"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tail_rejects_final_parent_symlink_after_validation() {
+        exercise_final_parent_swap("toctou-parent-abs", false);
+        exercise_final_parent_swap("toctou-parent-rel", true);
+    }
+
+    /// 最终文件被替换为符号链接，tail 必须失败（绝对 / 相对目标都覆盖）。
+    fn exercise_file_swap(tag: &str, relative_link: bool) {
+        let dir = temp_dir(tag);
+        let victim = dir.join("victim.log");
+        std::fs::write(&victim, b"VICTIM-SENTINEL\n").unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, b"real-line\n").unwrap();
+        let cfg = cfg_with(vec![file_source("app", &log)]);
+        validate_sources_io(&cfg).expect("正常路径应通过启动校验");
+        match tail(&cfg, &cfg.log_sources[0], 10).unwrap() {
+            ControlResult::LogLines { lines, .. } => assert_eq!(lines, ["real-line"]),
+            other => panic!("意外结果: {other:?}"),
+        }
+
+        let link = if relative_link {
+            PathBuf::from("victim.log")
+        } else {
+            victim.clone()
+        };
+        rename_to_real_and_link(&log, &link);
+
+        let err = format!("{:#}", validate_sources_io(&cfg).unwrap_err());
+        assert!(err.contains("符号链接"), "{err}");
+        let err = tail(&cfg, &cfg.log_sources[0], 10).expect_err("文件变成符号链接后必须失败");
+        assert_eq!(err.code, control::codes::CONTROL_FAILED);
+        assert!(
+            !err.message.contains("VICTIM-SENTINEL"),
+            "不能回显 victim 内容: {err:?}"
+        );
+
+        assert_victim_sentinel_readable(&victim);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tail_rejects_file_symlink_after_validation() {
+        exercise_file_swap("toctou-file-abs", false);
+        exercise_file_swap("toctou-file-rel", true);
+    }
+
+    /// 运行期每次重新打开：日志轮转后必须读新文件，不能复用旧 fd。
+    #[test]
+    fn tail_reopens_after_log_rotation() {
+        let dir = temp_dir("rotate");
+        let log = dir.join("app.log");
+        std::fs::write(&log, b"old-line\n").unwrap();
+        let cfg = cfg_with(vec![file_source("app", &log)]);
+        match tail(&cfg, &cfg.log_sources[0], 10).unwrap() {
+            ControlResult::LogLines { lines, .. } => assert_eq!(lines, ["old-line"]),
+            other => panic!("意外结果: {other:?}"),
+        }
+
+        // 模拟 logrotate：旧文件改名，新文件顶替原名。
+        std::fs::rename(&log, dir.join("app.log.1")).unwrap();
+        std::fs::write(&log, b"new-line\n").unwrap();
+        match tail(&cfg, &cfg.log_sources[0], 10).unwrap() {
+            ControlResult::LogLines { lines, .. } => assert_eq!(lines, ["new-line"]),
+            other => panic!("轮转后必须读新文件: {other:?}"),
+        }
+
+        // 文件被删除后立即失败，而不是返回下一次打开缓存的旧内容。
+        std::fs::remove_file(&log).unwrap();
+        assert!(tail(&cfg, &cfg.log_sources[0], 10).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 大文件 tail 不回归：从 2 MB+ 文件中只返回最新几行。
+    #[test]
+    fn tail_large_file_returns_newest_lines() {
+        use std::io::{BufWriter, Write};
+
+        let dir = temp_dir("large");
+        let log = dir.join("app.log");
+        {
+            let file = std::fs::File::create(&log).unwrap();
+            let mut writer = BufWriter::new(file);
+            for index in 0..200_000 {
+                writeln!(writer, "line-{index:06}").unwrap();
+            }
+            writer.flush().unwrap();
+        }
+        let size = std::fs::metadata(&log).unwrap().len();
+        assert!(size > 2 * 1024 * 1024, "场景必须是大文件: {size}");
+        let cfg = cfg_with(vec![file_source("app", &log)]);
+        match tail(&cfg, &cfg.log_sources[0], 7).unwrap() {
+            ControlResult::LogLines {
+                lines, size_bytes, ..
+            } => {
+                assert_eq!(size_bytes, size);
+                assert_eq!(
+                    lines,
+                    [
+                        "line-199993",
+                        "line-199994",
+                        "line-199995",
+                        "line-199996",
+                        "line-199997",
+                        "line-199998",
+                        "line-199999"
+                    ]
+                );
+            }
+            other => panic!("意外结果: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `RESOLVE_NO_XDEV`：跨挂载点必须被拒绝，而不是降级成普通读取。
+    #[test]
+    fn cross_mount_log_path_is_rejected() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root_dev = std::fs::metadata("/").unwrap().dev();
+        let tmp_base =
+            std::env::temp_dir().join(format!("rb-agent-logs-xdev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_base);
+        std::fs::create_dir_all(&tmp_base).unwrap();
+        let tmp_base = std::fs::canonicalize(&tmp_base).unwrap();
+        if std::fs::metadata(&tmp_base).unwrap().dev() == root_dev {
+            eprintln!("临时目录与 `/` 同挂载点，跳过跨挂载点用例");
+            let _ = std::fs::remove_dir_all(&tmp_base);
+            return;
+        }
+        let log = tmp_base.join("app.log");
+        std::fs::write(&log, b"cross-mount\n").unwrap();
+
+        let err = open_log_path_absolute(&log).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EXDEV),
+            "跨挂载点必须被 openat2 拒绝: {err:?}"
+        );
+
+        let cfg = cfg_with(vec![file_source("xdev", &log)]);
+        let err = format!("{:#}", validate_sources_io(&cfg).unwrap_err());
+        assert!(err.contains("跨挂载点"), "{err}");
+        let err = tail(&cfg, &cfg.log_sources[0], 10).expect_err("跨挂载点 tail 必须失败");
+        assert_eq!(err.code, control::codes::CONTROL_FAILED);
+        let _ = std::fs::remove_dir_all(&tmp_base);
+    }
+
+    /// 目录与设备（字符设备）都必须被 fstat 拒绝；无 CAP_MKNOD 时跳过设备部分。
+    #[test]
+    fn non_regular_targets_are_rejected() {
+        let dir = temp_dir("non-regular");
+
+        let subdir = dir.join("logs-dir");
+        std::fs::create_dir(&subdir).unwrap();
+        let err = open_log_path_absolute(&subdir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("不是普通文件"), "{err}");
+
+        let device = dir.join("null.dev");
+        let device_c = CString::new(device.as_os_str().as_bytes()).unwrap();
+        // Linux dev_t 编码：null 为 major=1, minor=3，即 (1 << 8) | 3。
+        let device_id = (1u64 << 8) | 3;
+        // SAFETY: device_c 是以 NUL 结尾的合法路径，mknod(2) 只读取该 C 字符串。
+        let rc = unsafe { libc::mknod(device_c.as_ptr(), libc::S_IFCHR | 0o600, device_id) };
+        if rc == 0 {
+            let err = open_log_path_absolute(&device).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err:?}");
+            assert!(err.to_string().contains("不是普通文件"), "{err}");
+
+            let cfg = cfg_with(vec![file_source("dev", &device)]);
+            let err = format!("{:#}", validate_sources_io(&cfg).unwrap_err());
+            assert!(err.contains("不是普通文件"), "{err}");
+            let err = tail(&cfg, &cfg.log_sources[0], 10).expect_err("设备必须被拒绝");
+            assert_eq!(err.code, control::codes::CONTROL_FAILED);
+        } else {
+            // 无 CAP_MKNOD（例如 CI 非 root）时退而验证系统设备节点同样不可读：
+            // /dev 通常独立挂载，会先被 RESOLVE_NO_XDEV 拒绝；同挂载点则由 fstat 拒绝。
+            eprintln!(
+                "mknod 不可用（{}），改用 /dev/null 验证设备节点拒绝",
+                io::Error::last_os_error()
+            );
+            let err = open_log_path_absolute(Path::new("/dev/null"))
+                .expect_err("设备节点不能被当作普通日志文件打开");
+            let code = err.raw_os_error();
+            assert!(
+                code == Some(libc::EXDEV) || err.kind() == io::ErrorKind::InvalidInput,
+                "/dev/null 必须以跨挂载点或非普通文件被拒绝: {err:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 安全回归：日志文件被替换成 FIFO 时，打开必须立即失败而不是阻塞控制线程。
     #[test]
     fn fifo_log_target_is_rejected_without_blocking() {
-        use std::os::unix::ffi::OsStrExt;
-
         let dir = temp_dir("fifo");
         let fifo = dir.join("app.fifo");
         let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
