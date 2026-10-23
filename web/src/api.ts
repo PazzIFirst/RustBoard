@@ -11,8 +11,15 @@ import {
   normalizeControlStatus,
 } from "./control";
 import type {
+  AlertEventListResponse,
+  AlertRule,
+  AlertRuleInput,
+  AlertSilence,
+  AlertSilenceInput,
   AuditQuery,
   AuditResponse,
+  ChannelInput,
+  ChannelView,
   OverviewResponse,
   SamplePoint,
   SeriesPoint,
@@ -133,6 +140,12 @@ export interface SeriesQuery {
   bucketMs?: number;
 }
 
+/** 事件分页：limit 默认 50（hub 上限 100），before_id 为排他游标。 */
+export interface AlertEventQuery {
+  limit?: number;
+  beforeId?: number;
+}
+
 export const api = {
   session(): Promise<{ authenticated: boolean }> {
     return request<{ authenticated: boolean }>("/api/session");
@@ -239,6 +252,97 @@ export const api = {
   async audit(query: AuditQuery = {}, signal?: AbortSignal): Promise<AuditResponse> {
     const raw = await request<unknown>(`/api/audit?${auditQueryParams(query)}`, { signal });
     return normalizeAuditResponse(raw);
+  },
+
+  // ---------------------------------------------------------------- M4 告警
+  // 全部走面板同源代理；渠道 secret 从不进入响应，页面也不回显。
+
+  alertRules(signal?: AbortSignal): Promise<AlertRule[]> {
+    return request<AlertRule[]>("/api/alerts/rules", { signal });
+  },
+
+  createAlertRule(input: AlertRuleInput): Promise<AlertRule> {
+    return request<AlertRule>("/api/alerts/rules", {
+      method: "POST",
+      ...jsonBody(input),
+    });
+  },
+
+  updateAlertRule(id: string, input: AlertRuleInput): Promise<AlertRule> {
+    return request<AlertRule>(`/api/alerts/rules/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      ...jsonBody(input),
+    });
+  },
+
+  deleteAlertRule(id: string): Promise<void> {
+    return request<void>(`/api/alerts/rules/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      ...jsonBody({}),
+    });
+  },
+
+  alertEvents(
+    query: AlertEventQuery = {},
+    signal?: AbortSignal,
+  ): Promise<AlertEventListResponse> {
+    const params = new URLSearchParams();
+    params.set("limit", String(query.limit ?? 50));
+    if (query.beforeId !== undefined) params.set("before_id", String(query.beforeId));
+    return request<AlertEventListResponse>(`/api/alerts/events?${params.toString()}`, {
+      signal,
+    });
+  },
+
+  alertSilences(signal?: AbortSignal): Promise<AlertSilence[]> {
+    return request<AlertSilence[]>("/api/alerts/silences", { signal });
+  },
+
+  createAlertSilence(input: AlertSilenceInput): Promise<AlertSilence> {
+    return request<AlertSilence>("/api/alerts/silences", {
+      method: "POST",
+      ...jsonBody(input),
+    });
+  },
+
+  deleteAlertSilence(id: number): Promise<void> {
+    return request<void>(`/api/alerts/silences/${encodeURIComponent(String(id))}`, {
+      method: "DELETE",
+      ...jsonBody({}),
+    });
+  },
+
+  alertChannels(signal?: AbortSignal): Promise<ChannelView[]> {
+    return request<ChannelView[]>("/api/alerts/channels", { signal });
+  },
+
+  createAlertChannel(input: ChannelInput): Promise<ChannelView> {
+    return request<ChannelView>("/api/alerts/channels", {
+      method: "POST",
+      ...jsonBody(input),
+    });
+  },
+
+  updateAlertChannel(id: string, input: ChannelInput): Promise<ChannelView> {
+    return request<ChannelView>(`/api/alerts/channels/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      ...jsonBody(input),
+    });
+  },
+
+  deleteAlertChannel(id: string): Promise<void> {
+    return request<void>(`/api/alerts/channels/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      ...jsonBody({}),
+    });
+  },
+
+  /** 发送测试消息；成功 204，失败由 hub 返回 502 notify_failed。 */
+  testAlertChannel(id: string): Promise<void> {
+    return request<void>(`/api/alerts/channels/${encodeURIComponent(id)}/test`, {
+      method: "POST",
+      ...jsonBody({}),
+    });
   },
 };
 

@@ -235,6 +235,43 @@ impl ProxyClient {
         send(self, request).await
     }
 
+    /// 使用普通上游超时 POST 一个 JSON 请求体。
+    ///
+    /// 告警规则 / 静默 / 渠道等普通写操作使用它；只有控制面 POST 才需要
+    /// [`Self::post_json`] 的长超时。
+    pub async fn post_json_regular(
+        &self,
+        path: &str,
+        value: &Value,
+    ) -> std::result::Result<HubReply, ProxyError> {
+        let url = self
+            .endpoint(path, &[])
+            .map_err(|e| ProxyError::Unreachable(e.to_string()))?;
+        let request = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .header(header::ACCEPT, "application/json")
+            .json(value);
+        send(self, request).await
+    }
+
+    /// DELETE 一个无请求体的 hub 管理 API。
+    ///
+    /// 只用于告警规则 / 静默 / 渠道这类固定端点的删除；路径 id 由调用方用
+    /// [`validate_alert_id`] 校验过。
+    pub async fn delete(&self, path: &str) -> std::result::Result<HubReply, ProxyError> {
+        let url = self
+            .endpoint(path, &[])
+            .map_err(|e| ProxyError::Unreachable(e.to_string()))?;
+        let request = self
+            .client
+            .delete(url)
+            .bearer_auth(&self.token)
+            .header(header::ACCEPT, "application/json");
+        send(self, request).await
+    }
+
     /// POST 一个 JSON 请求体到 hub。
     ///
     /// 控制面写操作固定使用 [`CONTROL_UPSTREAM_TIMEOUT`]：它必须覆盖 Hub 的
@@ -377,6 +414,30 @@ pub fn hub_reply_to_response(reply: HubReply) -> Response {
     response
 }
 
+/// 把 hub 的告警 API 响应原样映射给浏览器，**包括 401**。
+///
+/// 告警接口需要把 hub 的 400/401/403/404/409/502 状态码与错误码原样交给前端，
+/// 便于页面展示 `code`；因此这里不复用 [`hub_reply_to_response`] 的 401 → 502
+/// 改写。响应体仍逐字节透传，但 Content-Type 固定为 JSON、禁止缓存，避免上游
+/// HTML 在面板 origin 下执行。
+pub fn hub_reply_to_response_verbatim(reply: HubReply) -> Response {
+    if reply.status == StatusCode::UNAUTHORIZED {
+        // 只记录状态码与固定提示，绝不记录 token / Authorization 头。
+        tracing::warn!(
+            status = 401,
+            "hub 告警 API 返回 401；请检查 panel.toml 的 token 与 hub 的 admin_token 是否一致"
+        );
+    }
+    let mut response = Response::new(Body::from(reply.body));
+    *response.status_mut() = reply.status;
+    set_common_headers(response.headers_mut());
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
 /// 代理失败统一映射：普通错误 502；控制 POST 超时 504 且标记结果未知。
 ///
 /// 具体原因只进日志；响应体只暴露固定的错误码与说明，不回显上游内容。
@@ -448,6 +509,15 @@ pub fn validate_agent_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+/// 告警路径 id：只允许 UUID / 内置规则 id 字符集 `[A-Za-z0-9-]`，长度 1..=64。
+///
+/// 不允许 `.`、`_`、斜杠、空白与 percent-encoded 的 `..`：Axum 的 `Path`
+/// 提取器会先解码 `%2e%2e`，因此这里必须按**解码后**的值校验。该函数同时用于
+/// `/rules/{id}`、`/channels/{id}`、`/channels/{id}/test` 与 `/silences/{id}`。
+pub fn validate_alert_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 /// 查询串解析错误。

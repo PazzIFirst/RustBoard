@@ -23,7 +23,7 @@ use axum::extract::{ConnectInfo, Path as AxumPath, RawQuery, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{any, get, post};
+use axum::routing::{any, delete, get, post, put};
 use axum::Router;
 use clap::{Parser, Subcommand};
 use http_body::{Body as HttpBody, Frame as BodyFrame, SizeHint};
@@ -45,6 +45,10 @@ use tower::ServiceExt;
 
 /// 登录 / 设置 / 控制面请求体上限。
 const MAX_JSON_BODY: usize = 8 * 1024;
+/// 告警规则 / 静默 / 渠道写请求体上限（方案 §8.1：64 KiB）。
+const MAX_ALERT_BODY: usize = 64 * 1024;
+/// 告警事件单页上限；与 hub 的 `MAX_ALERT_EVENT_LIMIT` 对齐。
+const MAX_ALERT_EVENT_LIMIT: i64 = 100;
 /// 同时进行的 Argon2 校验上限，避免 64 MiB × N 的内存 DoS。
 const MAX_CONCURRENT_ARGON2: usize = 2;
 /// 面板 HTTP 全局并发连接上限；超出后 accept 到的 TCP 立即关闭。
@@ -332,6 +336,37 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/agents/{id}/control",
             get(api_control_get).post(api_control_post),
+        )
+        // M4-B3 告警管理：全部要求已登录会话，路径 id / 查询参数在面板先校验，
+        // 其余业务规则与 secret 脱敏由 hub 负责。
+        .route(
+            "/api/alerts/rules",
+            get(api_alert_rules_list).post(api_alert_rule_create),
+        )
+        .route(
+            "/api/alerts/rules/{id}",
+            put(api_alert_rule_update).delete(api_alert_rule_delete),
+        )
+        .route("/api/alerts/events", get(api_alert_events))
+        .route(
+            "/api/alerts/silences",
+            get(api_alert_silences_list).post(api_alert_silence_create),
+        )
+        .route(
+            "/api/alerts/silences/{id}",
+            delete(api_alert_silence_delete),
+        )
+        .route(
+            "/api/alerts/channels",
+            get(api_alert_channels_list).post(api_alert_channel_create),
+        )
+        .route(
+            "/api/alerts/channels/{id}",
+            put(api_alert_channel_update).delete(api_alert_channel_delete),
+        )
+        .route(
+            "/api/alerts/channels/{id}/test",
+            post(api_alert_channel_test),
         )
         .route("/api/audit", get(api_audit))
         .route("/api/system", get(api_system))
@@ -763,6 +798,299 @@ async fn api_control_post(
     }
 }
 
+// ---------------------------------------------------------------------------
+// M4-B3 告警管理代理
+// ---------------------------------------------------------------------------
+
+/// 告警路径 id 校验；非法时直接返回 400，不访问 hub。
+fn alert_id_guard(id: &str) -> Option<Response> {
+    if proxy::validate_alert_id(id) {
+        None
+    } else {
+        Some(bad_request("id 非法"))
+    }
+}
+
+/// 告警列表 / 写接口不接受任何查询参数。
+fn reject_alert_query(raw: Option<&str>) -> std::result::Result<(), String> {
+    parse_allowed(raw, &[])?;
+    Ok(())
+}
+
+/// 读取并校验告警写请求体：JSON Content-Type、≤64 KiB、必须是 JSON 对象。
+///
+/// 错误响应装箱，避免 `Result` 的 Err 分支持有过大的 `Response`（clippy
+/// `result_large_err`）；调用方解引用即可直接返回。
+async fn read_alert_json(
+    headers: &HeaderMap,
+    body: Body,
+) -> std::result::Result<serde_json::Value, Box<Response>> {
+    if !is_json_content_type(headers) {
+        return Err(Box::new(proxy::json_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "json_required",
+        )));
+    }
+    let bytes = axum::body::to_bytes(body, MAX_ALERT_BODY)
+        .await
+        .map_err(|_| {
+            Box::new(proxy::json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+            ))
+        })?;
+    let payload = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .map_err(|_| Box::new(bad_request("请求体必须是 JSON 对象")))?;
+    if !payload.is_object() {
+        return Err(Box::new(bad_request("请求体必须是 JSON 对象")));
+    }
+    Ok(payload)
+}
+
+/// 转发告警 GET；响应状态码（含 401）与 body 原样保留，网络错误固定 502。
+async fn forward_alert_get(state: &AppState, path: &str) -> Response {
+    match state.proxy.get(path, &[]).await {
+        Ok(reply) => proxy::hub_reply_to_response_verbatim(reply),
+        Err(error) => proxy::proxy_error_to_response(&error),
+    }
+}
+
+/// 转发告警 GET，保留经过校验的查询参数。
+async fn forward_alert_get_query(
+    state: &AppState,
+    path: &str,
+    query: &[(String, String)],
+) -> Response {
+    match state.proxy.get(path, query).await {
+        Ok(reply) => proxy::hub_reply_to_response_verbatim(reply),
+        Err(error) => proxy::proxy_error_to_response(&error),
+    }
+}
+
+/// 转发告警 POST；使用普通上游超时（不是控制面的 70s）。
+async fn forward_alert_post(state: &AppState, path: &str, payload: &serde_json::Value) -> Response {
+    match state.proxy.post_json_regular(path, payload).await {
+        Ok(reply) => proxy::hub_reply_to_response_verbatim(reply),
+        Err(error) => proxy::proxy_error_to_response(&error),
+    }
+}
+
+async fn forward_alert_put(state: &AppState, path: &str, payload: &serde_json::Value) -> Response {
+    match state.proxy.put_json(path, payload).await {
+        Ok(reply) => proxy::hub_reply_to_response_verbatim(reply),
+        Err(error) => proxy::proxy_error_to_response(&error),
+    }
+}
+
+async fn forward_alert_delete(state: &AppState, path: &str) -> Response {
+    match state.proxy.delete(path).await {
+        Ok(reply) => proxy::hub_reply_to_response_verbatim(reply),
+        Err(error) => proxy::proxy_error_to_response(&error),
+    }
+}
+
+/// `GET /api/alerts/rules`。
+async fn api_alert_rules_list(
+    State(state): State<Arc<AppState>>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    if let Err(message) = reject_alert_query(raw.as_deref()) {
+        return bad_request(&message);
+    }
+    forward_alert_get(&state, "/api/v1/alerts/rules").await
+}
+
+/// `POST /api/alerts/rules`。
+async fn api_alert_rule_create(
+    State(state): State<Arc<AppState>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if let Err(message) = reject_alert_query(raw.as_deref()) {
+        return bad_request(&message);
+    }
+    let payload = match read_alert_json(&headers, body).await {
+        Ok(payload) => payload,
+        Err(response) => return *response,
+    };
+    forward_alert_post(&state, "/api/v1/alerts/rules", &payload).await
+}
+
+/// `PUT /api/alerts/rules/{id}`。
+async fn api_alert_rule_update(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if let Some(response) = alert_id_guard(&id) {
+        return response;
+    }
+    if let Err(message) = reject_alert_query(raw.as_deref()) {
+        return bad_request(&message);
+    }
+    let payload = match read_alert_json(&headers, body).await {
+        Ok(payload) => payload,
+        Err(response) => return *response,
+    };
+    forward_alert_put(&state, &format!("/api/v1/alerts/rules/{id}"), &payload).await
+}
+
+/// `DELETE /api/alerts/rules/{id}`。
+async fn api_alert_rule_delete(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    if let Some(response) = alert_id_guard(&id) {
+        return response;
+    }
+    if let Err(message) = reject_alert_query(raw.as_deref()) {
+        return bad_request(&message);
+    }
+    forward_alert_delete(&state, &format!("/api/v1/alerts/rules/{id}")).await
+}
+
+/// `GET /api/alerts/events`；只放行数字型 `limit` / `before_id`。
+async fn api_alert_events(State(state): State<Arc<AppState>>, RawQuery(raw): RawQuery) -> Response {
+    let query = match parse_allowed(raw.as_deref(), &["limit", "before_id"]) {
+        Ok(query) => query,
+        Err(message) => return bad_request(&message),
+    };
+    if let Err(message) = validate_alert_event_query(&query) {
+        return bad_request(&message);
+    }
+    forward_alert_get_query(&state, "/api/v1/alerts/events", &query).await
+}
+
+/// `GET /api/alerts/silences`。
+async fn api_alert_silences_list(
+    State(state): State<Arc<AppState>>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    if let Err(message) = reject_alert_query(raw.as_deref()) {
+        return bad_request(&message);
+    }
+    forward_alert_get(&state, "/api/v1/alerts/silences").await
+}
+
+/// `POST /api/alerts/silences`。
+async fn api_alert_silence_create(
+    State(state): State<Arc<AppState>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if let Err(message) = reject_alert_query(raw.as_deref()) {
+        return bad_request(&message);
+    }
+    let payload = match read_alert_json(&headers, body).await {
+        Ok(payload) => payload,
+        Err(response) => return *response,
+    };
+    forward_alert_post(&state, "/api/v1/alerts/silences", &payload).await
+}
+
+/// `DELETE /api/alerts/silences/{id}`。
+async fn api_alert_silence_delete(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    if let Some(response) = alert_id_guard(&id) {
+        return response;
+    }
+    if let Err(message) = reject_alert_query(raw.as_deref()) {
+        return bad_request(&message);
+    }
+    forward_alert_delete(&state, &format!("/api/v1/alerts/silences/{id}")).await
+}
+
+/// `GET /api/alerts/channels`。
+async fn api_alert_channels_list(
+    State(state): State<Arc<AppState>>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    if let Err(message) = reject_alert_query(raw.as_deref()) {
+        return bad_request(&message);
+    }
+    forward_alert_get(&state, "/api/v1/alerts/channels").await
+}
+
+/// `POST /api/alerts/channels`。
+async fn api_alert_channel_create(
+    State(state): State<Arc<AppState>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if let Err(message) = reject_alert_query(raw.as_deref()) {
+        return bad_request(&message);
+    }
+    let payload = match read_alert_json(&headers, body).await {
+        Ok(payload) => payload,
+        Err(response) => return *response,
+    };
+    forward_alert_post(&state, "/api/v1/alerts/channels", &payload).await
+}
+
+/// `PUT /api/alerts/channels/{id}`。
+async fn api_alert_channel_update(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if let Some(response) = alert_id_guard(&id) {
+        return response;
+    }
+    if let Err(message) = reject_alert_query(raw.as_deref()) {
+        return bad_request(&message);
+    }
+    let payload = match read_alert_json(&headers, body).await {
+        Ok(payload) => payload,
+        Err(response) => return *response,
+    };
+    forward_alert_put(&state, &format!("/api/v1/alerts/channels/{id}"), &payload).await
+}
+
+/// `DELETE /api/alerts/channels/{id}`。
+async fn api_alert_channel_delete(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    if let Some(response) = alert_id_guard(&id) {
+        return response;
+    }
+    if let Err(message) = reject_alert_query(raw.as_deref()) {
+        return bad_request(&message);
+    }
+    forward_alert_delete(&state, &format!("/api/v1/alerts/channels/{id}")).await
+}
+
+/// `POST /api/alerts/channels/{id}/test`：调用 hub 发送一条固定测试消息。
+///
+/// 该端点没有业务请求体；仍以 `{}` 转发，保持请求是合法 JSON 且便于 hub 统一
+/// 处理。上游的 502 `notify_failed` 等错误码与 body 原样交给前端。
+async fn api_alert_channel_test(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    if let Some(response) = alert_id_guard(&id) {
+        return response;
+    }
+    if let Err(message) = reject_alert_query(raw.as_deref()) {
+        return bad_request(&message);
+    }
+    let path = format!("/api/v1/alerts/channels/{id}/test");
+    forward_alert_post(&state, &path, &json!({})).await
+}
+
 /// 审计列表；只放行分页与过滤参数。
 async fn api_audit(State(state): State<Arc<AppState>>, RawQuery(raw): RawQuery) -> Response {
     let query = match parse_allowed(
@@ -982,6 +1310,52 @@ fn validate_control_payload(payload: &serde_json::Value) -> std::result::Result<
         return Err("confirm 必须是布尔值".to_string());
     }
     Ok(())
+}
+
+/// 告警事件查询校验：`limit` / `before_id` 只接受十进制数字且不得重复。
+///
+/// - `limit` 1–100（缺省由 hub 使用默认值）；
+/// - `before_id` 必须是正整数（1 起步的排他游标）；
+/// - 数字串长度设上限，避免把超长字符串转给上游解析。
+fn validate_alert_event_query(query: &[(String, String)]) -> std::result::Result<(), String> {
+    let mut limit_seen = false;
+    let mut before_seen = false;
+    for (key, value) in query {
+        match key.as_str() {
+            "limit" => {
+                if limit_seen {
+                    return Err("limit 不能重复".to_string());
+                }
+                limit_seen = true;
+                let limit =
+                    parse_alert_number(value).ok_or_else(|| "limit 必须是正整数".to_string())?;
+                if !(1..=MAX_ALERT_EVENT_LIMIT).contains(&limit) {
+                    return Err(format!("limit 必须在 1–{MAX_ALERT_EVENT_LIMIT} 之间"));
+                }
+            }
+            "before_id" => {
+                if before_seen {
+                    return Err("before_id 不能重复".to_string());
+                }
+                before_seen = true;
+                let before = parse_alert_number(value)
+                    .ok_or_else(|| "before_id 必须是正整数".to_string())?;
+                if before <= 0 {
+                    return Err("before_id 必须是正整数".to_string());
+                }
+            }
+            _ => return Err(format!("不支持的查询参数: {key}")),
+        }
+    }
+    Ok(())
+}
+
+/// 只接受 1–18 位 ASCII 十进制数字；拒绝 `+`、`-`、空格、科学计数法与空串。
+fn parse_alert_number(value: &str) -> Option<i64> {
+    if value.is_empty() || value.len() > 18 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
 }
 
 /// 审计查询参数校验：只允许 limit / before_id / agent_id / capability。
@@ -2385,6 +2759,572 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn alert_proxy_requires_session_for_every_endpoint() {
+        let (state, _site) = test_state();
+        let cases: [(Method, &str); 11] = [
+            (Method::GET, "/api/alerts/rules"),
+            (Method::POST, "/api/alerts/rules"),
+            (Method::PUT, "/api/alerts/rules/abc"),
+            (Method::DELETE, "/api/alerts/rules/abc"),
+            (Method::GET, "/api/alerts/events?limit=50"),
+            (Method::GET, "/api/alerts/silences"),
+            (Method::POST, "/api/alerts/silences"),
+            (Method::DELETE, "/api/alerts/silences/1"),
+            (Method::GET, "/api/alerts/channels"),
+            (Method::POST, "/api/alerts/channels"),
+            (Method::DELETE, "/api/alerts/channels/abc"),
+        ];
+        for (method, uri) in cases {
+            let (status, _, body) = call(
+                &state,
+                method.clone(),
+                uri,
+                &[("content-type", "application/json")],
+                Body::from("{}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+            assert!(
+                String::from_utf8_lossy(&body).contains("unauthorized"),
+                "{method} {uri}"
+            );
+        }
+        // 渠道测试端点同样是受保护路由。
+        let (status, _, _) = call(
+            &state,
+            Method::POST,
+            "/api/alerts/channels/abc/test",
+            &[("content-type", "application/json")],
+            Body::from("{}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn alert_proxy_rejects_path_traversal_and_bad_ids() {
+        let (state, _site) = test_state();
+        let cookie = session_cookie(&state);
+        let cases: [(Method, &str); 8] = [
+            (Method::PUT, "/api/alerts/rules/%2e%2e"),
+            (Method::DELETE, "/api/alerts/rules/%2e%2e%2fadmin"),
+            (Method::DELETE, "/api/alerts/rules/..%2F..%2Fadmin"),
+            (Method::DELETE, "/api/alerts/rules/a_b"),
+            (Method::DELETE, "/api/alerts/channels/hub%2fself"),
+            (Method::PUT, "/api/alerts/channels/hub%20self"),
+            (Method::POST, "/api/alerts/channels/%2e%2e/test"),
+            (Method::DELETE, "/api/alerts/silences/1.5"),
+        ];
+        for (method, uri) in cases {
+            let (status, _, body) = call(
+                &state,
+                method.clone(),
+                uri,
+                &[("cookie", &cookie), ("content-type", "application/json")],
+                Body::from("{}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}");
+            assert!(
+                String::from_utf8_lossy(&body).contains("bad_request"),
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn alert_events_reject_unknown_or_non_numeric_query() {
+        let (state, _site) = test_state();
+        let cookie = session_cookie(&state);
+        for query in [
+            "foo=1",
+            "limit=abc",
+            "limit=0",
+            "limit=101",
+            "limit=1&limit=2",
+            "limit=%2B1",
+            "limit=%20",
+            "before_id=-1",
+            "before_id=0",
+            "before_id=abc",
+            "before_id=1.2",
+            "before_id=1&before_id=2",
+            "before_id=999999999999999999999",
+        ] {
+            let uri = format!("/api/alerts/events?{query}");
+            let (status, _, _) = call(
+                &state,
+                Method::GET,
+                &uri,
+                &[("cookie", &cookie)],
+                Body::empty(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn alert_lists_reject_unexpected_query_and_methods() {
+        let (state, _site) = test_state();
+        let cookie = session_cookie(&state);
+        for uri in [
+            "/api/alerts/rules?x=1",
+            "/api/alerts/silences?limit=1",
+            "/api/alerts/channels?foo=bar",
+            "/api/alerts/rules/abc?x=1",
+        ] {
+            let method = if uri.contains("/rules/abc") {
+                Method::DELETE
+            } else {
+                Method::GET
+            };
+            let (status, _, _) = call(
+                &state,
+                method,
+                uri,
+                &[("cookie", &cookie), ("content-type", "application/json")],
+                Body::empty(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        }
+
+        // 已注册路径上的不支持方法必须 405，而不是被 `/api/{*rest}` 吞成 404。
+        for (method, uri) in [
+            (Method::GET, "/api/alerts/channels/abc/test"),
+            (Method::PATCH, "/api/alerts/rules"),
+            (Method::POST, "/api/alerts/events"),
+        ] {
+            let (status, _, _) = call(
+                &state,
+                method.clone(),
+                uri,
+                &[("cookie", &cookie), ("content-type", "application/json")],
+                Body::from("{}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn alert_rule_create_forwards_method_path_and_body() {
+        let hub_body = r#"{"id":"rule-1","name":"rule"}"#;
+        let (hub_url, seen) = spawn_mock_hub(201, hub_body);
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let payload = r#"{"name":"rule","source":"agent_offline","threshold":90,"enabled":true}"#;
+        let (status, headers, body) = call(
+            &state,
+            Method::POST,
+            "/api/alerts/rules",
+            &[("cookie", &cookie), ("content-type", "application/json")],
+            Body::from(payload),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(&body[..], hub_body.as_bytes());
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        let (head, forwarded) = seen_request(&seen);
+        assert!(
+            head.starts_with("POST /api/v1/alerts/rules HTTP/1.1"),
+            "{head}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&forwarded).unwrap(),
+            serde_json::from_str::<Value>(payload).unwrap()
+        );
+        assert_bearer_sent_to_hub(&head);
+        assert!(!String::from_utf8_lossy(&body).contains(TEST_HUB_TOKEN));
+    }
+
+    #[tokio::test]
+    async fn alert_rule_update_and_delete_forward_expected_methods() {
+        let hub_body = r#"{"id":"builtin-agent-offline","enabled":false}"#;
+        let (hub_url, seen) = spawn_mock_hub(200, hub_body);
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let (status, _, body) = call(
+            &state,
+            Method::PUT,
+            "/api/alerts/rules/builtin-agent-offline",
+            &[("cookie", &cookie), ("content-type", "application/json")],
+            Body::from(r#"{"enabled":false}"#),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], hub_body.as_bytes());
+        let (head, forwarded) = seen_request(&seen);
+        assert!(
+            head.starts_with("PUT /api/v1/alerts/rules/builtin-agent-offline HTTP/1.1"),
+            "{head}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&forwarded).unwrap(),
+            json!({"enabled": false})
+        );
+        assert_bearer_sent_to_hub(&head);
+
+        let (hub_url, seen) = spawn_mock_hub(204, "");
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let (status, _, body) = call(
+            &state,
+            Method::DELETE,
+            "/api/alerts/rules/rule-1",
+            &[("cookie", &cookie), ("content-type", "application/json")],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(body.is_empty());
+        let (head, forwarded) = seen_request(&seen);
+        assert!(
+            head.starts_with("DELETE /api/v1/alerts/rules/rule-1 HTTP/1.1"),
+            "{head}"
+        );
+        assert!(forwarded.is_empty());
+        assert_bearer_sent_to_hub(&head);
+    }
+
+    #[tokio::test]
+    async fn alert_events_forwards_whitelisted_query() {
+        let hub_body = r#"{"events":[],"next_before_id":null}"#;
+        let (hub_url, seen) = spawn_mock_hub(200, hub_body);
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let (status, _, body) = call(
+            &state,
+            Method::GET,
+            "/api/alerts/events?limit=50&before_id=42",
+            &[("cookie", &cookie)],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], hub_body.as_bytes());
+        let (head, _) = seen_request(&seen);
+        assert!(
+            head.starts_with("GET /api/v1/alerts/events?limit=50&before_id=42 HTTP/1.1"),
+            "{head}"
+        );
+        assert_bearer_sent_to_hub(&head);
+    }
+
+    #[tokio::test]
+    async fn alert_silences_and_channels_forward_method_path_and_body() {
+        // 创建静默。
+        let (hub_url, seen) = spawn_mock_hub(200, r#"{"id":1}"#);
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let payload = r#"{"rule_id":"builtin-disk-percent","agent_id":null,"duration_secs":3600}"#;
+        let (status, _, _) = call(
+            &state,
+            Method::POST,
+            "/api/alerts/silences",
+            &[("cookie", &cookie), ("content-type", "application/json")],
+            Body::from(payload),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (head, forwarded) = seen_request(&seen);
+        assert!(
+            head.starts_with("POST /api/v1/alerts/silences HTTP/1.1"),
+            "{head}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&forwarded).unwrap(),
+            serde_json::from_str::<Value>(payload).unwrap()
+        );
+
+        // 撤销静默。
+        let (hub_url, seen) = spawn_mock_hub(204, "");
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let (status, _, _) = call(
+            &state,
+            Method::DELETE,
+            "/api/alerts/silences/7",
+            &[("cookie", &cookie), ("content-type", "application/json")],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (head, _) = seen_request(&seen);
+        assert!(
+            head.starts_with("DELETE /api/v1/alerts/silences/7 HTTP/1.1"),
+            "{head}"
+        );
+
+        // 创建渠道：面板原样转发，不在面板层解析或记录 secret。
+        let (hub_url, seen) = spawn_mock_hub(201, r#"{"id":"ch-1"}"#);
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let payload = r#"{"name":"telegram","kind":"telegram","enabled":true,"config":{"chat_id":"42","bot_token":"secret-token"}}"#;
+        let (status, _, body) = call(
+            &state,
+            Method::POST,
+            "/api/alerts/channels",
+            &[("cookie", &cookie), ("content-type", "application/json")],
+            Body::from(payload),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(!String::from_utf8_lossy(&body).contains("secret-token"));
+        let (head, forwarded) = seen_request(&seen);
+        assert!(
+            head.starts_with("POST /api/v1/alerts/channels HTTP/1.1"),
+            "{head}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&forwarded).unwrap(),
+            serde_json::from_str::<Value>(payload).unwrap()
+        );
+
+        // 渠道测试：没有业务 body，固定转发 `{}`。
+        let (hub_url, seen) = spawn_mock_hub(204, "");
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let (status, _, _) = call(
+            &state,
+            Method::POST,
+            "/api/alerts/channels/ch-1/test",
+            &[("cookie", &cookie), ("content-type", "application/json")],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (head, forwarded) = seen_request(&seen);
+        assert!(
+            head.starts_with("POST /api/v1/alerts/channels/ch-1/test HTTP/1.1"),
+            "{head}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&forwarded).unwrap(),
+            json!({})
+        );
+        assert_bearer_sent_to_hub(&head);
+
+        // 删除渠道。
+        let (hub_url, seen) = spawn_mock_hub(204, "");
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let (status, _, _) = call(
+            &state,
+            Method::DELETE,
+            "/api/alerts/channels/ch-1",
+            &[("cookie", &cookie), ("content-type", "application/json")],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (head, _) = seen_request(&seen);
+        assert!(
+            head.starts_with("DELETE /api/v1/alerts/channels/ch-1 HTTP/1.1"),
+            "{head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alert_hub_business_errors_pass_through_unchanged() {
+        for (hub_status, hub_body) in [
+            (400, r#"{"error":"bad_request","message":"规则名称非法"}"#),
+            (
+                401,
+                r#"{"error":{"code":"invalid_token","message":"token 无效"}}"#,
+            ),
+            (
+                403,
+                r#"{"error":"builtin_rule","message":"内置规则不能删除"}"#,
+            ),
+            (404, r#"{"error":"not_found","message":"规则不存在"}"#),
+            (409, r#"{"error":"conflict","message":"规则名称重复"}"#),
+            (
+                502,
+                r#"{"error":"notify_failed","message":"测试消息发送失败"}"#,
+            ),
+        ] {
+            let (hub_url, _seen) = spawn_mock_hub(hub_status, hub_body);
+            let state = test_state_with_hub(&hub_url);
+            let cookie = session_cookie(&state);
+            let (status, headers, body) = call(
+                &state,
+                Method::DELETE,
+                "/api/alerts/rules/rule-1",
+                &[("cookie", &cookie), ("content-type", "application/json")],
+                Body::empty(),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::from_u16(hub_status).unwrap(),
+                "hub status 必须原样保留"
+            );
+            assert_eq!(&body[..], hub_body.as_bytes(), "错误 body 必须原样保留");
+            assert_eq!(
+                headers.get(header::CONTENT_TYPE).unwrap(),
+                "application/json"
+            );
+            assert!(
+                !String::from_utf8_lossy(&body).contains(TEST_HUB_TOKEN),
+                "响应不得出现 hub token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn alert_network_errors_are_502_without_token() {
+        let state = test_state_with_hub("http://127.0.0.1:1");
+        let cookie = session_cookie(&state);
+        let (status, _, body) = call(
+            &state,
+            Method::GET,
+            "/api/alerts/rules",
+            &[("cookie", &cookie)],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let text = String::from_utf8_lossy(&body).to_string();
+        assert!(text.contains("hub_unreachable"), "{text}");
+        assert!(!text.contains(TEST_HUB_TOKEN), "{text}");
+    }
+
+    #[tokio::test]
+    async fn alert_bodies_require_json_and_stay_under_64kib() {
+        let (state, _site) = test_state();
+        let cookie = session_cookie(&state);
+        for (content_type, payload, expected) in [
+            (
+                "text/plain",
+                "{}".to_string(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                "application/json",
+                "[1,2,3]".to_string(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "application/json",
+                "null".to_string(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "application/json",
+                "{not json".to_string(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "application/json",
+                format!(r#"{{"name":"{}"}}"#, "a".repeat(MAX_ALERT_BODY)),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let (status, _, _) = call(
+                &state,
+                Method::POST,
+                "/api/alerts/rules",
+                &[
+                    ("cookie", &cookie),
+                    ("content-type", content_type),
+                    ("host", "panel.test:8080"),
+                    ("origin", "http://panel.test:8080"),
+                ],
+                Body::from(payload),
+                None,
+            )
+            .await;
+            assert_eq!(status, expected, "content-type={content_type}");
+        }
+    }
+
+    #[test]
+    fn validates_alert_event_query_boundaries() {
+        let pairs = |values: &[(&str, &str)]| {
+            values
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert!(validate_alert_event_query(&[]).is_ok());
+        assert!(validate_alert_event_query(&pairs(&[("limit", "1")])).is_ok());
+        assert!(validate_alert_event_query(&pairs(&[("limit", "100")])).is_ok());
+        assert!(validate_alert_event_query(&pairs(&[("before_id", "1")])).is_ok());
+        assert!(
+            validate_alert_event_query(&pairs(&[("limit", "50"), ("before_id", "42")])).is_ok()
+        );
+
+        for values in [
+            vec![("limit", "0")],
+            vec![("limit", "101")],
+            vec![("limit", "1.5")],
+            vec![("limit", "-1")],
+            vec![("limit", "+1")],
+            vec![("limit", "")],
+            vec![("limit", "1"), ("limit", "2")],
+            vec![("before_id", "0")],
+            vec![("before_id", "-1")],
+            vec![("before_id", "abc")],
+            vec![("before_id", "1"), ("before_id", "2")],
+        ] {
+            assert!(
+                validate_alert_event_query(&pairs(&values)).is_err(),
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_alert_ids() {
+        for id in [
+            "builtin-agent-offline",
+            "builtin-disk-percent",
+            "0b6c7d8e-1234-4abc-9def-0123456789ab",
+            "A1",
+        ] {
+            assert!(proxy::validate_alert_id(id), "{id}");
+        }
+        let long_id = "a".repeat(65);
+        for id in [
+            "",
+            ".",
+            "..",
+            "../admin",
+            "a/b",
+            "a b",
+            "a_b",
+            "a.b",
+            "%2e%2e",
+            long_id.as_str(),
+        ] {
+            assert!(!proxy::validate_alert_id(id), "{id}");
         }
     }
 

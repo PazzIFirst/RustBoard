@@ -171,3 +171,114 @@ export interface AuditQuery {
   agentId?: string;
   capability?: string;
 }
+
+/** M4 告警：规则来源与比较符使用 hub 的稳定小写字符串。 */
+export type AlertSource = "metric" | "agent_offline" | "hub_cert";
+export type AlertComparator = "gt" | "gte" | "lt" | "lte" | "eq" | "ne";
+export type AlertEventState = "firing" | "resolved";
+
+export interface AlertRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  source: AlertSource;
+  /** `metric` 来源必填；其他来源为空字符串。 */
+  metric: string;
+  comparator: AlertComparator;
+  threshold: number;
+  duration_secs: number;
+  cooldown_secs: number;
+  filter_agent_id: string | null;
+  filter_labels: Record<string, string>;
+  channel_ids: string[];
+  notify_on_resolve: boolean;
+  /** 内置规则可改可停，但不可删除。 */
+  is_builtin: boolean;
+  updated_by: string;
+  created_at: number;
+  updated_at: number;
+}
+
+/** PUT 只包含出现即覆盖的字段；页面只发送实际变更。 */
+export interface AlertRuleInput {
+  name?: string;
+  enabled?: boolean;
+  source?: AlertSource;
+  metric?: string;
+  comparator?: AlertComparator;
+  threshold?: number;
+  duration_secs?: number;
+  cooldown_secs?: number;
+  filter_agent_id?: string | null;
+  filter_labels?: Record<string, string>;
+  channel_ids?: string[];
+  notify_on_resolve?: boolean;
+}
+
+export interface AlertEvent {
+  id: number;
+  ts: number;
+  rule_id: string;
+  /** 事件产生时的规则名快照。 */
+  rule_name: string;
+  /** 全局事件为空字符串。 */
+  agent_id: string;
+  state: AlertEventState;
+  value: number | null;
+  message: string;
+  notified: boolean;
+  notify_error: string;
+  silenced: boolean;
+}
+
+export interface AlertEventListResponse {
+  events: AlertEvent[];
+  /** 本页满时返回最后一条 id；null 表示没有更多。 */
+  next_before_id?: number | null;
+}
+
+export interface AlertSilence {
+  id: number;
+  /** `null` = 全部规则。 */
+  rule_id: string | null;
+  /** `null` = 全部 agent。 */
+  agent_id: string | null;
+  until_ts: number;
+  created_by: string;
+  created_at: number;
+}
+
+export interface AlertSilenceInput {
+  rule_id?: string | null;
+  agent_id?: string | null;
+  duration_secs: number;
+}
+
+export type ChannelKind = "telegram" | "wecom" | "dingtalk" | "feishu";
+
+/**
+ * 渠道 API 视图（B2b 实际形状）。
+ *
+ * Telegram 的非敏感配置 `chat_id` 是扁平字段；`secret_fields` 只列出已配置的
+ * secret 字段名。任何 secret 值都不会出现在响应里。
+ */
+export interface ChannelView {
+  id: string;
+  name: string;
+  kind: ChannelKind;
+  enabled: boolean;
+  /** Telegram 的 chat_id；其他渠道为 null。 */
+  chat_id: string | null;
+  secret_fields: string[];
+  updated_by: string;
+  created_at: number;
+  updated_at: number;
+}
+
+/** 新建 / 编辑渠道的请求体；secret 留空表示编辑时保留原值。 */
+export interface ChannelInput {
+  name: string;
+  kind: ChannelKind;
+  enabled: boolean;
+  config: Record<string, string>;
+}
