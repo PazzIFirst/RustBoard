@@ -2477,10 +2477,13 @@ async fn handle_session(
     let mut watch_shutdown = true;
     // 每个会话最多成功续签一次，状态跟随会话生命周期。
     let mut renew = RenewState::default();
+    // 绝对空闲 deadline：每秒的控制清理 tick 不会重置它，只有入站帧才续期。
+    let mut idle = SessionIdle::new(SESSION_IDLE_TIMEOUT);
 
     loop {
         // 45s 内收不到任何帧就认为连接已死；agent 每 15s 发一次 Ping。
-        let recv = tokio::time::timeout(SESSION_IDLE_TIMEOUT, socket.recv());
+        // `timeout_at` 使用固定 deadline，避免 select 其他分支完成时重置空闲计时。
+        let recv = tokio::time::timeout_at(idle.deadline(), socket.recv());
         let event = tokio::select! {
             biased;
             changed = shutdown.changed(), if watch_shutdown => {
@@ -2558,6 +2561,9 @@ async fn handle_session(
                 }
             }
             SessionEvent::Message(message) => {
+                // 只有 agent 的入站帧才续期空闲 deadline；控制命令 / 清理 tick /
+                // shutdown 都不算心跳，不能让静默连接永远在线。
+                idle.on_frame();
                 match handle_message(
                     &mut socket,
                     &state,
@@ -2630,6 +2636,37 @@ enum SessionEvent {
 enum MessageAction {
     Continue,
     Close,
+}
+
+/// 会话空闲超时的绝对 deadline。
+///
+/// `select!` 每轮都会丢弃未完成的 recv future；如果每轮都用
+/// `timeout(SESSION_IDLE_TIMEOUT, recv)` 重新计时，每秒完成一次的
+/// `control_expire` tick 会把 45s 空闲窗口无限推后，静默连接（TCP 未断、
+/// 不再发帧）将永远不触发空闲超时。这里保存绝对时间点，只有收到 agent
+/// 入站帧才顺延；控制命令、清理 tick、shutdown 都不得调用 [`Self::on_frame`]。
+struct SessionIdle {
+    timeout: Duration,
+    expires_at: tokio::time::Instant,
+}
+
+impl SessionIdle {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            expires_at: tokio::time::Instant::now() + timeout,
+        }
+    }
+
+    /// 当前这一轮 `recv` 的绝对截止时间。
+    fn deadline(&self) -> tokio::time::Instant {
+        self.expires_at
+    }
+
+    /// 收到 agent 入站帧后才顺延整个空闲窗口。
+    fn on_frame(&mut self) {
+        self.expires_at = tokio::time::Instant::now() + self.timeout;
+    }
 }
 
 /// 单个会话的客户端证书续签状态。
@@ -3302,6 +3339,70 @@ mod tests {
             .await
             .expect_err("永不完成的写必须超时");
         assert!(err.to_string().contains("超时"), "错误信息: {err}");
+    }
+
+    /// 评审回归：每秒的控制清理 tick 不得重置 45s 空闲 deadline；
+    /// 只有收到入站帧（`on_frame`）才顺延。测试把时间压缩为 200ms 超时 / 20ms tick。
+    #[tokio::test]
+    async fn v032_session_idle_deadline_survives_control_ticks() {
+        const TIMEOUT: Duration = Duration::from_millis(200);
+        const TICK: Duration = Duration::from_millis(20);
+
+        let mut idle = SessionIdle::new(TIMEOUT);
+        let initial = idle.deadline();
+
+        // 模拟持续每秒 tick（压缩为 20ms），总 100ms：tick 不续期。
+        for _ in 0..5 {
+            tokio::time::sleep(TICK).await;
+        }
+        assert_eq!(
+            idle.deadline(),
+            initial,
+            "control_expire tick 不得重置空闲 deadline"
+        );
+        assert!(tokio::time::Instant::now() < idle.deadline());
+
+        // 等过原 deadline：空闲超时必须生效。
+        tokio::time::sleep_until(idle.deadline()).await;
+        assert!(tokio::time::Instant::now() >= idle.deadline());
+
+        // 收到入站帧后才顺延整个窗口。
+        let frame_at = tokio::time::Instant::now();
+        idle.on_frame();
+        assert!(idle.deadline() >= frame_at + TIMEOUT);
+        assert!(idle.deadline() > initial, "入站帧必须顺延 deadline");
+        tokio::time::sleep(TIMEOUT / 2).await;
+        assert!(
+            tokio::time::Instant::now() < idle.deadline(),
+            "续期后不应提前到期"
+        );
+        tokio::time::sleep_until(idle.deadline()).await;
+        assert!(tokio::time::Instant::now() >= idle.deadline());
+    }
+
+    /// 评审回归：用接近 `handle_session` 的 select 结构验证——持续 tick 完成时，
+    /// `timeout_at` 仍必须按期触发，不能被 tick 饿死。
+    #[tokio::test]
+    async fn v032_idle_timeout_fires_despite_control_ticks() {
+        const TIMEOUT: Duration = Duration::from_millis(200);
+        const TICK: Duration = Duration::from_millis(20);
+
+        let idle = SessionIdle::new(TIMEOUT);
+        let mut ticks = tokio::time::interval(TICK);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut idle_fired = false;
+        for _ in 0..50 {
+            tokio::select! {
+                biased;
+                _ = ticks.tick() => {}
+                _ = tokio::time::timeout_at(idle.deadline(), std::future::pending::<()>()) => {
+                    idle_fired = true;
+                    break;
+                }
+            }
+        }
+        assert!(idle_fired, "持续 tick 不得饿死空闲超时");
     }
 
     /// H2：连接数达到上限后不再发放许可，释放一条后恢复。
