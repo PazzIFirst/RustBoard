@@ -61,8 +61,13 @@ use session::{SessionRegistry, ShutdownReason};
 /// WebSocket 单条消息上限。agent 的正常批次只有几 KB，1 MiB 足够宽裕；
 /// 不设上限时 tungstenite 默认允许 64 MiB，未认证连接可用分片消息打爆内存。
 const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
-/// 单帧上限，防止一个巨大分片占满内存。
-const MAX_WS_FRAME_SIZE: usize = 256 * 1024;
+/// 单帧上限与消息上限一致，避免合法的大控制结果被额外卡住。
+///
+/// agent 的 `MAX_OUTPUT_BYTES` 允许单次控制输出接近 256 KiB，MessagePack 编码后的
+/// `ControlResponse` 单帧会略超 256 KiB；若单帧上限更小，tungstenite 会以
+/// `Space limit exceeded` 拒绝该帧并关闭整个 agent 会话（控制动作已执行却丢结果）。
+/// 内存边界不变：即使拆成多个分片，整条消息仍受 1 MiB `max_message_size` 约束。
+const MAX_WS_FRAME_SIZE: usize = MAX_WS_MESSAGE_SIZE;
 
 const HUB_SELF_AGENT_ID: &str = "hub-self";
 /// 会话身份与帧内身份不一致。
@@ -5775,6 +5780,47 @@ mod tests {
                 |entry| !entry.error_message.contains(SECRET) && !entry.params.contains(SECRET)
             ),
             "审计不得写入 agent 错误详情"
+        );
+    }
+
+    /// #19 e2e 回归：agent 允许约 256 KiB 的日志结果，MessagePack 编码后的
+    /// `ControlResponse` 单帧会略超旧的 256 KiB 单帧上限；单帧上限必须与消息
+    /// 上限一致，否则合法结果被 tungstenite 拒绝并连带关闭 agent 会话。
+    #[test]
+    fn v032_control_result_frame_fits_within_ws_frame_limit() {
+        use rustboard_common::control::ControlResponse;
+
+        // 2000 行 × 130B = 260,000B，低于 MAX_OUTPUT_BYTES(262144)；
+        // 加上每行换行与编码开销后刚好越过旧的 256 KiB 单帧上限。
+        let lines: Vec<String> = (0..2000).map(|_| "x".repeat(130)).collect();
+        let result = ControlResult::LogLines {
+            source: "journal".into(),
+            lines,
+            truncated: true,
+            size_bytes: 260_000,
+        };
+        let encoded = Frame::ControlResponse(ControlResponse::success(1, result))
+            .encode()
+            .expect("控制结果必须可编码");
+
+        assert!(
+            encoded.len() > 256 * 1024,
+            "编码后 {} 字节必须超过旧的 256 KiB 单帧上限，否则测试无法复现缺陷",
+            encoded.len()
+        );
+        assert!(
+            encoded.len() <= MAX_WS_MESSAGE_SIZE,
+            "编码后 {} 字节必须落在消息上限内",
+            encoded.len()
+        );
+        assert!(
+            encoded.len() <= MAX_WS_FRAME_SIZE,
+            "编码后 {} 字节必须落在单帧上限内",
+            encoded.len()
+        );
+        assert_eq!(
+            MAX_WS_FRAME_SIZE, MAX_WS_MESSAGE_SIZE,
+            "单帧上限不得小于合法消息上限"
         );
     }
 
