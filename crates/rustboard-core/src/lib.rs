@@ -2,6 +2,7 @@
 
 pub mod alerts;
 pub mod buffer;
+pub mod channels;
 pub mod collect;
 pub mod downsample;
 pub mod storage;

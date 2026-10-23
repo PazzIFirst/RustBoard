@@ -58,6 +58,7 @@ mod alerts_engine;
 mod auth;
 mod cert_rotation;
 mod control;
+mod notify;
 mod session;
 use auth::{AuthFailureLimiter, TokenScope};
 use cert_rotation::CertStatus;

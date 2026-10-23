@@ -17,11 +17,13 @@ rust-version = "1.80"
 [workspace.dependencies]
 anyhow = "1"
 argon2 = "0.5"
+async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 hex = "0.4"
+hmac = "0.12"
 http-body = "1"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service"] }
