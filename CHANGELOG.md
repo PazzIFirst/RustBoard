@@ -10,6 +10,45 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-23
+
+### Added
+
+- 控制面新增 `control_result_too_large` 错误码与 agent 发送前编码预算：超过
+  1 MiB−4 KiB 的控制结果改为固定小错误，保留请求 id，不再让 Hub 因 WS 帧/消息超限关闭会话
+- `tests/e2e/v032.sh` + `v032_agent.py`：66 项断言，覆盖 #18 pending 清理、#16
+  `busy_renewing` Hub 映射、#19 journald 尾部保留与真实大帧传输
+- 面板控制错误 `control_result_unknown` 的前端文案：结果未知、动作可能已执行、
+  不要直接重试，先核对状态
+
+### Changed
+
+- 面板控制 POST 使用 70s 专用上游超时（普通 GET/PUT 仍 30s），严格大于 Hub 最大 60s 控制等待
+- Hub WebSocket 单帧上限从 256 KiB 提升到 1 MiB，与消息上限一致；内存边界不变
+- journald tail 改用 `journalctl --reverse` 后反转行序，截断时保留最新内容并丢弃最旧半行；
+  `size_bytes` 表示实际保留的 stdout 字节数
+- 控制 pending 记录改为 `{reply, deadline}`，会话每秒清理到期项；清理 timer 优先于
+  入站消息与控制命令，避免 pending 长期占用配额
+
+### Fixed
+
+- #18 控制 HTTP 超时后 pending 不清理，连续请求会被历史上限永久变成 429
+- #16 证书续签等待期间 ControlRequest 被静默丢弃；现在立即回 `busy_renewing`
+  （Hub 503、审计 error）
+- #15 Panel 30s 超时短于 Hub 60s，命令可能已执行但面板报网络错误；现在返回
+  504 `control_result_unknown`
+- #19 journald 输出超 256 KiB 时保留最早内容、丢失最新日志；现在保留最新并恢复旧→新顺序
+- 约 256 KiB 控制结果经 MessagePack 编码后超过旧 256 KiB 单帧上限，agent 会话被踢下线
+- 45s 会话空闲超时被每秒控制清理 timer 重置，静默连接永不关闭
+
+### Security
+
+- 控制应答编码预算（1 MiB−4 KiB）与 Hub 1 MiB WS 消息上限留出余量；超限只丢结果并回
+  `control_result_too_large`，不关闭会话，避免控制动作已执行却返回 `agent_offline`
+- 升级顺序：先升级 hub 到 v0.3.2，再升级 agent。v0.3.1 hub 的单帧上限仍是 256 KiB，
+  新 agent 发送超过 256 KiB 的控制结果仍可能被旧 hub 拒绝并断开会话
+- v0.3.2 未实现 #9 的 scoped token / 管理端强制 TLS；#9/#17/#20/#21 仍 open
+
 ## [0.3.1] - 2026-10-23
 
 ### Added

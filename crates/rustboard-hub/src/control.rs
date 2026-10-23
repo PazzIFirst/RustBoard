@@ -90,6 +90,14 @@ const AUDIT_ERROR: &str = "error";
 /// 会话内待处理命令的应答通道。
 type ControlReply = oneshot::Sender<std::result::Result<ControlResult, ControlError>>;
 
+/// 一条待处理的控制请求：应答通道 + 本地超时 deadline。
+struct PendingControl {
+    reply: ControlReply,
+    /// 会话内超时时间点；到点后由 [`ControlSession::expire`] 清理并回
+    /// `control_timeout`，不依赖管理 API 的等待超时。
+    deadline: Instant,
+}
+
 /// 管理 API → 会话任务的一条控制命令。
 pub struct ControlCommand {
     pub op: ControlOp,
@@ -100,18 +108,21 @@ pub struct ControlCommand {
 pub struct ControlSession {
     /// 会话内单调递增；只用于匹配应答，不跨会话复用。
     next_id: u64,
-    pending: HashMap<u64, ControlReply>,
+    pending: HashMap<u64, PendingControl>,
     max_pending: usize,
+    /// 每条控制请求从入表起允许等待的时长。
+    request_timeout: Duration,
     /// 收到的未知 id 应答计数（陈旧 / 伪造应答），只用于排障。
     unknown_responses: u64,
 }
 
 impl ControlSession {
-    pub fn new(max_pending: usize) -> Self {
+    pub fn new(max_pending: usize, request_timeout: Duration) -> Self {
         Self {
             next_id: 0,
             pending: HashMap::new(),
             max_pending: max_pending.max(MIN_PENDING_LIMIT),
+            request_timeout,
             unknown_responses: 0,
         }
     }
@@ -135,8 +146,36 @@ impl ControlSession {
             self.next_id = 1;
         }
         let id = self.next_id;
-        self.pending.insert(id, reply);
+        self.pending.insert(
+            id,
+            PendingControl {
+                reply,
+                deadline: Instant::now() + self.request_timeout,
+            },
+        );
         Ok(ControlRequest::new(id, op))
+    }
+
+    /// 清理所有已到期的 pending，向等待者回 `control_timeout`，返回清理数量。
+    ///
+    /// 先收集 id 再逐个移除，避免遍历 `pending` 时同时借用 `self` 发送 oneshot。
+    /// 这是会话本地超时，不是 agent 的未知应答，因此**不**增加 `unknown_responses`。
+    pub fn expire(&mut self, now: Instant) -> usize {
+        let expired: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.deadline <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &expired {
+            if let Some(pending) = self.pending.remove(id) {
+                let _ = pending.reply.send(Err(ControlError::new(
+                    hub_codes::CONTROL_TIMEOUT,
+                    "控制请求超时",
+                )));
+            }
+        }
+        expired.len()
     }
 
     /// 登记并发送一条控制请求。
@@ -178,7 +217,7 @@ impl ControlSession {
     /// 用 agent 的应答完成一个待处理请求；未知 id 丢弃并计数。
     pub fn complete(&mut self, response: ControlResponse) {
         let ControlResponse { id, result, error } = response;
-        let Some(reply) = self.pending.remove(&id) else {
+        let Some(pending) = self.pending.remove(&id) else {
             self.unknown_responses = self.unknown_responses.saturating_add(1);
             tracing::debug!(id, "收到未知控制应答 id，已丢弃");
             return;
@@ -189,7 +228,7 @@ impl ControlSession {
             (Some(result), None) => Ok(result),
             (None, None) => Err(ControlError::control_failed("agent 返回了空的控制应答")),
         };
-        if reply.send(outcome).is_err() {
+        if pending.reply.send(outcome).is_err() {
             tracing::debug!(id, "控制应答无人等待（请求已超时或客户端断开）");
         }
     }
@@ -216,8 +255,8 @@ impl Drop for ControlSession {
             pending = self.pending.len(),
             "agent 会话结束，取消全部待处理控制请求"
         );
-        for (_, reply) in self.pending.drain() {
-            let _ = reply.send(Err(agent_offline_error()));
+        for (_, pending) in self.pending.drain() {
+            let _ = pending.reply.send(Err(agent_offline_error()));
         }
     }
 }
@@ -706,6 +745,22 @@ fn reject_from_agent_error(error: &ControlError) -> Reject {
             code: control_codes::UNSUPPORTED,
             message: "agent 不支持该控制操作".to_string(),
             audit_result: AUDIT_DENIED,
+        },
+        // #16：agent 正在续签证书，属于服务暂不可用而不是执行失败/超时。
+        // 使用固定文案，不采用 agent 传来的 message。
+        control_codes::BUSY_RENEWING => Reject {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: control_codes::BUSY_RENEWING,
+            message: "agent 正在续签证书，请稍后重试".to_string(),
+            audit_result: AUDIT_ERROR,
+        },
+        // 控制结果过大：动作可能已经执行，只是结果无法回传。必须给出专用错误码与
+        // 「请核对状态」文案，不能复用 control_failed（会误导为未执行而诱发重试）。
+        control_codes::RESULT_TOO_LARGE => Reject {
+            status: StatusCode::BAD_GATEWAY,
+            code: control_codes::RESULT_TOO_LARGE,
+            message: "控制结果过大，动作可能已执行，请核对状态".to_string(),
+            audit_result: AUDIT_ERROR,
         },
         _ => Reject {
             status: StatusCode::BAD_GATEWAY,
@@ -1405,6 +1460,9 @@ mod tests {
         serde_json::from_str(body).expect("测试请求体必须能反序列化")
     }
 
+    /// 既有测试只关心 pending 上限 / 应答匹配，给一个足够长的超时避免干扰。
+    const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
     fn prepare(body: &str) -> std::result::Result<PreparedControl, Reject> {
         prepare_control(&parse(body), &enabled_cfg())
     }
@@ -1615,7 +1673,7 @@ mod tests {
 
     #[test]
     fn control_session_ids_are_monotonic_and_pending_is_bounded() {
-        let mut session = ControlSession::new(2);
+        let mut session = ControlSession::new(2, TEST_REQUEST_TIMEOUT);
         let (reply_one, _rx_one) = oneshot::channel();
         let request = session
             .enqueue(ControlCommand {
@@ -1652,7 +1710,7 @@ mod tests {
 
     #[test]
     fn control_session_matches_responses_and_counts_unknown_ids() {
-        let mut session = ControlSession::new(4);
+        let mut session = ControlSession::new(4, TEST_REQUEST_TIMEOUT);
         let (reply, mut rx) = oneshot::channel();
         let request = session
             .enqueue(ControlCommand {
@@ -1717,7 +1775,7 @@ mod tests {
     /// 不能因为错误码不在 agent 错误表里就落到 502。
     #[test]
     fn pending_limit_error_maps_to_429_not_502() {
-        let mut session = ControlSession::new(1);
+        let mut session = ControlSession::new(1, TEST_REQUEST_TIMEOUT);
         let (reply, _rx) = oneshot::channel();
         session
             .enqueue(ControlCommand {
@@ -1768,7 +1826,7 @@ mod tests {
     fn dropping_session_resolves_pending_with_agent_offline() {
         let (reply, mut rx) = oneshot::channel();
         {
-            let mut session = ControlSession::new(1);
+            let mut session = ControlSession::new(1, TEST_REQUEST_TIMEOUT);
             session
                 .enqueue(ControlCommand {
                     op: ControlOp::SystemdList,
@@ -1781,6 +1839,145 @@ mod tests {
             error.expect_err("会话结束必须是错误").code,
             hub_codes::AGENT_OFFLINE
         );
+    }
+
+    /// #18：到期的 pending 必须被清理并回 `control_timeout`；
+    /// 清理后名额释放，新请求不会永久 `too_many_pending`。
+    #[test]
+    fn control_session_expires_timed_out_requests() {
+        let mut session = ControlSession::new(1, Duration::from_millis(50));
+        let (reply, mut rx) = oneshot::channel();
+        session
+            .enqueue(ControlCommand {
+                op: ControlOp::SystemdList,
+                reply,
+            })
+            .expect("第一个命令应成功");
+        assert_eq!(session.pending_len(), 1);
+
+        // deadline = 入队时刻 + 50ms；用 +60ms 的 now 一定过期。
+        let expired = session.expire(Instant::now() + Duration::from_millis(60));
+        assert_eq!(expired, 1);
+        assert_eq!(session.pending_len(), 0);
+
+        let error = rx
+            .try_recv()
+            .expect("过期必须回复等待者")
+            .expect_err("过期必须是错误");
+        assert_eq!(error.code, hub_codes::CONTROL_TIMEOUT);
+        assert_eq!(error.message, "控制请求超时");
+
+        // 名额已释放：新请求能进入 pending，而不是被历史遗留占满。
+        let (reply, _rx) = oneshot::channel();
+        session
+            .enqueue(ControlCommand {
+                op: ControlOp::ProcessList,
+                reply,
+            })
+            .expect("过期清理后必须能再入队");
+        assert_eq!(session.pending_len(), 1);
+    }
+
+    /// #18：过期后晚到的应答按未知 id 丢弃，不 panic、不改变 pending。
+    #[test]
+    fn late_response_after_expire_is_counted_as_unknown() {
+        let mut session = ControlSession::new(2, Duration::from_millis(50));
+        let (reply, mut rx) = oneshot::channel();
+        let request = session
+            .enqueue(ControlCommand {
+                op: ControlOp::LogList,
+                reply,
+            })
+            .unwrap();
+        assert_eq!(
+            session.expire(Instant::now() + Duration::from_millis(60)),
+            1
+        );
+        assert_eq!(
+            rx.try_recv()
+                .expect("过期必须回复等待者")
+                .expect_err("过期必须是错误")
+                .code,
+            hub_codes::CONTROL_TIMEOUT
+        );
+        assert_eq!(session.pending_len(), 0);
+
+        // 晚到的应答：unknown_responses 计数 +1，pending 保持不变。
+        session.complete(ControlResponse::success(
+            request.id,
+            ControlResult::SystemdUnits(Vec::new()),
+        ));
+        assert_eq!(session.unknown_responses(), 1);
+        assert_eq!(session.pending_len(), 0);
+    }
+
+    /// #18：多个请求各自 deadline，`expire` 只清已过期的，未过期保留。
+    #[test]
+    fn expire_removes_only_due_requests() {
+        let mut session = ControlSession::new(4, TEST_REQUEST_TIMEOUT);
+        let mut ids = Vec::new();
+        let mut receivers = Vec::new();
+        for op in [ControlOp::SystemdList, ControlOp::ProcessList] {
+            let (reply, rx) = oneshot::channel();
+            let request = session.enqueue(ControlCommand { op, reply }).unwrap();
+            ids.push(request.id);
+            receivers.push(rx);
+        }
+
+        // 直接构造不同 deadline：第一条过期，第二条仍在等待。
+        let now = Instant::now();
+        session.pending.get_mut(&ids[0]).unwrap().deadline = now - Duration::from_millis(1);
+        session.pending.get_mut(&ids[1]).unwrap().deadline = now + Duration::from_secs(30);
+
+        assert_eq!(session.expire(now), 1);
+        assert_eq!(session.pending_len(), 1);
+        assert!(session.pending.contains_key(&ids[1]), "未过期请求必须保留");
+        assert_eq!(
+            receivers[0]
+                .try_recv()
+                .expect("过期请求必须收到错误")
+                .expect_err("过期必须是错误")
+                .code,
+            hub_codes::CONTROL_TIMEOUT
+        );
+        assert!(receivers[1].try_recv().is_err(), "未过期请求不能收到错误");
+
+        // 重复清理是幂等的：没有新的过期项时返回 0。
+        assert_eq!(session.expire(now), 0);
+        assert_eq!(session.pending_len(), 1);
+    }
+
+    /// #16：续签期间的固定错误码映射 503 / `busy_renewing` / 审计 error，
+    /// 且 message 必须是本地固定文案，不采用 agent 传来的内容。
+    #[test]
+    fn busy_renewing_maps_to_503_with_fixed_message() {
+        let error = ControlError::new(control_codes::BUSY_RENEWING, "agent 侧详情不应被采用");
+        let reject = reject_from_agent_error(&error);
+        assert_eq!(reject.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reject.code, control_codes::BUSY_RENEWING);
+        assert_eq!(reject.code, "busy_renewing");
+        assert_eq!(reject.message, "agent 正在续签证书，请稍后重试");
+        assert!(!reject.message.contains("详情"), "不得回显 agent 错误详情");
+        assert_eq!(reject.audit_result, AUDIT_ERROR);
+        // 不能落到 502 / 504。
+        assert_ne!(reject.status, StatusCode::BAD_GATEWAY);
+        assert_ne!(reject.status, StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    /// 控制结果过大：动作可能已执行，必须映射为 502 + 专用错误码与固定文案，
+    /// 不能复用 control_failed / control_timeout（会误导为未执行而诱发重试）。
+    #[test]
+    fn result_too_large_maps_to_502_with_fixed_message() {
+        let error = ControlError::new(control_codes::RESULT_TOO_LARGE, "agent 侧详情不应被采用");
+        let reject = reject_from_agent_error(&error);
+        assert_eq!(reject.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(reject.code, control_codes::RESULT_TOO_LARGE);
+        assert_eq!(reject.code, "control_result_too_large");
+        assert_eq!(reject.message, "控制结果过大，动作可能已执行，请核对状态");
+        assert!(!reject.message.contains("详情"), "不得回显 agent 错误详情");
+        assert_eq!(reject.audit_result, AUDIT_ERROR);
+        assert_ne!(reject.code, control_codes::CONTROL_FAILED);
+        assert_ne!(reject.code, hub_codes::CONTROL_TIMEOUT);
     }
 
     #[test]

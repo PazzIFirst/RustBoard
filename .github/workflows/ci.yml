@@ -104,6 +104,9 @@ jobs:
       - name: 控制面回归
         run: bash tests/e2e/control.sh
 
+      - name: v0.3.2 控制面可靠性回归
+        run: bash tests/e2e/v032.sh
+
   web:
     name: web / tsc / build
     runs-on: ubuntu-latest

@@ -60,6 +60,13 @@ pub const MAX_LIST_ITEMS: usize = 512;
 pub const MAX_PROCESS_ITEMS: usize = 200;
 /// 单条命令 stdout / stderr 各自的输出上限（字节）。
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// agent 发送控制应答前的编码后字节预算（比 hub 的 1 MiB WS 消息上限小 4 KiB）。
+///
+/// `LogSources` 等由配置驱动的结果可能远超 256 KiB；超过预算时 agent 必须回
+/// 固定小错误，绝不能把超限帧发出去——hub 会因 `Message too long` 关闭整个
+/// 会话，命令结果反而全部丢失。留 4 KiB 给 MessagePack / 传输层开销，并保证
+/// `MAX_CONTROL_RESPONSE_BYTES < hub 的 MAX_WS_MESSAGE_SIZE`。
+pub const MAX_CONTROL_RESPONSE_BYTES: usize = 1024 * 1024 - 4096;
 /// 命令输出被截断时附加到 ActionOutput 的标记。
 pub const TRUNCATED_MARKER: &str = "\n...[truncated]...\n";
 
@@ -325,6 +332,19 @@ impl ControlError {
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::new(codes::UNSUPPORTED, message)
     }
+
+    /// agent 正在续签证书，暂时不能执行控制动作（固定文案，可提示稍后重试）。
+    pub fn busy_renewing() -> Self {
+        Self::new(codes::BUSY_RENEWING, "agent 正在续签证书，请稍后重试")
+    }
+
+    /// 控制结果超过单帧预算：动作可能已经执行，只是结果无法完整回传。
+    pub fn result_too_large() -> Self {
+        Self::new(
+            codes::RESULT_TOO_LARGE,
+            "控制结果过大，动作可能已执行，请核对状态",
+        )
+    }
 }
 
 /// 错误码常量，避免字符串散落在 agent / hub 两侧。
@@ -334,6 +354,10 @@ pub mod codes {
     pub const INVALID_REQUEST: &str = "invalid_request";
     pub const CONTROL_FAILED: &str = "control_failed";
     pub const UNSUPPORTED: &str = "unsupported";
+    /// agent 证书续签等待期间收到的控制请求：不执行动作，明确要求稍后重试。
+    pub const BUSY_RENEWING: &str = "busy_renewing";
+    /// 控制结果编码后超过单帧预算：动作可能已执行，结果被丢弃。
+    pub const RESULT_TOO_LARGE: &str = "control_result_too_large";
 }
 
 // ---------------------------------------------------------------------------
@@ -830,5 +854,23 @@ mod tests {
         let err = ControlResponse::failure(2, ControlError::invalid_request("bad"));
         assert!(err.result.is_none());
         assert_eq!(err.error.as_ref().unwrap().code, codes::INVALID_REQUEST);
+    }
+
+    /// #16：续签期间固定错误码与文案必须稳定（hub 按码映射 503）。
+    #[test]
+    fn busy_renewing_has_stable_code_and_message() {
+        let error = ControlError::busy_renewing();
+        assert_eq!(error.code, codes::BUSY_RENEWING);
+        assert_eq!(error.code, "busy_renewing");
+        assert_eq!(error.message, "agent 正在续签证书，请稍后重试");
+    }
+
+    /// 控制结果过大：动作可能已执行，固定错误码 / 文案必须稳定（hub 按码映射 502）。
+    #[test]
+    fn result_too_large_has_stable_code_and_message() {
+        let error = ControlError::result_too_large();
+        assert_eq!(error.code, codes::RESULT_TOO_LARGE);
+        assert_eq!(error.code, "control_result_too_large");
+        assert_eq!(error.message, "控制结果过大，动作可能已执行，请核对状态");
     }
 }

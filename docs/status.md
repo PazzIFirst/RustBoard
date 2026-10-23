@@ -12,6 +12,7 @@
 | v0.2.1 硬化 | 🟢 完成 | 修复 known-issues KI-01 ~ KI-12；单元/集成 259 个，hardening e2e 29/29 |
 | M3 控制面 | 🟢 完成 | systemd / Docker / 进程 / 日志 + 双端能力开关 + 审计页；单元 379，control e2e 99/99 |
 | v0.3.1 硬化 | 🟢 完成 | #10 缓冲物理上界/崩溃恢复、#12 发送超时、#13 过期证书自愈、#14 会话清理原子化、KI-17 慢连接；单元/集成 420，hardening 34/34，v031 94/94 |
+| v0.3.2 控制面可靠性 | 🟢 完成 | #15/#16/#18/#19、1MiB 控制应答帧预算、45s idle 回归；单元/集成 447，v032 66/66、control 100/100、hardening 34/34、v031 94/94、security 9/9、cert 103/103、panel 159/159 |
 | M4 告警与归档 | ⬜ 未开始 | |
 | M5 安装与交付 | ⬜ 未开始 | |
 
@@ -117,6 +118,29 @@
 - [x] 测试：单元/集成 379；`control.sh` 99/99；`cargo audit` 0 漏洞
 - [x] 独立评审 + 渗透：无高危；审计信任边界与低危限制已记录
 
+## v0.3.2 控制面可靠性明细
+
+已完成（对应 GitHub #15 / #16 / #18 / #19）：
+
+- [x] #18：`ControlSession` pending 记录增加绝对 deadline；会话 1s timer 清理到期项并回
+      `control_timeout`，清理优先于新控制命令与入站消息；晚到应答只计未知 id，不再永久占用
+      `max_pending` 配额
+- [x] #16：证书续签等待期间收到 `ControlRequest` 立即回 `busy_renewing`，不执行动作；
+      Hub 映射 503 / 固定文案 / 审计 `error`，不落 502/504
+- [x] #15：Panel 控制 POST 使用 70s 专用超时（Hub 最大 60s + 余量）；最终超时返回
+      504 `control_result_unknown`，响应体与前端文案明确“动作可能已执行、不要直接重试”
+- [x] #19：journald 使用 `journalctl --reverse`，截断时保留最新内容并丢弃最旧半行，
+      返回顺序恢复旧→新；`size_bytes` 为实际保留的 stdout 字节数
+- [x] 额外加固：Hub WS 单帧上限提升到 1 MiB（与消息上限一致）；agent 发送控制应答前检查
+      1 MiB−4 KiB 编码预算，超限回 `control_result_too_large`，避免大结果触发断连；
+      45s 会话空闲超时改为绝对 deadline，不被 1s 控制清理 timer 重置
+- [x] 测试：单元/集成 447；`v032.sh` 66/66、`control.sh` 100/100、`v031.sh` 94/94、
+      `security.sh` 9/9、`cert-rotation.sh` 103/103、`hardening.sh` 34/34、`panel.sh` 159/159；
+      web 48/48；`cargo audit` 0 漏洞
+- [x] 独立评审两轮：严重项（45s idle、256KiB 帧、>1MiB 控制结果）已修复并复审；无未修复严重项
+- [x] 独立渗透（本地实例）：认证 35/35、传输、注入、资源、泄露、依赖、配置均通过；
+      无未修复高危；低危 L1/L2 即既有 KI-19/KI-21，不阻塞 v0.3.2
+
 ## v0.3.1 硬化明细
 
 已完成（对应 GitHub #10 / #12 / #13 / #14、KI-17，#9/#11 复验）：
@@ -150,9 +174,10 @@
 - 面板修改采样间隔后 60s 内 agent 日志出现 `采样间隔已更新`，重连后继续上报；
 - series 多指标、自动分桶、32 天/点数上限与非法参数 400 均验证；
 - 证书轮换失败场景（CA 不配套、缺 ca.key、坏 ca.crt、空 SAN、缺 server.crt）均有 e2e 断言；
-- 测试：`cargo test --workspace` 420 通过；`cargo audit` 0 漏洞；
+- 测试：`cargo test --workspace` 447 通过；`cargo audit` 0 漏洞；
   `security.sh` 9/9、`cert-rotation.sh` 103/103、`panel.sh` 159/159、
-  `hardening.sh` 34/34、`v031.sh` 92/92、`control.sh` 99/99、web `pnpm test` 46/46。
+  `hardening.sh` 34/34、`v031.sh` 94/94、`control.sh` 100/100、`v032.sh` 66/66、
+  web `pnpm test` 48/48。
 
 ## 已知限制
 
@@ -183,6 +208,8 @@
     日志白名单文件的硬链接不会被 openat2 拦截（需日志目录写权限，KI-22）。
 12. 同 agent 多连接时，能力缓存以最新 Hello 为准；旧连接断开后可能短暂陈旧（KI-24，
     后续版本修复）。
+13. 升级 v0.3.2 时先升级 hub，再升级 agent。v0.3.1 hub 的 WebSocket 单帧上限仍是
+    256 KiB；新 agent 发送超过 256 KiB 的控制结果仍可能被旧 hub 拒绝并断开会话。
 
 ## 下一步建议
 

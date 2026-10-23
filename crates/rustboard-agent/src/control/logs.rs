@@ -174,6 +174,8 @@ fn tail_journal(
     }
     let tool = exec::resolve_tool(&cfg.journalctl_path, "journalctl")?;
     let lines_arg = max_lines.to_string();
+    // `--reverse` 让 journalctl 按新→旧输出；`exec::run` 的 `read_capped` 只保留
+    // 前 256 KiB，此时留下的正好是最新内容，而不是最旧内容。
     let output = exec::run(
         &tool,
         &[
@@ -182,6 +184,7 @@ fn tail_journal(
             "-n",
             lines_arg.as_str(),
             "--no-pager",
+            "--reverse",
             "-o",
             "short-iso",
         ],
@@ -191,8 +194,23 @@ fn tail_journal(
     exec::ensure_success(&output, "journalctl")?;
 
     let mut truncated = output.stdout_truncated;
-    let mut lines = Vec::new();
-    for raw in output.stdout.lines() {
+    // 注意不能用 `str::lines()`：判断末尾是否有换行关系到能否识别被截断的半行。
+    let ends_with_newline = output.stdout.ends_with('\n');
+    let mut raw_lines: Vec<&str> = output.stdout.split('\n').collect();
+    if raw_lines.last().is_some_and(|line| line.is_empty()) {
+        // 末尾换行产生的空段不是日志行。
+        raw_lines.pop();
+    }
+    if output.stdout_truncated && !ends_with_newline {
+        // 输出被 256 KiB 上限截断且末行不完整：--reverse 下它是已保留内容里最旧的
+        // 一条半行，必须丢弃，不能返回给客户端。
+        raw_lines.pop();
+    }
+    // 反转回旧→新，后续 max_lines / cap_output 才能继续丢最旧行。
+    raw_lines.reverse();
+
+    let mut lines = Vec::with_capacity(raw_lines.len());
+    for raw in raw_lines {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
         if line.is_empty() {
             continue;
@@ -210,6 +228,8 @@ fn tail_journal(
         source: source.id.clone(),
         lines,
         truncated,
+        // journal 为截断后保留的 stdout 字节数，不是 journalctl 原始总输出；
+        // 文件日志仍是文件总字节数。
         size_bytes: output.stdout.len() as u64,
     })
 }
@@ -467,6 +487,14 @@ mod tests {
         }
     }
 
+    /// 解析 fake journal 行序号：`line-<序号> ...`。
+    fn journal_line_number(line: &str) -> u64 {
+        line.strip_prefix("line-")
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|number| number.parse().ok())
+            .unwrap_or_else(|| panic!("无法解析 fake journal 行: {line}"))
+    }
+
     #[test]
     fn validate_io_accepts_existing_plain_file() {
         let dir = temp_dir("io-ok");
@@ -710,11 +738,12 @@ mod tests {
         let _guard = exec::test_serial_guard();
         let dir = temp_dir("journal");
         let args_file = dir.join("args.txt");
+        // `--reverse` 后 journalctl 的输出是新→旧：two 在 one 之前。
         let script = write_script(
             &dir,
             "journalctl",
             &format!(
-                "printf '%s\\n' \"$@\" > {}\nprintf '2026-10-22T10:00:00+00:00 host app: one\\n2026-10-22T10:00:01+00:00 host app: two\\n'",
+                "printf '%s\\n' \"$@\" > {}\nprintf '2026-10-22T10:00:01+00:00 host app: two\\n2026-10-22T10:00:00+00:00 host app: one\\n'",
                 args_file.display()
             ),
         );
@@ -727,16 +756,22 @@ mod tests {
                 source,
                 lines,
                 truncated,
-                ..
+                size_bytes,
             } => {
                 assert_eq!(source, "j");
                 assert_eq!(lines.len(), 2);
-                assert!(lines[0].contains("one"));
-                assert!(!truncated);
+                assert!(lines[0].contains("one"), "旧行必须在前: {lines:?}");
+                assert!(lines[1].contains("two"), "最新行必须最后: {lines:?}");
+                assert!(!truncated, "小于 256 KiB 且未超行数不应标记截断");
+                assert_eq!(size_bytes, 80, "size_bytes 应为实际保留的 stdout 字节数");
             }
             other => panic!("意外结果: {other:?}"),
         }
         let args = std::fs::read_to_string(&args_file).unwrap();
+        assert!(
+            args.lines().any(|arg| arg == "--reverse"),
+            "journalctl 必须使用 --reverse 让输出变为新→旧: {args}"
+        );
         assert_eq!(
             args.lines().collect::<Vec<_>>(),
             [
@@ -745,10 +780,196 @@ mod tests {
                 "-n",
                 "5",
                 "--no-pager",
+                "--reverse",
                 "-o",
                 "short-iso"
             ]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #19 核心回归：journalctl 输出远超 256 KiB 时必须保留最新内容并恢复旧→新顺序。
+    #[test]
+    fn journal_tail_keeps_newest_lines_when_output_is_truncated() {
+        let _guard = exec::test_serial_guard();
+        let dir = temp_dir("journal-big");
+        // 新→旧输出 line-1000…line-1，每行约 1 KiB，总量约 1 MiB；read_capped
+        // 只保留前 256 KiB，即最新的一批行。
+        let script = write_script(
+            &dir,
+            "journalctl",
+            r#"awk 'BEGIN {
+    pad = sprintf("%1023s", "");
+    gsub(/ /, "x", pad);
+    for (i = 1000; i >= 1; i--) {
+        printf "line-%d %s\n", i, pad;
+    }
+}'"#,
+        );
+        let mut cfg = cfg_with(vec![journal_source("j", "nginx.service")]);
+        cfg.systemd_units = vec!["nginx*".into()];
+        cfg.journalctl_path = script.to_str().unwrap().to_string();
+
+        match tail(&cfg, &cfg.log_sources[0], MAX_LOG_LINES).unwrap() {
+            ControlResult::LogLines {
+                lines,
+                truncated,
+                size_bytes,
+                ..
+            } => {
+                assert!(truncated, "丢弃较旧内容必须标记 truncated");
+                assert!(!lines.is_empty());
+                assert!(lines.len() < 1000, "超过 256 KiB 必须丢弃较旧行");
+                let pad = "x".repeat(1023);
+                assert!(
+                    lines.iter().all(|line| line.ends_with(&pad)),
+                    "不能返回被截断的半行"
+                );
+                let numbers: Vec<u64> =
+                    lines.iter().map(|line| journal_line_number(line)).collect();
+                assert_eq!(
+                    *numbers.last().unwrap(),
+                    1000,
+                    "最新一行 line-1000 必须保留"
+                );
+                assert!(*numbers.first().unwrap() < 1000, "必须丢弃最旧的部分行");
+                assert!(
+                    numbers.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                    "返回顺序必须是旧→新且连续: {numbers:?}"
+                );
+                let total: usize = lines.iter().map(|line| line.len() + 1).sum();
+                assert!(total <= MAX_OUTPUT_BYTES, "输出总量超限: {total}");
+                assert_eq!(
+                    size_bytes, MAX_OUTPUT_BYTES as u64,
+                    "size_bytes 是截断后保留的 stdout 字节数"
+                );
+            }
+            other => panic!("意外结果: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 输出恰好在行中间被 256 KiB 上限截断：丢弃末尾半行，保留最新完整行。
+    #[test]
+    fn journal_tail_drops_partial_line_at_output_cap() {
+        let _guard = exec::test_serial_guard();
+        let dir = temp_dir("journal-partial");
+        // 每行恰好 1000 字节（含换行），共 300 行；上限 262144 落在第 263 行中间，
+        // 该行是已保留内容里最旧的一条，必须整行丢弃。
+        let script = write_script(
+            &dir,
+            "journalctl",
+            r#"awk 'BEGIN {
+    pad = sprintf("%990s", "");
+    gsub(/ /, "x", pad);
+    for (i = 300; i >= 1; i--) {
+        printf "line-%03d %s\n", i, pad;
+    }
+}'"#,
+        );
+        let mut cfg = cfg_with(vec![journal_source("j", "nginx.service")]);
+        cfg.systemd_units = vec!["nginx*".into()];
+        cfg.journalctl_path = script.to_str().unwrap().to_string();
+
+        match tail(&cfg, &cfg.log_sources[0], MAX_LOG_LINES).unwrap() {
+            ControlResult::LogLines {
+                lines,
+                truncated,
+                size_bytes,
+                ..
+            } => {
+                assert!(truncated);
+                assert_eq!(lines.len(), 262, "半行必须丢弃，其余完整行保留");
+                assert!(lines.iter().all(|line| line.len() == 999), "不能返回半行");
+                assert_eq!(journal_line_number(&lines[0]), 39, "最旧的完整行应保留");
+                assert_eq!(
+                    journal_line_number(lines.last().unwrap()),
+                    300,
+                    "最新一行必须保留"
+                );
+                let numbers: Vec<u64> =
+                    lines.iter().map(|line| journal_line_number(line)).collect();
+                assert!(
+                    numbers.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                    "返回顺序必须是旧→新且连续: {numbers:?}"
+                );
+                assert_eq!(size_bytes, MAX_OUTPUT_BYTES as u64);
+            }
+            other => panic!("意外结果: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journal_tail_drops_oldest_lines_beyond_max_lines() {
+        let _guard = exec::test_serial_guard();
+        let dir = temp_dir("journal-max-lines");
+        let script = write_script(&dir, "journalctl", "printf 'line-3\\nline-2\\nline-1\\n'");
+        let mut cfg = cfg_with(vec![journal_source("j", "nginx.service")]);
+        cfg.systemd_units = vec!["nginx*".into()];
+        cfg.journalctl_path = script.to_str().unwrap().to_string();
+
+        match tail(&cfg, &cfg.log_sources[0], 2).unwrap() {
+            ControlResult::LogLines {
+                lines, truncated, ..
+            } => {
+                assert_eq!(lines, ["line-2", "line-3"], "只保留最新 2 行且旧→新");
+                assert!(truncated, "丢弃最旧行必须标记 truncated");
+            }
+            other => panic!("意外结果: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 多字节 UTF-8、CRLF、空行过滤与单行 4096 字节上限在反转后仍按旧→新处理。
+    #[test]
+    fn journal_tail_handles_utf8_crlf_empty_and_long_lines() {
+        let _guard = exec::test_serial_guard();
+        let dir = temp_dir("journal-edge");
+        // 新→旧：line-new（最新）、空行、6000 字节汉字的超长行、CRLF 行、line-old。
+        let script = write_script(
+            &dir,
+            "journalctl",
+            r#"long=$(yes '汉' | head -n 2000 | tr -d '\n')
+printf 'line-new 最新消息\n\nline-long %s\r\nline-crlf 旧日志\r\nline-old 最旧日志\n' "$long""#,
+        );
+        let mut cfg = cfg_with(vec![journal_source("j", "nginx.service")]);
+        cfg.systemd_units = vec!["nginx*".into()];
+        cfg.journalctl_path = script.to_str().unwrap().to_string();
+
+        match tail(&cfg, &cfg.log_sources[0], 10).unwrap() {
+            ControlResult::LogLines {
+                lines,
+                truncated,
+                size_bytes,
+                ..
+            } => {
+                assert_eq!(lines.len(), 4, "空行必须被过滤: {lines:?}");
+                assert_eq!(lines[0], "line-old 最旧日志");
+                assert_eq!(lines[1], "line-crlf 旧日志", "CRLF 必须去掉 \\r");
+                assert!(
+                    lines[2].starts_with("line-long "),
+                    "超长行必须保留开头: {}",
+                    &lines[2][..lines[2].len().min(32)]
+                );
+                assert_eq!(
+                    lines[2].len(),
+                    MAX_LOG_LINE_BYTES,
+                    "单行超过 4096 字节必须按字节上限截断"
+                );
+                assert!(
+                    lines[2].ends_with('汉'),
+                    "截断必须落在 UTF-8 字符边界，不能产生乱码"
+                );
+                assert_eq!(lines[3], "line-new 最新消息", "最新行必须在最后");
+                assert!(truncated, "单行截断必须标记 truncated");
+                assert!(
+                    size_bytes < MAX_OUTPUT_BYTES as u64,
+                    "本次 stdout 未达 256 KiB"
+                );
+            }
+            other => panic!("意外结果: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::task::{Context as TaskContext, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use axum::body::Body;
@@ -61,8 +61,13 @@ use session::{SessionRegistry, ShutdownReason};
 /// WebSocket 单条消息上限。agent 的正常批次只有几 KB，1 MiB 足够宽裕；
 /// 不设上限时 tungstenite 默认允许 64 MiB，未认证连接可用分片消息打爆内存。
 const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
-/// 单帧上限，防止一个巨大分片占满内存。
-const MAX_WS_FRAME_SIZE: usize = 256 * 1024;
+/// 单帧上限与消息上限一致，避免合法的大控制结果被额外卡住。
+///
+/// agent 的 `MAX_OUTPUT_BYTES` 允许单次控制输出接近 256 KiB，MessagePack 编码后的
+/// `ControlResponse` 单帧会略超 256 KiB；若单帧上限更小，tungstenite 会以
+/// `Space limit exceeded` 拒绝该帧并关闭整个 agent 会话（控制动作已执行却丢结果）。
+/// 内存边界不变：即使拆成多个分片，整条消息仍受 1 MiB `max_message_size` 约束。
+const MAX_WS_FRAME_SIZE: usize = MAX_WS_MESSAGE_SIZE;
 
 const HUB_SELF_AGENT_ID: &str = "hub-self";
 /// 会话身份与帧内身份不一致。
@@ -2424,9 +2429,18 @@ async fn handle_session(
     );
     // M3：控制命令的 pending 表属于本会话。声明顺序保证会话结束时先 Drop
     // `ControlSession`（给所有等待者回 agent_offline），再注销注册表。
-    let mut control = ControlSession::new(state.cfg.control.max_pending_per_session);
+    // #18：每条 pending 带上本地 deadline；会话每秒清理一次，避免管理 API 超时后
+    // 残留项永久占用 max_pending 名额。
+    let mut control = ControlSession::new(
+        state.cfg.control.max_pending_per_session,
+        Duration::from_millis(state.cfg.control.request_timeout_ms.max(1)),
+    );
     let mut control_rx = handle.control_rx;
     let mut watch_control = true;
+    // 首轮 tick 立即触发（此时 pending 必为空），随后每秒一次；错过的 tick 直接跳过，
+    // 不让慢连接积压出连续清理。
+    let mut control_expire = tokio::time::interval(Duration::from_secs(1));
+    control_expire.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     state.storage.upsert_agent(&record)?;
     // M3：登记 agent 实际启用的控制能力。未知能力在入库前就被忽略，
@@ -2463,10 +2477,16 @@ async fn handle_session(
     let mut watch_shutdown = true;
     // 每个会话最多成功续签一次，状态跟随会话生命周期。
     let mut renew = RenewState::default();
+    // 绝对空闲 deadline：每秒的控制清理 tick 不会重置它，只有入站帧才续期。
+    let mut idle = SessionIdle::new(SESSION_IDLE_TIMEOUT);
 
     loop {
         // 45s 内收不到任何帧就认为连接已死；agent 每 15s 发一次 Ping。
-        let recv = tokio::time::timeout(SESSION_IDLE_TIMEOUT, socket.recv());
+        // 空闲超时是独立 select 分支：即使 recv / 控制队列 / 清理 tick 持续就绪，
+        // biased 也会在 deadline 时优先关闭连接，不会被其它分支饿死。
+        let recv = socket.recv();
+        let idle_sleep = tokio::time::sleep_until(idle.deadline());
+        tokio::pin!(idle_sleep);
         let event = tokio::select! {
             biased;
             changed = shutdown.changed(), if watch_shutdown => {
@@ -2476,15 +2496,18 @@ async fn handle_session(
                     Err(_) => SessionEvent::WatchClosed,
                 }
             }
+            _ = &mut idle_sleep => SessionEvent::IdleTimeout,
+            // 清理优先于新控制命令：持续就绪的控制队列不能把 pending 超时清理
+            // 推迟到方案承诺的 ≤2s 之外。shutdown 仍保持最高优先级。
+            _ = control_expire.tick() => SessionEvent::ControlExpired,
             command = control_rx.recv(), if watch_control => match command {
                 Some(command) => SessionEvent::Control(command),
                 None => SessionEvent::ControlClosed,
             },
             received = recv => match received {
-                Err(_) => SessionEvent::IdleTimeout,
-                Ok(None) => SessionEvent::Closed,
-                Ok(Some(Err(err))) => SessionEvent::RecvError(err.to_string()),
-                Ok(Some(Ok(message))) => SessionEvent::Message(message),
+                None => SessionEvent::Closed,
+                Some(Err(err)) => SessionEvent::RecvError(err.to_string()),
+                Some(Ok(message)) => SessionEvent::Message(message),
             },
         };
 
@@ -2533,6 +2556,13 @@ async fn handle_session(
                 tracing::debug!(agent = %agent_id, "控制命令通道已关闭，停止接收控制请求");
                 watch_control = false;
             }
+            SessionEvent::ControlExpired => {
+                // 只遍历内存 pending 并回 oneshot，不做 I/O，不阻塞采集 / ACK。
+                let expired = control.expire(Instant::now());
+                if expired > 0 {
+                    tracing::debug!(agent = %agent_id, expired, "清理超时的控制请求");
+                }
+            }
             SessionEvent::Message(message) => {
                 match handle_message(
                     &mut socket,
@@ -2544,7 +2574,12 @@ async fn handle_session(
                 )
                 .await?
                 {
-                    MessageAction::Continue => {}
+                    MessageAction::Continue => {
+                        // 只有完整处理完一帧才续期：慢批次入库 / 证书签发等
+                        // 处理耗时不能被计入下一个空闲窗口，否则处理完立即被误杀。
+                        // 控制命令 / 清理 tick / shutdown 都不算心跳，不续期。
+                        idle.on_frame();
+                    }
                     MessageAction::Close => break,
                 }
             }
@@ -2594,6 +2629,8 @@ enum SessionEvent {
     Control(ControlCommand),
     /// 控制命令通道关闭（注册表已无发送端），后续不再轮询。
     ControlClosed,
+    /// 每秒一次：清理已超过 request_timeout 的 pending。
+    ControlExpired,
     Closed,
     RecvError(String),
     IdleTimeout,
@@ -2604,6 +2641,37 @@ enum SessionEvent {
 enum MessageAction {
     Continue,
     Close,
+}
+
+/// 会话空闲超时的绝对 deadline。
+///
+/// `select!` 每轮都会丢弃未完成的 recv future；如果每轮都用
+/// `timeout(SESSION_IDLE_TIMEOUT, recv)` 重新计时，每秒完成一次的
+/// `control_expire` tick 会把 45s 空闲窗口无限推后，静默连接（TCP 未断、
+/// 不再发帧）将永远不触发空闲超时。这里保存绝对时间点，只有收到 agent
+/// 入站帧才顺延；控制命令、清理 tick、shutdown 都不得调用 [`Self::on_frame`]。
+struct SessionIdle {
+    timeout: Duration,
+    expires_at: tokio::time::Instant,
+}
+
+impl SessionIdle {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            expires_at: tokio::time::Instant::now() + timeout,
+        }
+    }
+
+    /// 当前这一轮 `recv` 的绝对截止时间。
+    fn deadline(&self) -> tokio::time::Instant {
+        self.expires_at
+    }
+
+    /// 收到 agent 入站帧后才顺延整个空闲窗口。
+    fn on_frame(&mut self) {
+        self.expires_at = tokio::time::Instant::now() + self.timeout;
+    }
 }
 
 /// 单个会话的客户端证书续签状态。
@@ -3276,6 +3344,99 @@ mod tests {
             .await
             .expect_err("永不完成的写必须超时");
         assert!(err.to_string().contains("超时"), "错误信息: {err}");
+    }
+
+    /// 评审回归：每秒的控制清理 tick 不得重置 45s 空闲 deadline；
+    /// 只有收到入站帧（`on_frame`）才顺延。用 tokio 虚拟时间，避免 CI 抖动。
+    #[tokio::test(start_paused = true)]
+    async fn v032_session_idle_deadline_survives_control_ticks() {
+        let start = tokio::time::Instant::now();
+        let mut idle = SessionIdle::new(SESSION_IDLE_TIMEOUT);
+        assert_eq!(idle.deadline(), start + SESSION_IDLE_TIMEOUT);
+
+        // 模拟 44 次每秒 tick：tick 不续期，deadline 必须保持首次建立时的值。
+        for _ in 0..44 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            idle.deadline(),
+            start + SESSION_IDLE_TIMEOUT,
+            "control_expire tick 不得重置空闲 deadline"
+        );
+        assert!(tokio::time::Instant::now() < idle.deadline());
+
+        // 第 45 秒到期。
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(tokio::time::Instant::now() >= idle.deadline());
+
+        // 收到入站帧后才顺延整个 45s 窗口。
+        idle.on_frame();
+        assert_eq!(
+            idle.deadline(),
+            tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT
+        );
+        tokio::time::sleep(Duration::from_secs(44)).await;
+        assert!(tokio::time::Instant::now() < idle.deadline());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(tokio::time::Instant::now() >= idle.deadline());
+    }
+
+    /// 评审回归：控制命令队列持续就绪时，独立 idle 分支仍必须先触发关闭。
+    /// 用暂停时钟 + 始终就绪的控制 future 复现「biased 若把 idle 排后就被饿死」。
+    #[tokio::test(start_paused = true)]
+    async fn v032_idle_timeout_fires_despite_control_ticks() {
+        let idle = SessionIdle::new(SESSION_IDLE_TIMEOUT);
+        let idle_sleep = tokio::time::sleep_until(idle.deadline());
+        tokio::pin!(idle_sleep);
+        let mut ticks = tokio::time::interval(Duration::from_secs(1));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut idle_fired = false;
+        for _ in 0..200 {
+            tokio::select! {
+                biased;
+                _ = &mut idle_sleep => {
+                    idle_fired = true;
+                    break;
+                }
+                _ = ticks.tick() => {}
+                // 控制队列始终有命令；没有 timer 可以推进时手动拨动暂停时钟。
+                command = std::future::ready(Some(())) => {
+                    let _ = command;
+                    tokio::time::advance(Duration::from_secs(1)).await;
+                }
+            }
+        }
+        assert!(idle_fired, "控制队列持续就绪时 idle 仍必须先触发关闭");
+        // 虚拟时钟必须恰好停在 45s deadline：tick / 控制命令都没有把它推后。
+        assert_eq!(
+            tokio::time::Instant::now(),
+            idle.deadline(),
+            "空闲超时必须恰好在 deadline 触发"
+        );
+    }
+
+    /// 评审回归：续期必须发生在整帧处理完成之后；处理耗时不得挤占下一个
+    /// 45s 空闲窗口（helper 级断言，不必真等 45s）。
+    #[tokio::test(start_paused = true)]
+    async fn v032_session_idle_renews_after_slow_processing() {
+        let frame_at = tokio::time::Instant::now();
+        let mut idle = SessionIdle::new(SESSION_IDLE_TIMEOUT);
+
+        // 模拟一帧处理了 50s 才完成，已超过原 deadline。
+        tokio::time::sleep(Duration::from_secs(50)).await;
+        assert!(tokio::time::Instant::now() >= idle.deadline());
+
+        // 若按“帧到达时续期”，这里已经过期；必须处理完再续期，拿到完整 45s。
+        idle.on_frame();
+        assert_eq!(
+            idle.deadline(),
+            tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT
+        );
+        assert!(
+            idle.deadline() > frame_at + SESSION_IDLE_TIMEOUT,
+            "处理耗时不得挤占续期后的空闲窗口"
+        );
     }
 
     /// H2：连接数达到上限后不再发放许可，释放一条后恢复。
@@ -5754,6 +5915,62 @@ mod tests {
                 |entry| !entry.error_message.contains(SECRET) && !entry.params.contains(SECRET)
             ),
             "审计不得写入 agent 错误详情"
+        );
+    }
+
+    /// #19 e2e 回归：agent 允许约 256 KiB 的日志结果，MessagePack 编码后的
+    /// `ControlResponse` 单帧会略超旧的 256 KiB 单帧上限；单帧上限必须与消息
+    /// 上限一致，否则合法结果被 tungstenite 拒绝并连带关闭 agent 会话。
+    #[test]
+    fn v032_control_result_frame_fits_within_ws_frame_limit() {
+        use rustboard_common::control::ControlResponse;
+
+        // 2000 行 × 130B = 260,000B，低于 MAX_OUTPUT_BYTES(262144)；
+        // 加上每行换行与编码开销后刚好越过旧的 256 KiB 单帧上限。
+        let lines: Vec<String> = (0..2000).map(|_| "x".repeat(130)).collect();
+        let result = ControlResult::LogLines {
+            source: "journal".into(),
+            lines,
+            truncated: true,
+            size_bytes: 260_000,
+        };
+        let encoded = Frame::ControlResponse(ControlResponse::success(1, result))
+            .encode()
+            .expect("控制结果必须可编码");
+
+        assert!(
+            encoded.len() > 256 * 1024,
+            "编码后 {} 字节必须超过旧的 256 KiB 单帧上限，否则测试无法复现缺陷",
+            encoded.len()
+        );
+        assert!(
+            encoded.len() <= MAX_WS_MESSAGE_SIZE,
+            "编码后 {} 字节必须落在消息上限内",
+            encoded.len()
+        );
+        assert!(
+            encoded.len() <= MAX_WS_FRAME_SIZE,
+            "编码后 {} 字节必须落在单帧上限内",
+            encoded.len()
+        );
+        assert_eq!(
+            MAX_WS_FRAME_SIZE, MAX_WS_MESSAGE_SIZE,
+            "单帧上限不得小于合法消息上限"
+        );
+    }
+
+    /// 评审严重回归：hub 的 WS 单帧 / 单消息上限必须大于 agent 的控制应答预算，
+    /// 避免未来常量漂移后合法应答在 hub 侧被拒绝并断开会话。
+    #[test]
+    fn v032_ws_message_limit_covers_control_response_budget() {
+        let budget = rustboard_common::control::MAX_CONTROL_RESPONSE_BYTES;
+        assert!(
+            MAX_WS_MESSAGE_SIZE > budget,
+            "WS 消息上限 {MAX_WS_MESSAGE_SIZE} 必须大于控制应答预算 {budget}"
+        );
+        assert!(
+            MAX_WS_FRAME_SIZE > budget,
+            "WS 单帧上限 {MAX_WS_FRAME_SIZE} 必须大于控制应答预算 {budget}"
         );
     }
 
