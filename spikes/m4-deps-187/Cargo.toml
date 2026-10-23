@@ -1,0 +1,37 @@
+[package]
+name = "m4-deps-spike-187"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT"
+publish = false
+description = "M4 冷归档依赖 spike（Rust 1.87 复验 ctutils 修复），不进入根 workspace"
+
+# 独立 spike 工程：空的 [workspace] 阻止 Cargo 向上寻找根 workspace。
+[workspace]
+# Cargo 1.84+ 的 MSRV-aware resolver：按 rust-version = 1.87 选择兼容的传递依赖。
+resolver = "3"
+
+[dependencies]
+anyhow = "1"
+async-trait = "=0.1.92"
+# 冷归档压缩：纯 Rust miniz_oxide 后端，禁止 C zlib（不引入 cc/cmake）。
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
+# 与仓库现有 sha2 0.10.9 配对（digest 0.10）。
+hmac = "=0.12.1"
+# object_store 0.14.2：
+# - 不建议直接用 `aws` feature：它会硬启用 aws-lc-rs（进而 aws-lc-sys + cmake）；
+# - 改用 `aws-base` + `reqwest` + `ring` 细粒度组合，由 ring 提供签名/CRC 加密后端；
+# - quick-xml 由 0.14.2 固定为 ^0.41.0，满足 RustSec 修复版本。
+object_store = { version = "=0.14.2", default-features = false, features = ["aws-base", "reqwest", "ring"] }
+# 仅启用 rustls（不选 provider），运行时安装 ring provider；避免 reqwest 0.13 的
+# `rustls` feature 默认拉 aws-lc-rs。
+reqwest = { version = "=0.13.3", default-features = false, features = ["rustls-no-provider", "http2", "stream"] }
+# 纯 Rust SSH：显式关闭默认 aws-lc-rs，改用 ring；不启用 rsa（避免 rsa 的 Marvin 中危）。
+russh = { version = "=0.60.3", default-features = false, features = ["ring"] }
+# russh-sftp 3.0.1 只对 AsyncRead/AsyncWrite 泛型，不直接依赖 russh。
+russh-sftp = "=3.0.1"
+# 给 reqwest 的 rustls-no-provider 安装 ring provider。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sha2 = "=0.10.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "net"] }
