@@ -2136,15 +2136,14 @@ async fn archive_object_download(
         ));
     }
 
-    // 单并发：get 必须整对象读入内存，峰值由 64 MiB 上限 + 1 个许可共同约束。
-    // `acquire_owned` 的等待 future 取消安全：请求被取消时不会拿走许可。
-    // 许可随后移入响应 body：body 未读完 / 未 drop 时，下一个下载继续等待。
+    // 单并发且不排队：get 必须整对象读入内存，峰值由 64 MiB 上限 + 1 个许可
+    // 共同约束。`try_acquire_owned` 不创建等待队列，忙时立即 429，避免单个
+    // 客户端用多条连接排队占满 permit、饿死其他客户端；许可随后移入响应 body。
     let download_permit = state
         .archive_download_slots
         .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| archive_unavailable())?;
+        .try_acquire_owned()
+        .map_err(|_| archive_busy())?;
 
     let store = archive::build_store(&state.cfg.archive).map_err(|_| archive_unavailable())?;
     archive_download_response(
@@ -2155,6 +2154,11 @@ async fn archive_object_download(
         state.archive_download_send_timeout,
     )
     .await
+}
+
+/// 固定 429：已有归档下载占用唯一许可；不排队，立即让客户端重试。
+fn archive_busy() -> ApiError {
+    ApiError::busy("archive_busy", "归档下载正忙，请稍后重试")
 }
 
 /// 固定 502：下载后端不可用；不携带后端细节。
@@ -2280,6 +2284,16 @@ struct ArchiveDownloadBody {
     deadline: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// 释放下载资源：**顺序固定先 data 后 permit**。
+///
+/// 若先归还 permit，下一请求可能在旧 64 MiB `Bytes` 真正释放前获得许可，
+/// 使内存峰值变成 2×64 MiB。定时任务与 body drop 都必须走这里。
+fn release_archive_download_resources(data: Option<Bytes>, permit: Option<OwnedSemaphorePermit>) {
+    // 顺序不能交换：data 的析构必须在 permit 归还之前完成。
+    drop(data);
+    drop(permit);
+}
+
 impl ArchiveDownloadBody {
     fn new(data: Bytes, permit: OwnedSemaphorePermit, timeout: Duration) -> Self {
         let state = Arc::new(StdMutex::new(DownloadBodyState {
@@ -2301,9 +2315,8 @@ impl ArchiveDownloadBody {
                 state.expired = true;
                 (state.data.take(), state.permit.take())
             };
-            // 先释放 64 MiB 数据，再归还 permit；下一个下载才能开始。
-            drop(data);
-            drop(permit);
+            // 与 body drop 使用同一释放顺序：先 64 MiB 数据，再 permit。
+            release_archive_download_resources(data, permit);
             tracing::warn!(
                 timeout_ms = timeout.as_millis() as u64,
                 "归档下载发送超时，已释放对象内存与下载许可"
@@ -2335,8 +2348,8 @@ impl Drop for ArchiveDownloadBody {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             (state.data.take(), state.permit.take())
         };
-        drop(permit);
-        drop(data);
+        // 与定时任务一致：先释放对象数据，再归还 permit。
+        release_archive_download_resources(data, permit);
     }
 }
 
@@ -3557,6 +3570,11 @@ enum ApiError {
         code: &'static str,
         message: String,
     },
+    /// 并发资源忙（例如归档下载已有请求）：429 + 固定错误码 + Retry-After。
+    Busy {
+        code: &'static str,
+        message: String,
+    },
     /// 查询结果超过存储层硬上限：这是客户端可调整的参数问题，不是服务端错误。
     QueryTooLarge,
 }
@@ -3600,6 +3618,13 @@ impl ApiError {
 
     fn too_large(code: &'static str, message: impl Into<String>) -> Self {
         Self::TooLarge {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn busy(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Busy {
             code,
             message: message.into(),
         }
@@ -3675,6 +3700,17 @@ impl IntoResponse for ApiError {
                 Json(serde_json::json!({ "error": code, "message": message })),
             )
                 .into_response(),
+            ApiError::Busy { code, message } => {
+                let mut response = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({ "error": code, "message": message })),
+                )
+                    .into_response();
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                response
+            }
             ApiError::QueryTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(serde_json::json!({ "error": "query_too_large" })),
@@ -10420,11 +10456,11 @@ mod tests {
         );
     }
 
-    /// M4-C4：下载单并发信号量；等待请求取消不会泄漏许可。
+    /// M4-C4：不排队；permit 被占用时立即 429，释放后恢复，错误路径不泄漏。
     #[tokio::test]
-    async fn m4c4_archive_download_semaphore_serializes_and_cancel_is_safe() {
+    async fn m4c4_archive_download_busy_returns_429_without_queueing() {
         let state = v6_auth_state();
-        let read = v6_seed_token(&state, "archive-dl-serial", "read");
+        let read = v6_seed_token(&state, "archive-dl-busy", "read");
         let object = archive_object_record(
             "rustboard/2026/10/24/part-00001.csv.gz",
             ArchiveStatus::Uploaded,
@@ -10441,59 +10477,28 @@ mod tests {
             .unwrap();
         assert_eq!(state.archive_download_slots.available_permits(), 0);
 
-        let read_for_task = read.clone();
-        let router_for_task = router.clone();
-        let uri_for_task = uri.clone();
-        let mut task = tokio::spawn(async move {
-            admin_call(
-                &router_for_task,
-                "GET",
-                &uri_for_task,
-                Some(&read_for_task),
-                None,
-            )
-            .await
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut task)
-                .await
-                .is_err(),
-            "持锁期间下载必须等待"
+        // 忙时立即 429，不进入等待队列。
+        let (status, headers, body) = admin_call(&router, "GET", &uri, Some(&read), None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            headers.get(header::RETRY_AFTER).unwrap(),
+            "1",
+            "429 必须带 Retry-After: 1"
         );
+        assert_eq!(json_body(&body)["error"], "archive_busy");
         assert_eq!(state.archive_download_slots.available_permits(), 0);
 
         drop(held);
-        let (status, _, body) = task.await.unwrap();
-        // 该测试没有配置后端：拿到许可后应返回固定 502。
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(json_body(&body)["error"], "archive_unavailable");
         assert_eq!(state.archive_download_slots.available_permits(), 1);
 
-        // 取消等待：请求 future 被 drop 时不能占走许可。
-        let held = state
-            .archive_download_slots
-            .clone()
-            .try_acquire_owned()
-            .unwrap();
-        let router_for_cancel = admin_router(state.clone());
-        let read_for_cancel = read.clone();
-        let uri_for_cancel = uri.clone();
-        let pending = admin_call(
-            &router_for_cancel,
-            "GET",
-            &uri_for_cancel,
-            Some(&read_for_cancel),
-            None,
-        );
-        assert!(tokio::time::timeout(Duration::from_millis(100), pending)
-            .await
-            .is_err());
-        assert_eq!(state.archive_download_slots.available_permits(), 0);
-        drop(held);
+        // 该测试没有配置后端：拿到许可后返回固定 502，且许可归还。
+        let (status, _, body) = admin_call(&router, "GET", &uri, Some(&read), None).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(json_body(&body)["error"], "archive_unavailable");
         assert_eq!(
             state.archive_download_slots.available_permits(),
             1,
-            "取消等待不得泄漏许可"
+            "错误路径不得泄漏许可"
         );
     }
 
@@ -10533,20 +10538,12 @@ mod tests {
             "body 未读时许可不得提前释放"
         );
 
-        // 第二个下载必须等待第一个 body 结束。
-        let second = {
-            let router = router.clone();
-            let read = read.clone();
-            let uri = uri.clone();
-            tokio::spawn(async move { admin_response(&router, "GET", &uri, &read).await })
-        };
-        let mut second = second;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut second)
-                .await
-                .is_err(),
-            "第一个 body 未读完时第二个下载必须等待"
-        );
+        // 第二个下载不排队：立即 429，不能持续占用唯一 permit。
+        let (status, headers, body) = admin_call(&router, "GET", &uri, Some(&read), None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(headers.get(header::RETRY_AFTER).unwrap(), "1");
+        assert_eq!(json_body(&body)["error"], "archive_busy");
+        assert_eq!(state.archive_download_slots.available_permits(), 0);
 
         // 慢读：只取一帧，许可仍由第一个 body 持有。
         let mut first_body = Box::pin(first.into_body());
@@ -10557,11 +10554,6 @@ mod tests {
             0,
             "部分读取期间许可不得释放"
         );
-
-        // 取消第二个等待请求：它不能占走 / 泄漏许可。
-        second.abort();
-        let _ = second.await;
-        assert_eq!(state.archive_download_slots.available_permits(), 0);
 
         // drop 第一个 body → 许可归还。
         drop(first_body);

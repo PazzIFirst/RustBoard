@@ -48,6 +48,9 @@
   URL / 凭据 / 路径 / 超长内容统一显示 `archive_error`
 - 归档下载 body 增加 120s 发送期限：客户端不读 body 时由后台任务释放 64 MiB
   数据与下载许可，避免唯一 permit 永久阻塞；body drop 自动取消定时任务
+- 归档下载改为非排队：忙时立即 429 `archive_busy` + `Retry-After: 1`，避免单
+  客户端多连接排队饿死其他人；body 释放顺序固定先数据后许可，避免旧对象释放前
+  新请求获准造成 2×64 MiB 峰值
 
 ### Security
 

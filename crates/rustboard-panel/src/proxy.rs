@@ -261,10 +261,23 @@ impl ProxyClient {
         // 非 2xx 走既有 JSON 透传（含 401 日志与固定 body），不启动下载流。
         // 读错误响应失败同样只保留固定文案，避免日志出现后端 URL。
         if !status.is_success() {
-            return collect_reply(response)
+            // 429 archive_busy 的 Retry-After 属于“原样透传”的一部分；
+            // 只接受合法 header 值，非法值直接丢弃。
+            let retry_after = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let reply = collect_reply(response)
                 .await
-                .map(hub_reply_to_response_verbatim)
-                .map_err(|_| ProxyError::Body("归档下载错误响应读取失败".to_string()));
+                .map_err(|_| ProxyError::Body("归档下载错误响应读取失败".to_string()))?;
+            let mut out = hub_reply_to_response_verbatim(reply);
+            if let Some(value) = retry_after {
+                if let Ok(value) = HeaderValue::from_str(&value) {
+                    out.headers_mut().insert(header::RETRY_AFTER, value);
+                }
+            }
+            return Ok(out);
         }
 
         if response

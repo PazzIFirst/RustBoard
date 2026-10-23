@@ -3548,6 +3548,10 @@ mod tests {
                 502,
                 r#"{"error":"archive_unavailable","message":"归档对象下载失败"}"#,
             ),
+            (
+                429,
+                r#"{"error":"archive_busy","message":"归档下载正忙，请稍后重试"}"#,
+            ),
         ] {
             let (hub_url, _seen) = spawn_mock_hub(hub_status, hub_body);
             let state = test_state_with_hub(&hub_url);
@@ -3569,6 +3573,41 @@ mod tests {
             );
             assert!(!String::from_utf8_lossy(&body).contains(TEST_HUB_TOKEN));
         }
+    }
+
+    /// M4-C4：hub 429 archive_busy 的状态 / body / Retry-After 原样透传。
+    #[tokio::test]
+    async fn archive_download_preserves_busy_retry_after() {
+        let hub_body = r#"{"error":"archive_busy","message":"归档下载正忙，请稍后重试"}"#;
+        let hub_headers = format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 1\r\n",
+            hub_body.len()
+        );
+        let (hub_url, _seen) = spawn_raw_mock_hub(429, &hub_headers, hub_body.as_bytes().to_vec());
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+
+        let (status, headers, body) = call(
+            &state,
+            Method::GET,
+            "/api/archive/objects/42/download",
+            &[("cookie", &cookie)],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(&body[..], hub_body.as_bytes());
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            headers.get(header::RETRY_AFTER).unwrap(),
+            "1",
+            "429 的 Retry-After 必须透传"
+        );
+        assert!(!String::from_utf8_lossy(&body).contains(TEST_HUB_TOKEN));
     }
 
     #[tokio::test]
