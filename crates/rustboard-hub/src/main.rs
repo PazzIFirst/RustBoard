@@ -35,8 +35,7 @@ use rustboard_common::config::HubConfig;
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 use rustboard_common::tls;
 use rustboard_common::util::{
-    arch, boot_id, constant_time_eq, hostname, now_ms, os_pretty_name, pick_free_port_excluding,
-    port_of,
+    arch, boot_id, hostname, now_ms, os_pretty_name, pick_free_port_excluding, port_of,
 };
 use rustboard_common::wire::{codes, EnrollRequest, Frame, Welcome};
 use rustboard_common::{DEFAULT_HUB_CONFIG, PROTOCOL_VERSION, VERSION};
@@ -50,9 +49,11 @@ use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 
+mod auth;
 mod cert_rotation;
 mod control;
 mod session;
+use auth::TokenScope;
 use cert_rotation::CertStatus;
 use control::{ControlCommand, ControlSession};
 use session::{SessionRegistry, ShutdownReason};
@@ -227,6 +228,11 @@ enum Cmd {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// 管理 API scoped token 管理（create / list / rotate / revoke）。
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
     /// 纳管相关的运维命令。
     Agent {
         #[command(subcommand)]
@@ -256,6 +262,40 @@ enum AgentAction {
         config: Option<PathBuf>,
         #[arg(long)]
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenAction {
+    /// 新建 scoped token，只输出一次明文。
+    Create {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// token 名称（1–64 字符，仅 `[A-Za-z0-9._-]`），也是审计 actor。
+        #[arg(long)]
+        name: String,
+        /// 权限：read（只读）| write（只读 + 控制/设置）| admin（全部）。
+        #[arg(long, value_parser = ["read", "write", "admin"])]
+        scope: String,
+    },
+    /// 列出 token 元信息（TSV，不含明文 / 哈希）。
+    List {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// 轮换 token：生成新明文、清吊销状态，旧 token 立即失效。
+    Rotate {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        name: String,
+    },
+    /// 吊销 token（不删行）。
+    Revoke {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        name: String,
     },
 }
 
@@ -324,6 +364,7 @@ fn main() -> Result<()> {
             days,
         } => rotate_cert(config, force, days),
         Cmd::AdminToken { config } => admin_token(config),
+        Cmd::Token { action } => token_command(action),
         Cmd::Agent { action } => match action {
             AgentAction::Add {
                 config,
@@ -441,6 +482,102 @@ fn admin_token(config: Option<PathBuf>) -> Result<()> {
     }
     println!("{}", cfg.admin_token);
     Ok(())
+}
+
+/// `token` 子命令入口：只有这里负责打印，业务函数返回可测试的字符串。
+///
+/// `create` / `rotate` 的明文只经 stdout 输出一次，绝不写日志 / 配置 / 数据库明文。
+fn token_command(action: TokenAction) -> Result<()> {
+    match action {
+        TokenAction::Create {
+            config,
+            name,
+            scope,
+        } => println!("{}", token_create(config, name, scope)?),
+        TokenAction::List { config } => print!("{}", token_list(config)?),
+        TokenAction::Rotate { config, name } => println!("{}", token_rotate(config, name)?),
+        TokenAction::Revoke { config, name } => println!("{}", token_revoke(config, name)?),
+    }
+    Ok(())
+}
+
+/// token 名称规范：1–64 个字符，仅 `[A-Za-z0-9._-]`。
+///
+/// 名称会进入审计 actor 与 TSV 列表，限制字符集可避免换行 / 制表符注入。
+fn validate_token_name(name: &str) -> Result<()> {
+    let len = name.chars().count();
+    if !(1..=64).contains(&len) {
+        bail!("token 名称必须为 1–64 个字符，实际 {len} 个");
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("token 名称只能包含 A-Z a-z 0-9 . _ -");
+    }
+    Ok(())
+}
+
+/// 打开配置文件指向的 SQLite（CLI 与运行中的 hub 通过 WAL 并发）。
+fn open_token_storage(config: Option<PathBuf>) -> Result<SqliteStorage> {
+    let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
+    let cfg = load_config(&path)?;
+    SqliteStorage::open(&cfg.sqlite_path()?)
+}
+
+/// 把 `--scope` 解析成枚举，非法值给出可读错误。
+fn parse_token_scope(scope: &str) -> Result<TokenScope> {
+    TokenScope::parse(scope)
+        .ok_or_else(|| anyhow::anyhow!("scope 必须是 read / write / admin，实际: {scope}"))
+}
+
+/// 新建 token：返回 64 位 hex 明文（调用方负责只打印一次）。
+fn token_create(config: Option<PathBuf>, name: String, scope: String) -> Result<String> {
+    validate_token_name(&name)?;
+    let scope = parse_token_scope(&scope)?;
+    let storage = open_token_storage(config)?;
+    let token = new_secret();
+    storage.create_api_token(&name, &tls::sha256_hex(&token), scope.as_str(), now_ms())?;
+    Ok(token)
+}
+
+/// 列出 token：TSV，表头固定；空时间显示 `-`；绝不出现哈希或明文。
+fn token_list(config: Option<PathBuf>) -> Result<String> {
+    let storage = open_token_storage(config)?;
+    let tokens = storage.list_api_tokens()?;
+    let mut output = String::from("name\tscope\tcreated_at\tlast_used_at\trevoked_at\n");
+    for token in tokens {
+        let last_used = token
+            .last_used_at
+            .map(|ts| ts.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let revoked = token
+            .revoked_at
+            .map(|ts| ts.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            token.name, token.scope, token.created_at, last_used, revoked
+        ));
+    }
+    Ok(output)
+}
+
+/// 轮换 token：返回新的 64 位 hex 明文，旧 token 立即失效。
+fn token_rotate(config: Option<PathBuf>, name: String) -> Result<String> {
+    validate_token_name(&name)?;
+    let storage = open_token_storage(config)?;
+    let token = new_secret();
+    storage.rotate_api_token(&name, &tls::sha256_hex(&token), now_ms())?;
+    Ok(token)
+}
+
+/// 吊销 token：不删行，重复吊销 / 不存在都是明确错误。
+fn token_revoke(config: Option<PathBuf>, name: String) -> Result<String> {
+    validate_token_name(&name)?;
+    let storage = open_token_storage(config)?;
+    storage.revoke_api_token(&name, now_ms())?;
+    Ok(format!("已吊销 token: {name}"))
 }
 
 // init 的参数与 `init` 子命令的 CLI 字段一一对应，拆结构体只会多一层搬运。
@@ -1048,7 +1185,7 @@ fn admin_router(state: AppState) -> Router {
         .route("/api/v1/{*rest}", any(api_not_found))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            require_bearer,
+            auth::require_auth,
         ));
 
     Router::new()
@@ -1059,68 +1196,12 @@ fn admin_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// 受保护路由树的兜底：走到这里说明 Bearer（与限速）已经通过，只是路由不存在。
+/// 受保护路由树的兜底：走到这里说明认证（与限速）已经通过，只是路由不存在。
 async fn api_not_found() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({ "error": "not_found" })),
     )
-}
-
-/// 常量时间比较 Bearer token；除 `/healthz` 外的管理 API 都必须通过这里。
-///
-/// 顺序：先鉴权（401），再按直连 IP 限速（429）——未认证请求不能消耗限速额度。
-async fn require_bearer(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    request: axum::extract::Request,
-    next: Next,
-) -> Response {
-    let authorized = bearer_matches(request.headers(), &state.cfg.admin_token);
-    if !authorized {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "unauthorized" })),
-        )
-            .into_response();
-    }
-
-    let is_write = is_admin_write_method(request.method());
-    if let Err(retry_after) = state.admin_rate.check(peer.ip(), is_write) {
-        let mut response = (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({ "error": "rate_limited" })),
-        )
-            .into_response();
-        response.headers_mut().insert(
-            header::RETRY_AFTER,
-            HeaderValue::from_str(&retry_after.to_string())
-                .unwrap_or_else(|_| HeaderValue::from_static("60")),
-        );
-        return response;
-    }
-
-    next.run(request).await
-}
-
-/// 解析 `Authorization: Bearer <token>`；scheme 大小写不敏感，token 常量时间比较。
-///
-/// 只接受「scheme + 单个 token」两段，多余的分段（例如 token 里带空格）直接拒绝。
-fn bearer_matches(headers: &axum::http::HeaderMap, expected: &str) -> bool {
-    if expected.is_empty() {
-        return false;
-    }
-    let Some(value) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    let mut parts = value.split_ascii_whitespace();
-    let (Some(scheme), Some(token), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    scheme.eq_ignore_ascii_case("bearer") && constant_time_eq(token.as_bytes(), expected.as_bytes())
 }
 
 /// 管理 API 全部响应禁止缓存（含 token 的 401 与实时指标）。
@@ -4286,6 +4367,7 @@ mod tests {
     /// Bearer 解析：scheme 大小写不敏感、token 常量时间比较、拒绝多余分段。
     #[test]
     fn m2_bearer_scheme_is_case_insensitive() {
+        use crate::auth::bearer_matches;
         use axum::http::HeaderMap;
 
         let mut headers = HeaderMap::new();
@@ -6787,5 +6869,436 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    // ------------------------------------------------------------------
+    // v0.3.3 A1：scoped token 鉴权 / 授权 / CLI / 审计 actor
+    // ------------------------------------------------------------------
+
+    const V6_LEGACY_TOKEN: &str = "v6-legacy-admin-token-0123456789";
+
+    /// v6 鉴权测试状态：保留旧 admin_token，关闭限速（矩阵测试请求数会超过 60/min）。
+    fn v6_auth_state() -> AppState {
+        hub_state_with(HubConfig {
+            admin_token: V6_LEGACY_TOKEN.to_string(),
+            admin_rate_limit_per_min: 0,
+            admin_write_rate_limit_per_min: 0,
+            ..HubConfig::default()
+        })
+    }
+
+    /// 直接在库里种一个 token，返回明文（只在本进程测试内使用）。
+    fn v6_seed_token(state: &AppState, name: &str, scope: &str) -> String {
+        let token = new_secret();
+        state
+            .storage
+            .create_api_token(name, &tls::sha256_hex(&token), scope, now_ms())
+            .unwrap();
+        token
+    }
+
+    fn v6_token_cli_config(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = temp_dir(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("hub.toml");
+        let db_path = dir.join("rustboard.db");
+        HubConfig {
+            database: format!("sqlite://{}", db_path.display()),
+            ..HubConfig::default()
+        }
+        .save(&config_path)
+        .unwrap();
+        (config_path, db_path)
+    }
+
+    /// scope 矩阵：read/write/admin × GET/POST/PUT；旧 admin_token 仍全通过。
+    /// 403 固定结构、发生在限速后 / handler 前，不写审计；未知路由认证后 404/405。
+    #[tokio::test]
+    async fn v6_token_scope_matrix_and_unknown_routes() {
+        let state = v6_auth_state();
+        let read = v6_seed_token(&state, "read-token", "read");
+        let write = v6_seed_token(&state, "write-token", "write");
+        let admin = v6_seed_token(&state, "admin-http-token", "admin");
+        let router = admin_router(state.clone());
+
+        // 三种 scope 都允许只读 GET（write/admin 隐含 read），旧 admin_token 也兼容。
+        for token in [
+            read.as_str(),
+            write.as_str(),
+            admin.as_str(),
+            V6_LEGACY_TOKEN,
+        ] {
+            let (status, _, _) =
+                admin_call(&router, "GET", "/api/v1/agents", Some(token), None).await;
+            assert_eq!(status, StatusCode::OK, "token={token}");
+        }
+        // 已知只读子路由（agent 不存在时 handler 给 404，但 scope 必须先放行）。
+        for token in [read.as_str(), write.as_str(), admin.as_str()] {
+            let (status, _, _) = admin_call(
+                &router,
+                "GET",
+                "/api/v1/agents/a1/settings",
+                Some(token),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "token={token}");
+        }
+
+        // read token 调写接口：403 forbidden_scope，固定结构，且不写控制审计。
+        for (method, uri) in [
+            ("POST", "/api/v1/agents/a1/control"),
+            ("PUT", "/api/v1/agents/a1/settings"),
+        ] {
+            let (status, _, bytes) =
+                admin_call(&router, method, uri, Some(&read), Some("{}")).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+            assert_eq!(
+                json_body(&bytes),
+                serde_json::json!({ "error": "forbidden_scope" })
+            );
+        }
+        assert!(
+            state
+                .storage
+                .list_audit(10, None, None, None)
+                .unwrap()
+                .is_empty(),
+            "scope 不足的 403 不能进入控制 handler，也不得写审计"
+        );
+
+        // write / admin 通过 scope 检查：坏请求体由 handler 给 400（证明已进入 handler）。
+        for token in [write.as_str(), admin.as_str()] {
+            let (status, _, bytes) = admin_call(
+                &router,
+                "POST",
+                "/api/v1/agents/a1/control",
+                Some(token),
+                Some("{}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "token={token}");
+            assert_eq!(json_body(&bytes)["error"]["code"], "invalid_request");
+        }
+        let entries = state.storage.list_audit(10, None, None, None).unwrap();
+        assert_eq!(entries.len(), 2, "进入 handler 的拒绝必须写审计");
+        let mut actors: Vec<&str> = entries.iter().map(|entry| entry.actor.as_str()).collect();
+        actors.sort_unstable();
+        assert_eq!(actors, vec!["admin-http-token", "write-token"]);
+
+        // write token 通过 scope 后由 handler 校验请求体（400 而非 403）。
+        let (status, _, _) = admin_call(
+            &router,
+            "PUT",
+            "/api/v1/agents/a1/settings",
+            Some(&write),
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // 未知路径：先认证再 404；未知 POST/PUT 不能被 read token 变成 403。
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            let (status, _, _) =
+                admin_call(&router, method, "/api/v1/does-not-exist", Some(&read), None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "method={method}");
+            let (status, _, _) =
+                admin_call(&router, method, "/api/v1/does-not-exist", None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "method={method}");
+        }
+        // 已知路径的错误方法：认证后由路由给 405，不是 403。
+        let (status, _, _) = admin_call(&router, "POST", "/api/v1/agents", Some(&read), None).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// 401 结构、last_used_at 更新、rotate/revoke 立即生效（每次请求查库）。
+    #[tokio::test]
+    async fn v6_token_auth_401_shape_last_used_rotate_revoke() {
+        let state = v6_auth_state();
+        let token = v6_seed_token(&state, "panel", "read");
+        let router = admin_router(state.clone());
+
+        // 缺失 / 错误 / 空 token：固定 401 + WWW-Authenticate，不回显任何 token。
+        for provided in [None, Some("wrong-token"), Some("")] {
+            let (status, headers, bytes) =
+                admin_call(&router, "GET", "/api/v1/agents", provided, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "provided={provided:?}");
+            assert_eq!(
+                headers.get(header::WWW_AUTHENTICATE).unwrap(),
+                "Bearer",
+                "provided={provided:?}"
+            );
+            assert_eq!(
+                json_body(&bytes),
+                serde_json::json!({ "error": "unauthorized" })
+            );
+            assert!(!String::from_utf8_lossy(&bytes).contains("wrong-token"));
+        }
+        assert!(
+            state
+                .storage
+                .list_audit(10, None, None, None)
+                .unwrap()
+                .is_empty(),
+            "认证失败不得写审计"
+        );
+        assert_eq!(
+            state.storage.list_api_tokens().unwrap()[0].last_used_at,
+            None
+        );
+
+        // 认证成功：last_used_at 必须落库。
+        let (status, _, _) = admin_call(&router, "GET", "/api/v1/agents", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            state.storage.list_api_tokens().unwrap()[0]
+                .last_used_at
+                .is_some(),
+            "鉴权成功必须更新 last_used_at"
+        );
+
+        // rotate：旧 token 立即 401，新 token 立即 200。
+        let rotated = new_secret();
+        state
+            .storage
+            .rotate_api_token("panel", &tls::sha256_hex(&rotated), now_ms())
+            .unwrap();
+        let (status, _, _) = admin_call(&router, "GET", "/api/v1/agents", Some(&token), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "旧 token 必须立即失效");
+        let (status, _, _) =
+            admin_call(&router, "GET", "/api/v1/agents", Some(&rotated), None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // revoke：立即 401，行保留（不删行）。
+        state.storage.revoke_api_token("panel", now_ms()).unwrap();
+        let (status, _, _) =
+            admin_call(&router, "GET", "/api/v1/agents", Some(&rotated), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let records = state.storage.list_api_tokens().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].revoked_at.is_some());
+    }
+
+    /// CLI 端到端：临时 DB、不启 hub；TSV 不含明文 / 哈希；rotate/revoke 生效。
+    #[test]
+    fn v6_token_cli_create_list_rotate_revoke_end_to_end() {
+        let (config_path, db_path) = v6_token_cli_config("token-cli");
+
+        // 非法名称 / scope 在落库前拒绝。
+        assert!(token_create(Some(config_path.clone()), "bad name".into(), "read".into()).is_err());
+        assert!(token_create(Some(config_path.clone()), "panel".into(), "root".into()).is_err());
+
+        let token = token_create(Some(config_path.clone()), "panel".into(), "read".into()).unwrap();
+        assert_eq!(token.len(), 64, "明文必须是 64 位 hex");
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let db = SqliteStorage::open(&db_path).unwrap();
+        let records = db.list_api_tokens().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "panel");
+        assert_eq!(records[0].scope, "read");
+        assert_eq!(records[0].revoked_at, None);
+
+        // 重复 name：明确失败。
+        let err =
+            token_create(Some(config_path.clone()), "panel".into(), "write".into()).unwrap_err();
+        assert!(format!("{err:#}").contains("已存在"), "err={err:#}");
+
+        let second =
+            token_create(Some(config_path.clone()), "beta".into(), "admin".into()).unwrap();
+
+        // list：固定表头、按 name 升序、5 列 TSV、空值 -，绝不含明文 / 哈希。
+        let list = token_list(Some(config_path.clone())).unwrap();
+        let mut lines = list.lines();
+        assert_eq!(
+            lines.next(),
+            Some("name\tscope\tcreated_at\tlast_used_at\trevoked_at")
+        );
+        let rows: Vec<&str> = lines.collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].starts_with("beta\tadmin\t"), "rows={rows:?}");
+        assert!(rows[1].starts_with("panel\tread\t"), "rows={rows:?}");
+        assert!(
+            rows[1].ends_with("\t-\t-"),
+            "panel 从未使用且未吊销，时间列必须是 -: {rows:?}"
+        );
+        for row in &rows {
+            assert_eq!(row.split('\t').count(), 5, "row={row}");
+        }
+        assert!(!list.contains(&token));
+        assert!(!list.contains(&second));
+        assert!(!list.contains(&tls::sha256_hex(&token)));
+        assert!(!list.contains(&tls::sha256_hex(&second)));
+        assert!(db
+            .authenticate_api_token(&tls::sha256_hex(&token), now_ms())
+            .unwrap()
+            .is_some());
+
+        // rotate：旧 token 立即失效，新 token 可用。
+        let rotated = token_rotate(Some(config_path.clone()), "panel".into()).unwrap();
+        assert_ne!(rotated, token);
+        assert!(db
+            .authenticate_api_token(&tls::sha256_hex(&token), now_ms())
+            .unwrap()
+            .is_none());
+        assert!(db
+            .authenticate_api_token(&tls::sha256_hex(&rotated), now_ms())
+            .unwrap()
+            .is_some());
+
+        // revoke：不删行；重复吊销 / 不存在都报明确错误。
+        let message = token_revoke(Some(config_path.clone()), "panel".into()).unwrap();
+        assert!(message.contains("panel"));
+        assert!(db
+            .authenticate_api_token(&tls::sha256_hex(&rotated), now_ms())
+            .unwrap()
+            .is_none());
+        let err = token_revoke(Some(config_path.clone()), "panel".into()).unwrap_err();
+        assert!(format!("{err:#}").contains("已吊销"), "err={err:#}");
+        let err = token_revoke(Some(config_path.clone()), "missing".into()).unwrap_err();
+        assert!(format!("{err:#}").contains("不存在"), "err={err:#}");
+
+        let final_list = token_list(Some(config_path)).unwrap();
+        let panel = final_list
+            .lines()
+            .find(|line| line.starts_with("panel\t"))
+            .expect("panel 行必须保留");
+        assert!(
+            !panel.ends_with("\t-\t-"),
+            "吊销后 revoked_at 不能是 -: {panel}"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    /// CLI 参数接线：新 `token` 子命令完整可用，旧 `admin-token` 保留。
+    #[test]
+    fn v6_token_cli_parses_subcommands() {
+        let cli = Cli::try_parse_from([
+            "rustboard-hub",
+            "token",
+            "create",
+            "--config",
+            "hub.toml",
+            "--name",
+            "panel-prod",
+            "--scope",
+            "write",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Token {
+                action:
+                    TokenAction::Create {
+                        config,
+                        name,
+                        scope,
+                    },
+            } => {
+                assert_eq!(config.as_deref(), Some(std::path::Path::new("hub.toml")));
+                assert_eq!(name, "panel-prod");
+                assert_eq!(scope, "write");
+            }
+            _ => panic!("应解析为 token create"),
+        }
+        assert!(Cli::try_parse_from([
+            "rustboard-hub",
+            "token",
+            "create",
+            "--name",
+            "panel",
+            "--scope",
+            "root",
+        ])
+        .is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["rustboard-hub", "admin-token"])
+                .unwrap()
+                .cmd,
+            Cmd::AdminToken { .. }
+        ));
+    }
+
+    /// 控制路由缺少鉴权扩展时固定 500（接线错误），不得 panic。
+    #[tokio::test]
+    async fn v6_control_action_without_principal_returns_500() {
+        let state = m3_state(m3_control_cfg());
+        let router = Router::new()
+            .route(
+                "/api/v1/agents/{id}/control",
+                axum::routing::post(control::control_action),
+            )
+            .with_state(state);
+
+        let (status, _, bytes) = admin_call(
+            &router,
+            "POST",
+            "/api/v1/agents/a1/control",
+            None,
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = json_body(&bytes);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "internal_error");
+    }
+
+    /// 审计 actor：旧 admin_token 写 "admin"（既有 e2e 6.10 兼容），scoped token 写 name。
+    #[tokio::test]
+    async fn v6_control_audit_actor_uses_token_name() {
+        let state = m3_state(m3_control_cfg());
+        let handle = m3_register_agent(&state, "a1", &["systemd"]);
+        let responder = m3_spawn_responder(
+            handle.control_rx,
+            vec![
+                Ok(ControlResult::ActionOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                }),
+                Ok(ControlResult::ActionOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                }),
+            ],
+        );
+        let router = admin_router(state.clone());
+        let token = v6_seed_token(&state, "panel-prod", "write");
+        let body = r#"{"capability":"systemd","action":"restart","target":"nginx.service","confirm":true}"#;
+
+        // 旧 admin_token。
+        let (status, _, _) = admin_call(
+            &router,
+            "POST",
+            "/api/v1/agents/a1/control",
+            Some(M3_TOKEN),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // scoped token。
+        let (status, _, _) = admin_call(
+            &router,
+            "POST",
+            "/api/v1/agents/a1/control",
+            Some(&token),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(responder.await.unwrap(), 2);
+
+        let entries = m3_audit(&state);
+        assert_eq!(entries.len(), 2);
+        // id 倒序：最新一条是 scoped token。
+        assert_eq!(entries[0].actor, "panel-prod");
+        assert_eq!(entries[1].actor, "admin");
+        assert!(
+            !entries[0].actor.contains(&token),
+            "审计 actor 不能包含 token 明文"
+        );
     }
 }

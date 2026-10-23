@@ -19,6 +19,27 @@ pub struct AgentControlRecord {
     pub updated_at: i64,
 }
 
+/// 一条管理 API scoped token 记录（schema v6 `api_tokens` 表）。
+///
+/// **不含明文、不含 token 哈希**：哈希只用于数据库内比对，不进入任何对外
+/// 结构或日志。`scope` 以字符串保存，由 hub 侧映射成枚举；读取到非法值
+/// 时按未认证处理。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiTokenRecord {
+    /// 自增主键。
+    pub id: i64,
+    /// token 名称（运维可读，也是审计 actor）。
+    pub name: String,
+    /// `read` / `write` / `admin`。
+    pub scope: String,
+    /// 当前凭据创建时间（Unix 毫秒）；rotate 后更新为新凭据的创建时间。
+    pub created_at: i64,
+    /// 最近一次鉴权成功时间（Unix 毫秒）；从未使用为 `None`。
+    pub last_used_at: Option<i64>,
+    /// 吊销时间（Unix 毫秒）；未吊销为 `None`。吊销不删行。
+    pub revoked_at: Option<i64>,
+}
+
 /// 一条待写入的审计记录（没有自增 `id`）。
 ///
 /// `params` 只放 `target` / `pid` / `name` / `signal` / `lines`，

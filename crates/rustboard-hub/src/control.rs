@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::WebSocket;
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::{Extension, Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -40,6 +40,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
+use crate::auth::AuthPrincipal;
 use crate::{is_valid_agent_id, validate_agent_path, ApiError, AppState};
 
 /// 每条连接的控制命令队列容量。
@@ -505,8 +506,22 @@ impl Reject {
 pub(crate) async fn control_action(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
+    principal: Option<Extension<AuthPrincipal>>,
     body: std::result::Result<Json<ControlActionRequest>, JsonRejection>,
 ) -> Response {
+    // 控制路由一定挂在鉴权中间件之后；扩展缺失说明接线错误，固定 500 而不是 panic。
+    let Some(Extension(principal)) = principal else {
+        tracing::error!(agent = %agent_id, "控制请求缺少 AuthPrincipal 扩展（路由接线错误）");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "ok": false,
+                "error": { "code": "internal_error", "message": "内部错误" },
+            })),
+        )
+            .into_response();
+    };
+
     let started = Instant::now();
     // 非法 agent_id 不写进审计（避免污染过滤字段），但仍记录一次拒绝。
     let audit_agent = if is_valid_agent_id(&agent_id) && agent_id != "." && agent_id != ".." {
@@ -514,7 +529,8 @@ pub(crate) async fn control_action(
     } else {
         String::new()
     };
-    let mut audit = AuditDraft::new(&audit_agent);
+    // 审计 actor：旧 admin_token 仍是 "admin"（兼容既有 e2e），scoped token 用 name。
+    let mut audit = AuditDraft::new(&audit_agent, &principal.name);
 
     if validate_agent_path(&agent_id).is_err() {
         return finish_error(&state, audit, started, &Reject::invalid("agent_id 非法")).await;
@@ -1269,10 +1285,11 @@ struct AuditDraft {
 }
 
 impl AuditDraft {
-    fn new(agent_id: &str) -> Self {
+    /// `actor` 来自鉴权主体：旧 admin_token 为 `"admin"`，scoped token 为 name。
+    fn new(agent_id: &str, actor: &str) -> Self {
         Self {
             ts: now_ms(),
-            actor: "admin".to_string(),
+            actor: actor.to_string(),
             agent_id: agent_id.to_string(),
             capability: String::new(),
             action: String::new(),
