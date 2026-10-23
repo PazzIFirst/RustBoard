@@ -14,6 +14,7 @@
 //! 也让「剩余寿命」这类运维判断失去意义。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -241,27 +242,98 @@ pub fn harden_hub_material(data_dir: &Path) -> Result<()> {
 /// 每类证书材料（cert / key）备份保留的最近份数。
 pub const BACKUP_KEEP: usize = 5;
 
-/// 一次备份操作共用的文件名后缀：`<毫秒>-<pid>-<uuid>`。
+/// 备份后缀中进程内序号的十进制位数（`{:08}`）。
+const BACKUP_SEQ_DIGITS: usize = 8;
+
+/// 进程内单调递增的备份序号。
 ///
-/// 毫秒 + PID + UUID 保证同一秒内连续重签也不会互相覆盖；crt 与 key 复用同一个
-/// 后缀，便于把两份备份配成一对；固定宽度的毫秒前缀让字典序等于时间序，便于淘汰。
+/// 同一毫秒内可能连续备份多次（重签重试、引导流程、测试），毫秒前缀不足以区分
+/// 先后。序号从 1 开始，保证新格式的序号严格大于旧格式缺省值 0；`fetch_add`
+/// 只有在 2^64 次备份后才会回绕，实际不可达。
+static BACKUP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// 一次备份操作共用的文件名后缀：`<毫秒>-<8 位序号>-<pid>-<uuid>`。
+///
+/// 毫秒 + 进程内序号 + PID + UUID 保证同一毫秒内连续重签也不会互相覆盖；序号让
+/// 淘汰顺序不再依赖 UUID 的字典序。crt 与 key 复用同一个后缀，便于把两份备份
+/// 配成一对。
 fn backup_suffix() -> String {
-    format!(
-        "{}-{}-{}",
+    let seq = BACKUP_SEQ.fetch_add(1, Ordering::Relaxed);
+    format_backup_suffix(
         crate::util::now_ms(),
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
+        seq,
+        &uuid::Uuid::new_v4().simple().to_string(),
     )
 }
 
-/// 是否是本模块生成的「三段式」备份（`<name>.bak-<毫秒>-<pid>-<uuid>`）。
+/// 按给定毫秒、序号与 UUID 组装后缀（纯格式化，生产与测试共用）。
+fn format_backup_suffix(now_ms: i64, seq: u64, uuid: &str) -> String {
+    format!("{now_ms}-{seq:08}-{}-{uuid}", std::process::id())
+}
+
+/// 测试专用的确定性后缀：固定 UUID，毫秒/序号可注入，不依赖真实时钟与随机数。
+#[cfg(test)]
+fn backup_suffix_at(now_ms: i64, seq: u64) -> String {
+    format_backup_suffix(now_ms, seq, "00112233445566778899aabbccddeeff")
+}
+
+/// 解析本模块备份后缀，返回淘汰排序用的 `(毫秒, 序号)`。
 ///
-/// 用于把运维 CLI 自己创建的两段式 `bak-<秒>` 备份排除在保留策略之外。
+/// 识别两种格式：
+/// - 新 4 段 `<毫秒>-<8 位序号>-<pid>-<uuid>` → `(毫秒, 序号)`；
+/// - 旧 3 段 `<毫秒>-<pid>-<uuid>`（v0.3.3 及更早）→ `(毫秒, 0)`，旧格式没有序号。
+///
+/// 段数不对、数字段非法、UUID 段非法时返回 `None`；任何输入都不会 panic。
+fn parse_managed_backup_suffix(suffix: &str) -> Option<(u64, u64)> {
+    let parts: Vec<&str> = suffix.split('-').collect();
+    match parts.as_slice() {
+        [ms, seq, pid, uuid] => {
+            // 新格式的序号固定 8 位十进制，用来与旧格式的 pid 段区分。
+            if seq.len() != BACKUP_SEQ_DIGITS || !is_backup_uuid(uuid) {
+                return None;
+            }
+            let ms = parse_backup_decimal(ms)?;
+            let seq = parse_backup_decimal(seq)?;
+            parse_backup_decimal(pid)?;
+            Some((ms, seq))
+        }
+        [ms, pid, uuid] => {
+            if !is_backup_uuid(uuid) {
+                return None;
+            }
+            let ms = parse_backup_decimal(ms)?;
+            parse_backup_decimal(pid)?;
+            Some((ms, 0))
+        }
+        _ => None,
+    }
+}
+
+/// 备份后缀里的十进制段：只接受纯 ASCII 数字，拒绝空串、符号与溢出。
+fn parse_backup_decimal(part: &str) -> Option<u64> {
+    if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    part.parse().ok()
+}
+
+/// 本模块统一使用 `Uuid::new_v4().simple()`：32 位十六进制、无连字符。
+fn is_backup_uuid(part: &str) -> bool {
+    part.len() == 32 && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// 是否是本模块生成的备份文件名。
+///
+/// 同时识别：
+/// - 新 4 段：`<name>.bak-<毫秒>-<8 位序号>-<pid>-<uuid>`；
+/// - 旧 3 段：`<name>.bak-<毫秒>-<pid>-<uuid>`（v0.3.3 及更早的遗留备份）。
+///
+/// 运维 CLI 的两段式 `bak-<秒>` 不算，保留策略不会误删。
 pub fn is_managed_backup(file_name: &str, base: &str) -> bool {
-    let Some(rest) = file_name.strip_prefix(&format!("{base}.bak-")) else {
-        return false;
-    };
-    rest.split('-').filter(|part| !part.is_empty()).count() == 3
+    file_name
+        .strip_prefix(&format!("{base}.bak-"))
+        .and_then(parse_managed_backup_suffix)
+        .is_some()
 }
 
 /// 成对备份服务端 crt(0644) + key(0600)，返回本次生成的备份路径（crt 在前）。
@@ -302,18 +374,26 @@ pub fn backup_server_material(data_dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// 只保留最近 [`BACKUP_KEEP`] 份本模块生成的备份。
+///
+/// 按解析出的 `(毫秒, 序号)` 降序保留：同一毫秒内序号大的（后创建）优先；旧 3 段
+/// 格式的序号按 0 处理。只有 `(毫秒, 序号)` 完全相同时才用文件名倒序兜底，因此
+/// UUID 的字典序不会把刚创建的备份挤出保留区。
 fn prune_managed_backups(dir: &Path, base: &str) -> Result<()> {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
+    let prefix = format!("{base}.bak-");
+    let mut backups: Vec<((u64, u64), String)> = std::fs::read_dir(dir)
         .with_context(|| format!("读取证书目录失败: {}", dir.display()))?
         .filter_map(|entry| entry.ok())
-        .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .filter(|name| is_managed_backup(name, base))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let suffix = name.strip_prefix(&prefix)?;
+            Some((parse_managed_backup_suffix(suffix)?, name))
+        })
         .collect();
-    if names.len() <= BACKUP_KEEP {
+    if backups.len() <= BACKUP_KEEP {
         return Ok(());
     }
-    names.sort_unstable_by(|a, b| b.cmp(a));
-    for stale in names.iter().skip(BACKUP_KEEP) {
+    backups.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    for (_, stale) in backups.iter().skip(BACKUP_KEEP) {
         let path = dir.join(stale);
         if let Err(err) = std::fs::remove_file(&path) {
             // 清理失败不影响本次备份/续签，只影响磁盘占用。
@@ -414,7 +494,9 @@ pub fn ensure_hub_material(data_dir: &Path, sans: &[String], policy: CertPolicy)
     parse_server_sans(sans)?;
 
     let dir = cert_dir(data_dir);
-    crate::fsutil::ensure_dir(&dir, 0o700)?;
+    // KI-21：证书目录完全由 hub 拥有，旧版本遗留的 0755 也要在启动时收紧到 0700。
+    // 这里只改目录创建；备份命名/清理逻辑不在本任务的范围内。
+    crate::fsutil::ensure_private_dir(&dir, 0o700)?;
 
     let ca_cert_path = dir.join(CA_CERT_FILE);
     let ca_key_path = dir.join(CA_KEY_FILE);
@@ -1221,6 +1303,25 @@ mod tests {
         std::fs::read_to_string(cert_dir(data_dir).join(name)).unwrap()
     }
 
+    /// 在证书目录写一个指定后缀的备份文件，用于注入确定的时间/序号。
+    fn write_backup(data_dir: &Path, base: &str, suffix: &str) -> PathBuf {
+        let dir = cert_dir(data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{base}.bak-{suffix}"));
+        std::fs::write(&path, b"backup").unwrap();
+        path
+    }
+
+    /// 收集某类材料当前被识别为托管备份的文件名。
+    fn managed_backup_names(data_dir: &Path, base: &str) -> Vec<String> {
+        std::fs::read_dir(cert_dir(data_dir))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| is_managed_backup(name, base))
+            .collect()
+    }
+
     /// A1：`notAfter` 必须是配置的天数，`notBefore` 必须是 now-1h（容差 5 分钟）。
     fn assert_validity(pem: &str, days: u32) {
         let (not_before, not_after) = validity_unix(pem).unwrap();
@@ -1941,6 +2042,7 @@ mod tests {
         let legacy = cert_dir(&dir).join("server.crt.bak-1234567890");
         std::fs::write(&legacy, &cert_pem).unwrap();
 
+        let mut last_created = Vec::new();
         for _ in 0..(BACKUP_KEEP + 2) {
             let created = backup_server_material(&dir).unwrap();
             assert_eq!(created.len(), 2, "cert/key 必须成对备份");
@@ -1961,6 +2063,13 @@ mod tests {
                 .strip_prefix(&format!("{SERVER_KEY_FILE}.bak-"))
                 .unwrap();
             assert_eq!(cert_suffix, key_suffix, "cert/key 备份必须共用同一后缀");
+            assert_eq!(
+                cert_suffix.split('-').count(),
+                4,
+                "新后缀必须是 4 段: {cert_suffix}"
+            );
+            let seq = cert_suffix.split('-').nth(1).unwrap();
+            assert_eq!(seq.len(), 8, "进程内序号必须固定 8 位: {seq}");
             assert!(is_managed_backup(&cert_name, SERVER_CERT_FILE));
             assert!(is_managed_backup(&key_name, SERVER_KEY_FILE));
             #[cfg(unix)]
@@ -1971,6 +2080,7 @@ mod tests {
                 assert_eq!(mode(&created[0]), 0o644);
                 assert_eq!(mode(&created[1]), 0o600);
             }
+            last_created = created;
         }
 
         let managed: Vec<String> = std::fs::read_dir(cert_dir(&dir))
@@ -1985,8 +2095,235 @@ mod tests {
             "必须恰好保留最近 {BACKUP_KEEP} 份: {managed:?}"
         );
         assert!(!managed.is_empty(), "保留策略不能把最新备份也删掉");
+        assert!(
+            last_created.iter().all(|path| path.exists()),
+            "最后创建的 cert/key 备份必须仍存在: {last_created:?}"
+        );
         assert!(legacy.exists(), "不得删除运维 CLI 的两段式备份");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A6：同一毫秒内连续备份时，按进程内序号保留最近 KEEP 份，最后一份不得被删。
+    #[test]
+    fn prune_keeps_newest_backups_within_same_millisecond() {
+        let dir = temp_dir("prune-same-ms");
+        let ms = 1_700_000_000_000_i64;
+        // cert/key 共用同一后缀，模拟同毫秒内连续生成 KEEP+2 对备份。
+        let pairs: Vec<(PathBuf, PathBuf)> = (0..(BACKUP_KEEP as u64 + 2))
+            .map(|seq| {
+                let suffix = backup_suffix_at(ms, seq);
+                (
+                    write_backup(&dir, SERVER_CERT_FILE, &suffix),
+                    write_backup(&dir, SERVER_KEY_FILE, &suffix),
+                )
+            })
+            .collect();
+
+        for base in [SERVER_CERT_FILE, SERVER_KEY_FILE] {
+            prune_managed_backups(&cert_dir(&dir), base).unwrap();
+            let managed = managed_backup_names(&dir, base);
+            assert_eq!(
+                managed.len(),
+                BACKUP_KEEP,
+                "每类必须恰好保留 {BACKUP_KEEP} 份: {managed:?}"
+            );
+        }
+
+        let stale = pairs.len() - BACKUP_KEEP;
+        for (idx, (cert, key)) in pairs.iter().enumerate() {
+            assert_eq!(
+                cert.exists(),
+                key.exists(),
+                "cert/key 必须成对保留或淘汰: {idx}"
+            );
+            if idx < stale {
+                assert!(!cert.exists(), "最旧的备份应被清理: {}", cert.display());
+            } else {
+                assert!(cert.exists(), "最近的备份应被保留: {}", cert.display());
+            }
+        }
+        let (last_cert, last_key) = pairs.last().unwrap();
+        assert!(last_cert.exists(), "最后创建的证书备份必须保留");
+        assert!(last_key.exists(), "最后创建的私钥备份必须保留");
+        let cert_suffix = last_cert
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .strip_prefix(&format!("{SERVER_CERT_FILE}.bak-"))
+            .unwrap()
+            .to_string();
+        let key_suffix = last_key
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .strip_prefix(&format!("{SERVER_KEY_FILE}.bak-"))
+            .unwrap()
+            .to_string();
+        assert_eq!(cert_suffix, key_suffix, "cert/key 备份必须共用同一后缀");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A6：旧 3 段格式仍被识别并参与保留策略；2 段式运维备份不识别、不被误删。
+    #[test]
+    fn legacy_backups_are_managed_and_pruned_but_ops_backups_are_kept() {
+        let dir = temp_dir("legacy-prune");
+        let ms = 1_700_000_000_000_i64;
+        // KEEP+1 份旧格式备份，毫秒递增；最早的一份应被淘汰。
+        let legacy: Vec<PathBuf> = (0..=(BACKUP_KEEP as i64))
+            .map(|offset| {
+                write_backup(
+                    &dir,
+                    SERVER_CERT_FILE,
+                    &format!("{}-{}-{:032x}", ms + offset, 1000 + offset, offset + 1),
+                )
+            })
+            .collect();
+        let ops = write_backup(&dir, SERVER_CERT_FILE, "1234567890");
+
+        for path in &legacy {
+            let name = path.file_name().unwrap().to_string_lossy();
+            assert!(
+                is_managed_backup(&name, SERVER_CERT_FILE),
+                "旧 3 段格式必须被识别: {name}"
+            );
+            let suffix = name
+                .strip_prefix(&format!("{SERVER_CERT_FILE}.bak-"))
+                .unwrap();
+            assert_eq!(
+                parse_managed_backup_suffix(suffix).map(|(_, seq)| seq),
+                Some(0),
+                "旧格式没有序号，必须按 0 处理: {suffix}"
+            );
+        }
+        let ops_name = ops.file_name().unwrap().to_string_lossy();
+        assert!(
+            !is_managed_backup(&ops_name, SERVER_CERT_FILE),
+            "运维 CLI 的 2 段式备份不得被识别: {ops_name}"
+        );
+
+        prune_managed_backups(&cert_dir(&dir), SERVER_CERT_FILE).unwrap();
+
+        let managed = managed_backup_names(&dir, SERVER_CERT_FILE);
+        assert_eq!(managed.len(), BACKUP_KEEP, "保留份数: {managed:?}");
+        assert!(!legacy[0].exists(), "最旧的旧格式备份应被清理");
+        assert!(legacy.last().unwrap().exists(), "最新的旧格式备份必须保留");
+        assert!(ops.exists(), "不得删除运维 CLI 的 2 段式备份");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A6：新旧格式混排且同毫秒时，新格式（序号 >= 1）优先于旧格式（序号 0）。
+    #[test]
+    fn prune_prefers_new_format_over_legacy_in_same_millisecond() {
+        let dir = temp_dir("mixed-format-prune");
+        let ms = 1_700_000_000_000_i64;
+        let legacy: Vec<PathBuf> = (0..2)
+            .map(|i| {
+                write_backup(
+                    &dir,
+                    SERVER_CERT_FILE,
+                    &format!("{ms}-{}-{:032x}", 100 + i, i + 1),
+                )
+            })
+            .collect();
+        let new: Vec<PathBuf> = (1..=BACKUP_KEEP as u64)
+            .map(|seq| write_backup(&dir, SERVER_CERT_FILE, &backup_suffix_at(ms, seq)))
+            .collect();
+
+        prune_managed_backups(&cert_dir(&dir), SERVER_CERT_FILE).unwrap();
+
+        let managed = managed_backup_names(&dir, SERVER_CERT_FILE);
+        assert_eq!(managed.len(), BACKUP_KEEP, "保留份数: {managed:?}");
+        assert!(
+            new.iter().all(|path| path.exists()),
+            "新格式（同毫秒序号更大）必须优先保留: {managed:?}"
+        );
+        assert!(
+            legacy.iter().all(|path| !path.exists()),
+            "同毫秒的旧格式应被淘汰: {managed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A6：非法段数/非数字/UUID 非法的文件名返回 false 且不 panic。
+    #[test]
+    fn is_managed_backup_rejects_malformed_names_without_panicking() {
+        let uuid = "00112233445566778899aabbccddeeff";
+        let malformed = [
+            format!("{SERVER_CERT_FILE}.bak-"),
+            // 运维 CLI 的两段式 `bak-<秒>`。
+            format!("{SERVER_CERT_FILE}.bak-1234567890"),
+            // 毫秒非数字。
+            format!("{SERVER_CERT_FILE}.bak-abc-123-{uuid}"),
+            // 旧格式 pid 非数字。
+            format!("{SERVER_CERT_FILE}.bak-1000-abc-{uuid}"),
+            // 新格式 pid 非数字。
+            format!("{SERVER_CERT_FILE}.bak-1000-00000001-abc-{uuid}"),
+            // 新格式序号不足 8 位。
+            format!("{SERVER_CERT_FILE}.bak-1000-000001-123-{uuid}"),
+            // UUID 不是 32 位十六进制。
+            format!("{SERVER_CERT_FILE}.bak-1000-00000001-123-nothex"),
+            // 段数过多。
+            format!("{SERVER_CERT_FILE}.bak-1000-00000001-123-{uuid}-extra"),
+            // 空毫秒段。
+            format!("{SERVER_CERT_FILE}.bak--00000001-123-{uuid}"),
+            // base 不匹配（key 备份不能按 cert 识别）。
+            format!("server.key.bak-1000-00000001-123-{uuid}"),
+            // 非 ASCII 尾巴。
+            format!("{SERVER_CERT_FILE}.bak-1000-00000001-123-{uuid}中"),
+        ];
+        for name in &malformed {
+            assert!(
+                !is_managed_backup(name, SERVER_CERT_FILE),
+                "非法文件名必须返回 false: {name}"
+            );
+        }
+
+        // 合法的新/旧格式仍为 true。
+        let new = format!("{SERVER_CERT_FILE}.bak-1000-00000001-123-{uuid}");
+        let old = format!("{SERVER_CERT_FILE}.bak-1000-123-{uuid}");
+        assert!(is_managed_backup(&new, SERVER_CERT_FILE));
+        assert!(is_managed_backup(&old, SERVER_CERT_FILE));
+        assert_eq!(
+            parse_managed_backup_suffix("1000-00000001-123-00112233445566778899aabbccddeeff"),
+            Some((1000, 1))
+        );
+        assert_eq!(
+            parse_managed_backup_suffix("1000-123-00112233445566778899aabbccddeeff"),
+            Some((1000, 0))
+        );
+    }
+
+    /// A6：后缀是 `<毫秒>-<8 位序号>-<pid>-<uuid>`，且进程内序号严格递增。
+    #[test]
+    fn backup_suffix_has_fixed_width_monotonic_sequence() {
+        let ms = 1_700_000_000_123_i64;
+        let first = backup_suffix_at(ms, 1);
+        let second = backup_suffix_at(ms, 2);
+        assert!(
+            first.starts_with("1700000000123-00000001-"),
+            "后缀必须固定 8 位序号: {first}"
+        );
+        assert!(
+            second.starts_with("1700000000123-00000002-"),
+            "后缀必须固定 8 位序号: {second}"
+        );
+        assert_eq!(
+            parse_managed_backup_suffix(&first),
+            Some((1_700_000_000_123, 1))
+        );
+        assert_eq!(
+            parse_managed_backup_suffix(&second),
+            Some((1_700_000_000_123, 2))
+        );
+        assert!(
+            parse_managed_backup_suffix(&first) < parse_managed_backup_suffix(&second),
+            "同毫秒内序号大的排序键必须更大"
+        );
+
+        // 生产路径的进程内序号必须严格递增（不看毫秒，避免依赖真实时钟）。
+        let a = parse_managed_backup_suffix(&backup_suffix()).expect("生产后缀必须可解析");
+        let b = parse_managed_backup_suffix(&backup_suffix()).expect("生产后缀必须可解析");
+        assert!(b.1 > a.1, "进程内序号必须严格递增: {a:?} vs {b:?}");
     }
 
     /// S1：SAN 的 DNS 标签不允许以 '-' 开头/结尾。

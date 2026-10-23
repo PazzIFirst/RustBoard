@@ -10,6 +10,66 @@
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-10-23
+
+### Added
+
+- KI-26：管理 API 新增未认证失败限速 `admin_auth_failure_limit_per_min`
+  （默认 60，0 关闭，最大 600）；同一来源 IP 超限返回 429 + `Retry-After`，
+  超限路径不计算 SHA-256、不查 SQLite；旧 `admin_token` 保留应急旁路
+- KI-18：`rustboard-panel reset-password` 后运行中的 Panel 在 ≤2s 内吊销全部已有会话；
+  登录增加认证代际，重置瞬间在途的旧密码登录也不能在清空后新建会话
+- `tests/e2e/v034.sh` + `v034_agent.py`：KI-26/18/19/21/24 与权限、日志脱敏回归（97 项）
+
+### Changed
+
+- KI-26：401 认证失败 WARN 按来源 IP、每 60s 窗口采样；429 固定
+  `{"error":"rate_limited"}` 且不写审计。NAT / 反代共享来源 IP 时，阈值后的合法
+  scoped token 也可能在窗口结束前收到 429，旧 `admin_token` 不受影响
+- KI-19：Hello 的 `agent_id/name/hostname/os/arch/version/boot_id` 统一做 UTF-8
+  字节长度与控制字符校验；非法帧固定 `Problem(bad_frame)` 并关闭，不写库/审计，
+  日志不回显字段值
+- KI-21：hub 启动设置私有 umask（Unix 0o077）；数据目录/证书目录 0700，
+  SQLite 主库与 `-wal`/`-shm` 0600；已有过宽权限在启动时收紧。数据库位于
+  `data_dir` 之外时不会 chmod 其父目录（DB 文件仍收紧）。`data_dir` 必须是
+  本程序独占的绝对子目录（至少两级）：`/tmp`、`/var/tmp`、`/etc`、`/var/log`、`/` 等
+  共享/系统目录、sticky 目录、相对路径、任一祖先或最终组件为符号链接、非 root 指向
+  他人目录都会拒绝启动，防止误 chmod。该校验是启动时的静态检查；`data_dir`
+  祖先必须不可被非特权用户写（推荐 root 拥有的专用目录），否则本地竞态仍可能
+  在 validate→create/chmod 之间重定向路径
+- KI-24：同一 agent 多连接的能力以最新连接为准；旧连接晚到的 Hello 不覆盖新连接，
+  最新连接断开后回退到剩余最新已登记能力，全部断开保留历史能力
+- 证书备份后缀改为 `<毫秒>-<8 位序号>-<pid>-<uuid>`，按 `(毫秒, 序号)` 而非
+  UUID 字典序淘汰；旧 3 段格式仍识别，运维 CLI 的 2 段式备份不受影响
+
+### Fixed
+
+- KI-26 未认证 401 可无限驱动 SQLite 查询与 WARN 日志、放大 CPU/日志
+- KI-18 密码重置后旧 Cookie 仍可使用到会话 TTL；并发登录在清空后可能复活旧密码会话
+- KI-19 超长或含控制字符的 Hello 元数据被写入 agents 表与日志
+- KI-21 SQLite 默认 0644、数据目录默认 0755，旧安装权限不会自动收紧；
+  `data_dir` 指向 `/tmp`、`/etc`、`/` 等共享目录时会被误 chmod 0700
+- KI-24 旧连接能力覆盖新连接、最新连接断开后能力陈旧
+- 证书备份在同一毫秒连续生成时可能因 UUID 字典序误删刚创建的备份（测试偶发失败）
+
+### Security
+
+- 未认证管理请求达到阈值后按来源 IP 429，避免 401 放大；旧 `admin_token`
+  仍作为应急入口，`admin_tls` 只加密不认证客户端，管理口仍应限制来源
+- 密码重置即吊销全部面板会话，旧 Cookie 与重置瞬间在途的旧密码登录均不再有效
+- Hello 元数据校验阻断日志注入与超长字段写入
+- 数据目录/SQLite/SQLite sidecar 权限收紧，降低本机其他用户读取指标与哈希的风险；
+  数据目录路径先经共享/系统目录、sticky、owner 校验，避免把 `/tmp`、`/etc`、`/` 改坏
+- 协议仍为 v2、SQLite schema 仍为 v6、证书格式不变；hub/agent/panel 可滚动升级。
+  回滚 v0.3.3 只需回代码，旧二进制忽略新配置；权限收紧不可逆但无害。
+  `data_dir` 必须是独占绝对子目录（至少两级，祖先/最终组件不能是符号链接）；
+  `data_dir`/`certs` 为符号链接的部署会 fail-closed，需要改为真实目录。证书目录 0700 后，同机以不同用户运行且直接读取 hub `ca.crt`
+  的 Panel 需要复制 CA 或以同用户运行
+- 已知未修复中危 **KI-27**（v0.3.5）：WebSocket 升级后 TLS 单 IP 许可提前释放，
+  同一 IP 可占满全局 session slots；管理口默认回环可缓解管理面风险，但 agent 入口
+  需限制已纳管证书的信任范围。v0.3.4 渗透未发现其他高危；KI-26 失败表满后的
+  新来源 429、DB 位于 data_dir 外不告警、慢 DB 同步写阻塞等低危/权衡见 status.md
+
 ## [0.3.3] - 2026-10-23
 
 ### Added

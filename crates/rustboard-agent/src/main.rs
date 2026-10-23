@@ -6,7 +6,7 @@
 mod control;
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -279,33 +279,7 @@ fn main() -> Result<()> {
             force,
         } => {
             let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_CONFIG));
-            if path.exists() && !force {
-                bail!("{} 已存在，使用 --force 覆盖", path.display());
-            }
-            let mut cfg = AgentConfig::default();
-            if let Some(h) = hub {
-                cfg.hub_url = h;
-            }
-            if let Some(t) = token {
-                cfg.token = t;
-            }
-            if let Some(f) = fingerprint {
-                cfg.server_fingerprint = f;
-            }
-            if let Some(n) = name {
-                cfg.name = n;
-            }
-            if let Some(d) = data_dir {
-                cfg.data_dir = d;
-            }
-            cfg.save(&path)?;
-            println!("已写入配置: {}", path.display());
-            println!("hub 地址: {}", cfg.hub_url);
-            if cfg.hub_url.starts_with("wss://") && cfg.server_fingerprint.is_empty() {
-                println!("警告: wss:// 连接缺少 --fingerprint，启动时会失败");
-            }
-            println!("\n下一步: rustboard-agent run --config {}", path.display());
-            Ok(())
+            init_agent(&path, hub, token, fingerprint, name, data_dir, force)
         }
         Cmd::Run { config } => {
             let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_CONFIG));
@@ -323,6 +297,50 @@ fn main() -> Result<()> {
     }
 }
 
+/// 实现 `agent init`：组装默认配置 → 校验 → 落盘。
+///
+/// KI-21：和 hub init 一样必须在写配置**之前**调用 `AgentConfig::validate()`。
+/// 否则 `agent init --data-dir /etc` 会留下一个启动时才失败的配置；更糟的是
+/// 后续 `run` 会按旧版本行为尝试把共享目录 chmod 成 0700。校验失败时磁盘上
+/// 不能出现半个配置文件。
+fn init_agent(
+    path: &Path,
+    hub: Option<String>,
+    token: Option<String>,
+    fingerprint: Option<String>,
+    name: Option<String>,
+    data_dir: Option<PathBuf>,
+    force: bool,
+) -> Result<()> {
+    if path.exists() && !force {
+        bail!("{} 已存在，使用 --force 覆盖", path.display());
+    }
+    let mut cfg = AgentConfig::default();
+    if let Some(h) = hub {
+        cfg.hub_url = h;
+    }
+    if let Some(t) = token {
+        cfg.token = t;
+    }
+    if let Some(f) = fingerprint {
+        cfg.server_fingerprint = f;
+    }
+    if let Some(n) = name {
+        cfg.name = n;
+    }
+    if let Some(d) = data_dir {
+        cfg.data_dir = d;
+    }
+    // 先校验再落盘：非法 data_dir / hub_url 不能留下配置。
+    cfg.validate()
+        .context("init 参数校验失败（检查 --data-dir、--hub 等）")?;
+    cfg.save(path)?;
+    println!("已写入配置: {}", path.display());
+    println!("hub 地址: {}", cfg.hub_url);
+    println!("\n下一步: rustboard-agent run --config {}", path.display());
+    Ok(())
+}
+
 fn run(cfg: AgentConfig) -> Result<()> {
     // config.rs 只校验下界；这里补上限，避免本地配置本身就忙采/形同停采。
     validate_sample_interval_config(cfg.sample_interval_ms)?;
@@ -338,8 +356,17 @@ fn run(cfg: AgentConfig) -> Result<()> {
     runtime.block_on(async move { run_async(cfg).await })
 }
 
+/// 初始化 agent 的数据目录（KI-21）：新建目录 0700，旧版本遗留的过宽目录也收紧。
+///
+/// 只用于 agent 自己的 `data_dir`（证书、secret、缓冲都在其中）；`/etc/rustboard`
+/// 这类共享配置父目录仍由 `fsutil::ensure_dir` 处理，不改动既有权限。
+fn prepare_data_dir(data_dir: &Path) -> Result<()> {
+    fsutil::ensure_private_dir(data_dir, 0o700)
+        .with_context(|| format!("初始化数据目录失败: {}", data_dir.display()))
+}
+
 async fn run_async(cfg: AgentConfig) -> Result<()> {
-    fsutil::ensure_dir(&cfg.data_dir, 0o700)?;
+    prepare_data_dir(&cfg.data_dir)?;
 
     // 没纳管过就先走 enrollment；拿到证书后再开始采集，避免用临时 agent_id 产生脏数据。
     if !is_enrolled(&cfg) {
@@ -1409,6 +1436,84 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rb-agent-{}-{tag}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// KI-21：agent data_dir 新建为 0700，旧版本遗留的 0755 在启动初始化时收紧。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_prepare_data_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        let dir = temp_dir("perms-new");
+        prepare_data_dir(&dir).unwrap();
+        assert_eq!(mode_of(&dir), 0o700, "新建 agent 数据目录必须是 0700");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = temp_dir("perms-old");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_data_dir(&dir).unwrap();
+        assert_eq!(mode_of(&dir), 0o700, "旧 0755 agent 数据目录必须收紧");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// KI-21 复审：agent init 必须在写配置之前校验 data_dir。
+    ///
+    /// `--data-dir /etc` 这类共享 / 系统目录要立即失败，且不能留下半个配置文件；
+    /// 旧实现只写配置不校验，直到 `run` 才在 `ensure_private_dir` 报错。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_agent_init_rejects_unsafe_data_dir_before_writing() {
+        let dir = temp_dir("init-unsafe");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.toml");
+
+        let err = init_agent(
+            &path,
+            None,
+            None,
+            None,
+            None,
+            Some(PathBuf::from("/etc")),
+            false,
+        )
+        .unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("data_dir"),
+            "错误链必须点名 data_dir: {chain}"
+        );
+        assert!(!path.exists(), "校验失败时不能落盘配置");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// KI-21 复审：合法 data_dir 仍然能完成 init 并写回配置。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_agent_init_writes_valid_config() {
+        let dir = temp_dir("init-valid");
+        let data_dir = dir.join("data");
+        let path = dir.join("agent.toml");
+
+        init_agent(
+            &path,
+            Some("ws://127.0.0.1:1/agent/ws".to_string()),
+            None,
+            None,
+            None,
+            Some(data_dir.clone()),
+            false,
+        )
+        .unwrap();
+
+        assert!(path.exists(), "合法配置必须落盘");
+        let cfg = AgentConfig::load(&path).unwrap();
+        assert_eq!(cfg.data_dir, data_dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 单测用的空 sink：吞掉写出的帧，不模拟网络错误。

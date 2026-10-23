@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
@@ -33,12 +33,13 @@ use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use rustboard_common::config::{AdminTlsMode, HubConfig};
 use rustboard_common::control::ControlError;
+use rustboard_common::fsutil;
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 use rustboard_common::tls;
 use rustboard_common::util::{
     arch, boot_id, hostname, now_ms, os_pretty_name, pick_free_port_excluding, port_of,
 };
-use rustboard_common::wire::{codes, EnrollRequest, Frame, Welcome};
+use rustboard_common::wire::{codes, AgentHello, EnrollRequest, Frame, Welcome};
 use rustboard_common::{DEFAULT_HUB_CONFIG, PROTOCOL_VERSION, VERSION};
 use rustboard_core::collect::default_collectors;
 use rustboard_core::storage::sqlite::SqliteStorage;
@@ -54,10 +55,10 @@ mod auth;
 mod cert_rotation;
 mod control;
 mod session;
-use auth::TokenScope;
+use auth::{AuthFailureLimiter, TokenScope};
 use cert_rotation::CertStatus;
 use control::{ControlCommand, ControlSession};
-use session::{SessionRegistry, ShutdownReason};
+use session::{SessionRegistry, ShutdownReason, UnregisterOutcome};
 
 /// 内置本机采集使用的 agent_id，只允许 hub 进程内部写入。
 /// WebSocket 单条消息上限。agent 的正常批次只有几 KB，1 MiB 足够宽裕；
@@ -323,6 +324,8 @@ struct AppState {
     live_cert: Arc<RwLock<CertStatus>>,
     /// 管理 API 的每 IP 固定窗口限速。
     admin_rate: Arc<AdminRateLimiter>,
+    /// 未认证 401 的每来源 IP 固定窗口失败限速（KI-26）。
+    auth_failures: Arc<AuthFailureLimiter>,
 }
 
 /// 由 TLS accept 层注入到每个请求扩展里的对端身份。
@@ -332,6 +335,9 @@ struct AppState {
 struct PeerIdentity(Option<String>);
 
 fn main() -> Result<()> {
+    // KI-21：进程启动最早期收紧 umask 到 0o077（Unix），保证之后由 SQLite/临时文件
+    // 创建的文件默认 0600。此时日志尚未初始化，返回值只用于排障，不依赖日志。
+    let _ = fsutil::set_private_umask();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "rustboard_hub=info,rustboard_common=warn,tower_http=warn".into());
     tracing_subscriber::fmt()
@@ -919,6 +925,38 @@ fn rotate_cert(config: Option<PathBuf>, force: bool, days: Option<u32>) -> Resul
     Ok(())
 }
 
+/// 打开 SQLite 存储（KI-21）。
+///
+/// `data_dir` 是数据库文件的直接父目录时，把它声明为 hub 专用数据目录：旧版本
+/// 遗留的 0755 目录会在打开前被收紧到 0700。数据库在 `data_dir` 之外时走普通
+/// 构造，**绝不 chmod** 与该库无关的父目录（可能是 `/tmp`、`/var/tmp` 等共享目录）。
+fn open_storage(
+    db_path: &FsPath,
+    data_dir: &FsPath,
+    read_pool_size: usize,
+) -> Result<SqliteStorage> {
+    match db_path.parent() {
+        // 空父目录表示相对路径数据库，不能声明为「本程序专用目录」。
+        Some(parent) if !parent.as_os_str().is_empty() && parent == data_dir => {
+            SqliteStorage::open_with_private_data_dir(db_path, read_pool_size, data_dir)
+        }
+        _ => SqliteStorage::open_with_readers(db_path, read_pool_size),
+    }
+}
+
+/// 启动时收紧已存在的证书目录（KI-21）。
+///
+/// 只处理已经存在的目录：证书缺失是另一类需要暴露的启动错误，不能用一个新建的
+/// 空目录把它掩盖成「目录存在但文件不全」。
+fn harden_existing_cert_dir(data_dir: &FsPath) -> Result<()> {
+    let cert_dir = tls::cert_dir(data_dir);
+    if cert_dir.exists() {
+        fsutil::harden_dir(&cert_dir, 0o700)
+            .with_context(|| format!("收紧证书目录权限失败: {}", cert_dir.display()))?;
+    }
+    Ok(())
+}
+
 fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
     // 启动前先做配置自洽性校验，避免把明显错误的有效期/检查周期带到运行期。
     cfg.validate().context("hub 配置校验失败")?;
@@ -929,6 +967,10 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
     // v0.3.3：非回环管理监听禁止明文；required 时校验绑定 IP 在证书 SAN 内。
     // 必须发生在任何监听 / 证书加载之前。
     validate_admin_tls(&cfg)?;
+    // KI-21：数据目录完全归 hub 所有。在打开数据库前创建/收紧到 0700，
+    // 旧版本遗留的 0755 数据目录也会在这里被修正。
+    fsutil::ensure_private_dir(&cfg.data_dir, 0o700)
+        .with_context(|| format!("创建或收紧数据目录失败: {}", cfg.data_dir.display()))?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -936,10 +978,7 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
 
     runtime.block_on(async move {
         // KI-02：写连接 1 条 + 只读连接池，长查询不再阻塞写入与心跳。
-        let storage = Arc::new(SqliteStorage::open_with_readers(
-            &db_path,
-            cfg.read_pool_size,
-        )?);
+        let storage = Arc::new(open_storage(&db_path, &cfg.data_dir, cfg.read_pool_size)?);
         tracing::info!(db = %db_path.display(), read_pool_size = cfg.read_pool_size, "存储已就绪");
 
         // L5：监听前清掉上次异常退出遗留的 online，避免面板长期显示假在线。
@@ -960,6 +999,9 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
 
         // 升级路径：旧安装的 ca.key / server.key 可能是 0644
         tls::harden_hub_material(&cfg.data_dir)?;
+        // KI-21：证书目录同样是 hub 专用目录，旧版本的 0755 在启动时收紧到 0700；
+        // 目录不存在时保持缺失，由后续构建/自愈流程暴露真实错误。
+        harden_existing_cert_dir(&cfg.data_dir)?;
         // 启动自愈：上次续签在写盘中途被中断时，key/cert 会不配套，
         // 直接构建配置会永久失败；这里用 CA 强制重签一对再继续。
         let tls_config = cert_rotation::load_or_repair_tls_config(&cfg)?;
@@ -989,6 +1031,9 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
             ),
             live_cert: live_cert.clone(),
             admin_rate: Arc::new(AdminRateLimiter::from_config(&cfg)),
+            auth_failures: Arc::new(AuthFailureLimiter::new(
+                cfg.admin_auth_failure_limit_per_min,
+            )),
         };
 
         spawn_revoke_watcher(storage.clone(), sessions);
@@ -2607,13 +2652,11 @@ async fn dispatch(mut socket: WebSocket, state: AppState, peer: PeerIdentity) ->
                 reject_and_close(&mut socket, MTLS_REQUIRED, "正式会话必须使用客户端证书").await;
                 bail!("无客户端证书的连接尝试建立正式会话");
             };
-            if !is_valid_agent_id(&hello.agent_id) {
-                reject_and_close(&mut socket, IDENTITY_MISMATCH, "agent_id 非法").await;
-                bail!("agent_id 非法（长度或字符集）");
-            }
-            if !is_log_safe(&hello.hostname, 255) {
-                reject_and_close(&mut socket, IDENTITY_MISMATCH, "hostname 非法").await;
-                bail!("hostname 含控制字符或过长");
+            // KI-19：长度 / 控制字符校验必须在比较 CN、写日志与任何 DB 写入之前。
+            // 失败只记静态字段名，绝不回显原始字段值（防日志注入与放大）。
+            if let Err(field) = validate_hello_metadata(&hello) {
+                reject_and_close(&mut socket, codes::BAD_FRAME, "Hello 元数据非法").await;
+                bail!("Hello 元数据非法: {field}");
             }
             if hello.agent_id == HUB_SELF_AGENT_ID {
                 reject_and_close(&mut socket, IDENTITY_MISMATCH, "网络侧不允许声明 hub-self").await;
@@ -2755,11 +2798,14 @@ async fn handle_enroll(mut socket: WebSocket, state: AppState, req: EnrollReques
     Ok(())
 }
 
-async fn handle_session(
-    mut socket: WebSocket,
-    state: AppState,
-    hello: rustboard_common::wire::AgentHello,
-) -> Result<()> {
+async fn handle_session(mut socket: WebSocket, state: AppState, hello: AgentHello) -> Result<()> {
+    // KI-19 纵深防御：dispatch 已校验一次，但任何进入会话的路径都不得把非法
+    // 元数据写进 DB / 日志。失败同样只记静态字段名。
+    if let Err(field) = validate_hello_metadata(&hello) {
+        reject_and_close(&mut socket, codes::BAD_FRAME, "Hello 元数据非法").await;
+        bail!("Hello 元数据非法: {field}");
+    }
+
     let agent_id = hello.agent_id.clone();
 
     if protocol_gate(hello.protocol).is_some() {
@@ -2838,17 +2884,33 @@ async fn handle_session(
     control_expire.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     state.storage.upsert_agent(&record)?;
-    // M3：登记 agent 实际启用的控制能力。未知能力在入库前就被忽略，
-    // 数据库里只会有本版本认识的四个字符串。
+    // M3 + KI-24：能力先登记到本条连接；只有它仍是该 agent 的最新连接时才写库。
+    // 未知能力在入库前就被忽略，数据库里只会有本版本认识的四个字符串。
+    // 旧连接晚到的 Hello 只更新自己的记录，返回 false 且不覆盖新连接的能力。
     let capabilities = control::sanitize_agent_capabilities(&hello.capabilities);
-    state
-        .storage
-        .upsert_agent_control(&agent_id, &capabilities, now)?;
-    if !capabilities.is_empty() {
-        tracing::info!(
+    let persisted = state.sessions.set_capabilities(
+        &agent_id,
+        handle.conn_id,
+        capabilities,
+        |capabilities| {
+            state
+                .storage
+                .upsert_agent_control(&agent_id, capabilities, now)?;
+            if !capabilities.is_empty() {
+                tracing::info!(
+                    agent = %agent_id,
+                    capabilities = capabilities.len(),
+                    "agent 控制能力已登记"
+                );
+            }
+            Ok(())
+        },
+    )?;
+    if !persisted {
+        tracing::debug!(
             agent = %agent_id,
-            capabilities = capabilities.len(),
-            "agent 控制能力已登记"
+            conn_id = handle.conn_id,
+            "旧连接晚到的 Hello 能力仅登记到会话，不写库"
         );
     }
     // upsert_agent 会把状态写回 online；若吊销恰好发生在握手期间，立即恢复 revoked。
@@ -3455,13 +3517,15 @@ impl SessionCleanup {
         }
     }
 
-    /// 注销本连接；只有「该 agent 的最后一条连接」才写状态。
+    /// 注销本连接；最后一条连接写状态，最新连接断开时回退控制能力。
     ///
-    /// 关键点：`unregister_last_and_run` 在 per-agent slot 锁内执行回调，而同一
+    /// 关键点：`unregister_with_fallback` 在 per-agent slot 锁内执行两个回调，而同一
     /// agent 的新连接 `register` 也要拿这把锁。因此「查吊销 + 写 offline/revoked」
-    /// 与「新连接注册」严格串行：回调先完成，新连接才插入，调用方随后写 online。
-    /// 旧 offline 不可能落在新 online 之后，也不需要再调用 `has_active` 二次检查
-    /// （slot 已空且锁仍未释放，新连接插不进来）。
+    /// 以及「回退能力写库」都与「新连接注册」严格串行：回调先完成，新连接才插入，
+    /// 调用方随后写 online。旧 offline / 旧能力不可能落在新连接之后，也不需要再
+    /// 调用 `has_active` 二次检查（slot 已空且锁仍未释放，新连接插不进来）。
+    ///
+    /// 两个回调都只做单行数据库写入；失败处理与日志全部移到 slot 锁外。
     fn finish(&mut self) {
         if self.finished {
             return;
@@ -3470,13 +3534,17 @@ impl SessionCleanup {
 
         let agent_id = self.agent_id.clone();
         let storage = self.storage.clone();
-        // 回调内只做一次吊销查询 + 一次单行状态写入；日志与错误处理全部移到
-        // slot 锁外，避免在临界区里做任何可能阻塞的操作。
+        let fallback_agent_id = self.agent_id.clone();
+        let fallback_storage = self.storage.clone();
+        // 回调内只记录结果，避免在临界区里打日志。
         let mut revoked_error: Option<anyhow::Error> = None;
         let mut written: Option<(&'static str, anyhow::Result<()>)> = None;
-        let removed = self
-            .sessions
-            .unregister_last_and_run(&self.agent_id, self.conn_id, || {
+        // 能力回退写库的结果：剩余连接能力条数 + best-effort 写入结果。
+        let mut fallback: Option<(usize, anyhow::Result<()>)> = None;
+        let outcome = self.sessions.unregister_with_fallback(
+            &self.agent_id,
+            self.conn_id,
+            || {
                 // revoked 优先级最高：先查吊销，命中写 revoked，否则才写 offline。
                 let revoked = match storage.is_revoked(&agent_id) {
                     Ok(revoked) => revoked,
@@ -3487,13 +3555,27 @@ impl SessionCleanup {
                 };
                 let status = if revoked { "revoked" } else { "offline" };
                 written = Some((status, storage.set_status(&agent_id, status, now_ms())));
-            });
+            },
+            |capabilities| {
+                // KI-24：最新连接断开且仍有剩余连接，best-effort 回退能力。
+                // 失败只记录，不影响连接清理与采集。
+                let result = fallback_storage.upsert_agent_control(
+                    &fallback_agent_id,
+                    capabilities,
+                    now_ms(),
+                );
+                fallback = Some((capabilities.len(), result));
+            },
+        );
 
-        if !removed {
+        if matches!(
+            outcome,
+            UnregisterOutcome::NotRegistered | UnregisterOutcome::Removed
+        ) {
             tracing::debug!(
                 agent = %self.agent_id,
                 conn_id = self.conn_id,
-                "旧会话结束，不修改在线状态"
+                "旧会话结束，不修改在线状态与控制能力"
             );
             return;
         }
@@ -3512,6 +3594,28 @@ impl SessionCleanup {
                     tracing::warn!(agent = %self.agent_id, error = %err, "更新 agent 状态失败");
                 }
             }
+        }
+        match fallback {
+            Some((capabilities, result)) => match result {
+                Ok(()) => tracing::info!(
+                    agent = %self.agent_id,
+                    capabilities,
+                    "控制能力已回退到剩余连接"
+                ),
+                Err(err) => tracing::warn!(
+                    agent = %self.agent_id,
+                    error = %err,
+                    "回退控制能力失败，保留原值"
+                ),
+            },
+            None if matches!(outcome, UnregisterOutcome::LatestRemovedWithoutFallback) => {
+                // 剩余连接都还没登记能力：保留数据库里的历史能力，绝不写空。
+                tracing::debug!(
+                    agent = %self.agent_id,
+                    "剩余连接未登记控制能力，保留历史能力"
+                );
+            }
+            None => {}
         }
     }
 }
@@ -3639,6 +3743,40 @@ fn log_safe_error(err: &impl std::fmt::Display) -> String {
 /// 可选字段：允许为空，非空时同样要满足日志安全约束。
 fn is_log_safe_optional(value: &str, max_len: usize) -> bool {
     value.is_empty() || is_log_safe(value, max_len)
+}
+
+/// KI-19：Hello 元数据长度与控制字符校验。
+///
+/// - 长度按 UTF-8 **字节数**计算；
+/// - 所有字段拒绝控制字符（含 `\n`、`\t`、NUL），防止日志注入；
+/// - `agent_id` 沿用更严格的 [`is_valid_agent_id`]（非空、≤64 字节、ASCII 安全字符集）；
+/// - `name` / `os` / `arch` / `version` / `boot_id` 允许为空，`hostname` 不允许为空。
+///
+/// 出错时返回首个非法字段的**静态**名称，仅供内部日志使用；绝不携带字段值，
+/// 避免把攻击者可控内容写进日志。
+fn validate_hello_metadata(hello: &AgentHello) -> Result<(), &'static str> {
+    if !is_valid_agent_id(&hello.agent_id) {
+        return Err("agent_id");
+    }
+    if !is_log_safe_optional(&hello.name, 128) {
+        return Err("name");
+    }
+    if !is_log_safe(&hello.hostname, 255) {
+        return Err("hostname");
+    }
+    if !is_log_safe_optional(&hello.os, 64) {
+        return Err("os");
+    }
+    if !is_log_safe_optional(&hello.arch, 32) {
+        return Err("arch");
+    }
+    if !is_log_safe_optional(&hello.version, 64) {
+        return Err("version");
+    }
+    if !is_log_safe_optional(&hello.boot_id, 128) {
+        return Err("boot_id");
+    }
+    Ok(())
 }
 
 fn problem(code: &str, message: &str) -> Frame {
@@ -3769,6 +3907,132 @@ mod tests {
             }
         }
         assert!(protocol_gate(PROTOCOL_VERSION).is_none());
+    }
+
+    /// KI-19：构造一份全字段合法的 Hello，供边界测试改写单个字段。
+    fn valid_hello() -> AgentHello {
+        AgentHello {
+            agent_id: "agent-1".to_string(),
+            name: "测试节点".to_string(),
+            hostname: "node-1.example".to_string(),
+            os: "Linux".to_string(),
+            arch: "x86_64".to_string(),
+            version: "0.3.4".to_string(),
+            protocol: PROTOCOL_VERSION,
+            boot_id: "boot-1".to_string(),
+            epoch: 7,
+            secret: "s".repeat(64),
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn set_hello_field(hello: &mut AgentHello, field: &'static str, value: String) {
+        match field {
+            "agent_id" => hello.agent_id = value,
+            "name" => hello.name = value,
+            "hostname" => hello.hostname = value,
+            "os" => hello.os = value,
+            "arch" => hello.arch = value,
+            "version" => hello.version = value,
+            "boot_id" => hello.boot_id = value,
+            other => panic!("未知 Hello 字段: {other}"),
+        }
+    }
+
+    /// KI-19：全字段合法（name 为 UTF-8 中文）的 Hello 必须通过。
+    #[test]
+    fn ki19_hello_accepts_full_valid_metadata() {
+        assert_eq!(validate_hello_metadata(&valid_hello()), Ok(()));
+    }
+
+    /// KI-19：每个字段按 UTF-8 字节长度卡边界，max 通过、max+1 拒绝；
+    /// `agent_id` 沿用 64 字节的 ASCII 安全字符集规则（不放宽到 128）。
+    #[test]
+    fn ki19_hello_field_length_limits() {
+        for (field, max) in [
+            ("agent_id", 64),
+            ("name", 128),
+            ("hostname", 255),
+            ("os", 64),
+            ("arch", 32),
+            ("version", 64),
+            ("boot_id", 128),
+        ] {
+            let mut hello = valid_hello();
+            set_hello_field(&mut hello, field, "a".repeat(max));
+            assert_eq!(
+                validate_hello_metadata(&hello),
+                Ok(()),
+                "{field} 恰好 {max} 字节必须通过"
+            );
+
+            set_hello_field(&mut hello, field, "a".repeat(max + 1));
+            assert_eq!(
+                validate_hello_metadata(&hello),
+                Err(field),
+                "{field} 超过 {max} 字节必须拒绝"
+            );
+        }
+    }
+
+    /// KI-19：`agent_id` / `hostname` 空值必须拒绝；`name` / `os` / `arch` /
+    /// `version` / `boot_id` 允许为空。
+    #[test]
+    fn ki19_hello_empty_field_rules() {
+        let mut hello = valid_hello();
+        hello.agent_id.clear();
+        assert_eq!(validate_hello_metadata(&hello), Err("agent_id"));
+
+        let mut hello = valid_hello();
+        hello.hostname.clear();
+        assert_eq!(validate_hello_metadata(&hello), Err("hostname"));
+
+        for field in ["name", "os", "arch", "version", "boot_id"] {
+            let mut hello = valid_hello();
+            set_hello_field(&mut hello, field, String::new());
+            assert_eq!(validate_hello_metadata(&hello), Ok(()), "{field} 允许为空");
+        }
+    }
+
+    /// KI-19：所有字段都拒绝控制字符；返回值只能是静态字段名，
+    /// 不得包含任何攻击者提供的原始内容。
+    #[test]
+    fn ki19_hello_rejects_control_chars_without_echoing_values() {
+        for field in [
+            "agent_id", "name", "hostname", "os", "arch", "version", "boot_id",
+        ] {
+            for control in ['\n', '\t', '\0', '\r'] {
+                let mut hello = valid_hello();
+                let evil = format!("evil{control}INFO forged");
+                set_hello_field(&mut hello, field, evil.clone());
+
+                let err =
+                    validate_hello_metadata(&hello).expect_err("含控制字符的元数据必须被拒绝");
+                assert_eq!(err, field, "{field} 必须返回自身的静态字段名");
+                assert!(
+                    !err.contains(&control.to_string()),
+                    "{field} 的错误串不得包含控制字符"
+                );
+                assert!(!err.contains("evil"), "{field} 的错误串不得回显原值");
+                assert!(!err.contains("INFO forged"), "{field} 的错误串不得回显原值");
+                assert!(!evil.contains(err), "错误串不得是攻击者可控内容的一部分");
+            }
+        }
+    }
+
+    /// KI-19：长度按 UTF-8 字节而不是字符数计算；合法中文 name 必须通过。
+    #[test]
+    fn ki19_hello_length_is_utf8_bytes() {
+        let mut hello = valid_hello();
+        // 42 个「中」= 126 字节，再补 2 个 ASCII，恰好 128 字节。
+        hello.name = format!("{}ab", "中".repeat(42));
+        assert_eq!(hello.name.len(), 128);
+        assert_eq!(validate_hello_metadata(&hello), Ok(()));
+
+        // 43 个「中」= 129 字节：字符数只有 43，但按字节已超限。
+        hello.name = "中".repeat(43);
+        assert_eq!(hello.name.len(), 129);
+        assert_eq!(validate_hello_metadata(&hello), Err("name"));
     }
 
     /// M4：写操作永不完成时必须在超时后返回错误，不能把会话任务挂死。
@@ -4216,6 +4480,9 @@ mod tests {
             ..HubConfig::default()
         };
         let admin_rate = Arc::new(AdminRateLimiter::from_config(&cfg));
+        let auth_failures = Arc::new(AuthFailureLimiter::new(
+            cfg.admin_auth_failure_limit_per_min,
+        ));
         let state = AppState {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
             cfg: Arc::new(cfg),
@@ -4224,6 +4491,7 @@ mod tests {
             renewal: RenewalContext::new(tls::cert_dir(&dir), 90),
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
+            auth_failures,
         };
         let token = "enroll-token-bad-csr";
         let now = now_ms();
@@ -4271,6 +4539,9 @@ mod tests {
             ..HubConfig::default()
         };
         let admin_rate = Arc::new(AdminRateLimiter::from_config(&cfg));
+        let auth_failures = Arc::new(AuthFailureLimiter::new(
+            cfg.admin_auth_failure_limit_per_min,
+        ));
         let state = AppState {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
             cfg: Arc::new(cfg),
@@ -4279,6 +4550,7 @@ mod tests {
             renewal: RenewalContext::new(tls::cert_dir(&dir), 90),
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
+            auth_failures,
         };
 
         let token = "enroll-token-value";
@@ -4563,6 +4835,9 @@ mod tests {
 
     fn hub_state_with(cfg: HubConfig) -> AppState {
         let admin_rate = Arc::new(AdminRateLimiter::from_config(&cfg));
+        let auth_failures = Arc::new(AuthFailureLimiter::new(
+            cfg.admin_auth_failure_limit_per_min,
+        ));
         AppState {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
             cfg: Arc::new(cfg),
@@ -4571,6 +4846,7 @@ mod tests {
             renewal: RenewalContext::new(PathBuf::from("/tmp/rb-hub-test-unused-ca"), 90),
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
+            auth_failures,
         }
     }
 
@@ -6721,6 +6997,33 @@ mod tests {
             .status
     }
 
+    /// KI-24：按 `handle_session` 的方式登记能力（slot 锁内写库），返回是否为最新连接。
+    fn register_connection_capabilities(
+        storage: &SqliteStorage,
+        sessions: &SessionRegistry,
+        agent_id: &str,
+        conn_id: u64,
+        capabilities: &[&str],
+    ) -> bool {
+        let capabilities = capabilities
+            .iter()
+            .map(|capability| capability.to_string())
+            .collect::<Vec<_>>();
+        sessions
+            .set_capabilities(agent_id, conn_id, capabilities, |capabilities| {
+                storage.upsert_agent_control(agent_id, capabilities, now_ms())
+            })
+            .expect("写入控制能力失败")
+    }
+
+    fn stored_control_capabilities(storage: &SqliteStorage, agent_id: &str) -> Vec<String> {
+        storage
+            .get_agent_control(agent_id)
+            .expect("读取控制能力失败")
+            .expect("能力记录必须存在")
+            .capabilities
+    }
+
     /// c. 真正最后一条连接断开：回调执行一次，DB 置 offline；`finished` 保证 Drop
     /// 只清理一次，之后新连接写的 online 不会被二次清理覆盖。
     #[test]
@@ -6783,6 +7086,197 @@ mod tests {
             "旧连接已不在注册表"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// KI-24：能力以最新连接为准；最新连接断开回退旧连接，全部断开保留历史并 offline。
+    #[test]
+    fn session_cleanup_falls_back_to_remaining_connection_capabilities() {
+        let (dir, storage, sessions) = session_cleanup_fixture("cleanup-capabilities");
+        storage.upsert_agent(&test_agent("a1")).unwrap();
+
+        let old = sessions.register("a1");
+        assert!(register_connection_capabilities(
+            &storage,
+            &sessions,
+            "a1",
+            old.conn_id,
+            &["docker"],
+        ));
+        assert_eq!(
+            stored_control_capabilities(&storage, "a1"),
+            vec!["docker".to_string()]
+        );
+
+        let new = sessions.register("a1");
+        assert!(register_connection_capabilities(
+            &storage,
+            &sessions,
+            "a1",
+            new.conn_id,
+            &["systemd", "logs"],
+        ));
+        assert_eq!(
+            stored_control_capabilities(&storage, "a1"),
+            vec!["systemd".to_string(), "logs".to_string()]
+        );
+
+        // 最新连接断开：回退到旧连接已登记的能力，agent 仍在线上。
+        let mut new_cleanup = SessionCleanup::new(
+            storage.clone(),
+            sessions.clone(),
+            "a1".to_string(),
+            new.conn_id,
+        );
+        new_cleanup.finish();
+        assert!(sessions.has_active("a1"), "旧连接仍在线");
+        assert_eq!(agent_status(&storage, "a1"), "online");
+        assert_eq!(
+            stored_control_capabilities(&storage, "a1"),
+            vec!["docker".to_string()],
+            "最新连接断开后必须回退到剩余连接的能力"
+        );
+
+        // 最后一条连接断开：offline，并保留最后能力作为历史。
+        let mut old_cleanup = SessionCleanup::new(
+            storage.clone(),
+            sessions.clone(),
+            "a1".to_string(),
+            old.conn_id,
+        );
+        old_cleanup.finish();
+        assert!(!sessions.has_active("a1"));
+        assert_eq!(agent_status(&storage, "a1"), "offline");
+        assert_eq!(
+            stored_control_capabilities(&storage, "a1"),
+            vec!["docker".to_string()],
+            "无剩余连接时保留历史能力，不写空"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// KI-24：旧连接晚到的 Hello 不覆盖新连接写入的能力。
+    #[test]
+    fn stale_connection_hello_does_not_overwrite_latest_capabilities() {
+        let (dir, storage, sessions) = session_cleanup_fixture("cleanup-capabilities-stale");
+        storage.upsert_agent(&test_agent("a1")).unwrap();
+
+        let old = sessions.register("a1");
+        assert!(register_connection_capabilities(
+            &storage,
+            &sessions,
+            "a1",
+            old.conn_id,
+            &["docker"],
+        ));
+
+        let new = sessions.register("a1");
+        assert!(register_connection_capabilities(
+            &storage,
+            &sessions,
+            "a1",
+            new.conn_id,
+            &["systemd"],
+        ));
+        assert_eq!(
+            stored_control_capabilities(&storage, "a1"),
+            vec!["systemd".to_string()]
+        );
+
+        // 旧连接晚到的 Hello：只登记到会话，返回 false，不写库。
+        assert!(!register_connection_capabilities(
+            &storage,
+            &sessions,
+            "a1",
+            old.conn_id,
+            &["logs", "process"],
+        ));
+        assert_eq!(
+            stored_control_capabilities(&storage, "a1"),
+            vec!["systemd".to_string()],
+            "旧连接 Hello 不得覆盖新连接的能力"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // KI-21：hub 数据目录 / 证书目录接入
+    // ------------------------------------------------------------------
+
+    /// 库在 data_dir 内：走私有构造并收紧旧 0755 数据目录；库在 data_dir 外：
+    /// 走普通构造，绝不 chmod 无关的父目录。
+    #[cfg(unix)]
+    #[test]
+    fn hub_storage_hardens_only_declared_data_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data_dir = temp_dir("hub-storage-inside");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let inside_db = data_dir.join("hub.db");
+        let storage = open_storage(&inside_db, &data_dir, 2).expect("打开数据目录内的数据库失败");
+        drop(storage);
+        assert_eq!(
+            std::fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "data_dir 内的数据库必须把旧 0755 数据目录收紧到 0700"
+        );
+        assert_eq!(
+            std::fs::metadata(&inside_db).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "数据库文件必须是 0600"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+
+        // 数据库在 data_dir 之外：不得收紧（更不得创建）声明的数据目录。
+        let db_parent = temp_dir("hub-storage-outside");
+        std::fs::create_dir_all(&db_parent).unwrap();
+        std::fs::set_permissions(&db_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let outside_db = db_parent.join("hub.db");
+        let declared_data_dir = db_parent.join("declared-data");
+        let storage =
+            open_storage(&outside_db, &declared_data_dir, 2).expect("打开数据目录外的数据库失败");
+        drop(storage);
+        assert_eq!(
+            std::fs::metadata(&db_parent).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "未声明为数据目录的父目录不得被 chmod"
+        );
+        assert!(
+            !declared_data_dir.exists(),
+            "data_dir 外的数据库不得创建/改动声明的数据目录"
+        );
+        assert_eq!(
+            std::fs::metadata(&outside_db).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "数据库文件仍必须是 0600"
+        );
+        let _ = std::fs::remove_dir_all(&db_parent);
+    }
+
+    /// KI-21：证书目录只在已存在时收紧，缺失时不得创建空目录掩盖错误。
+    #[cfg(unix)]
+    #[test]
+    fn hub_hardens_existing_cert_dir_without_creating_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data_dir = temp_dir("hub-cert-dir-hardening");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        harden_existing_cert_dir(&data_dir).expect("缺失证书目录不是错误");
+        assert!(
+            !tls::cert_dir(&data_dir).exists(),
+            "缺失的证书目录不得被创建"
+        );
+
+        let cert_dir = tls::cert_dir(&data_dir);
+        std::fs::create_dir_all(&cert_dir).unwrap();
+        std::fs::set_permissions(&cert_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        harden_existing_cert_dir(&data_dir).expect("收紧证书目录失败");
+        assert_eq!(
+            std::fs::metadata(&cert_dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "已存在的 0755 证书目录必须收紧到 0700"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// e. revoked 最高优先级：清理前已吊销，回调命中吊销写 revoked。
@@ -8174,5 +8668,194 @@ mod tests {
             "该配置在 run 时必须被拒绝"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // v0.3.4 KI-26：未认证 401 的每来源 IP 失败限速
+    // ------------------------------------------------------------------
+
+    /// 认证失败限速测试状态：默认失败阈值 60；关闭已认证请求限速，
+    /// 避免 61 次请求触发另一套（认证成功后）的 429 干扰断言。
+    fn v034_auth_state(legacy_token: &str) -> AppState {
+        hub_state_with(HubConfig {
+            admin_token: legacy_token.to_string(),
+            admin_rate_limit_per_min: 0,
+            admin_write_rate_limit_per_min: 0,
+            ..HubConfig::default()
+        })
+    }
+
+    /// 错误 token 前 60 次 401（不写审计），第 61 次 429 + Retry-After；
+    /// 旧 admin_token 在超限后仍是应急入口（200），命中后清空失败计数。
+    #[tokio::test]
+    async fn v034_auth_failure_limit_429_and_legacy_bypass() {
+        let legacy = "v034-legacy-admin-token-0123456789";
+        let state = v034_auth_state(legacy);
+        let router = admin_router(state.clone());
+
+        for attempt in 1..=60 {
+            let (status, headers, body) =
+                admin_call(&router, "GET", "/api/v1/agents", Some("wrong-token"), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "第 {attempt} 次必须 401");
+            assert_eq!(headers.get(header::WWW_AUTHENTICATE).unwrap(), "Bearer");
+            assert_eq!(
+                json_body(&body),
+                serde_json::json!({ "error": "unauthorized" })
+            );
+            assert!(
+                !String::from_utf8_lossy(&body).contains("wrong-token"),
+                "401 不得回显 token"
+            );
+        }
+        assert!(
+            state
+                .storage
+                .list_audit(10, None, None, None)
+                .unwrap()
+                .is_empty(),
+            "401 不得写审计"
+        );
+
+        // 第 61 次：429 固定 body + Retry-After(1..=60)，不回显 token，不写审计。
+        let (status, headers, body) =
+            admin_call(&router, "GET", "/api/v1/agents", Some("wrong-token"), None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            json_body(&body),
+            serde_json::json!({ "error": "rate_limited" })
+        );
+        assert!(!String::from_utf8_lossy(&body).contains("wrong-token"));
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        let retry: u64 = headers
+            .get(header::RETRY_AFTER)
+            .expect("429 必须带 Retry-After")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&retry), "Retry-After 非法: {retry}");
+        assert!(
+            state
+                .storage
+                .list_audit(10, None, None, None)
+                .unwrap()
+                .is_empty(),
+            "429 不得写审计"
+        );
+
+        // 旧 admin_token：超限后仍必须 200，不受失败限速影响。
+        let (status, _, _) = admin_call(&router, "GET", "/api/v1/agents", Some(legacy), None).await;
+        assert_eq!(status, StatusCode::OK, "旧 admin_token 必须绕过失败限速");
+
+        // 命中后清空该 IP 计数：再次错误 token 重新从 401 开始。
+        let (status, _, _) =
+            admin_call(&router, "GET", "/api/v1/agents", Some("wrong-token"), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// 阈值前合法 scoped token 必须 200；超限后即使 token 合法也 429，
+    /// 且不查库（`last_used_at` 保持为空可证明未执行 `authenticate_api_token`）。
+    #[tokio::test]
+    async fn v034_scoped_token_before_limit_ok_and_after_limit_no_db() {
+        let state = hub_state_with(HubConfig {
+            admin_token: "v034-legacy-admin-token-0123456789".to_string(),
+            admin_auth_failure_limit_per_min: 3,
+            admin_rate_limit_per_min: 0,
+            admin_write_rate_limit_per_min: 0,
+            ..HubConfig::default()
+        });
+        let within = v6_seed_token(&state, "within-limit", "read");
+        let blocked = v6_seed_token(&state, "above-limit", "read");
+        let router = admin_router(state.clone());
+
+        // 2 次失败 < 3：合法 scoped token 必须 200，并清空失败计数。
+        for _ in 0..2 {
+            let (status, _, _) =
+                admin_call(&router, "GET", "/api/v1/agents", Some("wrong"), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        let (status, _, _) =
+            admin_call(&router, "GET", "/api/v1/agents", Some(&within), None).await;
+        assert_eq!(status, StatusCode::OK, "阈值前合法 scoped token 必须放行");
+
+        // 成功认证清零后重新累计 3 次失败，达到阈值。
+        for _ in 0..3 {
+            let (status, _, _) =
+                admin_call(&router, "GET", "/api/v1/agents", Some("wrong"), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        let blocked_last_used = || {
+            state
+                .storage
+                .list_api_tokens()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.name == "above-limit")
+                .expect("token 必须存在")
+                .last_used_at
+        };
+        assert_eq!(blocked_last_used(), None, "从未成功认证过");
+
+        // 超限后合法 scoped token：429 + Retry-After，且不查库、不回显 token。
+        let (status, headers, body) =
+            admin_call(&router, "GET", "/api/v1/agents", Some(&blocked), None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            json_body(&body),
+            serde_json::json!({ "error": "rate_limited" })
+        );
+        assert!(
+            !String::from_utf8_lossy(&body).contains(&blocked),
+            "429 不得回显 token"
+        );
+        let retry: u64 = headers
+            .get(header::RETRY_AFTER)
+            .expect("429 必须带 Retry-After")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&retry), "Retry-After 非法: {retry}");
+        assert_eq!(
+            blocked_last_used(),
+            None,
+            "超限路径不得执行查库（last_used_at 不能更新）"
+        );
+    }
+
+    /// 缺失 / 格式错误的 Bearer 也按来源 IP 计失败；达到阈值后同样 429。
+    #[tokio::test]
+    async fn v034_missing_and_malformed_bearer_are_rate_limited() {
+        let state = hub_state_with(HubConfig {
+            admin_token: "v034-legacy-admin-token-0123456789".to_string(),
+            admin_auth_failure_limit_per_min: 2,
+            admin_rate_limit_per_min: 0,
+            admin_write_rate_limit_per_min: 0,
+            ..HubConfig::default()
+        });
+        let router = admin_router(state);
+
+        for _ in 0..2 {
+            let (status, _, _) = admin_call(&router, "GET", "/api/v1/agents", None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        for _ in 0..2 {
+            let (status, headers, body) =
+                admin_call(&router, "GET", "/api/v1/agents", None, None).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(json_body(&body)["error"], "rate_limited");
+            assert!(headers.contains_key(header::RETRY_AFTER));
+        }
+
+        // 格式错误（没有 Bearer scheme）同样会在限速检查处直接 429。
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/v1/agents")
+            .header(header::AUTHORIZATION, "wrong-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = call_router(&router, request).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

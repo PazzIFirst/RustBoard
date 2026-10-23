@@ -8,6 +8,9 @@
 //! - 状态回调在 per-agent slot 锁内执行：同一 agent 的新连接 `register` 要拿同一把
 //!   slot 锁，因此它会等这次单行写库完成后才插入连接，调用方随后写 online。
 //!   「旧 offline」不可能落在「新 online」之后。
+//! - 控制能力（KI-24）随连接保存：只有**最新连接**（`conn_id` 最大）的 Hello 才写库，
+//!   旧连接晚到的 Hello 只更新自己；最新连接断开且仍有剩余连接时，回退到剩余连接中
+//!   已登记的能力；最后一条连接断开时保留历史能力，不做能力写入。
 //! - `shutdown` / `reconfigure` 对该 agent 的全部连接发取消信号，传播不依赖
 //!   「哪条是最新连接」。
 //!
@@ -55,11 +58,17 @@ struct SlotState {
     connections: HashMap<u64, ConnectionEntry>,
 }
 
-/// 单条连接持有的信号：关闭原因 + 控制命令队列。
+/// 单条连接持有的信号：关闭原因 + 控制命令队列 + 已登记的控制能力。
 struct ConnectionEntry {
     shutdown: watch::Sender<ShutdownReason>,
     /// M3：管理 API 通过它把控制命令投递给该连接所属的会话任务。
     control: mpsc::Sender<ControlCommand>,
+    /// KI-24：该连接 Hello 上报并清洗后的能力。
+    ///
+    /// `None` 表示这条连接**尚未登记** Hello 能力（刚 `register`，Hello 还在路上）；
+    /// `Some(vec![])` 表示已登记且确实没有任何能力。两者语义不同：前者不能用来
+    /// 回退写库，否则「新连接刚注册、旧连接断开」会误清空数据库里的历史能力。
+    capabilities: Option<Vec<String>>,
 }
 
 /// 会话关闭原因。
@@ -69,6 +78,23 @@ pub enum ShutdownReason {
     Revoke,
     /// 配置变化（采样间隔）：回 `Close(1000)` 正常关闭，agent 随后重连。
     Reconfigure,
+}
+
+/// [`SessionRegistry::unregister_with_fallback`] 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnregisterOutcome {
+    /// 连接不在注册表里（重复注销、未知 `conn_id` 或 agent 从未注册）。
+    NotRegistered,
+    /// 连接已注销，但它不是最新连接，未触发能力回退。
+    Removed,
+    /// 连接已注销；它是最新连接，且剩余连接里有已登记的能力，
+    /// `on_latest_removed` 已收到该能力（回调内已尝试写库）。
+    LatestRemoved,
+    /// 连接已注销；它是最新连接，但剩余连接都没登记能力。
+    /// 不写库，保留数据库里的历史能力。
+    LatestRemovedWithoutFallback,
+    /// 连接已注销且是该 agent 的最后一条连接，`on_empty` 已执行。
+    Empty,
 }
 
 /// 一次注册的凭据：连接编号 + 取消信号接收端 + 控制命令接收端。
@@ -143,9 +169,15 @@ impl SessionRegistry {
         let slot = self.agent_slot_or_create(agent_id);
         let active = {
             let mut state = slot.lock();
-            state
-                .connections
-                .insert(conn_id, ConnectionEntry { shutdown, control });
+            state.connections.insert(
+                conn_id,
+                ConnectionEntry {
+                    shutdown,
+                    control,
+                    // 注册时能力未知：Hello 能力由 `set_capabilities` 在握手时登记。
+                    capabilities: None,
+                },
+            );
             state.connections.len()
         };
         tracing::debug!(agent = %agent_id, conn_id, active, "agent 会话已注册");
@@ -171,6 +203,84 @@ impl SessionRegistry {
             .map(|(_, connection)| connection.control.clone())
     }
 
+    /// 登记某条连接 Hello 上报的控制能力（KI-24）。
+    ///
+    /// 能力总是记录到该连接自己的 [`ConnectionEntry`]；只有它仍是该 agent 的
+    /// **最新连接**（`conn_id` 最大）时才调用 `persist` 写库。`persist` 在 per-agent
+    /// slot 锁内执行：`register` 与清理回调都要拿同一把锁，因此不存在
+    /// 「旧连接读到自己是最大 → 新连接注册并写库 → 旧连接再写库」的覆盖窗口。
+    ///
+    /// 返回值：
+    /// - `Ok(true)`：连接存在且是最新连接，`persist` 已成功执行；
+    /// - `Ok(false)`：连接不存在，或它不是最新连接（能力只记录、不写库）；
+    /// - `Err(_)`：最新连接的能力已记录，但 `persist` 写库失败；调用方应视为
+    ///   握手失败并关闭会话（随后的清理回退会尝试恢复剩余连接的能力）。
+    pub fn set_capabilities<F>(
+        &self,
+        agent_id: &str,
+        conn_id: u64,
+        capabilities: Vec<String>,
+        persist: F,
+    ) -> anyhow::Result<bool>
+    where
+        F: FnOnce(&[String]) -> anyhow::Result<()>,
+    {
+        // 锁顺序：先取 slot（释放全局 map 锁），再锁 slot。
+        let Some(slot) = self.agent_slot(agent_id) else {
+            return Ok(false);
+        };
+        let mut state = slot.lock();
+        let is_latest = state.connections.keys().max().copied() == Some(conn_id);
+        let Some(entry) = state.connections.get_mut(&conn_id) else {
+            return Ok(false);
+        };
+        entry.capabilities = Some(capabilities);
+        if !is_latest {
+            // 旧连接晚到的 Hello：记录到该连接即可，绝不覆盖最新连接的库值。
+            return Ok(false);
+        }
+        let Some(capabilities) = entry.capabilities.as_deref() else {
+            // 不可达：上面刚写入 `Some`；保守地按「未登记」处理，不写库。
+            return Ok(false);
+        };
+        // 仍持有 slot 锁：新连接插不进来，旧写不可能落在新写之后。
+        persist(capabilities)?;
+        Ok(true)
+    }
+
+    /// 当前**最新连接**已登记的能力（KI-24）。
+    ///
+    /// 无连接、或最新连接尚未登记 Hello 能力时返回 `None`（不会用旧连接的能力
+    /// 冒充最新连接）；已登记但没有任何能力时返回 `Some(vec![])`。
+    ///
+    /// 生产路径目前只登记能力（`set_capabilities`），查询由测试使用；保留公共入口
+    /// 供后续管理面直接读内存态，避免为「查看能力」再查一次库。
+    #[allow(dead_code)]
+    pub fn latest_capabilities(&self, agent_id: &str) -> Option<Vec<String>> {
+        // 锁顺序：先取 slot（释放全局 map 锁），再锁 slot。
+        let slot = self.agent_slot(agent_id)?;
+        let state = slot.lock();
+        state
+            .connections
+            .iter()
+            .max_by_key(|(conn_id, _)| **conn_id)
+            .and_then(|(_, entry)| entry.capabilities.clone())
+    }
+
+    /// 指定连接是否存在且是该 agent 的当前最新连接。
+    ///
+    /// 与 `latest_capabilities` 一样目前主要供测试断言；保留为公共查询入口。
+    #[allow(dead_code)]
+    pub fn is_latest(&self, agent_id: &str, conn_id: u64) -> bool {
+        // 锁顺序：先取 slot（释放全局 map 锁），再锁 slot。
+        let Some(slot) = self.agent_slot(agent_id) else {
+            return false;
+        };
+        let state = slot.lock();
+        state.connections.contains_key(&conn_id)
+            && state.connections.keys().max().copied() == Some(conn_id)
+    }
+
     /// 注销连接，并在「这是该 agent 最后一条连接」时**在 slot 锁内**执行一次回调。
     ///
     /// 返回值：
@@ -185,20 +295,70 @@ impl SessionRegistry {
     where
         F: FnOnce(),
     {
+        // 兼容入口：不做能力回退，回调只在最后一条连接时执行（与旧语义一致）。
+        self.unregister_with_fallback(agent_id, conn_id, callback, |_| {})
+            == UnregisterOutcome::Empty
+    }
+
+    /// 注销连接，并按「是否最新连接」决定是否回退控制能力（KI-24）。
+    ///
+    /// - 已无剩余连接：在 slot 锁内执行 `on_empty`（现有 offline/revoked 原子逻辑），
+    ///   不写能力，保留数据库里的最后能力作为历史；
+    /// - 被移除的是最新连接且仍有剩余连接：取剩余连接中 `conn_id` 最大且已登记
+    ///   能力的那条，在 slot 锁内执行 `on_latest_removed(&capabilities)`；剩余连接
+    ///   都没登记能力时不写库；
+    /// - 被移除的不是最新连接：不做任何能力写入。
+    ///
+    /// 两个回调都在 slot 锁内运行，必须是短临界区且**不得再调用本注册表**
+    /// （会反向获取同一把锁而死锁）。`on_latest_removed` 的写库失败由调用方
+    /// best-effort 处理，不影响连接清理本身。
+    pub fn unregister_with_fallback<F, G>(
+        &self,
+        agent_id: &str,
+        conn_id: u64,
+        on_empty: F,
+        on_latest_removed: G,
+    ) -> UnregisterOutcome
+    where
+        F: FnOnce(),
+        G: FnOnce(&[String]),
+    {
         // 锁顺序：先取 slot（此时全局 map 锁已释放），再锁 slot。
         let Some(slot) = self.agent_slot(agent_id) else {
-            return false;
+            return UnregisterOutcome::NotRegistered;
         };
         let mut state = slot.lock();
         if state.connections.remove(&conn_id).is_none() {
-            return false;
+            return UnregisterOutcome::NotRegistered;
         }
-        if !state.connections.is_empty() {
-            return false;
+        if state.connections.is_empty() {
+            // 仍持有 slot 锁：新连接插不进来，直到回调写完状态。
+            on_empty();
+            return UnregisterOutcome::Empty;
         }
-        // 仍持有 slot 锁：新连接插不进来，直到回调写完状态。
-        callback();
-        true
+        // conn_id 全局递增：没有剩余连接的编号更大，才说明被移除的是最新连接。
+        if state.connections.keys().any(|latest| *latest > conn_id) {
+            return UnregisterOutcome::Removed;
+        }
+        // 剩余连接里 conn_id 最大、且已登记过能力的那条，才是应回退的能力来源。
+        // 先克隆再回调，避免在回调期间继续借用连接表。
+        let fallback = state
+            .connections
+            .iter()
+            .filter_map(|(remaining_id, entry)| {
+                entry
+                    .capabilities
+                    .as_ref()
+                    .map(|capabilities| (*remaining_id, capabilities.clone()))
+            })
+            .max_by_key(|(remaining_id, _)| *remaining_id);
+        match fallback {
+            Some((_, capabilities)) => {
+                on_latest_removed(&capabilities);
+                UnregisterOutcome::LatestRemoved
+            }
+            None => UnregisterOutcome::LatestRemovedWithoutFallback,
+        }
     }
 
     /// 注销连接：仅当这是该 agent 的**最后一条**连接时返回 `true`。
@@ -604,5 +764,281 @@ mod tests {
         // 同一连接随后收到吊销，原因必须是 Revoke。
         assert!(registry.shutdown("a"));
         assert_eq!(*first.shutdown.borrow(), ShutdownReason::Revoke);
+    }
+
+    // ------------------------------------------------------------------
+    // KI-24：多连接能力缓存
+    // ------------------------------------------------------------------
+
+    fn caps(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// 能力只跟随最新连接：旧连接晚到的 Hello 只记录到自己，返回 false 且不写库。
+    #[test]
+    fn capabilities_follow_latest_connection_only() {
+        let registry = SessionRegistry::new();
+        let persisted = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        // 旧连接登记时仍是最新连接：正常写库。
+        let old = registry.register("a");
+        let record = persisted.clone();
+        assert!(
+            registry
+                .set_capabilities("a", old.conn_id, caps(&["docker"]), move |capabilities| {
+                    record
+                        .lock()
+                        .expect("persist 计数锁不得中毒")
+                        .push(capabilities.to_vec());
+                    Ok(())
+                })
+                .expect("写库回调成功"),
+            "最新连接登记必须返回 true"
+        );
+        assert_eq!(registry.latest_capabilities("a"), Some(caps(&["docker"])));
+        assert!(registry.is_latest("a", old.conn_id));
+
+        // 新连接登记后成为最新连接，写库成功。
+        let new = registry.register("a");
+        let record = persisted.clone();
+        assert!(
+            registry
+                .set_capabilities(
+                    "a",
+                    new.conn_id,
+                    caps(&["systemd", "logs"]),
+                    move |capabilities| {
+                        record
+                            .lock()
+                            .expect("persist 计数锁不得中毒")
+                            .push(capabilities.to_vec());
+                        Ok(())
+                    },
+                )
+                .expect("写库回调成功"),
+            "新连接登记必须返回 true"
+        );
+        assert!(registry.is_latest("a", new.conn_id));
+        assert!(!registry.is_latest("a", old.conn_id));
+        assert_eq!(
+            registry.latest_capabilities("a"),
+            Some(caps(&["systemd", "logs"]))
+        );
+
+        // 旧连接晚到的 Hello：记录到该连接，但返回 false、不触发 persist。
+        let record = persisted.clone();
+        assert!(
+            !registry
+                .set_capabilities("a", old.conn_id, caps(&["process"]), move |capabilities| {
+                    record
+                        .lock()
+                        .expect("persist 计数锁不得中毒")
+                        .push(capabilities.to_vec());
+                    Ok(())
+                })
+                .expect("非最新连接不是错误"),
+            "旧连接晚到的 Hello 必须返回 false"
+        );
+        assert_eq!(
+            registry.latest_capabilities("a"),
+            Some(caps(&["systemd", "logs"])),
+            "旧连接不得覆盖最新连接的能力"
+        );
+        assert_eq!(
+            *persisted.lock().expect("persist 计数锁不得中毒"),
+            vec![caps(&["docker"]), caps(&["systemd", "logs"])],
+            "persist 只应看到最新连接的两次登记"
+        );
+    }
+
+    /// 最新连接断开：剩余连接仍有能力时在锁内回退，控制命令也重新指向旧连接。
+    #[test]
+    fn latest_disconnect_falls_back_to_remaining_capabilities() {
+        let registry = SessionRegistry::new();
+
+        let old = registry.register("a");
+        let old_sender = registry.control_sender("a").expect("旧连接在线");
+        assert!(registry
+            .set_capabilities("a", old.conn_id, caps(&["docker"]), |_| Ok(()))
+            .expect("登记旧连接能力"));
+
+        let new = registry.register("a");
+        assert!(registry
+            .set_capabilities("a", new.conn_id, caps(&["systemd"]), |_| Ok(()))
+            .expect("登记新连接能力"));
+
+        let fallback = Arc::new(Mutex::new(None::<Vec<String>>));
+        let captured = fallback.clone();
+        let outcome = registry.unregister_with_fallback(
+            "a",
+            new.conn_id,
+            || panic!("仍有旧连接，不能走 empty 分支"),
+            move |capabilities| {
+                *captured.lock().expect("回退锁不得中毒") = Some(capabilities.to_vec());
+            },
+        );
+        assert_eq!(outcome, UnregisterOutcome::LatestRemoved);
+        assert_eq!(
+            *fallback.lock().expect("回退锁不得中毒"),
+            Some(caps(&["docker"])),
+            "回退回调必须收到剩余最新连接的能力"
+        );
+        assert_eq!(registry.latest_capabilities("a"), Some(caps(&["docker"])));
+        let sender = registry.control_sender("a").expect("旧连接仍在线");
+        assert!(
+            sender.same_channel(&old_sender),
+            "最新连接断开后控制命令必须指向旧连接"
+        );
+
+        // 最后一条连接断开：只执行 empty 回调，不再触发能力回退。
+        let empty_calls = Arc::new(AtomicUsize::new(0));
+        let calls = empty_calls.clone();
+        let outcome = registry.unregister_with_fallback(
+            "a",
+            old.conn_id,
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            },
+            |_| panic!("无剩余连接时不得写能力"),
+        );
+        assert_eq!(outcome, UnregisterOutcome::Empty);
+        assert_eq!(empty_calls.load(Ordering::SeqCst), 1);
+        assert!(registry.latest_capabilities("a").is_none());
+        assert!(!registry.has_active("a"));
+    }
+
+    /// 新连接已注册但尚未登记能力（None）时，旧连接断开不得写库或清空历史能力。
+    #[test]
+    fn unregistered_new_connection_does_not_clear_capabilities() {
+        let registry = SessionRegistry::new();
+        let persisted = Arc::new(AtomicUsize::new(0));
+
+        let old = registry.register("a");
+        let count = persisted.clone();
+        assert!(registry
+            .set_capabilities("a", old.conn_id, caps(&["docker"]), move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .expect("登记旧连接能力"));
+        assert_eq!(persisted.load(Ordering::SeqCst), 1);
+
+        // 新连接已注册但还没 Hello：latest_capabilities 必须是 None，不能冒充空能力。
+        let new = registry.register("a");
+        assert_eq!(registry.latest_capabilities("a"), None);
+
+        // 旧连接（曾经的最新连接）断开：不是最新连接，不做能力回退。
+        let outcome = registry.unregister_with_fallback(
+            "a",
+            old.conn_id,
+            || panic!("仍有新连接"),
+            |_| panic!("非最新连接断开不得写能力"),
+        );
+        assert_eq!(outcome, UnregisterOutcome::Removed);
+        assert_eq!(
+            persisted.load(Ordering::SeqCst),
+            1,
+            "未登记能力的新连接不得触发写库"
+        );
+
+        // 最后一条（未登记能力的）连接断开：empty 分支，不写能力。
+        let empty_calls = Arc::new(AtomicUsize::new(0));
+        let calls = empty_calls.clone();
+        let outcome = registry.unregister_with_fallback(
+            "a",
+            new.conn_id,
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            },
+            |_| panic!("无剩余连接时不得写能力"),
+        );
+        assert_eq!(outcome, UnregisterOutcome::Empty);
+        assert_eq!(empty_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(persisted.load(Ordering::SeqCst), 1);
+
+        // 反过来：最新连接尚未 Hello 就断开，旧连接有能力时必须回退，而不是写空。
+        let old = registry.register("b");
+        assert!(registry
+            .set_capabilities("b", old.conn_id, caps(&["docker"]), |_| Ok(()))
+            .expect("登记旧连接能力"));
+        let unregistered = registry.register("b");
+        let fallback = Arc::new(Mutex::new(None::<Vec<String>>));
+        let captured = fallback.clone();
+        let outcome = registry.unregister_with_fallback(
+            "b",
+            unregistered.conn_id,
+            || panic!("仍有旧连接"),
+            move |capabilities| {
+                *captured.lock().expect("回退锁不得中毒") = Some(capabilities.to_vec());
+            },
+        );
+        assert_eq!(outcome, UnregisterOutcome::LatestRemoved);
+        assert_eq!(
+            *fallback.lock().expect("回退锁不得中毒"),
+            Some(caps(&["docker"])),
+            "未登记能力的最新连接断开不得清空旧连接的能力"
+        );
+    }
+
+    /// 最新连接断开、但剩余连接都没登记能力：不写库，保留历史能力。
+    #[test]
+    fn latest_disconnect_without_registered_fallback_keeps_history() {
+        let registry = SessionRegistry::new();
+        let old = registry.register("a");
+        let latest = registry.register("a");
+
+        let outcome = registry.unregister_with_fallback(
+            "a",
+            latest.conn_id,
+            || panic!("仍有旧连接"),
+            |_| panic!("剩余连接都没有能力，不得写库"),
+        );
+        assert_eq!(outcome, UnregisterOutcome::LatestRemovedWithoutFallback);
+        assert!(registry.has_active("a"));
+        assert_eq!(registry.latest_capabilities("a"), None);
+        assert!(!registry.is_latest("a", latest.conn_id));
+        assert!(registry.is_latest("a", old.conn_id));
+    }
+
+    /// persist 写库错误必须传给调用方，便于握手失败并触发清理回退。
+    #[test]
+    fn set_capabilities_propagates_persist_error() {
+        let registry = SessionRegistry::new();
+        let handle = registry.register("a");
+        let result = registry.set_capabilities("a", handle.conn_id, caps(&["docker"]), |_| {
+            anyhow::bail!("模拟写库失败")
+        });
+        assert!(result.is_err(), "persist 错误必须传给调用方");
+        assert_eq!(
+            registry.latest_capabilities("a"),
+            Some(caps(&["docker"])),
+            "能力应已记录到连接，便于清理时回退"
+        );
+    }
+
+    /// 未知连接 / agent 的登记与查询都是安全 no-op，不触发写库。
+    #[test]
+    fn capabilities_for_unknown_connection_are_ignored() {
+        let registry = SessionRegistry::new();
+        let persisted = Arc::new(AtomicUsize::new(0));
+        let count = persisted.clone();
+        assert!(!registry
+            .set_capabilities("a", 42, caps(&["docker"]), move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .expect("未知连接不是错误"));
+        assert_eq!(persisted.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.latest_capabilities("a"), None);
+        assert!(!registry.is_latest("a", 42));
+        assert_eq!(
+            registry.unregister_with_fallback(
+                "a",
+                42,
+                || panic!("不得回调"),
+                |_| panic!("不得回调")
+            ),
+            UnregisterOutcome::NotRegistered
+        );
     }
 }

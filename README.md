@@ -12,7 +12,7 @@
 已知问题见 [docs/known-issues.md](docs/known-issues.md)。
 协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面与 v0.3.1/v0.3.2/v0.3.3 硬化已完成。**
+> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面与 v0.3.1/v0.3.2/v0.3.3/v0.3.4 硬化已完成。**
 > 告警与归档尚未实现。证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。
 >
 > 线协议版本为 **2**：hub 与 agent 必须严格一致。版本不符时 hub 回 `bad_protocol`
@@ -35,7 +35,8 @@
    服务端证书由 hub 在剩余 `renew_before_days` 时自动续签并热加载，无需重启。
 5. 之后所有连接走 mTLS；Hello 里再带 `agent_secret` 做身份绑定（防止已纳管机器互相冒名）。
 6. `rustboard-hub agent revoke --id <id>` 立即清除 secret 并拒绝该 agent 重连。
-7. 敏感文件从创建起就是 0600（配置 / 私钥 / secret），证书为 0644；
+7. 敏感文件从创建起就是 0600（配置 / 私钥 / secret），证书为 0644；数据目录与证书目录
+   为 0700，SQLite 主库 / WAL / SHM 为 0600（v0.3.4 起旧安装的过宽权限也会在启动时收紧）；
    agent 接入层限制每来源 IP 并发与总连接数、5s TLS 握手超时、5s 请求头读取超时与 15s 写超时。
 8. 运维命令：
    - `rustboard-agent cert-info` 查看证书 CN / notBefore / notAfter / 剩余天数；
@@ -150,6 +151,17 @@ rustboard-hub token revoke --name panel-prod                 # 不删行，保�
   ```
   否则拒绝启动。修改 `server_names` 后先 `rotate-cert --force`。
 - 管理证书复用 hub 的 `certs/server.crt`；Panel 连私有 CA 时配置 `hub_ca`。
+- v0.3.4 起增加未认证失败限速：同一来源 IP 每分钟失败达到
+  `admin_auth_failure_limit_per_min`（默认 60，0 关闭，最大 600）后返回
+  429 + `Retry-After`，超限路径不再计算 SHA-256 或查询 SQLite，401 WARN 也按窗口采样。
+  旧 `admin_token` 常量时间路径不受此限速影响，保留为应急入口。NAT / 反代后多个客户端
+  共享来源 IP 时，达到阈值的合法 scoped token 也可能在窗口结束前收到 429；这是为避免
+  未认证请求放大而接受的可用性权衡。
+- v0.3.4 起 `data_dir` 必须是本程序独占的绝对子目录（至少两级，如 `/var/lib/rustboard/hub`）；
+  `/tmp`、`/var/tmp`、`/etc`、`/var/log`、`/` 等共享/系统目录、sticky 目录、相对路径、
+  任一祖先或最终组件为符号链接、非 root 指向他人目录都会拒绝启动。该校验是启动时的
+  静态检查；`data_dir` 祖先必须不可被非特权用户写（推荐 root 拥有的专用目录）。证书目录收紧为 0700；同机以不同用户运行 Panel 且直接
+  读取 hub `ca.crt` 时，需要复制 CA 或以同用户运行。
 
 ### 远程面板
 
