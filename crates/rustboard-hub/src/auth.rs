@@ -2,19 +2,26 @@
 //!
 //! 一次请求的完整顺序（与 v0.2 的单一 admin_token 行为兼容）：
 //! 1. 解析 `Authorization: Bearer <token>`（scheme 大小写不敏感，只接受两段）；
-//! 2. 先常量时间比较旧 `admin_token`，命中即 `admin` scope 的兼容主体；
-//! 3. 否则 SHA-256(token) 后查 `api_tokens`，只认未吊销行；
-//! 4. 认证失败固定 401 + `WWW-Authenticate: Bearer`，不回显 token / 内部错误，
-//!    不写审计，只 `warn` 记录来源 IP；
-//! 5. 认证成功后才进入每 IP 限速（401 先于 429，未认证请求不消耗额度）；
-//! 6. 按「已知路由 + 方法」精确校验 scope（见 [`required_scope`]）：
+//! 2. 缺失 / 格式错误：先查未认证失败限速，已超限直接 429；否则记一次失败后 401；
+//! 3. 先常量时间比较旧 `admin_token`，命中即清空该 IP 的失败计数，按 `admin` scope
+//!    的兼容主体放行，**不受失败限速影响**（保留应急入口）；
+//! 4. 否则先查失败限速，已超限直接 429（不计算 SHA-256、不 spawn_blocking 查库）；
+//! 5. 未超限才 SHA-256(token) 后查 `api_tokens`，只认未吊销行；成功清计数；
+//!    失败记一次失败，未超限 401，达到阈值后后续请求 429；
+//! 6. 认证失败固定 401 + `WWW-Authenticate: Bearer`；429 固定
+//!    `{"error":"rate_limited"}` + `Retry-After`（1..=60 秒）；两者都不写审计、
+//!    不回显 token；日志每 IP 每窗口只 WARN 第一条失败与首次 429，其余 debug；
+//! 7. 认证成功后才进入每 IP 管理限速（未认证请求不消耗已认证额度）；
+//! 8. 按「已知路由 + 方法」精确校验 scope（见 [`required_scope`]）：
 //!    `read < write < admin`，权限不足 403 `forbidden_scope`，不写控制审计；
-//! 7. 把 [`AuthPrincipal`] 放进 request extensions，供控制面写审计 actor。
+//! 9. 把 [`AuthPrincipal`] 放进 request extensions，供控制面写审计 actor。
 //!
 //! `/healthz` 不经过本中间件；未知 `/api/v1/*` 先认证，再由路由返回 404/405，
 //! 不因为 token scope 变成 403（避免用 403 泄露路由是否存在）。
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
@@ -91,61 +98,271 @@ enum AuthFailure {
     Backend(String),
 }
 
-/// 管理 API 鉴权 + 限速 + scope 授权中间件。
+/// 未认证失败限速的固定窗口长度（毫秒）。
+const AUTH_FAILURE_WINDOW_MS: i64 = 60_000;
+/// 未认证失败限速表容量（按来源 IP 计数）。
+const AUTH_FAILURE_TABLE_CAPACITY: usize = 4096;
+
+/// 未认证失败限速的判定结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthFailureCheck {
+    /// 未超限，可以继续认证流程。
+    Allowed,
+    /// 已超限：`retry_after` 秒后可重试；`first` 表示本窗口首次触发 429
+    /// （只用于日志采样，避免每个被拒请求都 WARN）。
+    Limited {
+        retry_after: u64,
+        first: bool,
+        cause: AuthFailureCause,
+    },
+}
+
+/// 触发 429 的原因，只用于日志分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthFailureCause {
+    /// 本窗口失败次数达到阈值。
+    Failures,
+    /// 限速表已满且无过期项，拒绝新来源。
+    TableFull,
+}
+
+/// 单个来源 IP 的固定窗口失败计数。
+#[derive(Debug, Clone, Copy, Default)]
+struct AuthFailureWindow {
+    started_at: i64,
+    failures: u32,
+    /// 本窗口是否已经 WARN 过首次 429，避免超限后每个请求都刷日志。
+    limited_logged: bool,
+}
+
+impl AuthFailureWindow {
+    fn is_expired(&self, now: i64) -> bool {
+        self.started_at == 0 || now.saturating_sub(self.started_at) >= AUTH_FAILURE_WINDOW_MS
+    }
+
+    /// 距离窗口结束的秒数，向上取整并夹在 1..=60。
+    fn retry_after(&self, now: i64) -> u64 {
+        let elapsed = now.saturating_sub(self.started_at).max(0);
+        let remaining = (AUTH_FAILURE_WINDOW_MS - elapsed).max(0);
+        (((remaining + 999) / 1_000).max(1) as u64).min(60)
+    }
+}
+
+#[derive(Default)]
+struct AuthFailureTable {
+    windows: HashMap<IpAddr, AuthFailureWindow>,
+    /// 上次「表满拒绝新来源」WARN 的时间（毫秒），按窗口全局节流。
+    capacity_warned_at: i64,
+}
+
+/// 未认证请求的每来源 IP 固定窗口失败限速（KI-26）。
 ///
-/// 401 固定 `{"error":"unauthorized"}`，403 固定 `{"error":"forbidden_scope"}`；
-/// 两者都不写审计，只 warn 记录来源 IP。
+/// 独立于管理 API 的 `AdminRateLimiter`：未认证请求只消耗失败额度，认证成功后
+/// 才进入每 IP 请求限速。窗口 60s、容量 4096 个来源 IP；`limit` 为 0 时整体关闭。
+/// 时钟可注入，单测不 sleep。
+pub(crate) struct AuthFailureLimiter {
+    limit: u32,
+    table: StdMutex<AuthFailureTable>,
+    now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
+}
+
+impl AuthFailureLimiter {
+    pub(crate) fn new(limit: u32) -> Self {
+        Self::with_clock(limit, Arc::new(now_ms))
+    }
+
+    fn with_clock(limit: u32, now_ms: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        Self {
+            limit,
+            table: StdMutex::new(AuthFailureTable::default()),
+            now_ms,
+        }
+    }
+
+    fn lock_table(&self) -> std::sync::MutexGuard<'_, AuthFailureTable> {
+        match self.table.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// 认证前检查：已超限返回 `Limited`，调用方必须直接 429（不查库）。
+    pub(crate) fn check(&self, ip: IpAddr) -> AuthFailureCheck {
+        if self.limit == 0 {
+            return AuthFailureCheck::Allowed;
+        }
+        let now = (self.now_ms)();
+        let mut table = self.lock_table();
+        if table
+            .windows
+            .get(&ip)
+            .is_some_and(|window| window.is_expired(now))
+        {
+            table.windows.remove(&ip);
+        }
+        if let Some(window) = table.windows.get_mut(&ip) {
+            if window.failures < self.limit {
+                return AuthFailureCheck::Allowed;
+            }
+            let retry_after = window.retry_after(now);
+            let first = !window.limited_logged;
+            window.limited_logged = true;
+            return AuthFailureCheck::Limited {
+                retry_after,
+                first,
+                cause: AuthFailureCause::Failures,
+            };
+        }
+        // 未跟踪来源：容量满时先清理过期项，仍满则拒绝新来源。
+        if table.windows.len() >= AUTH_FAILURE_TABLE_CAPACITY {
+            table.windows.retain(|_, window| !window.is_expired(now));
+            if table.windows.len() >= AUTH_FAILURE_TABLE_CAPACITY {
+                let first = now.saturating_sub(table.capacity_warned_at) >= AUTH_FAILURE_WINDOW_MS;
+                if first {
+                    table.capacity_warned_at = now;
+                }
+                return AuthFailureCheck::Limited {
+                    retry_after: AUTH_FAILURE_WINDOW_MS as u64 / 1_000,
+                    first,
+                    cause: AuthFailureCause::TableFull,
+                };
+            }
+        }
+        AuthFailureCheck::Allowed
+    }
+
+    /// 记录一次认证失败；返回 true 表示这是该 IP 本窗口第一条失败（用于 WARN 采样）。
+    pub(crate) fn record_failure(&self, ip: IpAddr) -> bool {
+        if self.limit == 0 {
+            return false;
+        }
+        let now = (self.now_ms)();
+        let mut table = self.lock_table();
+        if table
+            .windows
+            .get(&ip)
+            .is_some_and(|window| window.is_expired(now))
+        {
+            table.windows.remove(&ip);
+        }
+        if let Some(window) = table.windows.get_mut(&ip) {
+            window.failures = window.failures.saturating_add(1);
+            return false;
+        }
+        // 正常流程由 check 先保证容量；这里兜底，满表时丢弃新来源的计数。
+        if table.windows.len() >= AUTH_FAILURE_TABLE_CAPACITY {
+            table.windows.retain(|_, window| !window.is_expired(now));
+            if table.windows.len() >= AUTH_FAILURE_TABLE_CAPACITY {
+                return false;
+            }
+        }
+        table.windows.insert(
+            ip,
+            AuthFailureWindow {
+                started_at: now,
+                failures: 1,
+                limited_logged: false,
+            },
+        );
+        true
+    }
+
+    /// 认证成功（含旧 admin_token 命中）时清空该来源的失败计数。
+    pub(crate) fn clear(&self, ip: IpAddr) {
+        if self.limit == 0 {
+            return;
+        }
+        self.lock_table().windows.remove(&ip);
+    }
+
+    /// 当前记录的来源数量（测试 / 排障）。
+    #[cfg(test)]
+    fn tracked_ips(&self) -> usize {
+        self.lock_table().windows.len()
+    }
+}
+
+/// 401 或失败限速 429 的拒绝结果。
+enum AuthRejection {
+    /// 认证失败：携带日志分类与本窗口是否首条失败。
+    Unauthorized {
+        failure: AuthFailure,
+        first_in_window: bool,
+    },
+    /// 未认证失败超限，固定 429。
+    RateLimited {
+        retry_after: u64,
+        first: bool,
+        cause: AuthFailureCause,
+    },
+}
+
+/// 认证失败时先记一次失败，再构造 401 拒绝。
+fn reject_with_failure(state: &AppState, ip: IpAddr, failure: AuthFailure) -> AuthRejection {
+    let first_in_window = state.auth_failures.record_failure(ip);
+    AuthRejection::Unauthorized {
+        failure,
+        first_in_window,
+    }
+}
+
+/// 查未认证失败限速；已超限时返回 429 拒绝。
+fn check_failure_limit(state: &AppState, ip: IpAddr) -> Option<AuthRejection> {
+    match state.auth_failures.check(ip) {
+        AuthFailureCheck::Allowed => None,
+        AuthFailureCheck::Limited {
+            retry_after,
+            first,
+            cause,
+        } => Some(AuthRejection::RateLimited {
+            retry_after,
+            first,
+            cause,
+        }),
+    }
+}
+
+/// 管理 API 鉴权 + 未认证失败限速 + 已认证请求限速 + scope 授权中间件。
+///
+/// 401 固定 `{"error":"unauthorized"}`，403 固定 `{"error":"forbidden_scope"}`，
+/// 429 固定 `{"error":"rate_limited"}`；三者都不写审计、不回显 token。
 pub(crate) async fn require_auth(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let principal = match resolve_principal(&state, request.headers()).await {
+    let ip = peer.ip();
+    let principal = match resolve_principal(&state, request.headers(), ip).await {
         Ok(principal) => principal,
-        Err(AuthFailure::Unauthorized) => {
-            tracing::warn!(ip = %peer.ip(), "管理 API 鉴权失败");
-            return unauthorized();
+        Err(AuthRejection::RateLimited {
+            retry_after,
+            first,
+            cause,
+        }) => {
+            log_rate_limited(ip, retry_after, first, cause);
+            return rate_limited(retry_after);
         }
-        Err(AuthFailure::IllegalScope(name)) => {
-            tracing::warn!(
-                ip = %peer.ip(),
-                token_name = %name,
-                "api_tokens.scope 非法，按未认证处理"
-            );
-            return unauthorized();
-        }
-        Err(AuthFailure::Backend(err)) => {
-            tracing::warn!(
-                ip = %peer.ip(),
-                error = %err,
-                "校验 api_token 失败，按未认证拒绝"
-            );
+        Err(AuthRejection::Unauthorized {
+            failure,
+            first_in_window,
+        }) => {
+            log_auth_failure(ip, &failure, first_in_window);
             return unauthorized();
         }
     };
 
-    // 401 先于 429：未认证请求不能消耗限速额度（沿用 v0.2.1 KI-05 顺序）。
+    // 只有认证成功的请求才消耗已认证请求额度（沿用 v0.2.1 KI-05 顺序）。
     let is_write = crate::is_admin_write_method(request.method());
-    if let Err(retry_after) = state.admin_rate.check(peer.ip(), is_write) {
-        let mut response = (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({ "error": "rate_limited" })),
-        )
-            .into_response();
-        response.headers_mut().insert(
-            header::RETRY_AFTER,
-            HeaderValue::from_str(&retry_after.to_string())
-                .unwrap_or_else(|_| HeaderValue::from_static("60")),
-        );
-        return response;
+    if let Err(retry_after) = state.admin_rate.check(ip, is_write) {
+        return rate_limited(retry_after);
     }
 
     // 只对「已知路由 + 方法」做 scope 校验；未知路由留给 axum 返回 404/405。
     if let Some(required) = required_scope(request.method(), request.uri().path()) {
         if !scope_allows(principal.scope, required) {
             tracing::warn!(
-                ip = %peer.ip(),
+                ip = %ip,
                 token_name = %principal.name,
                 path = %request.uri().path(),
                 required = required.as_str(),
@@ -159,17 +376,113 @@ pub(crate) async fn require_auth(
     next.run(request).await
 }
 
-/// 认证主体解析：旧 admin_token 优先，其次查 scoped token。
+/// 采样后的日志级别：每 IP 每窗口首条失败 / 首次 429 用 WARN，其余 DEBUG。
+///
+/// 抽成纯函数便于确定性测试，不依赖 `tracing` subscriber 的线程局部状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampledLevel {
+    Warn,
+    Debug,
+}
+
+impl SampledLevel {
+    fn for_failure(first_in_window: bool) -> Self {
+        if first_in_window {
+            Self::Warn
+        } else {
+            Self::Debug
+        }
+    }
+
+    fn for_rate_limit(first: bool) -> Self {
+        if first {
+            Self::Warn
+        } else {
+            Self::Debug
+        }
+    }
+}
+
+/// 认证失败日志：每 IP 每窗口只 WARN 第一条失败，其余降为 debug，避免 401 洪水刷屏。
+fn log_auth_failure(ip: IpAddr, failure: &AuthFailure, first_in_window: bool) {
+    match (SampledLevel::for_failure(first_in_window), failure) {
+        (SampledLevel::Warn, AuthFailure::Unauthorized) => {
+            tracing::warn!(ip = %ip, "管理 API 鉴权失败");
+        }
+        (SampledLevel::Debug, AuthFailure::Unauthorized) => {
+            tracing::debug!(ip = %ip, "管理 API 鉴权失败");
+        }
+        (SampledLevel::Warn, AuthFailure::IllegalScope(name)) => {
+            tracing::warn!(
+                ip = %ip,
+                token_name = %name,
+                "api_tokens.scope 非法，按未认证处理"
+            );
+        }
+        (SampledLevel::Debug, AuthFailure::IllegalScope(name)) => {
+            tracing::debug!(
+                ip = %ip,
+                token_name = %name,
+                "api_tokens.scope 非法，按未认证处理"
+            );
+        }
+        (SampledLevel::Warn, AuthFailure::Backend(err)) => {
+            tracing::warn!(
+                ip = %ip,
+                error = %err,
+                "校验 api_token 失败，按未认证拒绝"
+            );
+        }
+        (SampledLevel::Debug, AuthFailure::Backend(err)) => {
+            tracing::debug!(
+                ip = %ip,
+                error = %err,
+                "校验 api_token 失败，按未认证拒绝"
+            );
+        }
+    }
+}
+
+/// 429 日志：每 IP 每窗口只在首次触发时 WARN，其余降为 debug。
+fn log_rate_limited(ip: IpAddr, retry_after: u64, first: bool, cause: AuthFailureCause) {
+    let cause = match cause {
+        AuthFailureCause::Failures => "failures",
+        AuthFailureCause::TableFull => "table_full",
+    };
+    match SampledLevel::for_rate_limit(first) {
+        SampledLevel::Warn => tracing::warn!(
+            ip = %ip,
+            retry_after,
+            cause,
+            "管理 API 未认证请求被失败限速，返回 429"
+        ),
+        SampledLevel::Debug => tracing::debug!(
+            ip = %ip,
+            retry_after,
+            cause,
+            "管理 API 未认证请求继续被失败限速"
+        ),
+    }
+}
+
+/// 认证主体解析：旧 admin_token 优先，其次在失败限速额度内查 scoped token。
 async fn resolve_principal(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<AuthPrincipal, AuthFailure> {
-    if bearer_token(headers).is_none() {
-        return Err(AuthFailure::Unauthorized);
-    }
+    ip: IpAddr,
+) -> Result<AuthPrincipal, AuthRejection> {
+    // 1. 缺失 / 格式错误：先查限速，未超限记一次失败后 401。
+    let Some(token) = bearer_token(headers) else {
+        if let Some(rejection) = check_failure_limit(state, ip) {
+            return Err(rejection);
+        }
+        return Err(reject_with_failure(state, ip, AuthFailure::Unauthorized));
+    };
 
-    // 兼容路径：常量时间比较旧 admin_token；空 token 永远不匹配。
+    // 2. 兼容路径：常量时间比较旧 admin_token；命中即清空失败计数，不受限速影响。
+    //    空 token 永远不匹配。
     if bearer_matches(headers, &state.cfg.admin_token) {
+        state.auth_failures.clear(ip);
         return Ok(AuthPrincipal {
             name: "admin".to_string(),
             scope: TokenScope::Admin,
@@ -177,24 +490,45 @@ async fn resolve_principal(
         });
     }
 
-    let Some(token) = bearer_token(headers) else {
-        return Err(AuthFailure::Unauthorized);
-    };
+    // 3. scoped token：先查失败限速；已超限直接 429，不计算 SHA-256、不查库。
+    if let Some(rejection) = check_failure_limit(state, ip) {
+        return Err(rejection);
+    }
+
     let token_hash = sha256_hex(token);
     let now = now_ms();
     let storage = state.storage.clone();
-    let record =
-        tokio::task::spawn_blocking(move || storage.authenticate_api_token(&token_hash, now))
-            .await
-            .map_err(|err| AuthFailure::Backend(err.to_string()))?
-            .map_err(|err| AuthFailure::Backend(err.to_string()))?;
+    let lookup =
+        tokio::task::spawn_blocking(move || storage.authenticate_api_token(&token_hash, now)).await;
+    let record = match lookup {
+        Ok(Ok(record)) => record,
+        Ok(Err(err)) => {
+            return Err(reject_with_failure(
+                state,
+                ip,
+                AuthFailure::Backend(err.to_string()),
+            ));
+        }
+        Err(err) => {
+            return Err(reject_with_failure(
+                state,
+                ip,
+                AuthFailure::Backend(err.to_string()),
+            ));
+        }
+    };
 
     let Some(record) = record else {
-        return Err(AuthFailure::Unauthorized);
+        return Err(reject_with_failure(state, ip, AuthFailure::Unauthorized));
     };
     let Some(scope) = TokenScope::parse(&record.scope) else {
-        return Err(AuthFailure::IllegalScope(record.name));
+        return Err(reject_with_failure(
+            state,
+            ip,
+            AuthFailure::IllegalScope(record.name),
+        ));
     };
+    state.auth_failures.clear(ip);
     Ok(AuthPrincipal {
         name: record.name,
         scope,
@@ -265,6 +599,22 @@ fn is_agent_subroute(path: &str, suffix: &str) -> bool {
     path.strip_prefix("/api/v1/agents/")
         .and_then(|rest| rest.strip_suffix(suffix))
         .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// 固定 429：`Retry-After` 夹到 1..=60 秒，不回显 token，也不写审计。
+fn rate_limited(retry_after: u64) -> Response {
+    let retry_after = retry_after.clamp(1, 60);
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({ "error": "rate_limited" })),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_str(&retry_after.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("60")),
+    );
+    response
 }
 
 /// 固定 401：不带 token / 内部错误信息，只告诉客户端该用 Bearer。
@@ -422,5 +772,225 @@ mod tests {
         assert_eq!(bearer_token(&multiple), Some("first"));
         assert!(bearer_matches(&multiple, "first"));
         assert!(!bearer_matches(&multiple, "second"));
+    }
+
+    // ------------------------------------------------------------------
+    // v0.3.4 KI-26：未认证失败限速（可注入时钟，不 sleep）
+    // ------------------------------------------------------------------
+
+    /// 60 次失败允许（第 60 次仍是 401），第 61 次检查返回 Limited；
+    /// 每窗口只有第一条失败与首次 429 需要 WARN 采样。
+    #[test]
+    fn v034_auth_failure_limiter_allows_limit_then_limits() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let now = Arc::new(AtomicI64::new(1_000_000));
+        let clock = now.clone();
+        let limiter =
+            AuthFailureLimiter::with_clock(60, Arc::new(move || clock.load(Ordering::Relaxed)));
+        let ip: IpAddr = "203.0.113.10".parse().unwrap();
+
+        for attempt in 1..=60 {
+            assert_eq!(
+                limiter.check(ip),
+                AuthFailureCheck::Allowed,
+                "第 {attempt} 次检查必须允许"
+            );
+            assert_eq!(
+                limiter.record_failure(ip),
+                attempt == 1,
+                "只有每窗口第一条失败返回 true"
+            );
+        }
+        // 第 61 次：第一次触发带 first=true，用于 WARN；之后只 debug。
+        assert_eq!(
+            limiter.check(ip),
+            AuthFailureCheck::Limited {
+                retry_after: 60,
+                first: true,
+                cause: AuthFailureCause::Failures,
+            }
+        );
+        assert_eq!(
+            limiter.check(ip),
+            AuthFailureCheck::Limited {
+                retry_after: 60,
+                first: false,
+                cause: AuthFailureCause::Failures,
+            }
+        );
+    }
+
+    /// 窗口边界：Retry-After 始终落在 1..=60 秒；恰好 60s 后恢复并重新采样 WARN。
+    #[test]
+    fn v034_auth_failure_limiter_window_boundary_and_retry_after() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let now = Arc::new(AtomicI64::new(1_000_000));
+        let clock = now.clone();
+        let limiter =
+            AuthFailureLimiter::with_clock(1, Arc::new(move || clock.load(Ordering::Relaxed)));
+        let ip: IpAddr = "203.0.113.11".parse().unwrap();
+        assert_eq!(limiter.check(ip), AuthFailureCheck::Allowed);
+        assert!(limiter.record_failure(ip));
+
+        // 同一窗口内 Retry-After 向上取整到秒，且不超过 60。
+        for (elapsed_ms, expected) in [(0_i64, 60_u64), (1, 60), (30_000, 30), (59_999, 1)] {
+            now.store(1_000_000 + elapsed_ms, Ordering::Relaxed);
+            assert_eq!(
+                limiter.check(ip),
+                AuthFailureCheck::Limited {
+                    retry_after: expected,
+                    first: elapsed_ms == 0,
+                    cause: AuthFailureCause::Failures,
+                },
+                "elapsed={elapsed_ms}ms"
+            );
+        }
+
+        // 恰好 60s：旧窗口过期，恢复允许；再次失败开启新窗口并重新采样。
+        now.store(1_000_000 + AUTH_FAILURE_WINDOW_MS, Ordering::Relaxed);
+        assert_eq!(limiter.check(ip), AuthFailureCheck::Allowed);
+        assert!(
+            limiter.record_failure(ip),
+            "新窗口第一条失败必须重新采样 WARN"
+        );
+        assert_eq!(
+            limiter.check(ip),
+            AuthFailureCheck::Limited {
+                retry_after: 60,
+                first: true,
+                cause: AuthFailureCause::Failures,
+            }
+        );
+    }
+
+    /// 不同来源 IP 独立计数；limit=0 关闭且完全不记录来源。
+    #[test]
+    fn v034_auth_failure_limiter_is_per_ip_and_can_be_disabled() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let now = Arc::new(AtomicI64::new(1_000_000));
+        let clock = now.clone();
+        let limiter =
+            AuthFailureLimiter::with_clock(2, Arc::new(move || clock.load(Ordering::Relaxed)));
+        let ip_a: IpAddr = "198.51.100.1".parse().unwrap();
+        let ip_b: IpAddr = "198.51.100.2".parse().unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(limiter.check(ip_a), AuthFailureCheck::Allowed);
+            limiter.record_failure(ip_a);
+        }
+        assert!(matches!(
+            limiter.check(ip_a),
+            AuthFailureCheck::Limited { .. }
+        ));
+        assert_eq!(
+            limiter.check(ip_b),
+            AuthFailureCheck::Allowed,
+            "不同 IP 必须独立计数"
+        );
+
+        // 认证成功（旧 admin_token 命中）清空计数。
+        limiter.clear(ip_a);
+        assert_eq!(limiter.check(ip_a), AuthFailureCheck::Allowed);
+
+        let disabled = AuthFailureLimiter::with_clock(0, Arc::new(|| 1_000_000));
+        for _ in 0..100 {
+            assert_eq!(disabled.check(ip_a), AuthFailureCheck::Allowed);
+            assert!(!disabled.record_failure(ip_a));
+        }
+        assert_eq!(disabled.tracked_ips(), 0, "关闭时不得记录来源");
+    }
+
+    /// 容量 4096：满且无过期项时拒绝新来源；逐窗口只 WARN 一次容量告警；
+    /// 推进一个窗口后可清理过期项并恢复。
+    #[test]
+    fn v034_auth_failure_limiter_table_capacity_is_bounded() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let now = Arc::new(AtomicI64::new(1_000_000));
+        let clock = now.clone();
+        let limiter =
+            AuthFailureLimiter::with_clock(600, Arc::new(move || clock.load(Ordering::Relaxed)));
+        for index in 0..AUTH_FAILURE_TABLE_CAPACITY {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(index as u32));
+            assert!(limiter.record_failure(ip), "容量内必须记录");
+        }
+        assert_eq!(limiter.tracked_ips(), AUTH_FAILURE_TABLE_CAPACITY);
+
+        let overflow: IpAddr = "203.0.113.99".parse().unwrap();
+        assert_eq!(
+            limiter.check(overflow),
+            AuthFailureCheck::Limited {
+                retry_after: 60,
+                first: true,
+                cause: AuthFailureCause::TableFull,
+            }
+        );
+        assert_eq!(
+            limiter.check(overflow),
+            AuthFailureCheck::Limited {
+                retry_after: 60,
+                first: false,
+                cause: AuthFailureCause::TableFull,
+            },
+            "同一窗口内容量告警只 WARN 一次"
+        );
+        assert!(!limiter.record_failure(overflow), "满表时新来源不记录");
+        assert_eq!(limiter.tracked_ips(), AUTH_FAILURE_TABLE_CAPACITY);
+
+        // 推进一个窗口：过期项可清理，新来源恢复允许。
+        now.store(1_000_000 + AUTH_FAILURE_WINDOW_MS, Ordering::Relaxed);
+        assert_eq!(limiter.check(overflow), AuthFailureCheck::Allowed);
+        assert!(limiter.record_failure(overflow));
+        assert!(limiter.tracked_ips() <= AUTH_FAILURE_TABLE_CAPACITY);
+    }
+
+    /// 日志采样策略（确定性，不依赖全局 subscriber）：
+    /// 只有每窗口首条失败与首次 429 用 WARN，其余 debug；
+    /// 标志直接来自限速器返回值，串联验证不会每个请求都 WARN。
+    #[test]
+    fn v034_auth_failure_log_sampling_is_warn_only_once() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        // 纯函数决策。
+        assert_eq!(SampledLevel::for_failure(true), SampledLevel::Warn);
+        assert_eq!(SampledLevel::for_failure(false), SampledLevel::Debug);
+        assert_eq!(SampledLevel::for_rate_limit(true), SampledLevel::Warn);
+        assert_eq!(SampledLevel::for_rate_limit(false), SampledLevel::Debug);
+
+        // 与限速器串联：limit=3，前两次失败 WARN/Debug，第 3 次失败仍是 Debug
+        // （401），第 4 次请求首次 429 才是 WARN，第 5 次恢复 Debug。
+        let now = Arc::new(AtomicI64::new(1_000_000));
+        let clock = now.clone();
+        let limiter =
+            AuthFailureLimiter::with_clock(3, Arc::new(move || clock.load(Ordering::Relaxed)));
+        let ip: IpAddr = "203.0.113.20".parse().unwrap();
+
+        let mut levels = Vec::new();
+        for _ in 0..3 {
+            levels.push(SampledLevel::for_failure(limiter.record_failure(ip)));
+        }
+        assert_eq!(
+            levels,
+            vec![SampledLevel::Warn, SampledLevel::Debug, SampledLevel::Debug],
+            "每窗口只有首条失败 WARN"
+        );
+
+        let mut limited_levels = Vec::new();
+        for _ in 0..2 {
+            match limiter.check(ip) {
+                AuthFailureCheck::Limited { first, .. } => {
+                    limited_levels.push(SampledLevel::for_rate_limit(first));
+                }
+                AuthFailureCheck::Allowed => panic!("达到阈值后必须 Limited"),
+            }
+        }
+        assert_eq!(
+            limited_levels,
+            vec![SampledLevel::Warn, SampledLevel::Debug],
+            "首次 429 只 WARN 一次"
+        );
     }
 }

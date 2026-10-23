@@ -54,7 +54,7 @@ mod auth;
 mod cert_rotation;
 mod control;
 mod session;
-use auth::TokenScope;
+use auth::{AuthFailureLimiter, TokenScope};
 use cert_rotation::CertStatus;
 use control::{ControlCommand, ControlSession};
 use session::{SessionRegistry, ShutdownReason};
@@ -323,6 +323,8 @@ struct AppState {
     live_cert: Arc<RwLock<CertStatus>>,
     /// 管理 API 的每 IP 固定窗口限速。
     admin_rate: Arc<AdminRateLimiter>,
+    /// 未认证 401 的每来源 IP 固定窗口失败限速（KI-26）。
+    auth_failures: Arc<AuthFailureLimiter>,
 }
 
 /// 由 TLS accept 层注入到每个请求扩展里的对端身份。
@@ -989,6 +991,9 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
             ),
             live_cert: live_cert.clone(),
             admin_rate: Arc::new(AdminRateLimiter::from_config(&cfg)),
+            auth_failures: Arc::new(AuthFailureLimiter::new(
+                cfg.admin_auth_failure_limit_per_min,
+            )),
         };
 
         spawn_revoke_watcher(storage.clone(), sessions);
@@ -4216,6 +4221,9 @@ mod tests {
             ..HubConfig::default()
         };
         let admin_rate = Arc::new(AdminRateLimiter::from_config(&cfg));
+        let auth_failures = Arc::new(AuthFailureLimiter::new(
+            cfg.admin_auth_failure_limit_per_min,
+        ));
         let state = AppState {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
             cfg: Arc::new(cfg),
@@ -4224,6 +4232,7 @@ mod tests {
             renewal: RenewalContext::new(tls::cert_dir(&dir), 90),
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
+            auth_failures,
         };
         let token = "enroll-token-bad-csr";
         let now = now_ms();
@@ -4271,6 +4280,9 @@ mod tests {
             ..HubConfig::default()
         };
         let admin_rate = Arc::new(AdminRateLimiter::from_config(&cfg));
+        let auth_failures = Arc::new(AuthFailureLimiter::new(
+            cfg.admin_auth_failure_limit_per_min,
+        ));
         let state = AppState {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
             cfg: Arc::new(cfg),
@@ -4279,6 +4291,7 @@ mod tests {
             renewal: RenewalContext::new(tls::cert_dir(&dir), 90),
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
+            auth_failures,
         };
 
         let token = "enroll-token-value";
@@ -4563,6 +4576,9 @@ mod tests {
 
     fn hub_state_with(cfg: HubConfig) -> AppState {
         let admin_rate = Arc::new(AdminRateLimiter::from_config(&cfg));
+        let auth_failures = Arc::new(AuthFailureLimiter::new(
+            cfg.admin_auth_failure_limit_per_min,
+        ));
         AppState {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
             cfg: Arc::new(cfg),
@@ -4571,6 +4587,7 @@ mod tests {
             renewal: RenewalContext::new(PathBuf::from("/tmp/rb-hub-test-unused-ca"), 90),
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
+            auth_failures,
         }
     }
 
@@ -8174,5 +8191,194 @@ mod tests {
             "该配置在 run 时必须被拒绝"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // v0.3.4 KI-26：未认证 401 的每来源 IP 失败限速
+    // ------------------------------------------------------------------
+
+    /// 认证失败限速测试状态：默认失败阈值 60；关闭已认证请求限速，
+    /// 避免 61 次请求触发另一套（认证成功后）的 429 干扰断言。
+    fn v034_auth_state(legacy_token: &str) -> AppState {
+        hub_state_with(HubConfig {
+            admin_token: legacy_token.to_string(),
+            admin_rate_limit_per_min: 0,
+            admin_write_rate_limit_per_min: 0,
+            ..HubConfig::default()
+        })
+    }
+
+    /// 错误 token 前 60 次 401（不写审计），第 61 次 429 + Retry-After；
+    /// 旧 admin_token 在超限后仍是应急入口（200），命中后清空失败计数。
+    #[tokio::test]
+    async fn v034_auth_failure_limit_429_and_legacy_bypass() {
+        let legacy = "v034-legacy-admin-token-0123456789";
+        let state = v034_auth_state(legacy);
+        let router = admin_router(state.clone());
+
+        for attempt in 1..=60 {
+            let (status, headers, body) =
+                admin_call(&router, "GET", "/api/v1/agents", Some("wrong-token"), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "第 {attempt} 次必须 401");
+            assert_eq!(headers.get(header::WWW_AUTHENTICATE).unwrap(), "Bearer");
+            assert_eq!(
+                json_body(&body),
+                serde_json::json!({ "error": "unauthorized" })
+            );
+            assert!(
+                !String::from_utf8_lossy(&body).contains("wrong-token"),
+                "401 不得回显 token"
+            );
+        }
+        assert!(
+            state
+                .storage
+                .list_audit(10, None, None, None)
+                .unwrap()
+                .is_empty(),
+            "401 不得写审计"
+        );
+
+        // 第 61 次：429 固定 body + Retry-After(1..=60)，不回显 token，不写审计。
+        let (status, headers, body) =
+            admin_call(&router, "GET", "/api/v1/agents", Some("wrong-token"), None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            json_body(&body),
+            serde_json::json!({ "error": "rate_limited" })
+        );
+        assert!(!String::from_utf8_lossy(&body).contains("wrong-token"));
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        let retry: u64 = headers
+            .get(header::RETRY_AFTER)
+            .expect("429 必须带 Retry-After")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&retry), "Retry-After 非法: {retry}");
+        assert!(
+            state
+                .storage
+                .list_audit(10, None, None, None)
+                .unwrap()
+                .is_empty(),
+            "429 不得写审计"
+        );
+
+        // 旧 admin_token：超限后仍必须 200，不受失败限速影响。
+        let (status, _, _) = admin_call(&router, "GET", "/api/v1/agents", Some(legacy), None).await;
+        assert_eq!(status, StatusCode::OK, "旧 admin_token 必须绕过失败限速");
+
+        // 命中后清空该 IP 计数：再次错误 token 重新从 401 开始。
+        let (status, _, _) =
+            admin_call(&router, "GET", "/api/v1/agents", Some("wrong-token"), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// 阈值前合法 scoped token 必须 200；超限后即使 token 合法也 429，
+    /// 且不查库（`last_used_at` 保持为空可证明未执行 `authenticate_api_token`）。
+    #[tokio::test]
+    async fn v034_scoped_token_before_limit_ok_and_after_limit_no_db() {
+        let state = hub_state_with(HubConfig {
+            admin_token: "v034-legacy-admin-token-0123456789".to_string(),
+            admin_auth_failure_limit_per_min: 3,
+            admin_rate_limit_per_min: 0,
+            admin_write_rate_limit_per_min: 0,
+            ..HubConfig::default()
+        });
+        let within = v6_seed_token(&state, "within-limit", "read");
+        let blocked = v6_seed_token(&state, "above-limit", "read");
+        let router = admin_router(state.clone());
+
+        // 2 次失败 < 3：合法 scoped token 必须 200，并清空失败计数。
+        for _ in 0..2 {
+            let (status, _, _) =
+                admin_call(&router, "GET", "/api/v1/agents", Some("wrong"), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        let (status, _, _) =
+            admin_call(&router, "GET", "/api/v1/agents", Some(&within), None).await;
+        assert_eq!(status, StatusCode::OK, "阈值前合法 scoped token 必须放行");
+
+        // 成功认证清零后重新累计 3 次失败，达到阈值。
+        for _ in 0..3 {
+            let (status, _, _) =
+                admin_call(&router, "GET", "/api/v1/agents", Some("wrong"), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        let blocked_last_used = || {
+            state
+                .storage
+                .list_api_tokens()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.name == "above-limit")
+                .expect("token 必须存在")
+                .last_used_at
+        };
+        assert_eq!(blocked_last_used(), None, "从未成功认证过");
+
+        // 超限后合法 scoped token：429 + Retry-After，且不查库、不回显 token。
+        let (status, headers, body) =
+            admin_call(&router, "GET", "/api/v1/agents", Some(&blocked), None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            json_body(&body),
+            serde_json::json!({ "error": "rate_limited" })
+        );
+        assert!(
+            !String::from_utf8_lossy(&body).contains(&blocked),
+            "429 不得回显 token"
+        );
+        let retry: u64 = headers
+            .get(header::RETRY_AFTER)
+            .expect("429 必须带 Retry-After")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&retry), "Retry-After 非法: {retry}");
+        assert_eq!(
+            blocked_last_used(),
+            None,
+            "超限路径不得执行查库（last_used_at 不能更新）"
+        );
+    }
+
+    /// 缺失 / 格式错误的 Bearer 也按来源 IP 计失败；达到阈值后同样 429。
+    #[tokio::test]
+    async fn v034_missing_and_malformed_bearer_are_rate_limited() {
+        let state = hub_state_with(HubConfig {
+            admin_token: "v034-legacy-admin-token-0123456789".to_string(),
+            admin_auth_failure_limit_per_min: 2,
+            admin_rate_limit_per_min: 0,
+            admin_write_rate_limit_per_min: 0,
+            ..HubConfig::default()
+        });
+        let router = admin_router(state);
+
+        for _ in 0..2 {
+            let (status, _, _) = admin_call(&router, "GET", "/api/v1/agents", None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        for _ in 0..2 {
+            let (status, headers, body) =
+                admin_call(&router, "GET", "/api/v1/agents", None, None).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(json_body(&body)["error"], "rate_limited");
+            assert!(headers.contains_key(header::RETRY_AFTER));
+        }
+
+        // 格式错误（没有 Bearer scheme）同样会在限速检查处直接 429。
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/v1/agents")
+            .header(header::AUTHORIZATION, "wrong-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = call_router(&router, request).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

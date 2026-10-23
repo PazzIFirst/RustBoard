@@ -513,6 +513,10 @@ pub struct HubConfig {
     /// 管理 API 写操作（PUT/POST/PATCH/DELETE）每 IP 每分钟上限；0 表示关闭。
     #[serde(default = "default_admin_write_rate_limit_per_min")]
     pub admin_write_rate_limit_per_min: u32,
+    /// 管理 API 未认证失败（缺失 / 错误 token）每来源 IP 每分钟上限（固定窗口）。
+    /// 0 表示关闭；默认 60，最大 600。超限后不再 SHA-256 / 查库。
+    #[serde(default = "default_admin_auth_failure_limit_per_min")]
+    pub admin_auth_failure_limit_per_min: u32,
     pub per_core: bool,
     pub excluded_interfaces: Vec<String>,
     pub retention_raw_days: u32,
@@ -566,6 +570,11 @@ fn default_admin_write_rate_limit_per_min() -> u32 {
     10
 }
 
+/// 管理 API 未认证失败默认每来源 IP 每分钟上限。
+fn default_admin_auth_failure_limit_per_min() -> u32 {
+    60
+}
+
 impl Default for HubConfig {
     fn default() -> Self {
         Self {
@@ -584,6 +593,7 @@ impl Default for HubConfig {
             read_pool_size: default_read_pool_size(),
             admin_rate_limit_per_min: default_admin_rate_limit_per_min(),
             admin_write_rate_limit_per_min: default_admin_write_rate_limit_per_min(),
+            admin_auth_failure_limit_per_min: default_admin_auth_failure_limit_per_min(),
             per_core: false,
             excluded_interfaces: default_excluded_interfaces(),
             retention_raw_days: 7,
@@ -671,6 +681,14 @@ impl HubConfig {
                 "admin_write_rate_limit_per_min 不能超过 {MAX_ADMIN_RATE_LIMIT_PER_MIN}\
                  （0 表示关闭），实际 {}",
                 self.admin_write_rate_limit_per_min
+            )));
+        }
+        // 未认证失败限速：0 关闭；上限 600，避免配置错误把保护变成无限额度。
+        if self.admin_auth_failure_limit_per_min > MAX_ADMIN_AUTH_FAILURE_LIMIT_PER_MIN {
+            return Err(Error::InvalidConfig(format!(
+                "admin_auth_failure_limit_per_min 不能超过 \
+                 {MAX_ADMIN_AUTH_FAILURE_LIMIT_PER_MIN}（0 表示关闭），实际 {}",
+                self.admin_auth_failure_limit_per_min
             )));
         }
         // server_names 是服务端证书的 SAN 唯一来源：为空或含非法条目时，
@@ -863,6 +881,12 @@ const MAX_READ_POOL_SIZE: usize = 16;
 /// 管理 API 每分钟请求上限的硬上限（0 表示关闭限速）。
 const MAX_ADMIN_RATE_LIMIT_PER_MIN: u32 = 6_000;
 
+/// 管理 API 未认证失败限速的硬上限（0 表示关闭限速）。
+///
+/// 失败限速用于压住未认证请求的查库与日志放大，阈值不宜设得过高；600/min
+/// 已远超正常客户端误输 token 的频率。
+const MAX_ADMIN_AUTH_FAILURE_LIMIT_PER_MIN: u32 = 600;
+
 /// agent 会话内证书检查周期的允许范围（小时）。
 const MIN_CERT_CHECK_INTERVAL_HOURS: u64 = 1;
 const MAX_CERT_CHECK_INTERVAL_HOURS: u64 = 168;
@@ -973,6 +997,39 @@ mod tests {
         assert_eq!(panel.cookie_secure, CookieSecure::Always);
         assert_eq!(panel.public_origin, "https://panel.example.com:8443");
         panel.validate().expect("合法面板配置必须通过校验");
+    }
+
+    /// v0.3.4 KI-26：未认证失败限速缺省 60（旧配置不写即启用）、0 关闭、>600 拒绝。
+    #[test]
+    fn v034_admin_auth_failure_limit_default_bounds_and_toml() {
+        // TOML 缺省与 Default 必须一致：旧配置不写该字段时仍为 60。
+        let hub: HubConfig = toml::from_str("").unwrap();
+        assert_eq!(hub.admin_auth_failure_limit_per_min, 60);
+        assert_eq!(HubConfig::default().admin_auth_failure_limit_per_min, 60);
+        hub.validate().expect("旧配置缺省必须合法");
+
+        // 显式值（含 0 = 关闭）必须被读取；0 / 1 / 600 是合法边界。
+        for (text, expected) in [
+            ("admin_auth_failure_limit_per_min = 0\n", 0),
+            ("admin_auth_failure_limit_per_min = 1\n", 1),
+            ("admin_auth_failure_limit_per_min = 600\n", 600),
+        ] {
+            let hub: HubConfig = toml::from_str(text).unwrap();
+            assert_eq!(
+                hub.admin_auth_failure_limit_per_min, expected,
+                "text={text}"
+            );
+            hub.validate().expect("边界值必须合法");
+        }
+
+        // 601 必须拒绝，错误信息点名字段，方便运维定位。
+        let hub: HubConfig = toml::from_str("admin_auth_failure_limit_per_min = 601\n").unwrap();
+        let err = hub.validate().expect_err("601 必须被拒绝").to_string();
+        assert!(
+            err.contains("admin_auth_failure_limit_per_min"),
+            "错误信息应包含字段名: {err}"
+        );
+        assert!(err.contains("600"), "错误信息应包含上限: {err}");
     }
 
     /// v0.3.3：`admin_tls` 默认 off（旧配置兼容），显式值必须正确解析，非法值拒绝。
