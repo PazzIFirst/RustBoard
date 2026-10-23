@@ -65,8 +65,11 @@ const MAX_IP_CONNECTION_ENTRIES: usize = 4096;
 const GENERATED_PASSWORD_LEN: usize = 20;
 /// 密码最短长度（仅约束 init 写入的密码）。
 const MIN_PASSWORD_LEN: usize = 8;
-/// series 查询最大跨度（32 天）。
-const MAX_SERIES_SPAN_MS: i64 = 32 * 24 * 3600 * 1000;
+/// series 查询最大跨度（730 天）。
+///
+/// 与 hub 的 `MAX_SERIES_SPAN_MS` 对齐，覆盖 1h 层默认保留期；面板只做代理，
+/// 更细的选层与 bucket 提升由 hub 负责。
+const MAX_SERIES_SPAN_MS: i64 = 730 * 24 * 3600 * 1000;
 /// overview 的 `window_ms` 下限：与 hub 侧 overview 的 1s 下限对齐。
 const MIN_OVERVIEW_WINDOW_MS: i64 = 1_000;
 /// latest 的 `window_ms` 下限：与 hub 侧 latest 一致，最小 1ms。
@@ -895,7 +898,7 @@ fn validate_series_query(query: &[(String, String)]) -> std::result::Result<(), 
         return Err("from 必须早于 to".to_string());
     }
     if to.saturating_sub(from) > MAX_SERIES_SPAN_MS {
-        return Err("时间跨度不能超过 32 天".to_string());
+        return Err("时间跨度不能超过 730 天".to_string());
     }
     Ok(())
 }
@@ -3038,10 +3041,21 @@ mod tests {
         uppercase[0].1 = "CPU.USAGE".into();
         assert!(validate_series_query(&uppercase).is_err());
 
-        let mut too_wide = valid.clone();
-        too_wide[3].1 = (1_700_000_000_000i64 + MAX_SERIES_SPAN_MS + 1).to_string();
-        too_wide[2].1 = "1700000000000".into();
-        assert!(validate_series_query(&too_wide).is_err());
+        // M4-A2b：与 hub 对齐，最长 730 天；边界本身通过，+1ms 拒绝。
+        let from = 1_700_000_000_000i64;
+        let series_at = |span_ms: i64| {
+            vec![
+                ("metric".to_string(), "cpu.usage".to_string()),
+                ("from".to_string(), from.to_string()),
+                ("to".to_string(), (from + span_ms).to_string()),
+            ]
+        };
+        assert!(
+            validate_series_query(&series_at(MAX_SERIES_SPAN_MS)).is_ok(),
+            "730 天必须通过"
+        );
+        let err = validate_series_query(&series_at(MAX_SERIES_SPAN_MS + 1)).unwrap_err();
+        assert!(err.contains("730"), "错误信息必须说明 730 天上限: {err}");
     }
 
     #[test]
