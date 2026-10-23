@@ -922,22 +922,41 @@ fn rotate_cert(config: Option<PathBuf>, force: bool, days: Option<u32>) -> Resul
     Ok(())
 }
 
+/// 数据库文件的直接父目录是否就是要声明的私有 `data_dir`。
+///
+/// 只有「非空父目录且恰好等于 `data_dir`」才允许走
+/// [`SqliteStorage::open_with_private_data_dir`] 收紧目录权限；相对路径（父目录为空）
+/// 与外置数据库一律返回 false，调用方走普通构造，绝不 chmod 可能共享的父目录。
+fn storage_uses_private_data_dir(db_path: &FsPath, data_dir: &FsPath) -> bool {
+    db_path
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty() && parent == data_dir)
+}
+
 /// 打开 SQLite 存储（KI-21）。
 ///
 /// `data_dir` 是数据库文件的直接父目录时，把它声明为 hub 专用数据目录：旧版本
-/// 遗留的 0755 目录会在打开前被收紧到 0700。数据库在 `data_dir` 之外时走普通
-/// 构造，**绝不 chmod** 与该库无关的父目录（可能是 `/tmp`、`/var/tmp` 等共享目录）。
+/// 遗留的 0755 目录会在打开前被收紧到 0700。数据库在 `data_dir` 之外（或 `database`
+/// 是相对路径）时走普通构造，**绝不 chmod** 与该库无关的父目录（可能是 `/tmp`、
+/// `/var/tmp` 等共享目录），并在启动时打一次 WARN 提示运维。
 fn open_storage(
     db_path: &FsPath,
     data_dir: &FsPath,
     read_pool_size: usize,
 ) -> Result<SqliteStorage> {
-    match db_path.parent() {
-        // 空父目录表示相对路径数据库，不能声明为「本程序专用目录」。
-        Some(parent) if !parent.as_os_str().is_empty() && parent == data_dir => {
-            SqliteStorage::open_with_private_data_dir(db_path, read_pool_size, data_dir)
-        }
-        _ => SqliteStorage::open_with_readers(db_path, read_pool_size),
+    let uses_private_data_dir = storage_uses_private_data_dir(db_path, data_dir);
+    if !uses_private_data_dir {
+        // 只告警不拒绝：外置 DB 是允许的部署形态，只是父目录不会被收紧。
+        tracing::warn!(
+            db = %db_path.display(),
+            data_dir = %data_dir.display(),
+            "数据库不在 data_dir 下：父目录不收紧（不做 0700 收紧），DB 文件仍 0600"
+        );
+    }
+    if uses_private_data_dir {
+        SqliteStorage::open_with_private_data_dir(db_path, read_pool_size, data_dir)
+    } else {
+        SqliteStorage::open_with_readers(db_path, read_pool_size)
     }
 }
 
@@ -7313,6 +7332,51 @@ mod tests {
             "数据库文件仍必须是 0600"
         );
         let _ = std::fs::remove_dir_all(&db_parent);
+    }
+
+    // ------------------------------------------------------------------
+    // v0.3.5：database 外置告警的构造判定（日志由 e2e 验证）
+    // ------------------------------------------------------------------
+
+    /// `database` 的**直接父目录**恰好是 `data_dir` 才允许走私有目录构造并收紧；
+    /// 外置、嵌套子目录、相对路径都不能误判，避免 chmod 共享/无关目录。
+    #[test]
+    fn v035_storage_private_data_dir_requires_exact_parent() {
+        let base = temp_dir("hub-storage-private-dir");
+        let data_dir = base.join("data");
+
+        // 同目录：直接父目录 == data_dir，允许收紧。
+        assert!(storage_uses_private_data_dir(
+            &data_dir.join("hub.db"),
+            &data_dir
+        ));
+
+        // 外置：父目录是另一个目录，必须判 false。
+        assert!(!storage_uses_private_data_dir(
+            &base.join("outside.db"),
+            &data_dir
+        ));
+
+        // 更深的嵌套子目录也不含在 data_dir 的直接父目录语义里。
+        assert!(!storage_uses_private_data_dir(
+            &data_dir.join("nested").join("hub.db"),
+            &data_dir
+        ));
+        // 反过来（DB 在 data_dir 的父目录里）同样不能收紧 data_dir。
+        assert!(!storage_uses_private_data_dir(
+            &base.join("hub.db"),
+            &data_dir
+        ));
+
+        // 相对路径：父目录为空，不能声明为「本程序专用目录」。
+        assert!(!storage_uses_private_data_dir(
+            FsPath::new("hub.db"),
+            &data_dir
+        ));
+        assert!(!storage_uses_private_data_dir(
+            FsPath::new("./hub.db"),
+            &data_dir
+        ));
     }
 
     /// KI-21：证书目录只在已存在时收紧，缺失时不得创建空目录掩盖错误。

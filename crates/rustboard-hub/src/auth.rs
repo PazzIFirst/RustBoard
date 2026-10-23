@@ -10,7 +10,8 @@
 //!    失败记一次失败，未超限 401，达到阈值后后续请求 429；
 //! 6. 认证失败固定 401 + `WWW-Authenticate: Bearer`；429 固定
 //!    `{"error":"rate_limited"}` + `Retry-After`（1..=60 秒）；两者都不写审计、
-//!    不回显 token；日志每 IP 每窗口只 WARN 第一条失败与首次 429，其余 debug；
+//!    不回显 token；日志每 IP 每窗口只 WARN 第一条失败与首次 429，其余 debug
+//!    （`limit = 0` 关闭限速时仍保留首条失败 WARN 采样，见 [`AuthFailureLimiter`]）；
 //! 7. 认证成功后才进入每 IP 管理限速（未认证请求不消耗已认证额度）；
 //! 8. 按「已知路由 + 方法」精确校验 scope（见 [`required_scope`]）：
 //!    `read < write < admin`，权限不足 403 `forbidden_scope`，不写控制审计；
@@ -158,8 +159,9 @@ struct AuthFailureTable {
 /// 未认证请求的每来源 IP 固定窗口失败限速（KI-26）。
 ///
 /// 独立于管理 API 的 `AdminRateLimiter`：未认证请求只消耗失败额度，认证成功后
-/// 才进入每 IP 请求限速。窗口 60s、容量 4096 个来源 IP；`limit` 为 0 时整体关闭。
-/// 时钟可注入，单测不 sleep。
+/// 才进入每 IP 请求限速。窗口 60s、容量 4096 个来源 IP；`limit` 为 0 时关闭限速
+/// （`check` 恒为 `Allowed`，不返回 429），但仍保留同一有界窗口**只用于 WARN 采样**：
+/// 每 IP 每窗口首条失败返回 true，后续降为 DEBUG。时钟可注入，单测不 sleep。
 pub(crate) struct AuthFailureLimiter {
     limit: u32,
     table: StdMutex<AuthFailureTable>,
@@ -187,6 +189,8 @@ impl AuthFailureLimiter {
     }
 
     /// 认证前检查：已超限返回 `Limited`，调用方必须直接 429（不查库）。
+    ///
+    /// `limit == 0` 时恒为 `Allowed`：采样窗口只服务日志，绝不能让关闭限速变成 429。
     pub(crate) fn check(&self, ip: IpAddr) -> AuthFailureCheck {
         if self.limit == 0 {
             return AuthFailureCheck::Allowed;
@@ -232,10 +236,11 @@ impl AuthFailureLimiter {
     }
 
     /// 记录一次认证失败；返回 true 表示这是该 IP 本窗口第一条失败（用于 WARN 采样）。
+    ///
+    /// `limit == 0`（关闭限速）时仍记录采样窗口：它只影响日志级别，不参与限速判定，
+    /// 因此不会恢复 429。表满时新来源仍返回 false，保持 `AUTH_FAILURE_TABLE_CAPACITY`
+    /// 的硬上界（此时该来源本轮无 WARN，属可接受的观测损失）。
     pub(crate) fn record_failure(&self, ip: IpAddr) -> bool {
-        if self.limit == 0 {
-            return false;
-        }
         let now = (self.now_ms)();
         let mut table = self.lock_table();
         if table
@@ -267,11 +272,11 @@ impl AuthFailureLimiter {
         true
     }
 
-    /// 认证成功（含旧 admin_token 命中）时清空该来源的失败计数。
+    /// 认证成功（含旧 admin_token 命中）时清空该来源的失败计数与采样窗口。
+    ///
+    /// `limit == 0` 时同样清空：否则成功登录后下一次失败仍会被当作同窗口后续失败，
+    /// 失去首条 WARN 采样。
     pub(crate) fn clear(&self, ip: IpAddr) {
-        if self.limit == 0 {
-            return;
-        }
         self.lock_table().windows.remove(&ip);
     }
 
@@ -865,7 +870,7 @@ mod tests {
         );
     }
 
-    /// 不同来源 IP 独立计数；limit=0 关闭且完全不记录来源。
+    /// 不同来源 IP 独立计数；limit=0 关闭限速但保留有界采样窗口。
     #[test]
     fn v034_auth_failure_limiter_is_per_ip_and_can_be_disabled() {
         use std::sync::atomic::{AtomicI64, Ordering};
@@ -895,12 +900,74 @@ mod tests {
         limiter.clear(ip_a);
         assert_eq!(limiter.check(ip_a), AuthFailureCheck::Allowed);
 
+        // limit=0：限速关闭（check 恒 Allowed），但仍保留一条采样窗口服务 WARN。
         let disabled = AuthFailureLimiter::with_clock(0, Arc::new(|| 1_000_000));
+        assert_eq!(disabled.check(ip_a), AuthFailureCheck::Allowed);
+        assert!(
+            disabled.record_failure(ip_a),
+            "关闭限速后首条失败仍要采样 WARN"
+        );
         for _ in 0..100 {
             assert_eq!(disabled.check(ip_a), AuthFailureCheck::Allowed);
-            assert!(!disabled.record_failure(ip_a));
+            assert!(!disabled.record_failure(ip_a), "同窗口后续失败只记 DEBUG");
         }
-        assert_eq!(disabled.tracked_ips(), 0, "关闭时不得记录来源");
+        assert_eq!(disabled.tracked_ips(), 1, "关闭限速时只为采样保留有界窗口");
+    }
+
+    /// v0.3.5：`limit = 0` 关闭限速但保留首条 WARN 采样。
+    ///
+    /// 覆盖：首条失败 → WARN、同窗口第二条 → DEBUG、`check` 始终 `Allowed`（不恢复
+    /// 429）、采样表有界、`clear` 后与窗口过期后可再次采样。确定性时钟，不依赖
+    /// 全局 tracing subscriber。
+    #[test]
+    fn v035_zero_limit_keeps_first_failure_warn_sample() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let now = Arc::new(AtomicI64::new(1_000_000));
+        let clock = now.clone();
+        let limiter =
+            AuthFailureLimiter::with_clock(0, Arc::new(move || clock.load(Ordering::Relaxed)));
+        let ip: IpAddr = "203.0.113.30".parse().unwrap();
+
+        assert_eq!(limiter.check(ip), AuthFailureCheck::Allowed);
+        assert_eq!(
+            SampledLevel::for_failure(limiter.record_failure(ip)),
+            SampledLevel::Warn,
+            "关闭限速后每窗口首条失败仍必须 WARN"
+        );
+        assert_eq!(
+            SampledLevel::for_failure(limiter.record_failure(ip)),
+            SampledLevel::Debug,
+            "同窗口后续失败不得刷屏"
+        );
+        assert_eq!(
+            limiter.check(ip),
+            AuthFailureCheck::Allowed,
+            "limit=0 不得因为采样窗口恢复 429"
+        );
+        assert!(
+            limiter.tracked_ips() <= 1,
+            "limit=0 只保留有界采样窗口，实际 tracked={}",
+            limiter.tracked_ips()
+        );
+
+        // 认证成功后清空采样窗口：下一次失败重新 WARN。
+        limiter.clear(ip);
+        assert_eq!(limiter.tracked_ips(), 0, "clear 必须清空采样窗口");
+        assert!(
+            limiter.record_failure(ip),
+            "clear 后下一次失败必须重新采样 WARN"
+        );
+        assert!(limiter.tracked_ips() <= 1);
+
+        // 窗口过期后重新采样，且仍不参与限速。
+        now.store(1_000_000 + AUTH_FAILURE_WINDOW_MS, Ordering::Relaxed);
+        assert!(
+            limiter.record_failure(ip),
+            "新窗口首条失败必须重新采样 WARN"
+        );
+        assert!(limiter.tracked_ips() <= 1);
+        assert_eq!(limiter.check(ip), AuthFailureCheck::Allowed);
     }
 
     /// 容量 4096：满且无过期项时拒绝新来源；逐窗口只 WARN 一次容量告警；
