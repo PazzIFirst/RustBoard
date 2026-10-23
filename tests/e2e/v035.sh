@@ -412,13 +412,10 @@ wait_health() {
   done
 }
 
-read_agent_status() {
+# 只解析 $HTTP_BODY_FILE（最近一次 GET /api/v1/agents 的响应），不发请求。
+# 必须在父 shell 里配合 `api GET ...` 使用，避免命令替换子 shell 丢失 STATUS。
+agent_status_from_body() {
   local id=$1
-  api GET "/api/v1/agents"
-  if [[ "$STATUS" != "200" ]]; then
-    echo ""
-    return 0
-  fi
   "$PYTHON" - "$id" "$HTTP_BODY_FILE" <<'PY'
 import json
 import sys
@@ -435,6 +432,16 @@ for agent in agents if isinstance(agents, list) else []:
         print(agent.get("status", ""))
         break
 PY
+}
+
+read_agent_status() {
+  local id=$1
+  api GET "/api/v1/agents"
+  if [[ "$STATUS" != "200" ]]; then
+    echo ""
+    return 0
+  fi
+  agent_status_from_body "$id"
 }
 
 wait_agent_status() {
@@ -695,8 +702,10 @@ FLOOD_DURING=no
 if is_running "$FLOOD_PID"; then
   FLOOD_DURING=yes
 fi
-DURING_STATUS=$(read_agent_status "$AGENT_ID")
+# 先在父 shell 请求（STATUS 才能传回），再用纯解析 helper 取 status。
+api GET "/api/v1/agents"
 DURING_HTTP=$STATUS
+DURING_STATUS=$(agent_status_from_body "$AGENT_ID")
 check_eq "3.2" "flood 保持期间管理 API 查询返回 200" "200" "$DURING_HTTP"
 check_eq "3.3" "flood 保持期间 A 仍 online" "online" "$DURING_STATUS"
 check_eq "3.4" "查询时 flood helper 仍在运行（连接仍保持）" "yes" "$FLOOD_DURING"
