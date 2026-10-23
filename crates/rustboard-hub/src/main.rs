@@ -7843,6 +7843,45 @@ mod tests {
         }
     }
 
+    /// #17 复审回归：命令在等待回复期间会话关闭（oneshot 被丢弃）且 agent 已吊销，
+    /// 必须回 403 `agent_revoked` + 审计 denied，而不是 503 `agent_offline` + error。
+    #[tokio::test]
+    async fn v033_dropped_reply_after_revoke_returns_agent_revoked() {
+        let state = m3_state(m3_control_cfg());
+        let mut handle = m3_register_agent(&state, "a1", &["systemd"]);
+        let router = admin_router(state.clone());
+
+        // 在独立任务里发起控制请求：它会通过能力/吊销检查并把命令投进会话队列，
+        // 然后卡在 reply_rx 等待上。
+        let post = tokio::spawn(async move {
+            m3_post(&router, "a1", r#"{"capability":"systemd","action":"list"}"#).await
+        });
+
+        let command = tokio::time::timeout(Duration::from_secs(2), handle.control_rx.recv())
+            .await
+            .expect("控制命令必须及时入队")
+            .expect("会话控制通道必须打开");
+
+        // 先吊销，再丢弃命令且不回复：reply oneshot 被丢弃，进入 handler 的
+        // `Ok(Err(_))` 分支；该分支必须重新查询吊销状态。
+        state.storage.revoke_agent("a1", now_ms()).unwrap();
+        drop(command);
+
+        let (status, body) = tokio::time::timeout(Duration::from_secs(2), post)
+            .await
+            .expect("POST 必须及时返回")
+            .expect("POST 任务不得 panic");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "agent_revoked");
+        assert_eq!(body["error"]["message"], "agent 已被吊销");
+
+        let entries = m3_audit(&state);
+        assert_eq!(entries.len(), 1, "拒绝路径必须写一条审计");
+        assert_eq!(entries[0].result, "denied");
+        assert_eq!(entries[0].error_code, "agent_revoked");
+    }
+
     // ------------------------------------------------------------------
     // v0.3.3 A2：管理端 TLS
     // ------------------------------------------------------------------

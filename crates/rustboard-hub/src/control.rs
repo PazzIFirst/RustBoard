@@ -698,8 +698,15 @@ pub(crate) async fn control_action(
             return finish_error(&state, audit, started, &Reject::timeout()).await;
         }
         Ok(Err(_)) => {
-            // oneshot 被丢弃：会话结束 / pending 被取消。
-            return finish_error(&state, audit, started, &Reject::offline()).await;
+            // oneshot 被丢弃：会话结束 / pending 被取消。这期间 agent 可能已被
+            // revoke（会话随后才关闭），必须再查一次吊销，否则会把 #17 的 403
+            // agent_revoked 误报成 503 agent_offline，审计口径也会错成 error。
+            let reject = match ensure_agent_not_revoked(&state, &agent_id).await {
+                Ok(()) => Reject::offline(),
+                // 命中吊销 → revoked(403/denied)；查询失败 → internal(fail closed)。
+                Err(reject) => reject,
+            };
+            return finish_error(&state, audit, started, &reject).await;
         }
         Ok(Ok(Ok(result))) => {
             // 命令是否成功只看退出码：只有明确的 0 算成功；非 0 与被信号终止
