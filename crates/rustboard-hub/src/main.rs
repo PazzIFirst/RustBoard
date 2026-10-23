@@ -315,9 +315,6 @@ struct AppState {
     storage: Arc<SqliteStorage>,
     cfg: Arc<HubConfig>,
     sessions: Arc<SessionRegistry>,
-    /// 已升级的 WebSocket 会话上限。TLS 层信号量在升级完成时释放，
-    /// 长连接会话必须在这里再占一个许可，才真正限制并发会话数。
-    session_slots: Arc<tokio::sync::Semaphore>,
     /// 客户端证书续签的准入控制（按 agent 的冷却窗口 + 读盘/签名上下文）。
     renewal: Arc<RenewalContext>,
     /// 监听器当前实际使用的证书摘要（热加载成功 / 自动续签后更新）。
@@ -1024,7 +1021,6 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
             storage: storage.clone(),
             cfg: Arc::new(cfg.clone()),
             sessions: sessions.clone(),
-            session_slots: Arc::new(tokio::sync::Semaphore::new(cfg.max_connections.max(1))),
             renewal: RenewalContext::new(
                 tls::cert_dir(&cfg.data_dir),
                 cfg.client_cert_validity_days,
@@ -1809,6 +1805,22 @@ fn try_acquire_connection(permits: &Arc<Semaphore>) -> Option<OwnedSemaphorePerm
     permits.clone().try_acquire_owned().ok()
 }
 
+/// TLS accept 层取得的连接许可，随请求 / 会话生命周期持有（KI-27）。
+///
+/// 两个字段都用 `Arc` 包裹，使 guard 可以廉价 clone 到请求扩展；只有最后一个
+/// clone 被 drop 时，底层 `OwnedSemaphorePermit` / `ConnectionPermit` 才真正
+/// 归还全局槽位与 per-IP 计数。
+///
+/// 生命周期：
+/// - 普通 HTTP 请求：`serve_tls` 把 clone 放进请求扩展，响应结束随请求释放；
+/// - WebSocket 升级：`agent_ws` 取出 clone 并移入 `on_upgrade` future，
+///   持有到 `dispatch` 返回，因此 `serve_connection` 提前返回不会提前归还许可。
+#[derive(Clone)]
+struct ConnectionGuards {
+    _global: Arc<OwnedSemaphorePermit>,
+    _per_ip: Arc<ConnectionPermit>,
+}
+
 async fn serve_tls(
     app: Router,
     addr: String,
@@ -1882,8 +1894,13 @@ async fn serve_tls(
         let acceptor = TlsAcceptor::from(config.borrow().clone());
         let app = app.clone();
         tokio::spawn(async move {
-            // 许可跟随整条连接生命周期（TLS 握手 + WebSocket 会话）。
-            let _permit = permit;
+            // A1 / KI-27：全局信号量许可与 per-IP 许可都包进同一个 guard。
+            // 普通 HTTP 请求随请求扩展在响应结束后释放；WebSocket 升级由
+            // `agent_ws` 把 guard 移入 upgrade future，持有到会话结束。
+            let guards = ConnectionGuards {
+                _global: Arc::new(permit),
+                _per_ip: Arc::new(connection),
+            };
             let stream =
                 match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
                     Ok(Ok(stream)) => stream,
@@ -1896,9 +1913,6 @@ async fn serve_tls(
                         return;
                     }
                 };
-            // 握手成功；连接许可（全局 + per-IP）继续持有到会话结束。
-            let _connection = connection;
-
             // 证书链已在 TLS 握手阶段由 rustls 校验；这里只取 subject CN 做身份绑定。
             let cn = stream
                 .get_ref()
@@ -1909,6 +1923,11 @@ async fn serve_tls(
             let cn_display = cn.clone();
             let service = tower::service_fn(move |mut req: Request<Incoming>| {
                 req.extensions_mut().insert(PeerIdentity(cn.clone()));
+                // A1 / KI-27：每个请求扩展都带上连接 guard。普通 HTTP 请求在
+                // 响应结束后随请求释放；WebSocket 升级时 `agent_ws` 会把这里的
+                // clone 移入 upgrade future，因此 `serve_connection` 提前返回
+                // 不会把全局 / per-IP 许可提前归还。
+                req.extensions_mut().insert(guards.clone());
                 let app = app.clone();
                 async move { app.oneshot(req.map(Body::new)).await }
             });
@@ -2593,25 +2612,17 @@ impl IntoResponse for ApiError {
 async fn agent_ws(
     ws: WebSocketUpgrade,
     Extension(peer): Extension<PeerIdentity>,
+    Extension(guards): Extension<ConnectionGuards>,
     State(state): State<AppState>,
 ) -> axum::response::Response {
-    // 会话级许可：TLS 层的 permit 在 HTTP 升级完成时就释放了，
-    // 这里必须再占一个，否则 max_connections 对长连接完全不生效。
-    let permit = match state.session_slots.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            tracing::warn!(
-                max = state.cfg.max_connections,
-                "agent 会话数已达上限，拒绝新连接"
-            );
-            return (StatusCode::SERVICE_UNAVAILABLE, "too many sessions").into_response();
-        }
-    };
-
+    // KI-27：连接许可由 TLS 层创建，经请求扩展转交到这里。升级成功后必须把
+    // guard 移入 upgrade future 并持有到 `dispatch` 返回；缺失扩展时 axum 的
+    // `Extension` 提取器返回 500（fail-closed），绝不静默创建无许可会话。
     ws.max_message_size(MAX_WS_MESSAGE_SIZE)
         .max_frame_size(MAX_WS_FRAME_SIZE)
         .on_upgrade(move |socket| async move {
-            let _permit = permit; // 持有到会话结束
+            // 全局许可与 per-IP 许可覆盖整个 WebSocket 会话。
+            let _guards = guards;
             if let Err(err) = dispatch(socket, state, peer).await {
                 tracing::warn!(error = %log_safe_error(&err), "agent 会话结束");
             }
@@ -4487,7 +4498,6 @@ mod tests {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
             cfg: Arc::new(cfg),
             sessions: SessionRegistry::new(),
-            session_slots: Arc::new(Semaphore::new(4)),
             renewal: RenewalContext::new(tls::cert_dir(&dir), 90),
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
@@ -4546,7 +4556,6 @@ mod tests {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
             cfg: Arc::new(cfg),
             sessions: SessionRegistry::new(),
-            session_slots: Arc::new(Semaphore::new(4)),
             renewal: RenewalContext::new(tls::cert_dir(&dir), 90),
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
@@ -4842,7 +4851,6 @@ mod tests {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
             cfg: Arc::new(cfg),
             sessions: SessionRegistry::new(),
-            session_slots: Arc::new(Semaphore::new(8)),
             renewal: RenewalContext::new(PathBuf::from("/tmp/rb-hub-test-unused-ca"), 90),
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
@@ -5842,6 +5850,60 @@ mod tests {
         assert_eq!(limiter.tracked_ips(), 1, "已建立连接仍必须被计数");
         drop(established);
         assert_eq!(limiter.tracked_ips(), 0, "归零后必须清理");
+    }
+
+    /// KI-27：连接 guard 必须由最后一个 clone 释放，覆盖整个 WS 会话。
+    ///
+    /// 模拟 `serve_tls` 的三份 clone：请求扩展、连接本身、upgrade future。
+    /// 前两者先释放时（HTTP 升级响应完成、`serve_connection` 返回），全局与
+    /// per-IP 许可都必须仍被 upgrade future 持有，直到 `dispatch` 返回。
+    #[test]
+    fn v035_connection_guards_hold_until_last_clone_drops() {
+        let permits = Arc::new(Semaphore::new(1));
+        let limiter = Arc::new(ConnectionLimiter::with_ip_capacity(1, 4));
+        let ip: IpAddr = "192.0.2.27".parse().unwrap();
+
+        let guards = ConnectionGuards {
+            _global: Arc::new(try_acquire_connection(&permits).expect("首个全局许可")),
+            _per_ip: Arc::new(limiter.try_acquire(ip).expect("首个 per-IP 许可")),
+        };
+        assert!(
+            try_acquire_connection(&permits).is_none(),
+            "guard 存活时全局许可不得重复发放"
+        );
+        assert!(
+            limiter.try_acquire(ip).is_err(),
+            "guard 存活时 per-IP 许可不得重复发放"
+        );
+
+        // 请求扩展与连接层各持有一份 clone；升级路径再把一份移入 upgrade future。
+        let request_extension = guards.clone();
+        let upgrade_future = guards.clone();
+
+        // HTTP 升级响应结束：请求扩展先释放，许可不能跟着归还。
+        drop(request_extension);
+        assert!(try_acquire_connection(&permits).is_none());
+        assert!(limiter.try_acquire(ip).is_err());
+
+        // `serve_connection` 返回：连接层的 guard 释放，但会话仍在进行。
+        drop(guards);
+        assert!(
+            try_acquire_connection(&permits).is_none(),
+            "WS 会话未结束前全局许可必须继续持有"
+        );
+        assert!(
+            limiter.try_acquire(ip).is_err(),
+            "WS 会话未结束前 per-IP 计数必须继续持有"
+        );
+
+        // `dispatch` 返回、upgrade future 结束：最后一份 guard 释放两个许可。
+        drop(upgrade_future);
+        let reacquired_global = try_acquire_connection(&permits).expect("全局许可已归还");
+        let reacquired_ip = limiter.try_acquire(ip).expect("per-IP 计数已归还");
+        assert_eq!(limiter.tracked_ips(), 1);
+        drop(reacquired_global);
+        drop(reacquired_ip);
+        assert_eq!(limiter.tracked_ips(), 0, "全部释放后来源表必须清空");
     }
 
     /// KI-01：握手 / header 超时必须是 5s（慢速连接不能长期占槽位）。
