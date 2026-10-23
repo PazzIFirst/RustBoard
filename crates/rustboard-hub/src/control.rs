@@ -746,6 +746,14 @@ fn reject_from_agent_error(error: &ControlError) -> Reject {
             message: "agent 不支持该控制操作".to_string(),
             audit_result: AUDIT_DENIED,
         },
+        // #16：agent 正在续签证书，属于服务暂不可用而不是执行失败/超时。
+        // 使用固定文案，不采用 agent 传来的 message。
+        control_codes::BUSY_RENEWING => Reject {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: control_codes::BUSY_RENEWING,
+            message: "agent 正在续签证书，请稍后重试".to_string(),
+            audit_result: AUDIT_ERROR,
+        },
         _ => Reject {
             status: StatusCode::BAD_GATEWAY,
             code: control_codes::CONTROL_FAILED,
@@ -1929,6 +1937,23 @@ mod tests {
         // 重复清理是幂等的：没有新的过期项时返回 0。
         assert_eq!(session.expire(now), 0);
         assert_eq!(session.pending_len(), 1);
+    }
+
+    /// #16：续签期间的固定错误码映射 503 / `busy_renewing` / 审计 error，
+    /// 且 message 必须是本地固定文案，不采用 agent 传来的内容。
+    #[test]
+    fn busy_renewing_maps_to_503_with_fixed_message() {
+        let error = ControlError::new(control_codes::BUSY_RENEWING, "agent 侧详情不应被采用");
+        let reject = reject_from_agent_error(&error);
+        assert_eq!(reject.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reject.code, control_codes::BUSY_RENEWING);
+        assert_eq!(reject.code, "busy_renewing");
+        assert_eq!(reject.message, "agent 正在续签证书，请稍后重试");
+        assert!(!reject.message.contains("详情"), "不得回显 agent 错误详情");
+        assert_eq!(reject.audit_result, AUDIT_ERROR);
+        // 不能落到 502 / 504。
+        assert_ne!(reject.status, StatusCode::BAD_GATEWAY);
+        assert_ne!(reject.status, StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[test]

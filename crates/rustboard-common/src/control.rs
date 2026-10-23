@@ -325,6 +325,11 @@ impl ControlError {
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::new(codes::UNSUPPORTED, message)
     }
+
+    /// agent 正在续签证书，暂时不能执行控制动作（固定文案，可提示稍后重试）。
+    pub fn busy_renewing() -> Self {
+        Self::new(codes::BUSY_RENEWING, "agent 正在续签证书，请稍后重试")
+    }
 }
 
 /// 错误码常量，避免字符串散落在 agent / hub 两侧。
@@ -334,6 +339,8 @@ pub mod codes {
     pub const INVALID_REQUEST: &str = "invalid_request";
     pub const CONTROL_FAILED: &str = "control_failed";
     pub const UNSUPPORTED: &str = "unsupported";
+    /// agent 证书续签等待期间收到的控制请求：不执行动作，明确要求稍后重试。
+    pub const BUSY_RENEWING: &str = "busy_renewing";
 }
 
 // ---------------------------------------------------------------------------
@@ -830,5 +837,14 @@ mod tests {
         let err = ControlResponse::failure(2, ControlError::invalid_request("bad"));
         assert!(err.result.is_none());
         assert_eq!(err.error.as_ref().unwrap().code, codes::INVALID_REQUEST);
+    }
+
+    /// #16：续签期间固定错误码与文案必须稳定（hub 按码映射 503）。
+    #[test]
+    fn busy_renewing_has_stable_code_and_message() {
+        let error = ControlError::busy_renewing();
+        assert_eq!(error.code, codes::BUSY_RENEWING);
+        assert_eq!(error.code, "busy_renewing");
+        assert_eq!(error.message, "agent 正在续签证书，请稍后重试");
     }
 }

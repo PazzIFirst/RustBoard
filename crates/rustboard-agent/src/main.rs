@@ -15,7 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use rustboard_common::config::AgentConfig;
-use rustboard_common::control::ControlResponse;
+use rustboard_common::control::{codes as control_codes, ControlError, ControlResponse};
 use rustboard_common::fsutil;
 use rustboard_common::model::SampleBatch;
 use rustboard_common::tls;
@@ -933,6 +933,20 @@ where
                 Frame::Problem { code, message } => {
                     bail!("hub 拒绝续签: {code} {message}");
                 }
+                // #16：续签等待期间不执行任何控制动作，立即回固定错误，
+                // 避免 hub 一直等到超时。日志只记录 id / 错误码 / 帧类型，
+                // 不记录 CSR、证书或控制参数；发送失败说明连接已不可用，向上传播。
+                Frame::ControlRequest(request) => {
+                    tracing::debug!(
+                        id = request.id,
+                        frame = "ControlRequest",
+                        code = control_codes::BUSY_RENEWING,
+                        "续签期间收到控制请求，回复 busy_renewing"
+                    );
+                    let response =
+                        ControlResponse::failure(request.id, ControlError::busy_renewing());
+                    send_frame_with_config(sink, &Frame::ControlResponse(response), cfg).await?;
+                }
                 // 其他帧与续签无关（例如在途批次的 Ack），等待期间丢弃。
                 _ => {}
             }
@@ -1461,6 +1475,104 @@ mod tests {
         }
     }
 
+    /// 记录型 sink：捕获所有写出的帧，用于断言续签等待期间发出的应答。
+    struct RecordingSink {
+        sent: Arc<std::sync::Mutex<Vec<Message>>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> (Self, Arc<std::sync::Mutex<Vec<Message>>>) {
+            let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    sent: Arc::clone(&sent),
+                },
+                sent,
+            )
+        }
+    }
+
+    impl Sink<Message> for RecordingSink {
+        type Error = WsError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Message) -> std::result::Result<(), WsError> {
+            self.sent.lock().expect("测试记录锁不应中毒").push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// 第一次完整发送（RenewCert）放行，之后 `poll_ready` / `poll_flush` 永不就绪。
+    ///
+    /// 用来验证续签期间的 `busy_renewing` 应答被 `send_timeout_secs` 约束，
+    /// 而不是永远卡在 send future 上。
+    #[derive(Default)]
+    struct StuckAfterFirstSendSink {
+        ready_calls: usize,
+        flush_calls: usize,
+    }
+
+    impl Sink<Message> for StuckAfterFirstSendSink {
+        type Error = WsError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), WsError>> {
+            let this = self.get_mut();
+            if this.ready_calls == 0 {
+                this.ready_calls += 1;
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> std::result::Result<(), WsError> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), WsError>> {
+            let this = self.get_mut();
+            if this.flush_calls == 0 {
+                this.flush_calls += 1;
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), WsError>> {
+            Poll::Pending
+        }
+    }
+
     /// #12：`poll_ready` 永不就绪时，发送 helper 必须在短超时后返回错误，
     /// 错误信息只带帧类型，不能带帧内容/CSR/secret。
     #[tokio::test]
@@ -1558,6 +1670,128 @@ mod tests {
             std::fs::read_to_string(dir.join(AGENT_KEY)).unwrap(),
             key_before,
             "续签必须复用原私钥"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #16：续签等待期间收到 ControlRequest 必须立即回 `busy_renewing`，
+    /// 不执行动作，也不打断后续的续签。
+    #[tokio::test]
+    async fn v032_renewal_rejects_control_request_with_busy_renewing() {
+        use rustboard_common::control::{codes as common_codes, ControlOp, ControlRequest};
+
+        let dir = temp_dir("renew-busy");
+        let cfg = enrolled_config(&dir, 1);
+        let key_before = std::fs::read_to_string(dir.join(AGENT_KEY)).unwrap();
+
+        // 与 a5 一致：用本地私钥预生成同 key 的 CSR，再让 hub CA 签 90 天证书。
+        let csr = tls::make_csr_with_key(&key_before).unwrap();
+        let new_cert = hub_sign(&dir, &csr, 90);
+
+        let control = Frame::ControlRequest(ControlRequest::new(7, ControlOp::SystemdList))
+            .encode()
+            .unwrap();
+        let renewed = Frame::CertRenewed {
+            cert_pem: new_cert.clone(),
+        }
+        .encode()
+        .unwrap();
+        let mut stream = futures_util::stream::iter(vec![
+            Ok(Message::Binary(control)),
+            Ok(Message::Binary(renewed)),
+        ]);
+
+        let (mut sink, sent) = RecordingSink::new();
+        renew_client_cert(&mut sink, &mut stream, &cfg, "agent-test")
+            .await
+            .expect("ControlRequest 不得中断续签");
+
+        let frames: Vec<Frame> = sent
+            .lock()
+            .expect("测试记录锁不应中毒")
+            .iter()
+            .map(|message| match message {
+                Message::Binary(bytes) => Frame::decode(bytes).expect("发出的帧必须可解码"),
+                other => panic!("只应发送二进制帧，实际: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            frames.len(),
+            2,
+            "只应发送 RenewCert 与 busy_renewing 两条帧"
+        );
+        assert!(
+            matches!(frames[0], Frame::RenewCert { .. }),
+            "第一条必须是续签请求"
+        );
+        match &frames[1] {
+            Frame::ControlResponse(response) => {
+                assert_eq!(response.id, 7);
+                assert!(response.result.is_none(), "busy_renewing 不得携带执行结果");
+                assert_eq!(
+                    response.error.as_ref().expect("必须带错误").code,
+                    common_codes::BUSY_RENEWING
+                );
+            }
+            other => panic!("第二条应为 ControlResponse，实际: {other:?}"),
+        }
+
+        // 控制请求没有被派发执行，续签仍正常完成并落盘。
+        let on_disk = std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap();
+        assert_eq!(on_disk, new_cert, "续签证书必须落盘");
+        assert_eq!(tls::days_left(&on_disk, now_ms()).unwrap(), 90);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #16：`busy_renewing` 应答发送超时后必须结束续签会话并上抛，
+    /// 不能无限等待（受 `send_timeout_secs` 约束，而不是 15s 会话写超时）。
+    #[tokio::test]
+    async fn v032_busy_renewing_send_timeout_ends_renewal() {
+        use rustboard_common::control::{ControlOp, ControlRequest};
+
+        let dir = temp_dir("renew-busy-stuck");
+        let mut cfg = enrolled_config(&dir, 1);
+        cfg.send_timeout_secs = 1;
+        let before = std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap();
+
+        let control = Frame::ControlRequest(ControlRequest::new(7, ControlOp::ProcessList))
+            .encode()
+            .unwrap();
+        // 第二帧不会被读到：busy 应答发送超时后必须立即返回错误。
+        let renewed = Frame::CertRenewed {
+            cert_pem: "unused".to_string(),
+        }
+        .encode()
+        .unwrap();
+        let mut stream = futures_util::stream::iter(vec![
+            Ok(Message::Binary(control)),
+            Ok(Message::Binary(renewed)),
+        ]);
+
+        let mut sink = StuckAfterFirstSendSink::default();
+        let started = tokio::time::Instant::now();
+        let err = renew_client_cert(&mut sink, &mut stream, &cfg, "agent-test")
+            .await
+            .expect_err("busy_renewing 发送超时后必须结束续签");
+        let elapsed = started.elapsed();
+
+        assert!(is_send_timeout_error(&err), "必须是发送超时: {err:#}");
+        assert!(
+            err.to_string().contains("ControlResponse"),
+            "错误应包含帧类型: {err}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "必须等满 1s 发送预算: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "不得退化成更长的会话超时: {elapsed:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap(),
+            before,
+            "发送失败时不得覆盖旧证书"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
