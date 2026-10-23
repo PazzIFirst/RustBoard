@@ -12,8 +12,9 @@ use rusqlite::{
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 
 use super::{
-    AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, IngestOutcome,
-    MaintenanceStateEntry, NewAuditEntry, QueryTooLarge, RejectReason, Storage, AUDIT_RETENTION_MS,
+    AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, DownsampleRangeResult,
+    IngestOutcome, MaintenanceStateEntry, NewAuditEntry, PruneResult, QueryTooLarge, RejectReason,
+    Storage, TierStats, AUDIT_RETENTION_MS, BUCKET_1H_MS, BUCKET_1M_MS,
 };
 
 /// 默认只读连接池大小（与 `HubConfig::read_pool_size` 默认值一致）。
@@ -319,6 +320,86 @@ CREATE TABLE IF NOT EXISTS archive_state (
     updated_at INTEGER NOT NULL
 );
 "#;
+
+/// 1m 聚合：把 `[?1, ?2)` 内 raw 行按 `(agent_id, metric, labels, 整分钟)` 聚合，
+/// 按主键 upsert。`last_value` 取桶内最大 `ts`，同 ts 取最大 `rowid`。
+///
+/// 下标 60000 与 [`BUCKET_1M_MS`] 必须一致（单元测试会断言）。
+const AGGREGATE_1M_SQL: &str = r#"
+INSERT INTO samples_1m
+    (agent_id, metric, labels, bucket_ts, min_value, max_value, avg_value, last_value, count)
+SELECT agent_id, metric, labels, bucket_ts,
+       MIN(value), MAX(value), AVG(value), last_value, COUNT(*)
+FROM (
+    SELECT agent_id, metric, labels,
+           (ts / 60000) * 60000 AS bucket_ts,
+           value,
+           FIRST_VALUE(value) OVER (
+               PARTITION BY agent_id, metric, labels, (ts / 60000) * 60000
+               ORDER BY ts DESC, rowid DESC
+           ) AS last_value
+    FROM samples
+    WHERE ts >= ?1 AND ts < ?2
+)
+GROUP BY agent_id, metric, labels, bucket_ts
+ON CONFLICT(agent_id, metric, labels, bucket_ts) DO UPDATE SET
+    min_value = excluded.min_value,
+    max_value = excluded.max_value,
+    avg_value = excluded.avg_value,
+    last_value = excluded.last_value,
+    count = excluded.count
+"#;
+
+/// 1h 聚合：把 `[?1, ?2)` 内 1m 桶按 `(agent_id, metric, labels, 整点小时)` 聚合。
+///
+/// - `avg_value` 必须按 `count` 加权（`SUM(avg*count)/SUM(count)`），不能对
+///   各分钟平均值再取简单平均；
+/// - `last_value` 取最新 1m 桶的 `last_value`（`bucket_ts` 最大）；
+/// - 下标 3600000 与 [`BUCKET_1H_MS`] 必须一致。
+const AGGREGATE_1H_SQL: &str = r#"
+INSERT INTO samples_1h
+    (agent_id, metric, labels, bucket_ts, min_value, max_value, avg_value, last_value, count)
+SELECT agent_id, metric, labels, bucket_ts,
+       MIN(min_value), MAX(max_value),
+       CAST(SUM(avg_value * count) AS REAL) / SUM(count),
+       last_value,
+       SUM(count)
+FROM (
+    SELECT agent_id, metric, labels,
+           (bucket_ts / 3600000) * 3600000 AS bucket_ts,
+           min_value, max_value, avg_value, count,
+           FIRST_VALUE(last_value) OVER (
+               PARTITION BY agent_id, metric, labels, (bucket_ts / 3600000) * 3600000
+               ORDER BY bucket_ts DESC
+           ) AS last_value
+    FROM samples_1m
+    WHERE bucket_ts >= ?1 AND bucket_ts < ?2
+)
+GROUP BY agent_id, metric, labels, bucket_ts
+ON CONFLICT(agent_id, metric, labels, bucket_ts) DO UPDATE SET
+    min_value = excluded.min_value,
+    max_value = excluded.max_value,
+    avg_value = excluded.avg_value,
+    last_value = excluded.last_value,
+    count = excluded.count
+"#;
+
+/// 保留期删除 SQL：每批最多 `?2` 行，`?1` 是排他 cutoff（`< cutoff`）。
+///
+/// 用 `rowid IN (SELECT ... LIMIT)` 而不是全表 DELETE，保证单批事务短、批间
+/// 可以释放写锁；`rowid` 对三张表都可用（均非 WITHOUT ROWID）。
+const PRUNE_RAW_SQL: &str = "DELETE FROM samples WHERE rowid IN \
+     (SELECT rowid FROM samples WHERE ts < ?1 ORDER BY ts LIMIT ?2)";
+const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE rowid IN \
+     (SELECT rowid FROM samples_1m WHERE bucket_ts < ?1 ORDER BY bucket_ts LIMIT ?2)";
+const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE rowid IN \
+     (SELECT rowid FROM samples_1h WHERE bucket_ts < ?1 ORDER BY bucket_ts LIMIT ?2)";
+
+/// M4 降采样单事务处理的源行数上限（一个桶本身超限时按整桶处理）。
+pub const DOWNSAMPLE_MAX_CHUNK_ROWS: usize = 5_000;
+
+/// M4 保留期删除的每批行数；批间释放写锁，避免长事务阻塞 ingest。
+pub const PRUNE_BATCH_ROWS: usize = 5_000;
 
 pub struct SqliteStorage {
     /// 唯一写连接：迁移、事务、写入都走它，保证 `(agent_id, epoch, seq)` 判重原子。
@@ -1607,6 +1688,235 @@ impl SqliteStorage {
         }
         Ok(Some(record))
     }
+}
+
+// ---------------------------------------------------------------------------
+// M4：降采样与保留期（schema v7 的 samples_1m / samples_1h / maintenance_state）
+// ---------------------------------------------------------------------------
+
+/// 把时间戳向下取整到 `bucket_ms` 边界（UTC 毫秒，非负）。
+fn bucket_floor(ts: i64, bucket_ms: i64) -> i64 {
+    ts.div_euclid(bucket_ms) * bucket_ms
+}
+
+impl SqliteStorage {
+    /// 把 `[from_ts, to_ts)` 内已完成的分钟 raw 聚合成 `samples_1m`。
+    ///
+    /// - 调用方负责只传「已关闭」的分钟；这里会把两端向下取整到整分钟，
+    ///   保证不会把半分钟数据算进一个不完整的桶；
+    /// - 按主键 upsert，重复执行幂等（值被重算覆盖，行数不增）；
+    /// - `last_value` 取桶内最大 `ts`，同 ts 取最大 `rowid`；
+    /// - labels 按原始文本分组，不做 JSON 归一化。
+    ///
+    /// 返回本次 upsert 的桶数与参与聚合的 raw 行数。
+    pub fn downsample_1m_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult> {
+        let from = bucket_floor(from_ts, BUCKET_1M_MS);
+        let to = bucket_floor(to_ts, BUCKET_1M_MS);
+        if to <= from {
+            return Ok(DownsampleRangeResult::default());
+        }
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM samples WHERE ts >= ?1 AND ts < ?2",
+            params![from, to],
+            |row| row.get(0),
+        )?;
+        let buckets = tx.execute(AGGREGATE_1M_SQL, params![from, to])?;
+        tx.commit()?;
+        Ok(DownsampleRangeResult {
+            buckets,
+            rows: rows as usize,
+        })
+    }
+
+    /// 把 `[from_ts, to_ts)` 内已完成整点的 1m 桶聚合成 `samples_1h`。
+    ///
+    /// `avg_value` 使用按 `count` 加权的平均值；`last_value` 取最新 1m 桶；
+    /// 两端向下取整到整点，保证不聚合半个小时的残缺数据；upsert 幂等。
+    pub fn downsample_1h_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult> {
+        let from = bucket_floor(from_ts, BUCKET_1H_MS);
+        let to = bucket_floor(to_ts, BUCKET_1H_MS);
+        if to <= from {
+            return Ok(DownsampleRangeResult::default());
+        }
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM samples_1m WHERE bucket_ts >= ?1 AND bucket_ts < ?2",
+            params![from, to],
+            |row| row.get(0),
+        )?;
+        let buckets = tx.execute(AGGREGATE_1H_SQL, params![from, to])?;
+        tx.commit()?;
+        Ok(DownsampleRangeResult {
+            buckets,
+            rows: rows as usize,
+        })
+    }
+
+    /// raw 层的行数与最旧/最新时间戳。
+    pub fn raw_stats(&self) -> Result<TierStats> {
+        self.tier_stats("SELECT COUNT(*), MIN(ts), MAX(ts) FROM samples")
+    }
+
+    /// 1m 层的行数与最旧/最新时间戳。
+    pub fn samples_1m_stats(&self) -> Result<TierStats> {
+        self.tier_stats("SELECT COUNT(*), MIN(bucket_ts), MAX(bucket_ts) FROM samples_1m")
+    }
+
+    /// 1h 层的行数与最旧/最新时间戳。
+    pub fn samples_1h_stats(&self) -> Result<TierStats> {
+        self.tier_stats("SELECT COUNT(*), MIN(bucket_ts), MAX(bucket_ts) FROM samples_1h")
+    }
+
+    /// 三张表的统计查询只差表名/列名；SQL 是编译期常量，不接受外部输入。
+    fn tier_stats(&self, sql: &'static str) -> Result<TierStats> {
+        let conn = self.lock_read();
+        Ok(conn.query_row(sql, [], |row| {
+            Ok(TierStats {
+                rows: row.get(0)?,
+                oldest_ts: row.get(1)?,
+                newest_ts: row.get(2)?,
+            })
+        })?)
+    }
+
+    /// 取 raw `[from_ts, to_ts)` 内按 `(ts, rowid)` 升序的第 `offset` 条（0-based）时间戳。
+    ///
+    /// 降采样分块用：找到第 N 条数据所在桶，就能把单事务控制在 N 行左右。
+    /// 不足 `offset + 1` 条时返回 `None`。
+    pub fn raw_ts_at_offset(&self, from_ts: i64, to_ts: i64, offset: usize) -> Result<Option<i64>> {
+        self.ts_at_offset(
+            "SELECT ts FROM samples WHERE ts >= ?1 AND ts < ?2 \
+             ORDER BY ts ASC, rowid ASC LIMIT 1 OFFSET ?3",
+            from_ts,
+            to_ts,
+            offset,
+        )
+    }
+
+    /// 取 1m `[from_ts, to_ts)` 内按 `(bucket_ts, rowid)` 升序的第 `offset` 条时间戳。
+    pub fn samples_1m_ts_at_offset(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        offset: usize,
+    ) -> Result<Option<i64>> {
+        self.ts_at_offset(
+            "SELECT bucket_ts FROM samples_1m WHERE bucket_ts >= ?1 AND bucket_ts < ?2 \
+             ORDER BY bucket_ts ASC, rowid ASC LIMIT 1 OFFSET ?3",
+            from_ts,
+            to_ts,
+            offset,
+        )
+    }
+
+    fn ts_at_offset(
+        &self,
+        sql: &'static str,
+        from_ts: i64,
+        to_ts: i64,
+        offset: usize,
+    ) -> Result<Option<i64>> {
+        let conn = self.lock_read();
+        Ok(conn
+            .query_row(sql, params![from_ts, to_ts, offset as i64], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    /// 分批删除 raw 中 `ts < cutoff` 的行；`cutoff` 是排他边界（等于不删）。
+    pub fn prune_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
+        self.prune_batched(PRUNE_RAW_SQL, cutoff)
+    }
+
+    /// 分批删除 1m 中 `bucket_ts < cutoff` 的行。
+    pub fn prune_samples_1m_before(&self, cutoff: i64) -> Result<PruneResult> {
+        self.prune_batched(PRUNE_1M_SQL, cutoff)
+    }
+
+    /// 分批删除 1h 中 `bucket_ts < cutoff` 的行。
+    pub fn prune_samples_1h_before(&self, cutoff: i64) -> Result<PruneResult> {
+        self.prune_batched(PRUNE_1H_SQL, cutoff)
+    }
+
+    /// 每批 [`PRUNE_BATCH_ROWS`] 行、每批独立隐式事务。
+    ///
+    /// 每轮循环内的写锁 guard 在批次结束后立即释放，等待中的 ingest 线程可以
+    /// 插进来；批次之间再 `yield_now`，避免长时间占用 CPU 让写线程饿死。
+    fn prune_batched(&self, sql: &'static str, cutoff: i64) -> Result<PruneResult> {
+        let mut result = PruneResult::default();
+        loop {
+            let deleted = {
+                let conn = self.lock_write();
+                conn.execute(sql, params![cutoff, PRUNE_BATCH_ROWS as i64])?
+            };
+            if deleted == 0 {
+                break;
+            }
+            result.deleted += deleted;
+            result.batches += 1;
+            if deleted < PRUNE_BATCH_ROWS {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        Ok(result)
+    }
+
+    /// 测试专用：读取 1m / 1h 聚合行，供 worker 单测断言聚合值。
+    ///
+    /// 生产代码不通过这里读数据（查询选层由 A2b 提供独立 API）；仅在同 crate
+    /// 的 `#[cfg(test)]` 构建里可见。
+    #[cfg(test)]
+    pub(crate) fn aggregate_rows_for_test(&self, tier: &str) -> Vec<AggregateRowForTest> {
+        let sql = match tier {
+            "1m" => {
+                "SELECT agent_id, metric, labels, bucket_ts, min_value, max_value, avg_value, \
+                 last_value, count FROM samples_1m ORDER BY bucket_ts, labels"
+            }
+            "1h" => {
+                "SELECT agent_id, metric, labels, bucket_ts, min_value, max_value, avg_value, \
+                 last_value, count FROM samples_1h ORDER BY bucket_ts, labels"
+            }
+            other => panic!("未知聚合层: {other}"),
+        };
+        let conn = self.lock_read();
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.query_map([], |row| {
+            Ok(AggregateRowForTest {
+                agent_id: row.get(0)?,
+                metric: row.get(1)?,
+                labels: row.get(2)?,
+                bucket_ts: row.get(3)?,
+                min_value: row.get(4)?,
+                max_value: row.get(5)?,
+                avg_value: row.get(6)?,
+                last_value: row.get(7)?,
+                count: row.get(8)?,
+            })
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+}
+
+/// 测试专用：一行 1m / 1h 聚合结果。
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AggregateRowForTest {
+    pub agent_id: String,
+    pub metric: String,
+    pub labels: String,
+    pub bucket_ts: i64,
+    pub min_value: f64,
+    pub max_value: f64,
+    pub avg_value: f64,
+    pub last_value: f64,
+    pub count: i64,
 }
 
 /// 按字节截断 UTF-8 字符串，保证不会切出半个字符。
@@ -3340,5 +3650,335 @@ mod tests {
         );
         assert_eq!(s.list_maintenance_state().unwrap().len(), 3);
         assert!(sqlite_object_exists(&s, "table", "maintenance_state"));
+    }
+
+    // ---- M4-A2：降采样聚合 / 统计 / 分批删除 ----
+
+    /// 一行聚合结果，便于整行断言（避免长元组）。
+    #[derive(Debug, Clone, PartialEq)]
+    struct AggRow {
+        labels: String,
+        bucket_ts: i64,
+        min_value: f64,
+        max_value: f64,
+        avg_value: f64,
+        last_value: f64,
+        count: i64,
+    }
+
+    /// 读取某张聚合表并按 `(bucket_ts, labels)` 排序。
+    fn agg_rows(s: &SqliteStorage, table: &str) -> Vec<AggRow> {
+        assert!(matches!(table, "samples_1m" | "samples_1h"));
+        let sql = format!(
+            "SELECT labels, bucket_ts, min_value, max_value, avg_value, last_value, count
+             FROM {table} ORDER BY bucket_ts, labels"
+        );
+        let conn = s.lock_read();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map([], |row| {
+            Ok(AggRow {
+                labels: row.get(0)?,
+                bucket_ts: row.get(1)?,
+                min_value: row.get(2)?,
+                max_value: row.get(3)?,
+                avg_value: row.get(4)?,
+                last_value: row.get(5)?,
+                count: row.get(6)?,
+            })
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    fn find_agg<'a>(rows: &'a [AggRow], labels: &str) -> &'a AggRow {
+        rows.iter()
+            .find(|row| row.labels == labels)
+            .unwrap_or_else(|| panic!("缺少 labels={labels} 的聚合行: {rows:?}"))
+    }
+
+    /// M4-A2：1m 的 min/max/avg/last/count 与手算一致；labels 不同不合并；
+    /// 空桶不建行；区间外的数据不参与聚合。
+    #[test]
+    fn m4a_downsample_1m_matches_manual_aggregation() {
+        // SQL 里的 60000 / 3600000 必须与公共常量一致。
+        assert_eq!(BUCKET_1M_MS, 60_000);
+        assert_eq!(BUCKET_1H_MS, 3_600_000);
+
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let base = 1_700_000_040_000; // 刚好落在整分钟
+        assert_eq!(base % BUCKET_1M_MS, 0);
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", base + 1_000, 1.0),
+                ("cpu.usage", "{}", base + 20_000, 5.0),
+                ("cpu.usage", "{}", base + 40_000, 3.0),
+                ("cpu.usage", r#"{"disk":"sda"}"#, base + 5_000, 42.0),
+                // 下一分钟的迟到数据：不在本次 [base, base+60000) 内。
+                ("cpu.usage", "{}", base + 61_000, 9.0),
+            ],
+        );
+
+        let res = s.downsample_1m_range(base, base + BUCKET_1M_MS).unwrap();
+        assert_eq!(
+            res,
+            DownsampleRangeResult {
+                buckets: 2,
+                rows: 4
+            },
+            "同一标签 3 行 + 另一标签 1 行 → 2 个桶、4 行源数据"
+        );
+
+        let rows = agg_rows(&s, "samples_1m");
+        assert_eq!(rows.len(), 2, "空桶 / 区间外数据都不得建行");
+        let plain = find_agg(&rows, "{}");
+        assert_eq!(plain.bucket_ts, base);
+        assert_eq!(plain.min_value, 1.0);
+        assert_eq!(plain.max_value, 5.0);
+        assert!((plain.avg_value - 3.0).abs() < 1e-9);
+        assert_eq!(plain.last_value, 3.0, "last 取最大 ts 的 3.0");
+        assert_eq!(plain.count, 3);
+
+        let disk = find_agg(&rows, r#"{"disk":"sda"}"#);
+        assert_eq!(disk.bucket_ts, base);
+        assert_eq!(disk.min_value, 42.0);
+        assert_eq!(disk.max_value, 42.0);
+        assert_eq!(disk.avg_value, 42.0);
+        assert_eq!(disk.last_value, 42.0);
+        assert_eq!(disk.count, 1);
+
+        // 没有任何 raw 的空区间：零结果，不写行、不建空桶。
+        let empty = s
+            .downsample_1m_range(base + 120_000, base + 180_000)
+            .unwrap();
+        assert_eq!(empty, DownsampleRangeResult::default());
+        assert_eq!(s.samples_1m_stats().unwrap().rows, 2);
+    }
+
+    /// M4-A2：重复聚合不增行、不改值；迟到数据（同 ts 更高 rowid）重算后
+    /// last_value / max / count 都更新。
+    #[test]
+    fn m4a_downsample_1m_rerun_is_idempotent_and_recomputes_late_data() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let base = 1_700_000_040_000;
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", base + 1_000, 1.0),
+                ("cpu.usage", "{}", base + 2_000, 2.0),
+            ],
+        );
+
+        let first = s.downsample_1m_range(base, base + 60_000).unwrap();
+        assert_eq!(
+            first,
+            DownsampleRangeResult {
+                buckets: 1,
+                rows: 2
+            }
+        );
+        let before = agg_rows(&s, "samples_1m");
+        assert_eq!(before.len(), 1);
+
+        // 重复执行：upsert 覆盖，行数与值都不变。
+        let again = s.downsample_1m_range(base, base + 60_000).unwrap();
+        assert_eq!(again, first);
+        assert_eq!(agg_rows(&s, "samples_1m"), before, "重复执行必须幂等");
+
+        // 迟到重传：同 ts、更高 rowid → last_value 取 8.0。
+        insert_samples(&s, "a1", &[("cpu.usage", "{}", base + 2_000, 8.0)]);
+        let third = s.downsample_1m_range(base, base + 60_000).unwrap();
+        assert_eq!(
+            third,
+            DownsampleRangeResult {
+                buckets: 1,
+                rows: 3
+            }
+        );
+        let rows = agg_rows(&s, "samples_1m");
+        assert_eq!(rows.len(), 1, "重算不得新增桶");
+        let row = &rows[0];
+        assert_eq!(row.count, 3);
+        assert_eq!(row.max_value, 8.0);
+        assert_eq!(row.last_value, 8.0, "同 ts 取最大 rowid");
+        assert!(
+            (row.avg_value - 11.0 / 3.0).abs() < 1e-9,
+            "avg 必须重算: {}",
+            row.avg_value
+        );
+    }
+
+    /// M4-A2：1h 的 avg 必须按 count 加权，min/max/count/last 正确；
+    /// 重复执行幂等；不足整点的范围不聚合。
+    #[test]
+    fn m4a_downsample_1h_weighted_average_idempotent() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let hour = 1_699_999_200_000; // 整点
+        assert_eq!(hour % BUCKET_1H_MS, 0);
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                // 分钟 0：avg=5, count=2
+                ("cpu.usage", "{}", hour + 1_000, 0.0),
+                ("cpu.usage", "{}", hour + 2_000, 10.0),
+                // 分钟 1：avg=20, count=1
+                ("cpu.usage", "{}", hour + 61_000, 20.0),
+                // 分钟 2：avg=1000, count=1
+                ("cpu.usage", "{}", hour + 121_000, 1_000.0),
+            ],
+        );
+        s.downsample_1m_range(hour, hour + 180_000).unwrap();
+        assert_eq!(s.samples_1m_stats().unwrap().rows, 3);
+
+        let res = s.downsample_1h_range(hour, hour + BUCKET_1H_MS).unwrap();
+        assert_eq!(
+            res,
+            DownsampleRangeResult {
+                buckets: 1,
+                rows: 3
+            }
+        );
+        let rows = agg_rows(&s, "samples_1h");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.bucket_ts, hour);
+        assert_eq!(row.min_value, 0.0);
+        assert_eq!(row.max_value, 1_000.0);
+        assert_eq!(row.count, 4);
+        assert_eq!(row.last_value, 1_000.0, "last 取最新 1m 桶的 last_value");
+        // (5*2 + 20*1 + 1000*1) / 4 = 257.5；简单平均会得到 341.67，必须区分。
+        assert!(
+            (row.avg_value - 257.5).abs() < 1e-9,
+            "1h avg 必须按 count 加权: {}",
+            row.avg_value
+        );
+
+        // 幂等：再跑一次不增行、不改值。
+        let before = agg_rows(&s, "samples_1h");
+        let again = s.downsample_1h_range(hour, hour + BUCKET_1H_MS).unwrap();
+        assert_eq!(again, res);
+        assert_eq!(agg_rows(&s, "samples_1h"), before);
+
+        // 同一个整点内、未跨到下一个整点的范围：向下取整后为空，绝不聚合未满整点的数据。
+        assert_eq!(
+            s.downsample_1h_range(hour + 1_800_000, hour + 3_000_000)
+                .unwrap(),
+            DownsampleRangeResult::default()
+        );
+    }
+
+    /// M4-A2：三层统计与分块探测用的 offset 时间戳。
+    #[test]
+    fn m4a_tier_stats_and_offset_probe() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        assert_eq!(s.raw_stats().unwrap(), TierStats::default());
+        assert_eq!(s.samples_1m_stats().unwrap(), TierStats::default());
+        assert_eq!(s.samples_1h_stats().unwrap(), TierStats::default());
+
+        let base = 1_700_000_040_000;
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", base + 1_000, 1.0),
+                ("cpu.usage", "{}", base + 2_000, 2.0),
+                ("cpu.usage", "{}", base + 61_000, 3.0),
+            ],
+        );
+        let raw = s.raw_stats().unwrap();
+        assert_eq!(raw.rows, 3);
+        assert_eq!(raw.oldest_ts, Some(base + 1_000));
+        assert_eq!(raw.newest_ts, Some(base + 61_000));
+
+        assert_eq!(
+            s.raw_ts_at_offset(base, base + 120_000, 0).unwrap(),
+            Some(base + 1_000)
+        );
+        assert_eq!(
+            s.raw_ts_at_offset(base, base + 120_000, 2).unwrap(),
+            Some(base + 61_000)
+        );
+        assert_eq!(s.raw_ts_at_offset(base, base + 120_000, 3).unwrap(), None);
+        // 范围外的数据不会被探测到。
+        assert_eq!(s.raw_ts_at_offset(base, base + 60_000, 2).unwrap(), None);
+
+        s.downsample_1m_range(base, base + 120_000).unwrap();
+        let minute = s.samples_1m_stats().unwrap();
+        assert_eq!(minute.rows, 2);
+        assert_eq!(minute.oldest_ts, Some(base));
+        assert_eq!(minute.newest_ts, Some(base + 60_000));
+        assert_eq!(
+            s.samples_1m_ts_at_offset(base, base + 120_000, 1).unwrap(),
+            Some(base + 60_000)
+        );
+
+        s.downsample_1h_range(base, base + 3_600_000).unwrap();
+        let hour = s.samples_1h_stats().unwrap();
+        assert_eq!(hour.rows, 1, "两个分钟桶属于同一个整点");
+        assert_eq!(hour.oldest_ts, Some(1_699_999_200_000));
+        assert_eq!(hour.newest_ts, Some(1_699_999_200_000));
+    }
+
+    /// M4-A2：删除严格 `< cutoff`（等于不删）、按 5000 行分批、三层都生效。
+    #[test]
+    fn m4a_prune_is_batched_and_strictly_before_cutoff() {
+        assert_eq!(PRUNE_BATCH_ROWS, 5_000);
+        assert_eq!(DOWNSAMPLE_MAX_CHUNK_ROWS, 5_000);
+
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let cutoff = 1_700_000_040_000; // 整分钟
+        let mut rows = Vec::with_capacity(12_002);
+        for index in 0..12_000i64 {
+            rows.push(("cpu.usage", "{}", cutoff - 12_000 + index, index as f64));
+        }
+        // 恰好等于 cutoff 的行必须保留；最新一行同样保留。
+        rows.push(("cpu.usage", "{}", cutoff, 1.0));
+        rows.push(("cpu.usage", "{}", cutoff + 1_000, 2.0));
+        insert_samples(&s, "a1", &rows);
+
+        let pruned = s.prune_samples_before(cutoff).unwrap();
+        assert_eq!(pruned.deleted, 12_000);
+        assert_eq!(pruned.batches, 3, "12,000 行 = 5000 + 5000 + 2000");
+        let raw = s.raw_stats().unwrap();
+        assert_eq!(raw.rows, 2, "等于 cutoff 的行必须保留");
+        assert_eq!(raw.oldest_ts, Some(cutoff));
+
+        // 重复删除：已无过期行，零批次零删除。
+        assert_eq!(
+            s.prune_samples_before(cutoff).unwrap(),
+            PruneResult::default()
+        );
+
+        // 1m：bucket_ts 严格小于 cutoff 才删除。
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", cutoff - 60_000 + 1_000, 1.0),
+                ("cpu.usage", "{}", cutoff + 1_000, 2.0),
+            ],
+        );
+        s.downsample_1m_range(cutoff - 60_000, cutoff + 60_000)
+            .unwrap();
+        assert_eq!(s.samples_1m_stats().unwrap().rows, 2);
+        assert_eq!(s.prune_samples_1m_before(cutoff).unwrap().deleted, 1);
+        let minute = s.samples_1m_stats().unwrap();
+        assert_eq!(minute.rows, 1);
+        assert_eq!(minute.oldest_ts, Some(cutoff));
+
+        // 1h：整点边界同样是严格小于。
+        let hour = 1_699_999_200_000;
+        insert_samples(&s, "a1", &[("cpu.usage", "{}", hour - 1_800_000, 5.0)]);
+        s.downsample_1m_range(hour - BUCKET_1H_MS, hour + BUCKET_1H_MS)
+            .unwrap();
+        s.downsample_1h_range(hour - BUCKET_1H_MS, hour + BUCKET_1H_MS)
+            .unwrap();
+        assert_eq!(s.samples_1h_stats().unwrap().rows, 2);
+        assert_eq!(s.prune_samples_1h_before(hour).unwrap().deleted, 1);
+        assert_eq!(s.samples_1h_stats().unwrap().oldest_ts, Some(hour));
     }
 }

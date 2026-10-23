@@ -523,9 +523,22 @@ pub struct HubConfig {
     pub admin_auth_failure_limit_per_min: u32,
     pub per_core: bool,
     pub excluded_interfaces: Vec<String>,
+    /// raw（原始点）保留天数；0 表示该层不自动删除。
     pub retention_raw_days: u32,
+    /// 1m（分钟聚合）保留天数；0 表示该层不自动删除。
+    ///
+    /// 非 0 时不得小于 `retention_raw_days`：1m 层必须先于或同时于 raw 保留，
+    /// 否则会出现「raw 还在、分钟曲线先消失」的倒挂。
     pub retention_1m_days: u32,
+    /// 1h（小时聚合）保留天数；0 表示该层不自动删除。
+    ///
+    /// 非 0 时不得小于 `retention_1m_days`，理由同上。
     pub retention_1h_days: u32,
+    /// 降采样 / 保留期后台任务的执行间隔（秒），范围 1–3600。
+    ///
+    /// 默认 60；e2e 可配短值以便快速观察。间隔过短只会增加空转，不会丢数据。
+    #[serde(default = "default_maintenance_interval_secs")]
+    pub maintenance_interval_secs: u64,
     /// 管理 API 的 Bearer token；由 `hub init` / `hub admin-token` 生成，为空时拒绝启动。
     #[serde(default)]
     pub admin_token: String,
@@ -603,6 +616,7 @@ impl Default for HubConfig {
             retention_raw_days: 7,
             retention_1m_days: 90,
             retention_1h_days: 730,
+            maintenance_interval_secs: default_maintenance_interval_secs(),
             admin_token: String::new(),
             ca_validity_days: default_ca_validity_days(),
             server_cert_validity_days: default_server_cert_validity_days(),
@@ -705,7 +719,74 @@ impl HubConfig {
         // 启动/init 必须尽早失败（签发层还会再校验一次，这里给出配置级错误）。
         crate::tls::parse_server_sans(&self.server_names)
             .map_err(|err| Error::InvalidConfig(format!("server_names 非法: {err}")))?;
+        self.validate_retention()?;
+        self.validate_maintenance_interval()?;
         self.control.validate()?;
+        Ok(())
+    }
+
+    /// M4：三层保留期与降采样/保留期任务的配置校验。
+    ///
+    /// 1. 每层天数必须在硬上限内（0 表示该层永不自动删除）；
+    /// 2. 非 0 的 1m 保留期不得短于 raw，非 0 的 1h 保留期不得短于 1m，
+    ///    否则会先删掉聚合层、raw 反而还在，曲线出现无法解释的空洞。
+    fn validate_retention(&self) -> Result<()> {
+        for (name, days, max) in [
+            (
+                "retention_raw_days",
+                self.retention_raw_days,
+                MAX_RETENTION_RAW_DAYS,
+            ),
+            (
+                "retention_1m_days",
+                self.retention_1m_days,
+                MAX_RETENTION_1M_DAYS,
+            ),
+            (
+                "retention_1h_days",
+                self.retention_1h_days,
+                MAX_RETENTION_1H_DAYS,
+            ),
+        ] {
+            if days > max {
+                return Err(Error::InvalidConfig(format!(
+                    "{name} 不能超过 {max} 天（0 表示该层不自动删除），实际 {days}；\
+                     请改小到允许范围内"
+                )));
+            }
+        }
+        // 0 = 该层永不删除，不存在倒挂；只有非 0 的聚合层保留期才需要与下一层比较。
+        if self.retention_1m_days != 0 && self.retention_1m_days < self.retention_raw_days {
+            return Err(Error::InvalidConfig(format!(
+                "retention_1m_days（{}）不能小于 retention_raw_days（{}）：\
+                 1m 层必须先于或同时于 raw 保留；请调大 retention_1m_days，\
+                 或把 retention_raw_days 调小到不超过它",
+                self.retention_1m_days, self.retention_raw_days
+            )));
+        }
+        if self.retention_1h_days != 0 && self.retention_1h_days < self.retention_1m_days {
+            return Err(Error::InvalidConfig(format!(
+                "retention_1h_days（{}）不能小于 retention_1m_days（{}）：\
+                 1h 层必须先于或同时于 1m 保留；请调大 retention_1h_days，\
+                 或把 retention_1m_days 调小到不超过它",
+                self.retention_1h_days, self.retention_1m_days
+            )));
+        }
+        Ok(())
+    }
+
+    /// M4：维护任务执行间隔校验（1–3600 秒）。
+    fn validate_maintenance_interval(&self) -> Result<()> {
+        if !(MIN_MAINTENANCE_INTERVAL_SECS..=MAX_MAINTENANCE_INTERVAL_SECS)
+            .contains(&self.maintenance_interval_secs)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "maintenance_interval_secs 必须在 {MIN_MAINTENANCE_INTERVAL_SECS}–\
+                 {MAX_MAINTENANCE_INTERVAL_SECS} 秒之间，实际 {}；\
+                 60 适合生产，e2e 才需要 1–5 秒",
+                self.maintenance_interval_secs
+            )));
+        }
         Ok(())
     }
 
@@ -904,6 +985,22 @@ const MAX_CERT_CHECK_INTERVAL_HOURS: u64 = 168;
 /// agent 主动重连周期上限（1 年）；0 表示不主动重连。
 const MAX_SESSION_MAX_HOURS: u64 = 24 * 365;
 
+/// M4：保留期天数硬上限（raw / 1m 十年，1h 二十年）。
+const MAX_RETENTION_RAW_DAYS: u32 = 3_650;
+const MAX_RETENTION_1M_DAYS: u32 = 3_650;
+const MAX_RETENTION_1H_DAYS: u32 = 7_300;
+
+/// M4：维护任务执行间隔范围与默认值（秒）。
+///
+/// 允许 1 秒是为了 e2e 用短值；生产默认 60 秒，与降采样分钟粒度一致。
+const MIN_MAINTENANCE_INTERVAL_SECS: u64 = 1;
+const MAX_MAINTENANCE_INTERVAL_SECS: u64 = 3_600;
+const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 60;
+
+fn default_maintenance_interval_secs() -> u64 {
+    DEFAULT_MAINTENANCE_INTERVAL_SECS
+}
+
 /// agent 单次 WebSocket 写超时的允许范围与默认值（秒）。
 const MIN_SEND_TIMEOUT_SECS: u64 = 1;
 const MAX_SEND_TIMEOUT_SECS: u64 = 120;
@@ -1040,6 +1137,100 @@ mod tests {
             "错误信息应包含字段名: {err}"
         );
         assert!(err.contains("600"), "错误信息应包含上限: {err}");
+    }
+
+    /// M4-A2：维护任务间隔缺省 60，1–3600 合法，0 / 3601 拒绝且错误信息可操作。
+    #[test]
+    fn m4a_maintenance_interval_default_bounds_and_toml() {
+        // 旧配置不写该字段时必须得到默认 60，且能通过完整校验。
+        let hub: HubConfig = toml::from_str("").unwrap();
+        assert_eq!(hub.maintenance_interval_secs, 60);
+        assert_eq!(HubConfig::default().maintenance_interval_secs, 60);
+        hub.validate().expect("旧配置缺省必须合法");
+
+        for secs in [1u64, 60, 3_600] {
+            let hub: HubConfig =
+                toml::from_str(&format!("maintenance_interval_secs = {secs}\n")).unwrap();
+            assert_eq!(hub.maintenance_interval_secs, secs);
+            hub.validate().expect("1 / 60 / 3600 是合法边界");
+        }
+
+        for secs in [0u64, 3_601] {
+            let hub: HubConfig =
+                toml::from_str(&format!("maintenance_interval_secs = {secs}\n")).unwrap();
+            let err = hub
+                .validate()
+                .expect_err("0 与 3601 必须被拒绝")
+                .to_string();
+            assert!(
+                err.contains("maintenance_interval_secs"),
+                "错误信息必须点名字段: {err}"
+            );
+            assert!(err.contains("3600"), "错误信息应包含上限: {err}");
+        }
+    }
+
+    /// M4-A2：retention 三层范围与倒挂校验；默认 7/90/730、0=不删、边界值通过。
+    #[test]
+    fn m4a_retention_defaults_bounds_and_inversions() {
+        let hub: HubConfig = toml::from_str("").unwrap();
+        assert_eq!(hub.retention_raw_days, 7);
+        assert_eq!(hub.retention_1m_days, 90);
+        assert_eq!(hub.retention_1h_days, 730);
+        hub.validate().expect("默认 retention 必须合法");
+
+        let cfg = |raw: u32, one_minute: u32, one_hour: u32| -> HubConfig {
+            toml::from_str(&format!(
+                "retention_raw_days = {raw}\nretention_1m_days = {one_minute}\n\
+                 retention_1h_days = {one_hour}\n"
+            ))
+            .unwrap()
+        };
+
+        // 合法：全 0（都不删）、三层上限边界、聚合层更长的常见组合、
+        // 1m/1h 为 0（永不删除）时不受倒挂约束。
+        for (raw, one_minute, one_hour) in [
+            (0, 0, 0),
+            (3_650, 3_650, 7_300),
+            (7, 90, 730),
+            (0, 90, 730),
+            (7, 7, 7),
+            (0, 0, 730),
+            (3_650, 0, 0),
+        ] {
+            cfg(raw, one_minute, one_hour)
+                .validate()
+                .unwrap_or_else(|err| {
+                    panic!("raw={raw} 1m={one_minute} 1h={one_hour} 应合法: {err}")
+                });
+        }
+
+        // 越界：三层各自的上限之外必须拒绝，错误信息点名字段且说明 0=不删。
+        for (raw, one_minute, one_hour, field) in [
+            (3_651, 3_651, 7_300, "retention_raw_days"),
+            (7, 3_651, 7_300, "retention_1m_days"),
+            (7, 90, 7_301, "retention_1h_days"),
+        ] {
+            let err = cfg(raw, one_minute, one_hour)
+                .validate()
+                .expect_err("越界必须被拒绝")
+                .to_string();
+            assert!(err.contains(field), "错误信息必须点名 {field}: {err}");
+            assert!(err.contains("0 表示"), "错误信息应说明 0 语义: {err}");
+        }
+
+        // 倒挂：1m 短于 raw、1h 短于 1m 都必须拒绝，并给出可操作的调整建议。
+        for (raw, one_minute, one_hour, field) in [
+            (10, 5, 730, "retention_1m_days"),
+            (7, 100, 50, "retention_1h_days"),
+        ] {
+            let err = cfg(raw, one_minute, one_hour)
+                .validate()
+                .expect_err("倒挂必须被拒绝")
+                .to_string();
+            assert!(err.contains(field), "错误信息必须点名 {field}: {err}");
+            assert!(err.contains("不能小于"), "错误信息应说明倒挂: {err}");
+        }
     }
 
     /// v0.3.3：`admin_tls` 默认 off（旧配置兼容），显式值必须正确解析，非法值拒绝。

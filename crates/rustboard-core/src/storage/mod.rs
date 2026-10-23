@@ -54,6 +54,44 @@ pub struct MaintenanceStateEntry {
     pub updated_at: i64,
 }
 
+/// 1m 聚合桶宽度（毫秒）：按 UTC 对齐的整分钟。
+pub const BUCKET_1M_MS: i64 = 60_000;
+
+/// 1h 聚合桶宽度（毫秒）：按 UTC 对齐的整点小时。
+pub const BUCKET_1H_MS: i64 = 3_600_000;
+
+/// 单次降采样聚合的结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct DownsampleRangeResult {
+    /// 写入/更新的聚合桶数（按主键 upsert，重复执行同样计数）。
+    pub buckets: usize,
+    /// 参与本次聚合的源行数（raw 或 1m）。
+    pub rows: usize,
+}
+
+/// 某一数据层（raw / 1m / 1h）的时间范围与总行数。
+///
+/// `oldest_ts` / `newest_ts` 为 `None` 表示该层没有数据；供维护状态与
+/// 保留期/降采样的起点判断使用。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TierStats {
+    /// 总行数。
+    pub rows: i64,
+    /// 最旧时间戳（毫秒）。
+    pub oldest_ts: Option<i64>,
+    /// 最新时间戳（毫秒）。
+    pub newest_ts: Option<i64>,
+}
+
+/// 按批删除过期行的结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PruneResult {
+    /// 删除的总行数。
+    pub deleted: usize,
+    /// 实际执行了删除的批次数（空批不计）。
+    pub batches: usize,
+}
+
 /// 一条待写入的审计记录（没有自增 `id`）。
 ///
 /// `params` 只放 `target` / `pid` / `name` / `signal` / `lines`，

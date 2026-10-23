@@ -42,6 +42,7 @@ use rustboard_common::util::{
 use rustboard_common::wire::{codes, AgentHello, EnrollRequest, Frame, Welcome};
 use rustboard_common::{DEFAULT_HUB_CONFIG, PROTOCOL_VERSION, VERSION};
 use rustboard_core::collect::default_collectors;
+use rustboard_core::downsample;
 use rustboard_core::storage::sqlite::SqliteStorage;
 use rustboard_core::storage::{
     AgentSeriesRow, IngestOutcome, QueryTooLarge, Storage, AUDIT_RETENTION_MS,
@@ -170,6 +171,15 @@ const OVERVIEW_METRICS: [&str; 7] = [
 const MIN_SAMPLE_INTERVAL_MS: u64 = 1_000;
 const MAX_SAMPLE_INTERVAL_MS: u64 = 300_000;
 
+/// M4：后台每轮降采样最多推进的小时块数。
+///
+/// 每块最多 1 小时 / 约 5,000 行；限制块数避免首次 backfill 长时间占用写锁，
+/// 追平前每轮继续推进，不会丢数据。
+const MAINTENANCE_MAX_BACKFILL_HOURS: u32 = 6;
+
+/// M4：`maintenance_state.last_error` 的最大字符数，避免把超长错误写进库。
+const MAX_MAINTENANCE_ERROR_CHARS: usize = 2_000;
+
 /// CSR 长度门禁：纳管与续签共用，必须在解析/消费 token 之前调用。
 fn csr_within_limit(csr_pem: &str) -> bool {
     csr_pem.len() <= MAX_CSR_PEM_LEN
@@ -254,6 +264,38 @@ enum Cmd {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// M4 维护任务：手动执行降采样/保留期，或查看维护状态（JSON 输出）。
+    Maintenance {
+        #[command(subcommand)]
+        action: MaintenanceAction,
+    },
+}
+
+/// `maintenance` 子命令（M4-A2）。
+#[derive(Subcommand)]
+enum MaintenanceAction {
+    /// 执行一次维护任务。
+    Run {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// 任务类型：downsample（聚合）或 retention（按保留期删除）。
+        #[arg(long, value_enum)]
+        task: MaintenanceTask,
+    },
+    /// 输出各层行数、水位、最近错误与 retention 配置（JSON）。
+    Status {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+}
+
+/// 维护任务类型。默认没有默认值：必须显式 `--task`，避免误删/误跑。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum MaintenanceTask {
+    /// 1m / 1h 降采样。
+    Downsample,
+    /// 按 `retention_*_days` 分批删除过期数据。
+    Retention,
 }
 
 #[derive(Subcommand)]
@@ -394,6 +436,7 @@ fn main() -> Result<()> {
             AgentAction::Revoke { config, id } => agent_revoke(config, id),
         },
         Cmd::Ports { config } => print_ports(config),
+        Cmd::Maintenance { action } => maintenance_command(action),
     }
 }
 
@@ -605,6 +648,85 @@ fn token_revoke(config: Option<PathBuf>, name: String) -> Result<String> {
     let storage = open_token_storage(config)?;
     storage.revoke_api_token(&name, now_ms())?;
     Ok(format!("已吊销 token: {name}"))
+}
+
+// ---------------------------------------------------------------------------
+// M4-A2：maintenance CLI（降采样 / 保留期 / 状态）
+// ---------------------------------------------------------------------------
+
+/// 维护 CLI 的入口：只负责打印，业务函数返回可测试的 JSON 字符串。
+fn maintenance_command(action: MaintenanceAction) -> Result<()> {
+    match action {
+        MaintenanceAction::Run { config, task } => {
+            println!("{}", maintenance_run_json(config, task)?);
+        }
+        MaintenanceAction::Status { config } => {
+            println!("{}", maintenance_status_json(config)?);
+        }
+    }
+    Ok(())
+}
+
+/// 打开配置指向的 SQLite，供维护 CLI 使用。
+///
+/// 只要求配置本身合法（retention 倒挂/越界必须在这里拒绝，否则删除边界不可信），
+/// **不要求 admin_token / 证书材料**：排障与 e2e 可在 hub 未运行时独立执行。
+/// `cfg.validate()` 不读取证书文件，也不校验 token 强度。
+fn open_maintenance_storage(config: Option<PathBuf>) -> Result<(SqliteStorage, HubConfig)> {
+    let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
+    let cfg = load_config(&path)?;
+    cfg.validate().context("维护任务配置校验失败")?;
+    let db_path = cfg.sqlite_path()?;
+    let storage = SqliteStorage::open(&db_path)
+        .with_context(|| format!("打开维护数据库失败: {}", db_path.display()))?;
+    Ok((storage, cfg))
+}
+
+/// 执行一次维护任务并返回 JSON（调用方负责打印）。
+///
+/// CLI 用 `max_backfill_hours = None`：手动执行要一直处理到追平。retention 的
+/// 归档水位传 `None`（M4-C 接入归档后再传 `last_archived_ts`）。
+fn maintenance_run_json(config: Option<PathBuf>, task: MaintenanceTask) -> Result<String> {
+    let (storage, cfg) = open_maintenance_storage(config)?;
+    let now = now_ms();
+    let report = match task {
+        MaintenanceTask::Downsample => {
+            let report = downsample::run_downsample(&storage, now, None)
+                .context("降采样任务失败（task=downsample）")?;
+            serde_json::to_value(report)?
+        }
+        MaintenanceTask::Retention => {
+            let report = downsample::run_retention(&storage, &cfg, now, None)
+                .context("保留期任务失败（task=retention）")?;
+            serde_json::to_value(report)?
+        }
+    };
+    Ok(serde_json::to_string_pretty(&report)?)
+}
+
+/// `maintenance status` 的 JSON 结构：状态 + 当前生效的 retention / 间隔配置。
+#[derive(serde::Serialize)]
+struct MaintenanceStatusOutput {
+    #[serde(flatten)]
+    status: downsample::MaintenanceStatus,
+    retention_raw_days: u32,
+    retention_1m_days: u32,
+    retention_1h_days: u32,
+    maintenance_interval_secs: u64,
+}
+
+/// 读取维护状态并返回 JSON（调用方负责打印）。
+fn maintenance_status_json(config: Option<PathBuf>) -> Result<String> {
+    let (storage, cfg) = open_maintenance_storage(config)?;
+    let status = downsample::maintenance_status(&storage).context("读取维护状态失败")?;
+    let output = MaintenanceStatusOutput {
+        status,
+        retention_raw_days: cfg.retention_raw_days,
+        retention_1m_days: cfg.retention_1m_days,
+        retention_1h_days: cfg.retention_1h_days,
+        maintenance_interval_secs: cfg.maintenance_interval_secs,
+    };
+    Ok(serde_json::to_string_pretty(&output)?)
 }
 
 // init 的参数与 `init` 子命令的 CLI 字段一一对应，拆结构体只会多一层搬运。
@@ -1083,6 +1205,9 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         if cfg.self_monitor {
             spawn_self_monitor(storage.clone(), cfg.clone());
         }
+        // M4：降采样 + 保留期后台任务。启动后先睡一个周期，不做同步 backfill，
+        // 不阻塞监听；每轮在 spawn_blocking 内串行执行。
+        spawn_maintenance(storage.clone(), cfg.clone());
 
         let agent_app = Router::new()
             .route("/agent/ws", get(agent_ws))
@@ -3910,6 +4035,77 @@ fn spawn_self_monitor(storage: Arc<SqliteStorage>, cfg: HubConfig) {
             tokio::time::sleep(Duration::from_millis(cfg.sample_interval_ms)).await;
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// M4-A2：后台维护任务（降采样 + 保留期）
+// ---------------------------------------------------------------------------
+
+/// 启动后台维护任务。
+///
+/// 语义（与方案 §5.1 / §5.3 一致）：
+/// - 每 `maintenance_interval_secs` 执行一轮；启动后先睡一个周期，**不在启动时
+///   同步跑大 backfill**，监听不会被占用；
+/// - 每轮先 `run_downsample(..., Some(6))`，再 `run_retention(..., None)`；
+/// - SQLite 读写全部在 `spawn_blocking` 里，单轮串行不重叠；
+/// - 任何错误只 WARN 并写入 `maintenance_state.last_error`，任务不退出，
+///   下一轮重试。
+fn spawn_maintenance(storage: Arc<SqliteStorage>, cfg: HubConfig) {
+    tokio::spawn(async move {
+        // 配置校验已保证 1–3600；这里 max(1) 只是防御非法配置造成的忙循环。
+        let interval = Duration::from_secs(cfg.maintenance_interval_secs.max(1));
+        loop {
+            tokio::time::sleep(interval).await;
+            let storage = storage.clone();
+            let cfg = cfg.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                run_maintenance_round(&storage, &cfg);
+            })
+            .await;
+            if let Err(err) = outcome {
+                // worker 内部不 panic；走到这里说明任务被取消或意外 panic。
+                tracing::warn!(error = %err, "维护任务轮次异常结束，下一轮继续");
+            }
+        }
+    });
+}
+
+/// 执行一轮「降采样 → 保留期」，并维护 `last_error`。
+///
+/// 降采样失败时仍执行保留期：水面未推进，保留期门禁会阻止删除未聚合数据，
+/// 不会因一次失败丢数据。只有整轮都成功才清空 `last_error`，否则保留本轮
+/// 错误供 `maintenance status` 排障。错误字符串不含 secret。
+fn run_maintenance_round(storage: &SqliteStorage, cfg: &HubConfig) {
+    let now = now_ms();
+    let mut errors: Vec<String> = Vec::new();
+
+    match downsample::run_downsample(storage, now, Some(MAINTENANCE_MAX_BACKFILL_HOURS)) {
+        Ok(report) => tracing::debug!(?report, "维护任务：降采样完成"),
+        Err(err) => {
+            let message = format!("downsample: {err:#}");
+            tracing::warn!(error = %message, "维护任务：降采样失败，下一轮重试");
+            errors.push(message);
+        }
+    }
+    match downsample::run_retention(storage, cfg, now, None) {
+        Ok(report) => tracing::debug!(?report, "维护任务：保留期完成"),
+        Err(err) => {
+            let message = format!("retention: {err:#}");
+            tracing::warn!(error = %message, "维护任务：保留期失败，下一轮重试");
+            errors.push(message);
+        }
+    }
+
+    // 成功一轮写空串（= 清空 last_error）；失败时保留错误，直到下一轮全绿。
+    let last_error: String = errors
+        .join("; ")
+        .chars()
+        .take(MAX_MAINTENANCE_ERROR_CHARS)
+        .collect();
+    if let Err(err) = storage.set_maintenance_state(downsample::STATE_LAST_ERROR, &last_error, now)
+    {
+        tracing::warn!(error = %err, "写入维护任务 last_error 失败");
+    }
 }
 
 #[cfg(test)]
@@ -8307,6 +8503,187 @@ mod tests {
                 .cmd,
             Cmd::AdminToken { .. }
         ));
+    }
+
+    /// M4-A2：`maintenance run/status` 子命令解析；task 必填且只接受白名单值。
+    #[test]
+    fn m4a_maintenance_cli_parses_subcommands() {
+        let cli = Cli::try_parse_from([
+            "rustboard-hub",
+            "maintenance",
+            "run",
+            "--config",
+            "hub.toml",
+            "--task",
+            "downsample",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Maintenance {
+                action: MaintenanceAction::Run { config, task },
+            } => {
+                assert_eq!(config.as_deref(), Some(std::path::Path::new("hub.toml")));
+                assert_eq!(task, MaintenanceTask::Downsample);
+            }
+            _ => panic!("应解析为 maintenance run"),
+        }
+
+        assert!(matches!(
+            Cli::try_parse_from(["rustboard-hub", "maintenance", "run", "--task", "retention"])
+                .unwrap()
+                .cmd,
+            Cmd::Maintenance {
+                action: MaintenanceAction::Run {
+                    task: MaintenanceTask::Retention,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "rustboard-hub",
+                "maintenance",
+                "status",
+                "--config",
+                "hub.toml"
+            ])
+            .unwrap()
+            .cmd,
+            Cmd::Maintenance {
+                action: MaintenanceAction::Status { .. }
+            }
+        ));
+        // 未知 task / 缺少 task 必须拒绝（避免误跑错误任务）。
+        assert!(
+            Cli::try_parse_from(["rustboard-hub", "maintenance", "run", "--task", "archive"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["rustboard-hub", "maintenance", "run"]).is_err());
+    }
+
+    /// M4-A2：CLI 只依赖配置里的 SQLite，不要求 admin_token / 证书；
+    /// 两条命令都输出可解析 JSON。
+    #[test]
+    fn m4a_maintenance_cli_run_and_status_emit_json() {
+        let dir = temp_dir("maintenance-json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            database: format!("sqlite://{}", dir.join("rustboard.db").display()),
+            // 管理 API token 与证书材料在维护 CLI 中都不需要。
+            admin_token: String::new(),
+            ..HubConfig::default()
+        };
+        let cfg_path = dir.join("hub.toml");
+        cfg.save(&cfg_path).unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(
+            &maintenance_run_json(Some(cfg_path.clone()), MaintenanceTask::Downsample).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["one_minute"]["buckets"], 0);
+        assert_eq!(json["one_minute"]["watermark"], serde_json::Value::Null);
+
+        let status: serde_json::Value =
+            serde_json::from_str(&maintenance_status_json(Some(cfg_path.clone())).unwrap())
+                .unwrap();
+        assert_eq!(status["retention_raw_days"], 7);
+        assert_eq!(status["retention_1m_days"], 90);
+        assert_eq!(status["retention_1h_days"], 730);
+        assert_eq!(status["maintenance_interval_secs"], 60);
+        assert_eq!(status["raw"]["rows"], 0);
+        assert_eq!(status["downsample_1m_watermark"], serde_json::Value::Null);
+
+        let json: serde_json::Value = serde_json::from_str(
+            &maintenance_run_json(Some(cfg_path), MaintenanceTask::Retention).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["raw"]["deleted"], 0);
+        assert_eq!(json["raw"]["skipped_no_watermark"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M4-A2：retention 倒挂配置必须在打开数据库之前被拒绝，错误点名字段。
+    #[test]
+    fn m4a_maintenance_cli_rejects_inverted_retention_before_touching_db() {
+        let dir = temp_dir("maintenance-bad-retention");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            database: format!("sqlite://{}", dir.join("rustboard.db").display()),
+            admin_token: String::new(),
+            retention_raw_days: 30,
+            retention_1m_days: 7,
+            ..HubConfig::default()
+        };
+        let cfg_path = dir.join("hub.toml");
+        cfg.save(&cfg_path).unwrap();
+
+        let err = maintenance_run_json(Some(cfg_path), MaintenanceTask::Retention).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("retention_1m_days"),
+            "错误必须点名倒挂字段: {message}"
+        );
+        assert!(
+            !dir.join("rustboard.db").exists(),
+            "配置非法时不得打开/创建数据库"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M4-A2：后台单轮串行执行，失败写 last_error、整轮成功后清空。
+    #[test]
+    fn m4a_maintenance_round_records_and_clears_last_error() {
+        let storage = SqliteStorage::open_in_memory().unwrap();
+        let cfg = HubConfig::default();
+
+        // 先留一条旧错误：成功一轮必须清空。
+        storage
+            .set_maintenance_state(downsample::STATE_LAST_ERROR, "old failure", now_ms())
+            .unwrap();
+        run_maintenance_round(&storage, &cfg);
+        assert_eq!(
+            storage
+                .get_maintenance_state(downsample::STATE_LAST_ERROR)
+                .unwrap(),
+            Some(String::new())
+        );
+
+        // 损坏水位：降采样与保留期都失败，错误必须带任务前缀被记录下来。
+        storage
+            .set_maintenance_state(
+                downsample::STATE_DOWNSAMPLE_1M_WATERMARK,
+                "not-a-number",
+                now_ms(),
+            )
+            .unwrap();
+        run_maintenance_round(&storage, &cfg);
+        let recorded = storage
+            .get_maintenance_state(downsample::STATE_LAST_ERROR)
+            .unwrap()
+            .unwrap_or_default();
+        assert!(
+            recorded.contains("downsample:"),
+            "缺少降采样错误: {recorded}"
+        );
+        assert!(
+            recorded.contains("retention:"),
+            "缺少保留期错误: {recorded}"
+        );
+
+        // 修好水位后下一轮恢复并清空错误。
+        storage
+            .set_maintenance_state(downsample::STATE_DOWNSAMPLE_1M_WATERMARK, "", now_ms())
+            .unwrap();
+        run_maintenance_round(&storage, &cfg);
+        assert_eq!(
+            storage
+                .get_maintenance_state(downsample::STATE_LAST_ERROR)
+                .unwrap(),
+            Some(String::new())
+        );
     }
 
     /// 控制路由缺少鉴权扩展时固定 500（接线错误），不得 panic。

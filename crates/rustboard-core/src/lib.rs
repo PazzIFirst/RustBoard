@@ -2,6 +2,7 @@
 
 pub mod buffer;
 pub mod collect;
+pub mod downsample;
 pub mod storage;
 
 pub use collect::Collector;
