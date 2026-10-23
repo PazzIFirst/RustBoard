@@ -268,7 +268,10 @@ async fn process_event(
         let states = {
             let storage = storage.clone();
             blocking(storage, move |storage| {
-                storage.list_alert_states_for_rule(&rule_id)
+                storage.list_alert_states_for_rule(
+                    &rule_id,
+                    crate::alerts_engine::MAX_ALERT_STATES_PER_RULE,
+                )
             })
             .await?
         };
@@ -351,7 +354,10 @@ async fn process_event(
             let states = {
                 let storage = storage.clone();
                 blocking(storage, move |storage| {
-                    storage.list_alert_states_for_rule(&rule_id)
+                    storage.list_alert_states_for_rule(
+                        &rule_id,
+                        crate::alerts_engine::MAX_ALERT_STATES_PER_RULE,
+                    )
                 })
                 .await?
             };
