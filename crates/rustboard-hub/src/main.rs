@@ -695,8 +695,8 @@ fn open_maintenance_storage(config: Option<PathBuf>) -> Result<(SqliteStorage, H
 
 /// 执行一次维护任务并返回 JSON（调用方负责打印）。
 ///
-/// CLI 用 `max_backfill_hours = None`：手动执行要一直处理到追平。retention 的
-/// 归档水位传 `None`（M4-C 接入归档后再传 `last_archived_ts`）。
+/// CLI 用 `max_backfill_hours = None`：手动执行要一直处理到追平。retention 传
+/// `ArchiveGate::Disabled`（M4-C 接入归档后按配置传 `Enabled`）。
 fn maintenance_run_json(config: Option<PathBuf>, task: MaintenanceTask) -> Result<String> {
     let (storage, cfg) = open_maintenance_storage(config)?;
     let now = now_ms();
