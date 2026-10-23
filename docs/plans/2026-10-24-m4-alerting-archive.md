@@ -628,6 +628,28 @@ notify_max_attempts = 3
 
 新增依赖必须写入 PR 说明理由、许可证、MSRV 与替代方案；CI `cargo audit` 保持 0。
 
+### 12.1 spike 结果（2026-10-24，分支 `chore/m4-dep-spike`）
+
+- **1.80**：`object_store 0.11.2` + `russh 0.53.0` 可编译且无 openssl/cmake，
+  但 `cargo audit` 为 4 高危 + 1 中危（quick-xml / russh / russh-cryptovec / rsa），
+  **不可放行**。
+- **1.85**：`object_store 0.14.2`（quick-xml 0.41）可用；`russh 0.60.3` 的
+  `ctutils 0.4.2` 仍有 1 高危，升 `ctutils 0.4.4` 需 Rust 1.87；`rsa` 为可选
+  依赖、未编译，但仍在 lock 中，cargo audit 报 1 中危。
+- **1.87**：`ctutils 0.4.5` 修复高危；`cargo +1.87 check/run` 通过，
+  `cargo audit` 只剩 `rsa 0.10.0-rc.16`（RUSTSEC-2023-0071，medium，无修复）。
+  `rsa` 是 `russh` 的 optional 依赖，未启用 feature、不在编译图，但 Cargo 会写入
+  lock，audit 仍会扫描到。
+- **C2（S3）**：`object_store 0.14.2` + `aws-base`/`reqwest`/`ring`，
+  quick-xml 0.41，可在 1.85+ 通过 audit；不使用 `aws` 大 feature（会拉
+  aws-lc-rs/cmake）。
+- **C3（SFTP）**：要同时满足纯 Rust、SFTP、`cargo audit` 0，必须在 1.87+ 且
+  对 `russh` 做 **最小 vendor/patch 删除 optional `rsa` 依赖**；否则只能
+  放弃 C3，或显式接受一条未编译的 rsa 中危 allowlist。**不得静默 `--ignore`。**
+  该选择需在 C3 开工前由维护者确认；C1/C2 不受影响。
+- 报告：分支 `chore/m4-dep-spike` 的
+  `spikes/m4-deps{,-185,-187}/REPORT*.md`（未合入 main）。
+
 ## 13. 风险与回滚
 
 | 风险 | 影响 | 缓解 |
