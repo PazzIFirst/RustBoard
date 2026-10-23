@@ -1160,7 +1160,9 @@ fn map_api_token_unique_error(err: rusqlite::Error, name: &str) -> anyhow::Error
             }
         }
     }
-    anyhow::Error::new(err).context(format!("创建/轮换 token 失败: {name}"))
+    // 兜底不透传原始 SQLite 错误（可能含 SQL / 文件路径），只记 debug。
+    tracing::debug!(error = %err, "创建/轮换 token 失败（非唯一约束错误）");
+    anyhow::anyhow!("创建/轮换 token 失败: {name}（数据库错误，详见日志）")
 }
 
 impl SqliteStorage {
@@ -1267,6 +1269,9 @@ impl SqliteStorage {
     /// - 60s 节流：同一 token 的 `last_used_at` 每 60s 最多写一次；首次必写。
     /// - 更新失败只记 debug，不影响本次鉴权结果（读路径已完成）。
     /// - 若更新时发现行已被并发吊销（影响 0 行），按未认证处理（安全默认拒绝）。
+    ///
+    /// 并发下两个请求可能同时通过节流判断、各写一次 `last_used_at`；两次写入
+    /// 都是幂等的统计更新，最多多一条 UPDATE，不影响鉴权与吊销语义。
     pub fn authenticate_api_token(
         &self,
         token_hash: &str,
@@ -1276,10 +1281,13 @@ impl SqliteStorage {
             "SELECT {API_TOKEN_COLUMNS} FROM api_tokens
              WHERE token_hash = ?1 AND revoked_at IS NULL"
         );
-        let record: Option<ApiTokenRecord> = self
-            .lock_read()
-            .query_row(&sql, params![token_hash], row_to_api_token)
-            .optional()?;
+        // 显式作用域释放读连接：读池为空时会回退到写连接，提前 drop 才能避免
+        // 后续 UPDATE 等待自己持有的写锁。
+        let record: Option<ApiTokenRecord> = {
+            let conn = self.lock_read();
+            conn.query_row(&sql, params![token_hash], row_to_api_token)
+                .optional()?
+        };
         let Some(mut record) = record else {
             return Ok(None);
         };

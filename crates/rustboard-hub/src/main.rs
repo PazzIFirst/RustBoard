@@ -333,7 +333,12 @@ struct PeerIdentity(Option<String>);
 fn main() -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "rustboard_hub=info,rustboard_common=warn,tower_http=warn".into());
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        // 日志固定走 stderr：`token create/rotate` 的明文只写 stdout，
+        // 避免 `RUST_LOG=info` 时脚本捕获的 token 被日志行污染。
+        .with_writer(std::io::stderr)
+        .init();
 
     match Cli::parse().cmd {
         Cmd::Init {
@@ -525,6 +530,13 @@ fn validate_token_name(name: &str) -> Result<()> {
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
         bail!("token 名称只能包含 A-Z a-z 0-9 . _ -");
+    }
+    // 审计 actor 兼容性：旧 admin_token 固定写 actor="admin"，若允许同名 scoped
+    // token，审计里将无法区分两者。保留名大小写不敏感（Admin/ADMIN 同样拒绝）。
+    if name.eq_ignore_ascii_case("admin") {
+        bail!(
+            "token 名称 \"admin\" 是审计 actor 保留名（与旧 admin_token 不可区分），请换一个名称"
+        );
     }
     Ok(())
 }
@@ -7269,16 +7281,18 @@ mod tests {
         actors.sort_unstable();
         assert_eq!(actors, vec!["admin-http-token", "write-token"]);
 
-        // write token 通过 scope 后由 handler 校验请求体（400 而非 403）。
-        let (status, _, _) = admin_call(
-            &router,
-            "PUT",
-            "/api/v1/agents/a1/settings",
-            Some(&write),
-            Some("{}"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // write / admin token 通过 scope 后由 handler 校验请求体（400 而非 403）。
+        for token in [write.as_str(), admin.as_str()] {
+            let (status, _, _) = admin_call(
+                &router,
+                "PUT",
+                "/api/v1/agents/a1/settings",
+                Some(token),
+                Some("{}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "token={token}");
+        }
 
         // 未知路径：先认证再 404；未知 POST/PUT 不能被 read token 变成 403。
         for method in ["GET", "POST", "PUT", "DELETE"] {
@@ -7370,6 +7384,34 @@ mod tests {
         // 非法名称 / scope 在落库前拒绝。
         assert!(token_create(Some(config_path.clone()), "bad name".into(), "read".into()).is_err());
         assert!(token_create(Some(config_path.clone()), "panel".into(), "root".into()).is_err());
+
+        // 保留名 admin（大小写不敏感）：create / rotate 都必须拒绝，
+        // 否则审计 actor 与旧 admin_token 完全不可区分。
+        for reserved in ["admin", "Admin", "ADMIN"] {
+            let err = token_create(Some(config_path.clone()), reserved.into(), "read".into())
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("保留名"),
+                "create {reserved} 错误信息: {err:#}"
+            );
+            let err = token_rotate(Some(config_path.clone()), reserved.into()).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("保留名"),
+                "rotate {reserved} 错误信息: {err:#}"
+            );
+        }
+
+        // 名称边界：1 / 64 合法；空、65、非 ASCII、tab / 换行拒绝。
+        assert!(validate_token_name("a").is_ok());
+        assert!(validate_token_name(&"a".repeat(64)).is_ok());
+        assert!(validate_token_name("").is_err());
+        assert!(validate_token_name(&"a".repeat(65)).is_err());
+        assert!(validate_token_name("名字").is_err());
+        assert!(validate_token_name("a\tb").is_err());
+        assert!(validate_token_name("a\nb").is_err());
+        assert!(validate_token_name("admin").is_err());
+        assert!(validate_token_name("ADMIN").is_err());
+        assert!(validate_token_name("Admin").is_err());
 
         let token = token_create(Some(config_path.clone()), "panel".into(), "read".into()).unwrap();
         assert_eq!(token.len(), 64, "明文必须是 64 位 hex");

@@ -408,5 +408,19 @@ mod tests {
             assert_eq!(bearer_token(&headers), None, "value={value}");
             assert!(!bearer_matches(&headers, "secret"), "value={value}");
         }
+
+        // 多个 Authorization 头：只取第一个，不能因为后面有一个合法值就放行。
+        let mut multiple = HeaderMap::new();
+        multiple.append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer first"),
+        );
+        multiple.append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer second"),
+        );
+        assert_eq!(bearer_token(&multiple), Some("first"));
+        assert!(bearer_matches(&multiple, "first"));
+        assert!(!bearer_matches(&multiple, "second"));
     }
 }
