@@ -14,7 +14,7 @@ use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, Ser
 use super::{
     AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, DownsampleRangeResult,
     IngestOutcome, MaintenanceStateEntry, NewAuditEntry, PruneResult, QueryTooLarge, RejectReason,
-    Storage, TierStats, AUDIT_RETENTION_MS, BUCKET_1H_MS, BUCKET_1M_MS,
+    SampleTier, Storage, TierStats, AUDIT_RETENTION_MS, BUCKET_1H_MS, BUCKET_1M_MS,
 };
 
 /// 默认只读连接池大小（与 `HubConfig::read_pool_size` 默认值一致）。
@@ -648,8 +648,9 @@ impl SqliteStorage {
         self.readers.len()
     }
 
-    /// `latest_samples` 的实现：SQL 侧最多取 `limit` 行。
+    /// `latest_samples` 的 raw 路径：SQL 侧最多取 `limit` 行。
     ///
+    /// 只查 raw 表；1m/1h 回退由 [`Storage::latest_samples`] 负责。
     /// 达到上限（行数 == limit）时返回错误而不是静默截断：截断后的「最新点」
     /// 可能缺序列，面板会显示错误的监控数据；宁可让调用方缩小窗口。
     fn latest_samples_limited(
@@ -694,33 +695,109 @@ impl SqliteStorage {
             })
         })?;
         let rows: Vec<AgentSeriesRow> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        dedupe_latest_samples(rows, limit, since, metrics, agent, SampleTier::Raw)
+    }
 
-        if rows.len() >= limit {
-            tracing::error!(
-                limit,
-                since,
-                metrics = metrics.len(),
-                agent = agent.unwrap_or("<all>"),
-                "latest_samples 达到 SQL 行数硬上限，拒绝返回可能不完整的快照"
-            );
-            return Err(anyhow::Error::new(QueryTooLarge { limit }));
+    /// 聚合表回退：取 `since` 之后某层每个序列的最新桶。
+    ///
+    /// 用 `bucket_ts + 层粒度 > since` 放宽一个层粒度，覆盖跨窗口边界的桶；
+    /// 返回 `bucket_ts` 作为 `ts`、`last_value` 作为 `value`。行数上限、agent /
+    /// metrics 过滤与按序列去重的语义都与 raw 路径一致。
+    fn latest_tier_samples(
+        &self,
+        tier: SampleTier,
+        since: i64,
+        metrics: &[String],
+        agent: Option<&str>,
+    ) -> Result<Vec<AgentSeriesRow>> {
+        let (table, granularity) = match tier {
+            SampleTier::Raw => {
+                return self.latest_samples_limited(since, metrics, agent, LATEST_SAMPLES_SQL_LIMIT)
+            }
+            SampleTier::OneMinute => ("samples_1m", BUCKET_1M_MS),
+            SampleTier::OneHour => ("samples_1h", BUCKET_1H_MS),
+        };
+        let conn = self.lock_read();
+
+        // 表名来自上面的固定分支，不接受外部输入；其余值全部参数绑定。
+        let mut sql = format!(
+            "SELECT agent_id, metric, labels, bucket_ts, last_value FROM {table}
+             WHERE bucket_ts + ?1 > ?2"
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Integer(granularity),
+            rusqlite::types::Value::Integer(since),
+        ];
+        if let Some(agent_id) = agent {
+            sql.push_str(" AND agent_id = ?");
+            params.push(rusqlite::types::Value::Text(agent_id.to_string()));
         }
-
-        // SQL 已按 ts 升序；同键后到的（更新的 ts）覆盖先到的。
-        // 用 BTreeMap 保证最终输出顺序稳定，便于面板与测试断言。
-        let mut latest: std::collections::BTreeMap<(String, String, Labels), AgentSeriesRow> =
-            std::collections::BTreeMap::new();
-        for row in rows {
-            let key = (row.agent_id.clone(), row.metric.clone(), row.labels.clone());
-            match latest.get(&key) {
-                Some(existing) if existing.ts > row.ts => {}
-                _ => {
-                    latest.insert(key, row);
-                }
+        if !metrics.is_empty() {
+            let holders = vec!["?"; metrics.len()].join(",");
+            sql.push_str(&format!(" AND metric IN ({holders})"));
+            for metric in metrics {
+                params.push(rusqlite::types::Value::Text(metric.clone()));
             }
         }
-        Ok(latest.into_values().collect())
+        sql.push_str(" ORDER BY agent_id, metric, labels, bucket_ts ASC LIMIT ?");
+        params.push(rusqlite::types::Value::Integer(
+            i64::try_from(LATEST_SAMPLES_SQL_LIMIT).unwrap_or(i64::MAX),
+        ));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+            let labels_json: String = r.get(2)?;
+            let labels: Labels = serde_json::from_str(&labels_json).unwrap_or_default();
+            Ok(AgentSeriesRow {
+                agent_id: r.get(0)?,
+                metric: r.get(1)?,
+                labels,
+                ts: r.get(3)?,
+                value: r.get(4)?,
+            })
+        })?;
+        let rows: Vec<AgentSeriesRow> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        dedupe_latest_samples(rows, LATEST_SAMPLES_SQL_LIMIT, since, metrics, agent, tier)
     }
+}
+
+/// `latest_samples` 各条路径共用的上限检查与按序列去重。
+///
+/// `rows` 必须已按 `(agent_id, metric, labels, ts)` 升序（SQL 保证）；同键后到
+/// 的（更新的 ts）覆盖先到的。用 BTreeMap 保证最终输出顺序稳定，便于面板与
+/// 测试断言。达到行数硬上限时返回 [`QueryTooLarge`] 而不是静默截断。
+fn dedupe_latest_samples(
+    rows: Vec<AgentSeriesRow>,
+    limit: usize,
+    since: i64,
+    metrics: &[String],
+    agent: Option<&str>,
+    tier: SampleTier,
+) -> Result<Vec<AgentSeriesRow>> {
+    if rows.len() >= limit {
+        tracing::error!(
+            limit,
+            since,
+            metrics = metrics.len(),
+            agent = agent.unwrap_or("<all>"),
+            tier = tier.as_str(),
+            "latest_samples 达到 SQL 行数硬上限，拒绝返回可能不完整的快照"
+        );
+        return Err(anyhow::Error::new(QueryTooLarge { limit }));
+    }
+
+    let mut latest: std::collections::BTreeMap<(String, String, Labels), AgentSeriesRow> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        let key = (row.agent_id.clone(), row.metric.clone(), row.labels.clone());
+        match latest.get(&key) {
+            Some(existing) if existing.ts > row.ts => {}
+            _ => {
+                latest.insert(key, row);
+            }
+        }
+    }
+    Ok(latest.into_values().collect())
 }
 
 /// 测试注入：让指定路径的只读连接全部打开失败，覆盖「读池降级到写连接」分支。
@@ -1171,13 +1248,94 @@ impl Storage for SqliteStorage {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    fn query_series_tiered(
+        &self,
+        query: &SeriesQuery,
+        bucket_ms: i64,
+        tier: SampleTier,
+    ) -> Result<Vec<SeriesRow>> {
+        if bucket_ms <= 0 {
+            anyhow::bail!("bucket_ms 必须大于 0");
+        }
+        if tier == SampleTier::Raw {
+            // raw 路径保持旧行为不变（包含 AVG(value) 与原有时间过滤）。
+            return self.query_series_bucketed(query, bucket_ms);
+        }
+        let (table, tier_granularity) = match tier {
+            SampleTier::Raw => unreachable!("raw 已在上面委托"),
+            SampleTier::OneMinute => ("samples_1m", BUCKET_1M_MS),
+            SampleTier::OneHour => ("samples_1h", BUCKET_1H_MS),
+        };
+        let conn = self.lock_read();
+
+        // 表名来自固定分支，不接受外部输入；值全部参数绑定。
+        // - 请求桶起点 = floor(bucket_ts / bucket_ms) * bucket_ms；别名不能叫
+        //   bucket_ts（会与源列同名，GROUP BY 解析到源列而拆散聚合）；
+        // - 与 [from, to] 有重叠即纳入：bucket_ts + 层粒度 > from 且 bucket_ts <= to；
+        // - value 必须按 count 加权平均，不能对各层均值再取简单平均。
+        let mut sql = format!(
+            "SELECT metric, labels, (bucket_ts / ?4) * ?4 AS query_ts,
+                    CAST(SUM(avg_value * count) AS REAL) / SUM(count)
+             FROM {table}
+             WHERE agent_id = ?1 AND bucket_ts + ?5 > ?2 AND bucket_ts <= ?3"
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Text(query.agent_id.clone()),
+            rusqlite::types::Value::Integer(query.from),
+            rusqlite::types::Value::Integer(query.to),
+            rusqlite::types::Value::Integer(bucket_ms),
+            rusqlite::types::Value::Integer(tier_granularity),
+        ];
+        if !query.metrics.is_empty() {
+            let holders: Vec<String> = (0..query.metrics.len())
+                .map(|i| format!("?{}", 6 + i))
+                .collect();
+            sql.push_str(&format!(" AND metric IN ({})", holders.join(",")));
+            for metric in &query.metrics {
+                params.push(rusqlite::types::Value::Text(metric.clone()));
+            }
+        }
+        let limit_idx = params.len() + 1;
+        sql.push_str(&format!(
+            " GROUP BY metric, labels, query_ts
+              ORDER BY metric, labels, query_ts
+              LIMIT ?{limit_idx}"
+        ));
+        params.push(rusqlite::types::Value::Integer(i64::from(query.limit)));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+            let labels_json: String = r.get(1)?;
+            let labels: Labels = serde_json::from_str(&labels_json).unwrap_or_default();
+            Ok(SeriesRow {
+                metric: r.get(0)?,
+                labels,
+                ts: r.get(2)?,
+                value: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     fn latest_samples(
         &self,
         since: i64,
         metrics: &[String],
         agent: Option<&str>,
     ) -> Result<Vec<AgentSeriesRow>> {
-        self.latest_samples_limited(since, metrics, agent, LATEST_SAMPLES_SQL_LIMIT)
+        // 先走 raw；只有 raw 完全没有数据时才依次回退 1m、1h，避免保留期删除
+        // raw 后面板「最新点」整片空白。任一层有数据就不再继续回落。
+        let rows = self.latest_samples_limited(since, metrics, agent, LATEST_SAMPLES_SQL_LIMIT)?;
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
+        for tier in [SampleTier::OneMinute, SampleTier::OneHour] {
+            let rows = self.latest_tier_samples(tier, since, metrics, agent)?;
+            if !rows.is_empty() {
+                return Ok(rows);
+            }
+        }
+        Ok(Vec::new())
     }
 
     fn get_sample_interval(&self, agent_id: &str) -> Result<Option<u64>> {
@@ -3980,5 +4138,335 @@ mod tests {
         assert_eq!(s.samples_1h_stats().unwrap().rows, 2);
         assert_eq!(s.prune_samples_1h_before(hour).unwrap().deleted, 1);
         assert_eq!(s.samples_1h_stats().unwrap().oldest_ts, Some(hour));
+    }
+
+    // ---- M4-A2b：查询选层（1m/1h 加权聚合、latest_samples 回退） ----
+
+    /// 直接写 1m/1h 聚合表，`min/max` 取 `avg`（查询测试只关心 avg/last/count）。
+    ///
+    /// 参数顺序：metric、labels、bucket_ts、avg_value、last_value、count。
+    fn insert_tier_rows(
+        s: &SqliteStorage,
+        table: &str,
+        agent_id: &str,
+        rows: &[(&str, &str, i64, f64, f64, i64)],
+    ) {
+        assert!(matches!(table, "samples_1m" | "samples_1h"));
+        let conn = s.lock_write();
+        let sql = format!(
+            "INSERT INTO {table}
+                 (agent_id, metric, labels, bucket_ts, min_value, max_value, avg_value, last_value, count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5, ?6, ?7)"
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        for (metric, labels, bucket_ts, avg_value, last_value, count) in rows {
+            stmt.execute(params![
+                agent_id, metric, labels, bucket_ts, avg_value, last_value, count
+            ])
+            .unwrap();
+        }
+    }
+
+    /// 1m 层：`value` 按 count 加权平均；labels 不同不合并；空范围返回空。
+    #[test]
+    fn m4b_tiered_query_1m_weights_by_count_and_groups_labels() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let base = 1_700_000_700_000; // 整 5 分钟
+        assert_eq!(base % BUCKET_1M_MS, 0);
+        assert_eq!(base % 300_000, 0);
+
+        // 三分钟桶合成一个 5 分钟查询桶：简单平均 37.33，按 count 加权 = 36。
+        insert_tier_rows(
+            &s,
+            "samples_1m",
+            "a1",
+            &[
+                ("cpu.usage", "{}", base, 2.0, 2.0, 3),
+                ("cpu.usage", "{}", base + 60_000, 10.0, 10.0, 1),
+                ("cpu.usage", "{}", base + 120_000, 100.0, 100.0, 2),
+                ("cpu.usage", r#"{"disk":"sda"}"#, base, 8.0, 9.0, 2),
+            ],
+        );
+
+        let query = SeriesQuery {
+            agent_id: "a1".into(),
+            metrics: Vec::new(),
+            from: base,
+            to: base + 299_999,
+            limit: 100,
+        };
+        let rows = s
+            .query_series_tiered(&query, 300_000, SampleTier::OneMinute)
+            .unwrap();
+        assert_eq!(rows.len(), 2, "labels 不同不能合并: {rows:?}");
+
+        let cpu = rows.iter().find(|r| r.labels.is_empty()).unwrap();
+        assert_eq!(cpu.ts, base);
+        assert!(
+            (cpu.value - 36.0).abs() < 1e-9,
+            "必须按 count 加权平均，实际 {}",
+            cpu.value
+        );
+        let disk = rows
+            .iter()
+            .find(|r| r.labels.get("disk").map(String::as_str) == Some("sda"))
+            .unwrap();
+        assert_eq!(disk.ts, base);
+        assert!((disk.value - 8.0).abs() < 1e-9);
+
+        // 空范围 / 非法桶宽。
+        let empty = SeriesQuery {
+            from: base + 10_000_000,
+            to: base + 10_100_000,
+            ..query.clone()
+        };
+        assert!(s
+            .query_series_tiered(&empty, 300_000, SampleTier::OneMinute)
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .query_series_tiered(&query, 0, SampleTier::OneMinute)
+            .is_err());
+        assert!(s
+            .query_series_tiered(&query, -1, SampleTier::OneMinute)
+            .is_err());
+    }
+
+    /// 1h 层：请求桶大于层粒度时仍按 `SUM(avg*count)/SUM(count)` 加权。
+    #[test]
+    fn m4b_tiered_query_1h_bucket_larger_than_granularity() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let hour = 1_699_999_200_000; // 整点且 2 小时对齐
+        assert_eq!(hour % BUCKET_1H_MS, 0);
+        assert_eq!(hour % 7_200_000, 0);
+
+        insert_tier_rows(
+            &s,
+            "samples_1h",
+            "a1",
+            &[
+                ("cpu.usage", "{}", hour, 12.5, 12.5, 4),
+                ("cpu.usage", "{}", hour + BUCKET_1H_MS, 100.0, 100.0, 2),
+            ],
+        );
+
+        let query = SeriesQuery {
+            agent_id: "a1".into(),
+            metrics: vec!["cpu.usage".into()],
+            from: hour,
+            to: hour + 7_199_999,
+            limit: 10,
+        };
+        let rows = s
+            .query_series_tiered(&query, 7_200_000, SampleTier::OneHour)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ts, hour, "返回 2 小时桶起点");
+        let expected = (12.5 * 4.0 + 100.0 * 2.0) / 6.0;
+        assert!(
+            (rows[0].value - expected).abs() < 1e-9,
+            "2h 桶必须按 count 加权: {} != {expected}",
+            rows[0].value
+        );
+        assert!(
+            (rows[0].value - 56.25).abs() > 1.0,
+            "不能对各小时均值简单平均"
+        );
+
+        // 上界恰好等于桶起点：纳入；上界早于桶：排除。
+        let at_start = SeriesQuery {
+            from: hour - 10_000,
+            to: hour,
+            ..query.clone()
+        };
+        assert_eq!(
+            s.query_series_tiered(&at_start, 7_200_000, SampleTier::OneHour)
+                .unwrap()
+                .len(),
+            1
+        );
+        let before_start = SeriesQuery {
+            from: hour - 10_000,
+            to: hour - 1,
+            ..query
+        };
+        assert!(s
+            .query_series_tiered(&before_start, 7_200_000, SampleTier::OneHour)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// 1m 时间重叠：`bucket_ts + 60s > from` 且 `bucket_ts <= to`；raw 路径不变。
+    #[test]
+    fn m4b_tiered_query_time_overlap_and_raw_path_unchanged() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let base = 1_700_000_700_000;
+        insert_tier_rows(
+            &s,
+            "samples_1m",
+            "a1",
+            &[("cpu.usage", "{}", base, 4.0, 4.0, 1)],
+        );
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", base + 1_000, 10.0),
+                ("cpu.usage", "{}", base + 1_900, 20.0),
+                ("cpu.usage", "{}", base + 2_100, 30.0),
+            ],
+        );
+
+        let range = |from: i64, to: i64| SeriesQuery {
+            agent_id: "a1".into(),
+            metrics: vec!["cpu.usage".into()],
+            from,
+            to,
+            limit: 100,
+        };
+
+        // 窗口落在桶中间：仍有重叠，返回桶起点。
+        let rows = s
+            .query_series_tiered(
+                &range(base + 30_000, base + 30_000),
+                60_000,
+                SampleTier::OneMinute,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ts, base);
+        // 窗口起点等于桶尾（bucket_ts + 60s）：不再重叠。
+        assert!(s
+            .query_series_tiered(
+                &range(base + 60_000, base + 120_000),
+                60_000,
+                SampleTier::OneMinute
+            )
+            .unwrap()
+            .is_empty());
+        // 窗口终点早于桶起点：排除。
+        assert!(s
+            .query_series_tiered(
+                &range(base - 10_000, base - 1),
+                60_000,
+                SampleTier::OneMinute
+            )
+            .unwrap()
+            .is_empty());
+
+        // raw 层必须与旧的 query_series_bucketed 完全一致。
+        let query = range(0, base + 10_000);
+        let tiered = s
+            .query_series_tiered(&query, 2_000, SampleTier::Raw)
+            .unwrap();
+        let legacy = s.query_series_bucketed(&query, 2_000).unwrap();
+        let summary = |rows: &[SeriesRow]| {
+            rows.iter()
+                .map(|r| (r.metric.clone(), r.labels.clone(), r.ts, r.value))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(summary(&tiered), summary(&legacy), "raw 路径必须保持旧行为");
+        assert_eq!(tiered.len(), 2, "只有 raw 表参与，1m 行不得混入");
+        assert!(s.query_series_tiered(&query, 0, SampleTier::Raw).is_err());
+    }
+
+    /// `latest_samples`：raw 为空才回退 1m，1m 也为空再回退 1h；
+    /// 保留 since 放宽一个层粒度、metrics/agent 过滤与 last_value 语义。
+    #[test]
+    fn m4b_latest_samples_falls_back_to_1m_then_1h() {
+        assert_eq!(LATEST_SAMPLES_SQL_LIMIT, 100_000);
+
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let base = 1_700_000_700_000; // 整分钟
+        assert_eq!(base % BUCKET_1M_MS, 0);
+        let hour = base.div_euclid(BUCKET_1H_MS) * BUCKET_1H_MS;
+
+        // raw：同序列两点，last_value 必须是 ts 更新的 9。
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", base + 1_000, 1.0),
+                ("cpu.usage", "{}", base + 2_000, 9.0),
+            ],
+        );
+        s.downsample_1m_range(base, base + BUCKET_1M_MS).unwrap();
+        // 额外的 1m / 1h 序列：raw 存在时不得出现在 latest 结果里。
+        insert_tier_rows(
+            &s,
+            "samples_1m",
+            "a1",
+            &[("disk.used", "{}", base, 10.0, 77.0, 3)],
+        );
+        insert_tier_rows(
+            &s,
+            "samples_1h",
+            "a1",
+            &[("net.rx", "{}", hour, 20.0, 88.0, 5)],
+        );
+        insert_tier_rows(
+            &s,
+            "samples_1m",
+            "a2",
+            &[("disk.used", "{}", base, 30.0, 99.0, 1)],
+        );
+
+        // raw 有数据：只返回 raw，不混入 1m/1h。
+        let rows = s.latest_samples(0, &[], None).unwrap();
+        assert_eq!(rows.len(), 1, "只能是 raw 序列: {rows:?}");
+        assert_eq!(rows[0].metric, "cpu.usage");
+        assert_eq!(rows[0].ts, base + 2_000);
+        assert!((rows[0].value - 9.0).abs() < 1e-9);
+
+        // 删除 raw：回退 1m，ts 用 bucket_ts、value 用 last_value。
+        s.prune_samples_before(i64::MAX).unwrap();
+        assert_eq!(s.raw_stats().unwrap().rows, 0);
+        let rows = s.latest_samples(0, &[], Some("a1")).unwrap();
+        let summary: Vec<(&str, i64, f64)> = rows
+            .iter()
+            .map(|r| (r.metric.as_str(), r.ts, r.value))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![("cpu.usage", base, 9.0), ("disk.used", base, 77.0)],
+            "1m 回退：按 (agent,metric,labels) 去重且用 last_value"
+        );
+
+        // since 放宽一个层粒度：跨窗口边界的桶仍可见；超过桶尾则不可见。
+        let rows = s
+            .latest_samples(base + 30_000, &["cpu.usage".into()], Some("a1"))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ts, base);
+        assert!(s
+            .latest_samples(base + BUCKET_1M_MS, &["cpu.usage".into()], None)
+            .unwrap()
+            .is_empty());
+        // metrics / agent 过滤同样作用于回退查询。
+        let rows = s
+            .latest_samples(0, &["disk.used".into()], Some("a2"))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_id, "a2");
+        assert!((rows[0].value - 99.0).abs() < 1e-9);
+
+        // 1m 也为空：再回退 1h。
+        s.prune_samples_1m_before(i64::MAX).unwrap();
+        assert_eq!(s.samples_1m_stats().unwrap().rows, 0);
+        let rows = s.latest_samples(0, &[], None).unwrap();
+        assert_eq!(rows.len(), 1, "只能回退到 1h: {rows:?}");
+        assert_eq!(rows[0].metric, "net.rx");
+        assert_eq!(rows[0].ts, hour);
+        assert!((rows[0].value - 88.0).abs() < 1e-9);
+
+        // 1h 的 since 同样放宽一个层粒度。
+        assert_eq!(
+            s.latest_samples(hour + 1_800_000, &[], None).unwrap().len(),
+            1
+        );
+        assert!(s
+            .latest_samples(hour + BUCKET_1H_MS, &[], None)
+            .unwrap()
+            .is_empty());
     }
 }

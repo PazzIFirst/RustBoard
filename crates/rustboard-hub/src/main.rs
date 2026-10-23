@@ -45,7 +45,7 @@ use rustboard_core::collect::default_collectors;
 use rustboard_core::downsample;
 use rustboard_core::storage::sqlite::SqliteStorage;
 use rustboard_core::storage::{
-    AgentSeriesRow, IngestOutcome, QueryTooLarge, Storage, AUDIT_RETENTION_MS,
+    AgentSeriesRow, IngestOutcome, QueryTooLarge, SampleTier, Storage, AUDIT_RETENTION_MS,
 };
 use tokio::net::TcpListener;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
@@ -144,8 +144,14 @@ const MAX_IP_CONNECTION_ENTRIES: usize = 4096;
 const ADMIN_RATE_WINDOW_MS: i64 = 60_000;
 /// 管理 API 限速表容量（按 IP 计数）。
 const ADMIN_RATE_TABLE_CAPACITY: usize = 4096;
-/// `series` 查询最大跨度 32 天。
-const MAX_SERIES_SPAN_MS: i64 = 32 * 24 * 60 * 60 * 1000;
+/// `series` 查询最大跨度 730 天，与 1h 层默认保留期（730 天）一致。
+///
+/// M4-A2b 从 32 天放宽：1h 明细保留 730 天，若仍限制 32 天，长跨度历史数据
+/// 将无法查询。超出仍按参数错误（400）拒绝，避免无界扫描。
+const MAX_SERIES_SPAN_MS: i64 = 730 * 24 * 60 * 60 * 1000;
+/// 选层边界：跨度 ≤6h 用 raw，≤7d 用 1m，更长用 1h（方案 §5.2）。
+const SERIES_RAW_MAX_SPAN_MS: i64 = 6 * 60 * 60 * 1000;
+const SERIES_ONE_MINUTE_MAX_SPAN_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_SERIES_METRICS: usize = 20;
 const MAX_METRIC_LEN: usize = 64;
 /// 自动降采样后单曲线目标点数上限。
@@ -153,9 +159,10 @@ const MAX_AUTO_BUCKET_POINTS: i64 = 1_500;
 /// 单次 `series` 返回的序列（metric + labels）与点数上限。
 const MAX_SERIES_COUNT: usize = 50;
 const MAX_SERIES_POINTS: usize = 20_000;
-/// 自动 bucket 档位（毫秒）。
-const AUTO_BUCKETS_MS: [i64; 9] = [
-    1_000, 5_000, 10_000, 30_000, 60_000, 300_000, 900_000, 3_600_000, 21_600_000,
+/// 自动 bucket 档位（毫秒）。12h / 24h 两档保证 730 天查询仍不超过 1500 点/曲线。
+const AUTO_BUCKETS_MS: [i64; 11] = [
+    1_000, 5_000, 10_000, 30_000, 60_000, 300_000, 900_000, 3_600_000, 21_600_000, 43_200_000,
+    86_400_000,
 ];
 /// `overview.latest` 只查这些关键指标，避免全量扫描。
 const OVERVIEW_METRICS: [&str; 7] = [
@@ -2326,7 +2333,12 @@ async fn agent_latest(
 
 #[derive(serde::Serialize)]
 struct SeriesResponse {
+    /// 实际生效的桶宽（可能被选层粒度提升，见 `tier`）。
     bucket_ms: i64,
+    /// 本次查询选中的数据层：`"raw"` / `"1m"` / `"1h"`。
+    ///
+    /// 新增字段，旧客户端忽略即可；既有 `bucket_ms` / `series` 结构不变。
+    tier: String,
     series: Vec<SeriesEntry>,
 }
 
@@ -2346,6 +2358,7 @@ async fn agent_series(
     validate_agent_path(&agent_id)?;
     let parsed = parse_series_query(raw.as_deref()).map_err(ApiError::bad_request)?;
     let bucket_ms = parsed.bucket_ms;
+    let tier = parsed.tier;
     let query = SeriesQuery {
         agent_id,
         metrics: parsed.metrics,
@@ -2362,7 +2375,7 @@ async fn agent_series(
             return Ok(None);
         }
         Ok(Some(
-            state.storage.query_series_bucketed(&query, bucket_ms)?,
+            state.storage.query_series_tiered(&query, bucket_ms, tier)?,
         ))
     })
     .await
@@ -2370,7 +2383,7 @@ async fn agent_series(
     let Some(rows) = rows else {
         return Err(ApiError::not_found("agent 不存在"));
     };
-    let response = build_series_response(bucket_ms, rows).map_err(ApiError::bad_request)?;
+    let response = build_series_response(bucket_ms, tier, rows).map_err(ApiError::bad_request)?;
     Ok(Json(response))
 }
 
@@ -2562,7 +2575,10 @@ struct ParsedSeriesQuery {
     metrics: Vec<String>,
     from: i64,
     to: i64,
+    /// 实际生效的桶宽：显式值或自动档位，且不小于所选层的粒度。
     bucket_ms: i64,
+    /// 按跨度选中的数据层。
+    tier: SampleTier,
 }
 
 /// `series` 参数校验与自动 bucket 选择（全部为纯函数，便于单测边界）。
@@ -2609,19 +2625,35 @@ fn parse_series_query(raw: Option<&str>) -> std::result::Result<ParsedSeriesQuer
     }
     let span_ms = to.saturating_sub(from);
     if span_ms > MAX_SERIES_SPAN_MS {
-        return Err("时间跨度不能超过 32 天".to_string());
+        return Err("时间跨度不能超过 730 天".to_string());
     }
 
+    let tier = series_tier_for_span(span_ms);
+    // 显式 bucket 过小时提升到层粒度而不是返回 400：旧面板/客户端的长跨度
+    // 请求仍然可用，响应 `bucket_ms` 回显实际值。自动档位同样夹到层粒度。
+    let tier_granularity = tier.granularity_ms();
     let bucket_ms = match bucket_ms {
-        Some(bucket) => bucket,
-        None => auto_bucket_ms(span_ms),
+        Some(bucket) => bucket.max(tier_granularity),
+        None => auto_bucket_ms(span_ms).max(tier_granularity),
     };
     Ok(ParsedSeriesQuery {
         metrics,
         from,
         to,
         bucket_ms,
+        tier,
     })
+}
+
+/// 按跨度选层：≤6h raw、≤7d 1m、更长 1h（方案 §5.2）。
+fn series_tier_for_span(span_ms: i64) -> SampleTier {
+    if span_ms <= SERIES_RAW_MAX_SPAN_MS {
+        SampleTier::Raw
+    } else if span_ms <= SERIES_ONE_MINUTE_MAX_SPAN_MS {
+        SampleTier::OneMinute
+    } else {
+        SampleTier::OneHour
+    }
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> std::result::Result<(), String> {
@@ -2652,12 +2684,14 @@ fn auto_bucket_ms(span_ms: i64) -> i64 {
         .iter()
         .copied()
         .find(|bucket| span_ms / bucket < MAX_AUTO_BUCKET_POINTS)
-        .unwrap_or(21_600_000)
+        // 730 天上限内 12h 档位必然命中；取最大档兜底，避免返回 0。
+        .unwrap_or(86_400_000)
 }
 
 /// 把聚合行按 `(metric, labels)` 组装成前端契约；同时兜住序列数与点数上限。
 fn build_series_response(
     bucket_ms: i64,
+    tier: SampleTier,
     rows: Vec<SeriesRow>,
 ) -> std::result::Result<SeriesResponse, String> {
     if rows.len() > MAX_SERIES_POINTS {
@@ -2686,7 +2720,11 @@ fn build_series_response(
             }
         })
         .collect();
-    Ok(SeriesResponse { bucket_ms, series })
+    Ok(SeriesResponse {
+        bucket_ms,
+        tier: tier.as_str().to_string(),
+        series,
+    })
 }
 
 #[derive(Debug)]
@@ -5453,7 +5491,9 @@ mod tests {
             (6 * 3_600_000, 30_000),
             (24 * 3_600_000, 60_000),
             (7 * 24 * 3_600_000, 900_000),
-            (MAX_SERIES_SPAN_MS, 3_600_000),
+            (30 * 24 * 3_600_000, 3_600_000),
+            (365 * 24 * 3_600_000, 21_600_000),
+            (MAX_SERIES_SPAN_MS, 43_200_000),
         ];
         for (span, expected) in cases {
             let bucket = auto_bucket_ms(span);
@@ -5463,15 +5503,18 @@ mod tests {
                 "span={span} 的 bucket={bucket} 单曲线点数超限"
             );
         }
-        // 档位必须单调、且来自方案固定集合。
+        // 730 天（1h 默认保留期）也必须落在 1500 点目标内。
+        assert!(MAX_SERIES_SPAN_MS / auto_bucket_ms(MAX_SERIES_SPAN_MS) < MAX_AUTO_BUCKET_POINTS);
+        // 档位必须单调、且来自方案固定集合（M4-A2b 新增 12h / 24h）。
         for bucket in [
             1_000, 5_000, 10_000, 30_000, 60_000, 300_000, 900_000, 3_600_000, 21_600_000,
+            43_200_000, 86_400_000,
         ] {
             assert!(AUTO_BUCKETS_MS.contains(&bucket));
         }
     }
 
-    /// series 参数边界：多 metric、from/to、32 天、metric 字符集与数量、bucket 校验。
+    /// series 参数边界：多 metric、from/to、730 天、metric 字符集与数量、bucket 校验。
     #[test]
     fn m2_series_query_validation_boundaries() {
         let from = 1_700_000_000_000_i64;
@@ -5482,12 +5525,13 @@ mod tests {
         assert_eq!(parsed.from, from);
         assert_eq!(parsed.to, to);
         assert_eq!(parsed.bucket_ms, auto_bucket_ms(MAX_SERIES_SPAN_MS));
+        assert_eq!(parsed.tier, SampleTier::OneHour);
 
+        // 730 天请求显式 60s：自动提升到 1h 层粒度，不返回 400。
         let explicit = format!("metric=cpu.usage&from={from}&to={to}&bucket_ms=60000");
-        assert_eq!(
-            parse_series_query(Some(&explicit)).unwrap().bucket_ms,
-            60_000
-        );
+        let parsed = parse_series_query(Some(&explicit)).unwrap();
+        assert_eq!(parsed.bucket_ms, 3_600_000);
+        assert_eq!(parsed.tier, SampleTier::OneHour);
 
         // 时间参数。
         assert!(parse_series_query(Some("metric=cpu.usage&from=1&to=1")).is_err());
@@ -5518,6 +5562,181 @@ mod tests {
         assert!(parse_series_query(Some("metric=cpu.usage&from=1&to=3&bogus=1")).is_err());
     }
 
+    /// M4-A2b：跨度边界选层、显式/自动 bucket 夹到层粒度、730 天上限。
+    #[test]
+    fn m4a_series_tier_selection_boundaries() {
+        let from = 1_700_000_000_000_i64;
+        let parse = |span: i64, bucket: Option<i64>| {
+            let mut raw = format!("metric=cpu.usage&from={from}&to={}", from + span);
+            if let Some(bucket) = bucket {
+                raw.push_str(&format!("&bucket_ms={bucket}"));
+            }
+            parse_series_query(Some(&raw))
+        };
+
+        // ≤6h → raw；显式小桶保持原值（raw 层粒度是 1ms）。
+        for span in [1_i64, 60_000, 6 * 3_600_000] {
+            assert_eq!(
+                parse(span, None).unwrap().tier,
+                SampleTier::Raw,
+                "span={span}"
+            );
+        }
+        assert_eq!(parse(6 * 3_600_000, Some(1_000)).unwrap().bucket_ms, 1_000);
+
+        // 6h + 1ms → 1m；1s 被提升到 1m 粒度，60s 保持。
+        let parsed = parse(6 * 3_600_000 + 1, None).unwrap();
+        assert_eq!(parsed.tier, SampleTier::OneMinute);
+        assert_eq!(
+            parse(6 * 3_600_000 + 1, Some(1_000)).unwrap().bucket_ms,
+            60_000
+        );
+        assert_eq!(
+            parse(6 * 3_600_000 + 1, Some(60_000)).unwrap().bucket_ms,
+            60_000
+        );
+
+        // 7d 边界：等于 7d 仍是 1m，+1ms → 1h。
+        let seven_days = 7 * 24 * 3_600_000;
+        assert_eq!(parse(seven_days, None).unwrap().tier, SampleTier::OneMinute);
+        assert_eq!(
+            parse(seven_days + 1, None).unwrap().tier,
+            SampleTier::OneHour
+        );
+
+        // 30 天查询显式 60s：提升到 1h 层粒度，响应回显实际值；显式大桶保留。
+        let parsed = parse(30 * 24 * 3_600_000, Some(60_000)).unwrap();
+        assert_eq!(parsed.tier, SampleTier::OneHour);
+        assert_eq!(parsed.bucket_ms, 3_600_000);
+        assert_eq!(
+            parse(30 * 24 * 3_600_000, Some(86_400_000))
+                .unwrap()
+                .bucket_ms,
+            86_400_000
+        );
+
+        // 730 天边界：允许且自动落到 12h 档（< 1500 点）；+1ms 必须拒绝。
+        let parsed = parse(MAX_SERIES_SPAN_MS, None).unwrap();
+        assert_eq!(parsed.tier, SampleTier::OneHour);
+        assert_eq!(parsed.bucket_ms, 43_200_000);
+        let err = match parse(MAX_SERIES_SPAN_MS + 1, None) {
+            Ok(_) => panic!("超过 730 天必须被拒绝"),
+            Err(err) => err,
+        };
+        assert!(err.contains("730"), "错误信息必须说明 730 天上限: {err}");
+    }
+
+    /// M4-A2b：30 天查询选 1h 层；响应 JSON 含 tier 且 bucket_ms 是实际值。
+    #[tokio::test]
+    async fn m4a_series_route_reports_tier_and_effective_bucket() {
+        let state = hub_state("token");
+        state.storage.upsert_agent(&test_agent("agent-1")).unwrap();
+        let router = admin_router(state.clone());
+
+        // 30 天前的一个点：先写 raw，再用真实降采样生成 1m / 1h，避免依赖私有 helper。
+        let to = 1_700_000_000_000_i64;
+        let from = to - 30 * 24 * 3_600_000;
+        let sample_ts = from + 1_000;
+        state
+            .storage
+            .insert_batch(&SampleBatch {
+                agent_id: "agent-1".to_string(),
+                epoch: 1,
+                seq: 0,
+                boot_id: "boot".to_string(),
+                sent_at: sample_ts,
+                samples: vec![Sample::new("cpu.usage", sample_ts, 42.0)],
+            })
+            .unwrap();
+        state
+            .storage
+            .downsample_1m_range(from, from + 3_600_000)
+            .unwrap();
+        state
+            .storage
+            .downsample_1h_range(from, from + 3_600_000)
+            .unwrap();
+        assert_eq!(state.storage.samples_1h_stats().unwrap().rows, 1);
+
+        let uri = format!(
+            "/api/v1/agents/agent-1/series?metric=cpu.usage&from={from}&to={to}&bucket_ms=60000"
+        );
+        let (status, _, body) = admin_call(&router, "GET", &uri, Some("token"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = json_body(&body);
+        assert_eq!(body["tier"], "1h");
+        assert_eq!(body["bucket_ms"], 3_600_000, "显式 60s 必须回显实际 1h");
+        assert_eq!(body["series"][0]["metric"], "cpu.usage");
+        assert_eq!(body["series"][0]["points"][0][1], 42.0);
+
+        // 超过 730 天：400，并说明上限。
+        let too_wide = format!(
+            "/api/v1/agents/agent-1/series?metric=cpu.usage&from={from}&to={}",
+            from + MAX_SERIES_SPAN_MS + 1
+        );
+        let (status, _, body) = admin_call(&router, "GET", &too_wide, Some("token"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let body = json_body(&body);
+        assert_eq!(body["error"], "bad_request");
+        assert!(
+            body["message"].as_str().unwrap_or_default().contains("730"),
+            "错误信息必须说明 730 天上限: {body}"
+        );
+    }
+
+    /// M4-A2b：8 天查询选 1h 层，且路由必须真的从 1h 表取数。
+    ///
+    /// 生成 1h 桶后删除 raw / 1m，只留 1h；若 `agent_series` 传错 tier（查
+    /// raw 或 1m），响应会变空——只校验 `tier` 回显无法发现这种错误。
+    #[tokio::test]
+    async fn m4a_series_route_reads_1h_tier() {
+        let state = hub_state("token");
+        state.storage.upsert_agent(&test_agent("agent-1")).unwrap();
+        let router = admin_router(state.clone());
+
+        let to = 1_700_000_000_000_i64;
+        let from = to - 8 * 24 * 3_600_000;
+        let sample_ts = from + 1_000;
+        state
+            .storage
+            .insert_batch(&SampleBatch {
+                agent_id: "agent-1".to_string(),
+                epoch: 1,
+                seq: 0,
+                boot_id: "boot".to_string(),
+                sent_at: sample_ts,
+                samples: vec![Sample::new("cpu.usage", sample_ts, 42.0)],
+            })
+            .unwrap();
+        state
+            .storage
+            .downsample_1m_range(from, from + 3_600_000)
+            .unwrap();
+        state
+            .storage
+            .downsample_1h_range(from, from + 3_600_000)
+            .unwrap();
+        state.storage.prune_samples_before(i64::MAX).unwrap();
+        state.storage.prune_samples_1m_before(i64::MAX).unwrap();
+        assert_eq!(state.storage.raw_stats().unwrap().rows, 0);
+        assert_eq!(state.storage.samples_1m_stats().unwrap().rows, 0);
+        assert_eq!(state.storage.samples_1h_stats().unwrap().rows, 1);
+
+        let uri = format!(
+            "/api/v1/agents/agent-1/series?metric=cpu.usage&from={from}&to={to}&bucket_ms=60000"
+        );
+        let (status, _, body) = admin_call(&router, "GET", &uri, Some("token"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = json_body(&body);
+        assert_eq!(body["tier"], "1h");
+        assert_eq!(body["bucket_ms"], 3_600_000, "8 天查询的 60s 必须提升到 1h");
+        assert_eq!(body["series"][0]["metric"], "cpu.usage");
+        assert_eq!(body["series"][0]["points"].as_array().unwrap().len(), 1);
+        let expected_ts = sample_ts.div_euclid(3_600_000) * 3_600_000;
+        assert_eq!(body["series"][0]["points"][0][0], expected_ts);
+        assert_eq!(body["series"][0]["points"][0][1], 42.0);
+    }
+
     /// 单次响应的点数 / 序列数上限：超限必须返回 400（这里验证纯函数返回错误）。
     #[test]
     fn m2_series_response_limits() {
@@ -5531,15 +5750,16 @@ mod tests {
         let too_many_points: Vec<SeriesRow> = (0..=MAX_SERIES_POINTS)
             .map(|i| row("cpu.usage".to_string(), Labels::new(), i as i64))
             .collect();
-        assert!(build_series_response(1_000, too_many_points).is_err());
+        assert!(build_series_response(1_000, SampleTier::Raw, too_many_points).is_err());
 
         let too_many_series: Vec<SeriesRow> = (0..=MAX_SERIES_COUNT)
             .map(|i| row(format!("m{i}"), Labels::new(), 1))
             .collect();
-        assert!(build_series_response(1_000, too_many_series).is_err());
+        assert!(build_series_response(1_000, SampleTier::Raw, too_many_series).is_err());
 
         let response = build_series_response(
             1_000,
+            SampleTier::Raw,
             vec![
                 row("cpu.usage".to_string(), Labels::new(), 2_000),
                 row("cpu.usage".to_string(), Labels::new(), 1_000),
@@ -5547,6 +5767,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.bucket_ms, 1_000);
+        assert_eq!(response.tier, "raw");
         assert_eq!(response.series.len(), 1);
         assert_eq!(
             response.series[0].points,
@@ -5554,6 +5775,8 @@ mod tests {
             "点必须按 ts 升序"
         );
         let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["bucket_ms"], 1_000);
+        assert_eq!(json["tier"], "raw");
         assert_eq!(json["series"][0]["points"][0][0], 1_000);
         assert_eq!(json["series"][0]["labels"], serde_json::json!({}));
     }
@@ -5835,6 +6058,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let body = json_body(&body);
         assert_eq!(body["bucket_ms"], 5_000);
+        assert_eq!(body["tier"], "raw");
         assert!(body["series"].is_array());
 
         let uri = format!(
@@ -5843,6 +6067,7 @@ mod tests {
         let (status, _, body) = admin_call(&router, "GET", &uri, Some("token"), None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json_body(&body)["bucket_ms"], 60_000);
+        assert_eq!(json_body(&body)["tier"], "raw");
 
         // 非法 series 参数统一 400 JSON。
         let invalid = [

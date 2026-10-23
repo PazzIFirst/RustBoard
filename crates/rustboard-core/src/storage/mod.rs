@@ -60,6 +60,39 @@ pub const BUCKET_1M_MS: i64 = 60_000;
 /// 1h 聚合桶宽度（毫秒）：按 UTC 对齐的整点小时。
 pub const BUCKET_1H_MS: i64 = 3_600_000;
 
+/// 查询选中的数据层（M4-A2b）。
+///
+/// 上层的选层规则见方案 §5.2：短跨度查 raw，中跨度查 1m，长跨度查 1h。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleTier {
+    /// 原始采样表 `samples`。
+    Raw,
+    /// 分钟聚合表 `samples_1m`。
+    OneMinute,
+    /// 小时聚合表 `samples_1h`。
+    OneHour,
+}
+
+impl SampleTier {
+    /// 对外 API 与日志里的层标识：`"raw"` / `"1m"` / `"1h"`。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SampleTier::Raw => "raw",
+            SampleTier::OneMinute => "1m",
+            SampleTier::OneHour => "1h",
+        }
+    }
+
+    /// 该层聚合桶的宽度（毫秒）：raw 为 1，1m 为 60_000，1h 为 3_600_000。
+    pub fn granularity_ms(self) -> i64 {
+        match self {
+            SampleTier::Raw => 1,
+            SampleTier::OneMinute => BUCKET_1M_MS,
+            SampleTier::OneHour => BUCKET_1H_MS,
+        }
+    }
+}
+
 /// 单次降采样聚合的结果。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct DownsampleRangeResult {
@@ -217,6 +250,23 @@ pub trait Storage: Send + Sync {
     /// 返回点的 `ts` 是桶起点；空桶不补点。`query.limit` 在聚合后生效，
     /// 供上层用「多取一条」的方式判断点数是否超限。
     fn query_series_bucketed(&self, query: &SeriesQuery, bucket_ms: i64) -> Result<Vec<SeriesRow>>;
+
+    /// 按指定数据层做时间桶聚合查询（M4-A2b 查询选层）。
+    ///
+    /// - [`SampleTier::Raw`]：与 [`Storage::query_series_bucketed`] 行为一致；
+    /// - [`SampleTier::OneMinute`] / [`SampleTier::OneHour`]：从降采样表读取，
+    ///   `value` 按桶内原始样本数加权平均（`SUM(avg_value*count)/SUM(count)`），
+    ///   不是各层均值的简单平均；
+    /// - 只要聚合桶与 `[from, to]` 有重叠就纳入（`bucket_ts + 层粒度 > from`
+    ///   且 `bucket_ts <= to`），返回桶起点；
+    /// - 调用方应保证 `bucket_ms >= tier.granularity_ms()`，否则桶会比该层
+    ///   粒度还细；`limit` 在聚合后生效。
+    fn query_series_tiered(
+        &self,
+        query: &SeriesQuery,
+        bucket_ms: i64,
+        tier: SampleTier,
+    ) -> Result<Vec<SeriesRow>>;
 
     /// 取 `since` 之后、指定指标（空表示全部）的最新点。
     ///
