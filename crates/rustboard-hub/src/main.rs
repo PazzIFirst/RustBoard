@@ -66,7 +66,7 @@ mod control;
 mod notify;
 mod notify_worker;
 mod session;
-use auth::{AuthFailureLimiter, TokenScope};
+use auth::{AuthFailureLimiter, AuthPrincipal, TokenScope};
 use cert_rotation::CertStatus;
 use control::{ControlCommand, ControlSession};
 use session::{SessionRegistry, ShutdownReason, UnregisterOutcome};
@@ -424,6 +424,11 @@ struct AppState {
     /// 客户端拿到响应头后不读 body 时，后台定时任务在到期后释放对象内存与
     /// 下载许可，避免唯一 permit 被永久占用。测试可注入更短的值。
     archive_download_send_timeout: Duration,
+    /// 每个认证主体的下载槽（1 permit）。
+    ///
+    /// 同一 principal 同时最多一个请求持有 / 等待全局 permit；第二个请求立即
+    /// 429，避免单客户端用多条连接排队。map 容量有上限，满了先清理空闲槽。
+    archive_download_principal_slots: Arc<StdMutex<HashMap<String, Arc<Semaphore>>>>,
 }
 
 /// 由 TLS accept 层注入到每个请求扩展里的对端身份。
@@ -1338,6 +1343,7 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
             notifier: notifier.clone(),
             archive_download_slots: Arc::new(Semaphore::new(1)),
             archive_download_send_timeout: ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
+            archive_download_principal_slots: Arc::new(StdMutex::new(HashMap::new())),
         };
 
         spawn_revoke_watcher(storage.clone(), sessions);
@@ -1953,6 +1959,11 @@ const MAX_ARCHIVE_OBJECT_LIMIT: usize = 100;
 /// 足以打爆内存。这里把“单请求内存”夹到 64 MiB，并配合 AppState 的 1 permit
 /// 信号量限制并发；超过上限直接 413，不读 body。
 const MAX_ARCHIVE_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
+/// 归档下载主体槽上限。
+///
+/// 认证主体数量本身有限，但仍设硬上限防止异常 token 名称撑大内存；达到上限时
+/// 先清理“无人持有 / 无人等待”的空闲槽，仍满则按忙碌拒绝。
+const MAX_ARCHIVE_DOWNLOAD_PRINCIPALS: usize = 1024;
 /// 归档下载响应 body 的发送期限（方案 §7.4 下载防 DoS）。
 ///
 /// 客户端拿到响应头后不读 body 时，后台任务到期释放对象内存与下载许可；
@@ -2117,9 +2128,16 @@ fn parse_archive_object_id(raw: &str) -> Result<i64, ApiError> {
 /// 凭据 / 响应正文。整个读取过程持有一个下载许可，最多并发一份对象内存。
 async fn archive_object_download(
     State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
     Path(raw_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let id = parse_archive_object_id(&raw_id)?;
+
+    // 先占主体槽（同一主体最多一个请求持有 / 等待），再做数据库与后端工作：
+    // 同一主体第二个请求立即 429，不能靠多条连接在数据库 / 全局 permit 前排队。
+    let principal_slot =
+        acquire_archive_principal_slot(&state.archive_download_principal_slots, &principal.name)?;
+
     let storage = state.storage.clone();
     let object = tokio::task::spawn_blocking(move || storage.get_archive_object(id))
         .await
@@ -2136,29 +2154,61 @@ async fn archive_object_download(
         ));
     }
 
-    // 单并发且不排队：get 必须整对象读入内存，峰值由 64 MiB 上限 + 1 个许可
-    // 共同约束。`try_acquire_owned` 不创建等待队列，忙时立即 429，避免单个
-    // 客户端用多条连接排队占满 permit、饿死其他客户端；许可随后移入响应 body。
-    let download_permit = state
+    // 主体槽拿到后再按 Tokio FIFO 等待全局 permit，不同主体之间公平轮转；
+    // 等待全局 permit 时请求被取消，主体槽随 future drop 释放，不会留下占位。
+    let global_slot = state
         .archive_download_slots
         .clone()
-        .try_acquire_owned()
-        .map_err(|_| archive_busy())?;
+        .acquire_owned()
+        .await
+        .map_err(|_| archive_unavailable())?;
+    let permits = ArchiveDownloadPermits {
+        _principal: principal_slot,
+        _global: global_slot,
+    };
 
     let store = archive::build_store(&state.cfg.archive).map_err(|_| archive_unavailable())?;
     archive_download_response(
         &state.cfg,
         &object,
         store.as_ref(),
-        download_permit,
+        permits,
         state.archive_download_send_timeout,
     )
     .await
 }
 
-/// 固定 429：已有归档下载占用唯一许可；不排队，立即让客户端重试。
+/// 固定 429：已有同一主体的归档下载，或主体槽已达上限；不排队，立即重试。
 fn archive_busy() -> ApiError {
     ApiError::busy("archive_busy", "归档下载正忙，请稍后重试")
+}
+
+/// 取得某个认证主体的下载槽；同一主体已有请求时立即 429。
+fn acquire_archive_principal_slot(
+    slots: &StdMutex<HashMap<String, Arc<Semaphore>>>,
+    principal: &str,
+) -> Result<OwnedSemaphorePermit, ApiError> {
+    let semaphore = {
+        let mut slots = slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slots.len() >= MAX_ARCHIVE_DOWNLOAD_PRINCIPALS {
+            // 只清理“map 外无引用且许可可用”的槽；还有请求持有 / 等待时保留。
+            slots.retain(|_, semaphore| {
+                semaphore.available_permits() == 0 || Arc::strong_count(semaphore) > 1
+            });
+            if slots.len() >= MAX_ARCHIVE_DOWNLOAD_PRINCIPALS {
+                return Err(archive_busy());
+            }
+        }
+        Arc::clone(
+            slots
+                .entry(principal.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(1))),
+        )
+    };
+    // 主体槽不排队：同一主体的第二个请求立即 429。
+    semaphore.try_acquire_owned().map_err(|_| archive_busy())
 }
 
 /// 固定 502：下载后端不可用；不携带后端细节。
@@ -2184,24 +2234,24 @@ async fn archive_download_response(
     cfg: &HubConfig,
     object: &ArchiveObject,
     store: &dyn ColdStore,
-    permit: OwnedSemaphorePermit,
+    permits: ArchiveDownloadPermits,
     send_timeout: Duration,
 ) -> Result<Response, ApiError> {
     let limit = cfg.archive.max_object_bytes.min(MAX_ARCHIVE_DOWNLOAD_BYTES);
-    archive_download_response_with_limit(object, store, limit, permit, send_timeout).await
+    archive_download_response_with_limit(object, store, limit, permits, send_timeout).await
 }
 
 /// 带可调上限 / 发送期限的下载响应实现；生产上限固定为
 /// `min(archive.max_object_bytes, 64 MiB)`，发送期限固定
 /// [`ARCHIVE_DOWNLOAD_SEND_TIMEOUT`]，测试用小值覆盖边界。
 ///
-/// 成功时把 `permit` 移入 [`ArchiveDownloadBody`]，由 body 的生命周期持有；
-/// 任何错误返回都会在这里 drop permit，不会泄漏。
+/// 成功时把主体槽与全局 permit 移入 [`ArchiveDownloadBody`]，由 body 生命周期
+/// 持有；任何错误返回都会在这里 drop，不会泄漏。
 async fn archive_download_response_with_limit(
     object: &ArchiveObject,
     store: &dyn ColdStore,
     limit: u64,
-    permit: OwnedSemaphorePermit,
+    permits: ArchiveDownloadPermits,
     send_timeout: Duration,
 ) -> Result<Response, ApiError> {
     // 先看数据库记录：超限完全不触碰后端，避免把异常对象读进内存。
@@ -2237,7 +2287,7 @@ async fn archive_download_response_with_limit(
         .map_err(|_| archive_unavailable())?;
     let length =
         HeaderValue::from_str(&data.len().to_string()).map_err(|_| archive_unavailable())?;
-    let body = ArchiveDownloadBody::new(Bytes::from(data), permit, send_timeout);
+    let body = ArchiveDownloadBody::new(Bytes::from(data), permits, send_timeout);
     let mut response = Response::new(Body::new(body));
     *response.status_mut() = StatusCode::OK;
     let headers = response.headers_mut();
@@ -2263,6 +2313,15 @@ const ARCHIVE_DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
 /// body 被发送期限中止后，后续 poll 返回的固定错误。
 const ARCHIVE_DOWNLOAD_TIMEOUT_ERROR: &str = "归档下载发送超时";
 
+/// 下载持有的两层许可：认证主体槽 + 全局 FIFO 槽。
+///
+/// 字段只用于 Drop 释放，故以下划线开头；body 同时持有两者，释放顺序由
+/// [`release_archive_download_resources`] 保证 data 先于 permits。
+struct ArchiveDownloadPermits {
+    _principal: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
+}
+
 /// body 与后台定时任务共享的状态。
 struct DownloadBodyState {
     /// 待发送对象；期限到期 / body drop 后置空并释放 64 MiB。
@@ -2270,42 +2329,45 @@ struct DownloadBodyState {
     offset: usize,
     /// 期限到期标志；后续 poll 返回固定错误。
     expired: bool,
-    /// 下载许可；期限到期 / body drop 时释放。
-    permit: Option<OwnedSemaphorePermit>,
+    /// 下载许可（主体槽 + 全局槽）；期限到期 / body drop 时释放。
+    permits: Option<ArchiveDownloadPermits>,
 }
 
 /// 持有下载许可与发送期限的归档响应 body。
 ///
 /// `ColdStore::get` 返回完整 `Vec<u8>`，转换为 `Bytes` 后由共享状态持有；
-/// 后台定时任务到期会清空 data 并释放 permit（即使客户端完全不读 body）。
-/// body 被 drop 时 abort 定时任务，并立即释放 data / permit。
+/// 后台定时任务到期会清空 data 并释放两层许可（即使客户端完全不读 body）。
+/// body 被 drop 时 abort 定时任务，并立即释放 data / permits。
 struct ArchiveDownloadBody {
     state: Arc<StdMutex<DownloadBodyState>>,
     deadline: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// 释放下载资源：**顺序固定先 data 后 permit**。
+/// 释放下载资源：**顺序固定先 data 后 permits**。
 ///
-/// 若先归还 permit，下一请求可能在旧 64 MiB `Bytes` 真正释放前获得许可，
+/// 若先归还许可，下一请求可能在旧 64 MiB `Bytes` 真正释放前获得许可，
 /// 使内存峰值变成 2×64 MiB。定时任务与 body drop 都必须走这里。
-fn release_archive_download_resources(data: Option<Bytes>, permit: Option<OwnedSemaphorePermit>) {
-    // 顺序不能交换：data 的析构必须在 permit 归还之前完成。
+fn release_archive_download_resources(
+    data: Option<Bytes>,
+    permits: Option<ArchiveDownloadPermits>,
+) {
+    // 顺序不能交换：data 的析构必须在许可归还之前完成。
     drop(data);
-    drop(permit);
+    drop(permits);
 }
 
 impl ArchiveDownloadBody {
-    fn new(data: Bytes, permit: OwnedSemaphorePermit, timeout: Duration) -> Self {
+    fn new(data: Bytes, permits: ArchiveDownloadPermits, timeout: Duration) -> Self {
         let state = Arc::new(StdMutex::new(DownloadBodyState {
             data: Some(data),
             offset: 0,
             expired: false,
-            permit: Some(permit),
+            permits: Some(permits),
         }));
         let timer_state = Arc::clone(&state);
         let deadline = tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
-            let (data, permit) = {
+            let (data, permits) = {
                 let mut state = timer_state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2313,10 +2375,10 @@ impl ArchiveDownloadBody {
                     return;
                 }
                 state.expired = true;
-                (state.data.take(), state.permit.take())
+                (state.data.take(), state.permits.take())
             };
-            // 与 body drop 使用同一释放顺序：先 64 MiB 数据，再 permit。
-            release_archive_download_resources(data, permit);
+            // 与 body drop 使用同一释放顺序：先 64 MiB 数据，再两层许可。
+            release_archive_download_resources(data, permits);
             tracing::warn!(
                 timeout_ms = timeout.as_millis() as u64,
                 "归档下载发送超时，已释放对象内存与下载许可"
@@ -2328,7 +2390,7 @@ impl ArchiveDownloadBody {
         }
     }
 
-    /// 测试用：观察 data / permit / expired 状态。
+    /// 测试用：观察 data / permits / expired 状态。
     #[cfg(test)]
     fn shared_state(&self) -> Arc<StdMutex<DownloadBodyState>> {
         Arc::clone(&self.state)
@@ -2341,15 +2403,15 @@ impl Drop for ArchiveDownloadBody {
         if let Some(deadline) = self.deadline.take() {
             deadline.abort();
         }
-        let (data, permit) = {
+        let (data, permits) = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (state.data.take(), state.permit.take())
+            (state.data.take(), state.permits.take())
         };
-        // 与定时任务一致：先释放对象数据，再归还 permit。
-        release_archive_download_resources(data, permit);
+        // 与定时任务一致：先释放对象数据，再归还两层许可。
+        release_archive_download_resources(data, permits);
     }
 }
 
@@ -5698,6 +5760,7 @@ mod tests {
             notifier: Arc::new(crate::notify::MockNotifier::new()),
             archive_download_slots: Arc::new(Semaphore::new(1)),
             archive_download_send_timeout: ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
+            archive_download_principal_slots: Arc::new(StdMutex::new(HashMap::new())),
         };
         let token = "enroll-token-bad-csr";
         let now = now_ms();
@@ -5759,6 +5822,7 @@ mod tests {
             notifier: Arc::new(crate::notify::MockNotifier::new()),
             archive_download_slots: Arc::new(Semaphore::new(1)),
             archive_download_send_timeout: ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
+            archive_download_principal_slots: Arc::new(StdMutex::new(HashMap::new())),
         };
 
         let token = "enroll-token-value";
@@ -6057,6 +6121,7 @@ mod tests {
             notifier: Arc::new(crate::notify::MockNotifier::new()),
             archive_download_slots: Arc::new(Semaphore::new(1)),
             archive_download_send_timeout: ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
+            archive_download_principal_slots: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -10260,6 +10325,45 @@ mod tests {
             .expect("新建信号量必有 1 个许可")
     }
 
+    /// 主体槽 + 全局槽各拿一个测试许可。
+    fn download_permits() -> ArchiveDownloadPermits {
+        ArchiveDownloadPermits {
+            _principal: download_permit(),
+            _global: download_permit(),
+        }
+    }
+
+    /// M4-C4：主体槽 map 有上限；达到上限时清理无人持用的空闲槽。
+    #[test]
+    fn principal_slot_map_is_bounded_and_prunes_idle_entries() {
+        let mut slots = HashMap::new();
+        for index in 0..MAX_ARCHIVE_DOWNLOAD_PRINCIPALS {
+            slots.insert(format!("p{index}"), Arc::new(Semaphore::new(1)));
+        }
+        let slots = StdMutex::new(slots);
+        let permit = acquire_archive_principal_slot(&slots, "new-principal")
+            .expect("空闲槽应被清理后容纳新主体");
+        {
+            let slots = slots.lock().unwrap();
+            assert_eq!(slots.len(), 1, "空闲槽必须被清理");
+            assert_eq!(
+                slots.get("new-principal").unwrap().available_permits(),
+                0,
+                "新主体槽必须已被占用"
+            );
+        }
+        drop(permit);
+        assert_eq!(
+            slots
+                .lock()
+                .unwrap()
+                .get("new-principal")
+                .unwrap()
+                .available_permits(),
+            1
+        );
+    }
+
     /// M4-C2b：对象列表按 id 倒序分页；error 只透传固定错误码，不泄露 URL。
     #[tokio::test]
     async fn m4c2b_archive_objects_list_paginates_and_sanitizes() {
@@ -10456,7 +10560,7 @@ mod tests {
         );
     }
 
-    /// M4-C4：不排队；permit 被占用时立即 429，释放后恢复，错误路径不泄漏。
+    /// M4-C4：同一主体已有请求时立即 429；释放后恢复，错误路径不泄漏。
     #[tokio::test]
     async fn m4c4_archive_download_busy_returns_429_without_queueing() {
         let state = v6_auth_state();
@@ -10470,14 +10574,19 @@ mod tests {
         let uri = format!("/api/v1/archive/objects/{id}/download");
         let router = admin_router(state.clone());
 
-        let held = state
-            .archive_download_slots
-            .clone()
-            .try_acquire_owned()
-            .unwrap();
-        assert_eq!(state.archive_download_slots.available_permits(), 0);
+        // 手工占用该主体的下载槽，模拟已有请求持有 / 等待全局 permit。
+        let principal_semaphore = Arc::new(Semaphore::new(1));
+        let held = principal_semaphore.clone().try_acquire_owned().unwrap();
+        state
+            .archive_download_principal_slots
+            .lock()
+            .unwrap()
+            .insert(
+                "archive-dl-busy".to_string(),
+                Arc::clone(&principal_semaphore),
+            );
 
-        // 忙时立即 429，不进入等待队列。
+        // 同一主体第二个请求立即 429，不进入等待队列。
         let (status, headers, body) = admin_call(&router, "GET", &uri, Some(&read), None).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
@@ -10486,19 +10595,24 @@ mod tests {
             "429 必须带 Retry-After: 1"
         );
         assert_eq!(json_body(&body)["error"], "archive_busy");
-        assert_eq!(state.archive_download_slots.available_permits(), 0);
+        assert_eq!(principal_semaphore.available_permits(), 0);
 
         drop(held);
-        assert_eq!(state.archive_download_slots.available_permits(), 1);
+        assert_eq!(principal_semaphore.available_permits(), 1);
 
-        // 该测试没有配置后端：拿到许可后返回固定 502，且许可归还。
+        // 该测试没有配置后端：拿到主体槽与全局槽后返回固定 502，且许可归还。
         let (status, _, body) = admin_call(&router, "GET", &uri, Some(&read), None).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(json_body(&body)["error"], "archive_unavailable");
         assert_eq!(
+            principal_semaphore.available_permits(),
+            1,
+            "错误路径不得泄漏主体槽"
+        );
+        assert_eq!(
             state.archive_download_slots.available_permits(),
             1,
-            "错误路径不得泄漏许可"
+            "错误路径不得泄漏全局槽"
         );
     }
 
@@ -10571,33 +10685,147 @@ mod tests {
         assert_eq!(state.archive_download_slots.available_permits(), 1);
     }
 
-    /// M4-C4：不读 body 时后台定时任务必须清空数据并归还许可，后续 poll 报错。
+    /// M4-C4：不同 principal 公平排队；同一 principal 32 连接只能全部 429。
+    #[tokio::test]
+    async fn m4c4_archive_download_per_principal_fairness() {
+        use crate::archive_webdav::test_support::MockDav;
+
+        let mock = MockDav::spawn().await;
+        let mut cfg = HubConfig::default();
+        cfg.archive.backend = rustboard_common::config::ArchiveBackend::Webdav;
+        cfg.archive.webdav = Some(mock.config());
+        // 发送期限保持默认 120s：本测试只验证排队，不依赖超时。
+        let state = hub_state_with(cfg);
+        let alice = v6_seed_token(&state, "alice", "read");
+        let bob = v6_seed_token(&state, "bob", "read");
+        let router = admin_router(state.clone());
+
+        let key = "rustboard/2026/10/24/part-00001.csv.gz";
+        let data = vec![0x1f_u8; 128 * 1024];
+        mock.inner
+            .lock()
+            .unwrap()
+            .objects
+            .insert(key.to_string(), data.clone());
+        let mut object = archive_object_record(key, ArchiveStatus::Uploaded, "");
+        object.bytes = data.len() as u64;
+        object.sha256 = sha256_hex(&data);
+        let id = state.storage.insert_archive_object(&object).unwrap();
+        let uri = format!("/api/v1/archive/objects/{id}/download");
+
+        // Alice 持有一个未读完的 body（主体槽 + 全局槽都在 body 里）。
+        let alice_first = admin_response(&router, "GET", &uri, &alice).await;
+        assert_eq!(alice_first.status(), StatusCode::OK);
+        assert_eq!(state.archive_download_slots.available_permits(), 0);
+
+        // Bob 拿到自己的主体槽，然后按 FIFO 等待全局 permit。
+        let bob_waiter = {
+            let router = router.clone();
+            let bob = bob.clone();
+            let uri = uri.clone();
+            tokio::spawn(async move { admin_call(&router, "GET", &uri, Some(&bob), None).await })
+        };
+        let mut bob_waiter = bob_waiter;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut bob_waiter)
+                .await
+                .is_err(),
+            "Alice 持有时 Bob 必须等待全局 permit"
+        );
+
+        // Alice 再用 32 条连接抢：全部在主体槽处立即 429，不能插到 Bob 前面。
+        let mut alice_burst = Vec::new();
+        for _ in 0..32 {
+            let router = router.clone();
+            let alice = alice.clone();
+            let uri = uri.clone();
+            alice_burst.push(tokio::spawn(async move {
+                admin_call(&router, "GET", &uri, Some(&alice), None).await
+            }));
+        }
+        for task in alice_burst {
+            let (status, _, body) = task.await.unwrap();
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(json_body(&body)["error"], "archive_busy");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut bob_waiter)
+                .await
+                .is_err(),
+            "Alice 的 32 条连接不得插队，Bob 仍在等待"
+        );
+
+        // Alice 的 body drop 后，Bob 按 FIFO 获得全局 permit 并成功。
+        drop(alice_first);
+        let (status, _, body) = bob_waiter.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, data);
+        assert_eq!(state.archive_download_slots.available_permits(), 1);
+
+        // 取消排队等待：Bob 的等待 future 被 abort 后主体槽立即释放，
+        // 下一次 Bob 请求仍可在 Alice 结束后成功。
+        let alice_second = admin_response(&router, "GET", &uri, &alice).await;
+        assert_eq!(alice_second.status(), StatusCode::OK);
+        let bob_cancelled = {
+            let router = router.clone();
+            let bob = bob.clone();
+            let uri = uri.clone();
+            tokio::spawn(async move { admin_call(&router, "GET", &uri, Some(&bob), None).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        bob_cancelled.abort();
+        let _ = bob_cancelled.await;
+        let bob_slot = state
+            .archive_download_principal_slots
+            .lock()
+            .unwrap()
+            .get("bob")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            bob_slot.available_permits(),
+            1,
+            "取消等待必须释放 Bob 的主体槽"
+        );
+        drop(alice_second);
+        let (status, _, body) = admin_call(&router, "GET", &uri, Some(&bob), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, data);
+    }
+
+    /// M4-C4：不读 body 时后台定时任务必须清空数据并归还两层许可，后续 poll 报错。
     #[tokio::test]
     async fn m4c4_archive_download_body_timeout_releases_memory_and_permit() {
-        let semaphore = Arc::new(Semaphore::new(1));
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let principal = Arc::new(Semaphore::new(1));
+        let global = Arc::new(Semaphore::new(1));
+        let permits = ArchiveDownloadPermits {
+            _principal: principal.clone().try_acquire_owned().unwrap(),
+            _global: global.clone().try_acquire_owned().unwrap(),
+        };
         let mut body = Box::pin(ArchiveDownloadBody::new(
             Bytes::from(vec![7_u8; 1024]),
-            permit,
+            permits,
             Duration::from_millis(50),
         ));
         let state = body.shared_state();
         {
             let state = state.lock().unwrap();
             assert!(state.data.is_some());
-            assert!(state.permit.is_some());
+            assert!(state.permits.is_some());
             assert!(!state.expired);
         }
-        assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(principal.available_permits(), 0);
+        assert_eq!(global.available_permits(), 0);
 
         tokio::time::sleep(Duration::from_millis(150)).await;
         {
             let state = state.lock().unwrap();
             assert!(state.expired, "超时后 body 应标记为过期");
             assert!(state.data.is_none(), "超时必须释放对象数据");
-            assert!(state.permit.is_none(), "超时必须移出许可");
+            assert!(state.permits.is_none(), "超时必须移出两层许可");
         }
-        assert_eq!(semaphore.available_permits(), 1, "超时必须归还许可");
+        assert_eq!(principal.available_permits(), 1, "超时必须归还主体槽");
+        assert_eq!(global.available_permits(), 1, "超时必须归还全局槽");
 
         let frame = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await;
         match frame {
@@ -10611,29 +10839,38 @@ mod tests {
         }
     }
 
-    /// M4-C4：body 在期限前 drop 时必须 abort 定时任务并立即归还许可。
+    /// M4-C4：body 在期限前 drop 时必须 abort 定时任务并立即归还两层许可。
     #[tokio::test]
     async fn m4c4_archive_download_body_drop_cancels_timeout() {
-        let semaphore = Arc::new(Semaphore::new(1));
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let principal = Arc::new(Semaphore::new(1));
+        let global = Arc::new(Semaphore::new(1));
+        let permits = ArchiveDownloadPermits {
+            _principal: principal.clone().try_acquire_owned().unwrap(),
+            _global: global.clone().try_acquire_owned().unwrap(),
+        };
         let body = ArchiveDownloadBody::new(
             Bytes::from(vec![0_u8; 128]),
-            permit,
+            permits,
             Duration::from_millis(200),
         );
         let state = body.shared_state();
         drop(body);
         assert_eq!(
-            semaphore.available_permits(),
+            principal.available_permits(),
             1,
-            "drop body 必须立即归还许可"
+            "drop body 必须立即归还主体槽"
+        );
+        assert_eq!(
+            global.available_permits(),
+            1,
+            "drop body 必须立即归还全局槽"
         );
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         let state = state.lock().unwrap();
         assert!(!state.expired, "body drop 后定时任务不得再触发");
         assert!(state.data.is_none());
-        assert!(state.permit.is_none());
+        assert!(state.permits.is_none());
     }
 
     /// M4-C4：已认证客户端不读 body 时，期限到期后下一次下载必须能成功。
@@ -10803,7 +11040,7 @@ mod tests {
             &cfg,
             &object,
             &store,
-            download_permit(),
+            download_permits(),
             ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
         )
         .await
@@ -10824,7 +11061,7 @@ mod tests {
             &cfg,
             &oversized,
             &store,
-            download_permit(),
+            download_permits(),
             ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
         )
         .await
@@ -10850,7 +11087,7 @@ mod tests {
             &small_record,
             &head_store,
             16,
-            download_permit(),
+            download_permits(),
             ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
         )
         .await
@@ -10879,7 +11116,7 @@ mod tests {
             &short_record,
             &store,
             1024,
-            download_permit(),
+            download_permits(),
             ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
         )
         .await
@@ -10901,7 +11138,7 @@ mod tests {
             &tampered,
             &store,
             1024,
-            download_permit(),
+            download_permits(),
             ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
         )
         .await
@@ -10925,7 +11162,7 @@ mod tests {
             &cfg,
             &weird,
             &store,
-            download_permit(),
+            download_permits(),
             ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
         )
         .await

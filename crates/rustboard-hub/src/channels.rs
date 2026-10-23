@@ -322,6 +322,9 @@ mod tests {
             notifier: mock,
             archive_download_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             archive_download_send_timeout: crate::ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
+            archive_download_principal_slots: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
