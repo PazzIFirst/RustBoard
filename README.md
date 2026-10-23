@@ -12,8 +12,8 @@
 已知问题见 [docs/known-issues.md](docs/known-issues.md)。
 协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面与 v0.3.1/v0.3.2/v0.3.3/v0.3.4/v0.3.5 硬化已完成。**
-> 告警与归档尚未实现。证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。
+> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面、v0.3.x 硬化与 M4 告警/归档已完成（v0.4.0）。**
+> 证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。
 >
 > 线协议版本为 **2**：hub 与 agent 必须严格一致。版本不符时 hub 回 `bad_protocol`
 > 且不下发 Welcome，agent 打印明确错误并以非零码退出，不会进入重连循环。
@@ -245,6 +245,7 @@ docs/                 需求确认稿、实现进度
 cargo test --workspace --locked
 bash tests/e2e/security.sh
 bash tests/e2e/v035.sh   # v0.3.5 安全收口
+bash tests/e2e/v040.sh   # M4 告警/归档
 ```
 
 单元与集成测试覆盖：CPU/内存解析、计数器重置容纳、磁盘缓冲落盘与恢复、

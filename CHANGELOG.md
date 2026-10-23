@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-24
+
 ### Added
 
 - M4 降采样与查询选层：schema v7 新增 `samples_1m`/`samples_1h`/`maintenance_state`；
