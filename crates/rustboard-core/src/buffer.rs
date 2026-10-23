@@ -69,7 +69,8 @@ pub struct DiskBuffer {
 
 impl DiskBuffer {
     pub fn open(dir: impl AsRef<Path>, max_bytes: u64, max_age_ms: u64) -> std::io::Result<Self> {
-        rustboard_common::fsutil::ensure_dir(dir.as_ref(), 0o700)?;
+        // KI-21：缓冲目录归 agent 独占，旧版本留下的 0755 也要在启动时收紧到 0700。
+        rustboard_common::fsutil::ensure_private_dir(dir.as_ref(), 0o700)?;
         let path = dir.as_ref().join("buffer.log");
         let meta_path = dir.as_ref().join("buffer.meta");
         let file = OpenOptions::new()
@@ -615,6 +616,33 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rb-buf-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// KI-21：缓冲目录新建即 0700，旧版本遗留的 0755 在 open 时收紧。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_buffer_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        let dir = temp_dir("perms-new");
+        {
+            let _b = DiskBuffer::open(&dir, 1024 * 1024, 60_000).unwrap();
+            assert_eq!(mode_of(&dir), 0o700, "新建缓冲目录必须是 0700");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = temp_dir("perms-old");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        {
+            let _b = DiskBuffer::open(&dir, 1024 * 1024, 60_000).unwrap();
+            assert_eq!(mode_of(&dir), 0o700, "旧 0755 缓冲目录必须在 open 时收紧");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn epochs_and_seqs(batches: &[SampleBatch]) -> Vec<(u64, u64)> {

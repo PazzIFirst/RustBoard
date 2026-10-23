@@ -414,7 +414,9 @@ pub fn ensure_hub_material(data_dir: &Path, sans: &[String], policy: CertPolicy)
     parse_server_sans(sans)?;
 
     let dir = cert_dir(data_dir);
-    crate::fsutil::ensure_dir(&dir, 0o700)?;
+    // KI-21：证书目录完全由 hub 拥有，旧版本遗留的 0755 也要在启动时收紧到 0700。
+    // 这里只改目录创建；备份命名/清理逻辑不在本任务的范围内。
+    crate::fsutil::ensure_private_dir(&dir, 0o700)?;
 
     let ca_cert_path = dir.join(CA_CERT_FILE);
     let ca_key_path = dir.join(CA_KEY_FILE);

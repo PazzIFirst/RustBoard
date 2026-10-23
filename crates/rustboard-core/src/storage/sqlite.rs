@@ -1,7 +1,7 @@
 //! SQLite 实现。所有写入走单连接 + 事务，读路径走只读连接池，WAL 模式。
 
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -232,7 +232,52 @@ impl SqliteStorage {
     /// 打开顺序：写连接建库 / 迁移 → 读连接打开同一路径并设置 `query_only=ON`。
     /// 任一读连接打开失败时停止扩容并告警，已有读连接继续服务；
     /// 一条都没有时读路径回退到写连接，**不允许启动失败**。
+    ///
+    /// 权限边界：本函数只保证**新建**的父目录是 0700，**不会收紧已存在的父目录**——
+    /// storage 只拿到数据库路径，父目录可能是 `/tmp`、`/var/tmp` 这类共享目录，
+    /// 无条件 chmod 会把系统目录改坏。数据库文件本身（含 WAL/SHM）仍会收紧到
+    /// 0600。需要把旧版本遗留的 0755 专用数据目录一并收紧时，调用方应使用
+    /// [`Self::open_with_private_data_dir`]。
     pub fn open_with_readers(path: &Path, read_pool_size: usize) -> Result<Self> {
+        Self::open_at(path, read_pool_size, None)
+    }
+
+    /// 打开数据库，并声明 `data_dir` 是本程序**专用**的数据目录（KI-21）。
+    ///
+    /// 与 [`Self::open_with_readers`] 的区别：会显式调用
+    /// `fsutil::ensure_private_dir(data_dir, 0o700)`，把旧版本遗留的 0755 数据目录
+    /// 收紧到 0700。**调用方必须保证 `data_dir` 完全归本程序所有**；不要把
+    /// `/tmp`、`/var/tmp`、`/` 等共享目录传进来。`data_dir` 必须就是数据库文件
+    /// 的直接父目录，否则视为编程错误直接拒绝，避免收紧一个与数据库无关的目录。
+    pub fn open_with_private_data_dir(
+        path: &Path,
+        read_pool_size: usize,
+        data_dir: &Path,
+    ) -> Result<Self> {
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => anyhow::bail!(
+                "数据库路径 {} 没有父目录，无法声明私有数据目录",
+                path.display()
+            ),
+        };
+        if parent != data_dir {
+            anyhow::bail!(
+                "私有数据目录 {} 不是数据库 {} 的父目录 {}，拒绝收紧权限",
+                data_dir.display(),
+                path.display(),
+                parent.display()
+            );
+        }
+        Self::open_at(path, read_pool_size, Some(data_dir))
+    }
+
+    /// `open_with_readers` / `open_with_private_data_dir` 的共同实现。
+    fn open_at(
+        path: &Path,
+        read_pool_size: usize,
+        private_data_dir: Option<&Path>,
+    ) -> Result<Self> {
         let pool_size = read_pool_size.clamp(MIN_READ_POOL_SIZE, MAX_READ_POOL_SIZE);
         if pool_size != read_pool_size {
             tracing::warn!(
@@ -241,13 +286,28 @@ impl SqliteStorage {
                 "read_pool_size 超出允许范围，已夹到合法区间"
             );
         }
-        if let Some(parent) = path.parent() {
-            rustboard_common::fsutil::ensure_dir(parent, 0o700)
-                .with_context(|| format!("创建数据目录失败: {}", parent.display()))?;
+        match private_data_dir {
+            Some(data_dir) => {
+                // KI-21：只有调用方显式声明「目录归本程序所有」时才收紧既有权限。
+                rustboard_common::fsutil::ensure_private_dir(data_dir, 0o700).with_context(
+                    || format!("创建或收紧私有数据目录失败: {}", data_dir.display()),
+                )?;
+            }
+            None => {
+                if let Some(parent) = path.parent() {
+                    // 保持既有语义：只给新建父目录 0700，不 chmod 已存在的共享目录。
+                    rustboard_common::fsutil::ensure_dir(parent, 0o700)
+                        .with_context(|| format!("创建数据目录失败: {}", parent.display()))?;
+                }
+            }
         }
+        reject_symlink_db_path(path)?;
         let writer = Connection::open(path)
             .with_context(|| format!("打开数据库失败: {}", path.display()))?;
         let writer = init_writer(writer)?;
+        // 写连接迁移完成后，主库与 WAL/SHM 都已落盘，统一收紧到 0600。
+        harden_db_file(path)?;
+        harden_db_sidecars(path)?;
 
         #[cfg(test)]
         let force_reader_failure = {
@@ -291,6 +351,9 @@ impl SqliteStorage {
                 "只读连接池为空，读路径回退到写连接（读会被写事务串行化）"
             );
         }
+        // KI-21：只读连接首次打开时 SQLite 可能重新创建 -wal/-shm（默认权限由
+        // umask 决定），因此在读池建好后再收紧一次 sidecar。
+        harden_db_sidecars(path)?;
         Ok(Self {
             writer: Mutex::new(writer),
             readers,
@@ -442,6 +505,57 @@ impl SqliteStorage {
 /// 测试注入：让指定路径的只读连接全部打开失败，覆盖「读池降级到写连接」分支。
 #[cfg(test)]
 static FAIL_READER_OPEN_FOR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// KI-21：数据库路径本身是符号链接时拒绝打开。
+///
+/// 必须在 `Connection::open` 之前调用：SQLite 默认跟随符号链接，先打开再 chmod
+/// 已经作用在链接目标上，无法保证「只收紧本进程拥有的数据文件」。
+fn reject_symlink_db_path(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            anyhow::bail!(
+                "数据库路径 {} 是符号链接，拒绝打开（请改为真实文件路径）",
+                path.display()
+            )
+        }
+        Ok(_) => Ok(()),
+        // 新库：路径尚不存在，由后续 `Connection::open` 创建。
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("检查数据库路径失败: {}", path.display())),
+    }
+}
+
+/// 收紧 SQLite 主库文件权限（KI-21）；主库此时必然存在，任何错误都要上抛。
+fn harden_db_file(path: &Path) -> Result<()> {
+    rustboard_common::fsutil::harden(path, 0o600)
+        .with_context(|| format!("收紧数据库文件权限失败: {}", path.display()))
+}
+
+/// 收紧 WAL/SHM sidecar 权限（KI-21）。
+///
+/// sidecar 按需创建、WAL 重置时可能被删除，`NotFound` 属于正常竞态；除此之外
+/// 的错误（PermissionDenied、I/O 错误）必须上抛，不能当成“没有文件”吞掉。
+fn harden_db_sidecars(path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = db_sidecar_path(path, suffix);
+        match rustboard_common::fsutil::harden(&sidecar, 0o600) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("收紧数据库 sidecar 权限失败: {}", sidecar.display()))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 拼接 SQLite sidecar 路径（保留非 UTF-8 路径原名）。
+fn db_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
 
 /// 初始化写连接：设置 PRAGMA、建表并迁移。
 fn init_writer(mut conn: Connection) -> Result<Connection> {
@@ -1332,6 +1446,9 @@ mod tests {
     use super::{IngestOutcome, RejectReason};
     use rustboard_common::model::Sample;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     fn batch_with(agent_id: &str, epoch: u64, seq: u64) -> SampleBatch {
         SampleBatch {
             agent_id: agent_id.into(),
@@ -2041,6 +2158,155 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("rustboard.db")
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// 断言 WAL 模式下两个 sidecar 都存在且为 0600。
+    #[cfg(unix)]
+    fn assert_sidecars_private(db: &Path) {
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = db_sidecar_path(db, suffix);
+            assert!(
+                sidecar.exists(),
+                "WAL 模式下 {suffix} 应该已经存在（open 已执行建表写入）"
+            );
+            assert_eq!(mode_of(&sidecar), 0o600, "{suffix} 必须是 0600");
+        }
+    }
+
+    /// KI-21：新建数据库的父目录 0700，主库/WAL/SHM 0600，且可正常读写。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_new_db_gets_private_dir_and_files() {
+        let path = temp_db("perms-new");
+        let parent = path.parent().unwrap().to_path_buf();
+        // temp_db 为其他用例预建了目录；这里删掉，覆盖“父目录尚不存在”的新建路径。
+        std::fs::remove_dir_all(&parent).unwrap();
+
+        let storage = SqliteStorage::open(&path).unwrap();
+        assert_eq!(mode_of(&parent), 0o700, "新建数据目录必须是 0700");
+        assert_eq!(mode_of(&path), 0o600, "数据库主文件必须是 0600");
+        assert_sidecars_private(&path);
+        assert_eq!(
+            storage.insert_batch(&batch(1)).unwrap(),
+            IngestOutcome::Inserted { inserted: 2 }
+        );
+        assert_eq!(storage.sample_count("a1").unwrap(), 2);
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// KI-21 安全边界：默认 `open` 只拿到 DB 路径，不能收紧已存在的共享父目录。
+    ///
+    /// `/tmp`、`/var/tmp`、`/` 都可能是 DB 的父目录，无条件 chmod 会把系统目录
+    /// 改坏；默认路径只保证新建目录 0700，旧目录由调用方显式声明后收紧。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_default_open_does_not_tighten_existing_parent() {
+        let path = temp_db("perms-shared");
+        let parent = path.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let storage = SqliteStorage::open(&path).unwrap();
+        assert_eq!(
+            mode_of(&parent),
+            0o755,
+            "默认 open 不得 chmod 已存在的共享父目录（如 /tmp）"
+        );
+        assert_eq!(mode_of(&path), 0o600, "数据库文件本身仍必须收紧到 0600");
+        assert_sidecars_private(&path);
+        assert_eq!(storage.sample_count("a1").unwrap(), 0);
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// KI-21：显式声明私有数据目录后，已存在的 0755 目录与 0644 主库被收紧，
+    /// 且读写正常；再次打开幂等。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_private_data_dir_tightens_existing_permissions() {
+        let path = temp_db("perms-tighten");
+        let parent = path.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let storage = SqliteStorage::open_with_private_data_dir(&path, 2, &parent).unwrap();
+        assert_eq!(mode_of(&parent), 0o700, "私有数据目录必须收紧到 0700");
+        assert_eq!(mode_of(&path), 0o600, "预置 0644 主库必须收紧到 0600");
+        assert_sidecars_private(&path);
+        assert_eq!(
+            storage.insert_batch(&batch(1)).unwrap(),
+            IngestOutcome::Inserted { inserted: 2 }
+        );
+        assert_eq!(storage.sample_count("a1").unwrap(), 2);
+        drop(storage);
+
+        // 重复打开幂等：权限已合规时不再报错，数据仍在。
+        let storage = SqliteStorage::open_with_private_data_dir(&path, 2, &parent).unwrap();
+        assert_eq!(mode_of(&parent), 0o700);
+        assert_eq!(mode_of(&path), 0o600);
+        assert_sidecars_private(&path);
+        assert_eq!(storage.sample_count("a1").unwrap(), 2);
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// KI-21：私有目录参数必须就是数据库父目录，防止误收紧无关目录。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_private_data_dir_must_match_db_parent() {
+        let path = temp_db("perms-mismatch");
+        let root = path.parent().unwrap().to_path_buf();
+        let other = root.join("other");
+        std::fs::create_dir(&other).unwrap();
+
+        let err = SqliteStorage::open_with_private_data_dir(&path, 1, &other)
+            .err()
+            .expect("目录与 DB 父目录不一致必须拒绝");
+        assert!(format!("{err:#}").contains("不是数据库"), "err={err:#}");
+        assert!(!path.exists(), "拒绝时不能创建数据库文件");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// KI-21：数据库路径本身是符号链接时，必须在打开/收紧权限之前拒绝。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_rejects_symlink_db_path_before_chmod() {
+        let path = temp_db("perms-symlink");
+        let parent = path.parent().unwrap().to_path_buf();
+        let victim = parent.join("victim.db");
+        std::fs::write(&victim, b"").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        let err = SqliteStorage::open(&path)
+            .err()
+            .expect("数据库路径是符号链接必须拒绝");
+        assert!(format!("{err:#}").contains("符号链接"), "err={err:#}");
+        assert_eq!(
+            mode_of(&victim),
+            0o644,
+            "拒绝必须发生在打开之前，链接目标不能被 chmod"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// KI-21：in-memory 路径不触碰文件系统，权限收紧逻辑不能影响它。
+    #[test]
+    fn ki21_in_memory_storage_still_works() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        assert_eq!(
+            s.insert_batch(&batch(1)).unwrap(),
+            IngestOutcome::Inserted { inserted: 2 }
+        );
+        assert_eq!(s.sample_count("a1").unwrap(), 2);
     }
 
     /// KI-02：读连接池大小可配置并在 1–16 内夹取；读连接必须是 `query_only=ON`。

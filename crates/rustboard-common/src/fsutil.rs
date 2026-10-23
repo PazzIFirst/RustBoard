@@ -63,6 +63,117 @@ pub fn ensure_dir(path: &Path, mode: u32) -> io::Result<()> {
     }
 }
 
+/// 校验私有目录的目标模式不含 group/other 位。
+///
+/// 私有目录一旦带共享位，`harden_dir` 的「只收紧」语义就可能变成误设共享目录，
+/// 因此把这类 mode 视为调用方的编程错误。也用于在创建目录**之前**校验，避免
+/// `ensure_private_dir` 先按 0755 创建再报错。
+fn validate_private_dir_mode(path: &Path, mode: u32) -> io::Result<()> {
+    if mode & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "目录 {} 的目标权限 {mode:04o} 含 group/other 位，私有目录只接受 owner-only 权限",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 收紧已经存在目录的权限（KI-21）。
+///
+/// 与 [`harden`] 的区别：目标必须**已存在且是目录**，非目录、符号链接都拒绝，
+/// 不会替调用方创建目录。只允许收紧到不含 group/other 位的私有模式
+/// （`mode & 0o077 != 0` 直接报错），避免把 `/etc` 这类共享目录误设成私有目录。
+/// 当前权限没有超出 `mode` 允许的位时不调用 `chmod`，重复调用幂等。
+pub fn harden_dir(path: &Path, mode: u32) -> io::Result<()> {
+    // 先校验 mode：这是调用方的编程错误，与路径状态无关，任何平台都应尽早报错。
+    validate_private_dir_mode(path, mode)?;
+
+    // 用 symlink_metadata 检查目标本身：符号链接一律拒绝，绝不 chmod 到链接目标。
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} 是符号链接，拒绝收紧目录权限", path.display()),
+        ));
+    }
+    if !meta.is_dir() {
+        // 与 ensure_dir 对「存在但不是目录」的处理保持一致。
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} 已存在且不是目录", path.display()),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let current = meta.permissions().mode() & 0o777;
+        // `current & !mode` 表示当前权限里有 mode 不允许的位（例如 0755 对 0700）。
+        // 只收紧、不放宽：比 mode 更严格的目录保持原样。
+        if current & !mode != 0 {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+            tracing::warn!(
+                path = %path.display(),
+                from = format!("{current:04o}"),
+                to = format!("{mode:04o}"),
+                "目录权限过宽，已收紧"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+    }
+    Ok(())
+}
+
+/// 创建（或复用）私有目录，并把已存在目录的过宽权限收紧到 `mode`（KI-21）。
+///
+/// 先 [`ensure_dir`] 再 [`harden_dir`]：新建目录直接是 `mode`，旧版本留下的
+/// 0755 目录也会在启动时被收紧。**只用于数据目录、证书目录这类完全由本程序
+/// 拥有的目录**；`/etc/rustboard` 等共享配置父目录仍应使用 [`ensure_dir`]，
+/// 以免改坏系统目录的既有语义。
+///
+/// 空路径保持 [`ensure_dir`] 的 no-op 语义：它表示当前工作目录（例如相对路径
+/// 数据库的父目录），不是由本程序拥有的私有目录，不能 chmod。
+pub fn ensure_private_dir(path: &Path, mode: u32) -> io::Result<()> {
+    // 先校验 mode，避免参数非法时先按公开权限把目录创建出来。
+    validate_private_dir_mode(path, mode)?;
+    ensure_dir(path, mode)?;
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    harden_dir(path, mode)
+}
+
+/// 把进程 umask 收紧到 `0o077`：此后新建文件默认 0600、目录默认 0700（Unix）。
+///
+/// 这是进程级全局状态，只应在进程启动的最早期调用一次（hub / agent 的 `main`
+/// 在创建线程与打开日志/数据库之前），避免和已有线程的创建行为竞争。需要显式
+/// 指定权限的路径（证书 0644、私钥/配置 0600）仍然由 [`atomic_write`] 等函数
+/// 设置，不受 umask 影响。
+///
+/// 返回调用前的旧 umask，便于排障或需要恢复时使用；非 Unix 平台是 no-op，
+/// 返回 `None`。
+pub fn set_private_umask() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `umask` 只读写进程级全局 umask，没有指针参数，也没有内存安全
+        // 前提；按约定在 main 最早期单线程调用，且返回值仅用于记录旧值。
+        let old = unsafe { libc::umask(0o077) };
+        tracing::debug!(old = format!("{:04o}", old), "已设置私有 umask 0o077");
+        Some(old as u32)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// 收紧已经存在文件的权限（M3）。
 ///
 /// 老版本或人为操作可能留下 0644 的配置 / 私钥。读取前检查组与其他位，
@@ -419,5 +530,134 @@ mod tests {
         harden(&path, 0o600).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"token = \"secret\"");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// KI-21：新建数据目录必须从第一刻起就是 0700（含缺失的父目录）。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_ensure_private_dir_creates_0700() {
+        let dir = temp_dir("private-new");
+        let nested = dir.join("data");
+
+        ensure_private_dir(&nested, 0o700).unwrap();
+
+        assert_eq!(mode_of(&nested), 0o700);
+        assert_eq!(mode_of(&dir), 0o700);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// KI-21：旧版本留下的 0755 目录在启动时必须被收紧；重复调用幂等。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_ensure_private_dir_tightens_existing_0755() {
+        let dir = temp_dir("private-old");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(mode_of(&dir), 0o755);
+
+        ensure_private_dir(&dir, 0o700).unwrap();
+        assert_eq!(mode_of(&dir), 0o700, "已存在的过宽目录必须被收紧");
+
+        // 已经合规时再做一次不能报错，也不能把权限改回旧值。
+        ensure_private_dir(&dir, 0o700).unwrap();
+        assert_eq!(mode_of(&dir), 0o700);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// KI-21：`harden_dir` 只收紧、不放宽：比目标更严格的目录保持原样。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_harden_dir_is_idempotent_and_never_widens() {
+        let dir = temp_dir("private-narrow");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        harden_dir(&dir, 0o700).unwrap();
+
+        assert_eq!(mode_of(&dir), 0o500, "已经比 0700 更严格的目录不能被放宽");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// KI-21：目标存在但不是目录时必须拒绝，不能 chmod 普通文件。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_harden_dir_rejects_non_directory() {
+        let dir = temp_dir("harden-file");
+        ensure_dir(&dir, 0o700).unwrap();
+        let file = dir.join("not-a-dir");
+        fs::write(&file, b"x").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = harden_dir(&file, 0o700).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(mode_of(&file), 0o644, "普通文件不能被当成目录 chmod");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// KI-21：目录是符号链接时拒绝收紧，且链接指向的目标权限不变。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_harden_dir_refuses_symlink_target() {
+        let dir = temp_dir("harden-symlink");
+        ensure_dir(&dir, 0o700).unwrap();
+        let victim = dir.join("victim-dir");
+        fs::create_dir(&victim).unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
+        let target = dir.join("data");
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+
+        let err = harden_dir(&target, 0o700).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(mode_of(&victim), 0o755, "不能 chmod 到符号链接目标");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// KI-21：`harden_dir` 不允许含 group/other 位的 mode，避免误用成共享目录。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_harden_dir_rejects_public_mode() {
+        let dir = temp_dir("harden-public-mode");
+        ensure_dir(&dir, 0o700).unwrap();
+
+        let err = harden_dir(&dir, 0o750).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(mode_of(&dir), 0o700, "参数非法时不能改动目录权限");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// KI-21：`ensure_private_dir` 的 mode 校验必须发生在创建目录之前，
+    /// 否则非法参数会先留下一个公开目录。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_ensure_private_dir_rejects_public_mode_before_creating() {
+        let dir = temp_dir("private-public-mode");
+        let nested = dir.join("data");
+
+        let err = ensure_private_dir(&nested, 0o755).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!nested.exists(), "参数非法时不能先创建公开目录");
+    }
+
+    /// KI-21：`harden_dir` 要求目标已存在（不负责创建目录）。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_harden_dir_requires_existing_path() {
+        let dir = temp_dir("harden-missing");
+        ensure_dir(&dir, 0o700).unwrap();
+        let missing = dir.join("missing");
+
+        let err = harden_dir(&missing, 0o700).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// KI-21：`set_private_umask` 签名固定（返回旧 umask，非 Unix 为 `None`）。
+    ///
+    /// 该函数会修改进程级全局 umask，测试并行时无法安全调用，因此这里只做
+    /// 编译期的签名验证，不实际执行。
+    #[test]
+    fn ki21_set_private_umask_has_stable_signature() {
+        let f: fn() -> Option<u32> = set_private_umask;
+        let _ = f;
     }
 }
