@@ -14,6 +14,7 @@ rustboard-common = { workspace = true }
 rustboard-core = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
+http-body = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 rustls = { workspace = true }

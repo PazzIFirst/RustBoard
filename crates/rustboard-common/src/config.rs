@@ -35,6 +35,12 @@ pub struct AgentConfig {
     /// 主动重连周期（小时），让轮换后的证书与 hub 配置有机会生效；0 表示不主动重连。
     #[serde(default = "default_session_max_hours")]
     pub session_max_hours: u64,
+    /// 单次 WebSocket 写操作的超时（秒），范围 1–120。
+    ///
+    /// 服务端不读（半死连接）时，超过该时长仍未写完就断开当前会话并走重连退避；
+    /// 默认 15 秒，与 hub 侧会话写超时保持一致。
+    #[serde(default = "default_send_timeout_secs")]
+    pub send_timeout_secs: u64,
     /// 会话空闲时的客户端证书检查周期（小时）。
     ///
     /// 即使 `session_max_hours = 0`（永不主动重连），也要周期检查证书剩余寿命，
@@ -63,6 +69,7 @@ impl Default for AgentConfig {
             buffer_max_age_hours: 24,
             cert_renew_before_days: default_cert_renew_before_days(),
             session_max_hours: default_session_max_hours(),
+            send_timeout_secs: default_send_timeout_secs(),
             cert_check_interval_hours: default_cert_check_interval_hours(),
             max_batch_samples: 512,
             control: ControlConfig::default(),
@@ -106,6 +113,14 @@ impl AgentConfig {
         if self.session_max_hours > MAX_SESSION_MAX_HOURS {
             return Err(Error::InvalidConfig(format!(
                 "session_max_hours 不能超过 {MAX_SESSION_MAX_HOURS}（0 表示不主动重连）"
+            )));
+        }
+        // 写超时是半死连接的唯一退出手段：0 会让每次写立刻失败，过大则长期卡住会话。
+        if !(MIN_SEND_TIMEOUT_SECS..=MAX_SEND_TIMEOUT_SECS).contains(&self.send_timeout_secs) {
+            return Err(Error::InvalidConfig(format!(
+                "send_timeout_secs 必须在 {MIN_SEND_TIMEOUT_SECS}–{MAX_SEND_TIMEOUT_SECS} 秒之间，\
+                 实际 {}",
+                self.send_timeout_secs
             )));
         }
         // 会话内周期检查必须有下界：0 会让定时器变成忙循环，超长周期则等于没检查。
@@ -829,12 +844,21 @@ const MAX_CERT_CHECK_INTERVAL_HOURS: u64 = 168;
 /// agent 主动重连周期上限（1 年）；0 表示不主动重连。
 const MAX_SESSION_MAX_HOURS: u64 = 24 * 365;
 
+/// agent 单次 WebSocket 写超时的允许范围与默认值（秒）。
+const MIN_SEND_TIMEOUT_SECS: u64 = 1;
+const MAX_SEND_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_SEND_TIMEOUT_SECS: u64 = 15;
+
 fn default_cert_renew_before_days() -> u32 {
     30
 }
 
 fn default_session_max_hours() -> u64 {
     12
+}
+
+fn default_send_timeout_secs() -> u64 {
+    DEFAULT_SEND_TIMEOUT_SECS
 }
 
 fn default_cert_check_interval_hours() -> u64 {
@@ -1098,6 +1122,53 @@ mod tests {
             ..AgentConfig::default()
         };
         assert!(disabled.validate().is_ok());
+    }
+
+    /// v0.3.1 #12：发送超时默认 15 秒，范围 1–120；旧配置缺字段必须走默认。
+    #[test]
+    fn v031_agent_send_timeout_defaults_and_bounds() {
+        let cfg: AgentConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.send_timeout_secs, 15);
+        assert_eq!(AgentConfig::default().send_timeout_secs, 15);
+
+        // 旧配置（没有该字段）同样走默认，且能通过校验。
+        let old: AgentConfig =
+            toml::from_str("hub_url = \"ws://127.0.0.1:8443/agent/ws\"\n").unwrap();
+        assert_eq!(old.send_timeout_secs, 15);
+        old.validate()
+            .expect("旧配置缺 send_timeout_secs 必须能启动");
+
+        // 显式配置必须生效。
+        let explicit: AgentConfig = toml::from_str("send_timeout_secs = 30\n").unwrap();
+        assert_eq!(explicit.send_timeout_secs, 30);
+        explicit.validate().expect("30 秒必须合法");
+
+        // 闭区间边界 1 / 120 合法。
+        for secs in [1, 120] {
+            let cfg = AgentConfig {
+                send_timeout_secs: secs,
+                ..AgentConfig::default()
+            };
+            cfg.validate()
+                .unwrap_or_else(|err| panic!("{secs} 秒必须合法: {err}"));
+        }
+
+        // 0 / 121 越界必须被拒绝，错误信息包含字段名与范围。
+        for secs in [0, 121] {
+            let cfg = AgentConfig {
+                send_timeout_secs: secs,
+                ..AgentConfig::default()
+            };
+            let err = cfg
+                .validate()
+                .expect_err(&format!("{secs} 秒必须被拒绝"))
+                .to_string();
+            assert!(
+                err.contains("send_timeout_secs"),
+                "错误信息应包含字段名: {err}"
+            );
+            assert!(err.contains("1–120"), "错误信息应包含范围: {err}");
+        }
     }
 
     /// v0.2.1 新增配置项的非法值必须在启动前被拒绝，且错误信息点名字段。

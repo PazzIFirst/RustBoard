@@ -7,9 +7,14 @@
 //! - [`check_and_renew`]：自动续签。先按同一套规则成对备份，再调用文件级签发，
 //!   最后重建 `tls::server_config` 自检并通过 `watch` 推给 accept 循环；
 //!   自检失败回滚旧材料，且不推送新配置。
-//! - [`load_or_repair_tls_config`]：hub 启动入口。先尝试加载，只有「服务端 key/cert
-//!   配对损坏 / 缺失」才自愈；CA 材料有问题、服务端证书不可解析等一律直接报错，
-//!   不写任何 server 文件（避免每次启动都换一张证书、指纹漂移）。
+//! - [`load_or_repair_tls_config`]：hub 启动入口。只允许两类自愈：
+//!   1. 服务端 key/cert 配对损坏 / 缺失（沿用原有行为）；
+//!   2. 服务端证书**仅因过期**——CA 材料配套、证书确由当前 CA 签发、CN/SAN 合法、
+//!      `server.key` 与证书配套，只是 `notAfter <= now`。这类在 [`CertLock`] 内用
+//!      当前 CA 重签并成对备份，然后继续启动。
+//!
+//!   其他情况（CA 材料异常、证书不可解析、非当前 CA 签发、CN/SAN 不覆盖、尚未生效
+//!   等）一律直接报错，不写任何 server 文件（避免每次启动都换一张证书、指纹漂移）。
 //!
 //! 安全决策（第二轮评审 S1/S2）：
 //! - 签发前校验 `ca.key` 与 `ca.crt` 配套、`server_names` 非空且逐条合法；
@@ -18,7 +23,11 @@
 //! - 重签前成对备份 crt(0644)+key(0600)，文件名带毫秒+PID+随机后缀，避免同秒覆盖，
 //!   每类只保留最近 [`tls::BACKUP_KEEP`] 份；
 //! - 私钥 0600、证书 0644，写入走 `fsutil::atomic_write`（随机临时名 + rename）；
-//! - 日志只打指纹与到期时间，绝不打印私钥或证书内容。
+//! - 日志只打指纹与到期时间，绝不打印私钥或证书内容；
+//! - 「仅过期」判定不会放宽结构校验：先取证书有效期内的某一时刻
+//!   （`notAfter - 1s`）跑完整 [`tls::validate_existing_server_cert`]，只有
+//!   CN / SAN / 签名 / notBefore 全部通过、且 `server.key` 配套时才归入过期自愈；
+//!   其余仍按原有规则拒绝启动。
 //!
 //! 关于检查周期：配置层要求 `cert_check_interval_secs ≥ 60`。方案文档里写的是
 //! 「最小 1」，实现采用更严格的安全下限——秒级检查在证书未到期时只是无意义的
@@ -677,10 +686,119 @@ pub fn check_and_renew(
     Ok(Some(renewed.fingerprint))
 }
 
-/// 启动时加载 TLS 配置；**只**对「服务端 key/cert 配对损坏或缺失」做自愈。
 /// 启动/init 可用的恢复指引：恢复备份优先，重签用 rotate-cert，重建 CA 必须手动清材料。
-const TLS_RECOVERY_HINT: &str = "请从备份恢复匹配的 CA 与服务端材料；     若只是证书链过期/失配，可执行 `rustboard-hub rotate-cert --force` 用当前 CA 重签（CA 未变时 agent 会自动重连）；     若要重建 CA，需先手动移除 ca.crt+ca.key+旧 server 材料（ca.crt / ca.key / server.crt / server.key），     再执行 `rustboard-hub init --force`（会重建 CA、重置端口与配置）；     若 CA 也被整体替换，所有 agent 必须重新纳管（旧 ca.crt/客户端证书属于旧 CA，会 mTLS 失败）";
+///
+/// 注意：**仅因过期**的服务端证书会在启动时自动重签，不再需要人工执行
+/// `rotate-cert`；其余证书异常仍需人工处理。
+const TLS_RECOVERY_HINT: &str = "请从备份恢复匹配的 CA 与服务端材料；     若服务端证书仅因过期（CA 材料配套、证书由当前 CA 签发、CN/SAN 合法、server.key 配套），hub 启动时会自动用当前 CA 重签，无需人工干预；     其它证书异常（不可解析 / 非当前 CA 签发 / CN 或 SAN 不覆盖 / 尚未生效）仍需人工处理：可执行 `rustboard-hub rotate-cert --force` 用当前 CA 重签（CA 未变时 agent 会自动重连）；     若要重建 CA，需先手动移除 ca.crt+ca.key+旧 server 材料（ca.crt / ca.key / server.crt / server.key），     再执行 `rustboard-hub init --force`（会重建 CA、重置端口与配置）；     若 CA 也被整体替换，所有 agent 必须重新纳管（旧 ca.crt/客户端证书属于旧 CA，会 mTLS 失败）";
 
+/// 启动路径（以及锁内复核）对现存服务端材料的分类。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StartupMaterial {
+    /// 证书与私钥配套且当前有效。
+    Healthy,
+    /// 服务端 key/cert 缺失、不配套或私钥不可解析：沿用原有配对自愈。
+    PairRepair(&'static str),
+    /// 配对与结构全部合法，只是当前已过期：允许用当前 CA 重签。
+    Expired { not_after: i64 },
+}
+
+/// 启动自愈的原因；只用于日志与锁内复核的上下文，不参与安全判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairCause {
+    PairDamaged,
+    ExpiredOnly,
+}
+
+impl RepairCause {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PairDamaged => "服务端 key/cert 配对损坏或缺失",
+            Self::ExpiredOnly => "服务端证书仅因过期",
+        }
+    }
+}
+
+/// 读取并分类现存服务端材料。
+///
+/// 分类顺序是安全关键：
+/// 1. 证书不可解析 → 直接错误（不因为 key 缺失就降级成配对自愈）；
+/// 2. 先在「证书仍有效」的参照时刻跑完整结构校验（CN/SAN/签名/notBefore）。
+///    证书已过期时参照时刻取 `notAfter - 1s`，只放过「当前已过期」；
+/// 3. 结构合法后才看 key 是否配套；过期但 key 不配套属于配对自愈；
+/// 4. 其余（尚未生效、非本 CA 签发、SAN 不覆盖等）直接错误。
+fn classify_startup_material(cfg: &HubConfig, ca: &tls::ValidatedCa) -> Result<StartupMaterial> {
+    let dir = tls::cert_dir(&cfg.data_dir);
+    let cert_path = dir.join(tls::SERVER_CERT_FILE);
+    let key_path = dir.join(tls::SERVER_KEY_FILE);
+
+    if !cert_path.exists() {
+        return Ok(StartupMaterial::PairRepair("服务端证书缺失"));
+    }
+    let cert_pem = std::fs::read_to_string(&cert_path)
+        .with_context(|| format!("读取服务端证书失败: {}", cert_path.display()))?;
+    let summary = tls::cert_summary(&cert_pem)
+        .with_context(|| format!("现存服务端证书不可解析，拒绝启动；{TLS_RECOVERY_HINT}"))?;
+
+    let now = now_ms();
+    let now_s = now / 1_000;
+    let expired = summary.not_after <= now_s;
+    // 过期证书仍要做完整结构校验：把时间拨回有效期最后一秒，CN / SAN / 签名 /
+    // notBefore / notAfter 全部照常检查，只让「当前已过期」这一项通过。
+    let validation_time_ms = if expired {
+        summary.not_after.saturating_mul(1_000).saturating_sub(1)
+    } else {
+        now
+    };
+    if let Err(err) = tls::validate_existing_server_cert(
+        &cert_pem,
+        &ca.cert_pem,
+        &cfg.server_names,
+        validation_time_ms,
+    ) {
+        let what = if expired {
+            "已过期，但无法按「仅过期」自愈"
+        } else {
+            "与当前 CA/SAN 不一致"
+        };
+        return Err(err.context(format!(
+            "现存服务端证书{what}，拒绝启动；{TLS_RECOVERY_HINT}"
+        )));
+    }
+
+    // 结构校验通过后才看配对：过期但 key 不配套属于配对自愈，不走过期自愈。
+    if !key_path.exists() {
+        return Ok(StartupMaterial::PairRepair("服务端私钥缺失"));
+    }
+    let key_pem = std::fs::read_to_string(&key_path)
+        .with_context(|| format!("读取服务端私钥失败: {}", key_path.display()))?;
+    match tls::cert_matches_key(&cert_pem, &key_pem) {
+        Ok(true) => {}
+        Ok(false) => return Ok(StartupMaterial::PairRepair("服务端证书与私钥不配套")),
+        Err(err) => {
+            tracing::warn!(error = %err, "服务端私钥不可解析，按配对损坏处理");
+            return Ok(StartupMaterial::PairRepair("服务端私钥不可解析"));
+        }
+    }
+
+    if expired {
+        Ok(StartupMaterial::Expired {
+            not_after: summary.not_after,
+        })
+    } else {
+        Ok(StartupMaterial::Healthy)
+    }
+}
+
+/// hub 启动入口：加载 TLS 配置，必要时做有限自愈。
+///
+/// 可自愈的只有两类：
+/// - 服务端 key/cert 配对损坏 / 缺失（沿用原有行为）；
+/// - 服务端证书**仅因过期**：CA 材料配套、证书确由当前 CA 签发、CN/SAN 合法且
+///   `server.key` 配套，只是 `notAfter <= now`。
+///
+/// 其他任何异常（CA 材料非法、证书不可解析、非当前 CA 签发、CN/SAN 不覆盖、
+/// 尚未生效等）都在写盘前拒绝启动。
 pub fn load_or_repair_tls_config(cfg: &HubConfig) -> Result<Arc<ServerConfig>> {
     // S1-1：任何启动路径都先校验 CA 材料与 server_names，再尝试加载。
     // `server_config` 只把 ca.crt 当信任根，并不会发现 ca.key 缺失/不配套；
@@ -688,109 +806,121 @@ pub fn load_or_repair_tls_config(cfg: &HubConfig) -> Result<Arc<ServerConfig>> {
     let ca = tls::load_validated_ca(&cfg.data_dir).context("CA 材料校验失败，拒绝启动")?;
     tls::parse_server_sans(&cfg.server_names).context("server_names 校验失败，拒绝启动")?;
 
-    // 第五轮 S1：现存 server.crt 必须由当前 CA 签发、且 SAN 覆盖 server_names。
-    // 只校验 CA 自身不够——把另一套 CA 的 ca.crt+ca.key 覆盖进来时，
-    // server_config 仍能构建成功（它不校验签发者），hub 会带着无效链启动。
-    let cert_path = tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE);
-    if cert_path.exists() {
-        let server_pem = std::fs::read_to_string(&cert_path)
-            .with_context(|| format!("读取服务端证书失败: {}", cert_path.display()))?;
-        tls::validate_existing_server_cert(&server_pem, &ca.cert_pem, &cfg.server_names, now_ms())
-            .with_context(|| {
-                format!("现存服务端证书与当前 CA/SAN 不一致，拒绝启动；{TLS_RECOVERY_HINT}")
-            })?;
-    }
-
-    match tls::server_config(&cfg.data_dir) {
-        Ok(config) => Ok(config),
-        Err(original) => repair_tls_material(cfg, original),
+    // 先分类，只有「配对损坏/缺失」与「仅过期」才允许进入写盘自愈；
+    // 其余情况由 `classify_startup_material` 直接返回错误，不会碰任何文件。
+    match classify_startup_material(cfg, &ca)? {
+        StartupMaterial::Healthy => match tls::server_config(&cfg.data_dir) {
+            Ok(config) => Ok(config),
+            // 分类正常但配置构建失败（权限/IO/竞争）：仍进入锁内复核，
+            // 复核若确认配对已损坏才自愈，否则报不可自愈错误。
+            Err(original) => repair_tls_material(cfg, RepairCause::PairDamaged, original),
+        },
+        StartupMaterial::PairRepair(reason) => repair_tls_material(
+            cfg,
+            RepairCause::PairDamaged,
+            anyhow::anyhow!("检测到{reason}，需要启动自愈"),
+        ),
+        StartupMaterial::Expired { not_after } => repair_tls_material(
+            cfg,
+            RepairCause::ExpiredOnly,
+            anyhow::anyhow!(
+                "检测到服务端证书已过期（notAfter={}），需要启动时自动重签",
+                tls::format_unix_utc(not_after)
+            ),
+        ),
     }
 }
 
 /// 对不可自愈的 TLS 故障给出可执行错误（不回显任何密钥材料）。
 fn unrepairable(original: anyhow::Error, hint: &str) -> anyhow::Error {
     original.context(format!(
-        "TLS 材料异常，无法自动修复：不属于可自愈的「服务端 key/cert 配对」问题（{hint}）；\
-         {TLS_RECOVERY_HINT}"
+        "TLS 材料异常，无法自动修复：不属于可自愈的「服务端 key/cert 配对损坏或缺失」\
+         或「服务端证书仅过期」问题（{hint}）；{TLS_RECOVERY_HINT}"
     ))
 }
 
-fn repair_tls_material(cfg: &HubConfig, original: anyhow::Error) -> Result<Arc<ServerConfig>> {
+/// 持 [`CertLock`] 复核分类并执行自愈重签。
+fn repair_tls_material(
+    cfg: &HubConfig,
+    cause: RepairCause,
+    original: anyhow::Error,
+) -> Result<Arc<ServerConfig>> {
     let dir = tls::cert_dir(&cfg.data_dir);
     // KI-11：启动自愈同样会写服务端材料，必须与 CLI rotate-cert 互斥；
     // 锁被占用时宁可拒绝启动，也不能和运维进程交错写 key/cert。
     let _lock = CertLock::acquire(&dir).context(
         "获取证书修复锁失败（另一个 rotate-cert 正在运行），拒绝启动以免写坏材料；请等待其结束后重试",
     )?;
-    let cert_path = dir.join(tls::SERVER_CERT_FILE);
-    let key_path = dir.join(tls::SERVER_KEY_FILE);
 
-    // CA 材料与 server_names 已由 `load_or_repair_tls_config` 校验，这里只分类
-    // 服务端材料：只有「配对损坏 / 缺失」才允许自愈。
-    let repair_reason = if !cert_path.exists() {
-        Some("服务端证书缺失")
-    } else {
-        let cert_pem = std::fs::read_to_string(&cert_path)
-            .with_context(|| format!("读取服务端证书失败: {}", cert_path.display()))?;
-        tls::cert_summary(&cert_pem).map_err(|err| {
-            unrepairable(
-                err,
-                &format!("服务端证书无法解析（{}）", cert_path.display()),
-            )
-        })?;
-        if !key_path.exists() {
-            Some("服务端私钥缺失")
-        } else {
-            let key_pem = std::fs::read_to_string(&key_path)
-                .with_context(|| format!("读取服务端私钥失败: {}", key_path.display()))?;
-            match tls::cert_matches_key(&cert_pem, &key_pem) {
-                Ok(true) => None,
-                Ok(false) => Some("服务端证书与私钥不配套"),
-                Err(err) => {
-                    tracing::warn!(error = %err, "服务端私钥不可解析，按配对损坏处理");
-                    Some("服务端私钥不可解析")
-                }
-            }
+    // 锁内复核：分类结果可能在「初次检查」与「拿到锁」之间被并发 rotate 改变。
+    // 这里重新读 CA 与 server 材料；任何不可自愈状态都直接报错，绝不盲写。
+    let ca = tls::load_validated_ca(&cfg.data_dir)
+        .context("持有证书修复锁后复核 CA 材料失败，拒绝启动")?;
+    let material = classify_startup_material(cfg, &ca)?;
+
+    let renew_reason = match material {
+        StartupMaterial::Healthy => {
+            // 并发 rotate 已经修好，或原本就是权限/IO 问题：只尝试加载，不写盘。
+            tracing::info!(
+                cause = cause.label(),
+                "锁内复核未发现需要重签的问题（可能已被并发 rotate 修复），直接加载现有材料"
+            );
+            return tls::server_config(&cfg.data_dir).map_err(|err| {
+                unrepairable(
+                    err,
+                    "服务端证书与私钥配对正常且未过期（检查 CA 证书、文件权限与磁盘）",
+                )
+            });
         }
-    };
-
-    let Some(repair_reason) = repair_reason else {
-        return Err(unrepairable(
-            original,
-            "服务端证书与私钥配对正常（检查 CA 证书、文件权限与磁盘）",
-        ));
+        StartupMaterial::PairRepair(reason) => reason.to_string(),
+        StartupMaterial::Expired { not_after } => format!(
+            "服务端证书仅因过期（notAfter={}）",
+            tls::format_unix_utc(not_after)
+        ),
     };
 
     tracing::warn!(
+        cause = cause.label(),
+        reason = %renew_reason,
         error = %original,
-        reason = repair_reason,
-        "检测到可自愈的 TLS 材料问题（可能是上次续签写盘中途被中断），将用 CA 重签服务端证书"
+        "锁内复核确认可自愈，将用当前 CA 重签服务端证书"
     );
 
-    // 3) 文件级签发内部会在全部校验通过后成对备份、再写盘；失败路径不产生 bak。
-    let renewed = renew_server_cert_files(cfg, true, None)
-        .context("自动修复服务端证书失败（失败发生在写盘之前，磁盘材料未改动）")?;
+    // 文件级签发内部会在全部校验通过后成对备份、再写盘；失败路径不产生 bak。
+    let renewed = renew_server_cert_files(cfg, true, None).context(format!(
+        "自动修复服务端证书失败（失败发生在写盘之前，磁盘材料未改动）；{TLS_RECOVERY_HINT}"
+    ))?;
     let Some(renewed) = renewed else {
-        return Err(original.context("自动修复没有产生新证书（内部状态异常）"));
+        return Err(original.context(format!(
+            "自动修复没有产生新证书（内部状态异常）；{TLS_RECOVERY_HINT}"
+        )));
     };
 
-    // 4) 重建配置；失败必须回到旧材料。
+    // 重建配置；失败必须回到旧材料。
     let config = match rebuild_server_config(cfg) {
         Ok(config) => config,
         Err(err) => {
             return Err(match renewed.rollback(cfg) {
-                Ok(true) => err.context("自动修复后重建 TLS 配置失败，已回滚到修复前的材料"),
-                Ok(false) => err.context("自动修复后重建 TLS 配置失败，且没有可回滚的旧材料"),
+                Ok(true) => err.context(format!(
+                    "自动修复后重建 TLS 配置失败，已回滚到修复前的材料；{TLS_RECOVERY_HINT}"
+                )),
+                Ok(false) => err.context(format!(
+                    "自动修复后重建 TLS 配置失败，且没有可回滚的旧材料；{TLS_RECOVERY_HINT}"
+                )),
                 Err(rollback_err) => err.context(format!(
-                    "自动修复后重建 TLS 配置失败，且回滚失败（需要人工检查证书目录）: {rollback_err}"
+                    "自动修复后重建 TLS 配置失败，且回滚失败（需要人工检查证书目录）: \
+                     {rollback_err}；{TLS_RECOVERY_HINT}"
                 )),
             });
         }
     };
 
-    tracing::error!(
+    tracing::warn!(
+        cause = cause.label(),
+        reason = %renew_reason,
         old_fingerprint = %renewed.old_fingerprint,
         new_fingerprint = %renewed.fingerprint,
+        not_after = %tls::format_unix_utc(renewed.not_after),
         "已自动重签服务端证书完成自愈；服务端指纹已变化，仍使用指纹钉扎的旧版 agent \
          需要升级到 v0.2 或重新纳管"
     );
@@ -1322,6 +1452,110 @@ mod tests {
         (cert.pem(), key.serialize_pem())
     }
 
+    /// 用当前 CA 私钥签一张指定绝对有效期窗口的服务端证书。
+    ///
+    /// 只用于构造「已过期 / 尚未生效」场景；签名者由磁盘上的 `ca.key` 推导，
+    /// 验签仍使用真实的 `ca.crt`，因此可以覆盖「确由当前 CA 签发」这一前提。
+    fn signed_server_pair(
+        dir: &Path,
+        sans: &[String],
+        not_before: (i32, u8, u8),
+        not_after: (i32, u8, u8),
+    ) -> (String, String) {
+        let ca_key_pem = read(dir, CA_KEY_FILE);
+        let ca_key = rcgen::KeyPair::from_pem(&ca_key_pem).unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, tls::CA_COMMON_NAME);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        ca_params.key_identifier_method = rcgen::KeyIdMethod::Sha256;
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.not_before = rcgen::date_time_ymd(not_before.0, not_before.1, not_before.2);
+        params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, tls::SERVER_COMMON_NAME);
+        params.subject_alt_names = sans
+            .iter()
+            .map(|name| rcgen::SanType::DnsName(rcgen::Ia5String::try_from(name.clone()).unwrap()))
+            .collect();
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.use_authority_key_identifier_extension = true;
+        let cert = params.signed_by(&key, &ca_cert, &ca_key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    /// 安装一张当前 CA 签发、key 配套、但已过期的服务端证书。
+    ///
+    /// 使用绝对时间窗口（2020-01-01 ~ 2020-02-01），不依赖真实时间流逝。
+    fn install_expired_server_pair(dir: &Path, sans: &[String]) -> (String, String) {
+        let (cert, key) = signed_server_pair(dir, sans, (2020, 1, 1), (2020, 2, 1));
+        write(dir, SERVER_CERT_FILE, cert.as_bytes());
+        write(dir, SERVER_KEY_FILE, key.as_bytes());
+        (cert, key)
+    }
+
+    /// 驱动一次进程内 TLS 握手，验证「原 CA 纳管的 agent 仍能连上」。
+    fn assert_original_agent_can_reconnect(
+        server_config: Arc<ServerConfig>,
+        ca_pem: &str,
+        client_cert_pem: &str,
+        client_key_pem: &str,
+    ) {
+        use rustls::pki_types::ServerName;
+
+        let client_config = tls::client_config_ca(ca_pem, client_cert_pem, client_key_pem).unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+        let mut client = rustls::ClientConnection::new(client_config, name).unwrap();
+        let mut server = rustls::ServerConnection::new(server_config).unwrap();
+        let mut c2s = Vec::new();
+        let mut s2c = Vec::new();
+        for _ in 0..20 {
+            while client.wants_write() {
+                client.write_tls(&mut c2s).unwrap();
+            }
+            if !c2s.is_empty() {
+                server
+                    .read_tls(&mut std::io::Cursor::new(c2s.as_slice()))
+                    .unwrap();
+                server.process_new_packets().unwrap();
+                c2s.clear();
+            }
+            while server.wants_write() {
+                server.write_tls(&mut s2c).unwrap();
+            }
+            if !s2c.is_empty() {
+                client
+                    .read_tls(&mut std::io::Cursor::new(s2c.as_slice()))
+                    .unwrap();
+                client.process_new_packets().unwrap();
+                s2c.clear();
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                assert!(
+                    server.peer_certificates().is_some(),
+                    "服务端必须看到 agent 的客户端证书（mTLS）"
+                );
+                return;
+            }
+        }
+        panic!("原 CA 纳管的 agent 在服务端证书过期自愈后未能完成 TLS 握手");
+    }
+
     /// 第六轮：v0.1.0 材料（notAfter=4096）必须能正常启动，不得被有效期上限拒绝。
     #[test]
     fn s6_load_or_repair_accepts_legacy_v01_material() {
@@ -1408,6 +1642,347 @@ mod tests {
         );
         assert!(text.contains("rotate-cert"), "必须给出重签命令: {text}");
         assert_eq!(read(&dir, SERVER_CERT_FILE), cert_before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #13：服务端证书仅因过期（CA/SAN/CN 合法且 key 配套）时，hub 启动必须
+    /// 用当前 CA 自动重签并继续启动；原 CA 纳管的 agent 仍能重连。
+    #[test]
+    fn cert_expiry_startup_self_heals_with_current_ca() {
+        let dir = temp_dir("expired-startup");
+        let policy = tls::CertPolicy {
+            server_days: 365,
+            ..Default::default()
+        };
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let cfg = test_config(&dir, 365, 30);
+        let ca_pem = read(&dir, CA_CERT_FILE);
+        let ca_key_pem = read(&dir, CA_KEY_FILE);
+
+        // 模拟在证书过期前就已纳管成功的 agent：客户端证书由原 CA 签发。
+        let (csr_pem, agent_key_pem) = tls::make_csr().unwrap();
+        let agent_cert_pem =
+            tls::sign_client_csr(&ca_key_pem, &csr_pem, "agent-before-expiry", 90).unwrap();
+
+        let (old_cert_pem, old_key_pem) =
+            install_expired_server_pair(&dir, &["localhost".to_string()]);
+        let old_fingerprint = tls::fingerprint_of_pem(&old_cert_pem).unwrap();
+        assert!(
+            tls::days_left(&old_cert_pem, now_ms()).unwrap() < 0,
+            "前提：构造的证书必须已过期"
+        );
+        assert!(
+            tls::validate_existing_server_cert(&old_cert_pem, &ca_pem, &cfg.server_names, now_ms())
+                .is_err(),
+            "前提：按当前时间校验必须因过期失败"
+        );
+
+        let config = load_or_repair_tls_config(&cfg).expect("仅因过期必须自动重签并继续启动");
+
+        let new_cert_pem = read(&dir, SERVER_CERT_FILE);
+        let new_key_pem = read(&dir, SERVER_KEY_FILE);
+        let new_fingerprint = tls::fingerprint_of_pem(&new_cert_pem).unwrap();
+        assert_ne!(new_fingerprint, old_fingerprint, "过期自愈必须生成新证书");
+        assert_eq!(
+            tls::days_left(&new_cert_pem, now_ms()).unwrap(),
+            365,
+            "新证书必须按配置的有效期签发，且不得仍是过期状态"
+        );
+        assert!(tls::cert_summary(&new_cert_pem).unwrap().not_after > now_ms() / 1_000);
+        assert!(
+            tls::cert_matches_key(&new_cert_pem, &new_key_pem).unwrap(),
+            "新 key 必须与证书配套"
+        );
+        assert!(
+            tls::cert_issued_by_ca(&new_cert_pem, &ca_pem, now_ms()).unwrap(),
+            "新证书必须仍由当前 CA 签发"
+        );
+        assert_eq!(read(&dir, CA_CERT_FILE), ca_pem, "不得替换 CA 证书");
+        assert_eq!(read(&dir, CA_KEY_FILE), ca_key_pem, "不得替换 CA 私钥");
+        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+
+        // 成对备份旧材料，备份内容必须就是自愈前的那一对。
+        let cert_backups = managed_backups(&dir, SERVER_CERT_FILE);
+        let key_backups = managed_backups(&dir, SERVER_KEY_FILE);
+        assert_eq!(cert_backups.len(), 1, "必须备份旧证书");
+        assert_eq!(key_backups.len(), 1, "必须备份旧私钥");
+        let stamp = cert_backups[0]
+            .strip_prefix(&format!("{}.bak-", SERVER_CERT_FILE))
+            .expect("备份文件名必须带统一后缀");
+        assert_eq!(
+            key_backups[0],
+            format!("{SERVER_KEY_FILE}.bak-{stamp}"),
+            "证书与私钥备份必须成对"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tls::cert_dir(&dir).join(&cert_backups[0])).unwrap(),
+            old_cert_pem
+        );
+        assert_eq!(
+            std::fs::read_to_string(tls::cert_dir(&dir).join(&key_backups[0])).unwrap(),
+            old_key_pem
+        );
+
+        // 权限：私钥 0600、证书 0644（当前材料与备份都一致）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |name: &str| {
+                std::fs::metadata(tls::cert_dir(&dir).join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode(SERVER_KEY_FILE), 0o600);
+            assert_eq!(mode(SERVER_CERT_FILE), 0o644);
+            assert_eq!(mode(&cert_backups[0]), 0o644);
+            assert_eq!(mode(&key_backups[0]), 0o600);
+        }
+
+        // 原 agent 用原 CA 仍能重连（真实 mTLS 握手）。
+        assert_original_agent_can_reconnect(config, &ca_pem, &agent_cert_pem, &agent_key_pem);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #13：未过期且未进入续签阈值时，启动不得重签、不得产生备份、指纹不变。
+    #[test]
+    fn startup_does_not_rewrite_valid_cert() {
+        let dir = temp_dir("valid-startup");
+        let policy = tls::CertPolicy {
+            server_days: 365,
+            ..Default::default()
+        };
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let cfg = test_config(&dir, 365, 30);
+        let cert_before = read(&dir, SERVER_CERT_FILE);
+        let key_before = read(&dir, SERVER_KEY_FILE);
+        let fingerprint_before = server_fingerprint(&dir);
+
+        let config = load_or_repair_tls_config(&cfg).expect("正常材料必须能启动");
+        assert_eq!(read(&dir, SERVER_CERT_FILE), cert_before, "不得改写证书");
+        assert_eq!(read(&dir, SERVER_KEY_FILE), key_before, "不得改写私钥");
+        assert_eq!(server_fingerprint(&dir), fingerprint_before, "指纹不得变化");
+        assert!(
+            managed_backups(&dir, SERVER_CERT_FILE).is_empty(),
+            "未重签时不应产生备份"
+        );
+        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #13：过期但 `server.key` 不配套属于原有配对自愈，不应误入「仅过期」分支。
+    #[test]
+    fn expired_cert_with_mismatched_key_uses_pair_repair() {
+        let dir = temp_dir("expired-mismatched-key");
+        let policy = tls::CertPolicy {
+            server_days: 365,
+            ..Default::default()
+        };
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let cfg = test_config(&dir, 365, 30);
+        let ca_pem = read(&dir, CA_CERT_FILE);
+        let (old_cert_pem, _) = install_expired_server_pair(&dir, &["localhost".to_string()]);
+        break_key_pair(&dir);
+
+        load_or_repair_tls_config(&cfg).expect("过期 + key 不配套必须走配对自愈");
+
+        let new_cert_pem = read(&dir, SERVER_CERT_FILE);
+        let new_key_pem = read(&dir, SERVER_KEY_FILE);
+        assert_ne!(
+            tls::fingerprint_of_pem(&new_cert_pem).unwrap(),
+            tls::fingerprint_of_pem(&old_cert_pem).unwrap()
+        );
+        assert!(tls::cert_matches_key(&new_cert_pem, &new_key_pem).unwrap());
+        assert!(tls::days_left(&new_cert_pem, now_ms()).unwrap() > 0);
+        assert!(tls::cert_issued_by_ca(&new_cert_pem, &ca_pem, now_ms()).unwrap());
+        assert_eq!(managed_backups(&dir, SERVER_CERT_FILE).len(), 1);
+        assert_eq!(managed_backups(&dir, SERVER_KEY_FILE).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #13：过期自愈必须持有 `CertLock`；锁被占用时拒绝启动且不写任何文件。
+    #[test]
+    fn expired_self_heal_respects_cert_lock() {
+        let dir = temp_dir("expired-lock");
+        let policy = tls::CertPolicy {
+            server_days: 365,
+            ..Default::default()
+        };
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let cfg = test_config(&dir, 365, 30);
+        let (cert_before, key_before) =
+            install_expired_server_pair(&dir, &["localhost".to_string()]);
+
+        let lock = CertLock::acquire(&tls::cert_dir(&dir)).expect("测试先持有 rotate-cert 锁");
+        let err = load_or_repair_tls_config(&cfg)
+            .expect_err("锁被占用时过期自愈必须拒绝启动，不能绕过 rotate-cert 锁");
+        assert!(
+            format!("{err:#}").contains("另一个 rotate-cert 正在运行"),
+            "错误信息必须说明锁被占用: {err:#}"
+        );
+        assert_eq!(read(&dir, SERVER_CERT_FILE), cert_before, "不得改写证书");
+        assert_eq!(read(&dir, SERVER_KEY_FILE), key_before, "不得改写私钥");
+        assert!(
+            managed_backups(&dir, SERVER_CERT_FILE).is_empty(),
+            "获取锁失败时不得产生备份"
+        );
+        assert!(lock.path().exists(), "失败方不得删除他人的锁");
+
+        // 释放锁后同一个过期证书可以被正常自愈。
+        drop(lock);
+        load_or_repair_tls_config(&cfg).expect("释放锁后过期自愈必须成功");
+        assert!(tls::days_left(&read(&dir, SERVER_CERT_FILE), now_ms()).unwrap() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #13：过期不能成为绕过结构校验的借口——SAN/签发者/可解析性/生效时间
+    /// 任一异常都必须拒绝启动，且不写证书、不产生备份。
+    #[test]
+    fn expired_cert_with_structural_problems_is_rejected_without_writing() {
+        let policy = tls::CertPolicy {
+            server_days: 365,
+            ..Default::default()
+        };
+
+        // A. SAN 缺失：证书过期，但 SAN 不覆盖 server_names。
+        let dir = temp_dir("expired-missing-san");
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let cfg = test_config(&dir, 365, 30);
+        let (cert_before, key_before) = install_expired_server_pair(&dir, &[]);
+        let err = load_or_repair_tls_config(&cfg).expect_err("过期 + SAN 缺失必须拒绝启动");
+        let text = format!("{err:#}");
+        assert!(text.contains("SAN"), "错误信息必须点名 SAN: {text}");
+        assert!(text.contains("拒绝启动"), "错误信息: {text}");
+        assert_eq!(read(&dir, SERVER_CERT_FILE), cert_before, "不得改写证书");
+        assert_eq!(read(&dir, SERVER_KEY_FILE), key_before, "不得改写私钥");
+        assert!(
+            managed_backups(&dir, SERVER_CERT_FILE).is_empty(),
+            "拒绝启动时不得产生备份"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // B. 非当前 CA 签发：CA 两件套被整体替换成另一套配套材料。
+        let dir = temp_dir("expired-foreign-ca");
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let cfg = test_config(&dir, 365, 30);
+        let (cert_before, key_before) =
+            install_expired_server_pair(&dir, &["localhost".to_string()]);
+        let other = temp_dir("expired-foreign-ca-other");
+        tls::ensure_hub_material(&other, &["localhost".to_string()], policy).unwrap();
+        for name in [CA_CERT_FILE, CA_KEY_FILE] {
+            let data = read(&other, name);
+            write(&dir, name, data.as_bytes());
+        }
+        let err = load_or_repair_tls_config(&cfg).expect_err("过期证书非当前 CA 签发必须拒绝");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("不是由当前 CA 签发"),
+            "错误信息必须说明签发者不匹配: {text}"
+        );
+        assert_eq!(read(&dir, SERVER_CERT_FILE), cert_before, "不得改写证书");
+        assert_eq!(read(&dir, SERVER_KEY_FILE), key_before, "不得改写私钥");
+        assert!(
+            managed_backups(&dir, SERVER_CERT_FILE).is_empty(),
+            "拒绝启动时不得产生备份"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+
+        // C. CA 材料不配套：过期证书同样不能绕过 CA 配对校验。
+        let dir = temp_dir("expired-mismatched-ca");
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let cfg = test_config(&dir, 365, 30);
+        let (cert_before, key_before) =
+            install_expired_server_pair(&dir, &["localhost".to_string()]);
+        break_ca_pair(&dir);
+        let err = load_or_repair_tls_config(&cfg).expect_err("过期 + CA 不配套必须拒绝启动");
+        let text = format!("{err:#}");
+        assert!(text.contains("不配套"), "错误信息: {text}");
+        assert_eq!(read(&dir, SERVER_CERT_FILE), cert_before, "不得改写证书");
+        assert_eq!(read(&dir, SERVER_KEY_FILE), key_before, "不得改写私钥");
+        assert!(
+            managed_backups(&dir, SERVER_CERT_FILE).is_empty(),
+            "拒绝启动时不得产生备份"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // D. 不可解析。
+        let dir = temp_dir("expired-unparsable");
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let cfg = test_config(&dir, 365, 30);
+        let _ = install_expired_server_pair(&dir, &["localhost".to_string()]);
+        let key_before = read(&dir, SERVER_KEY_FILE);
+        write(&dir, SERVER_CERT_FILE, b"not a certificate");
+        let cert_before = read(&dir, SERVER_CERT_FILE);
+        let err = load_or_repair_tls_config(&cfg).expect_err("不可解析必须拒绝启动");
+        let text = format!("{err:#}");
+        assert!(text.contains("拒绝启动"), "错误信息: {text}");
+        assert!(text.contains("rotate-cert"), "必须给出重签命令: {text}");
+        assert_eq!(read(&dir, SERVER_CERT_FILE), cert_before, "不得改写证书");
+        assert_eq!(read(&dir, SERVER_KEY_FILE), key_before, "不得改写私钥");
+        assert!(managed_backups(&dir, SERVER_CERT_FILE).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // E. 尚未生效：不能把「当前无效」一律当成「仅过期」。
+        // 用相对当前时间的未来窗口，避免固定年份在多年后变成有效证书。
+        let dir = temp_dir("not-yet-valid");
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let cfg = test_config(&dir, 365, 30);
+        let current_year: i32 = tls::format_unix_utc(now_ms() / 1_000)
+            .get(..4)
+            .expect("format_unix_utc 必须返回 YYYY- 开头的时间")
+            .parse()
+            .expect("format_unix_utc 的年份必须是数字");
+        let not_before_year = current_year + 10;
+        let (cert_pem, key_pem) = signed_server_pair(
+            &dir,
+            &["localhost".to_string()],
+            (not_before_year, 1, 1),
+            (not_before_year + 1, 1, 1),
+        );
+        write(&dir, SERVER_CERT_FILE, cert_pem.as_bytes());
+        write(&dir, SERVER_KEY_FILE, key_pem.as_bytes());
+        let err = load_or_repair_tls_config(&cfg).expect_err("尚未生效必须拒绝启动");
+        let text = format!("{err:#}");
+        assert!(text.contains("尚未生效"), "错误信息: {text}");
+        assert_eq!(read(&dir, SERVER_CERT_FILE), cert_pem, "不得改写证书");
+        assert_eq!(read(&dir, SERVER_KEY_FILE), key_pem, "不得改写私钥");
+        assert!(
+            managed_backups(&dir, SERVER_CERT_FILE).is_empty(),
+            "拒绝启动时不得产生备份"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #13：运行时热加载仍拒绝过期证书，启动自愈不能放宽热加载语义。
+    #[test]
+    fn cert_watcher_still_rejects_expired_certificate() {
+        let dir = temp_dir("watcher-expired");
+        let policy = tls::CertPolicy {
+            server_days: 365,
+            ..Default::default()
+        };
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let cfg = test_config(&dir, 365, 30);
+        let (tx, rx) = watch::channel(tls::server_config(&dir).unwrap());
+        let old_status = read_disk_cert_status(&cfg).unwrap();
+        let live = RwLock::new(old_status.clone());
+
+        let (expired_cert, _) = install_expired_server_pair(&dir, &["localhost".to_string()]);
+        let err =
+            reload_server_config_if_changed(&cfg, &tx, &live).expect_err("热加载必须拒绝过期证书");
+        assert!(
+            format!("{err:#}").contains("已过期"),
+            "错误信息必须说明过期: {err:#}"
+        );
+        assert!(!rx.has_changed().unwrap(), "热加载失败不得推送新配置");
+        assert_eq!(read_live(&live), old_status, "失败必须保留旧 live");
+        assert_eq!(
+            read(&dir, SERVER_CERT_FILE),
+            expired_cert,
+            "热加载失败不得改写证书"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

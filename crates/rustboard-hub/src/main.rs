@@ -7,10 +7,13 @@
 //! agent 首次连接只允许发 `Enroll`，换取客户端证书与独立 secret，之后走 mTLS。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -23,6 +26,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
+use http_body::{Body as HttpBody, Frame as BodyFrame, SizeHint};
 use hyper::body::Incoming;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
@@ -73,6 +77,16 @@ const REVOKE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// HTTP/1 请求头读取超时，抵挡 slowloris 一类慢速攻击。
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// 请求体总读取超时（从 header 读完开始一次性计时，不随 frame 重置）。
+///
+/// header 超时只能挡住半截 header；客户端发完 header + 超大 Content-Length 后
+/// 不发 body，读取 body 的 handler 会一直挂住并占住连接槽位。10s 是正常大请求
+/// 的宽裕上限，对逐字节 drip 同样只有一个总 deadline。
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// 管理 API 全局并发连接上限；超出后 accept 到的 TCP 立即关闭。
+const ADMIN_MAX_CONNECTIONS: usize = 256;
+/// 管理 API 单来源 IP 并发连接上限；只绑回环时同样生效。
+const ADMIN_MAX_CONNECTIONS_PER_IP: usize = 32;
 /// 单条 WebSocket 帧的写超时；写不出去说明对端已经不读了，直接清理会话。
 const SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// 客户端续签请求里 CSR 的 PEM 长度上限（16 KiB）。
@@ -828,16 +842,180 @@ async fn serve(app: Router, addr: String) -> Result<()> {
              禁止直接暴露到公网"
         );
     }
-    let listener = tokio::net::TcpListener::bind(sock)
+    let listener = TcpListener::bind(sock)
         .await
         .with_context(|| format!("监听 {sock} 失败"))?;
-    // KI-05：限速需要 ConnectInfo<SocketAddr> 取直连来源 IP。
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-    Ok(())
+    serve_admin_listener(app, listener).await
+}
+
+/// boxed body error，axum 的 `Body::new` 也接受这个错误类型。
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// 请求体总读取超时错误。
+#[derive(Debug)]
+struct BodyReadTimeout;
+
+impl std::fmt::Display for BodyReadTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("请求体读取超时")
+    }
+}
+
+impl std::error::Error for BodyReadTimeout {}
+
+/// 请求体总超时包装（KI-17 剩余缺口）。
+///
+/// 从请求进入（header 读完）启动**一次性** deadline，不随每个 frame 重置，
+/// 因此逐字节 drip 也无法延长；超时后向 axum 返回 body 错误，连接随请求结束关闭。
+/// 用 `Pin<Box<_>>` 避免引入 pin-project 依赖。
+struct DeadlineBody<B> {
+    inner: Pin<Box<B>>,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    timed_out: bool,
+}
+
+impl<B> DeadlineBody<B> {
+    fn new(inner: B, timeout: Duration) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            deadline: Box::pin(tokio::time::sleep(timeout)),
+            timed_out: false,
+        }
+    }
+}
+
+impl<B> HttpBody for DeadlineBody<B>
+where
+    B: HttpBody + Send + 'static,
+    B::Error: Into<BoxError>,
+{
+    type Data = B::Data;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<BodyFrame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.timed_out {
+            return Poll::Ready(None);
+        }
+        // 先检查一次性 deadline：即使 inner 永远 Pending，也会在 10s 时返回错误。
+        if this.deadline.as_mut().poll(cx).is_ready() {
+            this.timed_out = true;
+            return Poll::Ready(Some(Err(Box::new(BodyReadTimeout))));
+        }
+        match this.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        // 超时后对上层表现为流已结束，避免被误判为还有 body。
+        self.timed_out || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// 管理 API 的 accept 循环（KI-17）。
+///
+/// 不用 `axum::serve`：它没有 header 读超时，也拿不到连接数。这里手工 accept，
+/// 与 agent 的 mTLS 入口同款地做「全局 + 每来源 IP」并发限制、HTTP/1 header 超时，
+/// 保证半截 header 的慢连接最多占用 [`HEADER_READ_TIMEOUT`]，洪水下 `/healthz` 仍可用。
+async fn serve_admin_listener(app: Router, listener: TcpListener) -> Result<()> {
+    let sock = listener.local_addr().context("读取管理 API 监听地址失败")?;
+    let permits = Arc::new(Semaphore::new(ADMIN_MAX_CONNECTIONS.max(1)));
+    let limits = Arc::new(ConnectionLimiter::new(ADMIN_MAX_CONNECTIONS_PER_IP));
+    tracing::info!(
+        %sock,
+        max_connections = ADMIN_MAX_CONNECTIONS,
+        max_connections_per_ip = ADMIN_MAX_CONNECTIONS_PER_IP,
+        "管理 API 连接限制已启用"
+    );
+
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) => {
+                // 单个 accept 失败（例如 fd 瞬时耗尽）不应让整个 hub 退出。
+                tracing::warn!(error = %err, "管理 API accept 失败，100ms 后重试");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+
+        // KI-17：先占全局槽位，拿不到立即关 TCP（不读请求、不回响应）。
+        let permit = match try_acquire_connection(&permits) {
+            Some(permit) => permit,
+            None => {
+                tracing::warn!(
+                    %peer,
+                    max_connections = ADMIN_MAX_CONNECTIONS,
+                    "管理 API 连接数已达上限，直接关闭 TCP"
+                );
+                continue;
+            }
+        };
+
+        // 再占来源 IP 槽位；计数归零时删键，表容量有上限。
+        let connection = match limits.try_acquire(peer.ip()) {
+            Ok(connection) => connection,
+            Err(ConnectionLimitRejection::PerIp) => {
+                tracing::warn!(
+                    ip = %peer.ip(),
+                    max_connections_per_ip = ADMIN_MAX_CONNECTIONS_PER_IP,
+                    "管理 API 来源 IP 并发连接已达上限，直接关闭 TCP"
+                );
+                continue;
+            }
+            Err(ConnectionLimitRejection::TableFull) => {
+                tracing::warn!(ip = %peer.ip(), "管理 API 连接来源表已满，拒绝新来源");
+                continue;
+            }
+        };
+
+        if let Err(err) = tcp.set_nodelay(true) {
+            tracing::debug!(%peer, error = %err, "设置 TCP_NODELAY 失败");
+        }
+
+        let app = app.clone();
+        tokio::spawn(async move {
+            // 许可跟随连接生命周期；连接关闭（含超时）后自动归还。
+            let _permit = permit;
+            let _connection = connection;
+
+            // KI-05：管理限速 / 鉴权依赖 ConnectInfo<SocketAddr>，逐请求注入。
+            // KI-17：请求体套一次性总 deadline，慢 body 最多占 10s，不随 frame 重置。
+            let service = tower::service_fn(move |req: Request<Incoming>| {
+                let (mut parts, incoming) = req.into_parts();
+                parts.extensions.insert(ConnectInfo(peer));
+                let body = Body::new(DeadlineBody::new(incoming, BODY_READ_TIMEOUT));
+                let req = Request::from_parts(parts, body);
+                let app = app.clone();
+                async move { app.oneshot(req).await }
+            });
+
+            // 与 agent 入口一致：不用 hyper-util 的 auto builder（它有一个无超时的
+            // HTTP 版本嗅探阶段）；http1 Builder 只对「读 header」计时，header 超时
+            // 不会限制 body（body 由 DeadlineBody 的 10s 总 deadline 单独约束）。
+            if let Err(err) = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(HEADER_READ_TIMEOUT)
+                .serve_connection(TokioIo::new(tcp), TowerToHyperService::new(service))
+                .with_upgrades()
+                .await
+            {
+                // 只记录来源与错误，不记录请求头。
+                tracing::debug!(%peer, error = %err, "管理 API 连接结束");
+            }
+        });
+    }
 }
 
 /// 组装管理 API：`/healthz` 放行，`/api/v1/*` 统一 Bearer 鉴权 + 限速 + 64 KiB 请求体上限。
@@ -2235,6 +2413,8 @@ async fn handle_session(
 
     // 从这里开始，所有退出路径（正常关闭 / recv 错误 / send 错误 / 心跳超时 /
     // 入库错误 / 任务失败）都由 `_cleanup` 的 Drop 统一执行状态清理。
+    // `register` 对同一 agent 会等旧连接的清理回调（写 offline/revoked）结束才插入
+    // 新连接，因此下面的 `upsert_agent(online)` 一定晚于旧 offline 落库。
     let handle = state.sessions.register(&agent_id);
     let _cleanup = SessionCleanup::new(
         state.storage.clone(),
@@ -2779,7 +2959,9 @@ fn mark_seen(state: &AppState, agent_id: &str) {
 /// 会话退出时的统一清理。
 ///
 /// - 只有注册表里的当前连接才有资格改状态（旧连接不覆盖新连接）；
-/// - 吊销状态优先级最高：检测到吊销时恢复为 `revoked`，否则置 `offline`。
+/// - 吊销状态优先级最高：命中吊销恢复为 `revoked`，否则置 `offline`；
+/// - 「最后一条连接注销 + 状态写入」在注册表的 per-agent slot 锁内原子完成，
+///   同一 agent 的新连接注册会被串行化，不会出现旧 offline 覆盖新 online。
 struct SessionCleanup {
     storage: Arc<SqliteStorage>,
     sessions: Arc<SessionRegistry>,
@@ -2804,44 +2986,64 @@ impl SessionCleanup {
         }
     }
 
+    /// 注销本连接；只有「该 agent 的最后一条连接」才写状态。
+    ///
+    /// 关键点：`unregister_last_and_run` 在 per-agent slot 锁内执行回调，而同一
+    /// agent 的新连接 `register` 也要拿这把锁。因此「查吊销 + 写 offline/revoked」
+    /// 与「新连接注册」严格串行：回调先完成，新连接才插入，调用方随后写 online。
+    /// 旧 offline 不可能落在新 online 之后，也不需要再调用 `has_active` 二次检查
+    /// （slot 已空且锁仍未释放，新连接插不进来）。
     fn finish(&mut self) {
         if self.finished {
             return;
         }
         self.finished = true;
 
-        if !self.sessions.unregister(&self.agent_id, self.conn_id) {
-            tracing::debug!(agent = %self.agent_id, conn_id = self.conn_id, "旧会话结束，不修改在线状态");
+        let agent_id = self.agent_id.clone();
+        let storage = self.storage.clone();
+        // 回调内只做一次吊销查询 + 一次单行状态写入；日志与错误处理全部移到
+        // slot 锁外，避免在临界区里做任何可能阻塞的操作。
+        let mut revoked_error: Option<anyhow::Error> = None;
+        let mut written: Option<(&'static str, anyhow::Result<()>)> = None;
+        let removed = self
+            .sessions
+            .unregister_last_and_run(&self.agent_id, self.conn_id, || {
+                // revoked 优先级最高：先查吊销，命中写 revoked，否则才写 offline。
+                let revoked = match storage.is_revoked(&agent_id) {
+                    Ok(revoked) => revoked,
+                    Err(err) => {
+                        revoked_error = Some(err);
+                        false
+                    }
+                };
+                let status = if revoked { "revoked" } else { "offline" };
+                written = Some((status, storage.set_status(&agent_id, status, now_ms())));
+            });
+
+        if !removed {
+            tracing::debug!(
+                agent = %self.agent_id,
+                conn_id = self.conn_id,
+                "旧会话结束，不修改在线状态"
+            );
             return;
         }
-
-        let revoked = match self.storage.is_revoked(&self.agent_id) {
-            Ok(revoked) => revoked,
-            Err(err) => {
-                tracing::warn!(agent = %self.agent_id, error = %err, "清理时查询吊销状态失败");
-                false
+        if let Some(err) = revoked_error {
+            tracing::warn!(agent = %self.agent_id, error = %err, "清理时查询吊销状态失败");
+        }
+        if let Some((status, result)) = written {
+            match result {
+                Ok(()) => {
+                    tracing::info!(agent = %self.agent_id, status = status, "agent 状态已更新");
+                }
+                Err(err) if status == "revoked" => {
+                    tracing::warn!(agent = %self.agent_id, error = %err, "恢复 revoked 状态失败");
+                }
+                Err(err) => {
+                    tracing::warn!(agent = %self.agent_id, error = %err, "更新 agent 状态失败");
+                }
             }
-        };
-        if revoked {
-            // revoked 优先级最高，任何清理都不能把它改回 offline / online。
-            if let Err(err) = self.storage.set_status(&self.agent_id, "revoked", now_ms()) {
-                tracing::warn!(agent = %self.agent_id, error = %err, "恢复 revoked 状态失败");
-            }
-            tracing::info!(agent = %self.agent_id, status = "revoked", "agent 状态已更新");
-            return;
         }
-
-        // 注销与重连的竞态：如果刚刚有新连接注册，不要把它覆盖成 offline。
-        if self.sessions.has_active(&self.agent_id) {
-            tracing::debug!(agent = %self.agent_id, "已有新连接接管，跳过 offline");
-            return;
-        }
-
-        if let Err(err) = self.storage.set_status(&self.agent_id, "offline", now_ms()) {
-            tracing::warn!(agent = %self.agent_id, error = %err, "更新 agent 状态失败");
-            return;
-        }
-        tracing::info!(agent = %self.agent_id, status = "offline", "agent 状态已更新");
     }
 }
 
@@ -3049,6 +3251,7 @@ mod tests {
     use super::*;
     use rustboard_common::fsutil;
     use rustboard_common::model::Sample;
+    use std::sync::mpsc;
 
     /// H1：旧协议必须收到 `bad_protocol` + 「需要 agent ≥ 2」，当前协议放行。
     #[test]
@@ -5770,5 +5973,602 @@ mod tests {
         assert_eq!(entries[0].result, "error");
         assert_eq!(entries[0].error_code, "control_failed");
         assert_eq!(entries[0].error_message, "命令被信号终止");
+    }
+
+    // ------------------------------------------------------------------
+    // #14：会话清理与在线状态竞态（真实 SQLite 集成）
+    // ------------------------------------------------------------------
+
+    /// 真实 SQLite（临时目录文件库）+ 独立注册表，用于会话清理测试。
+    fn session_cleanup_fixture(tag: &str) -> (PathBuf, Arc<SqliteStorage>, Arc<SessionRegistry>) {
+        let dir = temp_dir(tag);
+        let storage = Arc::new(SqliteStorage::open(&dir.join("hub.db")).expect("打开测试库失败"));
+        (dir, storage, SessionRegistry::new())
+    }
+
+    fn agent_status(storage: &SqliteStorage, agent_id: &str) -> String {
+        storage
+            .get_agent(agent_id)
+            .expect("读取 agent 失败")
+            .expect("agent 记录必须存在")
+            .status
+    }
+
+    /// c. 真正最后一条连接断开：回调执行一次，DB 置 offline；`finished` 保证 Drop
+    /// 只清理一次，之后新连接写的 online 不会被二次清理覆盖。
+    #[test]
+    fn session_cleanup_marks_offline_after_last_connection() {
+        let (dir, storage, sessions) = session_cleanup_fixture("cleanup-offline");
+        storage.upsert_agent(&test_agent("a1")).unwrap();
+        let handle = sessions.register("a1");
+        let mut cleanup = SessionCleanup::new(
+            storage.clone(),
+            sessions.clone(),
+            "a1".to_string(),
+            handle.conn_id,
+        );
+
+        cleanup.finish();
+        assert_eq!(agent_status(&storage, "a1"), "offline");
+        assert!(!sessions.has_active("a1"));
+        assert!(sessions.active_agents().is_empty());
+
+        // finished 已置位：之后新连接握手写 online，再次 finish 不得覆盖。
+        let _new = sessions.register("a1");
+        storage.upsert_agent(&test_agent("a1")).unwrap();
+        cleanup.finish();
+        assert_eq!(
+            agent_status(&storage, "a1"),
+            "online",
+            "finished 后不得再次写 offline"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// b. 新连接先完成注册并写 online，旧连接清理必须看到「仍有连接」：
+    /// 返回 false、不执行回调、DB 保持 online。
+    #[test]
+    fn session_cleanup_keeps_online_when_new_connection_exists() {
+        let (dir, storage, sessions) = session_cleanup_fixture("cleanup-reconnect");
+        storage.upsert_agent(&test_agent("a1")).unwrap();
+        let old = sessions.register("a1");
+        let new = sessions.register("a1");
+        // 真实 handle_session 顺序：新连接 register 之后 upsert_agent(online)。
+        storage.upsert_agent(&test_agent("a1")).unwrap();
+
+        let mut cleanup = SessionCleanup::new(
+            storage.clone(),
+            sessions.clone(),
+            "a1".to_string(),
+            old.conn_id,
+        );
+        cleanup.finish();
+
+        assert_eq!(
+            agent_status(&storage, "a1"),
+            "online",
+            "旧连接不得把新连接覆盖成 offline"
+        );
+        assert!(sessions.has_active("a1"));
+        assert_ne!(new.conn_id, old.conn_id);
+        assert!(
+            !sessions.unregister("a1", old.conn_id),
+            "旧连接已不在注册表"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// e. revoked 最高优先级：清理前已吊销，回调命中吊销写 revoked。
+    #[test]
+    fn session_cleanup_restores_revoked_status() {
+        let (dir, storage, sessions) = session_cleanup_fixture("cleanup-revoked");
+        storage.upsert_agent(&test_agent("a1")).unwrap();
+        let handle = sessions.register("a1");
+        storage.revoke_agent("a1", now_ms()).unwrap();
+        assert_eq!(agent_status(&storage, "a1"), "revoked");
+
+        let mut cleanup = SessionCleanup::new(
+            storage.clone(),
+            sessions.clone(),
+            "a1".to_string(),
+            handle.conn_id,
+        );
+        cleanup.finish();
+        assert_eq!(agent_status(&storage, "a1"), "revoked");
+        assert!(!sessions.has_active("a1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// e. 任意交错：吊销后并发「旧连接清理 + 新连接注册」，最终状态始终 revoked。
+    #[test]
+    fn revoked_status_survives_concurrent_register_and_cleanup() {
+        let (dir, storage, sessions) = session_cleanup_fixture("cleanup-revoked-race");
+        for round in 0..20 {
+            let agent_id = format!("revoked-{round}");
+            storage.upsert_agent(&test_agent(&agent_id)).unwrap();
+            let handle = sessions.register(&agent_id);
+            storage.revoke_agent(&agent_id, now_ms()).unwrap();
+
+            let (done_tx, done_rx) = mpsc::channel::<()>();
+
+            let cleanup_storage = storage.clone();
+            let cleanup_sessions = sessions.clone();
+            let cleanup_agent = agent_id.clone();
+            let cleanup_conn = handle.conn_id;
+            let cleanup_done = done_tx.clone();
+            let cleanup = std::thread::spawn(move || {
+                let mut cleanup = SessionCleanup::new(
+                    cleanup_storage,
+                    cleanup_sessions,
+                    cleanup_agent,
+                    cleanup_conn,
+                );
+                cleanup.finish();
+                cleanup_done.send(()).expect("测试线程必须存活");
+            });
+
+            let register_storage = storage.clone();
+            let register_sessions = sessions.clone();
+            let register_agent = agent_id.clone();
+            let register_done = done_tx.clone();
+            let register = std::thread::spawn(move || {
+                let _handle = register_sessions.register(&register_agent);
+                // 模拟新会话握手：upsert 不得把 revoked 改回 online。
+                register_storage
+                    .upsert_agent(&test_agent(&register_agent))
+                    .unwrap();
+                register_done.send(()).expect("测试线程必须存活");
+            });
+
+            for _ in 0..2 {
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| {
+                        panic!("第 {round} 轮吊销/清理/注册并发操作超时（疑似死锁）")
+                    });
+            }
+            cleanup.join().expect("cleanup 线程不得 panic");
+            register.join().expect("register 线程不得 panic");
+            assert_eq!(
+                agent_status(&storage, &agent_id),
+                "revoked",
+                "第 {round} 轮最终状态必须是 revoked"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// a. 确定性交错：旧清理回调停在 slot 锁内（模拟慢 DB），新 register 必须阻塞；
+    /// 释放后旧 offline 先落库、新 online 后写，最终 DB 状态是 online。
+    #[test]
+    fn new_register_waits_for_old_cleanup_callback() {
+        let (dir, storage, sessions) = session_cleanup_fixture("cleanup-barrier");
+        storage.upsert_agent(&test_agent("a1")).unwrap();
+        let old = sessions.register("a1");
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let cleanup_storage = storage.clone();
+        let cleanup_sessions = sessions.clone();
+        let old_id = old.conn_id;
+        let cleanup = std::thread::spawn(move || {
+            cleanup_sessions.unregister_last_and_run("a1", old_id, || {
+                // 与生产回调一致：先查吊销，再写单行状态。DB 写推迟到释放点之后，
+                // 以便把「清理临界区」拉长成可观察窗口（不用 sleep 等待）。
+                let revoked = cleanup_storage.is_revoked("a1").expect("查询吊销失败");
+                entered_tx.send(()).expect("测试线程必须存活");
+                release_rx.recv().expect("等待测试线程释放临界区");
+                let status = if revoked { "revoked" } else { "offline" };
+                cleanup_storage
+                    .set_status("a1", status, now_ms())
+                    .expect("写状态失败");
+            })
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("旧连接清理必须进入回调（slot 锁已持有）");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let register_storage = storage.clone();
+        let register_sessions = sessions.clone();
+        let register = std::thread::spawn(move || {
+            started_tx.send(()).expect("测试线程必须存活");
+            let _handle = register_sessions.register("a1");
+            // 真实 handle_session 顺序：register 返回后写 online。
+            register_storage
+                .upsert_agent(&test_agent("a1"))
+                .expect("写 online 失败");
+            done_tx.send(()).expect("测试线程必须存活");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("注册线程必须启动");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "旧清理回调持有 slot 锁期间，新 register 不得完成写库"
+        );
+
+        release_tx.send(()).expect("cleanup 线程必须存活");
+        assert!(
+            cleanup.join().expect("cleanup 线程不得 panic"),
+            "旧连接是最后一条，回调必须执行"
+        );
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("释放临界区后注册必须完成");
+        register.join().expect("register 线程不得 panic");
+
+        assert!(sessions.has_active("a1"));
+        assert_eq!(
+            agent_status(&storage, "a1"),
+            "online",
+            "旧 offline 必须落在新 online 之前"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// d. 100 轮 register / 旧 conn_id unregister / shutdown 并发交错：
+    /// 每个线程用 `recv_timeout` 做死锁检测；最终活跃集合与 DB 状态一致。
+    #[test]
+    fn concurrent_session_churn_has_no_deadlock() {
+        let (dir, storage, sessions) = session_cleanup_fixture("cleanup-churn");
+        storage.upsert_agent(&test_agent("hot")).unwrap();
+        let mut current = sessions.register("hot");
+
+        for round in 0..100 {
+            let (done_tx, done_rx) = mpsc::channel::<()>();
+
+            let register_sessions = sessions.clone();
+            let register_storage = storage.clone();
+            let register_done = done_tx.clone();
+            let register = std::thread::spawn(move || {
+                let handle = register_sessions.register("hot");
+                // 新会话握手：register 之后写 online。
+                register_storage
+                    .upsert_agent(&test_agent("hot"))
+                    .expect("写 online 失败");
+                register_done.send(()).expect("测试线程必须存活");
+                handle
+            });
+
+            let cleanup_sessions = sessions.clone();
+            let cleanup_storage = storage.clone();
+            let cleanup_done = done_tx.clone();
+            let old_id = current.conn_id;
+            let cleanup = std::thread::spawn(move || {
+                cleanup_sessions.unregister_last_and_run("hot", old_id, || {
+                    let status = if cleanup_storage.is_revoked("hot").expect("查询吊销失败") {
+                        "revoked"
+                    } else {
+                        "offline"
+                    };
+                    cleanup_storage
+                        .set_status("hot", status, now_ms())
+                        .expect("写状态失败");
+                });
+                cleanup_done.send(()).expect("测试线程必须存活");
+            });
+
+            let shutdown_sessions = sessions.clone();
+            let shutdown_done = done_tx.clone();
+            let shutdown = std::thread::spawn(move || {
+                shutdown_sessions.shutdown("hot");
+                shutdown_done.send(()).expect("测试线程必须存活");
+            });
+
+            for _ in 0..3 {
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| {
+                        panic!("第 {round} 轮 register/unregister/shutdown 超时（疑似死锁）")
+                    });
+            }
+            current = register.join().expect("register 线程不得 panic");
+            cleanup.join().expect("cleanup 线程不得 panic");
+            shutdown.join().expect("shutdown 线程不得 panic");
+            assert!(
+                sessions.has_active("hot"),
+                "第 {round} 轮 register 已插入新连接，agent 必须在线"
+            );
+        }
+
+        // 100 轮结束后仍有一条连接：活跃集合与 DB 必须都表现为在线。
+        assert!(sessions.has_active("hot"));
+        assert_eq!(sessions.active_agents(), vec!["hot".to_string()]);
+        assert_eq!(agent_status(&storage, "hot"), "online");
+
+        // 最终断开：最后一条连接注销后由回调写 offline，活跃集合与 DB 一致。
+        let last_conn = current.conn_id;
+        let mut cleanup = SessionCleanup::new(
+            storage.clone(),
+            sessions.clone(),
+            "hot".to_string(),
+            last_conn,
+        );
+        cleanup.finish();
+
+        assert!(!sessions.has_active("hot"));
+        assert!(sessions.active_agents().is_empty());
+        assert_eq!(agent_status(&storage, "hot"), "offline");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // KI-17：管理 API 慢速连接防护（A1）
+    // ------------------------------------------------------------------
+
+    /// 测试路由：验证手工 accept 循环给请求注入了 `ConnectInfo<SocketAddr>`。
+    async fn test_peer_ip(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> String {
+        peer.ip().to_string()
+    }
+
+    /// 测试路由：完整读取请求体（验证 body 总超时只作用于真正读 body 的请求）。
+    async fn test_consume_body(_body: axum::body::Bytes) -> &'static str {
+        "ok"
+    }
+
+    /// 启动一个只提供 `/healthz`、`/peer`、`/consume` 的最小管理口，返回地址与 server 任务。
+    async fn spawn_test_admin_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定测试端口");
+        let addr = listener.local_addr().expect("读取测试端口");
+        let app = Router::new()
+            .route("/healthz", get(healthz))
+            .route("/peer", get(test_peer_ip))
+            .route("/consume", axum::routing::post(test_consume_body));
+        let server = tokio::spawn(async move {
+            let _ = serve_admin_listener(app, listener).await;
+        });
+        (addr, server)
+    }
+
+    /// 发一个完整的 `GET` 请求（带 `Connection: close`），返回原始响应文本。
+    async fn test_http_get(addr: SocketAddr, path: &str) -> std::io::Result<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok(String::from_utf8_lossy(&response).into_owned())
+    }
+
+    /// KI-17：30 条只发半截 header 的 TCP 必须在 10s 内全部被关闭，
+    /// 且慢连接存续期间与关闭之后 `/healthz` 都仍返回 200。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admin_slow_header_connections_are_closed_and_healthz_available() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 本测试依赖 30 < 每 IP / 全局上限，锁定常量防止以后调小后测试失去意义。
+        assert_eq!(ADMIN_MAX_CONNECTIONS, 256);
+        assert_eq!(ADMIN_MAX_CONNECTIONS_PER_IP, 32);
+
+        let (addr, server) = spawn_test_admin_server().await;
+        let response = test_http_get(addr, "/healthz")
+            .await
+            .expect("启动后的健康检查失败");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "启动后 /healthz 必须 200: {response}"
+        );
+
+        // 手工 accept 循环必须继续注入 ConnectInfo（管理限速依赖它）。
+        let peer = test_http_get(addr, "/peer")
+            .await
+            .expect("ConnectInfo 测试请求失败");
+        assert!(
+            peer.contains("127.0.0.1"),
+            "手工 accept 必须注入 ConnectInfo<SocketAddr>: {peer}"
+        );
+
+        // 30 条连接都只发半截 header，不再发送结束的 `\r\n\r\n`。
+        let partial = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nX-Slow: ";
+        let mut slow = Vec::new();
+        for _ in 0..30 {
+            let mut stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("连接管理口");
+            stream.write_all(partial).await.expect("写半截 header");
+            slow.push(stream);
+        }
+        // 让 accept 循环把这些连接登记进限额表。
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 慢连接仍占用 fd 时，健康检查必须可用（30 < 全局 / 每 IP 上限）。
+        let response = test_http_get(addr, "/healthz")
+            .await
+            .expect("慢连接存续期间健康检查失败");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "慢连接存续期间 /healthz 必须仍 200: {response}"
+        );
+
+        // header 读超时是 5s；从建立连接到全部被关闭必须落在 10s 内。
+        let started = std::time::Instant::now();
+        let mut readers = Vec::new();
+        for mut stream in slow {
+            readers.push(tokio::spawn(async move {
+                let mut buf = [0u8; 128];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                }
+            }));
+        }
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            for reader in readers {
+                let _ = reader.await;
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "30 条半截 header 连接必须在 10s 内被关闭");
+        assert!(
+            started.elapsed() <= Duration::from_secs(10),
+            "连接关闭耗时 {:?} 超过 10s",
+            started.elapsed()
+        );
+
+        let response = test_http_get(addr, "/healthz")
+            .await
+            .expect("慢连接关闭后健康检查失败");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "慢连接关闭后 /healthz 必须仍 200: {response}"
+        );
+
+        server.abort();
+    }
+
+    /// KI-17：同一来源 IP 达到并发上限后，下一条连接必须被立即关闭。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admin_per_ip_connection_limit_closes_extra_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (addr, server) = spawn_test_admin_server().await;
+        let partial = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nX-Slow: ";
+
+        // 占满该 IP 的额度：全部只发半截 header，保持连接不结束。
+        let mut held = Vec::new();
+        for _ in 0..ADMIN_MAX_CONNECTIONS_PER_IP {
+            let mut stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("连接管理口");
+            stream.write_all(partial).await.expect("写半截 header");
+            held.push(stream);
+        }
+        // 等 accept 循环处理完这 32 条（TCP accept 队列 FIFO，之后的新连接必然排在其后）。
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut extra = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("内核仍应接受 TCP 握手");
+        // 服务端拒绝时会直接关 TCP，写入可能立刻收到 RST；这本身就是证据。
+        let _ = extra.write_all(partial).await;
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut buf = [0u8; 128];
+            loop {
+                match extra.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "同 IP 第 {} 条连接必须立即被关闭",
+            ADMIN_MAX_CONNECTIONS_PER_IP + 1
+        );
+
+        drop(held);
+        server.abort();
+    }
+
+    /// KI-17 剩余缺口：header 完整、`Content-Length` 很大但永不发送 body 的连接，
+    /// 必须在请求体总超时后关闭（或收到非 2xx），且不能影响 `/healthz`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admin_body_read_timeout_closes_connection_without_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        assert_eq!(BODY_READ_TIMEOUT, Duration::from_secs(10));
+
+        let (addr, server) = spawn_test_admin_server().await;
+        // 先确认 server 已就绪。
+        let health = test_http_get(addr, "/healthz")
+            .await
+            .expect("启动后健康检查失败");
+        assert!(
+            health.starts_with("HTTP/1.1 200"),
+            "启动后 /healthz 必须 200: {health}"
+        );
+
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("连接管理口");
+        // header 完整，声明 8192 字节 body，但一个 body 字节都不发。
+        stream
+            .write_all(
+                b"POST /consume HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8192\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .await
+            .expect("写完整 header");
+
+        let started = std::time::Instant::now();
+        let reader = tokio::spawn(async move {
+            let mut response = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        response.extend_from_slice(&buf[..n]);
+                        // 400/413 响应很小；读到上限只是为了不在异常情况下无限读。
+                        if response.len() >= 16 * 1024 {
+                            break;
+                        }
+                    }
+                }
+            }
+            response
+        });
+
+        // 慢 body 连接存续期间，/healthz 必须仍然可用。
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let health = test_http_get(addr, "/healthz")
+            .await
+            .expect("慢 body 连接存续期间健康检查失败");
+        assert!(
+            health.starts_with("HTTP/1.1 200"),
+            "慢 body 连接存续期间 /healthz 必须仍 200: {health}"
+        );
+
+        let response = tokio::time::timeout(Duration::from_secs(12), reader)
+            .await
+            .expect("header 完整但没有 body 的连接必须在 12s 内关闭或返回响应")
+            .expect("读取任务不得 panic");
+        let elapsed = started.elapsed();
+        // 必须真的等到 body deadline 才关闭：防止路由/提取器提前 404 让用例假通过。
+        assert!(
+            elapsed >= BODY_READ_TIMEOUT.saturating_sub(Duration::from_secs(1)),
+            "连接过早关闭（{elapsed:?}），没有等到请求体 deadline"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(12),
+            "连接关闭耗时 {elapsed:?} 超过 12s"
+        );
+        if !response.is_empty() {
+            let text = String::from_utf8_lossy(&response);
+            assert!(
+                !text.starts_with("HTTP/1.1 2"),
+                "请求体超时不得返回 2xx（实际响应: {text}）"
+            );
+        }
+        eprintln!(
+            "hub 请求体超时：{elapsed:?} 后关闭，收到 {} 字节响应",
+            response.len()
+        );
+
+        let health = test_http_get(addr, "/healthz")
+            .await
+            .expect("超时关闭后健康检查失败");
+        assert!(
+            health.starts_with("HTTP/1.1 200"),
+            "超时关闭后 /healthz 必须仍 200: {health}"
+        );
+
+        server.abort();
     }
 }
