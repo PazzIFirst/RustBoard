@@ -60,9 +60,9 @@ FAKE_DIR="$TMP_DIR/fake"
 mkdir -p "$FAKE_DIR"
 chmod 700 "$TMP_DIR" "$FAKE_DIR"
 
-# #20：agent 从根 fd 单次 openat2 打开日志文件，带 RESOLVE_NO_XDEV，日志文件必须与
-# `/` 同挂载点。/tmp 通常是独立 tmpfs，放在那里会在启动校验时被 EXDEV 拒绝，因此
-# fake 日志源单独放在工作区 target 下（与 `/` 同一挂载点），用 mktemp 保证唯一。
+# #20：agent 从根 fd 单次 openat2 打开日志文件，允许跨挂载点（不启用 NO_XDEV）。
+# 日志夹具仍单独放在工作区 target 下，避免 /tmp 清理策略或挂载布局影响，并便于与
+# 配置/进程日志分开清理；用 mktemp 保证唯一。
 # 配置、进程日志等仍留在 TMP_DIR，保持原有调试习惯。
 mkdir -p "$ROOT/target"
 LOG_DIR=$(mktemp -d "$ROOT/target/rustboard-control-logs.XXXXXX")
