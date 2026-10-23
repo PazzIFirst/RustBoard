@@ -1824,20 +1824,27 @@ fn try_acquire_connection(permits: &Arc<Semaphore>) -> Option<OwnedSemaphorePerm
     permits.clone().try_acquire_owned().ok()
 }
 
-/// TLS accept 层取得的连接许可，随请求 / 会话生命周期持有（KI-27）。
+/// TLS accept 层取得的连接许可，随连接 / 会话生命周期持有（KI-27）。
 ///
 /// 两个字段都用 `Arc` 包裹，使 guard 可以廉价 clone 到请求扩展；只有最后一个
 /// clone 被 drop 时，底层 `OwnedSemaphorePermit` / `ConnectionPermit` 才真正
 /// 归还全局槽位与 per-IP 计数。
 ///
+/// 字段顺序决定 drop 顺序（Rust 按声明顺序释放）。这里让 `_per_ip` 先归还：
+/// `serve_tls` 先取全局许可、再取 per-IP 许可，先释放 per-IP 可以避免同一 IP
+/// 立即重连时出现「全局槽刚空、per-IP 计数尚未归还」的瞬时假拒绝。只是固定
+/// 释放顺序，不改变许可数量与持有语义。
+///
 /// 生命周期：
-/// - 普通 HTTP 请求：`serve_tls` 把 clone 放进请求扩展，响应结束随请求释放；
-/// - WebSocket 升级：`agent_ws` 取出 clone 并移入 `on_upgrade` future，
-///   持有到 `dispatch` 返回，因此 `serve_connection` 提前返回不会提前归还许可。
+/// - 普通 HTTP：连接层由 `service_fn` 闭包中的基础 guard 持有到
+///   `serve_connection` 返回（连接结束）；请求扩展 clone 只活到响应结束，
+///   不会因此提前归还连接许可；
+/// - WebSocket：`agent_ws` 在升级响应前取出 clone 并移入 `on_upgrade` future；
+///   `serve_connection` 提前返回后该 future 仍持有到 `dispatch` 返回（会话结束）。
 #[derive(Clone)]
 struct ConnectionGuards {
-    _global: Arc<OwnedSemaphorePermit>,
     _per_ip: Arc<ConnectionPermit>,
+    _global: Arc<OwnedSemaphorePermit>,
 }
 
 async fn serve_tls(
@@ -1914,11 +1921,13 @@ async fn serve_tls(
         let app = app.clone();
         tokio::spawn(async move {
             // A1 / KI-27：全局信号量许可与 per-IP 许可都包进同一个 guard。
-            // 普通 HTTP 请求随请求扩展在响应结束后释放；WebSocket 升级由
-            // `agent_ws` 把 guard 移入 upgrade future，持有到会话结束。
+            // 普通 HTTP 连接由 service_fn 闭包的基础 guard 持有到
+            // `serve_connection` 返回（连接结束）；请求扩展 clone 随响应释放，
+            // 但不会提前归还许可。WebSocket 升级由 `agent_ws` 把 clone 移入
+            // upgrade future，持有到会话结束。
             let guards = ConnectionGuards {
-                _global: Arc::new(permit),
                 _per_ip: Arc::new(connection),
+                _global: Arc::new(permit),
             };
             let stream =
                 match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
@@ -1942,10 +1951,10 @@ async fn serve_tls(
             let cn_display = cn.clone();
             let service = tower::service_fn(move |mut req: Request<Incoming>| {
                 req.extensions_mut().insert(PeerIdentity(cn.clone()));
-                // A1 / KI-27：每个请求扩展都带上连接 guard。普通 HTTP 请求在
-                // 响应结束后随请求释放；WebSocket 升级时 `agent_ws` 会把这里的
-                // clone 移入 upgrade future，因此 `serve_connection` 提前返回
-                // 不会把全局 / per-IP 许可提前归还。
+                // A1 / KI-27：每个请求扩展都带上连接 guard，供 `agent_ws`
+                // 在升级时取走。请求扩展 clone 随响应结束释放；连接许可本身
+                // 由 `service_fn` 闭包的基础 guard 持有到 `serve_connection`
+                // 返回（连接结束），WS 则从 upgrade future 一直持有到会话结束。
                 req.extensions_mut().insert(guards.clone());
                 let app = app.clone();
                 async move { app.oneshot(req.map(Body::new)).await }
@@ -2634,9 +2643,11 @@ async fn agent_ws(
     Extension(guards): Extension<ConnectionGuards>,
     State(state): State<AppState>,
 ) -> axum::response::Response {
-    // KI-27：连接许可由 TLS 层创建，经请求扩展转交到这里。升级成功后必须把
-    // guard 移入 upgrade future 并持有到 `dispatch` 返回；缺失扩展时 axum 的
-    // `Extension` 提取器返回 500（fail-closed），绝不静默创建无许可会话。
+    // KI-27：连接许可由 TLS 层创建，经请求扩展转交到这里。请求扩展 clone 会
+    // 随升级响应释放，连接层的基础 guard 也只到 `serve_connection` 返回，因此
+    // 必须把取出的 guard 移入 upgrade future、持有到 `dispatch` 返回，才能覆盖
+    // 整个 WebSocket 会话。缺失扩展时 axum 的 `Extension` 提取器返回 500
+    //（fail-closed），绝不静默创建无许可会话。
     ws.max_message_size(MAX_WS_MESSAGE_SIZE)
         .max_frame_size(MAX_WS_FRAME_SIZE)
         .on_upgrade(move |socket| async move {
