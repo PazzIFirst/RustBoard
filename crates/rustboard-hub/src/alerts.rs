@@ -465,6 +465,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notify::MockNotifier::new()),
             archive_download_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            archive_download_send_timeout: crate::ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
         }
     }
 

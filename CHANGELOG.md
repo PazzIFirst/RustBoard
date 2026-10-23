@@ -46,6 +46,8 @@
   `Content-Length`，短读让 body 报错
 - 归档 `status` 的 `last_error` 改为固定码写入 + 读取精确白名单掩码，历史库里的
   URL / 凭据 / 路径 / 超长内容统一显示 `archive_error`
+- 归档下载 body 增加 120s 发送期限：客户端不读 body 时由后台任务释放 64 MiB
+  数据与下载许可，避免唯一 permit 永久阻塞；body drop 自动取消定时任务
 
 ### Security
 
