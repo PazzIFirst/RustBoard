@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-23
+
 ### Added
 
 - #9 管理 API scoped token：SQLite schema v6 `api_tokens`，`read` / `write` / `admin`
