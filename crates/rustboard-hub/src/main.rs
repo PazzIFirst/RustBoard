@@ -42,7 +42,7 @@ use rustboard_common::util::{
 use rustboard_common::wire::{codes, AgentHello, EnrollRequest, Frame, Welcome};
 use rustboard_common::{DEFAULT_HUB_CONFIG, PROTOCOL_VERSION, VERSION};
 use rustboard_core::collect::default_collectors;
-use rustboard_core::downsample;
+use rustboard_core::downsample::{self, ArchiveGate};
 use rustboard_core::storage::sqlite::SqliteStorage;
 use rustboard_core::storage::{
     AgentSeriesRow, IngestOutcome, QueryTooLarge, SampleTier, Storage, AUDIT_RETENTION_MS,
@@ -703,7 +703,7 @@ fn maintenance_run_json(config: Option<PathBuf>, task: MaintenanceTask) -> Resul
             serde_json::to_value(report)?
         }
         MaintenanceTask::Retention => {
-            let report = downsample::run_retention(&storage, &cfg, now, None)
+            let report = downsample::run_retention(&storage, &cfg, now, ArchiveGate::Disabled)
                 .context("保留期任务失败（task=retention）")?;
             serde_json::to_value(report)?
         }
@@ -4084,7 +4084,7 @@ fn spawn_self_monitor(storage: Arc<SqliteStorage>, cfg: HubConfig) {
 /// 语义（与方案 §5.1 / §5.3 一致）：
 /// - 每 `maintenance_interval_secs` 执行一轮；启动后先睡一个周期，**不在启动时
 ///   同步跑大 backfill**，监听不会被占用；
-/// - 每轮先 `run_downsample(..., Some(6))`，再 `run_retention(..., None)`；
+/// - 每轮先 `run_downsample(..., Some(6))`，再 `run_retention(..., ArchiveGate::Disabled)`；
 /// - SQLite 读写全部在 `spawn_blocking` 里，单轮串行不重叠；
 /// - 任何错误只 WARN 并写入 `maintenance_state.last_error`，任务不退出，
 ///   下一轮重试。
@@ -4125,7 +4125,7 @@ fn run_maintenance_round(storage: &SqliteStorage, cfg: &HubConfig) {
             errors.push(message);
         }
     }
-    match downsample::run_retention(storage, cfg, now, None) {
+    match downsample::run_retention(storage, cfg, now, ArchiveGate::Disabled) {
         Ok(report) => tracing::debug!(?report, "维护任务：保留期完成"),
         Err(err) => {
             let message = format!("retention: {err:#}");

@@ -1985,6 +1985,48 @@ impl SqliteStorage {
             .optional()?)
     }
 
+    /// 读取 raw 当前最大 `rowid`，以及 `(after_rowid, max_rowid]` 区间内最旧 `ts`。
+    ///
+    /// 降采样用 `rowid` 水位发现迟到 / 重放批次：新写入的 raw 行 `rowid` 一定
+    /// 更大，即使 `ts` 很旧也能被发现。
+    ///
+    /// **先读 `MAX(rowid)` 再读 `MIN(ts)`**：并发插入的行 `rowid > max`，不会
+    /// 被本轮认领；即使它们 `ts` 很旧，下一轮也会被再次发现，不会漏。
+    ///
+    /// 返回 `(None, None)` 表示 raw 为空。`rowid` 空间可能因整表删除后重新插入
+    /// 而回退（SQLite 未用 AUTOINCREMENT 时会复用 rowid）：此时忽略旧水位，
+    /// 把所有现存行当作新行重新扫描，保守但不漏数据。
+    pub fn raw_new_rows(&self, after_rowid: Option<i64>) -> Result<(Option<i64>, Option<i64>)> {
+        let conn = self.lock_read();
+        let max_rowid: Option<i64> =
+            conn.query_row("SELECT MAX(rowid) FROM samples", [], |row| row.get(0))?;
+        let Some(max_rowid) = max_rowid else {
+            return Ok((None, None));
+        };
+        let after = match after_rowid {
+            // last == max：没有新行，MIN 返回 NULL；
+            // last > max：rowid 回退，按「全部是新行」重新扫描。
+            Some(last) if last <= max_rowid => last,
+            Some(_) | None => 0,
+        };
+        let min_ts: Option<i64> = conn.query_row(
+            "SELECT MIN(ts) FROM samples WHERE rowid > ?1 AND rowid <= ?2",
+            params![after, max_rowid],
+            |row| row.get(0),
+        )?;
+        Ok((Some(max_rowid), min_ts))
+    }
+
+    /// 1m 层最旧桶时间；`None` 表示该层没有数据（用 `MIN` 走索引，不 `COUNT(*)`）。
+    pub fn samples_1m_oldest_ts(&self) -> Result<Option<i64>> {
+        let conn = self.lock_read();
+        Ok(
+            conn.query_row("SELECT MIN(bucket_ts) FROM samples_1m", [], |row| {
+                row.get(0)
+            })?,
+        )
+    }
+
     /// 分批删除 raw 中 `ts < cutoff` 的行；`cutoff` 是排他边界（等于不删）。
     pub fn prune_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
         self.prune_batched(PRUNE_RAW_SQL, cutoff)
@@ -4079,6 +4121,46 @@ mod tests {
         assert_eq!(hour.rows, 1, "两个分钟桶属于同一个整点");
         assert_eq!(hour.oldest_ts, Some(1_699_999_200_000));
         assert_eq!(hour.newest_ts, Some(1_699_999_200_000));
+    }
+
+    /// M4-A2：rowid 扫描能发现增量行、无新行不误报、整表删除后 rowid 回退可恢复。
+    #[test]
+    fn m4a_raw_new_rows_detects_incremental_and_rowid_reset() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        assert_eq!(s.raw_new_rows(None).unwrap(), (None, None));
+
+        let base = 1_700_000_040_000;
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", base + 1_000, 1.0),
+                ("cpu.usage", "{}", base + 2_000, 2.0),
+            ],
+        );
+        let (max, min_ts) = s.raw_new_rows(None).unwrap();
+        let max = max.expect("非空表必须有最大 rowid");
+        assert_eq!(min_ts, Some(base + 1_000));
+        // 没有新行：不得把历史行误报成新行。
+        assert_eq!(s.raw_new_rows(Some(max)).unwrap(), (Some(max), None));
+
+        // 新写入一行更旧 ts 的迟到行：rowid 增长、MIN(ts) 变旧。
+        insert_samples(&s, "a1", &[("cpu.usage", "{}", base - 5_000, 9.0)]);
+        let (max2, min_ts2) = s.raw_new_rows(Some(max)).unwrap();
+        let max2 = max2.expect("迟到的行也有 rowid");
+        assert!(max2 > max);
+        assert_eq!(min_ts2, Some(base - 5_000));
+
+        // 整表删除后重新插入：rowid 回退，旧 rowid 水位必须失效并重新扫描。
+        assert_eq!(s.prune_samples_before(i64::MAX).unwrap().deleted, 3);
+        insert_samples(&s, "a1", &[("cpu.usage", "{}", base + 10_000, 3.0)]);
+        let (max3, min_ts3) = s.raw_new_rows(Some(max2)).unwrap();
+        assert_eq!(
+            min_ts3,
+            Some(base + 10_000),
+            "rowid 回退后必须把全部现存行当作新行"
+        );
+        assert!(max3.unwrap() < max2);
     }
 
     /// M4-A2：删除严格 `< cutoff`（等于不删）、按 5000 行分批、三层都生效。
