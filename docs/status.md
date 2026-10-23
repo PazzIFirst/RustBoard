@@ -14,6 +14,7 @@
 | v0.3.1 硬化 | 🟢 完成 | #10 缓冲物理上界/崩溃恢复、#12 发送超时、#13 过期证书自愈、#14 会话清理原子化、KI-17 慢连接；单元/集成 420，hardening 34/34，v031 94/94 |
 | v0.3.2 控制面可靠性 | 🟢 完成 | #15/#16/#18/#19、1MiB 控制应答帧预算、45s idle 回归；单元/集成 447，v032 66/66、control 100/100、hardening 34/34、v031 94/94、security 9/9、cert 103/103、panel 159/159 |
 | v0.3.3 管理面安全 | 🟢 完成 | #9 scoped token + 管理端 TLS/ Panel `https`+`hub_ca`、#17 吊销窗口、#20 日志 TOCTOU、#21 systemd 未加载 unit；单元/集成 495，v033 100/100、security 9/9、cert 103/103、hardening 36/36、control 100/100、v031 94/94、v032 66/66、panel 159/159 |
+| v0.3.4 低风险硬化 | 🟢 完成 | KI-26 未认证 401 限速、KI-18 重置会话/登录代际、KI-19 Hello 元数据、KI-21 权限与 data_dir 防护、KI-24 多连接能力、备份稳定性；单元/集成 562，v034 97/97，既有 8 套 e2e 全绿 |
 | M4 告警与归档 | ⬜ 未开始 | |
 | M5 安装与交付 | ⬜ 未开始 | |
 
@@ -118,6 +119,31 @@
       pidfd 结束进程、非 0 退出/信号终止审计失败
 - [x] 测试：单元/集成 379；`control.sh` 99/99；`cargo audit` 0 漏洞
 - [x] 独立评审 + 渗透：无高危；审计信任边界与低危限制已记录
+
+## v0.3.4 低风险硬化明细
+
+已完成（对应 KI-26 / KI-18 / KI-19 / KI-21 / KI-24 与备份稳定性）：
+
+- [x] KI-26：`admin_auth_failure_limit_per_min`（默认 60、0 关闭、最大 600）；按来源 IP
+      固定窗口失败限速，超限 429 + `Retry-After` 且不查库；旧 `admin_token` 应急旁路；
+      401/429 WARN 采样
+- [x] KI-18：密码重置后 ≤2s 吊销全部会话；登录认证代际关闭“Argon2 期间重置后旧会话
+      复活”的 TOCTOU（评审/渗透发现后补修）
+- [x] KI-19：Hello 全字段 UTF-8 字节长度/控制字符校验，非法帧 `bad_frame`、不写库不回显
+- [x] KI-21：数据/证书目录 0700、SQLite 主库/WAL/SHM 0600、私有 umask；共享/系统/
+      sticky/符号链接/相对 `data_dir` 拒绝启动，避免误 chmod `/tmp`、`/etc`、`/`
+- [x] KI-24：能力以最新连接为准，旧 Hello 不覆盖，最新断开回退剩余最新已登记能力
+- [x] 证书备份后缀 4 段并按 `(毫秒, 序号)` 淘汰，修复同毫秒偶发误删
+- [x] 测试：Rust 562（agent 100、common 109、core 73、hub 177、panel 103）；
+      `v034.sh` 97/97；`security.sh` 9/9、`cert-rotation.sh` 103/103、
+      `panel.sh` 159/159、`hardening.sh` 36/36、`control.sh` 100/100、
+      `v031.sh` 94/94、`v032.sh` 66/66、`v033.sh` 100/100；`cargo audit` 0
+- [x] 独立评审：首轮 2 个 [严重]（登录竞态、共享目录 chmod）、第二轮 2 个
+      [严重]（尾斜杠/中间符号链接、系统目录漏检）均已修复；第三轮复审无严重项，
+      残余的 validate→create/chmod TOCTOU 需祖先不可被他人写，已在限制中记录
+- [x] 独立渗透（本地实例）：无高危；KI-18 竞态与 data_dir 误 chmod 已修复；
+      新登记中危 KI-27（单 IP WS 会话上限绕过，v0.3.5）与低危/权衡见 known-issues/status
+- [x] 兼容：协议 v2 / DB schema v6 / 证书格式不变；滚动升级；回滚 v0.3.3 只需回代码
 
 ## v0.3.3 管理面安全明细
 
@@ -226,34 +252,45 @@
 5. 面板默认只监听 `127.0.0.1` 且是明文 HTTP；远程访问必须显式 `--listen` 并走 VPN/反代。
    反代场景必须配置 `trusted_proxies` 并确保反代**覆盖**客户端传入的 `X-Forwarded-For`，
    否则攻击者可轮换伪造 IP 绕过登录失败锁定（已知低危，见渗透报告 L1）。
-6. SQLite 数据库文件默认 0644（目录 0755），库内是指标与 agent 元数据，不含明文 secret；
-   多用户宿主机可手工收紧到 0600/0700。
+6. v0.3.4 起数据目录/证书目录 0700，SQLite 主库/WAL/SHM 0600；`data_dir` 必须是
+   本程序独占的绝对子目录（至少两级）。`/tmp`、`/var/tmp`、`/etc`、`/var/log`、`/` 等
+   共享/系统目录、sticky 目录、相对路径、任一祖先或最终组件为符号链接、非 root 指向
+   他人目录会拒绝启动；校验是静态路径检查，祖先目录必须不可被非特权用户写
+   （推荐 root 拥有的专用目录），否则 validate→create 之间仍有本地 TOCTOU。数据库位于 `data_dir` 外时
+   不收紧其父目录（DB 文件仍 0600）。证书目录 0700 后，同机以不同用户运行且直接读
+   hub `ca.crt` 的 Panel 需复制 CA 或以同用户运行。
 7. 客户端证书轮换复用原私钥，因此轮换不能补救私钥泄露；私钥/secret 泄露必须
    `agent revoke` 后重新纳管。CA 私钥是最高敏感资产，泄露等于全部身份失守。
 8. 管理 API 限速按直连来源 IP 统计；置于反代后所有客户端共享反代 IP 的额度。管理口
-   默认只绑回环，反代场景需自行评估并额外限速。
-9. `reset-password` 只热加载新密码，不吊销已有会话 Cookie；若怀疑会话泄露，重置密码后
-   仍需等待 TTL 或重启面板（KI-18，后续版本修复）。
-10. **控制面信任边界**：agent 是 systemd/Docker/进程动作的实际执行者与结果来源。拿到
-    agent 证书 + secret 的主体可以伪造执行结果；hub 审计不能抵抗被控 agent。能力默认关闭、
+   默认只绑回环，反代场景需自行评估并额外限速。v0.3.4 的未认证失败限速同样按直连 IP：
+   NAT 后达到阈值的合法 scoped token 可能收到 429；4096 个来源把失败表填满后，新来源
+   （含合法 scoped token）在窗口内 429，旧 `admin_token` 仍可应急。管理口默认回环，
+   非回环必须置于 VPN/防火墙后。
+9. **控制面信任边界**：agent 是 systemd/Docker/进程动作的实际执行者与结果来源。拿到
+   agent 证书 + secret 的主体可以伪造执行结果；hub 审计不能抵抗被控 agent。能力默认关闭、
    白名单与操作确认是主要防线（KI-25）。
-11. `nginx*` 这类前缀白名单会匹配 `nginx-evil`；需要更精确时请写完整 unit 名或更细前缀。
+10. `nginx*` 这类前缀白名单会匹配 `nginx-evil`；需要更精确时请写完整 unit 名或更细前缀。
     日志白名单文件的硬链接不会被 openat2 拦截（需日志目录写权限，KI-22）。
-12. 同 agent 多连接时，能力缓存以最新 Hello 为准；旧连接断开后可能短暂陈旧（KI-24，
-    后续版本修复）。
-13. 升级 v0.3.2 时先升级 hub，再升级 agent。v0.3.1 hub 的 WebSocket 单帧上限仍是
+11. 升级 v0.3.2 时先升级 hub，再升级 agent。v0.3.1 hub 的 WebSocket 单帧上限仍是
     256 KiB；新 agent 发送超过 256 KiB 的控制结果仍可能被旧 hub 拒绝并断开会话。
-14. v0.3.3 起非回环 `admin_listen` 必须 `admin_tls = "required"`，否则拒绝启动；
+12. v0.3.3 起非回环 `admin_listen` 必须 `admin_tls = "required"`，否则拒绝启动；
     远程 Panel 必须 `hub_url = "https://..."` + `hub_ca`（私有 CA）。管理证书 SAN
     不覆盖访问名时需先更新 `server_names` 并 `rotate-cert --force`。
-15. 回滚到 v0.3.2 前必须先把 `admin_listen` 改回回环：旧二进制不认识 `admin_tls`，
+13. 回滚到 v0.3.2 前必须先把 `admin_listen` 改回回环：旧二进制不认识 `admin_tls`，
     非回环时会按明文 HTTP 启动。scoped token 的 `api_tokens` 表可保留，旧二进制忽略。
-16. #17 的吊销门禁是“检查后再投递”：revoke 提交前已通过会话侧最后一次检查的
+14. #17 的吊销门禁是“检查后再投递”：revoke 提交前已通过会话侧最后一次检查的
     1 条在途命令仍可能执行（`dispatch` 写帧最多等 5s），审计按实际结果记录；
     revoke 之后新发起的请求一律 403。需要零窗口时应引入协议级可取消/租约，
     列入后续版本评估。
-17. 未认证 401 不受管理限速（KI-26，v0.3.4）：错误 token 可驱动 SQLite 查询与 WARN
-    日志。管理口默认回环；非回环必须置于 VPN/防火墙后，`admin_tls` 只加密不认证客户端。
+15. **KI-27（中危，v0.3.5）**：TLS 层的全局/单 IP 连接许可在 HTTP 升级完成时释放，
+    `agent_ws` 只重新占全局 session slot，没有 session 级 per-IP 许可；同一 IP 可用
+    合法 agent 证书占满全局会话，其他 agent 重连 503。详见 known-issues。
+16. Hello 字段超过 WebSocket 单消息上限（1 MiB）时由帧层关闭（1009），客户端收不到
+    `Problem(bad_frame)`；元数据校验覆盖帧上限内的字段，均不写库、不回显。
+17. 同步 SQLite 写（Hello upsert、mark_seen 等）在 DB 被外部长时间持锁/慢盘时可阻塞
+    hub 管理面；正常远程负载下未复现，后续可移入 `spawn_blocking` 并收紧 busy_timeout。
+18. `database` 指向 `data_dir` 外或相对路径时 hub 仍启动：DB 文件 0600、父目录不收紧、
+    无显式告警；非默认配置建议把数据库放在专用 `data_dir` 内。
 
 ## 下一步建议
 

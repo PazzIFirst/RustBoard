@@ -10,7 +10,7 @@
 
 | 状态 | 含义 |
 |---|---|
-| 已修复 | 已确认，尚未排期或尚未开始 |
+| 待修复 | 已确认，尚未排期或尚未开始 |
 | 修复中 | 有分支/PR 正在处理 |
 | 待验证 | 代码已合并，等待独立复测 |
 | 已修复 | 复测通过并记录回归用例 |
@@ -35,14 +35,15 @@
 | KI-11 | 低 | 证书轮换 | 已修复 | v0.2.1 | 并发执行 `rotate-cert` 没有文件锁，可能交错写坏 key/cert |
 | KI-12 | 低 | agent 证书 | 已修复 | v0.2.1 | `session_max_hours=0` 且连接超长时，客户端续签检查只发生在握手 |
 | KI-17 | 中 | hub/panel HTTP | 已修复 | v0.3.1 | 管理 API / 面板监听没有 header 读超时与连接上限，未认证慢速连接可长期占 fd |
-| KI-18 | 低 | panel 会话 | 待修复 | v0.3.1 | `reset-password` 不吊销已有会话 Cookie，最多可继续使用一个 TTL |
-| KI-19 | 低 | hub Hello | 待修复 | v0.3.1 | `name` / `os` / `arch` / `version` 未做长度与控制字符校验 |
+| KI-18 | 低 | panel 会话 | 已修复 | v0.3.4 | `reset-password` 不吊销已有会话 Cookie；v0.3.4 起密码变化后 ≤2s 清空全部会话 |
+| KI-19 | 低 | hub Hello | 已修复 | v0.3.4 | `name` / `os` / `arch` / `version` / `boot_id` 未做长度与控制字符校验；v0.3.4 起统一 `bad_frame` 拒绝 |
 | KI-20 | 低 | 安装命令 | 待修复 | v0.3.1 | `agent add --name` 打印的安装命令未对 name 做 shell 转义 |
-| KI-21 | 低 | 文件权限 | 待修复 | v0.3.1 | SQLite 数据库默认 0644、数据目录 0755（不含明文 secret） |
+| KI-21 | 低 | 文件权限 | 已修复 | v0.3.4 | SQLite 数据库默认 0644、数据目录 0755；v0.3.4 起数据目录 0700、DB/WAL/SHM 0600 |
 | KI-22 | 低 | 控制面日志 | 待修复 | v0.3.1 | 白名单日志文件的硬链接不会被 openat2 拦截（需目录写权限） |
 | KI-23 | 低 | 控制面白名单 | 不修复 | 文档 | `nginx*` 前缀会匹配 `nginx-evil`；这是前缀通配语义，部署时需写更精确的模式 |
-| KI-24 | 低 | 控制面能力 | 待修复 | v0.3.1 | 同 agent 多连接时能力缓存可被新 Hello 覆盖，旧连接断开后可能陈旧 |
-| KI-26 | 中 | 管理 API 认证 | 待修复 | v0.3.4 | 未认证 401 不受管理限速，可反复触发 SHA-256/SQLite 查询并刷 WARN 日志；管理口默认回环，非回环需网络边界 |
+| KI-24 | 低 | 控制面能力 | 已修复 | v0.3.4 | 同 agent 多连接时能力缓存可被新 Hello 覆盖；v0.3.4 起以最新连接为准并支持断开回退 |
+| KI-26 | 中 | 管理 API 认证 | 已修复 | v0.3.4 | 未认证 401 不受管理限速；v0.3.4 起按来源 IP 失败限速，超限 429 且不查库 |
+| KI-27 | 中 | hub 接入层 | 待修复 | v0.3.5 | WebSocket 升级后 TLS 单 IP 许可提前释放；同一 IP 可占满全局 session slots，其他 agent 重连 503 |
 | KI-25 | — | 审计信任边界 | 不修复 | 文档 | agent 是控制动作执行者与结果来源，被控 agent 可伪造成功；审计不能抵抗 |
 | KI-13 | — | agent 升级 | 不修复 | 文档 | v0.1 agent 使用指纹钉扎，服务端证书轮换后会失联 |
 | KI-14 | — | 客户端轮换 | 不修复 | 文档 | 续签复用原私钥，无法补救私钥泄露 |
@@ -194,6 +195,47 @@
   并对 401 WARN 采样；需评估 NAT 共享 IP 的误伤。
 - **关联**：v0.3.3 渗透报告 M1；#9 scoped token。
 
+### v0.3.4 已修复条目（KI-18/19/21/24/26）
+
+- **KI-18**：`SessionStore::revoke_all()`；`reload_password_hash` 检测到哈希变化后清空全部
+  会话；登录增加认证代际，重置瞬间在途的旧密码登录不能在清空后新建会话。
+  回归：`cargo test -p rustboard-panel`；`v034.sh` 3.1–3.8（旧 Cookie ≤2s 401）。
+- **KI-19**：`validate_hello_metadata` 对所有 Hello 元数据做 UTF-8 字节长度与控制字符校验，
+  失败固定 `Problem(bad_frame)`，不写库、不回显字段值。回归：`cargo test -p rustboard-hub`；
+  `v034.sh` 2.1–2.18。
+- **KI-21**：数据/证书目录 0700，SQLite 主库/WAL/SHM 0600；旧 0755/0644 启动时收紧；
+  hub 启动设置私有 umask；`data_dir` 先归一化并逐组件拒绝符号链接，再经共享/系统目录、
+  sticky、owner 与相对路径校验，避免误 chmod `/tmp`、`/etc`、`/var/log`、`/`；
+  不收紧 data_dir 外的共享父目录。回归：`cargo test -p
+  rustboard-common -p rustboard-core -p rustboard-agent -p rustboard-hub`；`v034.sh` 5.1–5.17。
+- **KI-24**：能力按连接保存，只有最新连接写库；最新断开回退到剩余最新已登记能力，
+  全部断开保留历史；`None`（未 Hello）与 `Some(empty)` 区分。回归：`cargo test -p
+  rustboard-hub`；`v034.sh` 4.1–4.19。
+- **KI-26**：新增 `admin_auth_failure_limit_per_min`（默认 60、0 关闭、最大 600），
+  按来源 IP 固定窗口失败限速；超限 429 + `Retry-After` 且不查库，旧 `admin_token`
+  保持应急旁路，401/429 WARN 采样。回归：`cargo test -p rustboard-hub -p
+  rustboard-common`；`v034.sh` 1.1–1.12。
+- 同时修复证书备份同毫秒排序不稳定（`v034` 发布说明），回归：`cargo test -p
+  rustboard-common` 与原偶发测试连续运行。
+- 共同回归：Rust 543 个测试、`v034.sh` 97/97、既有 8 套 e2e 全绿、`cargo audit` 0。
+
+### KI-27 单 IP WebSocket 会话上限绕过
+
+- **现象**（v0.3.4 独立渗透）：`max_connections_per_ip = 16`、`max_connections = 1024`
+  时，同一来源 IP 用合法 agent 证书连续建立 64 条 WebSocket 均成功；小实例
+  `max_connections=8`、`max_connections_per_ip=2` 时同一 IP 占满 8 条，第 9 条合法
+  agent 连接收到 503 `too many sessions`。
+- **影响**：任一持有有效 agent 证书的主体都能从单 IP 耗尽全局 session slots，使其他
+  agent 重连/新纳管 503，监控整体不可用；TLS 层的单 IP 并发限制没有覆盖 WebSocket
+  会话生命周期。
+- **根因**：`serve_tls` 的全局与 per-IP `ConnectionPermit` 在 HTTP 升级完成、
+  `serve_connection` 返回时释放；`agent_ws` 只重新占全局 `session_slots`，没有占
+  session 级 per-IP 许可。
+- **修复方案（v0.3.5）**：把 TLS 层的全局 + per-IP 许可放入请求扩展并移入
+  `on_upgrade` future，持有到 WebSocket 会话结束；或在 `agent_ws` 再取一个
+  session 级 per-IP 许可并持有到会话结束。补单 IP 达上限后第 N+1 条 WS 被拒的 e2e。
+- **关联**：v0.3.4 渗透报告 M2；KI-01 / v0.2.1 单 IP 连接限制的覆盖缺口。
+
 ### KI-13 ~ KI-16 设计/部署限制（不修复）
 
 - **KI-13**：v0.1 agent 仍用指纹钉扎，服务端证书轮换后失联。升级到 v0.2+ 或重新纳管；发布说明与 status.md 保留。
@@ -207,3 +249,4 @@
 |---|---|---|---|---|
 | 2026-10-23 | v0.2.1 | KI-01 ~ KI-12 | `42c98c9`..`f8136ef` | 单元 259；hardening 29/29；security 9/9；cert 103/103；panel 159/159 |
 | 2026-10-23 | v0.3.1 | KI-17 | `258f3b9` | 单元 420；v031 94/94；hardening 34/34 |
+| 2026-10-23 | v0.3.4 | KI-18/19/21/24/26 | `97965c2`..`3f78656` | 单元 562；v034 97/97；既有 8 套 e2e 全绿；audit 0；评审后补修 693899f/106b6d4/3a218ea |
