@@ -9,8 +9,9 @@
 //!   按 `filter_agent_id` / `filter_labels`（精确子集）过滤，每个序列独立状态；
 //! - `agent_offline`：`now - agents.last_seen_at` 与阈值（秒）比较；每个 agent
 //!   一条状态（`series_key` 为空），已吊销 agent 跳过；
-//! - `hub_cert`：读取 `cfg.data_dir/certs/server.crt` 的剩余天数，全局一条状态；
-//!   读盘 / 解析失败只 WARN 并跳过本轮，**绝不 resolve**。
+//! - `hub_cert`：读取 `cfg.data_dir/certs/server.crt` 的剩余**小时数**
+//!   （与 `cert_warn_hours` 同单位），全局一条状态；读盘 / 解析失败只 WARN 并
+//!   跳过本轮，**绝不 resolve**。
 //!
 //! 配置说明：`HubAlertsConfig::offline_after_secs` / `cert_warn_hours` 只用于
 //! 生成内置规则的默认阈值。评估时**规则自身的 threshold 才是权威**——用户改过
@@ -84,18 +85,18 @@ pub(crate) fn evaluate_once(
     cfg: &HubConfig,
     now: i64,
 ) -> Result<EvaluationReport> {
-    evaluate_once_with_cert_days(storage, cfg, now, |cfg| hub_cert_days_left(cfg, now))
+    evaluate_once_with_cert_hours(storage, cfg, now, |cfg| hub_cert_hours_left(cfg, now))
 }
 
-/// 带证书天数注入的评估入口，供单测替换真实证书读取。
+/// 带证书剩余小时数注入的评估入口，供单测替换真实证书读取。
 ///
 /// 生产路径使用 [`evaluate_once`]；测试传 `|_| Ok(20)` 之类的闭包即可覆盖
-/// hub_cert 规则，无需真实证书文件。
-pub(crate) fn evaluate_once_with_cert_days<F>(
+/// hub_cert 规则，无需真实证书文件。单位与规则阈值一致：**小时**。
+pub(crate) fn evaluate_once_with_cert_hours<F>(
     storage: &SqliteStorage,
     cfg: &HubConfig,
     now: i64,
-    cert_days: F,
+    cert_hours: F,
 ) -> Result<EvaluationReport>
 where
     F: Fn(&HubConfig) -> Result<i64>,
@@ -116,7 +117,7 @@ where
 
     // 离线规则共用一份 agent 列表；hub_cert 规则共用一次证书读取。
     let mut agents: Option<Vec<AgentRecord>> = None;
-    let mut cert_days_cache: Option<Option<i64>> = None;
+    let mut cert_hours_cache: Option<Option<i64>> = None;
 
     for rule in rules.iter().take(MAX_ALERT_RULES) {
         let mut context = RuleContext {
@@ -171,11 +172,11 @@ where
                 }
             }
             AlertSource::HubCert => {
-                let cached = match cert_days_cache {
+                let cached = match cert_hours_cache {
                     Some(value) => value,
                     None => {
-                        let loaded = match cert_days(cfg) {
-                            Ok(days) => Some(days),
+                        let loaded = match cert_hours(cfg) {
+                            Ok(hours) => Some(hours),
                             Err(err) => {
                                 context.report.cert_read_errors += 1;
                                 tracing::warn!(
@@ -186,12 +187,12 @@ where
                                 None
                             }
                         };
-                        cert_days_cache = Some(loaded);
+                        cert_hours_cache = Some(loaded);
                         loaded
                     }
                 };
-                let Some(days) = cached else { continue };
-                context.apply("", "", days as f64)?;
+                let Some(hours) = cached else { continue };
+                context.apply("", "", hours as f64)?;
             }
         }
     }
@@ -291,15 +292,17 @@ fn metric_lookback_ms(cfg: &HubConfig) -> i64 {
         .saturating_mul(1_000)
 }
 
-/// 读取 hub 服务端证书剩余天数（`data_dir/certs/server.crt`）。
+/// 读取 hub 服务端证书剩余小时数（`data_dir/certs/server.crt`）。
 ///
+/// **单位是小时**：规则阈值来自 `alerts.cert_warn_hours`（如 48 小时）。旧实现
+/// 用 `days_left` 与「48」比较，等于把阈值放大成 48 天，证书快到期也不会告警。
 /// 只读磁盘上的当前证书：证书轮换 / 续签后下一轮自动使用新值。读取或解析失败
 /// 由调用方 WARN 并跳过，不会 resolve。
-fn hub_cert_days_left(cfg: &HubConfig, now: i64) -> Result<i64> {
+fn hub_cert_hours_left(cfg: &HubConfig, now: i64) -> Result<i64> {
     let path = tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE);
     let pem = std::fs::read_to_string(&path)
         .with_context(|| format!("读取服务端证书失败: {}", path.display()))?;
-    tls::days_left(&pem, now).context("解析服务端证书失败")
+    tls::hours_left(&pem, now).context("解析服务端证书失败")
 }
 
 /// 启动后台告警评估任务。
@@ -730,7 +733,7 @@ mod tests {
                 last_notified_at: None,
             })
             .unwrap();
-        let report = evaluate_once_with_cert_days(&storage, &cfg, now, |_| {
+        let report = evaluate_once_with_cert_hours(&storage, &cfg, now, |_| {
             anyhow::bail!("模拟证书读取失败")
         })
         .unwrap();
@@ -797,9 +800,12 @@ mod tests {
         assert_eq!(storage.list_alert_events(10, None).unwrap().len(), 2);
     }
 
-    /// hub_cert：注入天数，低于 / 高于阈值分别 firing / resolved。
+    /// hub_cert：注入**小时数**，阈值 48 小时，低于 / 高于阈值分别 firing / resolved。
+    ///
+    /// 回归：旧实现用 `days_left` 与 48 比较（等于阈值 48 天）。证书剩 720 小时
+    /// （30 天）在旧语义下 30 < 48 → 误报；新语义 720 > 48 → 不得触发。
     #[test]
-    fn m4_b1b_hub_cert_rule_uses_injected_days() {
+    fn m4_b1fix_hub_cert_rule_uses_injected_hours_not_days() {
         let storage = SqliteStorage::open_in_memory().unwrap();
         let cfg = test_cfg();
         let now = 1_700_000_000_000;
@@ -815,19 +821,29 @@ mod tests {
             ),
         );
 
-        let report = evaluate_once_with_cert_days(&storage, &cfg, now, |_| Ok(20)).unwrap();
+        // 30 天 = 720 小时，远高于 48 小时：不能触发。
+        let report = evaluate_once_with_cert_hours(&storage, &cfg, now, |_| Ok(720)).unwrap();
+        assert_eq!(report.firing_events, 0, "30 天远高于 48 小时，不能触发");
+        assert!(storage.list_alert_events(10, None).unwrap().is_empty());
+
+        // 47 小时 < 48 小时：触发；事件 message 必须用「小时」而不是「天」。
+        let report =
+            evaluate_once_with_cert_hours(&storage, &cfg, now + 15_000, |_| Ok(47)).unwrap();
         assert_eq!(report.firing_events, 1);
         let state = storage
             .get_alert_state("hub-cert", "", "")
             .unwrap()
             .unwrap();
         assert_eq!(state.state, AlertStateKind::Firing);
-        assert_eq!(state.last_value, Some(20.0));
+        assert_eq!(state.last_value, Some(47.0));
         let event = storage.list_alert_events(1, None).unwrap().pop().unwrap();
-        assert!(event.message.contains("证书"));
+        assert!(event.message.contains("证书"), "{event:?}");
+        assert!(event.message.contains("47 小时"), "{event:?}");
+        assert!(!event.message.contains('天'), "{event:?}");
 
+        // 60 小时 > 48：恢复。
         let report =
-            evaluate_once_with_cert_days(&storage, &cfg, now + 15_000, |_| Ok(60)).unwrap();
+            evaluate_once_with_cert_hours(&storage, &cfg, now + 30_000, |_| Ok(60)).unwrap();
         assert_eq!(report.resolved_events, 1);
         let state = storage
             .get_alert_state("hub-cert", "", "")

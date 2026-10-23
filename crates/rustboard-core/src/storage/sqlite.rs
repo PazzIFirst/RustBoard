@@ -1804,23 +1804,62 @@ fn map_alert_rule_unique_error(err: rusqlite::Error) -> anyhow::Error {
     anyhow::anyhow!("写入告警规则失败（数据库错误，详见日志）")
 }
 
+/// 内置规则种子写入失败：名称被其它规则占用必须显式报错，不能静默跳过。
+///
+/// 只用于种子路径；自定义规则走 `create_alert_rule` 的 409 映射。`rule_id` 是
+/// 代码里的固定内置 id，可以安全写进错误信息。
+fn map_seed_alert_rule_error(err: rusqlite::Error, rule_id: &str) -> anyhow::Error {
+    if let rusqlite::Error::SqliteFailure(inner, Some(message)) = &err {
+        if inner.code == rusqlite::ErrorCode::ConstraintViolation
+            && message.contains("alert_rules.name")
+        {
+            return anyhow::anyhow!(
+                "内置告警规则 {rule_id} 的名称已被其它规则占用；\
+                 请先重命名冲突规则再启动 hub"
+            );
+        }
+    }
+    tracing::debug!(error = %err, rule_id = %rule_id, "写入内置告警规则种子失败（非名称唯一冲突）");
+    anyhow::anyhow!("写入内置告警规则 {rule_id} 失败（数据库错误详见日志）")
+}
+
 impl SqliteStorage {
-    /// 写入内置规则种子：`INSERT OR IGNORE`，已存在的规则（含用户改过的阈值 /
-    /// 启停状态）**绝不覆盖**；重复调用幂等，返回本次新插入的条数。
+    /// 写入内置规则种子：按固定 id 已存在的规则（含用户改过的阈值 / 启停状态）
+    /// **绝不覆盖**；重复调用幂等，返回本次新插入的条数。
+    ///
+    /// 与 `INSERT OR IGNORE` 不同：先按 id 查重、再显式 INSERT。这样 `name`
+    /// 唯一冲突（例如升级前用户已建同名自定义规则）会直接失败并回滚整批种子，
+    /// 而不是被 `OR IGNORE` 静默吞掉、留下「缺内置规则」的半残状态。
+    ///
+    /// 注意：id 已存在时整行跳过（可能已被用户改过），因此**不会**把修复前种入
+    /// 的旧内置规则（如 `cert.days_left` + 48）自动迁移成新单位；这类安装需要
+    /// 用户在面板里更新对应规则，或删除后由种子重建。v0.4.0 尚未发布，不存在
+    /// 已发布的旧数据升级路径。
     ///
     /// `now` 作为新插入行的 `created_at` / `updated_at`；调用方通常传 `now_ms()`。
     pub fn seed_builtin_alert_rules(&self, rules: &[AlertRule], now: i64) -> Result<usize> {
         let mut conn = self.lock_write();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let sql = format!(
-            "INSERT OR IGNORE INTO alert_rules {ALERT_RULE_INSERT_COLUMNS} \
+            "INSERT INTO alert_rules {ALERT_RULE_INSERT_COLUMNS} \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
         );
         let mut inserted = 0usize;
         for rule in rules {
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM alert_rules WHERE id = ?1",
+                    params![rule.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if exists.is_some() {
+                // 可能已被用户改过阈值 / 启停 / 名称：种子绝不覆盖。
+                continue;
+            }
             let filter_labels = serde_json::to_string(&rule.filter_labels)?;
             let channel_ids = serde_json::to_string(&rule.channel_ids)?;
-            inserted += tx.execute(
+            tx.execute(
                 &sql,
                 params![
                     rule.id,
@@ -1841,7 +1880,9 @@ impl SqliteStorage {
                     now,
                     now,
                 ],
-            )?;
+            )
+            .map_err(|err| map_seed_alert_rule_error(err, &rule.id))?;
+            inserted += 1;
         }
         tx.commit()?;
         Ok(inserted)
@@ -5410,14 +5451,14 @@ mod tests {
     fn m4_b1_alert_rule_seed_is_idempotent_and_preserves_user_edits() {
         let s = SqliteStorage::open_in_memory().unwrap();
         let now = 1_700_000_000_000;
-        let rules = builtin_rules(now);
+        let rules = builtin_rules(now, 90, 48);
         assert_eq!(s.seed_builtin_alert_rules(&rules, now).unwrap(), 5);
         assert_eq!(s.alert_rule_count().unwrap(), 5);
 
         // 重复种子（哪怕时间戳不同）不新增、不刷新任何字段。
         let same: Vec<AlertRule> = s.list_alert_rules().unwrap();
         assert_eq!(
-            s.seed_builtin_alert_rules(&builtin_rules(now + 1), now + 1)
+            s.seed_builtin_alert_rules(&builtin_rules(now + 1, 90, 48), now + 1)
                 .unwrap(),
             0
         );
@@ -5436,7 +5477,7 @@ mod tests {
         s.update_alert_rule(&edited).unwrap();
 
         assert_eq!(
-            s.seed_builtin_alert_rules(&builtin_rules(now + 120_000), now + 120_000)
+            s.seed_builtin_alert_rules(&builtin_rules(now + 120_000, 90, 48), now + 120_000)
                 .unwrap(),
             0
         );
@@ -5446,12 +5487,60 @@ mod tests {
         assert_eq!(s.alert_rule_count().unwrap(), 5);
     }
 
+    /// M4-B1 修复：种子不能被 name UNIQUE 冲突静默吞掉。
+    ///
+    /// 用户先建了与内置规则同名的自定义规则时，种子必须显式失败并回滚整批，
+    /// 而不是 `INSERT OR IGNORE` 静默跳过、留下缺内置规则的半残状态。
+    #[test]
+    fn m4_b1fix_seed_fails_loudly_on_name_conflict_and_rolls_back() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let now = 1_700_000_000_000;
+
+        // 自定义规则抢占内置规则名（不同 id）。
+        let mut squatter = alert_rule("磁盘使用率过高");
+        squatter.id = "custom-squatter".into();
+        s.create_alert_rule(&squatter).unwrap();
+
+        let err = s
+            .seed_builtin_alert_rules(&builtin_rules(now, 90, 48), now)
+            .expect_err("名称冲突必须显式失败");
+        let text = err.to_string();
+        assert!(
+            text.contains("名称已被其它规则占用") || text.contains("内置告警规则"),
+            "错误信息必须说明种子失败原因: {text}"
+        );
+
+        // 整批回滚：抢占者保留，内置规则一条都不能落库。
+        assert_eq!(s.alert_rule_count().unwrap(), 1);
+        assert_eq!(
+            s.get_alert_rule("custom-squatter").unwrap(),
+            Some(squatter.clone())
+        );
+        assert!(s.get_alert_rule("builtin-agent-offline").unwrap().is_none());
+        assert!(s.get_alert_rule("builtin-disk-percent").unwrap().is_none());
+
+        // 解决冲突后重新种子成功；抢占者不被覆盖。
+        let mut renamed = squatter.clone();
+        renamed.name = "用户自己的磁盘规则".into();
+        s.update_alert_rule(&renamed).unwrap();
+        assert_eq!(
+            s.seed_builtin_alert_rules(&builtin_rules(now, 90, 48), now)
+                .unwrap(),
+            5
+        );
+        assert_eq!(s.alert_rule_count().unwrap(), 6);
+        assert_eq!(
+            s.get_alert_rule("custom-squatter").unwrap().unwrap().name,
+            "用户自己的磁盘规则"
+        );
+    }
+
     /// 内置规则禁删；更新时 `is_builtin` / `created_at` 由存储层保持原值。
     #[test]
     fn m4_b1_alert_rule_builtin_delete_rejected_and_update_keeps_flag() {
         let s = SqliteStorage::open_in_memory().unwrap();
         let now = 42;
-        s.seed_builtin_alert_rules(&builtin_rules(now), now)
+        s.seed_builtin_alert_rules(&builtin_rules(now, 90, 48), now)
             .unwrap();
 
         let err = s.delete_alert_rule("builtin-agent-offline").unwrap_err();

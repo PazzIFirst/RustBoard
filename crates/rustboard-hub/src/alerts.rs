@@ -439,7 +439,7 @@ mod tests {
         let now = now_ms();
         state
             .storage
-            .seed_builtin_alert_rules(&builtin_rules(now), now)
+            .seed_builtin_alert_rules(&builtin_rules(now, 90, 48), now)
             .unwrap()
     }
 
@@ -873,7 +873,10 @@ mod tests {
     /// 内置规则 id 常量与种子一致（避免面板 / 文档引用漂移）。
     #[test]
     fn m4_b1_builtin_ids_are_stable() {
-        let ids: Vec<String> = builtin_rules(0).into_iter().map(|rule| rule.id).collect();
+        let ids: Vec<String> = builtin_rules(0, 90, 48)
+            .into_iter()
+            .map(|rule| rule.id)
+            .collect();
         for id in [
             BUILTIN_AGENT_OFFLINE,
             "builtin-disk-percent",

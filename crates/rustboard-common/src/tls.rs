@@ -58,6 +58,7 @@ const MAX_VALIDITY_DAYS: u32 = 36_500;
 const CLOCK_SKEW_BACKDATE_SECS: i64 = 3_600;
 
 const DAY_MS: i64 = 86_400_000;
+const HOUR_MS: i64 = 3_600_000;
 
 /// hub 的证书目录。
 pub fn cert_dir(data_dir: &Path) -> PathBuf {
@@ -1000,6 +1001,24 @@ pub fn days_left(pem: &str, now_ms: i64) -> Result<i64> {
     Ok((remaining_ms + DAY_MS - 1).div_euclid(DAY_MS))
 }
 
+/// 剩余寿命（小时），向上取整：「还能用几小时」。
+///
+/// 与 [`days_left`] 同源同语义，只是把粒度细到小时：告警阈值单位是小时
+/// （`HubAlertsConfig::cert_warn_hours`），用天粒度比较会把 48 小时放大成
+/// 48 天，导致证书快到期时不触发。
+///
+/// - 新签发的 30 天证书返回 720（而不是 719）；
+/// - `0` 表示正好到期或已过期不足 1 小时，负数表示已过期更多小时；
+/// - 真正的过期判定仍由 rustls / webpki 在握手时完成。
+pub fn hours_left(pem: &str, now_ms: i64) -> Result<i64> {
+    let not_after = not_after_unix(pem)?;
+    let remaining_ms = not_after
+        .checked_mul(1_000)
+        .and_then(|deadline| deadline.checked_sub(now_ms))
+        .ok_or_else(|| anyhow!("计算证书剩余寿命溢出"))?;
+    Ok((remaining_ms + HOUR_MS - 1).div_euclid(HOUR_MS))
+}
+
 /// Unix 秒格式化成 UTC 的 `YYYY-MM-DDTHH:MM:SSZ`（运维展示用）。
 ///
 /// `time` 只启用了默认的 `std` 特性（未启用 `formatting`），这里用日期组件拼装。
@@ -1465,6 +1484,65 @@ mod tests {
         // 展示格式：UTC ISO8601。
         let text = format_unix_utc(0);
         assert_eq!(text, "1970-01-01T00:00:00Z");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M4-B1 修复：剩余小时数必须向上取整，且与到期时刻精确对齐。
+    ///
+    /// 告警阈值单位是小时（`cert_warn_hours`）；用天粒度比较会把 48 小时
+    /// 放大成 48 天，因此这里逐毫秒验证 0 / 1 / 多小时的边界。
+    #[test]
+    fn m4_b1fix_hours_left_rounds_up_and_matches_deadline() {
+        let dir = temp_dir("hours-left");
+        let policy = CertPolicy {
+            ca_days: 3_650,
+            server_days: 30,
+            client_days: 90,
+        };
+        ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let server_pem = read_cert(&dir, SERVER_CERT_FILE);
+        let deadline_ms = not_after_unix(&server_pem).unwrap() * 1_000;
+
+        // 刚签发的 30 天证书 = 720 小时，而不是 719 / 29。
+        let now = crate::util::now_ms();
+        assert_eq!(hours_left(&server_pem, now).unwrap(), 30 * 24);
+        assert_eq!(
+            hours_left(&server_pem, deadline_ms).unwrap(),
+            0,
+            "正好到期必须返回 0"
+        );
+
+        // 到期前 1 毫秒：向上取整为 1 小时。
+        assert_eq!(hours_left(&server_pem, deadline_ms - 1).unwrap(), 1);
+        // 正好剩余 N 小时仍返回 N；多 1 毫秒必须进位到 N+1。
+        assert_eq!(hours_left(&server_pem, deadline_ms - HOUR_MS).unwrap(), 1);
+        assert_eq!(
+            hours_left(&server_pem, deadline_ms - HOUR_MS - 1).unwrap(),
+            2
+        );
+        assert_eq!(
+            hours_left(&server_pem, deadline_ms - 48 * HOUR_MS).unwrap(),
+            48
+        );
+        assert_eq!(
+            hours_left(&server_pem, deadline_ms - 48 * HOUR_MS - 1).unwrap(),
+            49
+        );
+
+        // 过期：不足 1 小时按 0，整小时按负数。
+        assert_eq!(hours_left(&server_pem, deadline_ms + 1).unwrap(), 0);
+        assert_eq!(hours_left(&server_pem, deadline_ms + HOUR_MS).unwrap(), -1);
+        assert_eq!(
+            hours_left(&server_pem, deadline_ms + HOUR_MS + 1).unwrap(),
+            -1
+        );
+        assert_eq!(
+            hours_left(&server_pem, deadline_ms + 2 * HOUR_MS).unwrap(),
+            -2
+        );
+
+        // 非证书输入必须报错，不能 panic。
+        assert!(hours_left("not a cert", now).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

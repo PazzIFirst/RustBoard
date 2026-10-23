@@ -403,7 +403,8 @@ async fn run_async(cfg: AgentConfig) -> Result<()> {
         let interval = sample_interval.clone();
         let notify = notify.clone();
         // M4-B1：采集任务需要 buffer 上限（算 pending_ratio）与证书路径（算
-        // cert.days_left），克隆一份配置避免与上传主循环共享引用生命周期。
+        // cert.days_left / cert.hours_left），克隆一份配置避免与上传主循环共享
+        // 引用生命周期。
         let cfg = cfg.clone();
         tokio::spawn(async move {
             loop {
@@ -413,14 +414,15 @@ async fn run_async(cfg: AgentConfig) -> Result<()> {
                 for collector in collectors.iter() {
                     samples.extend(collector.collect(ts));
                 }
-                // M4-B1：客户端证书剩余天数；未纳管 / 读取失败时跳过该条指标，
-                // 只记 debug（每个采集周期都失败时不能刷 WARN）。
-                match client_cert_days_left(&cfg) {
-                    Ok(days_left) => {
+                // M4-B1：客户端证书剩余寿命（天 + 小时）。未纳管 / 读取失败时
+                // 跳过这两个指标，只记 debug（每个采集周期都失败时不能刷 WARN）。
+                match client_cert_lifetimes(&cfg, ts) {
+                    Ok((days_left, hours_left)) => {
                         samples.push(Sample::new("cert.days_left", ts, days_left as f64));
+                        samples.push(Sample::new("cert.hours_left", ts, hours_left as f64));
                     }
                     Err(err) => {
-                        tracing::debug!(error = %err, "读取客户端证书剩余天数失败，跳过指标")
+                        tracing::debug!(error = %err, "读取客户端证书剩余寿命失败，跳过指标")
                     }
                 }
 
@@ -551,12 +553,23 @@ fn cert_check_due(days_left: i64, threshold: i64, now_ms: i64, last_attempt_ms: 
     now_ms.saturating_sub(last_attempt_ms) >= CERT_RENEW_RETRY_MS
 }
 
-/// 读取本地客户端证书剩余天数。
-fn client_cert_days_left(cfg: &AgentConfig) -> Result<i64> {
+/// 读取本地客户端证书剩余寿命（天 + 小时），同一份 PEM 只读一次。
+///
+/// `cert.days_left` 保留给旧面板 / 旧规则；`cert.hours_left` 供按小时配置的
+/// 证书告警使用（阈值单位是小时，避免把 48 小时误当成 48 天）。
+fn client_cert_lifetimes(cfg: &AgentConfig, now: i64) -> Result<(i64, i64)> {
     let cert_path = cfg.data_dir.join(AGENT_CERT);
     let cert_pem = std::fs::read_to_string(&cert_path)
         .with_context(|| format!("读取客户端证书失败: {}", cert_path.display()))?;
-    tls::days_left(&cert_pem, now_ms())
+    Ok((
+        tls::days_left(&cert_pem, now)?,
+        tls::hours_left(&cert_pem, now)?,
+    ))
+}
+
+/// 读取本地客户端证书剩余天数（会话内续签检查用）。
+fn client_cert_days_left(cfg: &AgentConfig) -> Result<i64> {
+    Ok(client_cert_lifetimes(cfg, now_ms())?.0)
 }
 
 /// 本地缓冲占用比例：`pending / max`，夹在 0..=1；`max = 0` 时返回 0。
@@ -1490,16 +1503,18 @@ mod tests {
         assert!(ratio.is_finite());
     }
 
-    /// M4-B1：未纳管（没有 agent.crt）时 `cert.days_left` 读取失败并跳过，
-    /// 不影响采集；返回的是可读错误而不是 panic。
+    /// M4-B1：未纳管（没有 agent.crt）时 `cert.days_left` / `cert.hours_left`
+    /// 读取失败并跳过，不影响采集；返回的是可读错误而不是 panic。
     #[test]
-    fn m4_b1_cert_days_left_missing_file_is_skipped() {
+    fn m4_b1_cert_lifetimes_missing_file_is_skipped() {
         let dir = temp_dir("cert-missing");
         let cfg = AgentConfig {
             data_dir: dir.clone(),
             ..AgentConfig::default()
         };
-        let err = client_cert_days_left(&cfg).expect_err("未纳管时读取证书必须失败");
+        let err = client_cert_lifetimes(&cfg, now_ms()).expect_err("未纳管时读取证书必须失败");
+        assert!(err.to_string().contains("读取客户端证书失败"));
+        let err = client_cert_days_left(&cfg).expect_err("会话续签路径同样必须失败");
         assert!(err.to_string().contains("读取客户端证书失败"));
         let _ = std::fs::remove_dir_all(&dir);
     }

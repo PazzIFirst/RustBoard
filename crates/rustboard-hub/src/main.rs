@@ -1149,11 +1149,19 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
 
         // M4-B1：内置告警规则是面板与告警引擎的功能依赖（固定 id，创建接口只生成
         // UUID），启动后无法补种，因此种子失败直接上抛，不让 hub 以缺规则的半残
-        // 状态监听。`INSERT OR IGNORE` 保证重启幂等，且绝不覆盖用户改过的阈值 /
-        // 启停状态；内置规则初始 disabled，升级后不会产生意外通知。
+        // 状态监听。种子按固定 id 幂等、绝不覆盖用户改过的阈值 / 启停状态；名称被
+        // 其它规则占用时显式失败（不再静默跳过）。初始阈值来自 `[alerts]` 配置：
+        // 离线用 `offline_after_secs`（秒），证书用 `cert_warn_hours`（小时）。
         let seed_now = now_ms();
         let seeded = storage
-            .seed_builtin_alert_rules(&builtin_rules(seed_now), seed_now)
+            .seed_builtin_alert_rules(
+                &builtin_rules(
+                    seed_now,
+                    cfg.alerts.offline_after_secs,
+                    cfg.alerts.cert_warn_hours,
+                ),
+                seed_now,
+            )
             .context("写入内置告警规则失败")?;
         if seeded > 0 {
             tracing::info!(seeded, "已写入内置告警规则（初始 disabled）");

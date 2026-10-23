@@ -560,7 +560,8 @@ fn alert_rule_input_enforces_label_channel_and_filter_limits() {
 #[test]
 fn builtin_rules_are_five_fixed_disabled_and_channel_free() {
     let now = 1_700_000_000_123_i64;
-    let rules = builtin_rules(now);
+    let alerts = HubAlertsConfig::default();
+    let rules = builtin_rules(now, alerts.offline_after_secs, alerts.cert_warn_hours);
     assert_eq!(rules.len(), 5, "内置规则必须固定 5 条");
 
     let expected_ids: BTreeSet<&str> = BTreeSet::from([
@@ -609,7 +610,10 @@ fn builtin_rules_are_five_fixed_disabled_and_channel_free() {
     let offline = by_id[BUILTIN_AGENT_OFFLINE];
     assert_eq!(offline.source, AlertSource::AgentOffline);
     assert_eq!(offline.metric, "");
-    assert_eq!(offline.threshold, 90.0, "离线阈值默认 90 秒");
+    assert_eq!(
+        offline.threshold, 90.0,
+        "离线阈值默认取 alerts.offline_after_secs = 90 秒"
+    );
 
     let disk = by_id[BUILTIN_DISK_PERCENT];
     assert_eq!(disk.source, AlertSource::Metric);
@@ -617,15 +621,62 @@ fn builtin_rules_are_five_fixed_disabled_and_channel_free() {
 
     let agent_cert = by_id[BUILTIN_AGENT_CERT];
     assert_eq!(agent_cert.source, AlertSource::Metric);
-    assert_eq!(agent_cert.metric, "cert.days_left");
+    assert_eq!(
+        agent_cert.metric, "cert.hours_left",
+        "证书阈值单位是小时，不能再使用 days_left"
+    );
+    assert_eq!(
+        agent_cert.threshold, 48.0,
+        "证书阈值默认取 alerts.cert_warn_hours = 48 小时"
+    );
 
     let hub_cert = by_id[BUILTIN_HUB_CERT];
     assert_eq!(hub_cert.source, AlertSource::HubCert);
     assert_eq!(hub_cert.metric, "");
+    assert_eq!(hub_cert.threshold, 48.0, "hub 证书阈值同样是 48 小时");
 
     let buffer = by_id[BUILTIN_BUFFER_BACKLOG];
     assert_eq!(buffer.source, AlertSource::Metric);
     assert_eq!(buffer.metric, "buffer.pending_ratio");
+}
+
+/// 内置离线 / 证书阈值必须来自 `HubAlertsConfig`，且证书规则用小时指标。
+///
+/// 回归：旧实现把 48 小时当成 48 天（`cert.days_left` + 阈值 48）。
+#[test]
+fn builtin_rules_thresholds_track_config() {
+    let now = 1_700_000_000_456_i64;
+    let alerts = HubAlertsConfig {
+        offline_after_secs: 30,
+        cert_warn_hours: 72,
+        ..HubAlertsConfig::default()
+    };
+    let rules = builtin_rules(now, alerts.offline_after_secs, alerts.cert_warn_hours);
+    let by_id: BTreeMap<&str, &AlertRule> =
+        rules.iter().map(|rule| (rule.id.as_str(), rule)).collect();
+
+    assert_eq!(
+        by_id[BUILTIN_AGENT_OFFLINE].threshold,
+        f64::from(30_u32),
+        "离线阈值必须取 offline_after_secs"
+    );
+    assert_eq!(
+        by_id[BUILTIN_AGENT_CERT].metric, "cert.hours_left",
+        "agent 证书规则必须使用小时指标"
+    );
+    assert_eq!(
+        by_id[BUILTIN_AGENT_CERT].threshold,
+        f64::from(72_u32),
+        "agent 证书阈值必须取 cert_warn_hours（小时）"
+    );
+    assert_eq!(
+        by_id[BUILTIN_HUB_CERT].threshold,
+        f64::from(72_u32),
+        "hub 证书阈值必须取 cert_warn_hours（小时）"
+    );
+    // 非证书规则不受影响。
+    assert_eq!(by_id[BUILTIN_DISK_PERCENT].threshold, 90.0);
+    assert_eq!(by_id[BUILTIN_BUFFER_BACKLOG].threshold, 0.8);
 }
 
 #[test]
@@ -636,7 +687,7 @@ fn seed_builtin_alert_rules_is_idempotent_and_preserves_user_edits() {
 
     assert_eq!(
         storage
-            .seed_builtin_alert_rules(&builtin_rules(now), now)
+            .seed_builtin_alert_rules(&builtin_rules(now, 90, 48), now)
             .expect("首次种子失败"),
         5,
         "首次种子必须插入 5 条"
@@ -647,7 +698,7 @@ fn seed_builtin_alert_rules_is_idempotent_and_preserves_user_edits() {
 
     assert_eq!(
         storage
-            .seed_builtin_alert_rules(&builtin_rules(now + 60_000), now + 60_000)
+            .seed_builtin_alert_rules(&builtin_rules(now + 60_000, 90, 48), now + 60_000)
             .expect("重复种子失败"),
         0,
         "再次种子必须插入 0 条"
@@ -676,7 +727,7 @@ fn seed_builtin_alert_rules_is_idempotent_and_preserves_user_edits() {
 
     assert_eq!(
         storage
-            .seed_builtin_alert_rules(&builtin_rules(now + 240_000), now + 240_000)
+            .seed_builtin_alert_rules(&builtin_rules(now + 240_000, 90, 48), now + 240_000)
             .expect("用户改动后再种子失败"),
         0,
         "已存在时种子必须插入 0 条"
@@ -816,7 +867,7 @@ fn alert_rule_crud_roundtrip_and_domain_errors() {
 
     // 内置规则：可更新（启停/阈值），但禁止删除。
     storage
-        .seed_builtin_alert_rules(&builtin_rules(1_700_000_200_000), 1_700_000_200_000)
+        .seed_builtin_alert_rules(&builtin_rules(1_700_000_200_000, 90, 48), 1_700_000_200_000)
         .expect("种子内置规则失败");
     assert_eq!(
         store_error(
@@ -868,7 +919,7 @@ fn alert_rule_limit_is_enforced_without_writing() {
 
     assert_eq!(
         storage
-            .seed_builtin_alert_rules(&builtin_rules(now), now)
+            .seed_builtin_alert_rules(&builtin_rules(now, 90, 48), now)
             .expect("种子内置规则失败"),
         5
     );

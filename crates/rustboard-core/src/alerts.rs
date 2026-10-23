@@ -62,7 +62,7 @@ pub enum AlertSource {
     Metric,
     /// agent 离线：比较 `now - last_seen_at` 与阈值（秒）。
     AgentOffline,
-    /// hub 服务端证书剩余天数。
+    /// hub 服务端证书剩余小时数（与 `cert_warn_hours` 同单位）。
     HubCert,
 }
 
@@ -524,7 +524,17 @@ pub const BUILTIN_BUFFER_BACKLOG: &str = "builtin-buffer-backlog";
 /// 有渠道时可能产生用户没预期的告警。面板启用并绑定渠道后才真正生效。
 ///
 /// `now` 只用于 `created_at` / `updated_at`；种子已存在时存储层绝不覆盖用户改动。
-pub fn builtin_rules(now: i64) -> Vec<AlertRule> {
+///
+/// `offline_after_secs` / `cert_warn_hours` 来自 `HubAlertsConfig`：内置规则只在
+/// **首次种入**时使用当时的配置值，之后规则自身的 `threshold` 才是权威——用户
+/// 改过阈值后，改配置不会覆盖它（与方案「规则阈值优先」一致）。
+///
+/// 单位必须与评估口径一致：
+/// - 离线：秒；
+/// - agent / hub 证书：小时（agent 上传的 `cert.hours_left` 也是小时）。
+pub fn builtin_rules(now: i64, offline_after_secs: u64, cert_warn_hours: u32) -> Vec<AlertRule> {
+    let offline_threshold = offline_after_secs as f64;
+    let cert_threshold = f64::from(cert_warn_hours);
     vec![
         builtin_rule(
             BUILTIN_AGENT_OFFLINE,
@@ -532,7 +542,7 @@ pub fn builtin_rules(now: i64) -> Vec<AlertRule> {
             AlertSource::AgentOffline,
             "",
             Comparator::Gt,
-            90.0,
+            offline_threshold,
             0,
             1_800,
             now,
@@ -552,9 +562,9 @@ pub fn builtin_rules(now: i64) -> Vec<AlertRule> {
             BUILTIN_AGENT_CERT,
             "Agent 证书即将过期",
             AlertSource::Metric,
-            "cert.days_left",
+            "cert.hours_left",
             Comparator::Lt,
-            48.0,
+            cert_threshold,
             0,
             1_800,
             now,
@@ -565,7 +575,7 @@ pub fn builtin_rules(now: i64) -> Vec<AlertRule> {
             AlertSource::HubCert,
             "",
             Comparator::Lt,
-            48.0,
+            cert_threshold,
             0,
             1_800,
             now,
@@ -1082,7 +1092,7 @@ pub fn alert_event_message(
             format!("{subject} 离线时长 {value_text} 秒，阈值 {comparator} {threshold} 秒")
         }
         AlertSource::HubCert => format!(
-            "{subject} Hub 服务端证书剩余 {value_text} 天，阈值 {comparator} {threshold} 天"
+            "{subject} Hub 服务端证书剩余 {value_text} 小时，阈值 {comparator} {threshold} 小时"
         ),
     };
     let verb = match state {
@@ -1170,7 +1180,7 @@ mod tests {
     /// 内置规则：固定 id、5 条、全部 disabled、is_builtin、无渠道、阈值语义正确。
     #[test]
     fn m4_b1_builtin_rules_are_fixed_disabled_and_channel_free() {
-        let rules = builtin_rules(1_700_000_000_000);
+        let rules = builtin_rules(1_700_000_000_000, 90, 48);
         assert_eq!(rules.len(), 5);
         let ids: Vec<&str> = rules.iter().map(|rule| rule.id.as_str()).collect();
         assert_eq!(
@@ -1211,7 +1221,7 @@ mod tests {
         assert_eq!(disk.duration_secs, 300);
 
         let cert = by_id(BUILTIN_AGENT_CERT);
-        assert_eq!(cert.metric, "cert.days_left");
+        assert_eq!(cert.metric, "cert.hours_left", "证书阈值单位是小时");
         assert_eq!(cert.comparator, Comparator::Lt);
         assert_eq!(cert.threshold, 48.0);
 
@@ -1224,6 +1234,47 @@ mod tests {
         assert_eq!(buffer.metric, "buffer.pending_ratio");
         assert_eq!(buffer.threshold, 0.8);
         assert_eq!(buffer.duration_secs, 60);
+    }
+
+    /// M4-B1 修复：内置离线 / 证书阈值必须来自 `HubAlertsConfig`，不是写死的 90/48。
+    ///
+    /// 证书阈值单位是**小时**：如果仍用 `cert.days_left` + 48，语义会变成「48 天
+    /// 就告警」；这里同时锁定 metric 名与数值来源。
+    #[test]
+    fn m4_b1fix_builtin_thresholds_come_from_config() {
+        let now = 1_700_000_000_000;
+        let rules = builtin_rules(now, 120, 72);
+        let by_id = |id: &str| rules.iter().find(|rule| rule.id == id).unwrap();
+
+        let offline = by_id(BUILTIN_AGENT_OFFLINE);
+        assert_eq!(
+            offline.threshold, 120.0,
+            "离线阈值必须取 alerts.offline_after_secs"
+        );
+        assert_eq!(offline.comparator, Comparator::Gt);
+
+        let agent_cert = by_id(BUILTIN_AGENT_CERT);
+        assert_eq!(
+            agent_cert.metric, "cert.hours_left",
+            "agent 证书规则必须使用小时指标"
+        );
+        assert_eq!(
+            agent_cert.threshold, 72.0,
+            "agent 证书阈值必须取 alerts.cert_warn_hours"
+        );
+        assert_eq!(agent_cert.comparator, Comparator::Lt);
+
+        let hub_cert = by_id(BUILTIN_HUB_CERT);
+        assert_eq!(
+            hub_cert.threshold, 72.0,
+            "hub 证书阈值必须取 alerts.cert_warn_hours"
+        );
+        assert_eq!(hub_cert.source, AlertSource::HubCert);
+        assert_eq!(hub_cert.comparator, Comparator::Lt);
+
+        // 非证书规则不受这两个配置影响。
+        assert_eq!(by_id(BUILTIN_DISK_PERCENT).threshold, 90.0);
+        assert_eq!(by_id(BUILTIN_BUFFER_BACKLOG).threshold, 0.8);
     }
 
     /// source / comparator 的字符串编码必须与 v7 表约定一致，且拒绝未知值。
@@ -1803,6 +1854,11 @@ mod tests {
         rule.source = AlertSource::HubCert;
         let cert = alert_event_message(&rule, "", AlertStateKind::Firing, 20.0);
         assert!(cert.contains("证书") && cert.contains("全局"), "{cert}");
+        assert!(
+            cert.contains("小时"),
+            "hub_cert 事件必须以小时为单位: {cert}"
+        );
+        assert!(!cert.contains("天"), "hub_cert 事件不能再用天: {cert}");
 
         // 超长消息：严格按 UTF-8 边界截断到 512 字节以内。
         let mut long = base_rule();
