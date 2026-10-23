@@ -143,7 +143,10 @@
       `v031.sh` 94/94、`v032.sh` 66/66、`panel.sh` 159/159；web 48/48；
       `cargo audit` 0 漏洞
 - [x] 独立评审：A1/A2/C/D 分项评审；[严重] 项（actor 撞名、hardening e2e、
-      `NO_XDEV` 启动回归）均已修复；最终安全复审与渗透见发布记录
+      `NO_XDEV` 启动回归）均已修复；最终安全复审无 [严重]
+- [x] 独立渗透（本地实例）：**无未修复高危**；中危 1 项 KI-26（未认证 401 不受
+      管理限速，计划 v0.3.4），低危 systemd 超时 join / #17 在途窗口已记录；
+      认证、TLS、注入、路径逃逸、资源、泄露、Panel CA 等必测项通过
 - [x] 升级顺序：先升级 hub（自动 v6 迁移），按需启用 `admin_tls` 并
       `rotate-cert`；Panel 最后改 `https://` + `hub_ca`；回滚前先把
       `admin_listen` 改回回环
