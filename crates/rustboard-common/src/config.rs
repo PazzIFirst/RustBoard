@@ -87,6 +87,10 @@ impl AgentConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        // KI-21：data_dir 完全归 agent 所有。共享 / 系统目录会被启动初始化
+        // chmod 成 0700，必须在读取配置时就拒绝，而不是等 prepare_data_dir 动手。
+        crate::fsutil::validate_private_dir_path(&self.data_dir)
+            .map_err(|err| Error::InvalidConfig(format!("data_dir 不安全: {err}")))?;
         if self.hub_url.trim().is_empty() {
             return Err(Error::InvalidConfig("hub_url 不能为空".into()));
         }
@@ -621,9 +625,15 @@ impl HubConfig {
 
     /// 业务校验：`run` / `init` 入口都会调用。
     ///
-    /// 只校验配置值本身是否自洽，不读写证书文件。`admin_token` 属于 M2 的鉴权范围，
-    /// 本阶段不校验（为空仍允许启动，保持 v0.1 行为）。
+    /// 校验配置值是否自洽，并确认 `data_dir` 是可以交给本程序独占的私有目录
+    /// （共享 / 系统目录会在启动时被 chmod，必须提前拒绝）。`data_dir` 已存在时
+    /// 只读取元数据，不修改权限；不读写证书文件。`admin_token` 属于 M2 的鉴权
+    /// 范围，本阶段不校验（为空仍允许启动，保持 v0.1 行为）。
     pub fn validate(&self) -> Result<()> {
+        // KI-21：先拒绝 /tmp、/etc、/ 这类 data_dir，避免后续 ensure_private_dir
+        // 把共享目录 chmod 成 0700（init 也会走这里，不会先留下半个 CA）。
+        crate::fsutil::validate_private_dir_path(&self.data_dir)
+            .map_err(|err| Error::InvalidConfig(format!("data_dir 不安全: {err}")))?;
         for (name, days) in [
             ("ca_validity_days", self.ca_validity_days),
             ("server_cert_validity_days", self.server_cert_validity_days),
@@ -1146,6 +1156,62 @@ mod tests {
 
         let agent: AgentConfig = toml::from_str("").unwrap();
         agent.validate().expect("默认 agent 配置必须合法");
+    }
+
+    /// KI-21：hub / agent 的 data_dir 指向共享目录、根目录或相对路径时，
+    /// 配置校验必须失败，并点名 data_dir；默认 `/var/lib/rustboard/...` 仍然合法。
+    #[test]
+    fn ki21_config_validation_rejects_unsafe_data_dir() {
+        for bad in [
+            "/tmp",
+            "/",
+            "/etc",
+            "/etc/rustboard",
+            "/var/lib",
+            "/var/tmp",
+            "relative/data",
+        ] {
+            let hub = HubConfig {
+                data_dir: PathBuf::from(bad),
+                ..HubConfig::default()
+            };
+            let err = hub
+                .validate()
+                .expect_err(&format!("hub data_dir={bad} 必须被拒绝"))
+                .to_string();
+            assert!(err.contains("data_dir"), "错误信息必须点名 data_dir: {err}");
+            assert!(err.contains("不安全"), "错误信息应说明不安全: {err}");
+
+            let agent = AgentConfig {
+                data_dir: PathBuf::from(bad),
+                ..AgentConfig::default()
+            };
+            let err = agent
+                .validate()
+                .expect_err(&format!("agent data_dir={bad} 必须被拒绝"))
+                .to_string();
+            assert!(err.contains("data_dir"), "错误信息必须点名 data_dir: {err}");
+            assert!(err.contains("不安全"), "错误信息应说明不安全: {err}");
+        }
+
+        // `.` 是相对路径的一种，必须和其他相对路径一样被拒绝。
+        let dot = HubConfig {
+            data_dir: PathBuf::from("."),
+            ..HubConfig::default()
+        };
+        assert!(dot.validate().is_err(), "data_dir=. 必须被拒绝");
+
+        // 专属子目录合法：只做路径校验，不会碰真实的 /var/lib/rustboard。
+        let ok = HubConfig {
+            data_dir: PathBuf::from("/var/lib/rustboard/hub"),
+            ..HubConfig::default()
+        };
+        ok.validate().expect("默认数据目录必须通过");
+        let ok = AgentConfig {
+            data_dir: PathBuf::from("/var/lib/rustboard/agent"),
+            ..AgentConfig::default()
+        };
+        ok.validate().expect("默认 agent 数据目录必须通过");
     }
 
     /// 有效期 / 续签阈值 / 检查周期的非法组合必须被拒绝，且错误信息点名具体字段。

@@ -15,10 +15,31 @@ use std::path::{Path, PathBuf};
 /// 临时文件随机名的最大重试次数；冲突时换一个随机名继续。
 const TMP_CREATE_ATTEMPTS: usize = 16;
 
+/// 顶层共享目录（精确匹配）：不能直接当作本程序的私有目录。
+///
+/// 它们本身归系统或所有用户共享，收紧为 0700 会破坏其他程序；其专属子目录
+/// （如 `/tmp/rustboard`、`/var/lib/rustboard/hub`）仍然允许。
+#[cfg(unix)]
+const SHARED_TOP_LEVEL_DIRS: &[&str] = &[
+    "bin", "boot", "dev", "etc", "home", "lib", "lib64", "media", "mnt", "opt", "proc", "root",
+    "run", "sbin", "srv", "sys", "tmp", "usr", "var",
+];
+
+/// 本身共享的两级目录（精确匹配）；其专属子目录仍然允许。
+#[cfg(unix)]
+const SHARED_SECOND_LEVEL_DIRS: &[(&str, &str)] = &[("var", "lib"), ("var", "tmp")];
+
+/// 不能存放数据 / 证书目录的系统前缀：其下任何路径都拒绝（KI-21）。
+#[cfg(unix)]
+const SYSTEM_DIR_PREFIXES: &[&str] = &[
+    "bin", "boot", "dev", "etc", "lib", "lib64", "proc", "run", "sbin", "sys", "usr",
+];
+
 /// 创建目录（含父目录），新建目录的权限为 `mode`。
 ///
-/// 已经存在的目录保持原权限不变：调用方可能传入 `/tmp`、`/etc` 这类共享目录，
-/// 无条件收紧会把系统目录改坏。敏感目录应位于私有父目录下。
+/// 已经存在的目录保持原权限不变：这是给配置文件父目录等**通用路径**用的，
+/// 无条件收紧会把系统目录改坏。数据目录、证书目录这类完全由本程序拥有的
+/// 私有目录请使用 [`ensure_private_dir`]，它会先拒绝共享 / 系统目录。
 ///
 /// H3：用 `symlink_metadata` 检查目标本身，是符号链接就报错，绝不跟随。
 pub fn ensure_dir(path: &Path, mode: u32) -> io::Result<()> {
@@ -81,31 +102,193 @@ fn validate_private_dir_mode(path: &Path, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// 收紧已经存在目录的权限（KI-21）。
+/// 校验目录路径能否作为本程序的私有数据 / 证书目录（KI-21）。
 ///
-/// 与 [`harden`] 的区别：目标必须**已存在且是目录**，非目录、符号链接都拒绝，
-/// 不会替调用方创建目录。只允许收紧到不含 group/other 位的私有模式
-/// （`mode & 0o077 != 0` 直接报错），避免把 `/etc` 这类共享目录误设成私有目录。
-/// 当前权限没有超出 `mode` 允许的位时不调用 `chmod`，重复调用幂等。
-pub fn harden_dir(path: &Path, mode: u32) -> io::Result<()> {
-    // 先校验 mode：这是调用方的编程错误，与路径状态无关，任何平台都应尽早报错。
-    validate_private_dir_mode(path, mode)?;
+/// 只读取路径和元数据，**不创建目录、不修改权限**，因此可以在创建之前调用。
+/// 拒绝以下情况：
+/// - 空路径、相对路径，以及含 `.` / `..` 组件的路径；
+/// - 顶层共享目录本身（`/tmp`、`/etc`、`/var` 等）和 `/var/lib`、`/var/tmp`；
+/// - `/etc/`、`/usr/`、`/bin/`、`/sbin/`、`/lib/`、`/lib64/`、`/boot/`、`/proc/`、
+///   `/sys/`、`/dev/`、`/run/` 下的任何路径；
+/// - 已存在的最终路径是符号链接、不是目录、带 sticky 位，或（非 root 运行时）
+///   不属于当前有效用户。
+///
+/// 由本程序独占的子目录可以通过，例如 `/tmp/<app>`、`/var/lib/<app>`、`/opt/<app>`。
+/// [`harden_dir`] 与 [`ensure_private_dir`] 内部都会调用本函数；配置校验也复用它，
+/// 让 `--data-dir /tmp` 这类配置在启动前就失败，而不是把共享目录 chmod 成 0700。
+pub fn validate_private_dir_path(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "目录路径不能为空",
+        ));
+    }
 
-    // 用 symlink_metadata 检查目标本身：符号链接一律拒绝，绝不 chmod 到链接目标。
-    let meta = fs::symlink_metadata(path)?;
+    #[cfg(unix)]
+    validate_unix_private_dir_path(path)?;
+    #[cfg(not(unix))]
+    {
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} 必须是绝对路径", path.display()),
+            ));
+        }
+    }
+
+    validate_existing_private_dir(path)
+}
+
+/// Unix 下的路径形状校验：绝对路径、至少两级、不含 `.` / `..`，且不落在共享 / 系统目录。
+#[cfg(unix)]
+fn validate_unix_private_dir_path(path: &Path) -> io::Result<()> {
+    use std::ffi::OsStr;
+    use std::path::Component;
+
+    // `components()` 会归一化重复分隔符和中间的 `.`；剩余的 `.` / `..` 都不可接受。
+    let mut components: Vec<&OsStr> = Vec::new();
+    let mut rooted = false;
+    for component in path.components() {
+        match component {
+            Component::RootDir => rooted = true,
+            Component::Normal(part) => components.push(part),
+            Component::CurDir => {
+                return Err(invalid_private_dir_reason(path, "不能包含 `.` 组件"));
+            }
+            Component::ParentDir => {
+                return Err(invalid_private_dir_reason(path, "不能包含 `..` 组件"));
+            }
+            Component::Prefix(_) => {
+                return Err(invalid_private_dir_reason(path, "必须是 Unix 绝对路径"));
+            }
+        }
+    }
+    if !rooted {
+        return Err(invalid_private_dir_reason(path, "必须是绝对路径"));
+    }
+
+    // 顶层共享目录（/tmp、/etc、/var ...）本身不能当私有目录；其专属子目录允许。
+    if components.len() == 1
+        && SHARED_TOP_LEVEL_DIRS
+            .iter()
+            .any(|dir| components[0] == OsStr::new(*dir))
+    {
+        return Err(shared_private_dir_error(path));
+    }
+    // 至少两级：既拦截 `/tmp`、`/etc`，也拦截 `/foo` 这类任意顶层目录。
+    if components.len() < 2 {
+        return Err(invalid_private_dir_reason(
+            path,
+            "至少需要两级目录（例如 /var/lib/rustboard/hub）",
+        ));
+    }
+    // `/var/lib`、`/var/tmp` 本身共享，但其下专属子目录允许（如 /var/lib/rustboard）。
+    let first = components[0];
+    let second = components[1];
+    if components.len() == 2
+        && SHARED_SECOND_LEVEL_DIRS
+            .iter()
+            .any(|(dir, sub)| first == OsStr::new(*dir) && second == OsStr::new(*sub))
+    {
+        return Err(shared_private_dir_error(path));
+    }
+    if SYSTEM_DIR_PREFIXES
+        .iter()
+        .any(|dir| first == OsStr::new(*dir))
+    {
+        return Err(invalid_private_dir_reason(
+            path,
+            "不能放在 /etc、/usr、/bin、/sbin、/lib、/lib64、/boot、/proc、/sys、/dev、/run 下",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn invalid_private_dir_reason(path: &Path, reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} 不能作为私有目录：{reason}", path.display()),
+    )
+}
+
+#[cfg(unix)]
+fn shared_private_dir_error(path: &Path) -> io::Error {
+    invalid_private_dir_reason(
+        path,
+        "是共享 / 系统目录本身，请使用由本程序独占的子目录（例如 /var/lib/rustboard/hub）",
+    )
+}
+
+/// 检查已存在的最终路径：符号链接、非目录、sticky 位、其他用户所有都拒绝。
+///
+/// 路径不存在时返回 `Ok(())`，交由调用方创建；父目录的符号链接语义不在本函数
+/// 范围内（沿用既有行为），但最终路径本身绝不跟随。
+fn validate_existing_private_dir(path: &Path) -> io::Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
     if meta.file_type().is_symlink() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("{} 是符号链接，拒绝收紧目录权限", path.display()),
+            format!("{} 是符号链接，不能作为私有目录", path.display()),
         ));
     }
     if !meta.is_dir() {
-        // 与 ensure_dir 对「存在但不是目录」的处理保持一致。
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("{} 已存在且不是目录", path.display()),
         ));
     }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        // sticky 位（/tmp、/var/tmp 等）说明目录是多人共享的，不能收紧为私有目录。
+        if meta.permissions().mode() & 0o1000 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} 带 sticky 位，是共享目录，不能作为私有目录",
+                    path.display()
+                ),
+            ));
+        }
+        // SAFETY: geteuid 只返回当前进程的有效用户 ID，没有指针参数或内存安全前提。
+        let euid = unsafe { libc::geteuid() };
+        // root 允许其他 owner（常见部署：数据目录预留给服务用户）；非 root 必须自己拥有。
+        if euid != 0 && meta.uid() != euid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} 属于其他用户（uid {}），当前有效用户为 {euid}",
+                    path.display(),
+                    meta.uid()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 收紧已经存在目录的权限（KI-21）。
+///
+/// 与 [`harden`] 的区别：目标必须**已存在且是目录**，非目录、符号链接都拒绝，
+/// 不会替调用方创建目录。调用前先经 [`validate_private_dir_path`] 校验，共享 /
+/// 系统目录、sticky 目录、非本人目录一律不 chmod；同时只允许收紧到不含
+/// group/other 位的私有模式（`mode & 0o077 != 0` 直接报错）。
+/// 当前权限没有超出 `mode` 允许的位时不调用 `chmod`，重复调用幂等。
+pub fn harden_dir(path: &Path, mode: u32) -> io::Result<()> {
+    // 先校验 mode 与路径：两者都是调用方的编程错误，必须在 chmod 之前失败。
+    validate_private_dir_mode(path, mode)?;
+    validate_private_dir_path(path)?;
+
+    // 路径校验已保证目标存在且是普通目录；这里再取一次元数据用于比较当前权限
+    // （路径不存在时 symlink_metadata 会返回 NotFound，保持「要求目标已存在」语义）。
+    let meta = fs::symlink_metadata(path)?;
 
     #[cfg(unix)]
     {
@@ -126,27 +309,31 @@ pub fn harden_dir(path: &Path, mode: u32) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = mode;
+        let _ = (meta, mode);
     }
     Ok(())
 }
 
 /// 创建（或复用）私有目录，并把已存在目录的过宽权限收紧到 `mode`（KI-21）。
 ///
-/// 先 [`ensure_dir`] 再 [`harden_dir`]：新建目录直接是 `mode`，旧版本留下的
-/// 0755 目录也会在启动时被收紧。**只用于数据目录、证书目录这类完全由本程序
-/// 拥有的目录**；`/etc/rustboard` 等共享配置父目录仍应使用 [`ensure_dir`]，
-/// 以免改坏系统目录的既有语义。
+/// 顺序：mode 校验 → [`validate_private_dir_path`] → [`ensure_dir`] →
+/// [`harden_dir`]。因此 `/tmp`、`/etc`、`/` 这类共享 / 系统目录会在创建或
+/// chmod **之前**被拒绝；新建目录直接是 `mode`，旧版本遗留的 0755 专属目录
+/// 也会在启动时被收紧。**只用于数据目录、证书目录这类完全由本程序拥有的
+/// 目录**；`/etc/rustboard` 等共享配置父目录仍应使用 [`ensure_dir`]，以免改坏
+/// 系统目录的既有语义。
 ///
 /// 空路径保持 [`ensure_dir`] 的 no-op 语义：它表示当前工作目录（例如相对路径
-/// 数据库的父目录），不是由本程序拥有的私有目录，不能 chmod。
+/// 数据库的父目录），不是由本程序拥有的私有目录，不能校验也不能 chmod。
 pub fn ensure_private_dir(path: &Path, mode: u32) -> io::Result<()> {
     // 先校验 mode，避免参数非法时先按公开权限把目录创建出来。
     validate_private_dir_mode(path, mode)?;
-    ensure_dir(path, mode)?;
     if path.as_os_str().is_empty() {
         return Ok(());
     }
+    // 路径校验必须发生在创建 / chmod 之前：共享目录先创建再报错就来不及了。
+    validate_private_dir_path(path)?;
+    ensure_dir(path, mode)?;
     harden_dir(path, mode)
 }
 
@@ -648,6 +835,174 @@ mod tests {
 
         let err = harden_dir(&missing, 0o700).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// KI-21：共享 / 系统目录本身、系统前缀下的路径都不能作为私有目录。
+    ///
+    /// 这里只调用只读的 `validate_private_dir_path`，**不会**对真实的
+    /// `/tmp`、`/etc`、`/` 执行 chmod。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_validate_private_dir_path_rejects_shared_and_system_dirs() {
+        for path in [
+            "/",
+            "/tmp",
+            "/var/tmp",
+            "/etc",
+            "/etc/foo",
+            "/etc/rustboard",
+            "/var/lib",
+            "/var",
+            "/usr",
+            "/usr/local/share",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/boot",
+            "/proc",
+            "/sys",
+            "/dev",
+            "/run",
+            "/root",
+            "/home",
+            "/opt",
+            "/srv",
+            "/mnt",
+            "/media",
+        ] {
+            let err = validate_private_dir_path(Path::new(path))
+                .expect_err(&format!("{path} 必须被拒绝"));
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidInput,
+                "path={path} 的错误类型不对: {err}"
+            );
+            assert!(!err.to_string().is_empty(), "path={path} 必须给出可读错误");
+        }
+    }
+
+    /// KI-21：空路径、相对路径以及含 `.` / `..` 的路径必须拒绝。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_validate_private_dir_path_rejects_relative_and_dot_components() {
+        for path in [
+            "",
+            "relative/path",
+            "data",
+            ".",
+            "./data",
+            "..",
+            "../data",
+            "/tmp/../etc",
+            "/tmp/./x/../y",
+        ] {
+            assert!(
+                validate_private_dir_path(Path::new(path)).is_err(),
+                "path={path:?} 必须被拒绝"
+            );
+        }
+
+        // 只有末尾的 `.` 会被 Path 归一化掉，但层级不足仍然拒绝。
+        assert!(validate_private_dir_path(Path::new("/tmp/.")).is_err());
+    }
+
+    /// KI-21：本程序独占的子目录合法；不存在的目标也能在创建前通过路径校验。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_validate_private_dir_path_accepts_owned_subdirs() {
+        let dir = temp_dir("validate-accept");
+        ensure_dir(&dir, 0o700).unwrap();
+
+        // /tmp/<unique-subdir> 是允许的。
+        validate_private_dir_path(&dir).expect("temp 下的专属子目录必须合法");
+        // 尚未创建的目标只做语法校验，应该通过且不得被创建。
+        let missing = dir.join("nested").join("data");
+        validate_private_dir_path(&missing).expect("创建前的目标路径必须合法");
+        assert!(!missing.exists(), "路径校验不得创建目录");
+        // 默认 hub / agent 数据目录只做校验，不 chmod 真实目录。
+        validate_private_dir_path(Path::new("/var/lib/rustboard/hub"))
+            .expect("/var/lib/<app> 必须合法");
+        validate_private_dir_path(Path::new("/var/lib/rustboard/agent"))
+            .expect("/var/lib/<app> 必须合法");
+        validate_private_dir_path(Path::new("/opt/rustboard/data")).expect("/opt/<app> 必须合法");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// KI-21：已存在目录带 sticky 位时拒绝，且 `harden_dir` 不得先去掉 sticky 再 chmod。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_validate_private_dir_path_rejects_sticky_dir_without_chmod() {
+        let dir = temp_dir("validate-sticky");
+        ensure_dir(&dir, 0o700).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o1700)).unwrap();
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o7777,
+            0o1700
+        );
+
+        let err = validate_private_dir_path(&dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("sticky"), "错误信息: {err}");
+
+        let err = harden_dir(&dir, 0o700).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o7777,
+            0o1700,
+            "校验失败时不能改动目录权限"
+        );
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// KI-21：最终路径是符号链接时拒绝；`ensure_private_dir` 不能跟随链接创建 / chmod。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_validate_private_dir_path_rejects_symlink_target() {
+        let dir = temp_dir("validate-symlink");
+        ensure_dir(&dir, 0o700).unwrap();
+        let victim = dir.join("victim");
+        ensure_dir(&victim, 0o700).unwrap();
+        let link = dir.join("data");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let err = validate_private_dir_path(&link).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("符号链接"), "错误信息: {err}");
+
+        let err = ensure_private_dir(&link, 0o700).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(mode_of(&victim), 0o700, "不能 chmod 到符号链接目标");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// KI-21：安全目录仍能正常 harden，重复调用幂等；空路径在 harden_dir 报错，
+    /// 在 ensure_private_dir 保持 no-op。
+    #[cfg(unix)]
+    #[test]
+    fn ki21_validate_then_harden_safe_dir_is_idempotent() {
+        let dir = temp_dir("validate-harden");
+        ensure_private_dir(&dir, 0o700).unwrap();
+        validate_private_dir_path(&dir).expect("安全目录必须通过校验");
+
+        harden_dir(&dir, 0o700).unwrap();
+        harden_dir(&dir, 0o700).unwrap();
+        assert_eq!(mode_of(&dir), 0o700);
+
+        ensure_private_dir(Path::new(""), 0o700).expect("空路径保持 no-op");
+        let err = harden_dir(Path::new(""), 0o700).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(validate_private_dir_path(Path::new("")).is_err());
+
         let _ = fs::remove_dir_all(&dir);
     }
 
