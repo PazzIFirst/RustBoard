@@ -12,6 +12,8 @@ use rusqlite::{
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 use rustboard_common::util::now_ms;
 
+use crate::alerts::{AlertRule, AlertRuleStoreError, AlertSource, Comparator, MAX_ALERT_RULES};
+
 use super::{
     AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, DownsampleRangeResult,
     IngestOutcome, MaintenanceStateEntry, NewAuditEntry, PruneResult, QueryTooLarge, RejectReason,
@@ -1695,6 +1697,312 @@ impl Storage for SqliteStorage {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M4-B1：告警规则（schema v7 `alert_rules` 表）
+// ---------------------------------------------------------------------------
+
+/// `alert_rules` 的 SELECT 列表；与 [`alert_rule_from_row`] 的列下标一一对应。
+const ALERT_RULE_COLUMNS: &str = "id, name, enabled, source, metric, comparator, threshold, \
+     duration_secs, cooldown_secs, filter_agent_id, filter_labels, channel_ids, \
+     notify_on_resolve, is_builtin, updated_by, created_at, updated_at";
+
+/// 新建 / 种子共用的列清单。
+const ALERT_RULE_INSERT_COLUMNS: &str = "(id, name, enabled, source, metric, comparator, \
+     threshold, duration_secs, cooldown_secs, filter_agent_id, filter_labels, channel_ids, \
+     notify_on_resolve, is_builtin, updated_by, created_at, updated_at)";
+
+/// 更新语句只覆盖可写字段：id 不变，`is_builtin` / `created_at` 由存储层保持原值。
+const ALERT_RULE_UPDATE_SQL: &str =
+    "UPDATE alert_rules SET name = ?2, enabled = ?3, source = ?4, metric = ?5, \
+     comparator = ?6, threshold = ?7, duration_secs = ?8, cooldown_secs = ?9, \
+     filter_agent_id = ?10, filter_labels = ?11, channel_ids = ?12, \
+     notify_on_resolve = ?13, updated_by = ?14, updated_at = ?15 WHERE id = ?1";
+
+/// 数据库里出现未知枚举值时产生的错误（不静默降级成默认值）。
+#[derive(Debug)]
+struct AlertRuleColumnError(&'static str);
+
+impl std::fmt::Display for AlertRuleColumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "alert_rules.{} 字段值非法", self.0)
+    }
+}
+
+impl std::error::Error for AlertRuleColumnError {}
+
+/// 把列值损坏翻译成 rusqlite 错误，让上层拿到明确失败而不是被默认值掩盖。
+fn alert_rule_column_error(column: usize, field: &'static str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        rusqlite::types::Type::Text,
+        Box::new(AlertRuleColumnError(field)),
+    )
+}
+
+fn parse_alert_source(raw: &str, column: usize) -> rusqlite::Result<AlertSource> {
+    AlertSource::parse(raw).ok_or_else(|| alert_rule_column_error(column, "source"))
+}
+
+fn parse_alert_comparator(raw: &str, column: usize) -> rusqlite::Result<Comparator> {
+    Comparator::parse(raw).ok_or_else(|| alert_rule_column_error(column, "comparator"))
+}
+
+fn parse_alert_rule_json<T: serde::de::DeserializeOwned>(
+    raw: &str,
+    column: usize,
+    field: &'static str,
+) -> rusqlite::Result<T> {
+    serde_json::from_str(raw).map_err(|_| alert_rule_column_error(column, field))
+}
+
+/// 一行 `alert_rules` 映射成 [`AlertRule`]；SELECT 列顺序必须与 [`ALERT_RULE_COLUMNS`] 一致。
+fn alert_rule_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertRule> {
+    let enabled: i64 = row.get(2)?;
+    let source: String = row.get(3)?;
+    let comparator: String = row.get(5)?;
+    let filter_labels: String = row.get(10)?;
+    let channel_ids: String = row.get(11)?;
+    let notify_on_resolve: i64 = row.get(12)?;
+    let is_builtin: i64 = row.get(13)?;
+    Ok(AlertRule {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        enabled: enabled != 0,
+        source: parse_alert_source(&source, 3)?,
+        metric: row.get(4)?,
+        comparator: parse_alert_comparator(&comparator, 5)?,
+        threshold: row.get(6)?,
+        duration_secs: row.get(7)?,
+        cooldown_secs: row.get(8)?,
+        filter_agent_id: row.get(9)?,
+        filter_labels: parse_alert_rule_json(&filter_labels, 10, "filter_labels")?,
+        channel_ids: parse_alert_rule_json(&channel_ids, 11, "channel_ids")?,
+        notify_on_resolve: notify_on_resolve != 0,
+        is_builtin: is_builtin != 0,
+        updated_by: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
+    })
+}
+
+/// 把 `alert_rules.name` 的唯一约束冲突翻译成领域错误，不透传 SQL。
+fn map_alert_rule_unique_error(err: rusqlite::Error) -> anyhow::Error {
+    if let rusqlite::Error::SqliteFailure(inner, Some(message)) = &err {
+        if inner.code == rusqlite::ErrorCode::ConstraintViolation
+            && message.contains("alert_rules.name")
+        {
+            return AlertRuleStoreError::NameExists.into();
+        }
+    }
+    tracing::debug!(error = %err, "写入告警规则失败（非名称唯一约束错误）");
+    anyhow::anyhow!("写入告警规则失败（数据库错误，详见日志）")
+}
+
+impl SqliteStorage {
+    /// 写入内置规则种子：`INSERT OR IGNORE`，已存在的规则（含用户改过的阈值 /
+    /// 启停状态）**绝不覆盖**；重复调用幂等，返回本次新插入的条数。
+    ///
+    /// `now` 作为新插入行的 `created_at` / `updated_at`；调用方通常传 `now_ms()`。
+    pub fn seed_builtin_alert_rules(&self, rules: &[AlertRule], now: i64) -> Result<usize> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let sql = format!(
+            "INSERT OR IGNORE INTO alert_rules {ALERT_RULE_INSERT_COLUMNS} \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+        );
+        let mut inserted = 0usize;
+        for rule in rules {
+            let filter_labels = serde_json::to_string(&rule.filter_labels)?;
+            let channel_ids = serde_json::to_string(&rule.channel_ids)?;
+            inserted += tx.execute(
+                &sql,
+                params![
+                    rule.id,
+                    rule.name,
+                    rule.enabled as i64,
+                    rule.source.as_str(),
+                    rule.metric,
+                    rule.comparator.as_str(),
+                    rule.threshold,
+                    i64::from(rule.duration_secs),
+                    i64::from(rule.cooldown_secs),
+                    rule.filter_agent_id.as_deref(),
+                    filter_labels,
+                    channel_ids,
+                    rule.notify_on_resolve as i64,
+                    rule.is_builtin as i64,
+                    rule.updated_by,
+                    now,
+                    now,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// 按 id 读取一条规则；不存在返回 `None`。
+    pub fn get_alert_rule(&self, id: &str) -> Result<Option<AlertRule>> {
+        let conn = self.lock_read();
+        let sql = format!("SELECT {ALERT_RULE_COLUMNS} FROM alert_rules WHERE id = ?1");
+        Ok(conn
+            .query_row(&sql, params![id], alert_rule_from_row)
+            .optional()?)
+    }
+
+    /// 列出全部规则：内置规则在前，同组按名称升序。
+    pub fn list_alert_rules(&self) -> Result<Vec<AlertRule>> {
+        let conn = self.lock_read();
+        let sql = format!(
+            "SELECT {ALERT_RULE_COLUMNS} FROM alert_rules ORDER BY is_builtin DESC, name ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], alert_rule_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 规则总数（含内置规则）。
+    pub fn alert_rule_count(&self) -> Result<usize> {
+        let conn = self.lock_read();
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM alert_rules", [], |row| row.get(0))?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    /// 新建一条规则。
+    ///
+    /// 事务内先查重再写入，把两种失败翻译成领域错误：
+    /// - 总数（含内置）达到 [`MAX_ALERT_RULES`] → [`AlertRuleStoreError::LimitReached`]；
+    /// - 名称重复 → [`AlertRuleStoreError::NameExists`]（并发下仍由 UNIQUE 兜底）。
+    pub fn create_alert_rule(&self, rule: &AlertRule) -> Result<()> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM alert_rules", [], |row| row.get(0))?;
+        if count >= MAX_ALERT_RULES as i64 {
+            return Err(AlertRuleStoreError::LimitReached.into());
+        }
+        let name_exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM alert_rules WHERE name = ?1",
+                params![rule.name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if name_exists.is_some() {
+            return Err(AlertRuleStoreError::NameExists.into());
+        }
+        let filter_labels = serde_json::to_string(&rule.filter_labels)?;
+        let channel_ids = serde_json::to_string(&rule.channel_ids)?;
+        let sql = format!(
+            "INSERT INTO alert_rules {ALERT_RULE_INSERT_COLUMNS} VALUES \
+             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+        );
+        tx.execute(
+            &sql,
+            params![
+                rule.id,
+                rule.name,
+                rule.enabled as i64,
+                rule.source.as_str(),
+                rule.metric,
+                rule.comparator.as_str(),
+                rule.threshold,
+                i64::from(rule.duration_secs),
+                i64::from(rule.cooldown_secs),
+                rule.filter_agent_id.as_deref(),
+                filter_labels,
+                channel_ids,
+                rule.notify_on_resolve as i64,
+                rule.is_builtin as i64,
+                rule.updated_by,
+                rule.created_at,
+                rule.updated_at,
+            ],
+        )
+        .map_err(map_alert_rule_unique_error)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 更新一条规则的可写字段。
+    ///
+    /// - `id` 是定位键，`is_builtin` / `created_at` 保持数据库中的原值（上层改不了）；
+    /// - 不存在 → [`AlertRuleStoreError::NotFound`]；
+    /// - 改成与其它规则重名 → [`AlertRuleStoreError::NameExists`]。
+    pub fn update_alert_rule(&self, rule: &AlertRule) -> Result<()> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM alert_rules WHERE id = ?1",
+                params![rule.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(AlertRuleStoreError::NotFound.into());
+        }
+        let name_exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM alert_rules WHERE name = ?1 AND id != ?2",
+                params![rule.name, rule.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if name_exists.is_some() {
+            return Err(AlertRuleStoreError::NameExists.into());
+        }
+        let filter_labels = serde_json::to_string(&rule.filter_labels)?;
+        let channel_ids = serde_json::to_string(&rule.channel_ids)?;
+        tx.execute(
+            ALERT_RULE_UPDATE_SQL,
+            params![
+                rule.id,
+                rule.name,
+                rule.enabled as i64,
+                rule.source.as_str(),
+                rule.metric,
+                rule.comparator.as_str(),
+                rule.threshold,
+                i64::from(rule.duration_secs),
+                i64::from(rule.cooldown_secs),
+                rule.filter_agent_id.as_deref(),
+                filter_labels,
+                channel_ids,
+                rule.notify_on_resolve as i64,
+                rule.updated_by,
+                rule.updated_at,
+            ],
+        )
+        .map_err(map_alert_rule_unique_error)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 删除自定义规则；内置规则返回 [`AlertRuleStoreError::BuiltinRule`]。
+    ///
+    /// 不存在与内置是两种不同的错误，调用方分别映射 404 / 403。
+    pub fn delete_alert_rule(&self, id: &str) -> Result<()> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let is_builtin: Option<i64> = tx
+            .query_row(
+                "SELECT is_builtin FROM alert_rules WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match is_builtin {
+            None => return Err(AlertRuleStoreError::NotFound.into()),
+            Some(flag) if flag != 0 => return Err(AlertRuleStoreError::BuiltinRule.into()),
+            Some(_) => {}
+        }
+        tx.execute("DELETE FROM alert_rules WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -4663,5 +4971,252 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ts, base, "未来桶必须被 bucket_ts <= now 排除");
         assert!((rows[0].value - 1.0).abs() < 1e-9);
+    // ------------------------------------------------------------------
+    // M4-B1：告警规则存储
+    // ------------------------------------------------------------------
+
+    use crate::alerts::builtin_rules;
+
+    fn alert_rule(name: &str) -> AlertRule {
+        AlertRule {
+            id: format!("custom-{name}"),
+            name: name.to_string(),
+            enabled: false,
+            source: AlertSource::Metric,
+            metric: "disk.used_percent".to_string(),
+            comparator: Comparator::Gt,
+            threshold: 90.0,
+            duration_secs: 300,
+            cooldown_secs: 1_800,
+            filter_agent_id: None,
+            filter_labels: Labels::new(),
+            channel_ids: Vec::new(),
+            notify_on_resolve: true,
+            is_builtin: false,
+            updated_by: "admin".to_string(),
+            created_at: 1_000,
+            updated_at: 1_000,
+        }
+    }
+
+    fn store_error(err: anyhow::Error) -> AlertRuleStoreError {
+        *err.downcast_ref::<AlertRuleStoreError>()
+            .expect("必须是可映射的告警规则领域错误")
+    }
+
+    /// CRUD 往返：labels / channel_ids / filter_agent_id 原样读回，删除后计数归零。
+    #[test]
+    fn m4_b1_alert_rule_crud_roundtrip() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let mut rule = alert_rule("磁盘告警");
+        rule.filter_agent_id = Some("agent-1".into());
+        rule.filter_labels.insert("mount".into(), "/".into());
+        rule.channel_ids = vec!["channel-1".into(), "channel-2".into()];
+
+        s.create_alert_rule(&rule).unwrap();
+        assert_eq!(s.alert_rule_count().unwrap(), 1);
+        assert_eq!(s.get_alert_rule(&rule.id).unwrap(), Some(rule.clone()));
+        assert_eq!(s.get_alert_rule("missing").unwrap(), None);
+
+        let mut updated = rule.clone();
+        updated.name = "磁盘告警-2".into();
+        updated.enabled = true;
+        updated.threshold = 95.5;
+        updated.duration_secs = 0;
+        updated.cooldown_secs = 0;
+        updated.filter_agent_id = None;
+        updated.filter_labels = Labels::new();
+        updated.channel_ids = vec!["channel-2".into()];
+        updated.notify_on_resolve = false;
+        updated.updated_by = "ops".into();
+        updated.updated_at = 2_000;
+        s.update_alert_rule(&updated).unwrap();
+
+        assert_eq!(s.get_alert_rule(&rule.id).unwrap(), Some(updated.clone()));
+        assert_eq!(s.list_alert_rules().unwrap(), vec![updated.clone()]);
+
+        s.delete_alert_rule(&rule.id).unwrap();
+        assert_eq!(s.get_alert_rule(&rule.id).unwrap(), None);
+        assert_eq!(s.alert_rule_count().unwrap(), 0);
+        assert!(s.list_alert_rules().unwrap().is_empty());
+    }
+
+    /// 名称唯一：创建与更新都返回 NameExists，失败时原值不变；缺失返回 NotFound。
+    #[test]
+    fn m4_b1_alert_rule_name_unique_and_missing_errors() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        s.create_alert_rule(&alert_rule("同名")).unwrap();
+
+        let err = s.create_alert_rule(&alert_rule("同名")).unwrap_err();
+        assert_eq!(store_error(err), AlertRuleStoreError::NameExists);
+
+        let mut second = alert_rule("第二条");
+        second.id = "rule-2".into();
+        s.create_alert_rule(&second).unwrap();
+        let mut conflict = second.clone();
+        conflict.name = "同名".into();
+        let err = s.update_alert_rule(&conflict).unwrap_err();
+        assert_eq!(store_error(err), AlertRuleStoreError::NameExists);
+        assert_eq!(
+            s.get_alert_rule("rule-2").unwrap().unwrap().name,
+            "第二条",
+            "重名更新失败不能改动原行"
+        );
+
+        let mut missing = alert_rule("不存在");
+        missing.id = "missing".into();
+        assert_eq!(
+            store_error(s.update_alert_rule(&missing).unwrap_err()),
+            AlertRuleStoreError::NotFound
+        );
+        assert_eq!(
+            store_error(s.delete_alert_rule("missing").unwrap_err()),
+            AlertRuleStoreError::NotFound
+        );
+
+        // 主键冲突不是「名称重复」，不能被误映射成 409 rule_name_exists。
+        let mut duplicate_id = alert_rule("另一个");
+        duplicate_id.id = "custom-同名".into();
+        let err = s.create_alert_rule(&duplicate_id).unwrap_err();
+        assert!(
+            err.downcast_ref::<AlertRuleStoreError>().is_none(),
+            "主键冲突必须是内部错误: {err}"
+        );
+    }
+
+    /// 种子幂等：重复调用不新增；用户改过的阈值 / 启停 / 名称绝不被覆盖。
+    #[test]
+    fn m4_b1_alert_rule_seed_is_idempotent_and_preserves_user_edits() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let now = 1_700_000_000_000;
+        let rules = builtin_rules(now);
+        assert_eq!(s.seed_builtin_alert_rules(&rules, now).unwrap(), 5);
+        assert_eq!(s.alert_rule_count().unwrap(), 5);
+
+        // 重复种子（哪怕时间戳不同）不新增、不刷新任何字段。
+        let same: Vec<AlertRule> = s.list_alert_rules().unwrap();
+        assert_eq!(
+            s.seed_builtin_alert_rules(&builtin_rules(now + 1), now + 1)
+                .unwrap(),
+            0
+        );
+        assert_eq!(s.list_alert_rules().unwrap(), same);
+
+        let mut edited = s
+            .get_alert_rule("builtin-disk-percent")
+            .unwrap()
+            .expect("内置规则必须已种入");
+        let seeded_created_at = edited.created_at;
+        edited.enabled = true;
+        edited.threshold = 95.0;
+        edited.name = "磁盘（自定义）".into();
+        edited.updated_by = "ops".into();
+        edited.updated_at = now + 60_000;
+        s.update_alert_rule(&edited).unwrap();
+
+        assert_eq!(
+            s.seed_builtin_alert_rules(&builtin_rules(now + 120_000), now + 120_000)
+                .unwrap(),
+            0
+        );
+        let after = s.get_alert_rule("builtin-disk-percent").unwrap().unwrap();
+        assert_eq!(after, edited, "种子绝不能覆盖用户改动");
+        assert_eq!(after.created_at, seeded_created_at);
+        assert_eq!(s.alert_rule_count().unwrap(), 5);
+    }
+
+    /// 内置规则禁删；更新时 `is_builtin` / `created_at` 由存储层保持原值。
+    #[test]
+    fn m4_b1_alert_rule_builtin_delete_rejected_and_update_keeps_flag() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let now = 42;
+        s.seed_builtin_alert_rules(&builtin_rules(now), now)
+            .unwrap();
+
+        let err = s.delete_alert_rule("builtin-agent-offline").unwrap_err();
+        assert_eq!(store_error(err), AlertRuleStoreError::BuiltinRule);
+        assert!(s.get_alert_rule("builtin-agent-offline").unwrap().is_some());
+
+        // 模拟上层把服务端字段改坏：存储层忽略 is_builtin / created_at 的改动。
+        let mut rule = s.get_alert_rule("builtin-agent-offline").unwrap().unwrap();
+        rule.is_builtin = false;
+        rule.created_at = 999;
+        rule.enabled = true;
+        rule.name = "离线（自定义）".into();
+        rule.updated_at = 100;
+        s.update_alert_rule(&rule).unwrap();
+
+        let stored = s.get_alert_rule("builtin-agent-offline").unwrap().unwrap();
+        assert!(stored.is_builtin, "is_builtin 不能通过更新接口改掉");
+        assert_eq!(stored.created_at, now, "created_at 不能被更新覆盖");
+        assert!(stored.enabled);
+        assert_eq!(stored.name, "离线（自定义）");
+        assert_eq!(stored.updated_at, 100);
+
+        // 自定义规则仍然可以删除。
+        s.create_alert_rule(&alert_rule("可删除")).unwrap();
+        s.delete_alert_rule("custom-可删除").unwrap();
+        assert_eq!(s.alert_rule_count().unwrap(), 5);
+    }
+
+    /// JSON 列稳定序列化：labels 按 BTreeMap 键序、channel_ids 保留顺序；
+    /// NULL `filter_agent_id` 与空 labels / 空数组往返一致。
+    #[test]
+    fn m4_b1_alert_rule_json_columns_are_stable() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let mut rule = alert_rule("json");
+        // 插入顺序与字典序相反，落库必须按字典序稳定输出。
+        rule.filter_labels.insert("mount".into(), "/data".into());
+        rule.filter_labels.insert("fs".into(), "ext4".into());
+        rule.channel_ids = vec!["channel-b".into(), "channel-a".into()];
+        s.create_alert_rule(&rule).unwrap();
+
+        {
+            let conn = s.lock_write();
+            let (labels, channels): (String, String) = conn
+                .query_row(
+                    "SELECT filter_labels, channel_ids FROM alert_rules WHERE id = ?1",
+                    params![rule.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(labels, r#"{"fs":"ext4","mount":"/data"}"#);
+            assert_eq!(channels, r#"["channel-b","channel-a"]"#);
+        }
+        let stored = s.get_alert_rule(&rule.id).unwrap().unwrap();
+        assert_eq!(stored.filter_labels, rule.filter_labels);
+        assert_eq!(stored.channel_ids, rule.channel_ids);
+        assert_eq!(stored.filter_agent_id, None);
+
+        // 空 labels / 空数组 / NULL 过滤 agent 的稳定形态。
+        let empty = alert_rule("empty");
+        s.create_alert_rule(&empty).unwrap();
+        let conn = s.lock_write();
+        let (labels, channels): (String, String) = conn
+            .query_row(
+                "SELECT filter_labels, channel_ids FROM alert_rules WHERE id = ?1",
+                params![empty.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(labels, "{}");
+        assert_eq!(channels, "[]");
+    }
+
+    /// 上限：总数（含内置）达到 200 后创建返回 LimitReached。
+    #[test]
+    fn m4_b1_alert_rule_limit_is_enforced() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        for index in 0..MAX_ALERT_RULES {
+            let mut rule = alert_rule("批量");
+            rule.id = format!("rule-{index}");
+            rule.name = format!("规则-{index}");
+            s.create_alert_rule(&rule).unwrap();
+        }
+        assert_eq!(s.alert_rule_count().unwrap(), MAX_ALERT_RULES);
+
+        let err = s.create_alert_rule(&alert_rule("超额")).unwrap_err();
+        assert_eq!(store_error(err), AlertRuleStoreError::LimitReached);
+        assert_eq!(s.alert_rule_count().unwrap(), MAX_ALERT_RULES);
     }
 }

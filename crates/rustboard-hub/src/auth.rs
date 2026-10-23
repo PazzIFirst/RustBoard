@@ -583,12 +583,20 @@ pub(crate) fn required_scope(method: &Method, path: &str) -> Option<TokenScope> 
             | "/api/v1/series"
             | "/api/v1/overview"
             | "/api/v1/audit"
+            // M4-B1：规则列表只读；增删改在下面单独映射为 Write。
+            | "/api/v1/alerts/rules"
     ) || ["/latest", "/series", "/settings", "/control"]
         .iter()
         .any(|suffix| is_agent_subroute(path, suffix));
 
     if *method == Method::GET || *method == Method::HEAD {
         return is_read_route.then_some(TokenScope::Read);
+    }
+    if *method == Method::POST && path == "/api/v1/alerts/rules" {
+        return Some(TokenScope::Write);
+    }
+    if (*method == Method::PUT || *method == Method::DELETE) && is_alert_rule_subroute(path) {
+        return Some(TokenScope::Write);
     }
     if *method == Method::POST && is_agent_subroute(path, "/control") {
         return Some(TokenScope::Write);
@@ -597,6 +605,13 @@ pub(crate) fn required_scope(method: &Method, path: &str) -> Option<TokenScope> 
         return Some(TokenScope::Write);
     }
     None
+}
+
+/// 匹配 `/api/v1/alerts/rules/<id>`；`<id>` 必须是非空单段（内置 id 是
+/// `builtin-*`，自定义是 UUID，都只有一段）。
+fn is_alert_rule_subroute(path: &str) -> bool {
+    path.strip_prefix("/api/v1/alerts/rules/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// 匹配 `/api/v1/agents/<id><suffix>`；`<id>` 必须是非空单段。
@@ -691,6 +706,7 @@ mod tests {
             "/api/v1/agents/a1/series",
             "/api/v1/agents/a1/settings",
             "/api/v1/agents/a1/control",
+            "/api/v1/alerts/rules",
         ] {
             assert_eq!(
                 required_scope(&Method::GET, path),
@@ -711,6 +727,41 @@ mod tests {
             required_scope(&Method::PUT, "/api/v1/agents/a1/settings"),
             Some(Write)
         );
+        // M4-B1：规则写接口必须 Write；内置 id 与 UUID 走同一路径规则。
+        for (method, path) in [
+            (&Method::POST, "/api/v1/alerts/rules"),
+            (&Method::PUT, "/api/v1/alerts/rules/rule-1"),
+            (&Method::PUT, "/api/v1/alerts/rules/builtin-agent-offline"),
+            (&Method::DELETE, "/api/v1/alerts/rules/rule-1"),
+            (
+                &Method::DELETE,
+                "/api/v1/alerts/rules/builtin-agent-offline",
+            ),
+        ] {
+            assert_eq!(
+                required_scope(method, path),
+                Some(Write),
+                "method={method} path={path}"
+            );
+        }
+        // 规则集合只接受 GET / POST；PUT / DELETE 集合路径不是已知路由。
+        for (method, path) in [
+            (&Method::PUT, "/api/v1/alerts/rules"),
+            (&Method::DELETE, "/api/v1/alerts/rules"),
+            // 子路径必须是单段；多段或空段交给路由 404，不提前 403。
+            (&Method::PUT, "/api/v1/alerts/rules/"),
+            (&Method::DELETE, "/api/v1/alerts/rules/a/b"),
+            (&Method::POST, "/api/v1/alerts/rules/rule-1"),
+            (&Method::GET, "/api/v1/alerts/rules/rule-1"),
+            (&Method::GET, "/api/v1/alerts/events"),
+            (&Method::POST, "/api/v1/alerts/silences"),
+        ] {
+            assert_eq!(
+                required_scope(method, path),
+                None,
+                "method={method} path={path}"
+            );
+        }
 
         // 未知路径 / 已知路径的错误方法 → None：认证后交给路由 404/405，
         // read token 不能因为「路径未知」或「方法不匹配」被 403 挡住。

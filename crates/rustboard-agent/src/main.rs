@@ -17,7 +17,7 @@ use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use rustboard_common::config::AgentConfig;
 use rustboard_common::control::{codes as control_codes, ControlError, ControlResponse};
 use rustboard_common::fsutil;
-use rustboard_common::model::SampleBatch;
+use rustboard_common::model::{Sample, SampleBatch};
 use rustboard_common::tls;
 use rustboard_common::util::{arch, boot_id, hostname, now_ms, os_pretty_name};
 use rustboard_common::wire::{codes, AgentHello, EnrollRequest, Frame};
@@ -402,6 +402,9 @@ async fn run_async(cfg: AgentConfig) -> Result<()> {
         let boot = boot.clone();
         let interval = sample_interval.clone();
         let notify = notify.clone();
+        // M4-B1：采集任务需要 buffer 上限（算 pending_ratio）与证书路径（算
+        // cert.days_left），克隆一份配置避免与上传主循环共享引用生命周期。
+        let cfg = cfg.clone();
         tokio::spawn(async move {
             loop {
                 // 首轮立即采集，之后按「当前」间隔休眠（首轮不等待）。
@@ -410,21 +413,45 @@ async fn run_async(cfg: AgentConfig) -> Result<()> {
                 for collector in collectors.iter() {
                     samples.extend(collector.collect(ts));
                 }
-                if !samples.is_empty() {
-                    let batch = SampleBatch {
-                        agent_id: agent_id.clone(),
-                        epoch,
-                        seq: seq.fetch_add(1, Ordering::Relaxed),
-                        boot_id: boot.clone(),
-                        sent_at: ts,
-                        samples,
-                    };
-                    let mut guard = buffer.lock().await;
-                    match guard.push(&batch) {
-                        Ok(()) => notify.notify_one(),
-                        Err(err) => tracing::warn!(error = %err, "写入本地缓冲失败"),
+                // M4-B1：客户端证书剩余天数；未纳管 / 读取失败时跳过该条指标，
+                // 只记 debug（每个采集周期都失败时不能刷 WARN）。
+                match client_cert_days_left(&cfg) {
+                    Ok(days_left) => {
+                        samples.push(Sample::new("cert.days_left", ts, days_left as f64));
+                    }
+                    Err(err) => {
+                        tracing::debug!(error = %err, "读取客户端证书剩余天数失败，跳过指标")
                     }
                 }
+
+                // M4-B1：本地缓冲水位。锁顺序固定为「先取 pending，再 push 同一个
+                // guard」：pending_bytes 只读偏移量、不额外加锁；两个样本在 push
+                // 前追加，统计的是本轮写入前的积压量。
+                let mut guard = buffer.lock().await;
+                let pending_bytes = guard.pending_bytes();
+                samples.push(Sample::new(
+                    "buffer.pending_bytes",
+                    ts,
+                    pending_bytes as f64,
+                ));
+                samples.push(Sample::new(
+                    "buffer.pending_ratio",
+                    ts,
+                    buffer_pending_ratio(pending_bytes, cfg.buffer_max_bytes),
+                ));
+                let batch = SampleBatch {
+                    agent_id: agent_id.clone(),
+                    epoch,
+                    seq: seq.fetch_add(1, Ordering::Relaxed),
+                    boot_id: boot.clone(),
+                    sent_at: ts,
+                    samples,
+                };
+                match guard.push(&batch) {
+                    Ok(()) => notify.notify_one(),
+                    Err(err) => tracing::warn!(error = %err, "写入本地缓冲失败"),
+                }
+                drop(guard);
 
                 // 若本轮采集为空也照样休眠，避免空样本时忙等。
                 // 分片休眠，每片最多 `SAMPLE_INTERVAL_SLICE`；Welcome 更新间隔后
@@ -530,6 +557,17 @@ fn client_cert_days_left(cfg: &AgentConfig) -> Result<i64> {
     let cert_pem = std::fs::read_to_string(&cert_path)
         .with_context(|| format!("读取客户端证书失败: {}", cert_path.display()))?;
     tls::days_left(&cert_pem, now_ms())
+}
+
+/// 本地缓冲占用比例：`pending / max`，夹在 0..=1；`max = 0` 时返回 0。
+///
+/// 纯函数便于边界测试；不做除零保护会让 `buffer.max_bytes = 0` 的坏配置
+/// 产生 NaN 样本（NaN 进入告警比较会得到不可预期结果）。
+fn buffer_pending_ratio(pending_bytes: u64, max_bytes: u64) -> f64 {
+    if max_bytes == 0 {
+        return 0.0;
+    }
+    (pending_bytes as f64 / max_bytes as f64).clamp(0.0, 1.0)
 }
 
 /// 按 `session_max_hours` 给会话加一个最长存活时间。
@@ -1436,6 +1474,34 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rb-agent-{}-{tag}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// M4-B1：`buffer.pending_ratio` 的边界：0 / 半满 / 满 / 超过上限 / max=0。
+    #[test]
+    fn m4_b1_buffer_pending_ratio_is_clamped_and_nan_free() {
+        assert_eq!(buffer_pending_ratio(0, 1_000), 0.0);
+        assert_eq!(buffer_pending_ratio(500, 1_000), 0.5);
+        assert_eq!(buffer_pending_ratio(1_000, 1_000), 1.0);
+        // 防御：pending 理论上不会超过 max，但坏状态也不能产出 >1 的比例。
+        assert_eq!(buffer_pending_ratio(2_000, 1_000), 1.0);
+        // max=0（坏配置）必须返回 0，不能除零得到 NaN / Infinity。
+        let ratio = buffer_pending_ratio(123, 0);
+        assert_eq!(ratio, 0.0);
+        assert!(ratio.is_finite());
+    }
+
+    /// M4-B1：未纳管（没有 agent.crt）时 `cert.days_left` 读取失败并跳过，
+    /// 不影响采集；返回的是可读错误而不是 panic。
+    #[test]
+    fn m4_b1_cert_days_left_missing_file_is_skipped() {
+        let dir = temp_dir("cert-missing");
+        let cfg = AgentConfig {
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let err = client_cert_days_left(&cfg).expect_err("未纳管时读取证书必须失败");
+        assert!(err.to_string().contains("读取客户端证书失败"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// KI-21：agent data_dir 新建为 0700，旧版本遗留的 0755 在启动初始化时收紧。

@@ -23,7 +23,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, RawQu
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, put};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
 use http_body::{Body as HttpBody, Frame as BodyFrame, SizeHint};
@@ -41,6 +41,7 @@ use rustboard_common::util::{
 };
 use rustboard_common::wire::{codes, AgentHello, EnrollRequest, Frame, Welcome};
 use rustboard_common::{DEFAULT_HUB_CONFIG, PROTOCOL_VERSION, VERSION};
+use rustboard_core::alerts::builtin_rules;
 use rustboard_core::collect::default_collectors;
 use rustboard_core::downsample::{self, ArchiveGate};
 use rustboard_core::storage::sqlite::SqliteStorage;
@@ -52,6 +53,7 @@ use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 
+mod alerts;
 mod auth;
 mod cert_rotation;
 mod control;
@@ -1144,6 +1146,18 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
             Err(err) => tracing::warn!(error = %err, "启动时清理过期审计记录失败"),
         }
 
+        // M4-B1：内置告警规则是面板与告警引擎的功能依赖（固定 id，创建接口只生成
+        // UUID），启动后无法补种，因此种子失败直接上抛，不让 hub 以缺规则的半残
+        // 状态监听。`INSERT OR IGNORE` 保证重启幂等，且绝不覆盖用户改过的阈值 /
+        // 启停状态；内置规则初始 disabled，升级后不会产生意外通知。
+        let seed_now = now_ms();
+        let seeded = storage
+            .seed_builtin_alert_rules(&builtin_rules(seed_now), seed_now)
+            .context("写入内置告警规则失败")?;
+        if seeded > 0 {
+            tracing::info!(seeded, "已写入内置告警规则（初始 disabled）");
+        }
+
         // 升级路径：旧安装的 ca.key / server.key 可能是 0644
         tls::harden_hub_material(&cfg.data_dir)?;
         // KI-21：证书目录同样是 hub 专用目录，旧版本的 0755 在启动时收紧到 0700；
@@ -1688,6 +1702,15 @@ fn admin_router(state: AppState) -> Router {
         )
         // 审计只读接口。
         .route("/api/v1/audit", get(control::audit_list))
+        // M4-B1：告警规则 CRUD。事件 / 静默 / 渠道留给 B1b / B2。
+        .route(
+            "/api/v1/alerts/rules",
+            get(alerts::list_rules).post(alerts::create_rule),
+        )
+        .route(
+            "/api/v1/alerts/rules/{id}",
+            put(alerts::update_rule).delete(alerts::delete_rule),
+        )
         // KI-08：未知 /api/v1/* 也要先过 Bearer 再 404，不能泄露路由是否存在。
         .route("/api/v1", any(api_not_found))
         .route("/api/v1/{*rest}", any(api_not_found))
@@ -2831,6 +2854,16 @@ enum ApiError {
     Internal(anyhow::Error),
     BadRequest(String),
     NotFound(String),
+    /// 已认证但操作被业务规则拒绝（例如删除内置告警规则）：403 + 固定错误码。
+    Forbidden {
+        code: &'static str,
+        message: String,
+    },
+    /// 与既有数据冲突（重名 / 达到上限）：409 + 固定错误码。
+    Conflict {
+        code: &'static str,
+        message: String,
+    },
     PayloadTooLarge,
     /// 查询结果超过存储层硬上限：这是客户端可调整的参数问题，不是服务端错误。
     QueryTooLarge,
@@ -2843,6 +2876,20 @@ impl ApiError {
 
     fn not_found(message: impl Into<String>) -> Self {
         Self::NotFound(message.into())
+    }
+
+    fn forbidden(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Forbidden {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Conflict {
+            code,
+            message: message.into(),
+        }
     }
 }
 
@@ -2883,6 +2930,16 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(message) => (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "not_found", "message": message })),
+            )
+                .into_response(),
+            ApiError::Forbidden { code, message } => (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": code, "message": message })),
+            )
+                .into_response(),
+            ApiError::Conflict { code, message } => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": code, "message": message })),
             )
                 .into_response(),
             ApiError::PayloadTooLarge => (

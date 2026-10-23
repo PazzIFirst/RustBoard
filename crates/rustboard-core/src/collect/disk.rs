@@ -82,6 +82,17 @@ fn statvfs(path: &str) -> Option<libc::statvfs> {
     }
 }
 
+/// 磁盘已用百分比：`(total - free) / total * 100`，夹在 0..=100。
+///
+/// 与 `disk.used` 使用同一个 `(total - free)`，保证两个指标口径一致；
+/// `total` 非正或非有限值时返回 `None`，不产生除零 / NaN 样本。
+fn used_percent(total: f64, free: f64) -> Option<f64> {
+    if !total.is_finite() || !free.is_finite() || total <= 0.0 {
+        return None;
+    }
+    Some(((total - free) / total * 100.0).clamp(0.0, 100.0))
+}
+
 /// 挂载点容量与 inode 使用率。
 pub struct DiskUsageCollector;
 
@@ -128,6 +139,13 @@ impl Collector for DiskUsageCollector {
                 )
                 .with_label("fs", fs_label),
             );
+            // M4-B1：每个 mount 的已用百分比，labels 与 disk.used 一致。
+            if let Some(percent) = used_percent(total, free) {
+                out.push(
+                    labelled("disk.used_percent", "mount", mount_label, ts, percent)
+                        .with_label("fs", fs_label),
+                );
+            }
             out.push(
                 labelled("disk.avail", "mount", mount_label, ts, avail.max(0.0))
                     .with_label("fs", fs_label),
@@ -454,5 +472,28 @@ mod tests {
         let map = parse_diskstats(text);
         assert!(!map.contains_key("loop0"));
         assert!(map.contains_key("sda"));
+    }
+
+    /// M4-B1：`disk.used_percent` 与 `disk.used` 同口径（total-free），并有界。
+    #[test]
+    fn m4_b1_used_percent_matches_disk_used_and_is_bounded() {
+        // 100 GiB 总量，用掉 40 GiB → 40%。
+        assert_eq!(used_percent(100.0, 60.0), Some(40.0));
+        assert_eq!(used_percent(100.0, 0.0), Some(100.0));
+        assert_eq!(used_percent(100.0, 100.0), Some(0.0));
+        // 与 disk.used 的分子一致：used = total - free = 25。
+        let (total, free) = (100.0, 75.0);
+        assert_eq!(total - free, 25.0);
+        assert_eq!(used_percent(total, free), Some(25.0));
+
+        // 坏输入不产生 NaN / 除零 / 越界样本。
+        assert_eq!(used_percent(0.0, 0.0), None);
+        assert_eq!(used_percent(-1.0, 0.0), None);
+        assert_eq!(used_percent(f64::NAN, 0.0), None);
+        assert_eq!(used_percent(100.0, f64::INFINITY), None);
+        // free > total（异常文件系统）夹到 0，而不是负数。
+        assert_eq!(used_percent(100.0, 120.0), Some(0.0));
+        // free 为负（异常）夹到 100。
+        assert_eq!(used_percent(100.0, -20.0), Some(100.0));
     }
 }

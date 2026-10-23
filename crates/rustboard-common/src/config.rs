@@ -478,6 +478,106 @@ pub enum AdminTlsMode {
     Required,
 }
 
+/// hub 端告警配置。对应 `hub.toml` 的 `[alerts]`。
+///
+/// 全部字段有默认值：旧配置（完全没有 `[alerts]`）可直接启动，行为与默认一致。
+/// 本阶段只落地配置与校验；评估任务在 B1b 接入后读取这些值。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HubAlertsConfig {
+    /// 告警引擎总开关。关闭时规则与事件表仍可用，但不执行评估与通知。
+    pub enabled: bool,
+    /// 评估轮询间隔（秒），1–3600。
+    pub evaluation_interval_secs: u64,
+    /// agent 离线判定阈值（秒），1–3600；内置离线规则默认 90 秒。
+    pub offline_after_secs: u64,
+    /// hub / agent 证书剩余寿命告警阈值（小时），1–720。
+    pub cert_warn_hours: u32,
+    /// 告警事件保留天数，1–3650。
+    pub event_retention_days: u32,
+    /// 告警事件表最大行数，1000–1_000_000。
+    pub max_events: u64,
+    /// 单次通知 HTTP 超时（秒），1–60。
+    pub notify_timeout_secs: u64,
+    /// 单条通知最多尝试次数（含首次），1–10。
+    pub notify_max_attempts: u32,
+}
+
+impl Default for HubAlertsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            evaluation_interval_secs: 15,
+            offline_after_secs: 90,
+            cert_warn_hours: 48,
+            event_retention_days: 90,
+            max_events: 100_000,
+            notify_timeout_secs: 10,
+            notify_max_attempts: 3,
+        }
+    }
+}
+
+impl HubAlertsConfig {
+    /// 配置自洽性校验。
+    ///
+    /// 即使 `enabled = false` 也校验取值范围：配置写错应在启动时暴露，
+    /// 而不是等到面板打开告警开关后才失败。
+    pub fn validate(&self) -> Result<()> {
+        for (name, value, min, max) in [
+            (
+                "evaluation_interval_secs",
+                self.evaluation_interval_secs,
+                MIN_ALERTS_EVALUATION_INTERVAL_SECS,
+                MAX_ALERTS_EVALUATION_INTERVAL_SECS,
+            ),
+            (
+                "offline_after_secs",
+                self.offline_after_secs,
+                MIN_ALERTS_OFFLINE_AFTER_SECS,
+                MAX_ALERTS_OFFLINE_AFTER_SECS,
+            ),
+            (
+                "cert_warn_hours",
+                u64::from(self.cert_warn_hours),
+                MIN_ALERTS_CERT_WARN_HOURS,
+                MAX_ALERTS_CERT_WARN_HOURS,
+            ),
+            (
+                "event_retention_days",
+                u64::from(self.event_retention_days),
+                MIN_ALERTS_EVENT_RETENTION_DAYS,
+                MAX_ALERTS_EVENT_RETENTION_DAYS,
+            ),
+            (
+                "max_events",
+                self.max_events,
+                MIN_ALERTS_MAX_EVENTS,
+                MAX_ALERTS_MAX_EVENTS,
+            ),
+            (
+                "notify_timeout_secs",
+                self.notify_timeout_secs,
+                MIN_ALERTS_NOTIFY_TIMEOUT_SECS,
+                MAX_ALERTS_NOTIFY_TIMEOUT_SECS,
+            ),
+            (
+                "notify_max_attempts",
+                u64::from(self.notify_max_attempts),
+                MIN_ALERTS_NOTIFY_MAX_ATTEMPTS,
+                MAX_ALERTS_NOTIFY_MAX_ATTEMPTS,
+            ),
+        ] {
+            if !(min..=max).contains(&value) {
+                return Err(Error::InvalidConfig(format!(
+                    "alerts.{name} 必须在 {min}–{max} 之间，实际 {value}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// hub 端配置。对应 `/etc/rustboard/hub.toml`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -560,6 +660,9 @@ pub struct HubConfig {
     /// M3 控制面配置；默认全部关闭，供 hub 控制 API 使用。
     #[serde(default)]
     pub control: HubControlConfig,
+    /// M4 告警配置；旧配置缺 `[alerts]` 时使用默认值。
+    #[serde(default)]
+    pub alerts: HubAlertsConfig,
 }
 
 /// agent 接入层默认的最大并发连接数。
@@ -624,6 +727,7 @@ impl Default for HubConfig {
             renew_before_days: default_renew_before_days(),
             cert_check_interval_secs: default_cert_check_interval_secs(),
             control: HubControlConfig::default(),
+            alerts: HubAlertsConfig::default(),
         }
     }
 }
@@ -722,6 +826,7 @@ impl HubConfig {
         self.validate_retention()?;
         self.validate_maintenance_interval()?;
         self.control.validate()?;
+        self.alerts.validate()?;
         Ok(())
     }
 
@@ -1001,6 +1106,22 @@ fn default_maintenance_interval_secs() -> u64 {
     DEFAULT_MAINTENANCE_INTERVAL_SECS
 }
 
+/// M4 告警配置的各字段允许范围（与方案 §8.2 一致）。
+const MIN_ALERTS_EVALUATION_INTERVAL_SECS: u64 = 1;
+const MAX_ALERTS_EVALUATION_INTERVAL_SECS: u64 = 3_600;
+const MIN_ALERTS_OFFLINE_AFTER_SECS: u64 = 1;
+const MAX_ALERTS_OFFLINE_AFTER_SECS: u64 = 3_600;
+const MIN_ALERTS_CERT_WARN_HOURS: u64 = 1;
+const MAX_ALERTS_CERT_WARN_HOURS: u64 = 720;
+const MIN_ALERTS_EVENT_RETENTION_DAYS: u64 = 1;
+const MAX_ALERTS_EVENT_RETENTION_DAYS: u64 = 3_650;
+const MIN_ALERTS_MAX_EVENTS: u64 = 1_000;
+const MAX_ALERTS_MAX_EVENTS: u64 = 1_000_000;
+const MIN_ALERTS_NOTIFY_TIMEOUT_SECS: u64 = 1;
+const MAX_ALERTS_NOTIFY_TIMEOUT_SECS: u64 = 60;
+const MIN_ALERTS_NOTIFY_MAX_ATTEMPTS: u64 = 1;
+const MAX_ALERTS_NOTIFY_MAX_ATTEMPTS: u64 = 10;
+
 /// agent 单次 WebSocket 写超时的允许范围与默认值（秒）。
 const MIN_SEND_TIMEOUT_SECS: u64 = 1;
 const MAX_SEND_TIMEOUT_SECS: u64 = 120;
@@ -1230,6 +1351,90 @@ mod tests {
                 .to_string();
             assert!(err.contains(field), "错误信息必须点名 {field}: {err}");
             assert!(err.contains("不能小于"), "错误信息应说明倒挂: {err}");
+        }
+    }
+
+    /// M4-B1：`[alerts]` 缺省与旧配置兼容；各字段默认值与方案 §8.2 一致；
+    /// 边界值合法，越界必须拒绝并点名字段。
+    #[test]
+    fn m4b1_alerts_defaults_toml_and_validation_bounds() {
+        // 旧配置完全没有 `[alerts]`：使用默认值且整体校验通过。
+        let hub: HubConfig = toml::from_str("").unwrap();
+        assert_eq!(hub.alerts, HubAlertsConfig::default());
+        let alerts = &hub.alerts;
+        assert!(alerts.enabled);
+        assert_eq!(alerts.evaluation_interval_secs, 15);
+        assert_eq!(alerts.offline_after_secs, 90);
+        assert_eq!(alerts.cert_warn_hours, 48);
+        assert_eq!(alerts.event_retention_days, 90);
+        assert_eq!(alerts.max_events, 100_000);
+        assert_eq!(alerts.notify_timeout_secs, 10);
+        assert_eq!(alerts.notify_max_attempts, 3);
+        hub.validate().expect("旧配置缺 [alerts] 必须合法");
+
+        // 只写部分字段：其余保持默认。
+        let hub: HubConfig = toml::from_str("[alerts]\nenabled = false\n").unwrap();
+        assert!(!hub.alerts.enabled);
+        assert_eq!(hub.alerts.evaluation_interval_secs, 15);
+        hub.validate().expect("关闭告警时默认值仍合法");
+
+        // 全部字段取合法边界。
+        let hub: HubConfig = toml::from_str(
+            "[alerts]\n\
+             enabled = true\n\
+             evaluation_interval_secs = 1\n\
+             offline_after_secs = 3600\n\
+             cert_warn_hours = 720\n\
+             event_retention_days = 3650\n\
+             max_events = 1000000\n\
+             notify_timeout_secs = 60\n\
+             notify_max_attempts = 10\n",
+        )
+        .unwrap();
+        hub.validate().expect("所有上限边界必须合法");
+
+        let hub: HubConfig = toml::from_str(
+            "[alerts]\n\
+             evaluation_interval_secs = 3600\n\
+             offline_after_secs = 1\n\
+             cert_warn_hours = 1\n\
+             event_retention_days = 1\n\
+             max_events = 1000\n\
+             notify_timeout_secs = 1\n\
+             notify_max_attempts = 1\n",
+        )
+        .unwrap();
+        hub.validate().expect("所有下限边界必须合法");
+
+        // 越界：0 与上限 +1 都必须拒绝，错误信息点名 alerts.<字段>。
+        for (line, field) in [
+            ("evaluation_interval_secs = 0", "evaluation_interval_secs"),
+            (
+                "evaluation_interval_secs = 3601",
+                "evaluation_interval_secs",
+            ),
+            ("offline_after_secs = 0", "offline_after_secs"),
+            ("offline_after_secs = 3601", "offline_after_secs"),
+            ("cert_warn_hours = 0", "cert_warn_hours"),
+            ("cert_warn_hours = 721", "cert_warn_hours"),
+            ("event_retention_days = 0", "event_retention_days"),
+            ("event_retention_days = 3651", "event_retention_days"),
+            ("max_events = 999", "max_events"),
+            ("max_events = 1000001", "max_events"),
+            ("notify_timeout_secs = 0", "notify_timeout_secs"),
+            ("notify_timeout_secs = 61", "notify_timeout_secs"),
+            ("notify_max_attempts = 0", "notify_max_attempts"),
+            ("notify_max_attempts = 11", "notify_max_attempts"),
+        ] {
+            let hub: HubConfig = toml::from_str(&format!("[alerts]\n{line}\n")).unwrap();
+            let err = hub
+                .validate()
+                .expect_err("越界告警配置必须被拒绝")
+                .to_string();
+            assert!(
+                err.contains(&format!("alerts.{field}")),
+                "错误信息必须点名 alerts.{field}: {err}"
+            );
         }
     }
 
