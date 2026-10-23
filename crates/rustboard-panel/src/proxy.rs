@@ -55,6 +55,8 @@ pub enum ProxyError {
     TooLarge,
     /// 读响应体失败。
     Body(String),
+    /// 读响应体超时（已收到响应头、未读完 body）；控制路径会转成 [`Self::Timeout`]。
+    BodyTimeout(String),
 }
 
 impl ProxyError {
@@ -63,7 +65,7 @@ impl ProxyError {
             ProxyError::Unreachable(_) => "hub_unreachable",
             ProxyError::Timeout(_) => "control_result_unknown",
             ProxyError::TooLarge => "hub_response_too_large",
-            ProxyError::Body(_) => "hub_body_error",
+            ProxyError::Body(_) | ProxyError::BodyTimeout(_) => "hub_body_error",
         }
     }
 }
@@ -172,8 +174,8 @@ impl ProxyClient {
     /// POST 一个 JSON 请求体到 hub，并使用请求级超时覆盖 client 的全局 30s。
     ///
     /// 单独暴露 `timeout` 是为了让测试能用毫秒级超时覆盖真实的 reqwest 超时路径，
-    /// 而不必在常规 CI 里等待几十秒。
-    pub async fn post_json_with_timeout(
+    /// 而不必在常规 CI 里等待几十秒；生产代码只经由 [`Self::post_json`] 使用它。
+    async fn post_json_with_timeout(
         &self,
         path: &str,
         value: &Value,
@@ -202,8 +204,10 @@ async fn send(request: reqwest::RequestBuilder) -> std::result::Result<HubReply,
 
 /// 带请求级超时的发送；只用于控制 POST（普通 GET/PUT 保持 30s 与既有错误语义）。
 ///
-/// `.timeout(timeout)` 覆盖 client 的全局 `UPSTREAM_TIMEOUT`；超时映射为
+/// `.timeout(timeout)` 覆盖 client 的全局 `UPSTREAM_TIMEOUT`；请求阶段超时映射为
 /// [`ProxyError::Timeout`]，其它连接错误仍是 [`ProxyError::Unreachable`]。
+/// 已收到响应头、读 body 阶段才超时时，`read_body_limited` 返回
+/// [`ProxyError::BodyTimeout`]；控制路径同样视为“结果未知”，统一转成 `Timeout`。
 async fn send_with_timeout(
     request: reqwest::RequestBuilder,
     timeout: Duration,
@@ -216,7 +220,10 @@ async fn send_with_timeout(
             ProxyError::Unreachable(detail)
         }
     })?;
-    collect_reply(response).await
+    collect_reply(response).await.map_err(|error| match error {
+        ProxyError::BodyTimeout(detail) => ProxyError::Timeout(detail),
+        other => other,
+    })
 }
 
 /// 读取状态码与受限响应体；`send` / `send_with_timeout` 共用。
@@ -243,10 +250,16 @@ async fn read_body_limited(
     }
     let mut body = Vec::new();
     loop {
-        let chunk = response
-            .chunk()
-            .await
-            .map_err(|e| ProxyError::Body(redact_url(&e.to_string())))?;
+        let chunk = response.chunk().await.map_err(|e| {
+            let detail = redact_url(&e.to_string());
+            if e.is_timeout() {
+                // 单独标记：控制 POST 会把“读 body 超时”视为结果未知，
+                // 普通 GET/PUT 仍按既有 502 `hub_body_error` 语义处理。
+                ProxyError::BodyTimeout(detail)
+            } else {
+                ProxyError::Body(detail)
+            }
+        })?;
         let Some(chunk) = chunk else {
             return Ok(body);
         };
@@ -297,6 +310,12 @@ pub fn proxy_error_to_response(error: &ProxyError) -> Response {
                 error.code(),
                 CONTROL_RESULT_UNKNOWN_MESSAGE,
             )
+        }
+        ProxyError::BodyTimeout(detail) => {
+            // 只有普通 GET/PUT 会走到这里：控制 POST 已在 `send_with_timeout`
+            // 把读 body 超时转成 `Timeout`；普通请求保持既有 502 语义。
+            tracing::warn!(error = %detail, "读取 hub 响应体超时");
+            json_error(StatusCode::BAD_GATEWAY, error.code())
         }
         ProxyError::Unreachable(detail) | ProxyError::Body(detail) => {
             tracing::warn!(error = %detail, "访问 hub 失败");
@@ -641,6 +660,69 @@ mod tests {
         assert_eq!(&body[..], &hub_body[..], "Hub 的 504 body 必须原样保留");
     }
 
+    #[tokio::test]
+    async fn maps_control_body_timeout_to_504_result_unknown() {
+        // 已收到响应头 + 部分 body，随后 body 卡住：控制 POST 仍必须标记结果未知。
+        let url = spawn_slow_body_server(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\
+              Connection: close\r\n\r\n{"
+                .to_vec(),
+            b"}".to_vec(),
+            Duration::from_millis(200),
+        );
+        let client = ProxyClient::new(&url, "test-token").unwrap();
+        let error = client
+            .post_json_with_timeout(
+                "/api/v1/agents/hub-self/control",
+                &serde_json::json!({ "capability": "process", "action": "list" }),
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("收到响应头后读 body 超时必须返回 Timeout");
+        assert!(
+            matches!(error, ProxyError::Timeout(_)),
+            "控制路径的 body 读超时必须映射为 Timeout，实际: {error:?}"
+        );
+        assert_eq!(error.code(), "control_result_unknown");
+
+        let response = proxy_error_to_response(&error);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"], "control_result_unknown");
+        assert_eq!(value["message"], CONTROL_RESULT_UNKNOWN_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn plain_request_body_timeout_stays_502_hub_body_error() {
+        // 普通 GET/PUT 的 body 读超时保持既有 502 `hub_body_error` 语义。
+        let url = spawn_slow_body_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{".to_vec(),
+            b"}".to_vec(),
+            Duration::from_millis(400),
+        );
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap();
+        let error = read_body_limited(response, 4096)
+            .await
+            .expect_err("读 body 超过 client 超时必须失败");
+        assert!(
+            matches!(error, ProxyError::BodyTimeout(_)),
+            "普通请求 body 读超时必须标记为 BodyTimeout，实际: {error:?}"
+        );
+        let response = proxy_error_to_response(&error);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("hub_body_error"));
+    }
+
     /// 起一个只服务一次请求的原始 HTTP 服务器；返回 URL。
     fn spawn_raw_server(response: Vec<u8>) -> String {
         format!(
@@ -662,6 +744,29 @@ mod tests {
                 let _ = stream.read(&mut scratch);
                 std::thread::sleep(delay);
                 let _ = stream.write_all(&response);
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// 先发 `head`（含响应头与部分 body），延迟 `delay` 后再发 `tail`。
+    ///
+    /// 用于覆盖“已收到响应头、读 body 阶段才超时”的边界。
+    fn spawn_slow_body_server(head: Vec<u8>, tail: Vec<u8>, delay: Duration) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut scratch = [0u8; 1024];
+                let _ = stream.read(&mut scratch);
+                let _ = stream.write_all(&head);
+                let _ = stream.flush();
+                std::thread::sleep(delay);
+                let _ = stream.write_all(&tail);
                 let _ = stream.flush();
             }
         });

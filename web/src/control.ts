@@ -312,6 +312,9 @@ export function describeControlError(error: ControlError, status?: number): stri
       // 面板等待超过 Hub 的最大控制等待：结果未知，动作可能已经执行。
       // 不能引导用户直接重试，否则可能重复执行危险动作。
       return "控制请求结果未知：动作可能已执行，不要直接重试；请先刷新并核对 systemd / 进程 / 容器状态";
+    case "control_result_too_large":
+      // hub 在 agent 执行完动作后才发现结果过大；同样不能诱导直接重试。
+      return "控制结果过大：动作可能已执行，请先核对状态，不要直接重试";
     case "too_many_pending":
       return "待处理命令过多，请稍后重试";
     case "rate_limited":

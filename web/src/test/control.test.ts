@@ -330,6 +330,17 @@ describe("控制错误文案", () => {
     // 不能出现“请稍后重试”这类会诱导用户直接重试的措辞。
     expect(text).not.toMatch(/稍后重试|自动重试|重试即可/);
   });
+
+  it("control_result_too_large 提示动作可能已执行且不诱导重试", () => {
+    const text = describeControlError(
+      { code: "control_result_too_large", message: "" },
+      502,
+    );
+    expect(text).toContain("控制结果过大");
+    expect(text).toContain("动作可能已执行");
+    expect(text).toContain("不要直接重试");
+    expect(text).not.toMatch(/稍后重试|自动重试|重试即可/);
+  });
 });
 
 describe("审计过滤参数编码", () => {
