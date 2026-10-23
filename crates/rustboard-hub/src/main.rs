@@ -42,7 +42,7 @@ use rustboard_common::util::{
 use rustboard_common::wire::{codes, AgentHello, EnrollRequest, Frame, Welcome};
 use rustboard_common::{DEFAULT_HUB_CONFIG, PROTOCOL_VERSION, VERSION};
 use rustboard_core::alerts::builtin_rules;
-use rustboard_core::archive::{ArchiveObject, ArchiveStatus, ColdStore};
+use rustboard_core::archive::{sha256_hex, ArchiveObject, ArchiveStatus, ColdStore};
 use rustboard_core::collect::default_collectors;
 use rustboard_core::downsample;
 use rustboard_core::storage::sqlite::SqliteStorage;
@@ -414,6 +414,11 @@ struct AppState {
     auth_failures: Arc<AuthFailureLimiter>,
     /// 通知发送器；渠道测试接口与通知 worker 共用，测试可注入 MockNotifier。
     notifier: Arc<dyn notify::Notifier>,
+    /// 归档下载单并发许可（1 permit）。
+    ///
+    /// 下载对象必须先完整读入内存（`ColdStore::get` 返回 `Vec<u8>`），
+    /// 单对象上限 64 MiB；用 1 个许可把并发峰值夹到最多一份对象内存。
+    archive_download_slots: Arc<Semaphore>,
 }
 
 /// 由 TLS accept 层注入到每个请求扩展里的对端身份。
@@ -1326,6 +1331,7 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
                 cfg.admin_auth_failure_limit_per_min,
             )),
             notifier: notifier.clone(),
+            archive_download_slots: Arc::new(Semaphore::new(1)),
         };
 
         spawn_revoke_watcher(storage.clone(), sessions);
@@ -1935,8 +1941,12 @@ async fn archive_status(
 const DEFAULT_ARCHIVE_OBJECT_LIMIT: usize = 50;
 /// 归档对象列表单页上限（方案 §8.1：limit 1..=100）。
 const MAX_ARCHIVE_OBJECT_LIMIT: usize = 100;
-/// 单次下载的服务端硬上限（方案 §7.4：1 GiB）。
-const MAX_ARCHIVE_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+/// 单次下载的内存硬上限（64 MiB）。
+///
+/// `ColdStore::get` 返回完整 `Vec<u8>`，无法流式读取；1 GiB 上限在并发请求下
+/// 足以打爆内存。这里把“单请求内存”夹到 64 MiB，并配合 AppState 的 1 permit
+/// 信号量限制并发；超过上限直接 413，不读 body。
+const MAX_ARCHIVE_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// `archive_objects.error` 允许透传的固定错误码；其它内容（可能来自人工改库 /
 /// 旧版本）一律收敛为 `archive_error`，避免把 URL 或后端正文带到 API。
 const ARCHIVE_OBJECT_ERROR_CODES: [&str; 6] = [
@@ -2091,8 +2101,9 @@ fn parse_archive_object_id(raw: &str) -> Result<i64, ApiError> {
 /// `GET /api/v1/archive/objects/{id}/download`：从冷存储读取对象并作为附件返回。
 ///
 /// 只有 `uploaded` / `local_deleted` 可下载；不存在 404，状态未就绪 409
-/// `archive_not_ready`；任何后端失败统一 502 `archive_unavailable`，不回显
-/// 后端 URL / 凭据 / 响应正文。
+/// `archive_not_ready`；对象超过 64 MiB 下载上限 413 `archive_too_large`；
+/// 后端失败 / 完整性校验失败统一 502 `archive_unavailable`，不回显后端 URL /
+/// 凭据 / 响应正文。整个读取过程持有一个下载许可，最多并发一份对象内存。
 async fn archive_object_download(
     State(state): State<AppState>,
     Path(raw_id): Path<String>,
@@ -2114,6 +2125,15 @@ async fn archive_object_download(
         ));
     }
 
+    // 单并发：get 必须整对象读入内存，峰值由 64 MiB 上限 + 1 个许可共同约束。
+    // `acquire_owned` 的等待 future 取消安全：请求被取消时不会拿走许可。
+    let _download_permit = state
+        .archive_download_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| archive_unavailable())?;
+
     let store = archive::build_store(&state.cfg.archive).map_err(|_| archive_unavailable())?;
     archive_download_response(&state.cfg, &object, store.as_ref()).await
 }
@@ -2123,10 +2143,17 @@ fn archive_unavailable() -> ApiError {
     ApiError::bad_gateway("archive_unavailable", "归档对象下载失败")
 }
 
+/// 固定 413：对象超过 64 MiB 下载上限；在读取 body 之前拒绝。
+fn archive_too_large() -> ApiError {
+    ApiError::too_large("archive_too_large", "归档对象超过 64 MiB 下载上限")
+}
+
 /// 从冷存储读取对象并构造下载响应。
 ///
-/// 先 `HEAD` 校验大小，再 `GET`；对象超过 `min(archive.max_object_bytes, 1 GiB)`
-/// 直接拒绝，避免异常对象一次性占满内存。响应头只由服务端构造：
+/// 先检查数据库记录与 `HEAD` 大小，再 `GET`；对象超过
+/// `min(archive.max_object_bytes, 64 MiB)` 直接 413，避免异常对象一次性占满
+/// 内存。读取后校验长度与 SHA-256 必须与数据库一致，否则固定 502。
+/// 响应头只由服务端构造：
 /// - `Content-Type: application/gzip`；
 /// - `Content-Disposition: attachment; filename="rustboard-<yyyyMMdd>-part-NNNNN.csv.gz"`；
 /// - `Content-Length` 与 `Cache-Control: private, no-store`。
@@ -2136,6 +2163,20 @@ async fn archive_download_response(
     store: &dyn ColdStore,
 ) -> Result<Response, ApiError> {
     let limit = cfg.archive.max_object_bytes.min(MAX_ARCHIVE_DOWNLOAD_BYTES);
+    archive_download_response_with_limit(object, store, limit).await
+}
+
+/// 带可调上限的下载响应实现；生产上限固定为
+/// `min(archive.max_object_bytes, 64 MiB)`，测试用小上限覆盖边界。
+async fn archive_download_response_with_limit(
+    object: &ArchiveObject,
+    store: &dyn ColdStore,
+    limit: u64,
+) -> Result<Response, ApiError> {
+    // 先看数据库记录：超限完全不触碰后端，避免把异常对象读进内存。
+    if object.bytes > limit {
+        return Err(archive_too_large());
+    }
     let filename =
         archive::download_filename(&object.object_key).ok_or_else(archive_unavailable)?;
 
@@ -2145,13 +2186,19 @@ async fn archive_download_response(
         .map_err(|_| archive_unavailable())?
         .ok_or_else(archive_unavailable)?;
     if meta.size > limit {
-        return Err(archive_unavailable());
+        return Err(archive_too_large());
     }
     let data = store
         .get(&object.object_key)
         .await
         .map_err(|_| archive_unavailable())?;
+    // 后端可能撒谎：HEAD / 数据库都小、实际 body 超大时仍拒绝（此时已分配，
+    // 但不会再返回给客户端；正常情况下 S3 / WebDAV 的 get 自身有 1 GiB 防线）。
     if data.len() as u64 > limit {
+        return Err(archive_too_large());
+    }
+    // 短读 / 对象被替换：长度或 SHA-256 必须与上传时记录一致。
+    if data.len() as u64 != object.bytes || sha256_hex(&data) != object.sha256 {
         return Err(archive_unavailable());
     }
 
@@ -3319,6 +3366,11 @@ enum ApiError {
         message: String,
     },
     PayloadTooLarge,
+    /// 资源超过服务端可承受上限（例如归档下载 > 64 MiB）：413 + 固定错误码。
+    TooLarge {
+        code: &'static str,
+        message: String,
+    },
     /// 上游依赖失败（例如渠道测试发送失败）：502 + 固定错误码，不回显上游内容。
     BadGateway {
         code: &'static str,
@@ -3360,6 +3412,13 @@ impl ApiError {
 
     fn bad_gateway(code: &'static str, message: impl Into<String>) -> Self {
         Self::BadGateway {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn too_large(code: &'static str, message: impl Into<String>) -> Self {
+        Self::TooLarge {
             code,
             message: message.into(),
         }
@@ -3423,6 +3482,11 @@ impl IntoResponse for ApiError {
             ApiError::PayloadTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(serde_json::json!({ "error": "payload_too_large" })),
+            )
+                .into_response(),
+            ApiError::TooLarge { code, message } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": code, "message": message })),
             )
                 .into_response(),
             ApiError::BadGateway { code, message } => (
@@ -5415,6 +5479,7 @@ mod tests {
             admin_rate,
             auth_failures,
             notifier: Arc::new(crate::notify::MockNotifier::new()),
+            archive_download_slots: Arc::new(Semaphore::new(1)),
         };
         let token = "enroll-token-bad-csr";
         let now = now_ms();
@@ -5474,6 +5539,7 @@ mod tests {
             admin_rate,
             auth_failures,
             notifier: Arc::new(crate::notify::MockNotifier::new()),
+            archive_download_slots: Arc::new(Semaphore::new(1)),
         };
 
         let token = "enroll-token-value";
@@ -5770,6 +5836,7 @@ mod tests {
             admin_rate,
             auth_failures,
             notifier: Arc::new(crate::notify::MockNotifier::new()),
+            archive_download_slots: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -9893,6 +9960,31 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
+    /// M4-C4：旧库 / 人工写入带 URL 的 last_error，status API 必须掩码。
+    #[tokio::test]
+    async fn m4c4_archive_status_api_masks_unsafe_last_error() {
+        let state = v6_auth_state();
+        state
+            .storage
+            .set_archive_state(
+                archive::STATE_LAST_ERROR,
+                "https://user:pass@minio.internal/secret-bucket?X-Amz-Credential=AKIA_LEAK",
+                1,
+            )
+            .unwrap();
+        let read = v6_seed_token(&state, "archive-status-mask", "read");
+        let router = admin_router(state.clone());
+
+        let (status, _, body) =
+            admin_call(&router, "GET", "/api/v1/archive/status", Some(&read), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body).to_string();
+        assert!(!text.contains("minio.internal"), "不得回显 URL");
+        assert!(!text.contains("AKIA"), "不得回显凭据");
+        assert!(!text.contains("user:pass"), "不得回显凭据");
+        assert_eq!(json_body(&body)["last_error"], "archive_error");
+    }
+
     // ------------------------------------------------------------------
     // M4-C2b：archive objects 列表 / 下载 / S3 archive test
     // ------------------------------------------------------------------
@@ -10045,7 +10137,9 @@ mod tests {
             .unwrap()
             .objects
             .insert(key.to_string(), data.clone());
-        let object = archive_object_record(key, ArchiveStatus::Uploaded, "");
+        let mut object = archive_object_record(key, ArchiveStatus::Uploaded, "");
+        object.bytes = data.len() as u64;
+        object.sha256 = sha256_hex(&data);
         let id = state.storage.insert_archive_object(&object).unwrap();
 
         let (status, headers, body) = admin_call(
@@ -10075,6 +10169,120 @@ mod tests {
         );
         assert_eq!(body, data, "下载字节必须与后端对象一致");
         assert!(!String::from_utf8_lossy(&body).contains("dav-password"));
+    }
+
+    /// M4-C4：数据库记录超过下载上限时 413，且不触碰后端（无 HEAD / GET）。
+    #[tokio::test]
+    async fn m4c4_archive_download_oversized_is_413_without_backend_io() {
+        use crate::archive_webdav::test_support::MockDav;
+
+        let mock = MockDav::spawn().await;
+        let mut cfg = HubConfig::default();
+        cfg.archive.backend = rustboard_common::config::ArchiveBackend::Webdav;
+        cfg.archive.webdav = Some(mock.config());
+        let state = hub_state_with(cfg);
+        let read = v6_seed_token(&state, "archive-dl-large", "read");
+        let router = admin_router(state.clone());
+
+        let mut object = archive_object_record(
+            "rustboard/2026/10/24/part-00001.csv.gz",
+            ArchiveStatus::Uploaded,
+            "",
+        );
+        object.bytes = MAX_ARCHIVE_DOWNLOAD_BYTES + 1;
+        let id = state.storage.insert_archive_object(&object).unwrap();
+
+        let (status, _, body) = admin_call(
+            &router,
+            "GET",
+            &format!("/api/v1/archive/objects/{id}/download"),
+            Some(&read),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(json_body(&body)["error"], "archive_too_large");
+        assert!(
+            mock.inner.lock().unwrap().requests.is_empty(),
+            "超限对象不得触碰后端"
+        );
+    }
+
+    /// M4-C4：下载单并发信号量；等待请求取消不会泄漏许可。
+    #[tokio::test]
+    async fn m4c4_archive_download_semaphore_serializes_and_cancel_is_safe() {
+        let state = v6_auth_state();
+        let read = v6_seed_token(&state, "archive-dl-serial", "read");
+        let object = archive_object_record(
+            "rustboard/2026/10/24/part-00001.csv.gz",
+            ArchiveStatus::Uploaded,
+            "",
+        );
+        let id = state.storage.insert_archive_object(&object).unwrap();
+        let uri = format!("/api/v1/archive/objects/{id}/download");
+        let router = admin_router(state.clone());
+
+        let held = state
+            .archive_download_slots
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        assert_eq!(state.archive_download_slots.available_permits(), 0);
+
+        let read_for_task = read.clone();
+        let router_for_task = router.clone();
+        let uri_for_task = uri.clone();
+        let mut task = tokio::spawn(async move {
+            admin_call(
+                &router_for_task,
+                "GET",
+                &uri_for_task,
+                Some(&read_for_task),
+                None,
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut task)
+                .await
+                .is_err(),
+            "持锁期间下载必须等待"
+        );
+        assert_eq!(state.archive_download_slots.available_permits(), 0);
+
+        drop(held);
+        let (status, _, body) = task.await.unwrap();
+        // 该测试没有配置后端：拿到许可后应返回固定 502。
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(json_body(&body)["error"], "archive_unavailable");
+        assert_eq!(state.archive_download_slots.available_permits(), 1);
+
+        // 取消等待：请求 future 被 drop 时不能占走许可。
+        let held = state
+            .archive_download_slots
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        let router_for_cancel = admin_router(state.clone());
+        let read_for_cancel = read.clone();
+        let uri_for_cancel = uri.clone();
+        let pending = admin_call(
+            &router_for_cancel,
+            "GET",
+            &uri_for_cancel,
+            Some(&read_for_cancel),
+            None,
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(100), pending)
+            .await
+            .is_err());
+        assert_eq!(state.archive_download_slots.available_permits(), 0);
+        drop(held);
+        assert_eq!(
+            state.archive_download_slots.available_permits(),
+            1,
+            "取消等待不得泄漏许可"
+        );
     }
 
     /// M4-C2b：下载的状态码与路径 id 校验；后端不可用时固定 502，不泄露细节。
@@ -10164,15 +10372,14 @@ mod tests {
         assert!(!body.to_string().contains("archive.webdav"));
     }
 
-    /// M4-C2b：下载响应构造的大小上限与错误收敛（注入 InMemory S3，不联网）。
+    /// M4-C4：下载 64 MiB 上限、短读 / 篡改校验；超限必须在 get 前拒绝。
     #[tokio::test]
-    async fn m4c2b_archive_download_response_enforces_size_limit() {
+    async fn m4c4_archive_download_response_enforces_size_and_integrity() {
         use crate::archive_s3::S3ColdStore;
         use object_store::memory::InMemory;
 
         let store = S3ColdStore::with_store(Arc::new(InMemory::new()));
-        let mut cfg = HubConfig::default();
-        cfg.archive.max_object_bytes = 1_048_576; // 配置下限 1 MiB
+        let cfg = HubConfig::default();
         let key = "rustboard/2026/10/24/part-00009.csv.gz";
 
         // 缺失对象 → 502。
@@ -10189,12 +10396,72 @@ mod tests {
             }
         ));
 
-        // 超过 archive.max_object_bytes → 502，且不读取对象内容。
-        store.put(key, &vec![0u8; 1_048_577]).await.unwrap();
-        let error = archive_download_response(&cfg, &object, &store)
+        // 数据库记录超过 64 MiB → 413；对象不存在也必须是 413（证明未 get）。
+        let mut oversized = archive_object_record(key, ArchiveStatus::Uploaded, "");
+        oversized.bytes = MAX_ARCHIVE_DOWNLOAD_BYTES + 1;
+        let error = archive_download_response(&cfg, &oversized, &store)
             .await
             .map(|_| ())
             .expect_err("超限对象必须失败");
+        assert!(matches!(
+            error,
+            ApiError::TooLarge {
+                code: "archive_too_large",
+                ..
+            }
+        ));
+
+        // HEAD 大小超限、数据库记录很小 → 413；用计数 store 证明没有调用 get。
+        let get_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let head_store = HeadOnlyStore {
+            size: 17,
+            get_calls: get_calls.clone(),
+        };
+        let mut small_record = archive_object_record(key, ArchiveStatus::Uploaded, "");
+        small_record.bytes = 1;
+        let error = archive_download_response_with_limit(&small_record, &head_store, 16)
+            .await
+            .map(|_| ())
+            .expect_err("HEAD 超限必须失败");
+        assert!(matches!(
+            error,
+            ApiError::TooLarge {
+                code: "archive_too_large",
+                ..
+            }
+        ));
+        assert_eq!(
+            get_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "HEAD 超限不得读取对象 body"
+        );
+
+        // 短读：实际 5 字节，数据库记录 10 字节 → 502。
+        let data = b"short".to_vec();
+        store.put(key, &data).await.unwrap();
+        let mut short_record = archive_object_record(key, ArchiveStatus::Uploaded, "");
+        short_record.bytes = 10;
+        short_record.sha256 = sha256_hex(&data);
+        let error = archive_download_response_with_limit(&short_record, &store, 1024)
+            .await
+            .map(|_| ())
+            .expect_err("短读必须失败");
+        assert!(matches!(
+            error,
+            ApiError::BadGateway {
+                code: "archive_unavailable",
+                ..
+            }
+        ));
+
+        // 篡改：长度一致但 SHA-256 不符 → 502。
+        let mut tampered = archive_object_record(key, ArchiveStatus::Uploaded, "");
+        tampered.bytes = data.len() as u64;
+        tampered.sha256 = "0".repeat(64);
+        let error = archive_download_response_with_limit(&tampered, &store, 1024)
+            .await
+            .map(|_| ())
+            .expect_err("SHA-256 不符必须失败");
         assert!(matches!(
             error,
             ApiError::BadGateway {
@@ -10220,6 +10487,47 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// 测试用 ColdStore：HEAD 返回指定大小，get 只计数不返回数据。
+    struct HeadOnlyStore {
+        size: u64,
+        get_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ColdStore for HeadOnlyStore {
+        async fn put(
+            &self,
+            _key: &str,
+            _data: &[u8],
+        ) -> rustboard_core::archive::ArchiveResult<()> {
+            unimplemented!("测试 store 不支持 put")
+        }
+
+        async fn get(&self, _key: &str) -> rustboard_core::archive::ArchiveResult<Vec<u8>> {
+            self.get_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(rustboard_core::archive::ArchiveError::BackendUnavailable)
+        }
+
+        async fn delete(&self, _key: &str) -> rustboard_core::archive::ArchiveResult<()> {
+            unimplemented!("测试 store 不支持 delete")
+        }
+
+        async fn head(
+            &self,
+            _key: &str,
+        ) -> rustboard_core::archive::ArchiveResult<Option<rustboard_core::archive::ColdObjectMeta>>
+        {
+            Ok(Some(rustboard_core::archive::ColdObjectMeta {
+                size: self.size,
+            }))
+        }
+
+        async fn test(&self) -> rustboard_core::archive::ArchiveResult<()> {
+            unimplemented!("测试 store 不支持 test")
+        }
     }
 
     /// M4-C2b：`archive test` 支持 S3，backend 输出实际配置值；探针不联网。

@@ -504,6 +504,11 @@ fn sanitize_download_disposition(headers: &HeaderMap) -> Option<HeaderValue> {
     HeaderValue::from_str(raw).ok()
 }
 
+/// 上游 `Content-Length` 与实际收到的字节数不一致（短读 / 截断）。
+fn download_length_mismatch(received: u64, content_length: Option<u64>) -> bool {
+    content_length.is_some_and(|expected| received != expected)
+}
+
 /// 启动下载泵任务：按块读取 hub 响应并送入固定容量通道。
 ///
 /// 通道提供背压，面板内存与对象大小无关；浏览器断开（接收端 drop）时
@@ -531,7 +536,20 @@ fn spawn_download_pump(
                         return;
                     }
                 }
-                Ok(None) => return,
+                Ok(None) => {
+                    // EOF 时再核对长度：上游若提前结束，不能把截断对象当成功下载。
+                    if download_length_mismatch(received, content_length) {
+                        tracing::warn!(
+                            received,
+                            expected = content_length.unwrap_or_default(),
+                            "归档下载上游提前结束，响应长度不一致"
+                        );
+                        let _ = sender
+                            .send(Err(std::io::Error::other("归档下载响应不完整")))
+                            .await;
+                    }
+                    return;
+                }
                 Err(_error) => {
                     // 流式阶段不再暴露 hub 地址 / token；客户端只会看到截断的下载。
                     let _ = sender
@@ -1437,6 +1455,29 @@ mod tests {
             read_body_limited(response, 32).await,
             Err(ProxyError::TooLarge)
         ));
+    }
+
+    #[test]
+    fn download_length_mismatch_is_detected() {
+        assert!(!download_length_mismatch(10, None));
+        assert!(!download_length_mismatch(10, Some(10)));
+        assert!(download_length_mismatch(9, Some(10)));
+        assert!(download_length_mismatch(11, Some(10)));
+    }
+
+    /// 上游声明 Content-Length: 100 但只发 5 字节：下载 body 必须报错，
+    /// 不能把截断对象当成功响应交给浏览器。
+    #[tokio::test]
+    async fn download_body_errors_on_truncated_upstream_response() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\n\
+            Content-Length: 100\r\nConnection: close\r\n\r\nshort"
+            .to_vec();
+        let url = spawn_raw_server(response);
+        let client = ProxyClient::new(&url, "test-token", "").unwrap();
+        let response = client.download("/api/v1/system").await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = to_bytes(response.into_body(), 1024).await;
+        assert!(result.is_err(), "短读必须让下载 body 报错");
     }
 
     /// reqwest 默认会读取 HTTP_PROXY/ALL_PROXY；面板访问 hub 时会带上 Bearer token，

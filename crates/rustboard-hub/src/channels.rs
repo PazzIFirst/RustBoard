@@ -320,6 +320,7 @@ mod tests {
                 cfg.admin_auth_failure_limit_per_min,
             )),
             notifier: mock,
+            archive_download_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 

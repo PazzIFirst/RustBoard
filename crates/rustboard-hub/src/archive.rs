@@ -56,8 +56,26 @@ const MAX_SHARD_ROWS: usize = 50_000;
 /// 单次 SQL 扫描行数；worker 分批读取，避免一次把整天 raw 读进内存。
 const SCAN_BATCH_ROWS: usize = 10_000;
 
-/// 写入 `archive_state.last_error` 的最大字符数，避免超长错误撑大状态表。
-const MAX_LAST_ERROR_CHARS: usize = 512;
+/// `archive_state.last_error` 允许透传的固定中文文案（历史版本可能直接存过
+/// `ArchiveError::Display`）。未知内容一律掩码为 `archive_error`。
+const SAFE_LAST_ERROR_TEXTS: [&str; 7] = [
+    "归档未启用（archive.enabled = false）",
+    "归档对象 key 非法",
+    "归档 manifest 非法",
+    "归档对象状态非法",
+    "归档数据编码失败",
+    "冷存储后端不可用",
+    "归档对象不存在",
+];
+
+/// `last_error` 允许的最大字符数；超长内容视为异常，不做截断展示。
+const MAX_LAST_ERROR_CHARS: usize = 64;
+
+/// 新失败写入的固定码：不含后端 URL / 凭据 / 响应正文。
+const LAST_ERROR_RUN_FAILED: &str = "archive_run_failed";
+
+/// 未知 / 不安全状态的统一掩码。
+const LAST_ERROR_MASKED: &str = "archive_error";
 
 /// 一次归档任务的结果（`archive run` 输出 / worker 日志 / 测试断言）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -85,6 +103,7 @@ pub(crate) struct ArchiveStatusOutput {
     pub backend: String,
     pub last_archived_ts: Option<i64>,
     pub last_run: Option<i64>,
+    /// 固定错误码 / 固定中文，或掩码后的 `archive_error`；不含 URL / 凭据。
     pub last_error: Option<String>,
     /// `archive_objects` 总行数（不区分状态）。
     pub objects: i64,
@@ -210,10 +229,14 @@ pub(crate) fn archive_gate(storage: &SqliteStorage, cfg: &HubConfig) -> ArchiveG
 }
 
 /// 读取 `archive status` 的结构化状态。
+///
+/// `last_error` 可能是旧版本写入的原始 `{err:#}`，读取时再做一次白名单 / 掩码，
+/// 防止历史库里的 URL、凭据或路径经由 API / 面板回显。
 pub(crate) fn status(storage: &SqliteStorage, cfg: &HubConfig) -> Result<ArchiveStatusOutput> {
     let last_error = storage
         .get_archive_state(STATE_LAST_ERROR)?
-        .filter(|value| !value.trim().is_empty());
+        .map(|value| sanitize_last_error(&value))
+        .filter(|value| !value.is_empty());
     Ok(ArchiveStatusOutput {
         enabled: cfg.archive.enabled,
         backend: cfg.archive.backend.as_str().to_string(),
@@ -222,6 +245,31 @@ pub(crate) fn status(storage: &SqliteStorage, cfg: &HubConfig) -> Result<Archive
         last_error,
         objects: storage.count_archive_objects()?,
     })
+}
+
+/// 判断是否为 `[a-z0-9_]*_failed` 形式的固定错误码。
+fn is_failed_code(value: &str) -> bool {
+    value.len() <= MAX_LAST_ERROR_CHARS
+        && value.ends_with("_failed")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+/// `archive_state.last_error` 的展示脱敏。
+///
+/// 只允许固定中文文案或 `*_failed` 固定码；其余内容（URL、凭据、路径、超长
+/// 错误或任意旧版本 `{err:#}`）一律返回 `archive_error`，不做截断展示。
+fn sanitize_last_error(raw: &str) -> String {
+    let value = raw.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+    if SAFE_LAST_ERROR_TEXTS.contains(&value) || is_failed_code(value) {
+        value.to_string()
+    } else {
+        LAST_ERROR_MASKED.to_string()
+    }
 }
 
 /// 启动归档 worker。
@@ -304,7 +352,8 @@ fn next_run_delay(now: i64, schedule_hour_utc: u8) -> Duration {
 
 /// 执行一轮归档（后台 worker 与 `archive run` 共用）。
 ///
-/// 无论成功失败都会写 `last_run`；失败时把固定错误摘要写入 `last_error`。
+/// 无论成功失败都会写 `last_run`；失败时只把固定码 `archive_run_failed`
+/// 写入 `last_error`（成功清空），不存后端错误原文。
 /// 返回的 [`ArchiveRunReport`] 只用于日志 / CLI，不包含 secret。
 pub(crate) async fn run_archive_once(
     storage: &SqliteStorage,
@@ -339,12 +388,10 @@ async fn run_archive_once_with_limits(
 
 /// 访问数据库失败时只 WARN，不覆盖调用方真正关心的归档错误。
 fn record_run_state(storage: &SqliteStorage, now: i64, result: &Result<ArchiveRunReport>) {
+    // 只写固定码：后端错误即使意外带出 URL / 凭据，也不会进入状态表。
     let last_error = match result {
         Ok(_) => String::new(),
-        Err(err) => format!("{err:#}")
-            .chars()
-            .take(MAX_LAST_ERROR_CHARS)
-            .collect::<String>(),
+        Err(_) => LAST_ERROR_RUN_FAILED.to_string(),
     };
     if let Err(err) = storage.set_archive_state(STATE_LAST_RUN, &now.to_string(), now) {
         tracing::warn!(error = %err, "写入归档任务 last_run 失败");
@@ -869,7 +916,10 @@ mod tests {
             .get_archive_state(STATE_LAST_ERROR)
             .unwrap()
             .unwrap_or_default();
-        assert!(!last_error.is_empty(), "失败必须记录 last_error");
+        assert_eq!(
+            last_error, LAST_ERROR_RUN_FAILED,
+            "失败只记录固定码，不写后端错误原文"
+        );
         assert!(mock.inner.lock().unwrap().objects.is_empty());
     }
 
@@ -1015,8 +1065,74 @@ mod tests {
         assert_eq!(status.backend, "webdav");
         assert_eq!(status.last_archived_ts, Some(123));
         assert_eq!(status.last_run, Some(456));
-        assert_eq!(status.last_error.as_deref(), Some("backend down"));
+        assert_eq!(status.last_error.as_deref(), Some("archive_error"));
         assert_eq!(status.objects, 1);
+    }
+
+    /// M4-C4：旧库 / 人工写入的 last_error 可能带 URL / 凭据 / 路径，
+    /// status 必须掩码；固定中文与固定码仍可展示。
+    #[test]
+    fn status_masks_unsafe_last_error_values() {
+        let storage = SqliteStorage::open_in_memory().unwrap();
+        let cfg = test_cfg();
+
+        let long = "a".repeat(MAX_LAST_ERROR_CHARS + 1);
+        for unsafe_value in [
+            "https://minio.internal/secret-bucket?X-Amz-Credential=AKIA_LEAK",
+            "user:password@dav.example.com/rustboard",
+            "/var/lib/rustboard/hub.toml",
+            "C:\\rustboard\\hub.toml",
+            "backend down",
+            long.as_str(),
+        ] {
+            storage
+                .set_archive_state(STATE_LAST_ERROR, unsafe_value, 1)
+                .unwrap();
+            assert_eq!(
+                status(&storage, &cfg).unwrap().last_error.as_deref(),
+                Some(LAST_ERROR_MASKED),
+                "value={unsafe_value:?}"
+            );
+        }
+
+        for safe_value in [
+            "archive_run_failed",
+            "archive_upload_failed",
+            "冷存储后端不可用",
+            "归档对象 key 非法",
+            "归档未启用（archive.enabled = false）",
+        ] {
+            storage
+                .set_archive_state(STATE_LAST_ERROR, safe_value, 1)
+                .unwrap();
+            assert_eq!(
+                status(&storage, &cfg).unwrap().last_error.as_deref(),
+                Some(safe_value),
+                "value={safe_value:?}"
+            );
+        }
+
+        // 空串视为无错误。
+        storage
+            .set_archive_state(STATE_LAST_ERROR, "   ", 1)
+            .unwrap();
+        assert!(status(&storage, &cfg).unwrap().last_error.is_none());
+    }
+
+    /// 固定码 / 固定中文的白名单不能把任意带 `_failed` 的大写或含符号串放行。
+    #[test]
+    fn last_error_code_whitelist_is_strict() {
+        for value in [
+            "Archive_failed",
+            "archive_failed!",
+            "../../etc/passwd_failed",
+            "x@_failed",
+            "archive_ failed",
+        ] {
+            assert!(!is_failed_code(value), "value={value:?}");
+        }
+        assert!(is_failed_code("archive_run_failed"));
+        assert!(is_failed_code("archive_upload_failed"));
     }
 
     #[test]

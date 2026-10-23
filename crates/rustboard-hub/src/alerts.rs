@@ -464,6 +464,7 @@ mod tests {
                 cfg.admin_auth_failure_limit_per_min,
             )),
             notifier: Arc::new(crate::notify::MockNotifier::new()),
+            archive_download_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 

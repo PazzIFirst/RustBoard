@@ -38,6 +38,14 @@
   `cert.days_left`）；内置证书阈值 48 小时、离线 90 秒，首次种入取配置
 - 通知测试发送 `POST /api/v1/alerts/channels/{id}/test` 成功返回 204
 
+### Fixed
+
+- 归档下载内存安全：单对象下载上限降为 64 MiB（超限 413
+  `archive_too_large`），读取用 1 permit 串行化，`get` 后校验长度与 SHA-256；
+  面板下载在 EOF 校验累计字节与 `Content-Length`，短读让 body 报错
+- 归档 `status` 的 `last_error` 改为固定码写入 + 读取白名单掩码，历史库里的
+  URL / 凭据 / 路径 / 超长内容统一显示 `archive_error`
+
 ### Security
 
 - 通知渠道 secret 只在 SQLite `config_json` 与发送边界出现；API 只返回
