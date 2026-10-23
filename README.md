@@ -41,7 +41,7 @@
    - `rustboard-agent cert-info` 查看证书 CN / notBefore / notAfter / 剩余天数；
    - `rustboard-agent renew` 立即强制轮换客户端证书；
    - `rustboard-hub rotate-cert [--force] [--days N]` 重签服务端证书（成对备份旧 key/cert）；
-     运行中的 hub 会在 ≤10s 内自动热加载新证书，无需重启；`--force` 用于未到阈值时强制轮换。
+     运行中的 hub 会在 ≤15s 内自动热加载新证书（含管理端 TLS），无需重启；`--force` 用于未到阈值时强制轮换。
 
 ## 控制面（v0.3.0，默认关闭）
 

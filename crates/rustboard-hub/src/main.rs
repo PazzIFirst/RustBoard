@@ -222,7 +222,7 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// 立即用 CA 重签服务端证书（备份旧证书，运行中的 hub 会在 ≤10s 内热加载）。
+    /// 立即用 CA 重签服务端证书（备份旧证书，运行中的 hub 会在 ≤15s 内热加载）。
     RotateCert {
         #[arg(short, long)]
         config: Option<PathBuf>,
@@ -678,6 +678,12 @@ fn init(
     // 先校验再落盘/签发：非法有效期/非法 SAN 不能留下一个起不来的安装或半个 CA。
     cfg.validate()
         .context("init 参数校验失败（检查有效期参数、--renew-before-days 与 --san）")?;
+    // required 时管理端地址必须能被证书覆盖（精确 IP 或 DNS 访问），在签发/落盘前
+    // 就拒绝，避免交付一个启动即失败的配置。off 非回环仍只警告、允许落盘。
+    if cfg.admin_tls == AdminTlsMode::Required {
+        validate_admin_tls(&cfg)
+            .context("init 管理 API TLS 校验失败（检查 --admin-listen 与 --san/server_names）")?;
+    }
 
     let policy = tls::CertPolicy {
         ca_days: cfg.ca_validity_days,
@@ -871,7 +877,7 @@ fn rotate_cert(config: Option<PathBuf>, force: bool, days: Option<u32>) -> Resul
         }
     }
 
-    println!("重签只改磁盘；运行中的 hub 会在 ≤10s 内自动热加载，无需重启。");
+    println!("重签只改磁盘；运行中的 hub 会在 ≤15s 内自动热加载，无需重启。");
 
     // 文件级签发：内部先做 CA/SAN/新证书自检，全部通过后才成对备份并写盘，
     // 失败路径不会留下无意义的备份；也不读旧 TLS 配置，key/cert 不配套时同样可用。
@@ -905,7 +911,8 @@ fn rotate_cert(config: Option<PathBuf>, force: bool, days: Option<u32>) -> Resul
         tls::format_unix_utc(renewed.not_after)
     );
     println!(
-        "运行中的 hub 将在 ≤10s 内自动加载新证书（无需重启）；默认（CA 未变）已纳管 agent \
+        "运行中的 hub 将在 ≤15s 内自动加载新证书（无需重启；管理端 TLS 会跟随 mTLS 证书切换）；\
+         默认（CA 未变）已纳管 agent \
          用 CA 信任会自动重连；若这次轮换同时替换了 CA，所有 agent 必须重新纳管\
          （旧 ca.crt/客户端证书属于旧 CA，会 mTLS 失败）。"
     );
@@ -990,7 +997,8 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         // rustls 配置推进 watch；accept 循环每条新连接读一次，老连接不受影响。
         let (tls_tx, tls_rx) = watch::channel(tls_config);
         cert_rotation::spawn_server_renewal(state.cfg.clone(), tls_tx.clone(), live_cert.clone());
-        // KI-10：每 10s 轮询磁盘证书，运行中 rotate 后 ≤10s 热加载（≤15s 验收）。
+        // KI-10：每 10s 轮询磁盘证书，运行中 rotate 后 mTLS ≤10s 热加载；
+        // 管理端 watcher 每 2s 跟随 live_cert，合计最迟约 12s（对外承诺 ≤15s）。
         cert_rotation::spawn_cert_file_watcher(state.cfg.clone(), tls_tx, live_cert.clone());
 
         // v0.3.3：管理端可选 HTTPS。复用 agent 入口的 server.crt/server.key，
@@ -1062,8 +1070,9 @@ fn admin_listen_is_non_loopback(addr: &str) -> Result<bool> {
 /// 启动前校验管理 API 的传输安全；任何失败都发生在监听之前。
 ///
 /// - `off` 只允许回环：非回环直接拒绝（v0.3.3 有意的安全收紧）。
-/// - `required`：非通配绑定 IP 必须在 `server_names` 里，否则证书 SAN 不覆盖该地址，
-///   提示先更新 server_names 再 rotate-cert；`0.0.0.0` / `::` 通配绑定跳过该检查。
+/// - `required`：绑定 IP 在 `server_names` 里（比较前 trim），或管理端可通过
+///   `server_names` 里的 DNS 名访问；两者都不满足时提示先更新 server_names 再
+///   rotate-cert。`0.0.0.0` / `::` 通配绑定跳过精确检查。
 fn validate_admin_tls(cfg: &HubConfig) -> Result<()> {
     let sock: SocketAddr = cfg
         .admin_listen
@@ -1082,22 +1091,55 @@ fn validate_admin_tls(cfg: &HubConfig) -> Result<()> {
         AdminTlsMode::Required => {
             let ip = sock.ip();
             if ip.is_unspecified() {
+                // 通配绑定不知道客户端用哪个地址访问，跳过精确 SAN 检查；但如果
+                // server_names 只有回环名，远端客户端必然校验证书失败，提前告警。
+                if all_loopback_server_names(&cfg.server_names) {
+                    tracing::warn!(
+                        "管理 API 使用通配绑定，但 server_names 全部是回环名；\
+                         远端客户端校验证书会失败，请补充可访问的 IP / DNS SAN 后执行 rotate-cert"
+                    );
+                }
                 return Ok(());
             }
-            let covered = cfg.server_names.iter().any(|name| {
+            let names: Vec<&str> = cfg
+                .server_names
+                .iter()
+                .map(|name| name.trim())
+                .filter(|name| !name.is_empty())
+                .collect();
+            let covered = names.iter().any(|name| {
                 name.parse::<IpAddr>()
                     .is_ok_and(|candidate| candidate == ip)
             });
-            if !covered {
+            // 也允许管理端通过 DNS 访问：bind IP 不必出现在 SAN 里，证书覆盖实际
+            // 访问的 DNS 名即可。回环绑定不适用（DNS 名无法指到 127.x），仍要求
+            // 精确 IP SAN，避免 init 产出无法本机访问的配置。
+            let dns_covered =
+                !ip.is_loopback() && names.iter().any(|name| name.parse::<IpAddr>().is_err());
+            if !covered && !dns_covered {
                 bail!(
-                    "admin_tls=\"required\" 且管理 API 绑定 {ip}，但 server_names 中没有该 IP SAN；\
-                     请先把 {ip} 加入 server_names，再执行 `rustboard-hub rotate-cert --force` \
-                     重签服务端证书"
+                    "admin_tls=\"required\" 且管理 API 绑定 {ip}，但 server_names 中既没有该 IP SAN、\
+                     也没有可用于远端访问的 DNS SAN；请先把 {ip}（或管理端 DNS 名）加入 \
+                     server_names，再执行 `rustboard-hub rotate-cert --force` 重签服务端证书"
                 );
             }
         }
     }
     Ok(())
+}
+
+/// server_names 是否全部是回环名（127.0.0.0/8、::1、localhost / *.localhost）。
+fn all_loopback_server_names(names: &[String]) -> bool {
+    !names.is_empty()
+        && names.iter().all(|name| {
+            let name = name.trim();
+            name.parse::<IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or_else(|_| {
+                    name.eq_ignore_ascii_case("localhost")
+                        || name.to_ascii_lowercase().ends_with(".localhost")
+                })
+        })
 }
 
 async fn serve(
@@ -5749,11 +5791,61 @@ mod tests {
         assert!(text.contains("server_names"), "错误信息: {text}");
         assert!(text.contains("rotate-cert"), "错误信息: {text}");
 
+        // 比较前 trim：带空格的 IP 也算覆盖。
+        let trimmed = HubConfig {
+            admin_listen: "127.0.0.1:8444".to_string(),
+            admin_tls: AdminTlsMode::Required,
+            server_names: vec![" 127.0.0.1 ".to_string()],
+            ..HubConfig::default()
+        };
+        validate_admin_tls(&trimmed).expect("trim 后的 IP 必须视为覆盖");
+
+        // DNS 访问：非回环 bind IP 不在 SAN 里，但 server_names 有 DNS 名 → 放行。
+        let dns = HubConfig {
+            admin_listen: "10.0.0.5:8444".to_string(),
+            admin_tls: AdminTlsMode::Required,
+            server_names: vec!["hub.example.com".to_string()],
+            ..HubConfig::default()
+        };
+        validate_admin_tls(&dns).expect("管理端通过 DNS 访问时必须放行");
+
+        // 只有不匹配的 IP、没有任何 DNS 名 → 仍拒绝。
+        let mismatched = HubConfig {
+            admin_listen: "10.0.0.5:8444".to_string(),
+            admin_tls: AdminTlsMode::Required,
+            server_names: vec!["127.0.0.1".to_string()],
+            ..HubConfig::default()
+        };
+        let err = validate_admin_tls(&mismatched).expect_err("只有不匹配 IP 时必须拒绝");
+        assert!(format!("{err:#}").contains("DNS SAN"), "错误信息: {err:#}");
+
+        // 回环绑定不能用 DNS 名兜底：本机只能通过该回环 IP 访问。
+        let loopback_dns = HubConfig {
+            admin_listen: "127.0.0.2:8444".to_string(),
+            admin_tls: AdminTlsMode::Required,
+            server_names: vec!["hub.example.com".to_string()],
+            ..HubConfig::default()
+        };
+        assert!(
+            validate_admin_tls(&loopback_dns).is_err(),
+            "回环 bind + 仅 DNS SAN 必须拒绝（init 127.0.0.2 用例依赖此语义）"
+        );
+
         // 通配绑定跳过 SAN 检查（由客户端 hostname/反代决定访问名）。
         for addr in ["0.0.0.0:8444", "[::]:8444"] {
             validate_admin_tls(&with(addr, AdminTlsMode::Required))
                 .unwrap_or_else(|err| panic!("通配绑定必须放行 {addr}: {err:#}"));
         }
+        assert!(all_loopback_server_names(&[
+            "127.0.0.1".to_string(),
+            " localhost ".to_string(),
+            "api.localhost".to_string(),
+        ]));
+        assert!(!all_loopback_server_names(&[
+            "127.0.0.1".to_string(),
+            "hub.example.com".to_string(),
+        ]));
+        assert!(all_loopback_server_names(&[" ::1 ".to_string()]));
     }
 
     /// KI-10：`/api/v1/system` 保留旧字段并新增 live/disk，顶层等于 live。
@@ -7962,6 +8054,60 @@ mod tests {
         assert!(tls::cert_dir(&data_dir)
             .join(tls::SERVER_CERT_FILE)
             .exists());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // required + 非通配且缺管理端 SAN：init 必须在签发/落盘前失败。
+        let dir = temp_dir("init-admin-tls-missing-san");
+        let cfg_path = dir.join("hub.toml");
+        let data_dir = dir.join("data");
+        let err = init(
+            Some(cfg_path.clone()),
+            Some(data_dir.clone()),
+            Some("127.0.0.1:0".to_string()),
+            Some("127.0.0.2:0".to_string()),
+            Some("required".to_string()),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect_err("required 且缺管理端 SAN 必须拒绝");
+        assert!(
+            format!("{err:#}").contains("管理 API TLS"),
+            "错误信息: {err:#}"
+        );
+        assert!(!cfg_path.exists(), "失败时不得写入配置文件");
+        assert!(
+            !tls::cert_dir(&data_dir).exists(),
+            "失败时不得创建证书目录/CA"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // required + 通配绑定：跳过精确 SAN 检查，init 成功。
+        let dir = temp_dir("init-admin-tls-wildcard");
+        let cfg_path = dir.join("hub.toml");
+        init(
+            Some(cfg_path.clone()),
+            Some(dir.join("data")),
+            Some("127.0.0.1:0".to_string()),
+            Some("0.0.0.0:0".to_string()),
+            Some("required".to_string()),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("通配绑定 + required 必须成功");
+        assert_eq!(
+            HubConfig::load(&cfg_path).unwrap().admin_tls,
+            AdminTlsMode::Required
+        );
         let _ = std::fs::remove_dir_all(&dir);
 
         // 非回环 + 默认 off：init 仍成功（随后 run 会拒绝），便于先落盘再改。
