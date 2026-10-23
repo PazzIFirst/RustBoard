@@ -132,7 +132,10 @@
 - [x] `admin_auth_failure_limit_per_min=0` 仍保留每 IP 每窗口首条失败 WARN，不恢复 429
 - [x] `database` 在 data_dir 外/相对路径时启动 WARN 一次，不收紧父目录、DB 仍 0600
 - [x] 测试：Rust 569（agent 100、common 113、core 73、hub 180、panel 103）；
-      `v035.sh` 48/48；既有 9 套 e2e 全绿；`cargo audit` 0
+      `v035.sh` 48/48；`security.sh` 9/9、`cert-rotation.sh` 103/103、
+      `panel.sh` 159/159、`hardening.sh` 36/36、`control.sh` 100/100、
+      `v031.sh` 94/94、`v032.sh` 66/66、`v033.sh` 100/100、`v034.sh` 97/97；
+      `cargo audit` 0
 - [x] 独立评审：A1、A2/A3 均无 [严重]；A1 建议的 guard 释放顺序/注释已处理；
       A2/A3 建议的“静态预检不覆盖祖先权限”和“O_RDONLY 极严目录会 EACCES”已写入限制，
       非 root owner 测试跳过、DB 外置 WARN 由 `v035.sh` 覆盖
