@@ -10,6 +10,49 @@
 
 ## [Unreleased]
 
+### Added
+
+- M4 降采样与查询选层：schema v7 新增 `samples_1m`/`samples_1h`/`maintenance_state`；
+  `maintenance run|status`、迟到 raw 回放、1m/1h 水位与 `ArchiveGate`；面板按
+  ≤6h raw / ≤7d 1m / >7d 1h 选层，跨度上限 730 天，桶过小自动提升
+- M4 告警：内置 5 条规则（离线/磁盘/agent/hub 证书/缓冲）、规则 CRUD、
+  pending→firing→resolved 状态机、事件、静默、后台评估（raw-only、每规则 5000
+  序列/状态上限、5s 预算、每小时清理）
+- M4 通知：Telegram / 企业微信 / 钉钉 / 飞书四渠道，固定端点、签名、3 次重试、
+  有界 worker、首次启动不补发存量、按 `(rule,agent,series)` 冷却、发送前复查静默
+- M4 面板 `/alerts`：规则/事件/渠道/静默四个 tab；渠道 secret 只写不读、测试发送
+- M4 冷归档核心：`[archive]` 配置、CSV.gz/manifest、`ColdStore`、WebDAV 与 S3
+  后端、按 UTC 天/分片 worker、`archive test|status|run`、retention 归档门禁
+- M4 数据页：归档对象列表/下载（进行中，见下方未完成）
+
+### Changed
+
+- SQLite schema v7（纯新增表/列/索引）：降采样、告警、归档、渠道、维护水位；
+  `alert_events` 增加 `series_key`，旧 v7 库启动时自动补列，不提升版本号
+- MSRV 提升到 Rust 1.89（`object_store`/`time` 等实际依赖要求；CI 使用 stable）
+- agent 新增 `disk.used_percent`、`buffer.pending_*`、`cert.hours_left`（保留
+  `cert.days_left`）；内置证书阈值 48 小时、离线 90 秒，首次种入取配置
+- 通知测试发送 `POST /api/v1/alerts/channels/{id}/test` 成功返回 204
+
+### Security
+
+- 通知渠道 secret 只在 SQLite `config_json` 与发送边界出现；API 只返回
+  `secret_fields`/非敏感字段，错误与日志不含 token/secret/URL
+- 归档读取/下载只接受合法对象 key，错误固定码；WebDAV Basic/S3 凭据只在配置中，
+  不进入 API/前端
+- 告警评估资源上限：raw-only 索引查询、每规则序列/状态 5000 上限、单轮预算、
+  事件 100k/90 天、静默 1000/7 天
+- SFTP 后端尚未实现：`russh` 依赖在 Rust 1.87+ 仍带 `rsa` medium advisory
+  （RUSTSEC-2023-0071），审计 0 需 patch/vendor 或放弃；v0.4.0 不发布该后端，
+  待维护者决策
+
+### Known
+
+- 归档 SFTP 未实现；WebDAV/S3 已接入，`archive.enabled` 但未配置后端时启动拒绝
+- 归档对象列表/下载与 `/archive` 页面仍在收尾；未完成前不发布 v0.4.0
+- KI-29 降采样 rowid 复用边界（低风险，v0.4.1）
+
+
 ## [0.3.5] - 2026-10-24
 
 ### Added
