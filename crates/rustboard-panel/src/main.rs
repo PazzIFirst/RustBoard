@@ -245,9 +245,11 @@ impl AppState {
     /// 只热加载密码哈希，不热加载监听地址 / 可信代理等需要重建监听器的字段；
     /// `reset-password` 只改哈希，因此这一范围足够且不会中断服务。
     ///
-    /// 哈希真正变化时吊销全部已有会话：旧 Cookie 不能继续用到 TTL。其他字段
-    /// 重载（哈希未变）返回 `false`，不动会话表。为避免锁顺序问题，密码写锁
-    /// 在调用 [`auth::SessionStore::revoke_all`] 之前显式释放。
+    /// 哈希真正变化时在**密码写锁内**递增认证代际，再吊销全部已有会话：登录
+    /// 侧先取代际、后读哈希，因此不会读到「新哈希 + 旧代际」；而在途登录用旧
+    /// 代际建会话会被拒绝，旧密码会话无法在清空之后复活。其他字段重载（哈希
+    /// 未变）返回 `false`，不 bump 代际、不动会话表。为避免锁顺序问题，密码写
+    /// 锁在调用 [`auth::SessionStore::revoke_all`] 之前显式释放。
     fn reload_password_hash(&self) -> Result<bool> {
         let Some(path) = self.config_path.as_ref() else {
             return Ok(false);
@@ -265,11 +267,15 @@ impl AppState {
             return Ok(false);
         }
         *guard = cfg.admin_password_hash;
+        // 必须与哈希更新同处密码写锁内：登录读取「代际 → 哈希」两步之间若插入
+        // 一次 bump，就会让旧哈希配上新代际，旧密码依然能通过代际检查。
+        let generation = self.sessions.bump_generation();
         // 先释放密码写锁，再清会话表：避免持锁做无关操作，也不让两把锁嵌套。
         drop(guard);
         let revoked = self.sessions.revoke_all();
         tracing::info!(
             path = %path.display(),
+            generation,
             revoked,
             "检测到面板密码变更，已热加载新哈希并吊销全部已有会话"
         );
@@ -511,6 +517,10 @@ async fn api_login(
         }
     };
     let password = request.password;
+    // 顺序不能反：先取代际，再读哈希。reload 在密码写锁内先更新哈希再 bump，
+    // 所以这里读到「新哈希 + 旧代际」只会导致一次保守的 401；反过来则可能读到
+    // 旧哈希 + 新代际，让旧密码在重置后通过代际检查。
+    let generation = state.sessions.generation();
     let hash = state
         .password_hash
         .read()
@@ -524,9 +534,18 @@ async fn api_login(
 
     match verified {
         Ok(true) => {
+            // 校验期间可能发生过密码重置：只有代际未变才允许建会话。否则旧密码
+            // 的校验结果会在 revoke_all 之后插入一个旧密码会话，存活整个 TTL。
+            let Some(token) = state.sessions.create_if_generation(now, generation) else {
+                // 凭据本身有效，只是已因改密失效：不记密码错误、不清限流状态，
+                // 归还 begin_attempt 预占的名额即可。响应与密码错误完全一致，
+                // 不回显“密码已变更”，避免泄露重置时序。
+                drop(attempt_guard);
+                tracing::warn!(ip = %ip, "面板登录失败：密码在校验期间被重置");
+                return proxy::json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+            };
             state.limiter.record_success(ip);
             attempt_guard.disarm();
-            let token = state.sessions.create(now);
             let secure = auth::secure_cookie(
                 state.cfg.cookie_secure,
                 peer.ip(),
@@ -3196,6 +3215,134 @@ mod tests {
             state.sessions.is_authenticated(&fresh, now),
             "相同哈希的 reload 不得清除新会话"
         );
+    }
+
+    /// KI-18 配套：只有哈希真正变化才 bump 认证代际并清会话；
+    /// 普通配置重载 / 相同哈希不得影响已有会话。
+    #[test]
+    fn reload_password_hash_bumps_generation_only_on_real_change() {
+        let site = TempSite::new();
+        let path = site.dir.join("panel.toml");
+        let old = "old-password";
+        let cfg = PanelConfig {
+            hub_url: "http://127.0.0.1:1".to_string(),
+            token: "test-hub-token".to_string(),
+            admin_password_hash: auth::hash_password(old).unwrap(),
+            trusted_proxies: vec!["127.0.0.1".to_string()],
+            ..PanelConfig::default()
+        };
+        cfg.save(&path).unwrap();
+        let state = AppState::new(cfg, None, Some(path.clone())).unwrap();
+        let now = now_ms();
+        let initial_generation = state.sessions.generation();
+        assert_eq!(initial_generation, 0);
+        let session = state
+            .sessions
+            .create_if_generation(now, initial_generation)
+            .expect("初始代际应允许创建会话");
+
+        // 其他字段变化、哈希未变：不 bump、不清会话。
+        let mut touched = PanelConfig::load(&path).unwrap();
+        touched.listen = "127.0.0.1:18082".to_string();
+        touched.save(&path).unwrap();
+        assert!(!state.reload_password_hash().unwrap());
+        assert_eq!(state.sessions.generation(), initial_generation);
+        assert!(
+            state.sessions.is_authenticated(&session, now),
+            "哈希未变时普通重载不得清除会话"
+        );
+
+        // 内容未变再次 reload：仍不 bump、不清会话。
+        assert!(!state.reload_password_hash().unwrap());
+        assert_eq!(state.sessions.generation(), initial_generation);
+        assert!(state.sessions.is_authenticated(&session, now));
+
+        // 密码变化：代际 +1、旧会话清空、旧代际拒绝、新代际放行。
+        reset_password(Some(path), Some("new-password".to_string())).unwrap();
+        assert!(state.reload_password_hash().unwrap());
+        let new_generation = initial_generation + 1;
+        assert_eq!(state.sessions.generation(), new_generation);
+        assert!(!state.sessions.is_authenticated(&session, now));
+        assert!(state
+            .sessions
+            .create_if_generation(now, initial_generation)
+            .is_none());
+        assert_eq!(state.sessions.len(), 0);
+        let fresh = state
+            .sessions
+            .create_if_generation(now, new_generation)
+            .expect("新代际应允许创建会话");
+        assert!(state.sessions.is_authenticated(&fresh, now));
+
+        // 新哈希未再变化：不得二次 bump，也不得误杀新会话。
+        assert!(!state.reload_password_hash().unwrap());
+        assert_eq!(state.sessions.generation(), new_generation);
+        assert!(state.sessions.is_authenticated(&fresh, now));
+    }
+
+    /// 回归 KI-18：登录读取旧代际后进入 Argon2，期间 reset-password 生效；
+    /// 校验完成时用旧代际建会话必须失败，清空后不能复活旧密码会话。
+    /// 单线程两步复现，不依赖真实 Argon2 时长与线程调度。
+    #[test]
+    fn password_reset_invalidates_in_flight_login_generation() {
+        let site = TempSite::new();
+        let path = site.dir.join("panel.toml");
+        let old = "old-password";
+        let cfg = PanelConfig {
+            hub_url: "http://127.0.0.1:1".to_string(),
+            token: "test-hub-token".to_string(),
+            admin_password_hash: auth::hash_password(old).unwrap(),
+            trusted_proxies: vec!["127.0.0.1".to_string()],
+            ..PanelConfig::default()
+        };
+        cfg.save(&path).unwrap();
+        let state = AppState::new(cfg, None, Some(path.clone())).unwrap();
+        let now = now_ms();
+
+        // 登录 handler 的第一步：先取代际，再 clone 哈希，然后进入 Argon2。
+        let login_generation = state.sessions.generation();
+        let login_hash = state
+            .password_hash
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert!(
+            auth::verify_password(old, &login_hash),
+            "登录应能校验旧密码"
+        );
+
+        // 模拟 Argon2 期间管理员改密：热加载会 bump 代际并清空会话。
+        let stale = state.sessions.create(now);
+        assert!(state.sessions.is_authenticated(&stale, now));
+        reset_password(Some(path), Some("new-password".to_string())).unwrap();
+        assert!(state.reload_password_hash().unwrap());
+        assert!(state.sessions.generation() > login_generation);
+        assert!(!state.sessions.is_authenticated(&stale, now));
+
+        // 登录侧校验完成后用旧代际建会话必须失败，且不得插入会话。
+        assert!(
+            state
+                .sessions
+                .create_if_generation(now, login_generation)
+                .is_none(),
+            "旧代际登录不得在 revoke_all 之后复活会话"
+        );
+        assert_eq!(state.sessions.len(), 0);
+
+        // 新代际 + 新哈希是唯一能建会话的组合。
+        let current_generation = state.sessions.generation();
+        let current_hash = state
+            .password_hash
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert!(auth::verify_password("new-password", &current_hash));
+        assert!(!auth::verify_password(old, &current_hash));
+        let fresh = state
+            .sessions
+            .create_if_generation(now, current_generation)
+            .expect("新代际应允许创建会话");
+        assert!(state.sessions.is_authenticated(&fresh, now));
     }
 
     #[tokio::test]

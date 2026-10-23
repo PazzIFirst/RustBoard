@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{anyhow, Context, Result};
@@ -96,6 +97,14 @@ fn random_hex(bytes: usize) -> String {
 pub struct SessionStore {
     inner: Mutex<HashMap<String, i64>>,
     ttl_ms: i64,
+    /// 认证代际：密码哈希每次真正变化时递增。
+    ///
+    /// 登录侧在读密码哈希**之前**取代际，校验完成后用 [`create_if_generation`]
+    /// 建会话；若期间哈希被重置（bump + revoke_all），旧密码的校验结果就拿不到
+    /// 会话，避免在 `revoke_all` 之后复活一个存活整个 TTL 的旧会话。
+    ///
+    /// [`create_if_generation`]: Self::create_if_generation
+    generation: AtomicU64,
 }
 
 impl SessionStore {
@@ -103,13 +112,53 @@ impl SessionStore {
         Self {
             inner: Mutex::new(HashMap::new()),
             ttl_ms: (ttl_hours.max(1) as i64).saturating_mul(3_600_000),
+            generation: AtomicU64::new(0),
         }
     }
 
+    /// 当前认证代际（Acquire，与 [`bump_generation`] 的 AcqRel 配对）。
+    ///
+    /// [`bump_generation`]: Self::bump_generation
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// 递增认证代际并返回新值。只应在密码哈希真正变化时调用。
+    pub fn bump_generation(&self) -> u64 {
+        self.generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
     /// 创建会话，返回随机令牌。
+    ///
+    /// 不做代际检查，只编译进测试目标供测试装配使用；生产登录必须使用
+    /// [`create_if_generation`]。
+    ///
+    /// [`create_if_generation`]: Self::create_if_generation
+    #[cfg(test)]
     pub fn create(&self, now_ms: i64) -> String {
         self.cleanup(now_ms);
         let mut sessions = lock(&self.inner);
+        Self::insert_session(&mut sessions, now_ms, self.ttl_ms)
+    }
+
+    /// 仅当认证代际仍为 `expected` 时创建会话，否则返回 `None`。
+    ///
+    /// 代际比较与会话插入在同一把会话表锁内完成：要么本方法先看到旧代际并插入
+    /// （随后密码重置的 `revoke_all` 会把它清掉），要么 `bump_generation` 已经
+    /// 生效而返回 `None`。两者都不会让旧密码的会话在 `revoke_all` 之后存活。
+    pub fn create_if_generation(&self, now_ms: i64, expected: u64) -> Option<String> {
+        self.cleanup(now_ms);
+        let mut sessions = lock(&self.inner);
+        if self.generation.load(Ordering::Acquire) != expected {
+            return None;
+        }
+        Some(Self::insert_session(&mut sessions, now_ms, self.ttl_ms))
+    }
+
+    /// 会话表已加锁时插入新会话；容量已满则淘汰最早过期的条目。
+    fn insert_session(sessions: &mut HashMap<String, i64>, now_ms: i64, ttl_ms: i64) -> String {
         if sessions.len() >= MAX_SESSIONS {
             if let Some(oldest) = sessions
                 .iter()
@@ -120,7 +169,7 @@ impl SessionStore {
             }
         }
         let token = random_hex(SESSION_TOKEN_BYTES);
-        sessions.insert(token.clone(), now_ms.saturating_add(self.ttl_ms));
+        sessions.insert(token.clone(), now_ms.saturating_add(ttl_ms));
         token
     }
 
@@ -150,10 +199,13 @@ impl SessionStore {
 
     /// 吊销全部会话，返回被清除的会话数；空表返回 0。
     ///
-    /// 密码变更后调用：清空后所有旧 Cookie 立即失效，之后仍可正常 [`create`]
-    /// 新会话。持锁期间只做 `clear`，不回调外部代码，避免锁顺序问题。
+    /// 密码变更后调用：清空后所有旧 Cookie 立即失效，之后仍可正常
+    /// [`create_if_generation`] 新会话。调用方必须**先** [`bump_generation`] 再
+    /// 清空，在途登录才会因代际不符而拿不到会话。持锁期间只做 `clear`，不回调
+    /// 外部代码，避免锁顺序问题。
     ///
-    /// [`create`]: Self::create
+    /// [`create_if_generation`]: Self::create_if_generation
+    /// [`bump_generation`]: Self::bump_generation
     pub fn revoke_all(&self) -> usize {
         let mut sessions = lock(&self.inner);
         let revoked = sessions.len();
@@ -711,6 +763,112 @@ mod tests {
         assert_eq!(created, 8 * 16);
         assert_eq!(store.revoke_all(), created);
         assert_eq!(store.len(), 0, "并发创建后 revoke_all 必须清空全部会话");
+    }
+
+    #[test]
+    fn generation_starts_at_zero_and_bumps_monotonically() {
+        let store = SessionStore::new(1);
+        assert_eq!(store.generation(), 0);
+        assert_eq!(store.bump_generation(), 1);
+        assert_eq!(store.generation(), 1);
+        assert_eq!(store.bump_generation(), 2);
+        assert_eq!(store.generation(), 2);
+    }
+
+    #[test]
+    fn create_if_generation_accepts_only_current_generation() {
+        let store = SessionStore::new(1);
+        let now = 1_700_000_000_000;
+
+        // 当前代际可创建。
+        let token = store
+            .create_if_generation(now, store.generation())
+            .expect("当前代际应允许创建会话");
+        assert!(store.is_authenticated(&token, now));
+
+        // bump 后旧代际必须被拒绝，且不得写入会话表。
+        let fresh_generation = store.bump_generation();
+        assert!(store
+            .create_if_generation(now, fresh_generation - 1)
+            .is_none());
+        assert_eq!(store.len(), 1, "旧代际被拒绝时不得插入会话");
+
+        // 新代际可正常创建。
+        let fresh = store
+            .create_if_generation(now, fresh_generation)
+            .expect("新代际应允许创建会话");
+        assert!(store.is_authenticated(&fresh, now));
+        assert_eq!(store.len(), 2);
+    }
+
+    /// 回归 KI-18：登录在旧代际读完哈希后进入 Argon2，期间密码被重置并清空
+    /// 会话；校验完成时用旧代际建会话必须失败，旧密码会话不能复活。
+    #[test]
+    fn stale_login_cannot_create_session_after_password_reset() {
+        let store = SessionStore::new(12);
+        let now = 1_700_000_000_000;
+        let old_token = store.create(now);
+        // 登录 handler 在读取密码哈希之前取到的代际。
+        let generation_seen_by_login = store.generation();
+
+        // 模拟 Argon2 期间管理员改密：bump 代际 + 清空会话。
+        store.bump_generation();
+        assert_eq!(store.revoke_all(), 1);
+
+        assert!(!store.is_authenticated(&old_token, now));
+        assert!(
+            store
+                .create_if_generation(now, generation_seen_by_login)
+                .is_none(),
+            "密码重置后旧代际不得创建会话"
+        );
+        assert_eq!(store.len(), 0, "被拒绝的旧登录不得留下会话");
+
+        // 只有新代际能建会话。
+        let fresh = store
+            .create_if_generation(now, store.generation())
+            .expect("新代际应允许创建会话");
+        assert!(store.is_authenticated(&fresh, now));
+    }
+
+    /// 两个线程 + 两道 Barrier 固定顺序：读旧代际的登录必须等重置完成后才能
+    /// 建会话，结果必须是 None。不依赖 sleep，不会 flaky。
+    #[test]
+    fn concurrent_password_reset_invalidates_in_flight_login() {
+        use std::sync::{Arc, Barrier};
+
+        let store = Arc::new(SessionStore::new(1));
+        let now = 1_700_000_000_000;
+        let read_done = Arc::new(Barrier::new(2));
+        let reset_done = Arc::new(Barrier::new(2));
+
+        let login = {
+            let store = store.clone();
+            let read_done = read_done.clone();
+            let reset_done = reset_done.clone();
+            std::thread::spawn(move || {
+                let generation = store.generation();
+                // 模拟“登录已读取旧代际，正在跑 Argon2”。
+                read_done.wait();
+                reset_done.wait();
+                store.create_if_generation(now, generation)
+            })
+        };
+
+        read_done.wait();
+        // 模拟密码重置：bump 后清空。
+        store.bump_generation();
+        store.revoke_all();
+        reset_done.wait();
+
+        assert!(
+            login.join().unwrap().is_none(),
+            "并发密码重置后，在途登录必须拿不到会话"
+        );
+        assert_eq!(store.len(), 0);
+        assert!(store
+            .create_if_generation(now, store.generation())
+            .is_some());
     }
 
     /// 模拟一次“预占名额 + 密码错误”的完整尝试。
