@@ -255,7 +255,11 @@ CREATE TABLE archive_state (
   rowid desc）后第一条。聚合在单写事务中分批提交，单批不超过 5,000 行。
 - 首次启用时做 backfill：从 raw 最旧行开始按小时分块生成 1m/1h；不阻塞启动，
   进度写入 `maintenance_state`；backfill 完成前保留任务仍按归档/保留规则保护 raw。
-- 迟到数据容错：最近 2 个 bucket 每次重算；1h 依赖 1m 已更新；幂等 upsert。
+- 迟到数据容错：除最近 2 个 bucket 每轮重算外，还用 `maintenance_state.
+  downsample_1m_last_raw_rowid` 扫描新 raw；若新 raw 的 `MIN(ts)` 早于 1m 水位，
+  先把 1h 水位回拨到对应整点、再把 1m 水位回拨到对应分钟，分块重算到
+  `closed_end`。回拨水位同时夹紧 retention，重算完成前不删 raw/1m；1h 依赖
+  1m 已更新；幂等 upsert。
 - 失败只记录 `WARN` 与 `maintenance_state.last_error`，不 panic；下一轮重试。
 
 ### 5.2 查询选层
@@ -282,6 +286,9 @@ CREATE TABLE archive_state (
 - 删除按 5,000 行/批，单批事务；批间让出写锁，避免长时间阻塞 ingest。
 - 归档启用时：raw 只删除 `archive_state.last_archived_ts` 之前且已成功归档的范围；
   未归档成功的最旧 raw 行及其后行保留，并记录 `archive_blocked` 状态。
+  代码用显式 `ArchiveGate::{Disabled, Enabled{watermark:Option<i64>}}`：
+  `Enabled` 且 `watermark=None`（尚无成功归档）时 raw 一律不删，不能把 None
+  当成“未启用”。watermark 是排他边界（只删 `ts < watermark`）。
 - 保留期不能删除尚未完成 downsample 的最近窗口；水位不足时跳过并下轮重试。
 - 校验：`retention_raw_days` 0..3650、1m 0..3650、1h 0..7300；
   非 0 时要求 `1m_days >= raw_days`、`1h_days >= 1m_days`（可在启动时放宽为
