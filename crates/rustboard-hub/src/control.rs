@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::WebSocket;
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::{Extension, Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -40,6 +40,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
+use crate::auth::AuthPrincipal;
 use crate::{is_valid_agent_id, validate_agent_path, ApiError, AppState};
 
 /// 每条连接的控制命令队列容量。
@@ -80,6 +81,8 @@ pub mod hub_codes {
     pub const INTERNAL: &str = "internal_error";
     pub const AGENT_NOT_FOUND: &str = "agent_not_found";
     pub const PAYLOAD_TOO_LARGE: &str = "payload_too_large";
+    /// #17：agent 已吊销（与 `agent_offline` 区分，避免误判为可重试）。
+    pub const AGENT_REVOKED: &str = "agent_revoked";
 }
 
 /// 审计 `result` 取值，与面板 `auditResultClass` 的识别范围一致。
@@ -454,6 +457,16 @@ impl Reject {
         }
     }
 
+    /// #17：agent 已吊销，固定 403 + `agent_revoked`；审计必须记 denied。
+    fn revoked() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: hub_codes::AGENT_REVOKED,
+            message: "agent 已被吊销".to_string(),
+            audit_result: AUDIT_DENIED,
+        }
+    }
+
     fn too_many_pending() -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -501,12 +514,50 @@ impl Reject {
     }
 }
 
+/// #17：控制投递前的吊销门禁。
+///
+/// `Ok(())` 才允许继续读取能力 / 投递；命中吊销返回 [`Reject::revoked`]，
+/// 查询失败返回 [`Reject::internal`]（fail closed，绝不猜测未吊销）。
+async fn ensure_agent_not_revoked(
+    state: &AppState,
+    agent_id: &str,
+) -> std::result::Result<(), Reject> {
+    let storage = state.storage.clone();
+    let agent = agent_id.to_string();
+    match tokio::task::spawn_blocking(move || storage.is_revoked(&agent)).await {
+        Ok(Ok(false)) => Ok(()),
+        Ok(Ok(true)) => Err(Reject::revoked()),
+        Ok(Err(err)) => {
+            tracing::warn!(agent = %agent_id, error = %err, "查询 agent 吊销状态失败，拒绝控制命令");
+            Err(Reject::internal())
+        }
+        Err(err) => {
+            tracing::warn!(agent = %agent_id, error = %err, "查询 agent 吊销状态任务失败，拒绝控制命令");
+            Err(Reject::internal())
+        }
+    }
+}
+
 /// 控制请求的完整处理结果（成功或错误都带审计草稿）。
 pub(crate) async fn control_action(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
+    principal: Option<Extension<AuthPrincipal>>,
     body: std::result::Result<Json<ControlActionRequest>, JsonRejection>,
 ) -> Response {
+    // 控制路由一定挂在鉴权中间件之后；扩展缺失说明接线错误，固定 500 而不是 panic。
+    let Some(Extension(principal)) = principal else {
+        tracing::error!(agent = %agent_id, "控制请求缺少 AuthPrincipal 扩展（路由接线错误）");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "ok": false,
+                "error": { "code": "internal_error", "message": "内部错误" },
+            })),
+        )
+            .into_response();
+    };
+
     let started = Instant::now();
     // 非法 agent_id 不写进审计（避免污染过滤字段），但仍记录一次拒绝。
     let audit_agent = if is_valid_agent_id(&agent_id) && agent_id != "." && agent_id != ".." {
@@ -514,7 +565,8 @@ pub(crate) async fn control_action(
     } else {
         String::new()
     };
-    let mut audit = AuditDraft::new(&audit_agent);
+    // 审计 actor：旧 admin_token 仍是 "admin"（兼容既有 e2e），scoped token 用 name。
+    let mut audit = AuditDraft::new(&audit_agent, &principal.name);
 
     if validate_agent_path(&agent_id).is_err() {
         return finish_error(&state, audit, started, &Reject::invalid("agent_id 非法")).await;
@@ -554,6 +606,11 @@ pub(crate) async fn control_action(
     audit.action = prepared.action.clone();
     audit.target = clip_label(&prepared.target);
     audit.params = prepared.params.clone();
+
+    // #17：第一道吊销门禁（读取能力之前）。查询失败也拒绝，不向已吊销 agent 投递。
+    if let Err(reject) = ensure_agent_not_revoked(&state, &agent_id).await {
+        return finish_error(&state, audit, started, &reject).await;
+    }
 
     // agent 上报的能力：必须以 Hello 上报并落库的为准，hub 不替 agent 做主。
     let reported = tokio::task::spawn_blocking({
@@ -608,6 +665,11 @@ pub(crate) async fn control_action(
         return finish_error(&state, audit, started, &Reject::offline()).await;
     };
 
+    // #17：第二道吊销门禁（try_send 之前），尽量缩小 revoke 与投递之间的竞态。
+    if let Err(reject) = ensure_agent_not_revoked(&state, &agent_id).await {
+        return finish_error(&state, audit, started, &reject).await;
+    }
+
     let (reply_tx, reply_rx) = oneshot::channel();
     match sender.try_send(ControlCommand {
         op: prepared.op,
@@ -636,8 +698,15 @@ pub(crate) async fn control_action(
             return finish_error(&state, audit, started, &Reject::timeout()).await;
         }
         Ok(Err(_)) => {
-            // oneshot 被丢弃：会话结束 / pending 被取消。
-            return finish_error(&state, audit, started, &Reject::offline()).await;
+            // oneshot 被丢弃：会话结束 / pending 被取消。这期间 agent 可能已被
+            // revoke（会话随后才关闭），必须再查一次吊销，否则会把 #17 的 403
+            // agent_revoked 误报成 503 agent_offline，审计口径也会错成 error。
+            let reject = match ensure_agent_not_revoked(&state, &agent_id).await {
+                Ok(()) => Reject::offline(),
+                // 命中吊销 → revoked(403/denied)；查询失败 → internal(fail closed)。
+                Err(reject) => reject,
+            };
+            return finish_error(&state, audit, started, &reject).await;
         }
         Ok(Ok(Ok(result))) => {
             // 命令是否成功只看退出码：只有明确的 0 算成功；非 0 与被信号终止
@@ -722,6 +791,8 @@ fn reject_from_agent_error(error: &ControlError) -> Reject {
         hub_codes::AGENT_OFFLINE => Reject::offline(),
         hub_codes::CONTROL_TIMEOUT => Reject::timeout(),
         hub_codes::INTERNAL => Reject::internal(),
+        // #17：吊销窗口内会话侧兜底门禁回的错误，不能落成 502 / agent_offline。
+        hub_codes::AGENT_REVOKED => Reject::revoked(),
         control_codes::CAPABILITY_DISABLED => Reject {
             status: StatusCode::FORBIDDEN,
             code: control_codes::CAPABILITY_DISABLED,
@@ -1269,10 +1340,11 @@ struct AuditDraft {
 }
 
 impl AuditDraft {
-    fn new(agent_id: &str) -> Self {
+    /// `actor` 来自鉴权主体：旧 admin_token 为 `"admin"`，scoped token 为 name。
+    fn new(agent_id: &str, actor: &str) -> Self {
         Self {
             ts: now_ms(),
-            actor: "admin".to_string(),
+            actor: actor.to_string(),
             agent_id: agent_id.to_string(),
             capability: String::new(),
             action: String::new(),
@@ -1820,6 +1892,16 @@ mod tests {
             assert_eq!(reject.code, code);
             assert_eq!(reject.audit_result, AUDIT_ERROR);
         }
+
+        // #17：吊销错误是 403 + denied，不能与 agent_offline（503）混淆。
+        let reject = reject_from_agent_error(&ControlError::new(
+            hub_codes::AGENT_REVOKED,
+            "这里的内容不该被使用",
+        ));
+        assert_eq!(reject.status, StatusCode::FORBIDDEN);
+        assert_eq!(reject.code, hub_codes::AGENT_REVOKED);
+        assert_eq!(reject.audit_result, AUDIT_DENIED);
+        assert_eq!(reject.message, "agent 已被吊销");
     }
 
     #[test]

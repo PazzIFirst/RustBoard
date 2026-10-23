@@ -1023,6 +1023,52 @@ pub fn server_config(data_dir: &Path) -> Result<Arc<rustls::ServerConfig>> {
     Ok(Arc::new(config))
 }
 
+/// 管理 API 的 TLS 服务端配置：server-auth，**不要求客户端证书**。
+///
+/// 复用 agent 入口同一对 `server.crt` / `server.key`，但管理端只验证服务端，
+/// 因此不能复用 [`server_config`]（它还要求客户端证书）。构建前显式校验：
+/// key/cert 配套、证书由当前 CA 签发、CN/SAN 覆盖 `expected_sans`、未过期。
+///
+/// 只启用 TLS 1.3，ALPN 固定 `http/1.1`（管理 API 是手写 hyper HTTP/1 服务）。
+pub fn admin_server_config(
+    data_dir: &Path,
+    expected_sans: &[String],
+) -> Result<Arc<rustls::ServerConfig>> {
+    let dir = cert_dir(data_dir);
+    let cert_path = dir.join(SERVER_CERT_FILE);
+    let cert_pem = std::fs::read_to_string(&cert_path)
+        .with_context(|| format!("读取服务端证书失败: {}", cert_path.display()))?;
+    let key_path = dir.join(SERVER_KEY_FILE);
+    // 与服务端入口一致：旧版本可能留下过宽权限，加载前收紧到 0600。
+    crate::fsutil::harden(&key_path, 0o600)?;
+    let key_pem = std::fs::read_to_string(&key_path)
+        .with_context(|| format!("读取服务端私钥失败: {}", key_path.display()))?;
+    let ca_path = dir.join(CA_CERT_FILE);
+    let ca_pem = std::fs::read_to_string(&ca_path)
+        .with_context(|| format!("读取 CA 证书失败: {}", ca_path.display()))?;
+
+    if !cert_matches_key(&cert_pem, &key_pem)? {
+        return Err(anyhow!(
+            "服务端证书与私钥不匹配（{} 与 {} 不是一对，可能是上次续签在写盘中途被中断）；\
+             执行 `rustboard-hub rotate-cert --force` 重新签发，或直接启动 hub 触发自动修复",
+            cert_path.display(),
+            key_path.display()
+        ));
+    }
+    validate_existing_server_cert(&cert_pem, &ca_pem, expected_sans, crate::util::now_ms())
+        .context("管理 API TLS 证书校验失败（CA 链 / SAN / 有效期）")?;
+
+    let certs = load_certs(&cert_pem)?;
+    let key = load_key(&key_pem)?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
 /// agent 的 TLS 客户端配置：固定服务端证书指纹，可选携带客户端证书。
 ///
 /// 只用于 bootstrap（尚未纳管）与「拿不到 CA 证书」的兼容回退：

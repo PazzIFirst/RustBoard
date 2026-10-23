@@ -10,6 +10,49 @@
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-23
+
+### Added
+
+- #9 管理 API scoped token：SQLite schema v6 `api_tokens`，`read` / `write` / `admin`
+  三级权限；`rustboard-hub token create/list/rotate/revoke`；审计 actor 记录 token 名称，
+  旧 `admin_token` 继续兼容并固定为 `admin`
+- #9 管理端 TLS：`admin_tls = "off" | "required"`；`required` 复用 server.crt/server.key
+  做 server-auth（不要求客户端证书），支持证书热加载
+- Panel 支持 `https://` hub 与私有 CA `hub_ca`；配置私有 CA 时只信任该 CA
+- #21 systemd 列表合并 `list-unit-files`，已安装但未加载的 service 以
+  `not-loaded/inactive/dead` 出现在面板并可 start
+- `tests/e2e/v033.sh`：scoped token、admin TLS、Panel HTTPS、#17/#20/#21 回归
+
+### Changed
+
+- 非回环 `admin_listen` + `admin_tls="off"` 现在拒绝启动（此前仅 WARN）；
+  迁移方式：`admin_tls="required"` 或只绑回环 + TLS 反向代理
+- 远程 Panel 的 `http://hub` 现在拒绝启动；改用 `https://` + `hub_ca`
+- #20 日志文件打开改为从根 fd 对完整绝对路径单次 `openat2`，保留跨挂载点兼容
+- #21 两次 `systemctl` 共享总超时；输出超过 256 KiB 时失败而不是返回截断列表
+
+### Fixed
+
+- #17 `agent revoke` 之后新发起的控制请求返回 403 `agent_revoked`、审计 `denied`；
+  已进入会话的最后 1 条在途命令仍可能执行（写帧最多等 5s），审计按实际结果记录
+- #20 日志父目录在启动校验后被替换为符号链接的 TOCTOU 窗口
+- #21 已安装未加载的 systemd service 在面板不可见、无法 start
+- token CLI 的 stdout 与日志分离（日志固定 stderr），避免脚本捕获 token 时混入日志
+
+### Security
+
+- scoped token 只存 SHA-256 哈希，明文仅 `create/rotate` 输出一次；`admin` 为审计
+  actor 保留名，禁止作为 token 名称
+- 管理端 HTTPS 与非回环明文拒绝、Panel 私有 CA 严格信任，关闭非回环管理面明文路径
+- 升级顺序：先升级 hub 到 v0.3.3（自动迁移 DB v6），再按需启用 `admin_tls`；
+  Panel 最后升级并使用 `https://` + `hub_ca`。旧 `admin_token` 仍可用
+- 回滚到 v0.3.2 前必须先把 `admin_listen` 改回回环：旧二进制不识别 `admin_tls`，
+  非回环配置会按明文 HTTP 启动
+- 已知中危 KI-26（计划 v0.3.4）：未认证 401 不受管理限速，错误 token 可驱动
+  SQLite 查询与 WARN 日志；管理口默认回环，非回环必须置于 VPN/防火墙后，
+  `admin_tls` 只加密不认证客户端
+
 ## [0.3.2] - 2026-10-23
 
 ### Added

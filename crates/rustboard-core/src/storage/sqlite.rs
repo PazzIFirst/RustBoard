@@ -12,8 +12,8 @@ use rusqlite::{
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 
 use super::{
-    AgentControlRecord, AgentSeriesRow, AuditEntry, IngestOutcome, NewAuditEntry, QueryTooLarge,
-    RejectReason, Storage, AUDIT_RETENTION_MS,
+    AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, IngestOutcome, NewAuditEntry,
+    QueryTooLarge, RejectReason, Storage, AUDIT_RETENTION_MS,
 };
 
 /// 默认只读连接池大小（与 `HubConfig::read_pool_size` 默认值一致）。
@@ -25,8 +25,13 @@ pub const MAX_READ_POOL_SIZE: usize = 16;
 /// `PRAGMA user_version`：v1 = `ingest_state` 以 agent_id 为主键，
 /// v2 = `(agent_id, epoch)`，v3 = 新增 `ingest_batches` 精确判重，
 /// v4 = 新增 `agent_settings`（每台 agent 的采样间隔，纯新增表），
-/// v5 = 新增 `agent_control` / `audit_log`（M3 控制面，纯新增表）。
-const SCHEMA_VERSION: i64 = 5;
+/// v5 = 新增 `agent_control` / `audit_log`（M3 控制面，纯新增表），
+/// v6 = 新增 `api_tokens`（管理 API scoped token，纯新增表）。
+const SCHEMA_VERSION: i64 = 6;
+
+/// `last_used_at` 的写入节流窗口：同一 token 60s 内只写一次，避免每个管理
+/// 请求都抢写连接；首次鉴权（`last_used_at IS NULL`）一定会写。
+const API_TOKEN_LAST_USED_THROTTLE_MS: i64 = 60_000;
 
 /// 每这么多次审计写入清理一次 180 天前的记录。
 const AUDIT_CLEANUP_EVERY: u64 = 1_000;
@@ -156,6 +161,23 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_agent_ts ON audit_log(agent_id, ts);
+"#;
+
+/// v6 新增表：管理 API scoped token。纯新增，不重写 v1–v5 任何表。
+///
+/// 只存 SHA-256 hex：明文只在 `token create` / `token rotate` 时输出一次。
+/// 吊销写 `revoked_at` 而不删行，保留审计与排障信息。
+const API_TOKENS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL UNIQUE,
+    token_hash   TEXT NOT NULL UNIQUE,
+    scope        TEXT NOT NULL CHECK (scope IN ('read','write','admin')),
+    created_at   INTEGER NOT NULL,
+    last_used_at INTEGER,
+    revoked_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
 "#;
 
 pub struct SqliteStorage {
@@ -506,13 +528,15 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     tx.execute_batch(AGENT_SETTINGS)?;
     // v5：控制面能力与审计表。纯新增，旧版本二进制忽略这两张表。
     tx.execute_batch(CONTROL_AUDIT_SCHEMA)?;
+    // v6：管理 API scoped token 表。纯新增，旧版本二进制忽略这张表。
+    tx.execute_batch(API_TOKENS_SCHEMA)?;
 
     if version < SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tracing::info!(
             from = version,
             to = SCHEMA_VERSION,
-            "数据库已迁移：新增 agent_control / audit_log（M3 控制面）"
+            "数据库已迁移：新增 api_tokens（scoped token）"
         );
     }
     tx.commit()?;
@@ -1099,6 +1123,194 @@ impl Storage for SqliteStorage {
             .lock_write()
             .execute("DELETE FROM audit_log WHERE ts < ?1", params![before_ts])?;
         Ok(removed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v6：管理 API scoped token
+// ---------------------------------------------------------------------------
+
+/// 允许的 scope 字符串；与 `api_tokens.scope` 的 CHECK 约束保持一致。
+const API_TOKEN_SCOPES: [&str; 3] = ["read", "write", "admin"];
+
+/// 把 `api_tokens` 的一行映射成记录。SELECT 的列顺序必须与这里一致。
+fn row_to_api_token(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiTokenRecord> {
+    Ok(ApiTokenRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        scope: row.get(2)?,
+        created_at: row.get(3)?,
+        last_used_at: row.get(4)?,
+        revoked_at: row.get(5)?,
+    })
+}
+
+/// `api_tokens` 的 SELECT 列表；与 [`row_to_api_token`] 一一对应。
+const API_TOKEN_COLUMNS: &str = "id, name, scope, created_at, last_used_at, revoked_at";
+
+/// 把唯一约束冲突翻译成可读错误，不把 SQL / 表结构泄露给 CLI 用户。
+fn map_api_token_unique_error(err: rusqlite::Error, name: &str) -> anyhow::Error {
+    if let rusqlite::Error::SqliteFailure(inner, Some(message)) = &err {
+        if inner.code == rusqlite::ErrorCode::ConstraintViolation {
+            if message.contains("api_tokens.name") {
+                return anyhow::anyhow!("token 名称已存在: {name}");
+            }
+            if message.contains("api_tokens.token_hash") {
+                return anyhow::anyhow!("token 哈希冲突，请重新生成 token");
+            }
+        }
+    }
+    // 兜底不透传原始 SQLite 错误（可能含 SQL / 文件路径），只记 debug。
+    tracing::debug!(error = %err, "创建/轮换 token 失败（非唯一约束错误）");
+    anyhow::anyhow!("创建/轮换 token 失败: {name}（数据库错误，详见日志）")
+}
+
+impl SqliteStorage {
+    /// 新建一条 scoped token；`token_hash` 是明文的 SHA-256 hex。
+    ///
+    /// 重复 name 返回可读错误；非法 scope 在落库前就被拒绝（数据库 CHECK 是
+    /// 最后防线）。
+    pub fn create_api_token(
+        &self,
+        name: &str,
+        token_hash: &str,
+        scope: &str,
+        created_at: i64,
+    ) -> Result<ApiTokenRecord> {
+        if !API_TOKEN_SCOPES.contains(&scope) {
+            anyhow::bail!("非法 token scope: {scope}（只允许 read / write / admin）");
+        }
+        let conn = self.lock_write();
+        conn.execute(
+            "INSERT INTO api_tokens (name, token_hash, scope, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![name, token_hash, scope, created_at],
+        )
+        .map_err(|err| map_api_token_unique_error(err, name))?;
+        Ok(ApiTokenRecord {
+            id: conn.last_insert_rowid(),
+            name: name.to_string(),
+            scope: scope.to_string(),
+            created_at,
+            last_used_at: None,
+            revoked_at: None,
+        })
+    }
+
+    /// 按 name 升序列出全部 token（含已吊销）；不返回哈希或明文。
+    pub fn list_api_tokens(&self) -> Result<Vec<ApiTokenRecord>> {
+        let conn = self.lock_read();
+        let sql = format!("SELECT {API_TOKEN_COLUMNS} FROM api_tokens ORDER BY name ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], row_to_api_token)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 轮换 token：同一行写入新哈希、清 `revoked_at`，旧哈希立即失效。
+    ///
+    /// 新凭据的 `created_at` 记为本次轮换时间，`last_used_at` 清空（新凭据尚未
+    /// 使用）；name / scope / id 不变，因此审计 actor 保持稳定。
+    pub fn rotate_api_token(
+        &self,
+        name: &str,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<ApiTokenRecord> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE api_tokens
+             SET token_hash = ?2, created_at = ?3, last_used_at = NULL, revoked_at = NULL
+             WHERE name = ?1",
+            params![name, token_hash, now],
+        );
+        let updated = match updated {
+            Ok(updated) => updated,
+            Err(err) => return Err(map_api_token_unique_error(err, name)),
+        };
+        if updated == 0 {
+            anyhow::bail!("token 不存在: {name}");
+        }
+        let sql = format!("SELECT {API_TOKEN_COLUMNS} FROM api_tokens WHERE name = ?1");
+        let record = tx.query_row(&sql, params![name], row_to_api_token)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    /// 吊销 token：只写 `revoked_at`，不删行。
+    ///
+    /// 不存在与已吊销是两种不同的可读错误；重复吊销不会刷新时间戳。
+    pub fn revoke_api_token(&self, name: &str, now: i64) -> Result<()> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE api_tokens SET revoked_at = ?2 WHERE name = ?1 AND revoked_at IS NULL",
+            params![name, now],
+        )?;
+        if updated == 0 {
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM api_tokens WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            anyhow::bail!(match exists {
+                Some(_) => format!("token 已吊销: {name}"),
+                None => format!("token 不存在: {name}"),
+            });
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 鉴权：只返回未吊销行，并 best-effort 更新 `last_used_at`。
+    ///
+    /// - 60s 节流：同一 token 的 `last_used_at` 每 60s 最多写一次；首次必写。
+    /// - 更新失败只记 debug，不影响本次鉴权结果（读路径已完成）。
+    /// - 若更新时发现行已被并发吊销（影响 0 行），按未认证处理（安全默认拒绝）。
+    ///
+    /// 并发下两个请求可能同时通过节流判断、各写一次 `last_used_at`；两次写入
+    /// 都是幂等的统计更新，最多多一条 UPDATE，不影响鉴权与吊销语义。
+    pub fn authenticate_api_token(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<Option<ApiTokenRecord>> {
+        let sql = format!(
+            "SELECT {API_TOKEN_COLUMNS} FROM api_tokens
+             WHERE token_hash = ?1 AND revoked_at IS NULL"
+        );
+        // 显式作用域释放读连接：读池为空时会回退到写连接，提前 drop 才能避免
+        // 后续 UPDATE 等待自己持有的写锁。
+        let record: Option<ApiTokenRecord> = {
+            let conn = self.lock_read();
+            conn.query_row(&sql, params![token_hash], row_to_api_token)
+                .optional()?
+        };
+        let Some(mut record) = record else {
+            return Ok(None);
+        };
+
+        let should_touch = record
+            .last_used_at
+            .map(|last| now.saturating_sub(last) >= API_TOKEN_LAST_USED_THROTTLE_MS)
+            .unwrap_or(true);
+        if should_touch {
+            match self.lock_write().execute(
+                "UPDATE api_tokens SET last_used_at = ?2
+                 WHERE id = ?1 AND revoked_at IS NULL",
+                params![record.id, now],
+            ) {
+                Ok(0) => return Ok(None),
+                Ok(_) => record.last_used_at = Some(now),
+                Err(err) => {
+                    // 鉴权已成功，last_used_at 只是统计信息，绝不能因此拒绝请求。
+                    tracing::debug!(token = %record.name, error = %err, "更新 token last_used_at 失败");
+                }
+            }
+        }
+        Ok(Some(record))
     }
 }
 
@@ -2228,5 +2440,236 @@ mod tests {
             10,
             "新写入的审计必须保留"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // v6：管理 API scoped token
+    // ------------------------------------------------------------------
+
+    /// v5 库（已有审计与控制数据）升级到 v6：只新增 api_tokens，旧数据保留，重复打开幂等。
+    #[test]
+    fn v6_v5_schema_upgrades_and_preserves_old_data() {
+        let path = temp_db("v6-migration");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agent_settings (
+                     agent_id           TEXT PRIMARY KEY,
+                     sample_interval_ms INTEGER NOT NULL,
+                     updated_at         INTEGER NOT NULL
+                 );
+                 INSERT INTO agent_settings VALUES ('a1', 2500, 42);
+                 CREATE TABLE audit_log (
+                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                     ts            INTEGER NOT NULL,
+                     actor         TEXT NOT NULL,
+                     agent_id      TEXT NOT NULL,
+                     capability    TEXT NOT NULL,
+                     action        TEXT NOT NULL,
+                     target        TEXT NOT NULL DEFAULT '',
+                     params        TEXT NOT NULL DEFAULT '{}',
+                     result        TEXT NOT NULL,
+                     error_code    TEXT NOT NULL DEFAULT '',
+                     error_message TEXT NOT NULL DEFAULT '',
+                     duration_ms   INTEGER NOT NULL
+                 );
+                 INSERT INTO audit_log
+                     (ts, actor, agent_id, capability, action, target, params, result,
+                      error_code, error_message, duration_ms)
+                 VALUES (111, 'admin', 'a1', 'systemd', 'list', '', '{}', 'ok', '', '', 5);
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        }
+
+        for round in 0..2 {
+            let s = SqliteStorage::open(&path).unwrap_or_else(|err| {
+                panic!("第 {round} 次打开 v5 库失败（v5→v6 迁移必须幂等）: {err}")
+            });
+            let version: i64 = s
+                .lock_read()
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION, "必须升级到 v6");
+            assert_eq!(s.get_sample_interval("a1").unwrap(), Some(2500));
+            let audits = s.list_audit(10, None, None, None).unwrap();
+            assert_eq!(audits.len(), 1, "旧审计必须保留");
+            assert_eq!(audits[0].actor, "admin");
+            assert!(s.list_api_tokens().unwrap().is_empty());
+
+            let table_exists: i64 = s
+                .lock_read()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'api_tokens')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(table_exists, 1, "v6 必须建好 api_tokens 表");
+            let index_exists: i64 = s
+                .lock_read()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_api_tokens_hash')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(index_exists, 1, "v6 必须建好 idx_api_tokens_hash");
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// 创建 / 列表排序 / 重复 name / 非法 scope；数据库只存哈希。
+    #[test]
+    fn v6_create_list_tokens_never_store_plaintext() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let plain_a = "plain-token-a";
+        let plain_b = "plain-token-b";
+        let hash_a = rustboard_common::tls::sha256_hex(plain_a);
+        let hash_b = rustboard_common::tls::sha256_hex(plain_b);
+
+        let record = s
+            .create_api_token("web-b", &hash_a, "read", 1_700_000_000_000)
+            .unwrap();
+        assert_eq!(record.name, "web-b");
+        assert_eq!(record.scope, "read");
+        assert_eq!(record.created_at, 1_700_000_000_000);
+        assert_eq!(record.last_used_at, None);
+        assert_eq!(record.revoked_at, None);
+        assert!(record.id > 0);
+
+        s.create_api_token("app-a", &hash_b, "admin", 1_700_000_000_001)
+            .unwrap();
+        let listed = s.list_api_tokens().unwrap();
+        assert_eq!(
+            listed.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["app-a", "web-b"],
+            "列表必须按 name 升序"
+        );
+
+        // 重复 name 是可读错误，不能是 SQL 约束原文。
+        let err = s
+            .create_api_token(
+                "web-b",
+                &rustboard_common::tls::sha256_hex("other"),
+                "read",
+                1,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("token 名称已存在"),
+            "err={err:#}"
+        );
+
+        // 非法 scope 在落库前被拒绝。
+        let err = s
+            .create_api_token("bad-scope", &hash_a, "root", 1)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("scope"), "err={err:#}");
+
+        // 数据库只有 SHA-256 hex，没有明文；对外记录里也没有哈希字段。
+        let stored: String = s
+            .lock_read()
+            .query_row(
+                "SELECT token_hash FROM api_tokens WHERE name = 'web-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, hash_a);
+        assert!(!stored.contains(plain_a));
+        let debug = format!("{listed:?}");
+        assert!(!debug.contains(plain_a) && !debug.contains(plain_b));
+        assert!(!debug.contains(&hash_a) && !debug.contains(&hash_b));
+    }
+
+    /// 鉴权：只返回未吊销行；首次写 last_used_at，60s 内节流，60s 后刷新。
+    #[test]
+    fn v6_authenticate_updates_last_used_and_rejects_revoked() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let hash = rustboard_common::tls::sha256_hex("active-token");
+        s.create_api_token("panel", &hash, "write", 100).unwrap();
+
+        assert!(s
+            .authenticate_api_token("not-a-hash", 200)
+            .unwrap()
+            .is_none());
+        let record = s
+            .authenticate_api_token(&hash, 200)
+            .unwrap()
+            .expect("未吊销 token 必须认证通过");
+        assert_eq!(record.name, "panel");
+        assert_eq!(record.scope, "write");
+        assert_eq!(
+            record.last_used_at,
+            Some(200),
+            "首次鉴权必须写 last_used_at"
+        );
+
+        // 60s 内节流：数据库保持首次时间，但鉴权仍成功。
+        let throttled = s.authenticate_api_token(&hash, 201).unwrap().unwrap();
+        assert_eq!(throttled.last_used_at, Some(200), "节流窗口内不重复写");
+        assert_eq!(s.list_api_tokens().unwrap()[0].last_used_at, Some(200));
+
+        // 超过 60s 刷新。
+        let refreshed = s
+            .authenticate_api_token(&hash, 200 + API_TOKEN_LAST_USED_THROTTLE_MS)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refreshed.last_used_at,
+            Some(200 + API_TOKEN_LAST_USED_THROTTLE_MS)
+        );
+        assert_eq!(
+            s.list_api_tokens().unwrap()[0].last_used_at,
+            Some(200 + API_TOKEN_LAST_USED_THROTTLE_MS)
+        );
+
+        s.revoke_api_token("panel", 300).unwrap();
+        assert!(
+            s.authenticate_api_token(&hash, 301).unwrap().is_none(),
+            "已吊销 token 必须认证失败"
+        );
+        let listed = s.list_api_tokens().unwrap();
+        assert_eq!(listed.len(), 1, "吊销不删行");
+        assert_eq!(listed[0].revoked_at, Some(300));
+
+        let err = s.revoke_api_token("panel", 400).unwrap_err();
+        assert!(format!("{err:#}").contains("已吊销"), "err={err:#}");
+        let err = s.revoke_api_token("missing", 400).unwrap_err();
+        assert!(format!("{err:#}").contains("不存在"), "err={err:#}");
+    }
+
+    /// 轮换：旧哈希立即失效、新哈希可用、清 revoked_at、created_at 更新。
+    #[test]
+    fn v6_rotate_invalidates_old_hash_and_clears_revocation() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let old_hash = rustboard_common::tls::sha256_hex("old-token");
+        let new_hash = rustboard_common::tls::sha256_hex("new-token");
+        s.create_api_token("panel", &old_hash, "read", 100).unwrap();
+        s.revoke_api_token("panel", 150).unwrap();
+
+        let rotated = s.rotate_api_token("panel", &new_hash, 200).unwrap();
+        assert_eq!(rotated.name, "panel");
+        assert_eq!(rotated.scope, "read", "rotate 不改变 scope");
+        assert_eq!(rotated.created_at, 200);
+        assert_eq!(rotated.last_used_at, None);
+        assert_eq!(rotated.revoked_at, None, "rotate 必须清 revoked_at");
+
+        assert!(
+            s.authenticate_api_token(&old_hash, 210).unwrap().is_none(),
+            "旧哈希必须立即失效"
+        );
+        let active = s
+            .authenticate_api_token(&new_hash, 210)
+            .unwrap()
+            .expect("新哈希必须可用");
+        assert_eq!(active.name, "panel");
+
+        let err = s.rotate_api_token("missing", &new_hash, 300).unwrap_err();
+        assert!(format!("{err:#}").contains("不存在"), "err={err:#}");
+
+        // 轮换后只有一行，不新建记录。
+        assert_eq!(s.list_api_tokens().unwrap().len(), 1);
     }
 }

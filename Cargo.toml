@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 license = "MIT"
 rust-version = "1.80"
@@ -29,7 +29,10 @@ include_dir = "0.7"
 libc = "0.2"
 rand = "0.8"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# v0.3.3：Panel 支持 https://hub。选 native roots + ring provider：
+# - `rustls-tls-native-roots` 的内部依赖包含 `__rustls-ring`，不会引入 aws-lc/cmake；
+# - 用系统信任库；Panel 配置 `hub_ca` 时只信任该私有 CA（见 panel/src/proxy.rs）。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 rmp-serde = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }

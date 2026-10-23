@@ -31,12 +31,12 @@ use hyper::body::Incoming;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use rustboard_common::config::HubConfig;
+use rustboard_common::config::{AdminTlsMode, HubConfig};
+use rustboard_common::control::ControlError;
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 use rustboard_common::tls;
 use rustboard_common::util::{
-    arch, boot_id, constant_time_eq, hostname, now_ms, os_pretty_name, pick_free_port_excluding,
-    port_of,
+    arch, boot_id, hostname, now_ms, os_pretty_name, pick_free_port_excluding, port_of,
 };
 use rustboard_common::wire::{codes, EnrollRequest, Frame, Welcome};
 use rustboard_common::{DEFAULT_HUB_CONFIG, PROTOCOL_VERSION, VERSION};
@@ -50,9 +50,11 @@ use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 
+mod auth;
 mod cert_rotation;
 mod control;
 mod session;
+use auth::TokenScope;
 use cert_rotation::CertStatus;
 use control::{ControlCommand, ControlSession};
 use session::{SessionRegistry, ShutdownReason};
@@ -92,6 +94,12 @@ const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const ADMIN_MAX_CONNECTIONS: usize = 256;
 /// 管理 API 单来源 IP 并发连接上限；只绑回环时同样生效。
 const ADMIN_MAX_CONNECTIONS_PER_IP: usize = 32;
+/// 管理 API TLS 握手超时：半开 TLS 连接最多占用 10s。
+const ADMIN_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 管理端 TLS 热加载轮询周期：跟踪 mTLS 监听器已经验证并切换过的 live 证书。
+const ADMIN_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(2);
+/// 管理端 TLS 热加载构建失败的最小告警间隔，避免坏证书每 2s 刷日志。
+const ADMIN_TLS_RELOAD_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// 单条 WebSocket 帧的写超时；写不出去说明对端已经不读了，直接清理会话。
 const SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// 客户端续签请求里 CSR 的 PEM 长度上限（16 KiB）。
@@ -190,6 +198,9 @@ enum Cmd {
         agent_listen: Option<String>,
         #[arg(long)]
         admin_listen: Option<String>,
+        /// 管理 API 传输模式：off（仅回环明文，默认）或 required（HTTPS）。
+        #[arg(long, value_parser = ["off", "required"])]
+        admin_tls: Option<String>,
         /// 追加到服务端证书 SAN 的地址，可重复。
         #[arg(long = "san")]
         sans: Vec<String>,
@@ -211,7 +222,7 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// 立即用 CA 重签服务端证书（备份旧证书，运行中的 hub 会在 ≤10s 内热加载）。
+    /// 立即用 CA 重签服务端证书（备份旧证书，运行中的 hub 会在 ≤15s 内热加载）。
     RotateCert {
         #[arg(short, long)]
         config: Option<PathBuf>,
@@ -226,6 +237,11 @@ enum Cmd {
     AdminToken {
         #[arg(short, long)]
         config: Option<PathBuf>,
+    },
+    /// 管理 API scoped token 管理（create / list / rotate / revoke）。
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
     },
     /// 纳管相关的运维命令。
     Agent {
@@ -259,6 +275,40 @@ enum AgentAction {
     },
 }
 
+#[derive(Subcommand)]
+enum TokenAction {
+    /// 新建 scoped token，只输出一次明文。
+    Create {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// token 名称（1–64 字符，仅 `[A-Za-z0-9._-]`），也是审计 actor。
+        #[arg(long)]
+        name: String,
+        /// 权限：read（只读）| write（只读 + 控制/设置）| admin（全部）。
+        #[arg(long, value_parser = ["read", "write", "admin"])]
+        scope: String,
+    },
+    /// 列出 token 元信息（TSV，不含明文 / 哈希）。
+    List {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// 轮换 token：生成新明文、清吊销状态，旧 token 立即失效。
+    Rotate {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        name: String,
+    },
+    /// 吊销 token（不删行）。
+    Revoke {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        name: String,
+    },
+}
+
 #[derive(Clone)]
 struct AppState {
     storage: Arc<SqliteStorage>,
@@ -284,7 +334,12 @@ struct PeerIdentity(Option<String>);
 fn main() -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "rustboard_hub=info,rustboard_common=warn,tower_http=warn".into());
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        // 日志固定走 stderr：`token create/rotate` 的明文只写 stdout，
+        // 避免 `RUST_LOG=info` 时脚本捕获的 token 被日志行污染。
+        .with_writer(std::io::stderr)
+        .init();
 
     match Cli::parse().cmd {
         Cmd::Init {
@@ -292,6 +347,7 @@ fn main() -> Result<()> {
             data_dir,
             agent_listen,
             admin_listen,
+            admin_tls,
             sans,
             advertise,
             ca_days,
@@ -304,6 +360,7 @@ fn main() -> Result<()> {
             data_dir,
             agent_listen,
             admin_listen,
+            admin_tls,
             sans,
             advertise,
             ca_days,
@@ -324,6 +381,7 @@ fn main() -> Result<()> {
             days,
         } => rotate_cert(config, force, days),
         Cmd::AdminToken { config } => admin_token(config),
+        Cmd::Token { action } => token_command(action),
         Cmd::Agent { action } => match action {
             AgentAction::Add {
                 config,
@@ -443,6 +501,109 @@ fn admin_token(config: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// `token` 子命令入口：只有这里负责打印，业务函数返回可测试的字符串。
+///
+/// `create` / `rotate` 的明文只经 stdout 输出一次，绝不写日志 / 配置 / 数据库明文。
+fn token_command(action: TokenAction) -> Result<()> {
+    match action {
+        TokenAction::Create {
+            config,
+            name,
+            scope,
+        } => println!("{}", token_create(config, name, scope)?),
+        TokenAction::List { config } => print!("{}", token_list(config)?),
+        TokenAction::Rotate { config, name } => println!("{}", token_rotate(config, name)?),
+        TokenAction::Revoke { config, name } => println!("{}", token_revoke(config, name)?),
+    }
+    Ok(())
+}
+
+/// token 名称规范：1–64 个字符，仅 `[A-Za-z0-9._-]`。
+///
+/// 名称会进入审计 actor 与 TSV 列表，限制字符集可避免换行 / 制表符注入。
+fn validate_token_name(name: &str) -> Result<()> {
+    let len = name.chars().count();
+    if !(1..=64).contains(&len) {
+        bail!("token 名称必须为 1–64 个字符，实际 {len} 个");
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("token 名称只能包含 A-Z a-z 0-9 . _ -");
+    }
+    // 审计 actor 兼容性：旧 admin_token 固定写 actor="admin"，若允许同名 scoped
+    // token，审计里将无法区分两者。保留名大小写不敏感（Admin/ADMIN 同样拒绝）。
+    if name.eq_ignore_ascii_case("admin") {
+        bail!(
+            "token 名称 \"admin\" 是审计 actor 保留名（与旧 admin_token 不可区分），请换一个名称"
+        );
+    }
+    Ok(())
+}
+
+/// 打开配置文件指向的 SQLite（CLI 与运行中的 hub 通过 WAL 并发）。
+fn open_token_storage(config: Option<PathBuf>) -> Result<SqliteStorage> {
+    let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
+    let cfg = load_config(&path)?;
+    SqliteStorage::open(&cfg.sqlite_path()?)
+}
+
+/// 把 `--scope` 解析成枚举，非法值给出可读错误。
+fn parse_token_scope(scope: &str) -> Result<TokenScope> {
+    TokenScope::parse(scope)
+        .ok_or_else(|| anyhow::anyhow!("scope 必须是 read / write / admin，实际: {scope}"))
+}
+
+/// 新建 token：返回 64 位 hex 明文（调用方负责只打印一次）。
+fn token_create(config: Option<PathBuf>, name: String, scope: String) -> Result<String> {
+    validate_token_name(&name)?;
+    let scope = parse_token_scope(&scope)?;
+    let storage = open_token_storage(config)?;
+    let token = new_secret();
+    storage.create_api_token(&name, &tls::sha256_hex(&token), scope.as_str(), now_ms())?;
+    Ok(token)
+}
+
+/// 列出 token：TSV，表头固定；空时间显示 `-`；绝不出现哈希或明文。
+fn token_list(config: Option<PathBuf>) -> Result<String> {
+    let storage = open_token_storage(config)?;
+    let tokens = storage.list_api_tokens()?;
+    let mut output = String::from("name\tscope\tcreated_at\tlast_used_at\trevoked_at\n");
+    for token in tokens {
+        let last_used = token
+            .last_used_at
+            .map(|ts| ts.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let revoked = token
+            .revoked_at
+            .map(|ts| ts.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            token.name, token.scope, token.created_at, last_used, revoked
+        ));
+    }
+    Ok(output)
+}
+
+/// 轮换 token：返回新的 64 位 hex 明文，旧 token 立即失效。
+fn token_rotate(config: Option<PathBuf>, name: String) -> Result<String> {
+    validate_token_name(&name)?;
+    let storage = open_token_storage(config)?;
+    let token = new_secret();
+    storage.rotate_api_token(&name, &tls::sha256_hex(&token), now_ms())?;
+    Ok(token)
+}
+
+/// 吊销 token：不删行，重复吊销 / 不存在都是明确错误。
+fn token_revoke(config: Option<PathBuf>, name: String) -> Result<String> {
+    validate_token_name(&name)?;
+    let storage = open_token_storage(config)?;
+    storage.revoke_api_token(&name, now_ms())?;
+    Ok(format!("已吊销 token: {name}"))
+}
+
 // init 的参数与 `init` 子命令的 CLI 字段一一对应，拆结构体只会多一层搬运。
 #[allow(clippy::too_many_arguments)]
 fn init(
@@ -450,6 +611,7 @@ fn init(
     data_dir: Option<PathBuf>,
     agent_listen: Option<String>,
     admin_listen: Option<String>,
+    admin_tls: Option<String>,
     sans: Vec<String>,
     advertise: Option<String>,
     ca_days: Option<u32>,
@@ -463,6 +625,10 @@ fn init(
         bail!("{} 已存在，使用 --force 覆盖", path.display());
     }
     let mut cfg = HubConfig::default();
+    // 默认 off；`required` 复用随后签发的 server.crt / server.key。
+    if admin_tls.as_deref() == Some("required") {
+        cfg.admin_tls = AdminTlsMode::Required;
+    }
     if let Some(d) = data_dir {
         cfg.database = format!("sqlite://{}/rustboard.db", d.display());
         cfg.data_dir = d;
@@ -512,6 +678,12 @@ fn init(
     // 先校验再落盘/签发：非法有效期/非法 SAN 不能留下一个起不来的安装或半个 CA。
     cfg.validate()
         .context("init 参数校验失败（检查有效期参数、--renew-before-days 与 --san）")?;
+    // required 时管理端地址必须能被证书覆盖（精确 IP 或 DNS 访问），在签发/落盘前
+    // 就拒绝，避免交付一个启动即失败的配置。off 非回环仍只警告、允许落盘。
+    if cfg.admin_tls == AdminTlsMode::Required {
+        validate_admin_tls(&cfg)
+            .context("init 管理 API TLS 校验失败（检查 --admin-listen 与 --san/server_names）")?;
+    }
 
     let policy = tls::CertPolicy {
         ca_days: cfg.ca_validity_days,
@@ -532,7 +704,27 @@ fn init(
         cfg.renew_before_days
     );
     println!("agent 接入监听: {}", cfg.agent_listen);
-    println!("管理 API 监听: {}", cfg.admin_listen);
+    println!(
+        "管理 API 监听: {}（{}）",
+        cfg.admin_listen,
+        match cfg.admin_tls {
+            AdminTlsMode::Off => "HTTP",
+            AdminTlsMode::Required => "HTTPS",
+        }
+    );
+    if cfg.admin_tls == AdminTlsMode::Off {
+        // init 允许先落盘（便于之后改配置），但必须明确告知随后 run 会拒绝。
+        if let Ok(true) = admin_listen_is_non_loopback(&cfg.admin_listen) {
+            println!(
+                "警告: admin_tls=\"off\" 且管理 API 监听在非回环地址 {}；\
+                 启动会拒绝。请改用 --admin-tls required，或只绑回环 + TLS 反向代理。",
+                cfg.admin_listen
+            );
+        }
+    } else {
+        println!("管理 API HTTPS：复用 server.crt / server.key（server-auth，不要求客户端证书）");
+        println!("  证书 SAN 必须包含管理端访问地址；变更 server_names 后需执行 rotate-cert。");
+    }
     println!("管理 API token: {}", cfg.admin_token);
     println!("  面板/脚本访问管理 API 时使用 Authorization: Bearer <token>；");
     println!("  可随时用 `rustboard-hub admin-token` 查看（为空时会重新生成）。");
@@ -557,7 +749,13 @@ fn print_ports(config: Option<PathBuf>) -> Result<()> {
     println!("  监听: {}", cfg.agent_listen);
     println!("  对外: wss://<公网IP>:{agent_port}/agent/ws");
     println!("管理 API 端口: {admin_port}");
-    println!("  本机: http://127.0.0.1:{admin_port}");
+    println!(
+        "  本机: {}://127.0.0.1:{admin_port}",
+        match cfg.admin_tls {
+            AdminTlsMode::Off => "http",
+            AdminTlsMode::Required => "https",
+        }
+    );
     if let Some(host) = &cfg.advertise_host {
         println!("agent 连接地址: wss://{host}:{agent_port}/agent/ws");
     }
@@ -679,7 +877,7 @@ fn rotate_cert(config: Option<PathBuf>, force: bool, days: Option<u32>) -> Resul
         }
     }
 
-    println!("重签只改磁盘；运行中的 hub 会在 ≤10s 内自动热加载，无需重启。");
+    println!("重签只改磁盘；运行中的 hub 会在 ≤15s 内自动热加载，无需重启。");
 
     // 文件级签发：内部先做 CA/SAN/新证书自检，全部通过后才成对备份并写盘，
     // 失败路径不会留下无意义的备份；也不读旧 TLS 配置，key/cert 不配套时同样可用。
@@ -713,7 +911,8 @@ fn rotate_cert(config: Option<PathBuf>, force: bool, days: Option<u32>) -> Resul
         tls::format_unix_utc(renewed.not_after)
     );
     println!(
-        "运行中的 hub 将在 ≤10s 内自动加载新证书（无需重启）；默认（CA 未变）已纳管 agent \
+        "运行中的 hub 将在 ≤15s 内自动加载新证书（无需重启；管理端 TLS 会跟随 mTLS 证书切换）；\
+         默认（CA 未变）已纳管 agent \
          用 CA 信任会自动重连；若这次轮换同时替换了 CA，所有 agent 必须重新纳管\
          （旧 ca.crt/客户端证书属于旧 CA，会 mTLS 失败）。"
     );
@@ -727,6 +926,9 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
     validate_hub_sample_interval(&cfg)?;
     // M2：管理 API 全部要求 Bearer token，空 token 不允许启动。
     require_admin_token(&cfg)?;
+    // v0.3.3：非回环管理监听禁止明文；required 时校验绑定 IP 在证书 SAN 内。
+    // 必须发生在任何监听 / 证书加载之前。
+    validate_admin_tls(&cfg)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -771,6 +973,9 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
             tls::fingerprint_of_pem(&pem)?
         };
         tracing::info!(fingerprint, "TLS 已启用");
+        // 管理端 watcher 以「启动时实际构建配置的证书」为基线，而不是启动后读 live：
+        // 避免极端竞态下把启动后才切换的指纹误当成已加载。
+        let initial_admin_fingerprint = fingerprint.clone();
 
         let sessions = SessionRegistry::new();
         let state = AppState {
@@ -792,8 +997,28 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         // rustls 配置推进 watch；accept 循环每条新连接读一次，老连接不受影响。
         let (tls_tx, tls_rx) = watch::channel(tls_config);
         cert_rotation::spawn_server_renewal(state.cfg.clone(), tls_tx.clone(), live_cert.clone());
-        // KI-10：每 10s 轮询磁盘证书，运行中 rotate 后 ≤10s 热加载（≤15s 验收）。
-        cert_rotation::spawn_cert_file_watcher(state.cfg.clone(), tls_tx, live_cert);
+        // KI-10：每 10s 轮询磁盘证书，运行中 rotate 后 mTLS ≤10s 热加载；
+        // 管理端 watcher 每 2s 跟随 live_cert，合计最迟约 12s（对外承诺 ≤15s）。
+        cert_rotation::spawn_cert_file_watcher(state.cfg.clone(), tls_tx, live_cert.clone());
+
+        // v0.3.3：管理端可选 HTTPS。复用 agent 入口的 server.crt/server.key，
+        // 但为 server-auth（不要求客户端证书）；watcher 轮询 live_cert 指纹，
+        // 换证成功后新连接使用新配置，构建失败保留旧配置。
+        let admin_tls = match cfg.admin_tls {
+            AdminTlsMode::Off => None,
+            AdminTlsMode::Required => {
+                let config = tls::admin_server_config(&cfg.data_dir, &cfg.server_names)
+                    .context("构建管理 API TLS 配置失败")?;
+                let (admin_tx, admin_rx) = watch::channel(config);
+                spawn_admin_tls_watcher(
+                    state.cfg.clone(),
+                    admin_tx,
+                    live_cert.clone(),
+                    initial_admin_fingerprint.clone(),
+                );
+                Some(admin_rx)
+            }
+        };
 
         if cfg.self_monitor {
             spawn_self_monitor(storage.clone(), cfg.clone());
@@ -809,7 +1034,14 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         let agent_addr = cfg.agent_listen.clone();
         let admin_addr = cfg.admin_listen.clone();
         tracing::info!(%agent_addr, "agent 接入监听（TLS）");
-        tracing::info!(%admin_addr, "管理 API 监听（HTTP，请只绑内网）");
+        match cfg.admin_tls {
+            AdminTlsMode::Off => {
+                tracing::info!(%admin_addr, "管理 API 监听（HTTP，仅回环）");
+            }
+            AdminTlsMode::Required => {
+                tracing::info!(%admin_addr, "管理 API 监听（HTTPS，server-auth）");
+            }
+        }
 
         tokio::try_join!(
             serve_tls(
@@ -819,38 +1051,109 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
                 cfg.max_connections,
                 cfg.max_connections_per_ip
             ),
-            serve(admin_app, admin_addr)
+            serve(admin_app, admin_addr, admin_tls)
         )?;
         Ok(())
     })
 }
 
-/// 管理监听地址是否需要非回环安全告警（KI-06）。
+/// 管理监听是否绑在非回环地址；解析失败与 bind 一样视为启动错误。
 ///
-/// 解析失败与 bind 一样视为启动错误；回环地址（127.0.0.0/8、::1）不告警。
-fn admin_listen_needs_warning(addr: &str) -> Result<bool> {
+/// 回环范围沿用 `IpAddr::is_loopback`（IPv4 127.0.0.0/8、IPv6 ::1）。
+fn admin_listen_is_non_loopback(addr: &str) -> Result<bool> {
     let sock: SocketAddr = addr
         .parse()
         .with_context(|| format!("管理 API 监听地址非法: {addr}"))?;
     Ok(!sock.ip().is_loopback())
 }
 
-async fn serve(app: Router, addr: String) -> Result<()> {
+/// 启动前校验管理 API 的传输安全；任何失败都发生在监听之前。
+///
+/// - `off` 只允许回环：非回环直接拒绝（v0.3.3 有意的安全收紧）。
+/// - `required`：绑定 IP 在 `server_names` 里（比较前 trim），或管理端可通过
+///   `server_names` 里的 DNS 名访问；两者都不满足时提示先更新 server_names 再
+///   rotate-cert。`0.0.0.0` / `::` 通配绑定跳过精确检查。
+fn validate_admin_tls(cfg: &HubConfig) -> Result<()> {
+    let sock: SocketAddr = cfg
+        .admin_listen
+        .parse()
+        .with_context(|| format!("管理 API 监听地址非法: {}", cfg.admin_listen))?;
+    match cfg.admin_tls {
+        AdminTlsMode::Off => {
+            if !sock.ip().is_loopback() {
+                bail!(
+                    "admin_tls=\"off\" 只允许管理 API 绑定回环地址（127.0.0.0/8、::1），\
+                     当前为 {}；请改用 admin_tls=\"required\"，或只绑回环 + TLS 反向代理",
+                    cfg.admin_listen
+                );
+            }
+        }
+        AdminTlsMode::Required => {
+            let ip = sock.ip();
+            if ip.is_unspecified() {
+                // 通配绑定不知道客户端用哪个地址访问，跳过精确 SAN 检查；但如果
+                // server_names 只有回环名，远端客户端必然校验证书失败，提前告警。
+                if all_loopback_server_names(&cfg.server_names) {
+                    tracing::warn!(
+                        "管理 API 使用通配绑定，但 server_names 全部是回环名；\
+                         远端客户端校验证书会失败，请补充可访问的 IP / DNS SAN 后执行 rotate-cert"
+                    );
+                }
+                return Ok(());
+            }
+            let names: Vec<&str> = cfg
+                .server_names
+                .iter()
+                .map(|name| name.trim())
+                .filter(|name| !name.is_empty())
+                .collect();
+            let covered = names.iter().any(|name| {
+                name.parse::<IpAddr>()
+                    .is_ok_and(|candidate| candidate == ip)
+            });
+            // 也允许管理端通过 DNS 访问：bind IP 不必出现在 SAN 里，证书覆盖实际
+            // 访问的 DNS 名即可。回环绑定不适用（DNS 名无法指到 127.x），仍要求
+            // 精确 IP SAN，避免 init 产出无法本机访问的配置。
+            let dns_covered =
+                !ip.is_loopback() && names.iter().any(|name| name.parse::<IpAddr>().is_err());
+            if !covered && !dns_covered {
+                bail!(
+                    "admin_tls=\"required\" 且管理 API 绑定 {ip}，但 server_names 中既没有该 IP SAN、\
+                     也没有可用于远端访问的 DNS SAN；请先把 {ip}（或管理端 DNS 名）加入 \
+                     server_names，再执行 `rustboard-hub rotate-cert --force` 重签服务端证书"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// server_names 是否全部是回环名（127.0.0.0/8、::1、localhost / *.localhost）。
+fn all_loopback_server_names(names: &[String]) -> bool {
+    !names.is_empty()
+        && names.iter().all(|name| {
+            let name = name.trim();
+            name.parse::<IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or_else(|_| {
+                    name.eq_ignore_ascii_case("localhost")
+                        || name.to_ascii_lowercase().ends_with(".localhost")
+                })
+        })
+}
+
+async fn serve(
+    app: Router,
+    addr: String,
+    tls: Option<watch::Receiver<Arc<rustls::ServerConfig>>>,
+) -> Result<()> {
     let sock: SocketAddr = addr
         .parse()
         .with_context(|| format!("管理 API 监听地址非法: {addr}"))?;
-    // KI-06：管理 API 是明文 HTTP，绑到非回环必须显式告警。
-    if admin_listen_needs_warning(&addr)? {
-        tracing::warn!(
-            %sock,
-            "管理 API 监听在非回环地址，且为明文 HTTP：只应置于 VPN / 可信反向代理之后，\
-             禁止直接暴露到公网"
-        );
-    }
     let listener = TcpListener::bind(sock)
         .await
         .with_context(|| format!("监听 {sock} 失败"))?;
-    serve_admin_listener(app, listener).await
+    serve_admin_listener(app, listener, tls).await
 }
 
 /// boxed body error，axum 的 `Body::new` 也接受这个错误类型。
@@ -933,12 +1236,20 @@ where
 /// 不用 `axum::serve`：它没有 header 读超时，也拿不到连接数。这里手工 accept，
 /// 与 agent 的 mTLS 入口同款地做「全局 + 每来源 IP」并发限制、HTTP/1 header 超时，
 /// 保证半截 header 的慢连接最多占用 [`HEADER_READ_TIMEOUT`]，洪水下 `/healthz` 仍可用。
-async fn serve_admin_listener(app: Router, listener: TcpListener) -> Result<()> {
+///
+/// `tls` 为 `Some` 时每条新连接先做 TLS 握手（10s 超时），底层流随后交给
+/// [`serve_admin_connection`]；`None` 保持原有明文 HTTP 行为。
+async fn serve_admin_listener(
+    app: Router,
+    listener: TcpListener,
+    tls: Option<watch::Receiver<Arc<rustls::ServerConfig>>>,
+) -> Result<()> {
     let sock = listener.local_addr().context("读取管理 API 监听地址失败")?;
     let permits = Arc::new(Semaphore::new(ADMIN_MAX_CONNECTIONS.max(1)));
     let limits = Arc::new(ConnectionLimiter::new(ADMIN_MAX_CONNECTIONS_PER_IP));
     tracing::info!(
         %sock,
+        tls = tls.is_some(),
         max_connections = ADMIN_MAX_CONNECTIONS,
         max_connections_per_ip = ADMIN_MAX_CONNECTIONS_PER_IP,
         "管理 API 连接限制已启用"
@@ -990,37 +1301,177 @@ async fn serve_admin_listener(app: Router, listener: TcpListener) -> Result<()> 
         }
 
         let app = app.clone();
+        // 每条新连接取一次最新 TLS 配置：watcher 换证只影响之后的新连接。
+        let tls_rx = tls.clone();
         tokio::spawn(async move {
             // 许可跟随连接生命周期；连接关闭（含超时）后自动归还。
             let _permit = permit;
             let _connection = connection;
 
-            // KI-05：管理限速 / 鉴权依赖 ConnectInfo<SocketAddr>，逐请求注入。
-            // KI-17：请求体套一次性总 deadline，慢 body 最多占 10s，不随 frame 重置。
-            let service = tower::service_fn(move |req: Request<Incoming>| {
-                let (mut parts, incoming) = req.into_parts();
-                parts.extensions.insert(ConnectInfo(peer));
-                let body = Body::new(DeadlineBody::new(incoming, BODY_READ_TIMEOUT));
-                let req = Request::from_parts(parts, body);
-                let app = app.clone();
-                async move { app.oneshot(req).await }
-            });
-
-            // 与 agent 入口一致：不用 hyper-util 的 auto builder（它有一个无超时的
-            // HTTP 版本嗅探阶段）；http1 Builder 只对「读 header」计时，header 超时
-            // 不会限制 body（body 由 DeadlineBody 的 10s 总 deadline 单独约束）。
-            if let Err(err) = hyper::server::conn::http1::Builder::new()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(HEADER_READ_TIMEOUT)
-                .serve_connection(TokioIo::new(tcp), TowerToHyperService::new(service))
-                .with_upgrades()
-                .await
-            {
-                // 只记录来源与错误，不记录请求头。
-                tracing::debug!(%peer, error = %err, "管理 API 连接结束");
+            match tls_rx {
+                None => serve_admin_connection(tcp, peer, app).await,
+                Some(rx) => {
+                    let config = rx.borrow().clone();
+                    let acceptor = TlsAcceptor::from(config);
+                    let stream = match tokio::time::timeout(
+                        ADMIN_TLS_HANDSHAKE_TIMEOUT,
+                        acceptor.accept(tcp),
+                    )
+                    .await
+                    {
+                        Ok(Ok(stream)) => stream,
+                        // 明文请求打到 HTTPS 端口、SNI/ALPN 错误等都只记 debug：
+                        // 未认证连接的错误细节不应进入 info 日志。
+                        Ok(Err(err)) => {
+                            tracing::debug!(%peer, error = %err, "管理 API TLS 握手失败");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::debug!(%peer, "管理 API TLS 握手超时");
+                            return;
+                        }
+                    };
+                    serve_admin_connection(stream, peer, app).await;
+                }
             }
         });
     }
+}
+
+/// 明文 TCP 与 TLS 流共用的管理连接服务。
+///
+/// 负责逐请求注入 `ConnectInfo<SocketAddr>`、套一次性 body deadline，并用 hyper
+/// HTTP/1 跑 axum。TLS 握手与 TLS 配置选择由调用方在 accept 循环完成。
+async fn serve_admin_connection<S>(stream: S, peer: SocketAddr, app: Router)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    // KI-05：管理限速 / 鉴权依赖 ConnectInfo<SocketAddr>，逐请求注入。
+    // KI-17：请求体套一次性总 deadline，慢 body 最多占 10s，不随 frame 重置。
+    let service = tower::service_fn(move |req: Request<Incoming>| {
+        let (mut parts, incoming) = req.into_parts();
+        parts.extensions.insert(ConnectInfo(peer));
+        let body = Body::new(DeadlineBody::new(incoming, BODY_READ_TIMEOUT));
+        let req = Request::from_parts(parts, body);
+        let app = app.clone();
+        async move { app.oneshot(req).await }
+    });
+
+    // 与 agent 入口一致：不用 hyper-util 的 auto builder（它有一个无超时的
+    // HTTP 版本嗅探阶段）；http1 Builder 只对「读 header」计时，header 超时
+    // 不会限制 body（body 由 DeadlineBody 的 10s 总 deadline 单独约束）。
+    if let Err(err) = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service))
+        .with_upgrades()
+        .await
+    {
+        // 只记录来源与错误，不记录请求头。
+        tracing::debug!(%peer, error = %err, "管理 API 连接结束");
+    }
+}
+
+/// 管理端 TLS 热加载 watcher。
+///
+/// 只跟随 mTLS 监听器已经校验并切换到的 live 证书指纹（2s 轮询），不重复实现磁盘
+/// 轮询；指纹变化后用同一对 server.crt/server.key 重建 server-auth 配置并通过 watch
+/// 推给 accept 循环。构建失败只 warn（每分钟最多一条）并保留旧配置。
+fn spawn_admin_tls_watcher(
+    cfg: Arc<HubConfig>,
+    tx: watch::Sender<Arc<rustls::ServerConfig>>,
+    live: Arc<RwLock<CertStatus>>,
+    initial_fingerprint: String,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(ADMIN_TLS_RELOAD_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_fingerprint = initial_fingerprint;
+        // 第一次 tick 立即完成：启动路径刚构建并校验过配置，直接跳过。
+        ticker.tick().await;
+
+        let mut last_warn: Option<Instant> = None;
+        loop {
+            ticker.tick().await;
+            let check_cfg = cfg.clone();
+            let check_tx = tx.clone();
+            let check_live = live.clone();
+            let last = last_fingerprint.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                reload_admin_tls_if_changed(&check_cfg, &check_tx, &check_live, &last)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(Some(fingerprint))) => {
+                    last_fingerprint = fingerprint;
+                    tracing::info!(
+                        fingerprint = %last_fingerprint,
+                        "管理 API TLS 证书已热加载（新连接生效）"
+                    );
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(err)) => {
+                    if should_warn_admin_tls(&mut last_warn) {
+                        tracing::warn!(
+                            error = %format!("{err:#}"),
+                            "管理 API TLS 证书热加载失败，保留旧配置（每分钟最多告警一次）"
+                        );
+                    }
+                }
+                Err(err) => {
+                    if should_warn_admin_tls(&mut last_warn) {
+                        tracing::warn!(error = %err, "管理 API TLS 热加载任务失败，下个周期重试");
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn live_fingerprint(live: &RwLock<CertStatus>) -> String {
+    live.read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .fingerprint
+        .clone()
+}
+
+/// 管理端 TLS 失败告警节流：返回 `true` 表示本次应告警并记录时间。
+fn should_warn_admin_tls(last_warn: &mut Option<Instant>) -> bool {
+    let now = Instant::now();
+    match last_warn {
+        Some(last) if now.duration_since(*last) < ADMIN_TLS_RELOAD_WARN_INTERVAL => false,
+        _ => {
+            *last_warn = Some(now);
+            true
+        }
+    }
+}
+
+/// 一次管理端 TLS 热加载尝试（独立函数便于单测）。
+///
+/// `last_fingerprint` 是 accept 循环当前配置对应的证书指纹；仅在 live 指纹变化且
+/// 新配置构建成功时推送，并返回新指纹。构建失败返回 `Err`，调用方保留旧配置。
+fn reload_admin_tls_if_changed(
+    cfg: &HubConfig,
+    tx: &watch::Sender<Arc<rustls::ServerConfig>>,
+    live: &RwLock<CertStatus>,
+    last_fingerprint: &str,
+) -> Result<Option<String>> {
+    let current = live_fingerprint(live);
+    if current == last_fingerprint {
+        return Ok(None);
+    }
+    let config = tls::admin_server_config(&cfg.data_dir, &cfg.server_names)
+        .context("管理 API TLS 配置构建失败")?;
+    // 构建期间证书可能又被 rotate：与 mTLS 热加载一致，本周期跳过，下周期重试。
+    let confirmed = cert_rotation::read_disk_cert_status(cfg)?;
+    if confirmed.fingerprint != current {
+        tracing::debug!("证书在管理端热加载过程中再次变化，本周期跳过");
+        return Ok(None);
+    }
+    tx.send_replace(config);
+    Ok(Some(confirmed.fingerprint))
 }
 
 /// 组装管理 API：`/healthz` 放行，`/api/v1/*` 统一 Bearer 鉴权 + 限速 + 64 KiB 请求体上限。
@@ -1048,7 +1499,7 @@ fn admin_router(state: AppState) -> Router {
         .route("/api/v1/{*rest}", any(api_not_found))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            require_bearer,
+            auth::require_auth,
         ));
 
     Router::new()
@@ -1059,68 +1510,12 @@ fn admin_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// 受保护路由树的兜底：走到这里说明 Bearer（与限速）已经通过，只是路由不存在。
+/// 受保护路由树的兜底：走到这里说明认证（与限速）已经通过，只是路由不存在。
 async fn api_not_found() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({ "error": "not_found" })),
     )
-}
-
-/// 常量时间比较 Bearer token；除 `/healthz` 外的管理 API 都必须通过这里。
-///
-/// 顺序：先鉴权（401），再按直连 IP 限速（429）——未认证请求不能消耗限速额度。
-async fn require_bearer(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    request: axum::extract::Request,
-    next: Next,
-) -> Response {
-    let authorized = bearer_matches(request.headers(), &state.cfg.admin_token);
-    if !authorized {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "unauthorized" })),
-        )
-            .into_response();
-    }
-
-    let is_write = is_admin_write_method(request.method());
-    if let Err(retry_after) = state.admin_rate.check(peer.ip(), is_write) {
-        let mut response = (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({ "error": "rate_limited" })),
-        )
-            .into_response();
-        response.headers_mut().insert(
-            header::RETRY_AFTER,
-            HeaderValue::from_str(&retry_after.to_string())
-                .unwrap_or_else(|_| HeaderValue::from_static("60")),
-        );
-        return response;
-    }
-
-    next.run(request).await
-}
-
-/// 解析 `Authorization: Bearer <token>`；scheme 大小写不敏感，token 常量时间比较。
-///
-/// 只接受「scheme + 单个 token」两段，多余的分段（例如 token 里带空格）直接拒绝。
-fn bearer_matches(headers: &axum::http::HeaderMap, expected: &str) -> bool {
-    if expected.is_empty() {
-        return false;
-    }
-    let Some(value) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    let mut parts = value.split_ascii_whitespace();
-    let (Some(scheme), Some(token), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    scheme.eq_ignore_ascii_case("bearer") && constant_time_eq(token.as_bytes(), expected.as_bytes())
 }
 
 /// 管理 API 全部响应禁止缓存（含 token 的 401 与实时指标）。
@@ -2549,6 +2944,12 @@ async fn handle_session(
                 break;
             }
             SessionEvent::Control(command) => {
+                // #17：dispatch 前再查一次吊销。命中/查询失败都只回错误，
+                // 绝不把 ControlCommand 投递给 agent；随后 continue 等 watcher 关闭。
+                if let Err(error) = control_revocation_gate(&state, &agent_id).await {
+                    let _ = command.reply.send(Err(error));
+                    continue;
+                }
                 // 分配会话内 id 并发送 ControlRequest；容量超限时 dispatch 已回错误。
                 control.dispatch(&mut socket, command).await?;
             }
@@ -3118,6 +3519,40 @@ impl SessionCleanup {
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
         self.finish();
+    }
+}
+
+/// #17：会话侧控制命令的吊销兜底门禁。
+///
+/// 管理 API 已检查两次，但 revoke 仍可能恰好插在「API 检查后、命令入队」之间；
+/// 会话在 dispatch 前再查一次库，确保吊销后绝不向 agent 发送 ControlRequest。
+/// 命中吊销 → `agent_revoked`；查询失败 → `internal_error`（fail closed）。
+async fn control_revocation_gate(
+    state: &AppState,
+    agent_id: &str,
+) -> std::result::Result<(), ControlError> {
+    let storage = state.storage.clone();
+    let agent = agent_id.to_string();
+    match tokio::task::spawn_blocking(move || storage.is_revoked(&agent)).await {
+        Ok(Ok(false)) => Ok(()),
+        Ok(Ok(true)) => Err(ControlError::new(
+            control::hub_codes::AGENT_REVOKED,
+            "agent 已被吊销",
+        )),
+        Ok(Err(err)) => {
+            tracing::warn!(agent = %agent_id, error = %err, "查询 agent 吊销状态失败，拒绝控制命令");
+            Err(ControlError::new(
+                control::hub_codes::INTERNAL,
+                "无法确认 agent 吊销状态",
+            ))
+        }
+        Err(err) => {
+            tracing::warn!(agent = %agent_id, error = %err, "查询 agent 吊销状态任务失败，拒绝控制命令");
+            Err(ControlError::new(
+                control::hub_codes::INTERNAL,
+                "无法确认 agent 吊销状态",
+            ))
+        }
     }
 }
 
@@ -3936,6 +4371,7 @@ mod tests {
             Some(data_dir.clone()),
             Some("127.0.0.1:0".to_string()),
             Some("127.0.0.1:0".to_string()),
+            None,
             vec!["bad name".to_string()],
             None,
             None,
@@ -4021,6 +4457,7 @@ mod tests {
                 Some(data.clone()),
                 Some("127.0.0.1:0".to_string()),
                 Some("127.0.0.1:0".to_string()),
+                None,
                 Vec::new(),
                 None,
                 None,
@@ -4286,6 +4723,7 @@ mod tests {
     /// Bearer 解析：scheme 大小写不敏感、token 常量时间比较、拒绝多余分段。
     #[test]
     fn m2_bearer_scheme_is_case_insensitive() {
+        use crate::auth::bearer_matches;
         use axum::http::HeaderMap;
 
         let mut headers = HeaderMap::new();
@@ -5312,30 +5750,102 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    /// KI-06：只有非回环管理监听需要告警；非法地址启动失败。
+    /// v0.3.3：off 只允许回环；required 要求非通配绑定 IP 有对应 SAN；非法地址启动失败。
     #[test]
-    fn v021_admin_listen_warns_only_for_non_loopback() {
+    fn v033_admin_tls_startup_validation() {
+        let with = |listen: &str, mode: AdminTlsMode| HubConfig {
+            admin_listen: listen.to_string(),
+            admin_tls: mode,
+            ..HubConfig::default()
+        };
+
+        // off + 回环：保持原有明文行为。
         for addr in ["127.0.0.1:8444", "127.1.2.3:1", "[::1]:8444"] {
-            assert!(
-                !admin_listen_needs_warning(addr).unwrap(),
-                "回环地址不应告警: {addr}"
-            );
+            validate_admin_tls(&with(addr, AdminTlsMode::Off))
+                .unwrap_or_else(|err| panic!("回环明文必须放行 {addr}: {err:#}"));
         }
+        // off + 非回环：v0.3.3 起拒绝启动，错误信息给出两条迁移路径。
         for addr in [
             "0.0.0.0:8444",
             "192.168.1.10:8444",
             "8.8.8.8:8444",
             "[::]:8444",
         ] {
-            assert!(
-                admin_listen_needs_warning(addr).unwrap(),
-                "非回环地址必须告警: {addr}"
-            );
+            let err = validate_admin_tls(&with(addr, AdminTlsMode::Off))
+                .expect_err("非回环明文必须拒绝启动");
+            let text = format!("{err:#}");
+            assert!(text.contains("admin_tls=\"required\""), "错误信息: {text}");
+            assert!(text.contains("回环"), "错误信息: {text}");
         }
         assert!(
-            admin_listen_needs_warning("not-an-address").is_err(),
+            validate_admin_tls(&with("not-an-address", AdminTlsMode::Off)).is_err(),
             "非法监听地址必须与 bind 一样启动失败"
         );
+
+        // required：绑定 IP 必须在 server_names 里（默认含 127.0.0.1）。
+        validate_admin_tls(&with("127.0.0.1:8444", AdminTlsMode::Required))
+            .expect("127.0.0.1 默认在 server_names，required 必须放行");
+        let err = validate_admin_tls(&with("127.0.0.2:8444", AdminTlsMode::Required))
+            .expect_err("缺失 IP SAN 必须拒绝启动");
+        let text = format!("{err:#}");
+        assert!(text.contains("server_names"), "错误信息: {text}");
+        assert!(text.contains("rotate-cert"), "错误信息: {text}");
+
+        // 比较前 trim：带空格的 IP 也算覆盖。
+        let trimmed = HubConfig {
+            admin_listen: "127.0.0.1:8444".to_string(),
+            admin_tls: AdminTlsMode::Required,
+            server_names: vec![" 127.0.0.1 ".to_string()],
+            ..HubConfig::default()
+        };
+        validate_admin_tls(&trimmed).expect("trim 后的 IP 必须视为覆盖");
+
+        // DNS 访问：非回环 bind IP 不在 SAN 里，但 server_names 有 DNS 名 → 放行。
+        let dns = HubConfig {
+            admin_listen: "10.0.0.5:8444".to_string(),
+            admin_tls: AdminTlsMode::Required,
+            server_names: vec!["hub.example.com".to_string()],
+            ..HubConfig::default()
+        };
+        validate_admin_tls(&dns).expect("管理端通过 DNS 访问时必须放行");
+
+        // 只有不匹配的 IP、没有任何 DNS 名 → 仍拒绝。
+        let mismatched = HubConfig {
+            admin_listen: "10.0.0.5:8444".to_string(),
+            admin_tls: AdminTlsMode::Required,
+            server_names: vec!["127.0.0.1".to_string()],
+            ..HubConfig::default()
+        };
+        let err = validate_admin_tls(&mismatched).expect_err("只有不匹配 IP 时必须拒绝");
+        assert!(format!("{err:#}").contains("DNS SAN"), "错误信息: {err:#}");
+
+        // 回环绑定不能用 DNS 名兜底：本机只能通过该回环 IP 访问。
+        let loopback_dns = HubConfig {
+            admin_listen: "127.0.0.2:8444".to_string(),
+            admin_tls: AdminTlsMode::Required,
+            server_names: vec!["hub.example.com".to_string()],
+            ..HubConfig::default()
+        };
+        assert!(
+            validate_admin_tls(&loopback_dns).is_err(),
+            "回环 bind + 仅 DNS SAN 必须拒绝（init 127.0.0.2 用例依赖此语义）"
+        );
+
+        // 通配绑定跳过 SAN 检查（由客户端 hostname/反代决定访问名）。
+        for addr in ["0.0.0.0:8444", "[::]:8444"] {
+            validate_admin_tls(&with(addr, AdminTlsMode::Required))
+                .unwrap_or_else(|err| panic!("通配绑定必须放行 {addr}: {err:#}"));
+        }
+        assert!(all_loopback_server_names(&[
+            "127.0.0.1".to_string(),
+            " localhost ".to_string(),
+            "api.localhost".to_string(),
+        ]));
+        assert!(!all_loopback_server_names(&[
+            "127.0.0.1".to_string(),
+            "hub.example.com".to_string(),
+        ]));
+        assert!(all_loopback_server_names(&[" ::1 ".to_string()]));
     }
 
     /// KI-10：`/api/v1/system` 保留旧字段并新增 live/disk，顶层等于 live。
@@ -6538,7 +7048,7 @@ mod tests {
             .route("/peer", get(test_peer_ip))
             .route("/consume", axum::routing::post(test_consume_body));
         let server = tokio::spawn(async move {
-            let _ = serve_admin_listener(app, listener).await;
+            let _ = serve_admin_listener(app, listener, None).await;
         });
         (addr, server)
     }
@@ -6787,5 +7297,882 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    // ------------------------------------------------------------------
+    // v0.3.3 A1：scoped token 鉴权 / 授权 / CLI / 审计 actor
+    // ------------------------------------------------------------------
+
+    const V6_LEGACY_TOKEN: &str = "v6-legacy-admin-token-0123456789";
+
+    /// v6 鉴权测试状态：保留旧 admin_token，关闭限速（矩阵测试请求数会超过 60/min）。
+    fn v6_auth_state() -> AppState {
+        hub_state_with(HubConfig {
+            admin_token: V6_LEGACY_TOKEN.to_string(),
+            admin_rate_limit_per_min: 0,
+            admin_write_rate_limit_per_min: 0,
+            ..HubConfig::default()
+        })
+    }
+
+    /// 直接在库里种一个 token，返回明文（只在本进程测试内使用）。
+    fn v6_seed_token(state: &AppState, name: &str, scope: &str) -> String {
+        let token = new_secret();
+        state
+            .storage
+            .create_api_token(name, &tls::sha256_hex(&token), scope, now_ms())
+            .unwrap();
+        token
+    }
+
+    fn v6_token_cli_config(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = temp_dir(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("hub.toml");
+        let db_path = dir.join("rustboard.db");
+        HubConfig {
+            database: format!("sqlite://{}", db_path.display()),
+            ..HubConfig::default()
+        }
+        .save(&config_path)
+        .unwrap();
+        (config_path, db_path)
+    }
+
+    /// scope 矩阵：read/write/admin × GET/POST/PUT；旧 admin_token 仍全通过。
+    /// 403 固定结构、发生在限速后 / handler 前，不写审计；未知路由认证后 404/405。
+    #[tokio::test]
+    async fn v6_token_scope_matrix_and_unknown_routes() {
+        let state = v6_auth_state();
+        let read = v6_seed_token(&state, "read-token", "read");
+        let write = v6_seed_token(&state, "write-token", "write");
+        let admin = v6_seed_token(&state, "admin-http-token", "admin");
+        let router = admin_router(state.clone());
+
+        // 三种 scope 都允许只读 GET（write/admin 隐含 read），旧 admin_token 也兼容。
+        for token in [
+            read.as_str(),
+            write.as_str(),
+            admin.as_str(),
+            V6_LEGACY_TOKEN,
+        ] {
+            let (status, _, _) =
+                admin_call(&router, "GET", "/api/v1/agents", Some(token), None).await;
+            assert_eq!(status, StatusCode::OK, "token={token}");
+        }
+        // 已知只读子路由（agent 不存在时 handler 给 404，但 scope 必须先放行）。
+        for token in [read.as_str(), write.as_str(), admin.as_str()] {
+            let (status, _, _) = admin_call(
+                &router,
+                "GET",
+                "/api/v1/agents/a1/settings",
+                Some(token),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "token={token}");
+        }
+
+        // read token 调写接口：403 forbidden_scope，固定结构，且不写控制审计。
+        for (method, uri) in [
+            ("POST", "/api/v1/agents/a1/control"),
+            ("PUT", "/api/v1/agents/a1/settings"),
+        ] {
+            let (status, _, bytes) =
+                admin_call(&router, method, uri, Some(&read), Some("{}")).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+            assert_eq!(
+                json_body(&bytes),
+                serde_json::json!({ "error": "forbidden_scope" })
+            );
+        }
+        assert!(
+            state
+                .storage
+                .list_audit(10, None, None, None)
+                .unwrap()
+                .is_empty(),
+            "scope 不足的 403 不能进入控制 handler，也不得写审计"
+        );
+
+        // write / admin 通过 scope 检查：坏请求体由 handler 给 400（证明已进入 handler）。
+        for token in [write.as_str(), admin.as_str()] {
+            let (status, _, bytes) = admin_call(
+                &router,
+                "POST",
+                "/api/v1/agents/a1/control",
+                Some(token),
+                Some("{}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "token={token}");
+            assert_eq!(json_body(&bytes)["error"]["code"], "invalid_request");
+        }
+        let entries = state.storage.list_audit(10, None, None, None).unwrap();
+        assert_eq!(entries.len(), 2, "进入 handler 的拒绝必须写审计");
+        let mut actors: Vec<&str> = entries.iter().map(|entry| entry.actor.as_str()).collect();
+        actors.sort_unstable();
+        assert_eq!(actors, vec!["admin-http-token", "write-token"]);
+
+        // write / admin token 通过 scope 后由 handler 校验请求体（400 而非 403）。
+        for token in [write.as_str(), admin.as_str()] {
+            let (status, _, _) = admin_call(
+                &router,
+                "PUT",
+                "/api/v1/agents/a1/settings",
+                Some(token),
+                Some("{}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "token={token}");
+        }
+
+        // 未知路径：先认证再 404；未知 POST/PUT 不能被 read token 变成 403。
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            let (status, _, _) =
+                admin_call(&router, method, "/api/v1/does-not-exist", Some(&read), None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "method={method}");
+            let (status, _, _) =
+                admin_call(&router, method, "/api/v1/does-not-exist", None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "method={method}");
+        }
+        // 已知路径的错误方法：认证后由路由给 405，不是 403。
+        let (status, _, _) = admin_call(&router, "POST", "/api/v1/agents", Some(&read), None).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// 401 结构、last_used_at 更新、rotate/revoke 立即生效（每次请求查库）。
+    #[tokio::test]
+    async fn v6_token_auth_401_shape_last_used_rotate_revoke() {
+        let state = v6_auth_state();
+        let token = v6_seed_token(&state, "panel", "read");
+        let router = admin_router(state.clone());
+
+        // 缺失 / 错误 / 空 token：固定 401 + WWW-Authenticate，不回显任何 token。
+        for provided in [None, Some("wrong-token"), Some("")] {
+            let (status, headers, bytes) =
+                admin_call(&router, "GET", "/api/v1/agents", provided, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "provided={provided:?}");
+            assert_eq!(
+                headers.get(header::WWW_AUTHENTICATE).unwrap(),
+                "Bearer",
+                "provided={provided:?}"
+            );
+            assert_eq!(
+                json_body(&bytes),
+                serde_json::json!({ "error": "unauthorized" })
+            );
+            assert!(!String::from_utf8_lossy(&bytes).contains("wrong-token"));
+        }
+        assert!(
+            state
+                .storage
+                .list_audit(10, None, None, None)
+                .unwrap()
+                .is_empty(),
+            "认证失败不得写审计"
+        );
+        assert_eq!(
+            state.storage.list_api_tokens().unwrap()[0].last_used_at,
+            None
+        );
+
+        // 认证成功：last_used_at 必须落库。
+        let (status, _, _) = admin_call(&router, "GET", "/api/v1/agents", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            state.storage.list_api_tokens().unwrap()[0]
+                .last_used_at
+                .is_some(),
+            "鉴权成功必须更新 last_used_at"
+        );
+
+        // rotate：旧 token 立即 401，新 token 立即 200。
+        let rotated = new_secret();
+        state
+            .storage
+            .rotate_api_token("panel", &tls::sha256_hex(&rotated), now_ms())
+            .unwrap();
+        let (status, _, _) = admin_call(&router, "GET", "/api/v1/agents", Some(&token), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "旧 token 必须立即失效");
+        let (status, _, _) =
+            admin_call(&router, "GET", "/api/v1/agents", Some(&rotated), None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // revoke：立即 401，行保留（不删行）。
+        state.storage.revoke_api_token("panel", now_ms()).unwrap();
+        let (status, _, _) =
+            admin_call(&router, "GET", "/api/v1/agents", Some(&rotated), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let records = state.storage.list_api_tokens().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].revoked_at.is_some());
+    }
+
+    /// CLI 端到端：临时 DB、不启 hub；TSV 不含明文 / 哈希；rotate/revoke 生效。
+    #[test]
+    fn v6_token_cli_create_list_rotate_revoke_end_to_end() {
+        let (config_path, db_path) = v6_token_cli_config("token-cli");
+
+        // 非法名称 / scope 在落库前拒绝。
+        assert!(token_create(Some(config_path.clone()), "bad name".into(), "read".into()).is_err());
+        assert!(token_create(Some(config_path.clone()), "panel".into(), "root".into()).is_err());
+
+        // 保留名 admin（大小写不敏感）：create / rotate 都必须拒绝，
+        // 否则审计 actor 与旧 admin_token 完全不可区分。
+        for reserved in ["admin", "Admin", "ADMIN"] {
+            let err = token_create(Some(config_path.clone()), reserved.into(), "read".into())
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("保留名"),
+                "create {reserved} 错误信息: {err:#}"
+            );
+            let err = token_rotate(Some(config_path.clone()), reserved.into()).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("保留名"),
+                "rotate {reserved} 错误信息: {err:#}"
+            );
+        }
+
+        // 名称边界：1 / 64 合法；空、65、非 ASCII、tab / 换行拒绝。
+        assert!(validate_token_name("a").is_ok());
+        assert!(validate_token_name(&"a".repeat(64)).is_ok());
+        assert!(validate_token_name("").is_err());
+        assert!(validate_token_name(&"a".repeat(65)).is_err());
+        assert!(validate_token_name("名字").is_err());
+        assert!(validate_token_name("a\tb").is_err());
+        assert!(validate_token_name("a\nb").is_err());
+        assert!(validate_token_name("admin").is_err());
+        assert!(validate_token_name("ADMIN").is_err());
+        assert!(validate_token_name("Admin").is_err());
+
+        let token = token_create(Some(config_path.clone()), "panel".into(), "read".into()).unwrap();
+        assert_eq!(token.len(), 64, "明文必须是 64 位 hex");
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let db = SqliteStorage::open(&db_path).unwrap();
+        let records = db.list_api_tokens().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "panel");
+        assert_eq!(records[0].scope, "read");
+        assert_eq!(records[0].revoked_at, None);
+
+        // 重复 name：明确失败。
+        let err =
+            token_create(Some(config_path.clone()), "panel".into(), "write".into()).unwrap_err();
+        assert!(format!("{err:#}").contains("已存在"), "err={err:#}");
+
+        let second =
+            token_create(Some(config_path.clone()), "beta".into(), "admin".into()).unwrap();
+
+        // list：固定表头、按 name 升序、5 列 TSV、空值 -，绝不含明文 / 哈希。
+        let list = token_list(Some(config_path.clone())).unwrap();
+        let mut lines = list.lines();
+        assert_eq!(
+            lines.next(),
+            Some("name\tscope\tcreated_at\tlast_used_at\trevoked_at")
+        );
+        let rows: Vec<&str> = lines.collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].starts_with("beta\tadmin\t"), "rows={rows:?}");
+        assert!(rows[1].starts_with("panel\tread\t"), "rows={rows:?}");
+        assert!(
+            rows[1].ends_with("\t-\t-"),
+            "panel 从未使用且未吊销，时间列必须是 -: {rows:?}"
+        );
+        for row in &rows {
+            assert_eq!(row.split('\t').count(), 5, "row={row}");
+        }
+        assert!(!list.contains(&token));
+        assert!(!list.contains(&second));
+        assert!(!list.contains(&tls::sha256_hex(&token)));
+        assert!(!list.contains(&tls::sha256_hex(&second)));
+        assert!(db
+            .authenticate_api_token(&tls::sha256_hex(&token), now_ms())
+            .unwrap()
+            .is_some());
+
+        // rotate：旧 token 立即失效，新 token 可用。
+        let rotated = token_rotate(Some(config_path.clone()), "panel".into()).unwrap();
+        assert_ne!(rotated, token);
+        assert!(db
+            .authenticate_api_token(&tls::sha256_hex(&token), now_ms())
+            .unwrap()
+            .is_none());
+        assert!(db
+            .authenticate_api_token(&tls::sha256_hex(&rotated), now_ms())
+            .unwrap()
+            .is_some());
+
+        // revoke：不删行；重复吊销 / 不存在都报明确错误。
+        let message = token_revoke(Some(config_path.clone()), "panel".into()).unwrap();
+        assert!(message.contains("panel"));
+        assert!(db
+            .authenticate_api_token(&tls::sha256_hex(&rotated), now_ms())
+            .unwrap()
+            .is_none());
+        let err = token_revoke(Some(config_path.clone()), "panel".into()).unwrap_err();
+        assert!(format!("{err:#}").contains("已吊销"), "err={err:#}");
+        let err = token_revoke(Some(config_path.clone()), "missing".into()).unwrap_err();
+        assert!(format!("{err:#}").contains("不存在"), "err={err:#}");
+
+        let final_list = token_list(Some(config_path)).unwrap();
+        let panel = final_list
+            .lines()
+            .find(|line| line.starts_with("panel\t"))
+            .expect("panel 行必须保留");
+        assert!(
+            !panel.ends_with("\t-\t-"),
+            "吊销后 revoked_at 不能是 -: {panel}"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    /// CLI 参数接线：新 `token` 子命令完整可用，旧 `admin-token` 保留。
+    #[test]
+    fn v6_token_cli_parses_subcommands() {
+        let cli = Cli::try_parse_from([
+            "rustboard-hub",
+            "token",
+            "create",
+            "--config",
+            "hub.toml",
+            "--name",
+            "panel-prod",
+            "--scope",
+            "write",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Token {
+                action:
+                    TokenAction::Create {
+                        config,
+                        name,
+                        scope,
+                    },
+            } => {
+                assert_eq!(config.as_deref(), Some(std::path::Path::new("hub.toml")));
+                assert_eq!(name, "panel-prod");
+                assert_eq!(scope, "write");
+            }
+            _ => panic!("应解析为 token create"),
+        }
+        assert!(Cli::try_parse_from([
+            "rustboard-hub",
+            "token",
+            "create",
+            "--name",
+            "panel",
+            "--scope",
+            "root",
+        ])
+        .is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["rustboard-hub", "admin-token"])
+                .unwrap()
+                .cmd,
+            Cmd::AdminToken { .. }
+        ));
+    }
+
+    /// 控制路由缺少鉴权扩展时固定 500（接线错误），不得 panic。
+    #[tokio::test]
+    async fn v6_control_action_without_principal_returns_500() {
+        let state = m3_state(m3_control_cfg());
+        let router = Router::new()
+            .route(
+                "/api/v1/agents/{id}/control",
+                axum::routing::post(control::control_action),
+            )
+            .with_state(state);
+
+        let (status, _, bytes) = admin_call(
+            &router,
+            "POST",
+            "/api/v1/agents/a1/control",
+            None,
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = json_body(&bytes);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "internal_error");
+    }
+
+    /// 审计 actor：旧 admin_token 写 "admin"（既有 e2e 6.10 兼容），scoped token 写 name。
+    #[tokio::test]
+    async fn v6_control_audit_actor_uses_token_name() {
+        let state = m3_state(m3_control_cfg());
+        let handle = m3_register_agent(&state, "a1", &["systemd"]);
+        let responder = m3_spawn_responder(
+            handle.control_rx,
+            vec![
+                Ok(ControlResult::ActionOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                }),
+                Ok(ControlResult::ActionOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                }),
+            ],
+        );
+        let router = admin_router(state.clone());
+        let token = v6_seed_token(&state, "panel-prod", "write");
+        let body = r#"{"capability":"systemd","action":"restart","target":"nginx.service","confirm":true}"#;
+
+        // 旧 admin_token。
+        let (status, _, _) = admin_call(
+            &router,
+            "POST",
+            "/api/v1/agents/a1/control",
+            Some(M3_TOKEN),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // scoped token。
+        let (status, _, _) = admin_call(
+            &router,
+            "POST",
+            "/api/v1/agents/a1/control",
+            Some(&token),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(responder.await.unwrap(), 2);
+
+        let entries = m3_audit(&state);
+        assert_eq!(entries.len(), 2);
+        // id 倒序：最新一条是 scoped token。
+        assert_eq!(entries[0].actor, "panel-prod");
+        assert_eq!(entries[1].actor, "admin");
+        assert!(
+            !entries[0].actor.contains(&token),
+            "审计 actor 不能包含 token 明文"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // v0.3.3 B：#17 吊销窗口内拒绝控制命令
+    // ------------------------------------------------------------------
+
+    /// 已吊销 agent：POST control 固定 403 `agent_revoked`，审计 denied，
+    /// 且会话队列里绝不能出现 ControlCommand。
+    #[tokio::test]
+    async fn v033_revoked_agent_control_returns_403_without_dispatch() {
+        let state = m3_state(m3_control_cfg());
+        let mut handle = m3_register_agent(&state, "a1", &["systemd"]);
+        let router = admin_router(state.clone());
+        state.storage.revoke_agent("a1", now_ms()).unwrap();
+
+        let (status, body) =
+            m3_post(&router, "a1", r#"{"capability":"systemd","action":"list"}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "agent_revoked");
+        assert_eq!(body["error"]["message"], "agent 已被吊销");
+
+        // API 必须在投递前拒绝：会话队列保持为空。
+        assert!(
+            handle.control_rx.try_recv().is_err(),
+            "吊销后不得向会话投递 ControlCommand"
+        );
+
+        // 审计最后一条必须是 denied + agent_revoked，不能出现 ok。
+        let entries = m3_audit(&state);
+        assert_eq!(entries.len(), 1, "拒绝路径也必须写一条审计");
+        assert_eq!(entries[0].result, "denied");
+        assert_eq!(entries[0].error_code, "agent_revoked");
+        assert!(
+            entries.iter().all(|entry| entry.result != "ok"),
+            "吊销后不得出现成功审计"
+        );
+    }
+
+    /// 确定性并发：命令先入队，随后 revoke，再运行会话 gate。
+    /// gate 必须回 agent_revoked，且会话只回错误、不 dispatch。
+    #[tokio::test]
+    async fn v033_control_revocation_gate_blocks_queued_command_after_revoke() {
+        let state = m3_state(m3_control_cfg());
+        let mut handle = m3_register_agent(&state, "a1", &["systemd"]);
+
+        // revoke 前 gate 放行（未吊销 agent 仍正常投递，既有测试继续覆盖完整成功路径）。
+        control_revocation_gate(&state, "a1")
+            .await
+            .expect("未吊销 agent 的 gate 必须放行");
+
+        // 命令先进入会话队列：模拟管理 API 已完成两次检查并成功 try_send。
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        state
+            .sessions
+            .control_sender("a1")
+            .expect("会话必须在线")
+            .try_send(ControlCommand {
+                op: rustboard_common::control::ControlOp::SystemdList,
+                reply: reply_tx,
+            })
+            .expect("队列应能接收命令");
+
+        // revoke 在入队之后、会话 dispatch 之前生效。
+        state.storage.revoke_agent("a1", now_ms()).unwrap();
+
+        let gate_error = control_revocation_gate(&state, "a1")
+            .await
+            .expect_err("吊销后 gate 必须拒绝");
+        assert_eq!(gate_error.code, control::hub_codes::AGENT_REVOKED);
+        assert_eq!(gate_error.message, "agent 已被吊销");
+
+        // 与生产 session loop 相同：命令出队后只回错误，绝不调用 dispatch。
+        let command = handle.control_rx.try_recv().expect("命令必须已进入队列");
+        command.reply.send(Err(gate_error)).expect("等待者应仍在");
+
+        match reply_rx.await.expect("应收到拒绝回复") {
+            Ok(_) => panic!("吊销后的命令绝不能返回成功"),
+            Err(error) => {
+                assert_eq!(error.code, control::hub_codes::AGENT_REVOKED);
+                assert_eq!(error.message, "agent 已被吊销");
+            }
+        }
+    }
+
+    /// #17 复审回归：命令在等待回复期间会话关闭（oneshot 被丢弃）且 agent 已吊销，
+    /// 必须回 403 `agent_revoked` + 审计 denied，而不是 503 `agent_offline` + error。
+    #[tokio::test]
+    async fn v033_dropped_reply_after_revoke_returns_agent_revoked() {
+        let state = m3_state(m3_control_cfg());
+        let mut handle = m3_register_agent(&state, "a1", &["systemd"]);
+        let router = admin_router(state.clone());
+
+        // 在独立任务里发起控制请求：它会通过能力/吊销检查并把命令投进会话队列，
+        // 然后卡在 reply_rx 等待上。
+        let post = tokio::spawn(async move {
+            m3_post(&router, "a1", r#"{"capability":"systemd","action":"list"}"#).await
+        });
+
+        let command = tokio::time::timeout(Duration::from_secs(2), handle.control_rx.recv())
+            .await
+            .expect("控制命令必须及时入队")
+            .expect("会话控制通道必须打开");
+
+        // 先吊销，再丢弃命令且不回复：reply oneshot 被丢弃，进入 handler 的
+        // `Ok(Err(_))` 分支；该分支必须重新查询吊销状态。
+        state.storage.revoke_agent("a1", now_ms()).unwrap();
+        drop(command);
+
+        let (status, body) = tokio::time::timeout(Duration::from_secs(2), post)
+            .await
+            .expect("POST 必须及时返回")
+            .expect("POST 任务不得 panic");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "agent_revoked");
+        assert_eq!(body["error"]["message"], "agent 已被吊销");
+
+        let entries = m3_audit(&state);
+        assert_eq!(entries.len(), 1, "拒绝路径必须写一条审计");
+        assert_eq!(entries[0].result, "denied");
+        assert_eq!(entries[0].error_code, "agent_revoked");
+    }
+
+    // ------------------------------------------------------------------
+    // v0.3.3 A2：管理端 TLS
+    // ------------------------------------------------------------------
+
+    /// 管理端 TLS 测试材料：同一套 server.crt/key + 指定 SAN。
+    fn admin_tls_test_config(tag: &str, listen: &str, sans: &[&str]) -> HubConfig {
+        let dir = temp_dir(tag);
+        let server_names: Vec<String> = sans.iter().map(|san| (*san).to_string()).collect();
+        tls::ensure_hub_material(&dir, &server_names, tls::CertPolicy::default()).unwrap();
+        HubConfig {
+            data_dir: dir,
+            admin_listen: listen.to_string(),
+            admin_tls: AdminTlsMode::Required,
+            server_names,
+            ..HubConfig::default()
+        }
+    }
+
+    /// 用测试证书目录里的 CA 构建 server-auth 客户端（不携带客户端证书）。
+    fn admin_tls_client_config(data_dir: &std::path::Path) -> Arc<rustls::ClientConfig> {
+        let ca_pem = std::fs::read_to_string(tls::cert_dir(data_dir).join(tls::CA_CERT_FILE))
+            .expect("读取测试 CA");
+        let mut roots = rustls::RootCertStore::empty();
+        let (added, _) = roots.add_parsable_certificates(tls::load_certs(&ca_pem).unwrap());
+        assert!(added > 0, "测试 CA 必须能载入信任库");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Arc::new(config)
+    }
+
+    fn der_fingerprint(der: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(der))
+    }
+
+    /// 起一个只含 `/healthz` 的 HTTPS 管理监听，返回连接信息与热加载句柄。
+    async fn spawn_test_admin_tls_server(
+        sans: &[&str],
+    ) -> (
+        SocketAddr,
+        Arc<RwLock<CertStatus>>,
+        watch::Sender<Arc<rustls::ServerConfig>>,
+        HubConfig,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let cfg = admin_tls_test_config("admin-tls", "127.0.0.1:0", sans);
+        let config = tls::admin_server_config(&cfg.data_dir, &cfg.server_names).unwrap();
+        let (tx, rx) = watch::channel(config);
+        let live = Arc::new(RwLock::new(
+            cert_rotation::read_disk_cert_status(&cfg).unwrap(),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定测试端口");
+        let addr = listener.local_addr().expect("读取测试端口");
+        let app = Router::new().route("/healthz", get(healthz));
+        let server = tokio::spawn(async move {
+            let _ = serve_admin_listener(app, listener, Some(rx)).await;
+        });
+        (addr, live, tx, cfg, server)
+    }
+
+    /// 发起一次 HTTPS GET，返回响应文本与该连接实际看到的服务端证书。
+    async fn test_https_get(
+        addr: SocketAddr,
+        config: Arc<rustls::ClientConfig>,
+        path: &str,
+    ) -> std::io::Result<(String, Vec<Vec<u8>>)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let server_name =
+            rustls::pki_types::ServerName::try_from("127.0.0.1").expect("测试 server name 合法");
+        let connector = tokio_rustls::TlsConnector::from(config);
+        let mut stream = connector.connect(server_name, tcp).await?;
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let peer_certs = stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .map(|certs| certs.iter().map(|cert| cert.as_ref().to_vec()).collect())
+            .unwrap_or_default();
+        Ok((String::from_utf8_lossy(&response).into_owned(), peer_certs))
+    }
+
+    /// required：HTTPS `/healthz` 200；明文 TCP 发同一请求拿不到 HTTP 200。
+    #[tokio::test]
+    async fn v033_admin_tls_required_serves_https_only() {
+        // 握手超时是安全边界，锁定 10s。
+        assert_eq!(ADMIN_TLS_HANDSHAKE_TIMEOUT, Duration::from_secs(10));
+
+        let (addr, _live, _tx, cfg, server) =
+            spawn_test_admin_tls_server(&["localhost", "127.0.0.1"]).await;
+        let client = admin_tls_client_config(&cfg.data_dir);
+        let (response, certs) = test_https_get(addr, client, "/healthz")
+            .await
+            .expect("HTTPS 请求失败");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "HTTPS /healthz 必须 200: {response}"
+        );
+        assert!(!certs.is_empty(), "客户端必须收到服务端证书");
+        assert_eq!(
+            der_fingerprint(&certs[0]),
+            cert_rotation::read_disk_cert_status(&cfg)
+                .unwrap()
+                .fingerprint,
+            "HTTPS 必须使用 server.crt"
+        );
+
+        // 明文请求直接打进 TLS 端口：握手失败/连接关闭，绝不能拿到 HTTP 200。
+        if let Ok(text) = test_http_get(addr, "/healthz").await {
+            assert!(
+                !text.starts_with("HTTP/1.1 200"),
+                "明文请求不得拿到 HTTP 200: {text}"
+            );
+        }
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&cfg.data_dir);
+    }
+
+    /// 证书轮换：watcher 重建 server-auth 配置后，新连接使用新证书。
+    #[tokio::test]
+    async fn v033_admin_tls_hot_reload_uses_new_certificate() {
+        let (addr, live, tx, cfg, server) =
+            spawn_test_admin_tls_server(&["localhost", "127.0.0.1"]).await;
+        let client = admin_tls_client_config(&cfg.data_dir);
+        let old_fingerprint = cert_rotation::read_disk_cert_status(&cfg)
+            .unwrap()
+            .fingerprint;
+
+        let (_, certs) = test_https_get(addr, client.clone(), "/healthz")
+            .await
+            .expect("轮换前 HTTPS 请求失败");
+        assert_eq!(der_fingerprint(&certs[0]), old_fingerprint);
+
+        // 同一 CA / 同一 SAN 重签：客户端信任链不变，只有指纹变化。
+        let renewed = cert_rotation::renew_server_cert_files(&cfg, true, None)
+            .unwrap()
+            .expect("--force 必须重签");
+        assert_ne!(renewed.fingerprint, old_fingerprint);
+        let new_fingerprint = renewed.fingerprint;
+
+        // 模拟 mTLS watcher 已成功切换 live；管理端 watcher 只跟随这个指纹。
+        *live.write().unwrap() = cert_rotation::read_disk_cert_status(&cfg).unwrap();
+        let (_, certs) = test_https_get(addr, client.clone(), "/healthz")
+            .await
+            .expect("推送前 HTTPS 请求失败");
+        assert_eq!(
+            der_fingerprint(&certs[0]),
+            old_fingerprint,
+            "watch 未推送前 accept 循环必须继续使用旧配置"
+        );
+
+        let pushed = reload_admin_tls_if_changed(&cfg, &tx, &live, &old_fingerprint).unwrap();
+        assert_eq!(pushed.as_deref(), Some(new_fingerprint.as_str()));
+
+        let (response, certs) = test_https_get(addr, client, "/healthz")
+            .await
+            .expect("热加载后 HTTPS 请求失败");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(
+            der_fingerprint(&certs[0]),
+            new_fingerprint,
+            "新连接必须使用轮换后的证书"
+        );
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&cfg.data_dir);
+    }
+
+    /// init 持久化 `--admin-tls`；非回环 + off 仍成功落盘（run 时才拒绝）。
+    #[test]
+    fn v033_init_persists_admin_tls_mode() {
+        let dir = temp_dir("init-admin-tls");
+        let cfg_path = dir.join("hub.toml");
+        let data_dir = dir.join("data");
+        init(
+            Some(cfg_path.clone()),
+            Some(data_dir.clone()),
+            Some("127.0.0.1:0".to_string()),
+            Some("127.0.0.1:0".to_string()),
+            Some("required".to_string()),
+            vec!["127.0.0.1".to_string()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("init --admin-tls required 必须成功");
+        let cfg = HubConfig::load(&cfg_path).unwrap();
+        assert_eq!(cfg.admin_tls, AdminTlsMode::Required);
+        assert_eq!(cfg.admin_listen, "127.0.0.1:0");
+        assert!(tls::cert_dir(&data_dir)
+            .join(tls::SERVER_CERT_FILE)
+            .exists());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // required + 非通配且缺管理端 SAN：init 必须在签发/落盘前失败。
+        let dir = temp_dir("init-admin-tls-missing-san");
+        let cfg_path = dir.join("hub.toml");
+        let data_dir = dir.join("data");
+        let err = init(
+            Some(cfg_path.clone()),
+            Some(data_dir.clone()),
+            Some("127.0.0.1:0".to_string()),
+            Some("127.0.0.2:0".to_string()),
+            Some("required".to_string()),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect_err("required 且缺管理端 SAN 必须拒绝");
+        assert!(
+            format!("{err:#}").contains("管理 API TLS"),
+            "错误信息: {err:#}"
+        );
+        assert!(!cfg_path.exists(), "失败时不得写入配置文件");
+        assert!(
+            !tls::cert_dir(&data_dir).exists(),
+            "失败时不得创建证书目录/CA"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // required + 通配绑定：跳过精确 SAN 检查，init 成功。
+        let dir = temp_dir("init-admin-tls-wildcard");
+        let cfg_path = dir.join("hub.toml");
+        init(
+            Some(cfg_path.clone()),
+            Some(dir.join("data")),
+            Some("127.0.0.1:0".to_string()),
+            Some("0.0.0.0:0".to_string()),
+            Some("required".to_string()),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("通配绑定 + required 必须成功");
+        assert_eq!(
+            HubConfig::load(&cfg_path).unwrap().admin_tls,
+            AdminTlsMode::Required
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 非回环 + 默认 off：init 仍成功（随后 run 会拒绝），便于先落盘再改。
+        let dir = temp_dir("init-admin-tls-off");
+        let cfg_path = dir.join("hub.toml");
+        init(
+            Some(cfg_path.clone()),
+            Some(dir.join("data")),
+            Some("127.0.0.1:0".to_string()),
+            Some("0.0.0.0:0".to_string()),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("非回环 off 的 init 必须成功且打印警告");
+        let cfg = HubConfig::load(&cfg_path).unwrap();
+        assert_eq!(cfg.admin_tls, AdminTlsMode::Off);
+        assert!(
+            validate_admin_tls(&cfg).is_err(),
+            "该配置在 run 时必须被拒绝"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -13,6 +13,7 @@
 | M3 控制面 | 🟢 完成 | systemd / Docker / 进程 / 日志 + 双端能力开关 + 审计页；单元 379，control e2e 99/99 |
 | v0.3.1 硬化 | 🟢 完成 | #10 缓冲物理上界/崩溃恢复、#12 发送超时、#13 过期证书自愈、#14 会话清理原子化、KI-17 慢连接；单元/集成 420，hardening 34/34，v031 94/94 |
 | v0.3.2 控制面可靠性 | 🟢 完成 | #15/#16/#18/#19、1MiB 控制应答帧预算、45s idle 回归；单元/集成 447，v032 66/66、control 100/100、hardening 34/34、v031 94/94、security 9/9、cert 103/103、panel 159/159 |
+| v0.3.3 管理面安全 | 🟢 完成 | #9 scoped token + 管理端 TLS/ Panel `https`+`hub_ca`、#17 吊销窗口、#20 日志 TOCTOU、#21 systemd 未加载 unit；单元/集成 495，v033 100/100、security 9/9、cert 103/103、hardening 36/36、control 100/100、v031 94/94、v032 66/66、panel 159/159 |
 | M4 告警与归档 | ⬜ 未开始 | |
 | M5 安装与交付 | ⬜ 未开始 | |
 
@@ -92,7 +93,7 @@
 - [x] KI-03：面板 `trusted_proxies` / `cookie_secure`；不可信 XFF/XFP 完全忽略
 - [x] KI-04：`admin_token` 强度校验（长度 / 字符集 / 多样性 / 占位符）
 - [x] KI-05：管理 API 每 IP 读 60/min、写 10/min，429 + `Retry-After`
-- [x] KI-06：管理端口非回环启动 WARN
+- [x] KI-06：v0.2.1 非回环启动 WARN；v0.3.3 起非回环 + `admin_tls=off` 拒绝启动
 - [x] KI-07：面板变更请求 Origin 同源校验
 - [x] KI-08：未知 `/api/v1/*` 先 Bearer 再 404
 - [x] KI-09：`rustboard-panel reset-password`
@@ -117,6 +118,38 @@
       pidfd 结束进程、非 0 退出/信号终止审计失败
 - [x] 测试：单元/集成 379；`control.sh` 99/99；`cargo audit` 0 漏洞
 - [x] 独立评审 + 渗透：无高危；审计信任边界与低危限制已记录
+
+## v0.3.3 管理面安全明细
+
+已完成（对应 GitHub #9 / #17 / #20 / #21）：
+
+- [x] #9 scoped token：SQLite schema v6 `api_tokens`（只存 SHA-256）、
+      `read` / `write` / `admin` 三级权限、`token create/list/rotate/revoke`；
+      审计 actor 记录 token name，旧 `admin_token` 兼容并固定 `admin`；
+      `admin` 为保留名（大小写不敏感拒绝）
+- [x] #9 管理端 TLS：`admin_tls = "off" | "required"`；非回环 + off 拒绝启动；
+      required 复用 server.crt/key 做 server-auth（TLS1.3 + ALPN h1），
+      支持证书热加载；Panel 支持 `https://` + 私有 `hub_ca`（只信任该 CA）
+- [x] #17：控制 API 两道吊销门禁 + 会话 dispatch 前门禁；死吊销返回 403
+      `agent_revoked`、审计 denied；API 不投递、会话不发 ControlRequest
+- [x] #20：日志文件从根 fd 对完整绝对路径单次 `openat2`
+      （`NO_SYMLINKS|NO_MAGICLINKS|BENEATH`），关闭父路径 TOCTOU；
+      保留跨挂载点兼容（不启用 `NO_XDEV`）
+- [x] #21：systemd 合并 `list-unit-files`，已安装未加载 unit 以
+      `not-loaded/inactive/dead` 展示并可 start；两次命令共享总超时，
+      输出 >256 KiB 拒绝不完整列表
+- [x] 测试：单元/集成 495；`v033.sh` 100/100、`hardening.sh` 36/36、
+      `security.sh` 9/9、`cert-rotation.sh` 103/103、`control.sh` 100/100、
+      `v031.sh` 94/94、`v032.sh` 66/66、`panel.sh` 159/159；web 48/48；
+      `cargo audit` 0 漏洞
+- [x] 独立评审：A1/A2/C/D 分项评审；[严重] 项（actor 撞名、hardening e2e、
+      `NO_XDEV` 启动回归）均已修复；最终安全复审无 [严重]
+- [x] 独立渗透（本地实例）：**无未修复高危**；中危 1 项 KI-26（未认证 401 不受
+      管理限速，计划 v0.3.4），低危 systemd 超时 join / #17 在途窗口已记录；
+      认证、TLS、注入、路径逃逸、资源、泄露、Panel CA 等必测项通过
+- [x] 升级顺序：先升级 hub（自动 v6 迁移），按需启用 `admin_tls` 并
+      `rotate-cert`；Panel 最后改 `https://` + `hub_ca`；回滚前先把
+      `admin_listen` 改回回环
 
 ## v0.3.2 控制面可靠性明细
 
@@ -174,10 +207,10 @@
 - 面板修改采样间隔后 60s 内 agent 日志出现 `采样间隔已更新`，重连后继续上报；
 - series 多指标、自动分桶、32 天/点数上限与非法参数 400 均验证；
 - 证书轮换失败场景（CA 不配套、缺 ca.key、坏 ca.crt、空 SAN、缺 server.crt）均有 e2e 断言；
-- 测试：`cargo test --workspace` 447 通过；`cargo audit` 0 漏洞；
+- 测试：`cargo test --workspace` 495 通过；`cargo audit` 0 漏洞；
   `security.sh` 9/9、`cert-rotation.sh` 103/103、`panel.sh` 159/159、
-  `hardening.sh` 34/34、`v031.sh` 94/94、`control.sh` 100/100、`v032.sh` 66/66、
-  web `pnpm test` 48/48。
+  `hardening.sh` 36/36、`v031.sh` 94/94、`control.sh` 100/100、`v032.sh` 66/66、
+  `v033.sh` 100/100、web `pnpm test` 48/48。
 
 ## 已知限制
 
@@ -210,6 +243,17 @@
     后续版本修复）。
 13. 升级 v0.3.2 时先升级 hub，再升级 agent。v0.3.1 hub 的 WebSocket 单帧上限仍是
     256 KiB；新 agent 发送超过 256 KiB 的控制结果仍可能被旧 hub 拒绝并断开会话。
+14. v0.3.3 起非回环 `admin_listen` 必须 `admin_tls = "required"`，否则拒绝启动；
+    远程 Panel 必须 `hub_url = "https://..."` + `hub_ca`（私有 CA）。管理证书 SAN
+    不覆盖访问名时需先更新 `server_names` 并 `rotate-cert --force`。
+15. 回滚到 v0.3.2 前必须先把 `admin_listen` 改回回环：旧二进制不认识 `admin_tls`，
+    非回环时会按明文 HTTP 启动。scoped token 的 `api_tokens` 表可保留，旧二进制忽略。
+16. #17 的吊销门禁是“检查后再投递”：revoke 提交前已通过会话侧最后一次检查的
+    1 条在途命令仍可能执行（`dispatch` 写帧最多等 5s），审计按实际结果记录；
+    revoke 之后新发起的请求一律 403。需要零窗口时应引入协议级可取消/租约，
+    列入后续版本评估。
+17. 未认证 401 不受管理限速（KI-26，v0.3.4）：错误 token 可驱动 SQLite 查询与 WARN
+    日志。管理口默认回环；非回环必须置于 VPN/防火墙后，`admin_tls` 只加密不认证客户端。
 
 ## 下一步建议
 

@@ -459,6 +459,21 @@ impl HubControlConfig {
     }
 }
 
+/// 管理 API 传输模式。
+///
+/// - `off`：明文 HTTP；只允许绑定回环地址（127.0.0.0/8、::1），否则拒绝启动。
+/// - `required`：HTTPS；复用 agent 入口同一对 `server.crt` / `server.key` 做
+///   server-auth（不要求客户端证书），证书 SAN 必须覆盖管理端访问地址。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdminTlsMode {
+    /// 明文 HTTP，仅回环。
+    #[default]
+    Off,
+    /// 服务端 TLS，证书与 agent 入口相同。
+    Required,
+}
+
 /// hub 端配置。对应 `/etc/rustboard/hub.toml`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -467,6 +482,9 @@ pub struct HubConfig {
     pub agent_listen: String,
     /// 面板/管理 API 监听地址。默认只绑回环，公网暴露需显式修改。
     pub admin_listen: String,
+    /// 管理 API 传输模式：默认 `off`（仅回环明文）。
+    #[serde(default)]
+    pub admin_tls: AdminTlsMode,
     pub data_dir: PathBuf,
     /// SQLite 用路径，PostgreSQL 用 `postgres://...`。
     pub database: String,
@@ -553,6 +571,7 @@ impl Default for HubConfig {
         Self {
             agent_listen: format!("0.0.0.0:{}", crate::DEFAULT_AGENT_PORT),
             admin_listen: format!("127.0.0.1:{}", crate::DEFAULT_ADMIN_PORT),
+            admin_tls: AdminTlsMode::Off,
             data_dir: PathBuf::from("/var/lib/rustboard/hub"),
             database: "sqlite:///var/lib/rustboard/hub/rustboard.db".to_string(),
             self_monitor: true,
@@ -675,8 +694,14 @@ impl HubConfig {
 #[serde(default)]
 pub struct PanelConfig {
     pub listen: String,
-    /// hub 的管理 API 地址，例如 `http://127.0.0.1:8444`。
+    /// hub 的管理 API 地址，例如 `http://127.0.0.1:8444` 或 `https://hub.example.com:8444`。
     pub hub_url: String,
+    /// hub 的私有 CA 证书路径（PEM，可包含多张证书组成的 bundle）。
+    ///
+    /// 只在 `hub_url` 为 `https://` 时允许非空：配了它表示只信任该 CA，
+    /// 不再叠加系统根证书；留空则使用系统根证书。
+    #[serde(default)]
+    pub hub_ca: String,
     /// 面板访问 hub 用的 scoped token。
     pub token: String,
     /// 单管理员的 Argon2id PHC 密码哈希；`panel init` 生成。
@@ -717,6 +742,7 @@ impl Default for PanelConfig {
         Self {
             listen: default_panel_listen(),
             hub_url: format!("http://127.0.0.1:{}", crate::DEFAULT_ADMIN_PORT),
+            hub_ca: String::new(),
             token: String::new(),
             admin_password_hash: String::new(),
             session_ttl_hours: default_session_ttl_hours(),
@@ -947,6 +973,52 @@ mod tests {
         assert_eq!(panel.cookie_secure, CookieSecure::Always);
         assert_eq!(panel.public_origin, "https://panel.example.com:8443");
         panel.validate().expect("合法面板配置必须通过校验");
+    }
+
+    /// v0.3.3：`admin_tls` 默认 off（旧配置兼容），显式值必须正确解析，非法值拒绝。
+    #[test]
+    fn v033_admin_tls_default_serde_and_invalid_values() {
+        let hub: HubConfig = toml::from_str("").unwrap();
+        assert_eq!(hub.admin_tls, AdminTlsMode::Off);
+        assert_eq!(AdminTlsMode::default(), AdminTlsMode::Off);
+
+        for (text, expected) in [
+            ("off", AdminTlsMode::Off),
+            ("required", AdminTlsMode::Required),
+        ] {
+            let hub: HubConfig = toml::from_str(&format!("admin_tls = \"{text}\"\n")).unwrap();
+            assert_eq!(hub.admin_tls, expected);
+        }
+
+        // 大写 / 别名不能静默回退到 off：配置错误必须在解析阶段暴露。
+        for invalid in ["on", "true", "REQUIRED", "tls", ""] {
+            let err = toml::from_str::<HubConfig>(&format!("admin_tls = \"{invalid}\"\n"))
+                .expect_err("非法 admin_tls 必须解析失败");
+            assert!(
+                err.to_string().contains("admin_tls"),
+                "错误信息应点名 admin_tls: {err}"
+            );
+        }
+    }
+
+    /// v0.3.3 Panel 新增 `hub_ca`：缺省为空，旧配置不写该字段也能加载；
+    /// 显式配置按原样读取，且必须能通过 serde 往返。
+    #[test]
+    fn v033_panel_hub_ca_is_optional_and_roundtrips() {
+        let panel: PanelConfig = toml::from_str("").unwrap();
+        assert!(
+            panel.hub_ca.is_empty(),
+            "旧配置缺 hub_ca 时必须默认为空，而不是解析失败"
+        );
+        assert_eq!(panel.hub_ca, PanelConfig::default().hub_ca);
+
+        let panel: PanelConfig =
+            toml::from_str("hub_ca = \"/etc/rustboard/panel/hub-ca.crt\"\n").unwrap();
+        assert_eq!(panel.hub_ca, "/etc/rustboard/panel/hub-ca.crt");
+
+        let serialized = toml::to_string(&panel).unwrap();
+        let reparsed: PanelConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.hub_ca, panel.hub_ca, "hub_ca 必须能 serde 往返");
     }
 
     /// 非法 `cookie_secure` 值必须在反序列化阶段失败，不能静默回退 auto。
