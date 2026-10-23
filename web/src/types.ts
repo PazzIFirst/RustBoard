@@ -282,3 +282,50 @@ export interface ChannelInput {
   enabled: boolean;
   config: Record<string, string>;
 }
+
+// ---------------------------------------------------------------- M4 归档
+
+/** 归档对象状态；与 hub / SQLite 的稳定字符串一致。 */
+export type ArchiveObjectStatus =
+  | "pending"
+  | "uploaded"
+  | "local_deleted"
+  | "failed";
+
+/**
+ * 归档对象视图。
+ *
+ * 只含对象元数据；后端 URL / 凭据不会出现在响应里。`error` 是固定错误码
+ * （未知内容已被 hub 收敛为 `archive_error`），页面不直接渲染任意后端报文。
+ */
+export interface ArchiveObject {
+  id: number;
+  object_key: string;
+  manifest_key: string;
+  from_ts: number;
+  to_ts: number;
+  rows: number;
+  bytes: number;
+  sha256: string;
+  status: ArchiveObjectStatus;
+  error: string;
+  created_at: number;
+  uploaded_at: number | null;
+  deleted_at: number | null;
+}
+
+export interface ArchiveObjectListResponse {
+  objects: ArchiveObject[];
+  /** 本页满时返回最后一条 id；null 表示没有更多。 */
+  next_before_id?: number | null;
+}
+
+/** `GET /api/archive/status`；`backend` 只是类型名，不含地址或凭据。 */
+export interface ArchiveStatus {
+  enabled: boolean;
+  backend: string;
+  last_archived_ts: number | null;
+  last_run: number | null;
+  last_error: string | null;
+  objects: number;
+}

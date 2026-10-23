@@ -1660,3 +1660,64 @@ h3 {
     flex: 1;
   }
 }
+
+/* M4-C2b 归档数据页 */
+.archive-status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin: 12px 0 0;
+}
+
+.archive-status-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  background: rgba(7, 10, 15, 0.35);
+}
+
+.archive-status-card dt {
+  color: var(--muted);
+  font-size: 0.72rem;
+  margin-bottom: 4px;
+}
+
+.archive-status-card dd {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.archive-status-error dd {
+  font-weight: 500;
+  font-size: 0.85rem;
+  color: #ffb4ae;
+}
+
+.archive-status-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+}
+
+.archive-table td:first-child {
+  min-width: 220px;
+}
+
+.archive-table .mono {
+  font-size: 0.8rem;
+}
+
+@media (max-width: 720px) {
+  .archive-status-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .archive-table td:first-child {
+    min-width: 0;
+  }
+}

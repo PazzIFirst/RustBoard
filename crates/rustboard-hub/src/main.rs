@@ -42,6 +42,7 @@ use rustboard_common::util::{
 use rustboard_common::wire::{codes, AgentHello, EnrollRequest, Frame, Welcome};
 use rustboard_common::{DEFAULT_HUB_CONFIG, PROTOCOL_VERSION, VERSION};
 use rustboard_core::alerts::builtin_rules;
+use rustboard_core::archive::{ArchiveObject, ArchiveStatus, ColdStore};
 use rustboard_core::collect::default_collectors;
 use rustboard_core::downsample;
 use rustboard_core::storage::sqlite::SqliteStorage;
@@ -794,18 +795,23 @@ fn archive_command(action: ArchiveAction) -> Result<()> {
     Ok(())
 }
 
-/// `archive test`：显式测试 WebDAV 后端（写入/读取/删除探针对象）。
+/// `archive test`：显式测试当前配置的冷存储后端（写入/读取/删除探针对象）。
 ///
-/// 成功输出固定 JSON；失败返回固定 [`rustboard_core::archive::ArchiveError`]，
-/// 不打印 URL / 用户名 / 密码 / 响应正文。测试不会启动 hub，也不需要证书。
+/// 支持 WebDAV 与 S3；成功输出 `{ok, backend}`，`backend` 是配置里的实际值。
+/// 失败返回固定 [`rustboard_core::archive::ArchiveError`]，不打印 URL / 用户名 /
+/// 密码 / 响应正文。测试不会启动 hub，也不需要证书。
 fn archive_test_json(config: Option<PathBuf>) -> Result<String> {
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
     let cfg = load_config(&path)?;
     cfg.validate().context("归档配置校验失败")?;
-    if cfg.archive.backend != rustboard_common::config::ArchiveBackend::Webdav {
-        bail!("当前仅支持 webdav 归档后端（S3 / SFTP 在 C2 / C3 提供）");
-    }
     let store = archive::build_store(&cfg.archive)?;
+    archive_test_with_store(&cfg, store.as_ref())
+}
+
+/// `archive test` 的可测试主体：后端已由 [`archive::build_store`] 构造。
+///
+/// 拆出来便于测试注入 InMemory / mock store，避免单测依赖真实网络。
+fn archive_test_with_store(cfg: &HubConfig, store: &dyn ColdStore) -> Result<String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1877,8 +1883,14 @@ fn admin_router(state: AppState) -> Router {
         )
         // M4-B2b：通知渠道 CRUD 与测试发送。渠道请求体单独放宽到 1 MiB。
         .merge(channel_routes())
-        // M4-C1b：归档状态只读（下载 / 对象列表属于 C4）。
+        // M4-C1b / C2b：归档状态、对象列表与下载。响应只含对象元数据，
+        // 不返回后端 URL / 凭据；下载失败统一 502 `archive_unavailable`。
         .route("/api/v1/archive/status", get(archive_status))
+        .route("/api/v1/archive/objects", get(archive_objects))
+        .route(
+            "/api/v1/archive/objects/{id}/download",
+            get(archive_object_download),
+        )
         // KI-08：未知 /api/v1/* 也要先过 Bearer 再 404，不能泄露路由是否存在。
         .route("/api/v1", any(api_not_found))
         .route("/api/v1/{*rest}", any(api_not_found))
@@ -1919,12 +1931,265 @@ async fn archive_status(
     Ok(Json(status))
 }
 
+/// 归档对象列表默认条数（面板固定 50）。
+const DEFAULT_ARCHIVE_OBJECT_LIMIT: usize = 50;
+/// 归档对象列表单页上限（方案 §8.1：limit 1..=100）。
+const MAX_ARCHIVE_OBJECT_LIMIT: usize = 100;
+/// 单次下载的服务端硬上限（方案 §7.4：1 GiB）。
+const MAX_ARCHIVE_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+/// `archive_objects.error` 允许透传的固定错误码；其它内容（可能来自人工改库 /
+/// 旧版本）一律收敛为 `archive_error`，避免把 URL 或后端正文带到 API。
+const ARCHIVE_OBJECT_ERROR_CODES: [&str; 6] = [
+    "invalid_key",
+    "invalid_manifest",
+    "invalid_status",
+    "encode_failed",
+    "backend_unavailable",
+    "not_found",
+];
+
+/// 归档对象列表响应：`objects` 按 id 倒序，`next_before_id` 是下一页排他游标。
+#[derive(Debug, serde::Serialize)]
+struct ArchiveObjectListResponse {
+    objects: Vec<ArchiveObjectView>,
+    next_before_id: Option<i64>,
+}
+
+/// 归档对象对外视图：只含对象元数据，不含后端 URL / 凭据 / 内部配置。
+#[derive(Debug, serde::Serialize)]
+struct ArchiveObjectView {
+    id: i64,
+    object_key: String,
+    manifest_key: String,
+    from_ts: i64,
+    to_ts: i64,
+    rows: u64,
+    bytes: u64,
+    sha256: String,
+    status: ArchiveStatus,
+    error: String,
+    created_at: i64,
+    uploaded_at: Option<i64>,
+    deleted_at: Option<i64>,
+}
+
+impl From<ArchiveObject> for ArchiveObjectView {
+    fn from(object: ArchiveObject) -> Self {
+        Self {
+            id: object.id,
+            object_key: object.object_key,
+            manifest_key: object.manifest_key,
+            from_ts: object.from_ts,
+            to_ts: object.to_ts,
+            rows: object.rows,
+            bytes: object.bytes,
+            sha256: object.sha256,
+            status: object.status,
+            error: archive_error_view(&object.error),
+            created_at: object.created_at,
+            uploaded_at: object.uploaded_at,
+            deleted_at: object.deleted_at,
+        }
+    }
+}
+
+/// `error` 只允许固定错误码；空串保持为空（成功对象）。
+fn archive_error_view(error: &str) -> String {
+    if error.is_empty() {
+        return String::new();
+    }
+    if ARCHIVE_OBJECT_ERROR_CODES.contains(&error) {
+        return error.to_string();
+    }
+    "archive_error".to_string()
+}
+
+/// `GET /api/v1/archive/objects?limit=&before_id=`：按 id 倒序分页列出归档对象。
+async fn archive_objects(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<ArchiveObjectListResponse>, ApiError> {
+    let pairs = parse_query_pairs(raw.as_deref()).map_err(ApiError::bad_request)?;
+    let limit = parse_archive_objects_limit(&pairs).map_err(ApiError::bad_request)?;
+    let before_id = parse_archive_before_id(&pairs).map_err(ApiError::bad_request)?;
+
+    let storage = state.storage.clone();
+    let objects =
+        tokio::task::spawn_blocking(move || storage.list_archive_objects(limit, before_id))
+            .await
+            .map_err(ApiError::from)?
+            .map_err(ApiError::from)?;
+    // 排他游标：本页满时下一页从最后一条 id 继续（严格小于），不会漏也不会重。
+    let next_before_id = if objects.len() == limit {
+        objects.last().map(|object| object.id).filter(|id| *id > 1)
+    } else {
+        None
+    };
+    Ok(Json(ArchiveObjectListResponse {
+        objects: objects.into_iter().map(Into::into).collect(),
+        next_before_id,
+    }))
+}
+
+/// 取单值查询参数；重复出现视为参数错误（不猜客户端意图）。
+fn single_archive_query_value<'a>(
+    pairs: &'a [(String, String)],
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    let mut found: Option<&str> = None;
+    for (name, value) in pairs {
+        if name == key {
+            if found.is_some() {
+                return Err(format!("查询参数 {key} 重复"));
+            }
+            found = Some(value.as_str());
+        }
+    }
+    Ok(found)
+}
+
+/// 解析 `limit`：缺省 50，范围 1..=100。
+fn parse_archive_objects_limit(pairs: &[(String, String)]) -> Result<usize, String> {
+    let Some(raw) = single_archive_query_value(pairs, "limit")? else {
+        return Ok(DEFAULT_ARCHIVE_OBJECT_LIMIT);
+    };
+    let limit: usize = raw.parse().map_err(|_| "limit 必须是正整数".to_string())?;
+    if !(1..=MAX_ARCHIVE_OBJECT_LIMIT).contains(&limit) {
+        return Err(format!("limit 必须在 1–{MAX_ARCHIVE_OBJECT_LIMIT} 之间"));
+    }
+    Ok(limit)
+}
+
+/// 解析排他游标 `before_id`：必须是正整数。
+fn parse_archive_before_id(pairs: &[(String, String)]) -> Result<Option<i64>, String> {
+    let Some(raw) = single_archive_query_value(pairs, "before_id")? else {
+        return Ok(None);
+    };
+    let value: i64 = raw
+        .parse()
+        .map_err(|_| "before_id 必须是正整数".to_string())?;
+    if value <= 0 {
+        return Err("before_id 必须是正整数".to_string());
+    }
+    Ok(Some(value))
+}
+
+/// 路径 id 只接受 1..=18 位 ASCII 十进制数字；拒绝 `+` / `-` / 空白 / 科学计数法。
+fn parse_archive_object_id(raw: &str) -> Result<i64, ApiError> {
+    if raw.is_empty() || raw.len() > 18 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ApiError::bad_request("归档对象 id 必须是正整数"));
+    }
+    let id: i64 = raw
+        .parse()
+        .map_err(|_| ApiError::bad_request("归档对象 id 必须是正整数"))?;
+    if id <= 0 {
+        return Err(ApiError::bad_request("归档对象 id 必须是正整数"));
+    }
+    Ok(id)
+}
+
+/// `GET /api/v1/archive/objects/{id}/download`：从冷存储读取对象并作为附件返回。
+///
+/// 只有 `uploaded` / `local_deleted` 可下载；不存在 404，状态未就绪 409
+/// `archive_not_ready`；任何后端失败统一 502 `archive_unavailable`，不回显
+/// 后端 URL / 凭据 / 响应正文。
+async fn archive_object_download(
+    State(state): State<AppState>,
+    Path(raw_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let id = parse_archive_object_id(&raw_id)?;
+    let storage = state.storage.clone();
+    let object = tokio::task::spawn_blocking(move || storage.get_archive_object(id))
+        .await
+        .map_err(ApiError::from)?
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("归档对象不存在"))?;
+    if !matches!(
+        object.status,
+        ArchiveStatus::Uploaded | ArchiveStatus::LocalDeleted
+    ) {
+        return Err(ApiError::conflict(
+            "archive_not_ready",
+            "归档对象尚未上传完成，暂不可下载",
+        ));
+    }
+
+    let store = archive::build_store(&state.cfg.archive).map_err(|_| archive_unavailable())?;
+    archive_download_response(&state.cfg, &object, store.as_ref()).await
+}
+
+/// 固定 502：下载后端不可用；不携带后端细节。
+fn archive_unavailable() -> ApiError {
+    ApiError::bad_gateway("archive_unavailable", "归档对象下载失败")
+}
+
+/// 从冷存储读取对象并构造下载响应。
+///
+/// 先 `HEAD` 校验大小，再 `GET`；对象超过 `min(archive.max_object_bytes, 1 GiB)`
+/// 直接拒绝，避免异常对象一次性占满内存。响应头只由服务端构造：
+/// - `Content-Type: application/gzip`；
+/// - `Content-Disposition: attachment; filename="rustboard-<yyyyMMdd>-part-NNNNN.csv.gz"`；
+/// - `Content-Length` 与 `Cache-Control: private, no-store`。
+async fn archive_download_response(
+    cfg: &HubConfig,
+    object: &ArchiveObject,
+    store: &dyn ColdStore,
+) -> Result<Response, ApiError> {
+    let limit = cfg.archive.max_object_bytes.min(MAX_ARCHIVE_DOWNLOAD_BYTES);
+    let filename =
+        archive::download_filename(&object.object_key).ok_or_else(archive_unavailable)?;
+
+    let meta = store
+        .head(&object.object_key)
+        .await
+        .map_err(|_| archive_unavailable())?
+        .ok_or_else(archive_unavailable)?;
+    if meta.size > limit {
+        return Err(archive_unavailable());
+    }
+    let data = store
+        .get(&object.object_key)
+        .await
+        .map_err(|_| archive_unavailable())?;
+    if data.len() as u64 > limit {
+        return Err(archive_unavailable());
+    }
+
+    let disposition = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+        .map_err(|_| archive_unavailable())?;
+    let length =
+        HeaderValue::from_str(&data.len().to_string()).map_err(|_| archive_unavailable())?;
+    let mut response = Response::new(Body::from(data));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/gzip"),
+    );
+    headers.insert(header::CONTENT_DISPOSITION, disposition);
+    headers.insert(header::CONTENT_LENGTH, length);
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    Ok(response)
+}
+
 /// 管理 API 全部响应禁止缓存（含 token 的 401 与实时指标）。
+///
+/// 下载接口显式声明 `private, no-store`，这里保留该值；其余响应统一强制
+/// `no-store`，避免误把敏感响应放进缓存。
 async fn no_store(request: axum::extract::Request, next: Next) -> Response {
     let mut response = next.run(request).await;
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let explicit = response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok());
+    if explicit != Some("private, no-store") {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     response
 }
 
@@ -9626,6 +9891,366 @@ mod tests {
         let (status, _, _) =
             admin_call(&router, "GET", "/api/v1/archive/status", Some(&write), None).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    // ------------------------------------------------------------------
+    // M4-C2b：archive objects 列表 / 下载 / S3 archive test
+    // ------------------------------------------------------------------
+
+    fn archive_object_record(
+        object_key: &str,
+        status: ArchiveStatus,
+        error: &str,
+    ) -> ArchiveObject {
+        ArchiveObject {
+            id: 0,
+            backend: "webdav".to_string(),
+            object_key: object_key.to_string(),
+            manifest_key: object_key.replace(".csv.gz", ".manifest.json"),
+            from_ts: 1_700_000_000_000,
+            to_ts: 1_700_003_600_000,
+            rows: 42,
+            bytes: 128,
+            sha256: "a".repeat(64),
+            status,
+            error: error.to_string(),
+            created_at: 1_700_000_000_000,
+            uploaded_at: Some(1_700_000_000_000),
+            deleted_at: None,
+        }
+    }
+
+    /// M4-C2b：对象列表按 id 倒序分页；error 只透传固定错误码，不泄露 URL。
+    #[tokio::test]
+    async fn m4c2b_archive_objects_list_paginates_and_sanitizes() {
+        let state = v6_auth_state();
+        let read = v6_seed_token(&state, "archive-objs-read", "read");
+        let router = admin_router(state.clone());
+
+        let (status, _, body) =
+            admin_call(&router, "GET", "/api/v1/archive/objects", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(json_body(&body)["error"], "unauthorized");
+
+        // 三行：id 越大越新；其中一行 error 带后端 URL，必须被收敛。
+        for (key, status, error) in [
+            (
+                "rustboard/2026/10/22/part-00001.csv.gz",
+                ArchiveStatus::Uploaded,
+                "",
+            ),
+            (
+                "rustboard/2026/10/23/part-00001.csv.gz",
+                ArchiveStatus::LocalDeleted,
+                "",
+            ),
+            (
+                "rustboard/2026/10/24/part-00001.csv.gz",
+                ArchiveStatus::Failed,
+                "https://minio.internal/secret-bucket?X-Amz-Credential=AKIA_LEAK",
+            ),
+        ] {
+            state
+                .storage
+                .insert_archive_object(&archive_object_record(key, status, error))
+                .unwrap();
+        }
+
+        let (status, _, body) = admin_call(
+            &router,
+            "GET",
+            "/api/v1/archive/objects?limit=2",
+            Some(&read),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body_text = String::from_utf8_lossy(&body).to_string();
+        assert!(!body_text.contains("minio.internal"), "不得回显后端 URL");
+        assert!(!body_text.contains("AKIA"), "不得回显凭据");
+        let body = json_body(&body);
+        let objects = body["objects"].as_array().expect("objects 必须是数组");
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0]["id"], 3);
+        assert_eq!(objects[1]["id"], 2);
+        assert_eq!(objects[0]["status"], "failed");
+        assert_eq!(objects[0]["error"], "archive_error");
+        assert_eq!(objects[0]["rows"], 42);
+        assert_eq!(objects[0]["bytes"], 128);
+        assert_eq!(objects[0]["sha256"].as_str().unwrap().len(), 64);
+        assert!(
+            objects[0].get("backend").is_none(),
+            "列表不返回 backend 字段"
+        );
+        assert!(objects[0].get("url").is_none(), "列表不返回后端 URL");
+        assert_eq!(body["next_before_id"], 2);
+
+        // 排他游标：下一页只返回 id < 2 的记录，且游标耗尽为 null。
+        let (status, _, body) = admin_call(
+            &router,
+            "GET",
+            "/api/v1/archive/objects?limit=2&before_id=2",
+            Some(&read),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body = json_body(&body);
+        let objects = body["objects"].as_array().unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0]["id"], 1);
+        assert!(body["next_before_id"].is_null());
+
+        // 参数边界：limit 1..=100、before_id 正整数、重复参数全部 400。
+        for query in [
+            "limit=0",
+            "limit=101",
+            "limit=abc",
+            "before_id=0",
+            "before_id=-1",
+            "before_id=abc",
+            "limit=2&limit=2",
+            "before_id=1&before_id=2",
+        ] {
+            let (status, _, body) = admin_call(
+                &router,
+                "GET",
+                &format!("/api/v1/archive/objects?{query}"),
+                Some(&read),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "query={query}");
+            assert_eq!(json_body(&body)["error"], "bad_request", "query={query}");
+        }
+    }
+
+    /// M4-C2b：下载 200 的响应头与字节；走真实 router + mock WebDAV。
+    #[tokio::test]
+    async fn m4c2b_archive_download_returns_headers_and_bytes() {
+        use crate::archive_webdav::test_support::MockDav;
+
+        let mock = MockDav::spawn().await;
+        let mut cfg = HubConfig::default();
+        cfg.archive.backend = rustboard_common::config::ArchiveBackend::Webdav;
+        cfg.archive.webdav = Some(mock.config());
+        let state = hub_state_with(cfg);
+        let read = v6_seed_token(&state, "archive-dl-read", "read");
+        let router = admin_router(state.clone());
+
+        let key = "rustboard/2026/10/24/part-00001.csv.gz";
+        let data = b"\x1f\x8b\x08\x00rustboard-gzip".to_vec();
+        mock.inner
+            .lock()
+            .unwrap()
+            .objects
+            .insert(key.to_string(), data.clone());
+        let object = archive_object_record(key, ArchiveStatus::Uploaded, "");
+        let id = state.storage.insert_archive_object(&object).unwrap();
+
+        let (status, headers, body) = admin_call(
+            &router,
+            "GET",
+            &format!("/api/v1/archive/objects/{id}/download"),
+            Some(&read),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/gzip"
+        );
+        assert_eq!(
+            headers.get(header::CONTENT_DISPOSITION).unwrap(),
+            "attachment; filename=\"rustboard-20261024-part-00001.csv.gz\""
+        );
+        assert_eq!(
+            headers.get(header::CONTENT_LENGTH).unwrap(),
+            &data.len().to_string()
+        );
+        assert_eq!(
+            headers.get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        assert_eq!(body, data, "下载字节必须与后端对象一致");
+        assert!(!String::from_utf8_lossy(&body).contains("dav-password"));
+    }
+
+    /// M4-C2b：下载的状态码与路径 id 校验；后端不可用时固定 502，不泄露细节。
+    #[tokio::test]
+    async fn m4c2b_archive_download_maps_404_409_502_and_rejects_bad_ids() {
+        let state = v6_auth_state();
+        let read = v6_seed_token(&state, "archive-dl-errors", "read");
+        let router = admin_router(state.clone());
+
+        // 未认证 → 401（即便 id 非法也先鉴权）。
+        let (status, _, _) = admin_call(
+            &router,
+            "GET",
+            "/api/v1/archive/objects/abc/download",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // 路径 id 必须是 ASCII 数字正整数。
+        for id in ["abc", "0", "-1", "1.5", "%2e%2e", "9999999999999999999"] {
+            let (status, _, body) = admin_call(
+                &router,
+                "GET",
+                &format!("/api/v1/archive/objects/{id}/download"),
+                Some(&read),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "id={id}");
+            assert_eq!(json_body(&body)["error"], "bad_request", "id={id}");
+        }
+
+        // 不存在 → 404。
+        let (status, _, _) = admin_call(
+            &router,
+            "GET",
+            "/api/v1/archive/objects/999/download",
+            Some(&read),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // pending / failed → 409 archive_not_ready。
+        let pending = state
+            .storage
+            .insert_archive_object(&archive_object_record(
+                "rustboard/2026/10/24/part-00002.csv.gz",
+                ArchiveStatus::Pending,
+                "",
+            ))
+            .unwrap();
+        let (status, _, body) = admin_call(
+            &router,
+            "GET",
+            &format!("/api/v1/archive/objects/{pending}/download"),
+            Some(&read),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json_body(&body)["error"], "archive_not_ready");
+
+        // uploaded 但后端未配置：502 固定码，不回显后端配置。
+        let uploaded = state
+            .storage
+            .insert_archive_object(&archive_object_record(
+                "rustboard/2026/10/24/part-00003.csv.gz",
+                ArchiveStatus::Uploaded,
+                "",
+            ))
+            .unwrap();
+        let (status, _, body) = admin_call(
+            &router,
+            "GET",
+            &format!("/api/v1/archive/objects/{uploaded}/download"),
+            Some(&read),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let body = json_body(&body);
+        assert_eq!(body["error"], "archive_unavailable");
+        assert!(!body.to_string().contains("webdav"));
+        assert!(!body.to_string().contains("archive.webdav"));
+    }
+
+    /// M4-C2b：下载响应构造的大小上限与错误收敛（注入 InMemory S3，不联网）。
+    #[tokio::test]
+    async fn m4c2b_archive_download_response_enforces_size_limit() {
+        use crate::archive_s3::S3ColdStore;
+        use object_store::memory::InMemory;
+
+        let store = S3ColdStore::with_store(Arc::new(InMemory::new()));
+        let mut cfg = HubConfig::default();
+        cfg.archive.max_object_bytes = 1_048_576; // 配置下限 1 MiB
+        let key = "rustboard/2026/10/24/part-00009.csv.gz";
+
+        // 缺失对象 → 502。
+        let object = archive_object_record(key, ArchiveStatus::Uploaded, "");
+        let error = archive_download_response(&cfg, &object, &store)
+            .await
+            .map(|_| ())
+            .expect_err("缺失对象必须失败");
+        assert!(matches!(
+            error,
+            ApiError::BadGateway {
+                code: "archive_unavailable",
+                ..
+            }
+        ));
+
+        // 超过 archive.max_object_bytes → 502，且不读取对象内容。
+        store.put(key, &vec![0u8; 1_048_577]).await.unwrap();
+        let error = archive_download_response(&cfg, &object, &store)
+            .await
+            .map(|_| ())
+            .expect_err("超限对象必须失败");
+        assert!(matches!(
+            error,
+            ApiError::BadGateway {
+                code: "archive_unavailable",
+                ..
+            }
+        ));
+
+        // 非标准 key（无法重新构造安全文件名）→ 502，避免 header 注入。
+        let weird = archive_object_record(
+            "../evil/2026/10/24/part-00001.csv.gz",
+            ArchiveStatus::Uploaded,
+            "",
+        );
+        let error = archive_download_response(&cfg, &weird, &store)
+            .await
+            .map(|_| ())
+            .expect_err("非标准 key 必须失败");
+        assert!(matches!(
+            error,
+            ApiError::BadGateway {
+                code: "archive_unavailable",
+                ..
+            }
+        ));
+    }
+
+    /// M4-C2b：`archive test` 支持 S3，backend 输出实际配置值；探针不联网。
+    #[test]
+    fn m4c2b_archive_test_supports_s3_with_injected_store() {
+        use crate::archive_s3::S3ColdStore;
+        use object_store::memory::InMemory;
+        use rustboard_common::config::{ArchiveBackend, ArchiveS3Config};
+
+        let mut cfg = HubConfig::default();
+        cfg.archive.backend = ArchiveBackend::S3;
+        cfg.archive.enabled = true;
+        cfg.archive.s3 = Some(ArchiveS3Config {
+            bucket: "rustboard-test".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            access_key_id: "test-access-key".to_string(),
+            secret_access_key: "test-secret-key".to_string(),
+            path_style: true,
+        });
+        let store = S3ColdStore::with_store(Arc::new(InMemory::new()));
+
+        let output = archive_test_with_store(&cfg, &store).unwrap();
+        let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["ok"], true);
+        assert_eq!(output["backend"], "s3");
+        assert!(
+            !output.to_string().contains("secret"),
+            "archive test 输出不得包含凭据"
+        );
+        assert!(!output.to_string().contains("127.0.0.1"));
     }
 
     /// M4-A2：后台单轮串行执行，失败写 last_error、整轮成功后清空。

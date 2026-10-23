@@ -45,6 +45,12 @@ export default function Layout({ children }: { children: ReactNode }) {
               告警
             </NavLink>
             <NavLink
+              to="/archive"
+              className={({ isActive }) => `topnav-link ${isActive ? "active" : ""}`}
+            >
+              归档
+            </NavLink>
+            <NavLink
               to="/audit"
               className={({ isActive }) => `topnav-link ${isActive ? "active" : ""}`}
             >

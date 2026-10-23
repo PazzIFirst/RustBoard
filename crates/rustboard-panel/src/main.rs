@@ -49,6 +49,8 @@ const MAX_JSON_BODY: usize = 8 * 1024;
 const MAX_ALERT_BODY: usize = 64 * 1024;
 /// 告警事件单页上限；与 hub 的 `MAX_ALERT_EVENT_LIMIT` 对齐。
 const MAX_ALERT_EVENT_LIMIT: i64 = 100;
+/// 归档对象单页上限；与 hub 的 `MAX_ARCHIVE_OBJECT_LIMIT` 对齐。
+const MAX_ARCHIVE_OBJECT_LIMIT: i64 = 100;
 /// 同时进行的 Argon2 校验上限，避免 64 MiB × N 的内存 DoS。
 const MAX_CONCURRENT_ARGON2: usize = 2;
 /// 面板 HTTP 全局并发连接上限；超出后 accept 到的 TCP 立即关闭。
@@ -368,6 +370,14 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/alerts/channels/{id}/test",
             post(api_alert_channel_test),
         )
+        // M4-C2b 归档数据页：列表走普通 JSON 代理；下载必须流式转发，不能进
+        // 8 MiB JSON 缓冲。两者都要求已登录会话。
+        .route("/api/archive/status", get(api_archive_status))
+        .route("/api/archive/objects", get(api_archive_objects))
+        .route(
+            "/api/archive/objects/{id}/download",
+            get(api_archive_object_download),
+        )
         .route("/api/audit", get(api_audit))
         .route("/api/system", get(api_system))
         .route("/api", any(api_unknown))
@@ -424,14 +434,26 @@ async fn security_headers(request: Request, next: Next) -> Response {
 /// `/api/*` 响应一律声明 JSON。
 ///
 /// 上游 Content-Type 在 `proxy` 层已被丢弃；这里再兜一层，保证登录/错误/未知路由
-/// 等面板自己产生的响应也不会被浏览器按 HTML 解析。
+/// 等面板自己产生的响应也不会被浏览器按 HTML 解析。归档下载是唯一例外：它的
+/// 成功响应必须是 `application/gzip` + `attachment`，错误分支已由代理层自行
+/// 声明 JSON，因此下载路径不做覆盖。
 async fn force_json_content_type(request: Request, next: Next) -> Response {
+    let is_download = is_archive_download_path(request.uri().path());
     let mut response = next.run(request).await;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
+    if !is_download {
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
     response
+}
+
+/// 匹配 `/api/archive/objects/<单段 id>/download`；用于 JSON Content-Type 豁免。
+fn is_archive_download_path(path: &str) -> bool {
+    path.strip_prefix("/api/archive/objects/")
+        .and_then(|rest| rest.strip_suffix("/download"))
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// 变更类 API 的同源校验（KI-07）。
@@ -1091,6 +1113,59 @@ async fn api_alert_channel_test(
     forward_alert_post(&state, &path, &json!({})).await
 }
 
+/// `GET /api/archive/objects`：转发归档对象列表。
+///
+/// 只放行 `limit`（1..=100）与 `before_id`（正整数）；响应体由 hub 保证只含
+/// 对象元数据（不含 backend 凭据）。
+async fn api_archive_objects(
+    State(state): State<Arc<AppState>>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let query = match parse_allowed(raw.as_deref(), &["limit", "before_id"]) {
+        Ok(query) => query,
+        Err(message) => return bad_request(&message),
+    };
+    if let Err(message) = validate_archive_objects_query(&query) {
+        return bad_request(&message);
+    }
+    forward_alert_get_query(&state, "/api/v1/archive/objects", &query).await
+}
+
+/// `GET /api/archive/status`：转发归档开关 / 后端类型 / 水位 / 对象数。
+///
+/// 不接受任何查询参数；响应不含后端 URL 或凭据（hub 侧保证）。
+async fn api_archive_status(
+    State(state): State<Arc<AppState>>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    if let Err(message) = reject_alert_query(raw.as_deref()) {
+        return bad_request(&message);
+    }
+    forward_alert_get(&state, "/api/v1/archive/status").await
+}
+
+/// `GET /api/archive/objects/{id}/download`：流式转发归档对象下载。
+///
+/// 路径 id 在面板先做数字校验（拒绝 `%2e%2e` / 斜杠 / `+` / 小数）；代理层
+/// 注入 Bearer、保留安全响应头并限制 1 GiB，不把对象读进 8 MiB JSON 缓冲。
+async fn api_archive_object_download(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    if let Err(message) = reject_alert_query(raw.as_deref()) {
+        return bad_request(&message);
+    }
+    if !proxy::validate_archive_object_id(&id) {
+        return bad_request("归档对象 id 必须是正整数");
+    }
+    let path = format!("/api/v1/archive/objects/{id}/download");
+    match state.proxy.download(&path).await {
+        Ok(response) => response,
+        Err(error) => proxy::proxy_error_to_response(&error),
+    }
+}
+
 /// 审计列表；只放行分页与过滤参数。
 async fn api_audit(State(state): State<Arc<AppState>>, RawQuery(raw): RawQuery) -> Response {
     let query = match parse_allowed(
@@ -1312,12 +1387,15 @@ fn validate_control_payload(payload: &serde_json::Value) -> std::result::Result<
     Ok(())
 }
 
-/// 告警事件查询校验：`limit` / `before_id` 只接受十进制数字且不得重复。
+/// 告警事件 / 归档对象分页查询校验：`limit` / `before_id` 只接受十进制数字且不得重复。
 ///
-/// - `limit` 1–100（缺省由 hub 使用默认值）；
+/// - `limit` 1–`max_limit`（缺省由 hub 使用默认值）；
 /// - `before_id` 必须是正整数（1 起步的排他游标）；
 /// - 数字串长度设上限，避免把超长字符串转给上游解析。
-fn validate_alert_event_query(query: &[(String, String)]) -> std::result::Result<(), String> {
+fn validate_pagination_query(
+    query: &[(String, String)],
+    max_limit: i64,
+) -> std::result::Result<(), String> {
     let mut limit_seen = false;
     let mut before_seen = false;
     for (key, value) in query {
@@ -1328,9 +1406,9 @@ fn validate_alert_event_query(query: &[(String, String)]) -> std::result::Result
                 }
                 limit_seen = true;
                 let limit =
-                    parse_alert_number(value).ok_or_else(|| "limit 必须是正整数".to_string())?;
-                if !(1..=MAX_ALERT_EVENT_LIMIT).contains(&limit) {
-                    return Err(format!("limit 必须在 1–{MAX_ALERT_EVENT_LIMIT} 之间"));
+                    parse_decimal_number(value).ok_or_else(|| "limit 必须是正整数".to_string())?;
+                if !(1..=max_limit).contains(&limit) {
+                    return Err(format!("limit 必须在 1–{max_limit} 之间"));
                 }
             }
             "before_id" => {
@@ -1338,7 +1416,7 @@ fn validate_alert_event_query(query: &[(String, String)]) -> std::result::Result
                     return Err("before_id 不能重复".to_string());
                 }
                 before_seen = true;
-                let before = parse_alert_number(value)
+                let before = parse_decimal_number(value)
                     .ok_or_else(|| "before_id 必须是正整数".to_string())?;
                 if before <= 0 {
                     return Err("before_id 必须是正整数".to_string());
@@ -1350,8 +1428,18 @@ fn validate_alert_event_query(query: &[(String, String)]) -> std::result::Result
     Ok(())
 }
 
+/// 告警事件查询校验（limit 1–100）。
+fn validate_alert_event_query(query: &[(String, String)]) -> std::result::Result<(), String> {
+    validate_pagination_query(query, MAX_ALERT_EVENT_LIMIT)
+}
+
+/// 归档对象查询校验（limit 1–100）。
+fn validate_archive_objects_query(query: &[(String, String)]) -> std::result::Result<(), String> {
+    validate_pagination_query(query, MAX_ARCHIVE_OBJECT_LIMIT)
+}
+
 /// 只接受 1–18 位 ASCII 十进制数字；拒绝 `+`、`-`、空格、科学计数法与空串。
-fn parse_alert_number(value: &str) -> Option<i64> {
+fn parse_decimal_number(value: &str) -> Option<i64> {
     if value.is_empty() || value.len() > 18 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
@@ -2264,6 +2352,52 @@ mod tests {
         (format!("http://{address}"), seen)
     }
 
+    /// 只服务一次请求的假 hub：可自定义响应头与二进制 body（下载测试用）。
+    ///
+    /// `headers` 由调用方给出（含 Content-Length），方便模拟超限 / 缺长度等
+    /// 异常响应，面板必须在不读取 body 的情况下先做上限判断。
+    fn spawn_raw_mock_hub(
+        status: u16,
+        headers: &str,
+        body: Vec<u8>,
+    ) -> (String, Arc<Mutex<Vec<u8>>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let headers = headers.to_string();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut request = Vec::new();
+            let mut scratch = [0u8; 4096];
+            loop {
+                match stream.read(&mut scratch) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&scratch[..read]),
+                }
+                if request_complete(&request) {
+                    break;
+                }
+            }
+            *recorded.lock().unwrap() = request;
+            let reason = StatusCode::from_u16(status)
+                .unwrap()
+                .canonical_reason()
+                .unwrap_or("OK");
+            let head = format!("HTTP/1.1 {status} {reason}\r\n{headers}Connection: close\r\n\r\n");
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+        });
+        (format!("http://{address}"), seen)
+    }
+
     /// 请求头完整且 `Content-Length` 指定的 body 已全部到达。
     fn request_complete(request: &[u8]) -> bool {
         let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
@@ -2290,6 +2424,10 @@ mod tests {
         let text = String::from_utf8_lossy(&request).to_string();
         let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
         (head.to_string(), body.to_string())
+    }
+
+    fn json_body(bytes: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(bytes).expect("响应必须是 JSON")
     }
 
     /// 断言面板只把 hub token 放进面板 → hub 的 Authorization 头。
@@ -3214,6 +3352,363 @@ mod tests {
         let text = String::from_utf8_lossy(&body).to_string();
         assert!(text.contains("hub_unreachable"), "{text}");
         assert!(!text.contains(TEST_HUB_TOKEN), "{text}");
+    }
+
+    // ------------------------------------------------------------------
+    // M4-C2b：归档列表 / 流式下载代理
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn archive_proxy_requires_session_for_list_and_download() {
+        let state = test_state_with_hub("http://127.0.0.1:1");
+        for uri in [
+            "/api/archive/status",
+            "/api/archive/objects",
+            "/api/archive/objects/42/download",
+        ] {
+            let (status, headers, body) =
+                call(&state, Method::GET, uri, &[], Body::empty(), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "uri={uri}");
+            assert_eq!(
+                headers.get(header::CONTENT_TYPE).unwrap(),
+                "application/json"
+            );
+            assert!(String::from_utf8_lossy(&body).contains("unauthorized"));
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_objects_forwards_query_and_validates() {
+        let state = test_state_with_hub("http://127.0.0.1:1");
+        let cookie = session_cookie(&state);
+
+        // 参数校验发生在代理之前：非法请求不会碰到 hub。
+        for query in [
+            "limit=0",
+            "limit=101",
+            "limit=abc",
+            "before_id=0",
+            "before_id=-1",
+            "before_id=abc",
+            "before_id=1&before_id=2",
+            "limit=50&foo=bar",
+            "x=1",
+        ] {
+            let (status, _, body) = call(
+                &state,
+                Method::GET,
+                &format!("/api/archive/objects?{query}"),
+                &[("cookie", &cookie)],
+                Body::empty(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "query={query}");
+            assert_eq!(json_body(&body)["error"], "bad_request", "query={query}");
+        }
+
+        // 合法查询原样转发（含 before_id），并注入 hub Bearer。
+        let hub_body = r#"{"objects":[],"next_before_id":null}"#;
+        let (hub_url, seen) = spawn_mock_hub(200, hub_body);
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let (status, headers, body) = call(
+            &state,
+            Method::GET,
+            "/api/archive/objects?limit=50&before_id=42",
+            &[("cookie", &cookie)],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(&body[..], hub_body.as_bytes());
+        let (head, _) = seen_request(&seen);
+        assert!(
+            head.starts_with("GET /api/v1/archive/objects?limit=50&before_id=42 HTTP/1.1"),
+            "{head}"
+        );
+        assert_bearer_sent_to_hub(&head);
+        assert!(!String::from_utf8_lossy(&body).contains(TEST_HUB_TOKEN));
+    }
+
+    #[tokio::test]
+    async fn archive_status_forwards_and_rejects_query() {
+        let hub_body = r#"{"enabled":true,"backend":"s3","last_run":null,"objects":0}"#;
+        let (hub_url, seen) = spawn_mock_hub(200, hub_body);
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let (status, headers, body) = call(
+            &state,
+            Method::GET,
+            "/api/archive/status",
+            &[("cookie", &cookie)],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(&body[..], hub_body.as_bytes());
+        let (head, _) = seen_request(&seen);
+        assert!(
+            head.starts_with("GET /api/v1/archive/status HTTP/1.1"),
+            "{head}"
+        );
+        assert_bearer_sent_to_hub(&head);
+
+        // 状态接口不接受任何查询参数。
+        let (status, _, body) = call(
+            &state,
+            Method::GET,
+            "/api/archive/status?x=1",
+            &[("cookie", &cookie)],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(&body)["error"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn archive_download_streams_headers_and_body() {
+        let payload = b"\x1f\x8b\x08\x00rustboard-archive-gzip".to_vec();
+        let hub_headers = format!(
+            "Content-Type: application/gzip\r\n\
+             Content-Disposition: attachment; filename=\"rustboard-20261024-part-00001.csv.gz\"\r\n\
+             Content-Length: {}\r\n",
+            payload.len()
+        );
+        let (hub_url, seen) = spawn_raw_mock_hub(200, &hub_headers, payload.clone());
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+
+        let (status, headers, body) = call(
+            &state,
+            Method::GET,
+            "/api/archive/objects/42/download",
+            &[("cookie", &cookie)],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/gzip"
+        );
+        assert_eq!(
+            headers.get(header::CONTENT_DISPOSITION).unwrap(),
+            "attachment; filename=\"rustboard-20261024-part-00001.csv.gz\""
+        );
+        assert_eq!(
+            headers.get(header::CONTENT_LENGTH).unwrap(),
+            &payload.len().to_string()
+        );
+        assert_eq!(
+            headers.get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        assert_eq!(
+            headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        assert_eq!(body, payload, "下载流必须逐字节透传");
+        assert!(!String::from_utf8_lossy(&body).contains(TEST_HUB_TOKEN));
+
+        let (head, _) = seen_request(&seen);
+        assert!(
+            head.starts_with("GET /api/v1/archive/objects/42/download HTTP/1.1"),
+            "{head}"
+        );
+        assert_bearer_sent_to_hub(&head);
+        assert!(
+            !head.to_ascii_lowercase().contains("x-ratelimit"),
+            "不得把无关头带到 hub: {head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_download_passes_through_hub_errors() {
+        for (hub_status, hub_body) in [
+            (404, r#"{"error":"not_found","message":"归档对象不存在"}"#),
+            (
+                409,
+                r#"{"error":"archive_not_ready","message":"归档对象尚未上传完成"}"#,
+            ),
+            (
+                502,
+                r#"{"error":"archive_unavailable","message":"归档对象下载失败"}"#,
+            ),
+        ] {
+            let (hub_url, _seen) = spawn_mock_hub(hub_status, hub_body);
+            let state = test_state_with_hub(&hub_url);
+            let cookie = session_cookie(&state);
+            let (status, headers, body) = call(
+                &state,
+                Method::GET,
+                "/api/archive/objects/42/download",
+                &[("cookie", &cookie)],
+                Body::empty(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::from_u16(hub_status).unwrap());
+            assert_eq!(&body[..], hub_body.as_bytes(), "错误 body 必须原样保留");
+            assert_eq!(
+                headers.get(header::CONTENT_TYPE).unwrap(),
+                "application/json"
+            );
+            assert!(!String::from_utf8_lossy(&body).contains(TEST_HUB_TOKEN));
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_download_rejects_bad_ids_and_query() {
+        let state = test_state_with_hub("http://127.0.0.1:1");
+        let cookie = session_cookie(&state);
+
+        for id in [
+            "abc",
+            "0",
+            "-1",
+            "1.5",
+            "%2e%2e",
+            "+1",
+            "9999999999999999999",
+        ] {
+            let (status, _, body) = call(
+                &state,
+                Method::GET,
+                &format!("/api/archive/objects/{id}/download"),
+                &[("cookie", &cookie)],
+                Body::empty(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "id={id}");
+            assert_eq!(json_body(&body)["error"], "bad_request", "id={id}");
+        }
+
+        // 多段路径不匹配下载路由，落到 /api/* 兜底 404（仍是 JSON）。
+        let (status, headers, body) = call(
+            &state,
+            Method::GET,
+            "/api/archive/objects/a/b/download",
+            &[("cookie", &cookie)],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(json_body(&body)["error"], "not_found");
+
+        // 下载不接受任何查询参数。
+        let (status, _, body) = call(
+            &state,
+            Method::GET,
+            "/api/archive/objects/42/download?x=1",
+            &[("cookie", &cookie)],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(&body)["error"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn archive_download_rejects_oversized_response_and_network_errors() {
+        // Content-Length 已超 1 GiB：必须直接 502，不读取 body。
+        let payload = b"ignored".to_vec();
+        let (hub_url, _seen) = spawn_raw_mock_hub(
+            200,
+            "Content-Type: application/gzip\r\nContent-Length: 1073741825\r\n",
+            payload,
+        );
+        let state = test_state_with_hub(&hub_url);
+        let cookie = session_cookie(&state);
+        let (status, headers, body) = call(
+            &state,
+            Method::GET,
+            "/api/archive/objects/42/download",
+            &[("cookie", &cookie)],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(json_body(&body)["error"], "archive_too_large");
+        assert!(!String::from_utf8_lossy(&body).contains(TEST_HUB_TOKEN));
+
+        // hub 不可达同样是 502，且不回显 token。
+        let state = test_state_with_hub("http://127.0.0.1:1");
+        let cookie = session_cookie(&state);
+        let (status, _, body) = call(
+            &state,
+            Method::GET,
+            "/api/archive/objects/42/download",
+            &[("cookie", &cookie)],
+            Body::empty(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let text = String::from_utf8_lossy(&body).to_string();
+        assert!(text.contains("hub_unreachable"), "{text}");
+        assert!(!text.contains(TEST_HUB_TOKEN), "{text}");
+    }
+
+    #[test]
+    fn archive_path_helpers_are_strict() {
+        assert!(proxy::validate_archive_object_id("1"));
+        assert!(proxy::validate_archive_object_id("42"));
+        assert!(proxy::validate_archive_object_id("999999999999999999"));
+        for invalid in [
+            "",
+            "0",
+            "-1",
+            "+1",
+            "1.5",
+            " 1",
+            "1 ",
+            "abc",
+            "..",
+            "1/2",
+            "9999999999999999999",
+        ] {
+            assert!(
+                !proxy::validate_archive_object_id(invalid),
+                "id={invalid:?}"
+            );
+        }
+
+        assert!(is_archive_download_path("/api/archive/objects/42/download"));
+        for invalid in [
+            "/api/archive/objects/download",
+            "/api/archive/objects//download",
+            "/api/archive/objects/a/b/download",
+            "/api/archive/objects/42/download/extra",
+            "/api/v1/archive/objects/42/download",
+        ] {
+            assert!(!is_archive_download_path(invalid), "path={invalid:?}");
+        }
     }
 
     #[tokio::test]

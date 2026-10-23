@@ -16,6 +16,8 @@ import type {
   AlertRuleInput,
   AlertSilence,
   AlertSilenceInput,
+  ArchiveObjectListResponse,
+  ArchiveStatus,
   AuditQuery,
   AuditResponse,
   ChannelInput,
@@ -142,6 +144,12 @@ export interface SeriesQuery {
 
 /** 事件分页：limit 默认 50（hub 上限 100），before_id 为排他游标。 */
 export interface AlertEventQuery {
+  limit?: number;
+  beforeId?: number;
+}
+
+/** 归档对象分页：limit 默认 50（hub 上限 100），before_id 为排他游标。 */
+export interface ArchiveObjectQuery {
   limit?: number;
   beforeId?: number;
 }
@@ -343,6 +351,27 @@ export const api = {
       method: "POST",
       ...jsonBody({}),
     });
+  },
+
+  // ---------------------------------------------------------------- M4 归档
+  // 下载不走 fetch（避免把大对象读进 JS 内存），页面直接用同源 <a href>；
+  // 这里只提供状态与对象列表。
+
+  archiveStatus(signal?: AbortSignal): Promise<ArchiveStatus> {
+    return request<ArchiveStatus>("/api/archive/status", { signal });
+  },
+
+  archiveObjects(
+    query: ArchiveObjectQuery = {},
+    signal?: AbortSignal,
+  ): Promise<ArchiveObjectListResponse> {
+    const params = new URLSearchParams();
+    params.set("limit", String(query.limit ?? 50));
+    if (query.beforeId !== undefined) params.set("before_id", String(query.beforeId));
+    return request<ArchiveObjectListResponse>(
+      `/api/archive/objects?${params.toString()}`,
+      { signal },
+    );
   },
 };
 

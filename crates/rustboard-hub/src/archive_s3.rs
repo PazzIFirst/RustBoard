@@ -1,7 +1,8 @@
-//! M4-C2a：S3 / MinIO 冷存储实现。
+//! M4-C2a/C2b：S3 / MinIO 冷存储实现。
 //!
-//! 本模块只提供 [`S3ColdStore`]（`rustboard_core::archive::ColdStore` 的 S3 后端）
-//! 与构造器 [`build_s3_store`]；归档 worker、下载与 UI 属于 C2b，不在本阶段接线。
+//! 本模块提供 [`S3ColdStore`]（`rustboard_core::archive::ColdStore` 的 S3 后端）
+//! 与构造器 [`build_s3_store`]；C2b 起由 `archive::build_store` 接线到归档
+//! worker、`archive run/test` 与下载 API。
 //!
 //! 安全约定：
 //! - 所有对外错误都映射为 [`ArchiveError`] 的固定分类，**绝不**拼接
@@ -12,7 +13,7 @@
 //!   直接拒绝，避免后端异常对象打爆内存；
 //! - 健康检查只写 `health/` 前缀的随机探针对象，失败时尽力删除，不写真实归档目录；
 //! - 构造 [`AmazonS3Builder`] 不发网络请求：凭据、endpoint 只是填入配置，
-//!   连通性由 [`ColdStore::test`] 或 C2b 的显式测试触发。
+//!   连通性由 [`ColdStore::test`] / `archive test` 显式触发。
 //!
 //! TLS：`object_store` 只启用 `aws-base` + `reqwest` + `ring`，不使用会拉入
 //! aws-lc-rs 的 `aws` feature；reqwest 0.13 由 hub 的 `reqwest13` 别名启用

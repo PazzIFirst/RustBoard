@@ -589,11 +589,15 @@ pub(crate) fn required_scope(method: &Method, path: &str) -> Option<TokenScope> 
             | "/api/v1/alerts/silences"
             // M4-B2b：渠道列表只读；CRUD / 测试发送为 Write。
             | "/api/v1/alerts/channels"
-            // M4-C1b：归档状态只读；下载 / 对象列表属于 C4。
+            // M4-C1b / C2b：归档状态、对象列表只读；下载按单段 id 单独匹配。
             | "/api/v1/archive/status"
+            | "/api/v1/archive/objects"
     ) || ["/latest", "/series", "/settings", "/control"]
         .iter()
-        .any(|suffix| is_agent_subroute(path, suffix));
+        .any(|suffix| is_agent_subroute(path, suffix))
+        // 下载路径的 id 由 handler 再校验；这里先按「单段 + /download」认领为
+        // 只读路由，保证非数字 id 也先经过 scope 检查再交给 handler 400。
+        || is_archive_download_subroute(path);
 
     if *method == Method::GET || *method == Method::HEAD {
         return is_read_route.then_some(TokenScope::Read);
@@ -661,6 +665,15 @@ fn is_alert_channel_test_subroute(path: &str) -> bool {
 fn is_agent_subroute(path: &str, suffix: &str) -> bool {
     path.strip_prefix("/api/v1/agents/")
         .and_then(|rest| rest.strip_suffix(suffix))
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// 匹配 `/api/v1/archive/objects/<id>/download`；`<id>` 必须是非空单段。
+///
+/// 不在这里校验数字：handler 负责返回固定 400，但 scope 必须先按 read 生效。
+fn is_archive_download_subroute(path: &str) -> bool {
+    path.strip_prefix("/api/v1/archive/objects/")
+        .and_then(|rest| rest.strip_suffix("/download"))
         .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
@@ -754,6 +767,10 @@ mod tests {
             "/api/v1/alerts/silences",
             "/api/v1/alerts/channels",
             "/api/v1/archive/status",
+            "/api/v1/archive/objects",
+            // 下载路径：数字 id 与（handler 会拒绝的）非数字单段都先要求 read。
+            "/api/v1/archive/objects/42/download",
+            "/api/v1/archive/objects/not-a-number/download",
         ] {
             assert_eq!(
                 required_scope(&Method::GET, path),
@@ -858,6 +875,13 @@ mod tests {
             (&Method::GET, "/api/v1/agents/"),
             (&Method::GET, "/api/v1/agents/a1/settings/extra"),
             (&Method::POST, "/api/v1/agents/a1/settings"),
+            // 归档：集合只有 GET；下载只接受 GET/HEAD 的单段 id 路径。
+            (&Method::POST, "/api/v1/archive/objects"),
+            (&Method::GET, "/api/v1/archive/objects/"),
+            (&Method::GET, "/api/v1/archive/objects/42"),
+            (&Method::POST, "/api/v1/archive/objects/42/download"),
+            (&Method::GET, "/api/v1/archive/objects/a/b/download"),
+            (&Method::GET, "/api/v1/archive/objects//download"),
         ] {
             assert_eq!(
                 required_scope(method, path),

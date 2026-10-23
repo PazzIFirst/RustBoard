@@ -1,7 +1,8 @@
-//! M4-C1b：冷归档 worker、水位与保留期门禁。
+//! M4-C1b/C2b：冷归档 worker、水位与保留期门禁。
 //!
-//! 实现范围（方案 §7.1–7.4 / §10 C1，仅 WebDAV）：
+//! 实现范围（方案 §7.1–7.4 / §10 C1、C2）：
 //!
+//! - [`build_store`]：按配置构造 WebDAV / S3 冷存储；SFTP 属于 C3，显式失败；
 //! - [`spawn_archive_worker`]：仅 `archive.enabled = true` 时启动；每天 UTC
 //!   `schedule_hour_utc` 执行一次，启动时若今天已过计划时间且
 //!   `archive_state.last_archived_ts` 落后则立即补跑。任何错误只 WARN，
@@ -89,7 +90,11 @@ pub(crate) struct ArchiveStatusOutput {
     pub objects: i64,
 }
 
-/// 构建 WebDAV 冷存储；S3 / SFTP 属于 C2 / C3，当前显式失败。
+/// 构建冷存储后端。
+///
+/// - WebDAV / S3 只校验配置并构造客户端，**不发起网络请求**；
+/// - SFTP 属于 C3，尚未实现，显式失败而不是静默降级；
+/// - 任何构造错误都不包含后端 URL / 凭据（由各后端自身保证）。
 pub(crate) fn build_store(cfg: &ArchiveConfig) -> Result<Arc<dyn ColdStore>> {
     match cfg.backend {
         ArchiveBackend::Webdav => {
@@ -97,11 +102,74 @@ pub(crate) fn build_store(cfg: &ArchiveConfig) -> Result<Arc<dyn ColdStore>> {
             let store = WebdavColdStore::new(webdav)?;
             Ok(Arc::new(store))
         }
-        ArchiveBackend::S3 | ArchiveBackend::Sftp => bail!(
-            "归档后端 {} 尚未实现（当前仅支持 webdav，S3 / SFTP 在 C2 / C3 提供）",
-            cfg.backend.as_str()
-        ),
+        ArchiveBackend::S3 => {
+            let s3 = cfg.s3.as_ref().context("缺少 [archive.s3] 配置")?;
+            let store = crate::archive_s3::build_s3_store(s3)?;
+            Ok(Arc::new(store))
+        }
+        ArchiveBackend::Sftp => bail!("归档后端 sftp 尚未实现（计划在 C3 提供）"),
     }
+}
+
+/// 从对象 key 重新构造下载文件名：`rustboard-<yyyyMMdd>-part-NNNNN.csv.gz`。
+///
+/// 只接受 C1a 生成的标准 key 形状（`<prefix>/<yyyy>/<mm>/<dd>/part-NNNNN.csv.gz`）；
+/// 文件名完全由重新校验过的数字段拼接，**绝不**直接截取或回显数据库里的原始
+/// key，因此不存在 header / 路径注入。无法识别时返回 `None`，由 API 层映射为
+/// 固定的 502。
+pub(crate) fn download_filename(object_key: &str) -> Option<String> {
+    let base = object_key.strip_suffix(".csv.gz")?;
+    let mut segments = base.rsplit('/');
+    let shard = segments.next()?;
+    let day = segments.next()?;
+    let month = segments.next()?;
+    let year = segments.next()?;
+    let prefix = segments.next()?;
+    // prefix 是单个路径段（配置校验禁止 `/`）；多段说明不是标准 key。
+    // 同时复用配置 prefix 的字符白名单，拒绝 `..` / 绝对路径伪装。
+    if prefix.is_empty()
+        || prefix.len() > rustboard_core::archive::MAX_ARCHIVE_PREFIX_BYTES
+        || prefix.contains("..")
+        || !prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || segments.next().is_some()
+    {
+        return None;
+    }
+    if year.len() != 4
+        || month.len() != 2
+        || day.len() != 2
+        || !year
+            .bytes()
+            .chain(month.bytes())
+            .chain(day.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let shard_digits = shard.strip_prefix("part-")?;
+    if shard_digits.len() != 5 || !shard_digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let shard_number: u32 = shard_digits.parse().ok()?;
+    if shard_number == 0 {
+        return None;
+    }
+    let (year_value, month_value, day_value) = (
+        year.parse::<u32>().ok()?,
+        month.parse::<u32>().ok()?,
+        day.parse::<u32>().ok()?,
+    );
+    if !(1970..=9999).contains(&year_value)
+        || !(1..=12).contains(&month_value)
+        || !(1..=31).contains(&day_value)
+    {
+        return None;
+    }
+    Some(format!(
+        "rustboard-{year}{month}{day}-part-{shard_digits}.csv.gz"
+    ))
 }
 
 /// 读取归档水位；key 不存在 / 空串视为 `None`，非法整数返回错误。
@@ -981,5 +1049,150 @@ mod tests {
             .set_archive_state(STATE_LAST_ARCHIVED_TS, &eligible.to_string(), 0)
             .unwrap();
         assert!(!should_catch_up(&storage, &cfg, base + 3 * 3_600_000).unwrap());
+    }
+
+    // ------------------------------------------------------------------
+    // M4-C2b：S3 接线与下载文件名
+    // ------------------------------------------------------------------
+
+    fn valid_s3_config() -> rustboard_common::config::ArchiveS3Config {
+        rustboard_common::config::ArchiveS3Config {
+            bucket: "rustboard-test".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            access_key_id: "test-access-key".to_string(),
+            secret_access_key: "test-secret-key".to_string(),
+            path_style: true,
+        }
+    }
+
+    fn test_cfg_s3() -> HubConfig {
+        let mut cfg = test_cfg();
+        cfg.archive.backend = ArchiveBackend::S3;
+        cfg.archive.s3 = Some(valid_s3_config());
+        cfg
+    }
+
+    /// S3 builder 只校验配置 / 构造客户端，不联网；`build_store` 应接受它。
+    #[test]
+    fn build_store_wires_webdav_and_s3_without_network() {
+        let mut cfg = ArchiveConfig {
+            enabled: true,
+            webdav: Some(rustboard_common::config::ArchiveWebdavConfig {
+                url: "http://127.0.0.1:9/dav".to_string(),
+                username: "dav-user".to_string(),
+                password: "dav-password".to_string(),
+            }),
+            ..ArchiveConfig::default()
+        };
+        let webdav = build_store(&cfg).unwrap();
+        drop(webdav);
+
+        cfg.backend = ArchiveBackend::S3;
+        cfg.s3 = Some(valid_s3_config());
+        let s3 = build_store(&cfg).unwrap();
+        drop(s3);
+
+        // 缺少 [archive.s3] 时给出明确错误，且不包含凭据。
+        cfg.s3 = None;
+        let error = build_store(&cfg).err().expect("缺少 S3 配置必须失败");
+        assert!(
+            format!("{error:#}").contains("archive.s3"),
+            "缺少 S3 配置必须明确报错: {error:#}"
+        );
+
+        // SFTP 属于 C3，即便配置完整也必须显式失败，不能静默降级。
+        cfg.backend = ArchiveBackend::Sftp;
+        let error = build_store(&cfg).err().expect("SFTP 必须失败");
+        assert!(
+            format!("{error:#}").contains("sftp"),
+            "SFTP 必须显式报未实现: {error:#}"
+        );
+    }
+
+    /// 用 InMemory 注入的 `S3ColdStore` 跑完整 worker：验证 S3 后端不止能构造，
+    /// 上传 / HEAD 校验 / 状态落库都走同一条真实 S3 代码路径（不联网）。
+    #[tokio::test]
+    async fn s3_worker_uploads_objects_through_injected_store() {
+        use crate::archive_s3::S3ColdStore;
+        use object_store::memory::InMemory;
+
+        let storage = SqliteStorage::open_in_memory().unwrap();
+        let store = S3ColdStore::with_store(Arc::new(InMemory::new()));
+        let cfg = test_cfg_s3();
+        insert_raw_rows(&storage, ARCHIVE_DAY_START + 3_600_000, &[1.0, 2.0, 3.0]);
+
+        let report = run_archive_once_with_limits(&storage, &cfg, &store, TEST_NOW, 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(report.days, 1);
+        assert_eq!(report.objects, 2);
+        assert_eq!(report.rows, 3);
+        assert_eq!(report.watermark, Some(ARCHIVE_DAY_START + TEST_DAY_MS));
+
+        let mut objects = storage.list_archive_objects(10, None).unwrap();
+        objects.sort_by_key(|object| object.id);
+        assert_eq!(objects.len(), 2);
+        for object in &objects {
+            assert_eq!(object.backend, "s3");
+            assert_eq!(object.status, ArchiveStatus::Uploaded);
+            assert!(object.object_key.ends_with(".csv.gz"));
+            assert!(object.manifest_key.ends_with(".manifest.json"));
+            assert_eq!(
+                store
+                    .head(&object.object_key)
+                    .await
+                    .unwrap()
+                    .map(|meta| meta.size),
+                Some(object.bytes),
+                "S3 对象大小必须与数据库记录一致"
+            );
+            assert!(
+                store.head(&object.manifest_key).await.unwrap().is_some(),
+                "manifest 必须上传"
+            );
+        }
+    }
+
+    #[test]
+    fn download_filename_is_rebuilt_from_validated_key_segments() {
+        assert_eq!(
+            download_filename("rustboard/2026/10/24/part-00001.csv.gz").as_deref(),
+            Some("rustboard-20261024-part-00001.csv.gz")
+        );
+        assert_eq!(
+            download_filename("rb-test/1970/01/01/part-99999.csv.gz").as_deref(),
+            Some("rustboard-19700101-part-99999.csv.gz")
+        );
+
+        // 只有标准 key 才能生成文件名；其余一律拒绝，绝不回显原始 key。
+        for key in [
+            "",
+            "rustboard/2026/10/24/part-00001.csv",
+            "rustboard/2026/10/24/part-00001.csv.gz.extra",
+            "rustboard/2026/10/24/part-00001.csv.gz/",
+            "/2026/10/24/part-00001.csv.gz",
+            "rustboard/2026/10/24/part-00000.csv.gz",
+            "rustboard/2026/10/24/part-1.csv.gz",
+            "rustboard/2026/10/24/part-000001.csv.gz",
+            "rustboard/2026/10/24/part-0000a.csv.gz",
+            "rustboard/2026/13/24/part-00001.csv.gz",
+            "rustboard/2026/00/24/part-00001.csv.gz",
+            "rustboard/2026/10/32/part-00001.csv.gz",
+            "rustboard/2026/10/24/part-00001.csv.gz/../../evil.csv.gz",
+            "../2026/10/24/part-00001.csv.gz",
+            "rustboard-../../etc/2026/10/24/part-00001.csv.gz",
+            "rustboard\\2026\\10\\24\\part-00001.csv.gz",
+            "rustboard/2026/10/24/part-00001.csv.gz\r\nX-Injected: 1",
+        ] {
+            assert_eq!(download_filename(key), None, "key={key:?}");
+        }
+
+        let name = download_filename("rustboard/2026/10/24/part-00001.csv.gz").unwrap();
+        assert!(
+            name.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')),
+            "文件名只允许安全字符: {name}"
+        );
     }
 }

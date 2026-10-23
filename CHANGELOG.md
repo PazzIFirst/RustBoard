@@ -23,7 +23,11 @@
 - M4 面板 `/alerts`：规则/事件/渠道/静默四个 tab；渠道 secret 只写不读、测试发送
 - M4 冷归档核心：`[archive]` 配置、CSV.gz/manifest、`ColdStore`、WebDAV 与 S3
   后端、按 UTC 天/分片 worker、`archive test|status|run`、retention 归档门禁
-- M4 数据页：归档对象列表/下载（进行中，见下方未完成）
+- M4-C2b/C4：S3 冷存储接入归档 worker / `archive test` / `archive run`；
+  hub 新增 `GET /api/v1/archive/objects` 游标分页与
+  `GET /api/v1/archive/objects/{id}/download`（read scope、32 MiB 上限、
+  固定 502）；面板新增 `/archive` 数据页与 1 GiB 上限的流式下载代理
+- M4 数据页：归档对象列表/下载、sha256/状态展示、`/archive` 页面
 
 ### Changed
 
@@ -49,7 +53,6 @@
 ### Known
 
 - 归档 SFTP 未实现；WebDAV/S3 已接入，`archive.enabled` 但未配置后端时启动拒绝
-- 归档对象列表/下载与 `/archive` 页面仍在收尾；未完成前不发布 v0.4.0
 - KI-29 降采样 rowid 复用边界（低风险，v0.4.1）
 
 

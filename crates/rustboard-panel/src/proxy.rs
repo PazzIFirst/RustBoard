@@ -10,12 +10,15 @@
 //! - 普通 GET/PUT 连接失败 / 超时 / 响应体读失败 → 502 既有错误码；
 //! - 控制 POST 超过专用超时 → 504 `control_result_unknown`（动作可能已执行）。
 
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
+use http_body::{Body as HttpBody, Frame as BodyFrame, SizeHint};
 use reqwest::redirect::Policy;
 use reqwest::Url;
 use serde_json::Value;
@@ -25,6 +28,15 @@ use serde_json::Value;
 /// hub 的 series 正常响应远小于此（单曲线 ≤2000 点、总线数 ≤50），8 MiB 足够；
 /// 读取时用 `chunk()` 流式累计，超过上限立即中止，而不是先 `bytes()` 全量读入。
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// 归档下载的单次上限（方案 §7.4：1 GiB），与 hub 硬限对齐。
+///
+/// 先校验 `Content-Length`，再在流式转发时按累计字节二次防护；超过上限时
+/// 不把整个对象读进面板内存（通道容量固定，背压生效）。
+const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+/// 下载上游超时：1 GiB 对象在慢链路上远长于普通 API 的 30s。
+const DOWNLOAD_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(600);
+/// 下载流通道容量（块数）；固定容量保证面板内存不随对象大小增长。
+const DOWNLOAD_CHANNEL_CAPACITY: usize = 4;
 /// 面板 → hub 的普通请求超时。series 查询最多 730 天（1h 自动分桶），留足时间。
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// 控制 POST 专用的上游超时。
@@ -53,6 +65,8 @@ pub enum ProxyError {
     Timeout(String),
     /// hub 返回了异常巨大的响应。
     TooLarge,
+    /// 归档下载超过 1 GiB 上限（响应头或流式累计）。
+    DownloadTooLarge,
     /// 读响应体失败。
     Body(String),
     /// 读响应体超时（已收到响应头、未读完 body）；控制路径会转成 [`Self::Timeout`]。
@@ -65,6 +79,7 @@ impl ProxyError {
             ProxyError::Unreachable(_) => "hub_unreachable",
             ProxyError::Timeout(_) => "control_result_unknown",
             ProxyError::TooLarge => "hub_response_too_large",
+            ProxyError::DownloadTooLarge => "archive_too_large",
             ProxyError::Body(_) | ProxyError::BodyTimeout(_) => "hub_body_error",
         }
     }
@@ -216,6 +231,80 @@ impl ProxyClient {
             .bearer_auth(&self.token)
             .header(header::ACCEPT, "application/json");
         send(self, request).await
+    }
+
+    /// 归档下载：把 hub 的响应体**流式**转给浏览器，不经过 8 MiB JSON 缓冲。
+    ///
+    /// - 注入 Bearer token 只发生在面板 → hub 的请求头，响应与日志都不包含 token；
+    /// - 成功响应只保留 `Content-Type: application/gzip`、经过白名单校验的
+    ///   `Content-Disposition` 与 `Content-Length`，并强制 `private, no-store`；
+    /// - 超过 1 GiB（响应头或流式累计）→ [`ProxyError::DownloadTooLarge`]；
+    /// - hub 的 4xx/5xx（404 / 409 / 502 等）按原状态码与 JSON body 透传，
+    ///   前端 `<a href>` 下载失败时仍能看到固定错误码。
+    pub async fn download(&self, path: &str) -> std::result::Result<Response, ProxyError> {
+        let url = self
+            .endpoint(path, &[])
+            .map_err(|e| ProxyError::Unreachable(e.to_string()))?;
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.token)
+            .header(header::ACCEPT, "application/gzip")
+            .timeout(DOWNLOAD_UPSTREAM_TIMEOUT)
+            .send()
+            .await
+            // 下载链路不把 hub URL / 证书路径写进错误详情：只返回固定 502。
+            .map_err(|_| ProxyError::Unreachable("归档下载请求失败".to_string()))?;
+        let status =
+            StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+
+        // 非 2xx 走既有 JSON 透传（含 401 日志与固定 body），不启动下载流。
+        // 读错误响应失败同样只保留固定文案，避免日志出现后端 URL。
+        if !status.is_success() {
+            return collect_reply(response)
+                .await
+                .map(hub_reply_to_response_verbatim)
+                .map_err(|_| ProxyError::Body("归档下载错误响应读取失败".to_string()));
+        }
+
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_DOWNLOAD_BYTES)
+        {
+            return Err(ProxyError::DownloadTooLarge);
+        }
+        let content_length = response.content_length();
+        let disposition = sanitize_download_disposition(response.headers());
+
+        let mut out = Response::new(Body::new(spawn_download_pump(
+            response,
+            MAX_DOWNLOAD_BYTES,
+            content_length,
+        )));
+        *out.status_mut() = status;
+        let headers = out.headers_mut();
+        // 上游类型不可信：只允许 gzip，避免把 text/html 之类带到浏览器。
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/gzip"),
+        );
+        if let Some(disposition) = disposition {
+            headers.insert(header::CONTENT_DISPOSITION, disposition);
+        }
+        if let Some(length) = content_length {
+            if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
+                headers.insert(header::CONTENT_LENGTH, value);
+            }
+        }
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        headers.insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        );
+        Ok(out)
     }
 
     pub async fn put_json(
@@ -392,6 +481,108 @@ fn redact_url(message: &str) -> String {
     message.split('?').next().unwrap_or(message).to_string()
 }
 
+/// 只保留符合 `attachment; filename="rustboard-...csv.gz"` 且字符安全的
+/// `Content-Disposition`；其它值一律丢弃，防止把不可信 header 带到浏览器。
+fn sanitize_download_disposition(headers: &HeaderMap) -> Option<HeaderValue> {
+    let raw = headers.get(header::CONTENT_DISPOSITION)?.to_str().ok()?;
+    let filename = raw
+        .strip_prefix("attachment; filename=\"")?
+        .strip_suffix('"')?;
+    if filename.is_empty()
+        || filename.len() > 128
+        || !filename.starts_with("rustboard-")
+        || !filename.ends_with(".csv.gz")
+    {
+        return None;
+    }
+    if !filename
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    HeaderValue::from_str(raw).ok()
+}
+
+/// 启动下载泵任务：按块读取 hub 响应并送入固定容量通道。
+///
+/// 通道提供背压，面板内存与对象大小无关；浏览器断开（接收端 drop）时
+/// `send` 失败，任务立即退出。累计字节超过 `limit` 时向 body 报错并停止。
+fn spawn_download_pump(
+    mut response: reqwest::Response,
+    limit: u64,
+    content_length: Option<u64>,
+) -> DownloadStreamBody {
+    let (sender, receiver) = tokio::sync::mpsc::channel(DOWNLOAD_CHANNEL_CAPACITY);
+    tokio::spawn(async move {
+        let mut received = 0u64;
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    received = received.saturating_add(chunk.len() as u64);
+                    if received > limit {
+                        let _ = sender
+                            .send(Err(std::io::Error::other("归档下载超过 1 GiB 上限")))
+                            .await;
+                        return;
+                    }
+                    if sender.send(Ok(chunk)).await.is_err() {
+                        // 客户端取消 / 连接关闭：停止读取上游，释放连接。
+                        return;
+                    }
+                }
+                Ok(None) => return,
+                Err(_error) => {
+                    // 流式阶段不再暴露 hub 地址 / token；客户端只会看到截断的下载。
+                    let _ = sender
+                        .send(Err(std::io::Error::other("读取归档下载流失败")))
+                        .await;
+                    return;
+                }
+            }
+        }
+    });
+    DownloadStreamBody {
+        receiver,
+        size: content_length,
+    }
+}
+
+/// 流式下载响应体：把通道里的块适配成 `http_body::Body`。
+///
+/// 不缓存完整对象；`size` 来自上游 `Content-Length`，用于保留该响应头所需的
+/// 精确大小提示（缺失时按 chunked 转发）。
+struct DownloadStreamBody {
+    receiver: tokio::sync::mpsc::Receiver<std::result::Result<Bytes, std::io::Error>>,
+    size: Option<u64>,
+}
+
+impl HttpBody for DownloadStreamBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<BodyFrame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match this.receiver.poll_recv(cx) {
+            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(BodyFrame::data(chunk)))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let mut hint = SizeHint::default();
+        if let Some(size) = self.size {
+            hint.set_exact(size);
+        }
+        hint
+    }
+}
+
 /// 把 hub 的响映射成浏览器可用的响应。
 ///
 /// 无论上游返回什么 `Content-Type`，面板 `/api/*` 一律声明 `application/json`：
@@ -463,6 +654,10 @@ pub fn proxy_error_to_response(error: &ProxyError) -> Response {
             json_error(StatusCode::BAD_GATEWAY, error.code())
         }
         ProxyError::TooLarge => json_error(StatusCode::BAD_GATEWAY, error.code()),
+        ProxyError::DownloadTooLarge => {
+            tracing::warn!("归档下载超过 1 GiB 上限，已拒绝");
+            json_error(StatusCode::BAD_GATEWAY, error.code())
+        }
     }
 }
 
@@ -518,6 +713,17 @@ pub fn validate_agent_id(id: &str) -> bool {
 /// `/rules/{id}`、`/channels/{id}`、`/channels/{id}/test` 与 `/silences/{id}`。
 pub fn validate_alert_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// 归档对象路径 id：只允许 1..=18 位 ASCII 十进制数字且大于 0。
+///
+/// Axum 会先解码 `%2e%2e` 等转义；这里按解码后的值校验，因此 `..`、`a/b`、
+/// `+1`、`1.5` 与科学计数法全部被拒绝，避免把任意路径拼进上游 URL。
+pub fn validate_archive_object_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 18
+        && id.bytes().all(|byte| byte.is_ascii_digit())
+        && id.parse::<i64>().is_ok_and(|value| value > 0)
 }
 
 /// 查询串解析错误。

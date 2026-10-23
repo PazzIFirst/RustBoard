@@ -4,6 +4,7 @@ import Layout from "./components/Layout";
 import AgentControlPage from "./pages/AgentControl";
 import AgentDetailPage from "./pages/AgentDetail";
 import AlertsPage from "./pages/Alerts";
+import ArchivePage from "./pages/Archive";
 import AuditPage from "./pages/Audit";
 import LoginPage from "./pages/Login";
 import OverviewPage from "./pages/Overview";
@@ -46,6 +47,7 @@ export default function App() {
           <Route path="/agents/:id/control" element={<AgentControlPage />} />
           <Route path="/agents/:id" element={<AgentDetailPage />} />
           <Route path="/alerts" element={<AlertsPage />} />
+          <Route path="/archive" element={<ArchivePage />} />
           <Route path="/audit" element={<AuditPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
