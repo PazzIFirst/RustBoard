@@ -253,6 +253,22 @@
   拒绝 WARN，其余 DEBUG；补单测与 e2e 计数断言。不改变拒绝行为。
 - **关联**：v0.3.5 渗透报告 L1；KI-01 的单 IP 连接限制。
 
+### KI-29 降采样 rowid 水位复用边界（v0.4.0 已知低风险）
+
+- **现象**：SQLite 的 `samples` 未使用 `AUTOINCREMENT`。若“当前最大 rowid”的 raw 行
+  恰好是迟到旧数据、先被 retention 删除，随后新的迟到行复用了同一 rowid，则
+  `downsample_1m_last_raw_rowid` 水位可能把它误判为“已认领”，导致该行不触发
+  1m/1h 重算。整表清空时的 rowid 回退已显式处理；这是更窄的中间态。
+- **影响**：低。需要同时满足“最大 rowid 行是迟到旧数据 + 被 retention 删除 +
+  后续迟到行复用同一 rowid”，常规 10–24h 重放与默认 7 天保留路径不触发。
+- **缓解**：升级/迁移不自动清理历史 raw；归档/retention 前确认无长期离线 agent；
+  如怀疑命中，`rustboard-hub maintenance run --task downsample` 后检查
+  `maintenance_state` 与 1m/1h 桶。
+- **修复方案（v0.4.1）**：为 raw 增加不复用的单调 ingest 序列（独立计数器或
+  `AUTOINCREMENT` 新表），或在删除最大 rowid 后失效 rowid 水位；补“删最大行后
+  插入迟到行”回归。查询/告警/归档功能不受影响。
+- **关联**：M4-A2 复审建议；v0.4.0 发布说明。
+
 ### KI-13 ~ KI-16 设计/部署限制（不修复）
 
 - **KI-13**：v0.1 agent 仍用指纹钉扎，服务端证书轮换后失联。升级到 v0.2+ 或重新纳管；发布说明与 status.md 保留。
