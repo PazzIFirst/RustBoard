@@ -3625,6 +3625,20 @@ fn archive_count_from_row(value: i64, column: usize, field: &'static str) -> rus
     u64::try_from(value).map_err(|_| archive_object_column_error(column, field))
 }
 
+/// 一行待归档的 raw 采样；`rowid` 用于按升序分批扫描（见
+/// [`SqliteStorage::scan_archive_rows`]）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArchiveRawRow {
+    /// `samples` 表的隐式 `rowid`，升序扫描的游标。
+    pub rowid: i64,
+    pub agent_id: String,
+    pub metric: String,
+    /// labels 的原始 JSON 文本（不做归一化，保持与 CSV 输出一致）。
+    pub labels: String,
+    pub ts: i64,
+    pub value: f64,
+}
+
 /// 一行 `archive_objects` 映射成 [`ArchiveObject`]。
 fn row_to_archive_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveObject> {
     let status: String = row.get(9)?;
@@ -3829,6 +3843,50 @@ impl SqliteStorage {
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![from_ts, to_ts], row_to_archive_object)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 按 `rowid` 升序分批扫描 raw 采样，供归档 worker 生成 CSV.GZ。
+    ///
+    /// - 时间范围是左闭右开 `[from_ts, to_ts)`；
+    /// - `after_rowid` 是上一批最后一条的 `rowid`（排他），`None` 表示从该
+    ///   时间范围的第一条开始；
+    /// - `limit == 0` 返回空列表；SQL 全部参数化，不接受外部拼接；
+    /// - 返回顺序严格按 `rowid ASC`，调用方据此把连续行切成归档分片，并在
+    ///   中断后从最后一条继续。
+    pub fn scan_archive_rows(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        after_rowid: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ArchiveRawRow>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.lock_read();
+        let mut stmt = conn.prepare(
+            "SELECT rowid, agent_id, metric, labels, ts, value FROM samples \
+             WHERE ts >= ?1 AND ts < ?2 AND (?3 IS NULL OR rowid > ?3) \
+             ORDER BY rowid ASC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![from_ts, to_ts, after_rowid, limit], |row| {
+            Ok(ArchiveRawRow {
+                rowid: row.get(0)?,
+                agent_id: row.get(1)?,
+                metric: row.get(2)?,
+                labels: row.get(3)?,
+                ts: row.get(4)?,
+                value: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// `archive_objects` 的总行数（`archive status` / 面板状态用）。
+    pub fn count_archive_objects(&self) -> Result<i64> {
+        let conn = self.lock_read();
+        Ok(conn.query_row("SELECT COUNT(*) FROM archive_objects", [], |row| row.get(0))?)
     }
 }
 

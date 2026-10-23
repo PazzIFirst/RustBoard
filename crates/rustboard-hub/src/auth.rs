@@ -589,6 +589,8 @@ pub(crate) fn required_scope(method: &Method, path: &str) -> Option<TokenScope> 
             | "/api/v1/alerts/silences"
             // M4-B2b：渠道列表只读；CRUD / 测试发送为 Write。
             | "/api/v1/alerts/channels"
+            // M4-C1b：归档状态只读；下载 / 对象列表属于 C4。
+            | "/api/v1/archive/status"
     ) || ["/latest", "/series", "/settings", "/control"]
         .iter()
         .any(|suffix| is_agent_subroute(path, suffix));
@@ -751,6 +753,7 @@ mod tests {
             "/api/v1/alerts/events",
             "/api/v1/alerts/silences",
             "/api/v1/alerts/channels",
+            "/api/v1/archive/status",
         ] {
             assert_eq!(
                 required_scope(&Method::GET, path),

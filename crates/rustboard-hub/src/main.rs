@@ -43,7 +43,7 @@ use rustboard_common::wire::{codes, AgentHello, EnrollRequest, Frame, Welcome};
 use rustboard_common::{DEFAULT_HUB_CONFIG, PROTOCOL_VERSION, VERSION};
 use rustboard_core::alerts::builtin_rules;
 use rustboard_core::collect::default_collectors;
-use rustboard_core::downsample::{self, ArchiveGate};
+use rustboard_core::downsample;
 use rustboard_core::storage::sqlite::SqliteStorage;
 use rustboard_core::storage::{
     AgentSeriesRow, IngestOutcome, QueryTooLarge, SampleTier, Storage, AUDIT_RETENTION_MS,
@@ -55,8 +55,9 @@ use tower::ServiceExt;
 
 mod alerts;
 mod alerts_engine;
-#[allow(dead_code)] // C2b 归档 worker / 下载接线前，S3 ColdStore 暂无调用方
+mod archive;
 mod archive_s3;
+mod archive_webdav;
 mod auth;
 mod cert_rotation;
 mod channels;
@@ -289,6 +290,11 @@ enum Cmd {
         #[command(subcommand)]
         action: MaintenanceAction,
     },
+    /// M4 冷归档：测试 WebDAV 后端、查看状态、手动执行一轮（JSON 输出）。
+    Archive {
+        #[command(subcommand)]
+        action: ArchiveAction,
+    },
 }
 
 /// `maintenance` 子命令（M4-A2）。
@@ -316,6 +322,26 @@ enum MaintenanceTask {
     Downsample,
     /// 按 `retention_*_days` 分批删除过期数据。
     Retention,
+}
+
+/// `archive` 子命令（M4-C1b）。
+#[derive(Subcommand)]
+enum ArchiveAction {
+    /// 写入/读取/删除一个小探针对象，验证后端连通性与凭据。
+    Test {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// 输出 enabled / backend / 水位 / 最近运行 / 对象数（JSON）。
+    Status {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// 立即执行一轮归档（忽略每日计划时间，同样只处理已到期数据）。
+    Run {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -459,6 +485,7 @@ fn main() -> Result<()> {
         },
         Cmd::Ports { config } => print_ports(config),
         Cmd::Maintenance { action } => maintenance_command(action),
+        Cmd::Archive { action } => archive_command(action),
     }
 }
 
@@ -706,8 +733,9 @@ fn open_maintenance_storage(config: Option<PathBuf>) -> Result<(SqliteStorage, H
 
 /// 执行一次维护任务并返回 JSON（调用方负责打印）。
 ///
-/// CLI 用 `max_backfill_hours = None`：手动执行要一直处理到追平。retention 传
-/// `ArchiveGate::Disabled`（M4-C 接入归档后按配置传 `Enabled`）。
+/// CLI 用 `max_backfill_hours = None`：手动执行要一直处理到追平。retention 的
+/// 归档门禁与 hub 后台任务一致：`archive.enabled = true` 时读取
+/// `archive_state.last_archived_ts`，缺失水位会阻止 raw 删除。
 fn maintenance_run_json(config: Option<PathBuf>, task: MaintenanceTask) -> Result<String> {
     let (storage, cfg) = open_maintenance_storage(config)?;
     let now = now_ms();
@@ -718,7 +746,8 @@ fn maintenance_run_json(config: Option<PathBuf>, task: MaintenanceTask) -> Resul
             serde_json::to_value(report)?
         }
         MaintenanceTask::Retention => {
-            let report = downsample::run_retention(&storage, &cfg, now, ArchiveGate::Disabled)
+            let gate = archive::archive_gate(&storage, &cfg);
+            let report = downsample::run_retention(&storage, &cfg, now, gate)
                 .context("保留期任务失败（task=retention）")?;
             serde_json::to_value(report)?
         }
@@ -749,6 +778,74 @@ fn maintenance_status_json(config: Option<PathBuf>) -> Result<String> {
         maintenance_interval_secs: cfg.maintenance_interval_secs,
     };
     Ok(serde_json::to_string_pretty(&output)?)
+}
+
+// ---------------------------------------------------------------------------
+// M4-C1b：archive CLI（后端测试 / 状态 / 手动执行）
+// ---------------------------------------------------------------------------
+
+/// `archive` 子命令入口：只负责打印，业务函数返回可测试的 JSON 字符串。
+fn archive_command(action: ArchiveAction) -> Result<()> {
+    match action {
+        ArchiveAction::Test { config } => println!("{}", archive_test_json(config)?),
+        ArchiveAction::Status { config } => println!("{}", archive_status_json(config)?),
+        ArchiveAction::Run { config } => println!("{}", archive_run_json(config)?),
+    }
+    Ok(())
+}
+
+/// `archive test`：显式测试 WebDAV 后端（写入/读取/删除探针对象）。
+///
+/// 成功输出固定 JSON；失败返回固定 [`rustboard_core::archive::ArchiveError`]，
+/// 不打印 URL / 用户名 / 密码 / 响应正文。测试不会启动 hub，也不需要证书。
+fn archive_test_json(config: Option<PathBuf>) -> Result<String> {
+    let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
+    let cfg = load_config(&path)?;
+    cfg.validate().context("归档配置校验失败")?;
+    if cfg.archive.backend != rustboard_common::config::ArchiveBackend::Webdav {
+        bail!("当前仅支持 webdav 归档后端（S3 / SFTP 在 C2 / C3 提供）");
+    }
+    let store = archive::build_store(&cfg.archive)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("初始化归档测试运行时失败")?;
+    runtime
+        .block_on(store.test())
+        .context("归档后端连通性测试失败")?;
+    Ok(serde_json::to_string(&serde_json::json!({
+        "ok": true,
+        "backend": cfg.archive.backend.as_str(),
+    }))?)
+}
+
+/// `archive status`：读取 `archive_state` / `archive_objects`，输出固定 JSON。
+fn archive_status_json(config: Option<PathBuf>) -> Result<String> {
+    let (storage, cfg) = open_maintenance_storage(config)?;
+    let status = archive::status(&storage, &cfg).context("读取归档状态失败")?;
+    Ok(serde_json::to_string_pretty(&status)?)
+}
+
+/// `archive run`：立即执行一轮归档（忽略每日计划时间，仍只处理已到期数据）。
+fn archive_run_json(config: Option<PathBuf>) -> Result<String> {
+    let (storage, cfg) = open_maintenance_storage(config)?;
+    if !cfg.archive.enabled {
+        bail!("归档未启用（archive.enabled = false）");
+    }
+    let store = archive::build_store(&cfg.archive)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("初始化归档运行时时失败")?;
+    let report = runtime
+        .block_on(archive::run_archive_once(
+            &storage,
+            &cfg,
+            store.as_ref(),
+            now_ms(),
+        ))
+        .context("归档任务失败（archive run）")?;
+    Ok(serde_json::to_string_pretty(&report)?)
 }
 
 // init 的参数与 `init` 子命令的 CLI 字段一一对应，拆结构体只会多一层搬运。
@@ -1260,6 +1357,9 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         // M4：降采样 + 保留期后台任务。启动后先睡一个周期，不做同步 backfill，
         // 不阻塞监听；每轮在 spawn_blocking 内串行执行。
         spawn_maintenance(storage.clone(), cfg.clone());
+        // M4-C1b：冷归档 worker。`archive.enabled = false` 时只记日志不启动；
+        // 启动时若今天已过计划时间且水位落后，会立即补跑一轮。
+        archive::spawn_archive_worker(storage.clone(), cfg.clone());
         // M4-B1b：告警评估任务。`alerts.enabled = false` 时只记日志不启动；
         // 启动后同样先睡一个周期，避免与监听 / 维护任务抢写锁。
         alerts_engine::spawn_alert_engine(storage.clone(), cfg.clone());
@@ -1777,6 +1877,8 @@ fn admin_router(state: AppState) -> Router {
         )
         // M4-B2b：通知渠道 CRUD 与测试发送。渠道请求体单独放宽到 1 MiB。
         .merge(channel_routes())
+        // M4-C1b：归档状态只读（下载 / 对象列表属于 C4）。
+        .route("/api/v1/archive/status", get(archive_status))
         // KI-08：未知 /api/v1/* 也要先过 Bearer 再 404，不能泄露路由是否存在。
         .route("/api/v1", any(api_not_found))
         .route("/api/v1/{*rest}", any(api_not_found))
@@ -1799,6 +1901,22 @@ async fn api_not_found() -> (StatusCode, Json<serde_json::Value>) {
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({ "error": "not_found" })),
     )
+}
+
+/// `GET /api/v1/archive/status`：归档开关 / 后端 / 水位 / 最近运行 / 对象数。
+///
+/// 只返回配置中的后端类型与状态，不返回 WebDAV URL 或凭据；SQLite 读取放到
+/// `spawn_blocking`，避免阻塞 async worker。
+async fn archive_status(
+    State(state): State<AppState>,
+) -> Result<Json<archive::ArchiveStatusOutput>, ApiError> {
+    let storage = state.storage.clone();
+    let cfg = state.cfg.clone();
+    let status = tokio::task::spawn_blocking(move || archive::status(&storage, &cfg))
+        .await
+        .map_err(ApiError::from)?
+        .map_err(ApiError::from)?;
+    Ok(Json(status))
 }
 
 /// 管理 API 全部响应禁止缓存（含 token 的 401 与实时指标）。
@@ -4340,7 +4458,9 @@ fn spawn_self_monitor(storage: Arc<SqliteStorage>, cfg: HubConfig) {
 /// 语义（与方案 §5.1 / §5.3 一致）：
 /// - 每 `maintenance_interval_secs` 执行一轮；启动后先睡一个周期，**不在启动时
 ///   同步跑大 backfill**，监听不会被占用；
-/// - 每轮先 `run_downsample(..., Some(6))`，再 `run_retention(..., ArchiveGate::Disabled)`；
+/// - 每轮先 `run_downsample(..., Some(6))`，再 `run_retention(...)`；retention
+///   的归档门禁由 [`archive::archive_gate`] 按配置生成（启用归档但无水位时阻止
+///   删除 raw）；
 /// - SQLite 读写全部在 `spawn_blocking` 里，单轮串行不重叠；
 /// - 任何错误只 WARN 并写入 `maintenance_state.last_error`，任务不退出，
 ///   下一轮重试。
@@ -4381,7 +4501,8 @@ fn run_maintenance_round(storage: &SqliteStorage, cfg: &HubConfig) {
             errors.push(message);
         }
     }
-    match downsample::run_retention(storage, cfg, now, ArchiveGate::Disabled) {
+    let gate = archive::archive_gate(storage, cfg);
+    match downsample::run_retention(storage, cfg, now, gate) {
         Ok(report) => tracing::debug!(?report, "维护任务：保留期完成"),
         Err(err) => {
             let message = format!("retention: {err:#}");
@@ -9311,6 +9432,200 @@ mod tests {
             "配置非法时不得打开/创建数据库"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M4-C1b：`archive test/status/run` 子命令解析；不与 maintenance 冲突。
+    #[test]
+    fn m4c1b_archive_cli_parses_subcommands() {
+        assert!(matches!(
+            Cli::try_parse_from(["rustboard-hub", "archive", "test", "--config", "hub.toml"])
+                .unwrap()
+                .cmd,
+            Cmd::Archive {
+                action: ArchiveAction::Test { .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["rustboard-hub", "archive", "status"])
+                .unwrap()
+                .cmd,
+            Cmd::Archive {
+                action: ArchiveAction::Status { .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["rustboard-hub", "archive", "run", "--config", "hub.toml"])
+                .unwrap()
+                .cmd,
+            Cmd::Archive {
+                action: ArchiveAction::Run { .. }
+            }
+        ));
+        // maintenance 只接受 downsample / retention，archive 走独立子命令。
+        assert!(
+            Cli::try_parse_from(["rustboard-hub", "maintenance", "run", "--task", "archive"])
+                .is_err()
+        );
+    }
+
+    /// M4-C1b：`archive status` 输出固定 JSON；`archive test` 未配置 WebDAV 时
+    /// 返回固定错误，不创建数据库、不打印凭据。
+    #[test]
+    fn m4c1b_archive_status_and_test_cli_emit_fixed_outputs() {
+        let dir = temp_dir("archive-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            database: format!("sqlite://{}", dir.join("rustboard.db").display()),
+            admin_token: String::new(),
+            ..HubConfig::default()
+        };
+        let cfg_path = dir.join("hub.toml");
+        cfg.save(&cfg_path).unwrap();
+
+        // `archive test` 只读配置，不应创建数据库；先跑它再跑 status。
+        let message = format!(
+            "{:#}",
+            archive_test_json(Some(cfg_path.clone())).unwrap_err()
+        );
+        assert!(message.contains("webdav"), "错误必须点明后端: {message}");
+        assert!(!message.contains("password"), "错误不得包含凭据: {message}");
+        assert!(
+            !dir.join("rustboard.db").exists(),
+            "archive test 不应打开数据库"
+        );
+
+        let status: serde_json::Value =
+            serde_json::from_str(&archive_status_json(Some(cfg_path.clone())).unwrap()).unwrap();
+        assert_eq!(status["enabled"], false);
+        assert_eq!(status["backend"], "webdav");
+        assert!(status["last_archived_ts"].is_null());
+        assert!(status["last_run"].is_null());
+        assert!(status["last_error"].is_null());
+        assert_eq!(status["objects"], 0);
+
+        let message = format!("{:#}", archive_run_json(Some(cfg_path)).unwrap_err());
+        assert!(
+            message.contains("archive.enabled"),
+            "未启用时必须明确拒绝: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M4-C1b：`maintenance run --task retention` 必须使用归档门禁：
+    /// 归档已启用但水位缺失时 raw 不删；水位覆盖 cutoff 后才删。
+    #[test]
+    fn m4c1b_maintenance_retention_uses_archive_watermark() {
+        use rustboard_common::config::ArchiveWebdavConfig;
+        use rustboard_common::model::SampleBatch;
+        use rustboard_core::downsample::STATE_DOWNSAMPLE_1M_WATERMARK;
+
+        let dir = temp_dir("archive-gate-retention");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = HubConfig {
+            data_dir: dir.clone(),
+            database: format!("sqlite://{}", dir.join("rustboard.db").display()),
+            admin_token: String::new(),
+            retention_raw_days: 7,
+            ..HubConfig::default()
+        };
+        cfg.archive.enabled = true;
+        cfg.archive.after_days = 7;
+        cfg.archive.webdav = Some(ArchiveWebdavConfig {
+            // 不需要真实连通：retention 只读水位，不构建后端。
+            url: "http://127.0.0.1:9/rustboard".to_string(),
+            username: "user".to_string(),
+            password: "password".to_string(),
+        });
+        let cfg_path = dir.join("hub.toml");
+        cfg.save(&cfg_path).unwrap();
+
+        let now = now_ms();
+        let db_path = dir.join("rustboard.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let batch = SampleBatch {
+            agent_id: "agent-1".to_string(),
+            epoch: 1,
+            seq: 1,
+            boot_id: "boot".to_string(),
+            sent_at: now - 10 * 86_400_000,
+            samples: (0..3)
+                .map(|index| Sample::new("cpu.usage", now - 10 * 86_400_000 + index, index as f64))
+                .collect(),
+        };
+        assert!(matches!(
+            storage.insert_batch(&batch).unwrap(),
+            rustboard_core::storage::IngestOutcome::Inserted { inserted: 3 }
+        ));
+        storage
+            .set_maintenance_state(STATE_DOWNSAMPLE_1M_WATERMARK, &now.to_string(), now)
+            .unwrap();
+        drop(storage);
+
+        let report: serde_json::Value = serde_json::from_str(
+            &maintenance_run_json(Some(cfg_path.clone()), MaintenanceTask::Retention).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["raw"]["deleted"], 0);
+        assert_eq!(report["raw"]["blocked_by_archive"], true);
+        assert_eq!(
+            SqliteStorage::open(&db_path)
+                .unwrap()
+                .raw_stats()
+                .unwrap()
+                .rows,
+            3,
+            "无归档水位时 raw 必须保留"
+        );
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .set_archive_state("last_archived_ts", &now.to_string(), now)
+            .unwrap();
+        drop(storage);
+        let report: serde_json::Value = serde_json::from_str(
+            &maintenance_run_json(Some(cfg_path), MaintenanceTask::Retention).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["raw"]["deleted"], 3);
+        assert_eq!(report["raw"]["blocked_by_archive"], false);
+        assert_eq!(
+            SqliteStorage::open(&db_path)
+                .unwrap()
+                .raw_stats()
+                .unwrap()
+                .rows,
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M4-C1b：`GET /api/v1/archive/status` 需要 read scope，响应不含凭据。
+    #[tokio::test]
+    async fn m4c1b_archive_status_api_requires_read_scope() {
+        let state = v6_auth_state();
+        let router = admin_router(state.clone());
+
+        let (status, _, body) =
+            admin_call(&router, "GET", "/api/v1/archive/status", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(json_body(&body)["error"], "unauthorized");
+
+        let read = v6_seed_token(&state, "archive-read", "read");
+        let (status, _, body) =
+            admin_call(&router, "GET", "/api/v1/archive/status", Some(&read), None).await;
+        assert_eq!(status, StatusCode::OK, "read token 应可读归档状态");
+        let body = json_body(&body);
+        assert_eq!(body["enabled"], false);
+        assert_eq!(body["backend"], "webdav");
+        assert_eq!(body["objects"], 0);
+        assert!(body.get("url").is_none(), "不得返回后端 URL");
+
+        // write 隐含 read；未知方法仍交给路由 405，不提前 403。
+        let write = v6_seed_token(&state, "archive-write", "write");
+        let (status, _, _) =
+            admin_call(&router, "GET", "/api/v1/archive/status", Some(&write), None).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// M4-A2：后台单轮串行执行，失败写 last_error、整轮成功后清空。
