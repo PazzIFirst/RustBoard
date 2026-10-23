@@ -257,7 +257,7 @@ class WebSocket:
     """最小 RFC 6455 客户端：二进制帧 + ping/pong/close。"""
 
     def __init__(self, url: str, ca: str, cert: str | None, key: str | None,
-                 timeout: float = 8.0):
+                 timeout: float = 8.0, bind_ip: str | None = None):
         parts = urllib.parse.urlsplit(url)
         if parts.scheme != "wss":
             raise ProbeError(f"只支持 wss://，收到 {url}")
@@ -277,7 +277,11 @@ class WebSocket:
         elif cert or key:
             raise ProbeError("--cert 与 --key 必须同时提供")
 
-        raw = socket.create_connection((host, port), timeout=timeout)
+        # bind_ip 用于 e2e 模拟不同来源 IP；None 时保持 create_connection 默认行为。
+        source_address = (bind_ip, 0) if bind_ip else None
+        raw = socket.create_connection(
+            (host, port), timeout=timeout, source_address=source_address
+        )
         try:
             self.sock = context.wrap_socket(raw, server_hostname=host)
         except Exception:

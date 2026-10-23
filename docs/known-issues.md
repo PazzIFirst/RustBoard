@@ -4,7 +4,7 @@
 > 修复后在条目里补「修复版本 + 提交/PR + 回归测试」，状态改为 `已修复`；不要删除历史条目。
 > 设计取舍与部署限制单独放在 [status.md](status.md#已知限制)，本文件只跟踪**可修复的缺陷**。
 >
-> 最后更新：2026-10-23
+> 最后更新：2026-10-24
 
 ## 状态与级别
 
@@ -43,7 +43,8 @@
 | KI-23 | 低 | 控制面白名单 | 不修复 | 文档 | `nginx*` 前缀会匹配 `nginx-evil`；这是前缀通配语义，部署时需写更精确的模式 |
 | KI-24 | 低 | 控制面能力 | 已修复 | v0.3.4 | 同 agent 多连接时能力缓存可被新 Hello 覆盖；v0.3.4 起以最新连接为准并支持断开回退 |
 | KI-26 | 中 | 管理 API 认证 | 已修复 | v0.3.4 | 未认证 401 不受管理限速；v0.3.4 起按来源 IP 失败限速，超限 429 且不查库 |
-| KI-27 | 中 | hub 接入层 | 待修复 | v0.3.5 | WebSocket 升级后 TLS 单 IP 许可提前释放；同一 IP 可占满全局 session slots，其他 agent 重连 503 |
+| KI-27 | 中 | hub 接入层 | 已修复 | v0.3.5 | WebSocket 升级后 TLS 单 IP 许可提前释放；v0.3.5 起全局 + per-IP 许可持有到会话结束 |
+| KI-28 | 低 | hub 接入层 | 待修复 | v0.4.0 | 单 IP 连接超限的 WARN 未采样，持续洪水可放大日志/告警 |
 | KI-25 | — | 审计信任边界 | 不修复 | 文档 | agent 是控制动作执行者与结果来源，被控 agent 可伪造成功；审计不能抵抗 |
 | KI-13 | — | agent 升级 | 不修复 | 文档 | v0.1 agent 使用指纹钉扎，服务端证书轮换后会失联 |
 | KI-14 | — | 客户端轮换 | 不修复 | 文档 | 续签复用原私钥，无法补救私钥泄露 |
@@ -223,18 +224,34 @@
 
 - **现象**（v0.3.4 独立渗透）：`max_connections_per_ip = 16`、`max_connections = 1024`
   时，同一来源 IP 用合法 agent 证书连续建立 64 条 WebSocket 均成功；小实例
-  `max_connections=8`、`max_connections_per_ip=2` 时同一 IP 占满 8 条，第 9 条合法
-  agent 连接收到 503 `too many sessions`。
+  `max_connections=8`、`max_connections_per_ip=2` 时同一 IP 占满 8 条，其他合法
+  agent 连接被拒绝（旧实现表现为 503 `too many sessions`）。
 - **影响**：任一持有有效 agent 证书的主体都能从单 IP 耗尽全局 session slots，使其他
-  agent 重连/新纳管 503，监控整体不可用；TLS 层的单 IP 并发限制没有覆盖 WebSocket
+  agent 重连/新纳管失败，监控整体不可用；TLS 层的单 IP 并发限制没有覆盖 WebSocket
   会话生命周期。
 - **根因**：`serve_tls` 的全局与 per-IP `ConnectionPermit` 在 HTTP 升级完成、
   `serve_connection` 返回时释放；`agent_ws` 只重新占全局 `session_slots`，没有占
   session 级 per-IP 许可。
-- **修复方案（v0.3.5）**：把 TLS 层的全局 + per-IP 许可放入请求扩展并移入
-  `on_upgrade` future，持有到 WebSocket 会话结束；或在 `agent_ws` 再取一个
-  session 级 per-IP 许可并持有到会话结束。补单 IP 达上限后第 N+1 条 WS 被拒的 e2e。
+- **修复（v0.3.5）**：新增 `ConnectionGuards`，把 TLS 层的全局 + per-IP 许可放入
+  请求扩展并移入 `on_upgrade` future，持有到 WebSocket 会话结束；删除重复计数的
+  `session_slots`。超限在 TLS accept 阶段直接关闭 TCP。回归：`cargo test -p
+  rustboard-hub`（guard clone/drop）与 `v035.sh` 3.1–3.11（per-IP 2 / 全局 8，第 3 条
+  同源连接被拒、另一源 IP 可用、已有 agent 保持 online）。
 - **关联**：v0.3.4 渗透报告 M2；KI-01 / v0.2.1 单 IP 连接限制的覆盖缺口。
+
+### KI-28 连接拒绝日志无采样
+
+- **现象**（v0.3.5 独立渗透）：`max_connections_per_ip=2` 时，同一来源 IP 连续建立
+  40 条 TCP 连接会产生 39–44 条 `WARN 来源 IP 并发连接已达上限，直接关闭 TCP`。
+- **影响**：攻击者可用持续连接洪水放大日志写入与磁盘占用，并淹没其他告警；
+  hub 本身仍健康，不涉及数据泄露。属 v0.3.4 / KI-01 的既有行为，非 v0.3.5 回归。
+- **复现**：小实例 `max_connections_per_ip=2`，从同一源 IP 循环建 TCP（不完成 TLS），
+  统计 hub 日志中的上述 WARN。
+- **根因**：`serve_tls` 在 per-IP `ConnectionLimitRejection::PerIp` 分支逐连接 `warn!`，
+  没有按来源 IP + 时间窗口采样。
+- **修复方案（v0.4.0）**：复用认证失败限速的窗口采样思路，每个来源 IP 每窗口首条
+  拒绝 WARN，其余 DEBUG；补单测与 e2e 计数断言。不改变拒绝行为。
+- **关联**：v0.3.5 渗透报告 L1；KI-01 的单 IP 连接限制。
 
 ### KI-13 ~ KI-16 设计/部署限制（不修复）
 
@@ -250,3 +267,4 @@
 | 2026-10-23 | v0.2.1 | KI-01 ~ KI-12 | `42c98c9`..`f8136ef` | 单元 259；hardening 29/29；security 9/9；cert 103/103；panel 159/159 |
 | 2026-10-23 | v0.3.1 | KI-17 | `258f3b9` | 单元 420；v031 94/94；hardening 34/34 |
 | 2026-10-23 | v0.3.4 | KI-18/19/21/24/26 | `97965c2`..`3f78656` | 单元 562；v034 97/97；既有 8 套 e2e 全绿；audit 0；评审后补修 693899f/106b6d4/3a218ea |
+| 2026-10-24 | v0.3.5 | KI-27 | `c6baf4f`/`e9ebe51` | 单元 569；v035 48/48；既有 9 套 e2e 全绿；audit 0 |

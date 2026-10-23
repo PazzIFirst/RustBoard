@@ -1,6 +1,6 @@
 # 实现进度
 
-> 最后更新：2026-10-23　｜　对应需求稿：[requirements.md](requirements.md)
+> 最后更新：2026-10-24　｜　对应需求稿：[requirements.md](requirements.md)
 
 ## 总体
 
@@ -15,6 +15,7 @@
 | v0.3.2 控制面可靠性 | 🟢 完成 | #15/#16/#18/#19、1MiB 控制应答帧预算、45s idle 回归；单元/集成 447，v032 66/66、control 100/100、hardening 34/34、v031 94/94、security 9/9、cert 103/103、panel 159/159 |
 | v0.3.3 管理面安全 | 🟢 完成 | #9 scoped token + 管理端 TLS/ Panel `https`+`hub_ca`、#17 吊销窗口、#20 日志 TOCTOU、#21 systemd 未加载 unit；单元/集成 495，v033 100/100、security 9/9、cert 103/103、hardening 36/36、control 100/100、v031 94/94、v032 66/66、panel 159/159 |
 | v0.3.4 低风险硬化 | 🟢 完成 | KI-26 未认证 401 限速、KI-18 重置会话/登录代际、KI-19 Hello 元数据、KI-21 权限与 data_dir 防护、KI-24 多连接能力、备份稳定性；单元/集成 562，v034 97/97，既有 8 套 e2e 全绿 |
+| v0.3.5 安全收口 | 🟢 完成 | KI-27 WS 会话许可、data_dir `openat2` fd/owner 加固、limit=0 与 DB 外置 WARN；单元/集成 569，v035 48/48，既有 9 套 e2e 全绿 |
 | M4 告警与归档 | ⬜ 未开始 | |
 | M5 安装与交付 | ⬜ 未开始 | |
 
@@ -119,6 +120,28 @@
       pidfd 结束进程、非 0 退出/信号终止审计失败
 - [x] 测试：单元/集成 379；`control.sh` 99/99；`cargo audit` 0 漏洞
 - [x] 独立评审 + 渗透：无高危；审计信任边界与低危限制已记录
+
+## v0.3.5 安全收口明细
+
+已完成（对应 KI-27、data_dir TOCTOU 与两项低风险告警）：
+
+- [x] KI-27：TLS 全局 + per-IP 许可由 `ConnectionGuards` 持有到 WebSocket 会话结束；
+      删除重复计数的 `session_slots`；超限在 accept 阶段关闭 TCP，其他来源 IP 不受影响
+- [x] data_dir：Linux 下从 `/` 逐组件 `openat2` + 目录 fd + `mkdirat`/`fchmod`；
+      祖先不可被非特权用户写，最终目录必须 euid 拥有且无 sticky；确定性 TOCTOU 单测
+- [x] `admin_auth_failure_limit_per_min=0` 仍保留每 IP 每窗口首条失败 WARN，不恢复 429
+- [x] `database` 在 data_dir 外/相对路径时启动 WARN 一次，不收紧父目录、DB 仍 0600
+- [x] 测试：Rust 569（agent 100、common 113、core 73、hub 180、panel 103）；
+      `v035.sh` 48/48；`security.sh` 9/9、`cert-rotation.sh` 103/103、
+      `panel.sh` 159/159、`hardening.sh` 36/36、`control.sh` 100/100、
+      `v031.sh` 94/94、`v032.sh` 66/66、`v033.sh` 100/100、`v034.sh` 97/97；
+      `cargo audit` 0
+- [x] 独立评审：A1、A2/A3 均无 [严重]；A1 建议的 guard 释放顺序/注释已处理；
+      A2/A3 建议的“静态预检不覆盖祖先权限”和“O_RDONLY 极严目录会 EACCES”已写入限制，
+      非 root owner 测试跳过、DB 外置 WARN 由 `v035.sh` 覆盖
+- [x] 独立渗透：本地实例全清单，**无高危/中危**；KI-27 与 data_dir 修复实跑通过；
+      新登记低危 KI-28（连接拒绝 WARN 未采样，既有行为，v0.4.0 处理）与 4 条信息项
+- [x] 兼容：协议 v2 / DB schema v6 / 证书格式不变；data_dir owner 规则收紧需发布说明
 
 ## v0.3.4 低风险硬化明细
 
@@ -252,13 +275,19 @@
 5. 面板默认只监听 `127.0.0.1` 且是明文 HTTP；远程访问必须显式 `--listen` 并走 VPN/反代。
    反代场景必须配置 `trusted_proxies` 并确保反代**覆盖**客户端传入的 `X-Forwarded-For`，
    否则攻击者可轮换伪造 IP 绕过登录失败锁定（已知低危，见渗透报告 L1）。
-6. v0.3.4 起数据目录/证书目录 0700，SQLite 主库/WAL/SHM 0600；`data_dir` 必须是
-   本程序独占的绝对子目录（至少两级）。`/tmp`、`/var/tmp`、`/etc`、`/var/log`、`/` 等
-   共享/系统目录、sticky 目录、相对路径、任一祖先或最终组件为符号链接、非 root 指向
-   他人目录会拒绝启动；校验是静态路径检查，祖先目录必须不可被非特权用户写
-   （推荐 root 拥有的专用目录），否则 validate→create 之间仍有本地 TOCTOU。数据库位于 `data_dir` 外时
-   不收紧其父目录（DB 文件仍 0600）。证书目录 0700 后，同机以不同用户运行且直接读
-   hub `ca.crt` 的 Panel 需复制 CA 或以同用户运行。
+6. v0.3.5 起 Linux 下数据目录/证书目录的创建与收紧改为从 `/` 逐组件 `openat2` +
+   目录 fd + `mkdirat`/`fchmod`，消除了 validate→create/chmod 的路径替换窗口；祖先
+   必须不可被非特权用户写，最终目录必须由当前 euid 拥有且无 sticky。`data_dir` 必须是
+   本程序独占的绝对子目录（至少两级）：`/tmp`、`/var/tmp`、`/etc`、`/var/log`、`/` 等
+   共享/系统目录、sticky 目录、相对路径、任一祖先或最终组件为符号链接、他人拥有的
+   最终目录都会拒绝启动。root 服务只能使用 root 拥有的最终目录，非 root 必须使用
+   自己拥有的最终目录；root-owned sticky 目录（`/tmp`、`/var/tmp`）只能作为祖先。
+   非 Linux 平台仍保留静态路径检查，完整 fd 保证仅 Linux。配置阶段的静态预检只做
+   路径形状 / 符号链接 / 最终 owner；祖先 owner 与可写性在 fd 打开时校验，预检可能
+   放过运行期会拒绝的路径（fail-closed）。最终目录用 `O_RDONLY` 打开后 `fchmod`，
+   因此 0300/0100 这类 owner 不可读的极严目录会 EACCES，需先恢复读权限。数据库位于
+   `data_dir` 外时会打一次 WARN，但不收紧其父目录（DB 文件仍 0600）。证书目录 0700
+   后，同机以不同用户运行且直接读 hub `ca.crt` 的 Panel 需复制 CA 或以同用户运行。
 7. 客户端证书轮换复用原私钥，因此轮换不能补救私钥泄露；私钥/secret 泄露必须
    `agent revoke` 后重新纳管。CA 私钥是最高敏感资产，泄露等于全部身份失守。
 8. 管理 API 限速按直连来源 IP 统计；置于反代后所有客户端共享反代 IP 的额度。管理口
@@ -282,15 +311,14 @@
     1 条在途命令仍可能执行（`dispatch` 写帧最多等 5s），审计按实际结果记录；
     revoke 之后新发起的请求一律 403。需要零窗口时应引入协议级可取消/租约，
     列入后续版本评估。
-15. **KI-27（中危，v0.3.5）**：TLS 层的全局/单 IP 连接许可在 HTTP 升级完成时释放，
-    `agent_ws` 只重新占全局 session slot，没有 session 级 per-IP 许可；同一 IP 可用
-    合法 agent 证书占满全局会话，其他 agent 重连 503。详见 known-issues。
-16. Hello 字段超过 WebSocket 单消息上限（1 MiB）时由帧层关闭（1009），客户端收不到
+15. Hello 字段超过 WebSocket 单消息上限（1 MiB）时由帧层关闭（1009），客户端收不到
     `Problem(bad_frame)`；元数据校验覆盖帧上限内的字段，均不写库、不回显。
-17. 同步 SQLite 写（Hello upsert、mark_seen 等）在 DB 被外部长时间持锁/慢盘时可阻塞
+16. 同步 SQLite 写（Hello upsert、mark_seen 等）在 DB 被外部长时间持锁/慢盘时可阻塞
     hub 管理面；正常远程负载下未复现，后续可移入 `spawn_blocking` 并收紧 busy_timeout。
-18. `database` 指向 `data_dir` 外或相对路径时 hub 仍启动：DB 文件 0600、父目录不收紧、
-    无显式告警；非默认配置建议把数据库放在专用 `data_dir` 内。
+17. `database` 指向 `data_dir` 外或相对路径时 hub 仍启动：会打一次 WARN，DB 文件 0600、
+    父目录不收紧；非默认配置建议把数据库放在专用 `data_dir` 内。
+18. **KI-28（低危，v0.4.0）**：单 IP 连接超限时每条被拒 TCP 都打 WARN，持续洪水可
+    放大日志/磁盘并淹没告警；v0.3.5 渗透登记，拒绝行为本身正确，留待后续按窗口采样。
 
 ## 下一步建议
 

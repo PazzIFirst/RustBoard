@@ -315,9 +315,6 @@ struct AppState {
     storage: Arc<SqliteStorage>,
     cfg: Arc<HubConfig>,
     sessions: Arc<SessionRegistry>,
-    /// 已升级的 WebSocket 会话上限。TLS 层信号量在升级完成时释放，
-    /// 长连接会话必须在这里再占一个许可，才真正限制并发会话数。
-    session_slots: Arc<tokio::sync::Semaphore>,
     /// 客户端证书续签的准入控制（按 agent 的冷却窗口 + 读盘/签名上下文）。
     renewal: Arc<RenewalContext>,
     /// 监听器当前实际使用的证书摘要（热加载成功 / 自动续签后更新）。
@@ -925,22 +922,41 @@ fn rotate_cert(config: Option<PathBuf>, force: bool, days: Option<u32>) -> Resul
     Ok(())
 }
 
+/// 数据库文件的直接父目录是否就是要声明的私有 `data_dir`。
+///
+/// 只有「非空父目录且恰好等于 `data_dir`」才允许走
+/// [`SqliteStorage::open_with_private_data_dir`] 收紧目录权限；相对路径（父目录为空）
+/// 与外置数据库一律返回 false，调用方走普通构造，绝不 chmod 可能共享的父目录。
+fn storage_uses_private_data_dir(db_path: &FsPath, data_dir: &FsPath) -> bool {
+    db_path
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty() && parent == data_dir)
+}
+
 /// 打开 SQLite 存储（KI-21）。
 ///
 /// `data_dir` 是数据库文件的直接父目录时，把它声明为 hub 专用数据目录：旧版本
-/// 遗留的 0755 目录会在打开前被收紧到 0700。数据库在 `data_dir` 之外时走普通
-/// 构造，**绝不 chmod** 与该库无关的父目录（可能是 `/tmp`、`/var/tmp` 等共享目录）。
+/// 遗留的 0755 目录会在打开前被收紧到 0700。数据库在 `data_dir` 之外（或 `database`
+/// 是相对路径）时走普通构造，**绝不 chmod** 与该库无关的父目录（可能是 `/tmp`、
+/// `/var/tmp` 等共享目录），并在启动时打一次 WARN 提示运维。
 fn open_storage(
     db_path: &FsPath,
     data_dir: &FsPath,
     read_pool_size: usize,
 ) -> Result<SqliteStorage> {
-    match db_path.parent() {
-        // 空父目录表示相对路径数据库，不能声明为「本程序专用目录」。
-        Some(parent) if !parent.as_os_str().is_empty() && parent == data_dir => {
-            SqliteStorage::open_with_private_data_dir(db_path, read_pool_size, data_dir)
-        }
-        _ => SqliteStorage::open_with_readers(db_path, read_pool_size),
+    let uses_private_data_dir = storage_uses_private_data_dir(db_path, data_dir);
+    if !uses_private_data_dir {
+        // 只告警不拒绝：外置 DB 是允许的部署形态，只是父目录不会被收紧。
+        tracing::warn!(
+            db = %db_path.display(),
+            data_dir = %data_dir.display(),
+            "数据库不在 data_dir 下：父目录不收紧（不做 0700 收紧），DB 文件仍 0600"
+        );
+    }
+    if uses_private_data_dir {
+        SqliteStorage::open_with_private_data_dir(db_path, read_pool_size, data_dir)
+    } else {
+        SqliteStorage::open_with_readers(db_path, read_pool_size)
     }
 }
 
@@ -1024,7 +1040,6 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
             storage: storage.clone(),
             cfg: Arc::new(cfg.clone()),
             sessions: sessions.clone(),
-            session_slots: Arc::new(tokio::sync::Semaphore::new(cfg.max_connections.max(1))),
             renewal: RenewalContext::new(
                 tls::cert_dir(&cfg.data_dir),
                 cfg.client_cert_validity_days,
@@ -1809,6 +1824,29 @@ fn try_acquire_connection(permits: &Arc<Semaphore>) -> Option<OwnedSemaphorePerm
     permits.clone().try_acquire_owned().ok()
 }
 
+/// TLS accept 层取得的连接许可，随连接 / 会话生命周期持有（KI-27）。
+///
+/// 两个字段都用 `Arc` 包裹，使 guard 可以廉价 clone 到请求扩展；只有最后一个
+/// clone 被 drop 时，底层 `OwnedSemaphorePermit` / `ConnectionPermit` 才真正
+/// 归还全局槽位与 per-IP 计数。
+///
+/// 字段顺序决定 drop 顺序（Rust 按声明顺序释放）。这里让 `_per_ip` 先归还：
+/// `serve_tls` 先取全局许可、再取 per-IP 许可，先释放 per-IP 可以避免同一 IP
+/// 立即重连时出现「全局槽刚空、per-IP 计数尚未归还」的瞬时假拒绝。只是固定
+/// 释放顺序，不改变许可数量与持有语义。
+///
+/// 生命周期：
+/// - 普通 HTTP：连接层由 `service_fn` 闭包中的基础 guard 持有到
+///   `serve_connection` 返回（连接结束）；请求扩展 clone 只活到响应结束，
+///   不会因此提前归还连接许可；
+/// - WebSocket：`agent_ws` 在升级响应前取出 clone 并移入 `on_upgrade` future；
+///   `serve_connection` 提前返回后该 future 仍持有到 `dispatch` 返回（会话结束）。
+#[derive(Clone)]
+struct ConnectionGuards {
+    _per_ip: Arc<ConnectionPermit>,
+    _global: Arc<OwnedSemaphorePermit>,
+}
+
 async fn serve_tls(
     app: Router,
     addr: String,
@@ -1882,8 +1920,15 @@ async fn serve_tls(
         let acceptor = TlsAcceptor::from(config.borrow().clone());
         let app = app.clone();
         tokio::spawn(async move {
-            // 许可跟随整条连接生命周期（TLS 握手 + WebSocket 会话）。
-            let _permit = permit;
+            // A1 / KI-27：全局信号量许可与 per-IP 许可都包进同一个 guard。
+            // 普通 HTTP 连接由 service_fn 闭包的基础 guard 持有到
+            // `serve_connection` 返回（连接结束）；请求扩展 clone 随响应释放，
+            // 但不会提前归还许可。WebSocket 升级由 `agent_ws` 把 clone 移入
+            // upgrade future，持有到会话结束。
+            let guards = ConnectionGuards {
+                _per_ip: Arc::new(connection),
+                _global: Arc::new(permit),
+            };
             let stream =
                 match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
                     Ok(Ok(stream)) => stream,
@@ -1896,9 +1941,6 @@ async fn serve_tls(
                         return;
                     }
                 };
-            // 握手成功；连接许可（全局 + per-IP）继续持有到会话结束。
-            let _connection = connection;
-
             // 证书链已在 TLS 握手阶段由 rustls 校验；这里只取 subject CN 做身份绑定。
             let cn = stream
                 .get_ref()
@@ -1909,6 +1951,11 @@ async fn serve_tls(
             let cn_display = cn.clone();
             let service = tower::service_fn(move |mut req: Request<Incoming>| {
                 req.extensions_mut().insert(PeerIdentity(cn.clone()));
+                // A1 / KI-27：每个请求扩展都带上连接 guard，供 `agent_ws`
+                // 在升级时取走。请求扩展 clone 随响应结束释放；连接许可本身
+                // 由 `service_fn` 闭包的基础 guard 持有到 `serve_connection`
+                // 返回（连接结束），WS 则从 upgrade future 一直持有到会话结束。
+                req.extensions_mut().insert(guards.clone());
                 let app = app.clone();
                 async move { app.oneshot(req.map(Body::new)).await }
             });
@@ -2593,25 +2640,19 @@ impl IntoResponse for ApiError {
 async fn agent_ws(
     ws: WebSocketUpgrade,
     Extension(peer): Extension<PeerIdentity>,
+    Extension(guards): Extension<ConnectionGuards>,
     State(state): State<AppState>,
 ) -> axum::response::Response {
-    // 会话级许可：TLS 层的 permit 在 HTTP 升级完成时就释放了，
-    // 这里必须再占一个，否则 max_connections 对长连接完全不生效。
-    let permit = match state.session_slots.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            tracing::warn!(
-                max = state.cfg.max_connections,
-                "agent 会话数已达上限，拒绝新连接"
-            );
-            return (StatusCode::SERVICE_UNAVAILABLE, "too many sessions").into_response();
-        }
-    };
-
+    // KI-27：连接许可由 TLS 层创建，经请求扩展转交到这里。请求扩展 clone 会
+    // 随升级响应释放，连接层的基础 guard 也只到 `serve_connection` 返回，因此
+    // 必须把取出的 guard 移入 upgrade future、持有到 `dispatch` 返回，才能覆盖
+    // 整个 WebSocket 会话。缺失扩展时 axum 的 `Extension` 提取器返回 500
+    //（fail-closed），绝不静默创建无许可会话。
     ws.max_message_size(MAX_WS_MESSAGE_SIZE)
         .max_frame_size(MAX_WS_FRAME_SIZE)
         .on_upgrade(move |socket| async move {
-            let _permit = permit; // 持有到会话结束
+            // 全局许可与 per-IP 许可覆盖整个 WebSocket 会话。
+            let _guards = guards;
             if let Err(err) = dispatch(socket, state, peer).await {
                 tracing::warn!(error = %log_safe_error(&err), "agent 会话结束");
             }
@@ -4487,7 +4528,6 @@ mod tests {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
             cfg: Arc::new(cfg),
             sessions: SessionRegistry::new(),
-            session_slots: Arc::new(Semaphore::new(4)),
             renewal: RenewalContext::new(tls::cert_dir(&dir), 90),
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
@@ -4546,7 +4586,6 @@ mod tests {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
             cfg: Arc::new(cfg),
             sessions: SessionRegistry::new(),
-            session_slots: Arc::new(Semaphore::new(4)),
             renewal: RenewalContext::new(tls::cert_dir(&dir), 90),
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
@@ -4842,7 +4881,6 @@ mod tests {
             storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
             cfg: Arc::new(cfg),
             sessions: SessionRegistry::new(),
-            session_slots: Arc::new(Semaphore::new(8)),
             renewal: RenewalContext::new(PathBuf::from("/tmp/rb-hub-test-unused-ca"), 90),
             live_cert: Arc::new(RwLock::new(CertStatus::unknown())),
             admin_rate,
@@ -5842,6 +5880,60 @@ mod tests {
         assert_eq!(limiter.tracked_ips(), 1, "已建立连接仍必须被计数");
         drop(established);
         assert_eq!(limiter.tracked_ips(), 0, "归零后必须清理");
+    }
+
+    /// KI-27：连接 guard 必须由最后一个 clone 释放，覆盖整个 WS 会话。
+    ///
+    /// 模拟 `serve_tls` 的三份 clone：请求扩展、连接本身、upgrade future。
+    /// 前两者先释放时（HTTP 升级响应完成、`serve_connection` 返回），全局与
+    /// per-IP 许可都必须仍被 upgrade future 持有，直到 `dispatch` 返回。
+    #[test]
+    fn v035_connection_guards_hold_until_last_clone_drops() {
+        let permits = Arc::new(Semaphore::new(1));
+        let limiter = Arc::new(ConnectionLimiter::with_ip_capacity(1, 4));
+        let ip: IpAddr = "192.0.2.27".parse().unwrap();
+
+        let guards = ConnectionGuards {
+            _global: Arc::new(try_acquire_connection(&permits).expect("首个全局许可")),
+            _per_ip: Arc::new(limiter.try_acquire(ip).expect("首个 per-IP 许可")),
+        };
+        assert!(
+            try_acquire_connection(&permits).is_none(),
+            "guard 存活时全局许可不得重复发放"
+        );
+        assert!(
+            limiter.try_acquire(ip).is_err(),
+            "guard 存活时 per-IP 许可不得重复发放"
+        );
+
+        // 请求扩展与连接层各持有一份 clone；升级路径再把一份移入 upgrade future。
+        let request_extension = guards.clone();
+        let upgrade_future = guards.clone();
+
+        // HTTP 升级响应结束：请求扩展先释放，许可不能跟着归还。
+        drop(request_extension);
+        assert!(try_acquire_connection(&permits).is_none());
+        assert!(limiter.try_acquire(ip).is_err());
+
+        // `serve_connection` 返回：连接层的 guard 释放，但会话仍在进行。
+        drop(guards);
+        assert!(
+            try_acquire_connection(&permits).is_none(),
+            "WS 会话未结束前全局许可必须继续持有"
+        );
+        assert!(
+            limiter.try_acquire(ip).is_err(),
+            "WS 会话未结束前 per-IP 计数必须继续持有"
+        );
+
+        // `dispatch` 返回、upgrade future 结束：最后一份 guard 释放两个许可。
+        drop(upgrade_future);
+        let reacquired_global = try_acquire_connection(&permits).expect("全局许可已归还");
+        let reacquired_ip = limiter.try_acquire(ip).expect("per-IP 计数已归还");
+        assert_eq!(limiter.tracked_ips(), 1);
+        drop(reacquired_global);
+        drop(reacquired_ip);
+        assert_eq!(limiter.tracked_ips(), 0, "全部释放后来源表必须清空");
     }
 
     /// KI-01：握手 / header 超时必须是 5s（慢速连接不能长期占槽位）。
@@ -7251,6 +7343,51 @@ mod tests {
             "数据库文件仍必须是 0600"
         );
         let _ = std::fs::remove_dir_all(&db_parent);
+    }
+
+    // ------------------------------------------------------------------
+    // v0.3.5：database 外置告警的构造判定（日志由 e2e 验证）
+    // ------------------------------------------------------------------
+
+    /// `database` 的**直接父目录**恰好是 `data_dir` 才允许走私有目录构造并收紧；
+    /// 外置、嵌套子目录、相对路径都不能误判，避免 chmod 共享/无关目录。
+    #[test]
+    fn v035_storage_private_data_dir_requires_exact_parent() {
+        let base = temp_dir("hub-storage-private-dir");
+        let data_dir = base.join("data");
+
+        // 同目录：直接父目录 == data_dir，允许收紧。
+        assert!(storage_uses_private_data_dir(
+            &data_dir.join("hub.db"),
+            &data_dir
+        ));
+
+        // 外置：父目录是另一个目录，必须判 false。
+        assert!(!storage_uses_private_data_dir(
+            &base.join("outside.db"),
+            &data_dir
+        ));
+
+        // 更深的嵌套子目录也不含在 data_dir 的直接父目录语义里。
+        assert!(!storage_uses_private_data_dir(
+            &data_dir.join("nested").join("hub.db"),
+            &data_dir
+        ));
+        // 反过来（DB 在 data_dir 的父目录里）同样不能收紧 data_dir。
+        assert!(!storage_uses_private_data_dir(
+            &base.join("hub.db"),
+            &data_dir
+        ));
+
+        // 相对路径：父目录为空，不能声明为「本程序专用目录」。
+        assert!(!storage_uses_private_data_dir(
+            FsPath::new("hub.db"),
+            &data_dir
+        ));
+        assert!(!storage_uses_private_data_dir(
+            FsPath::new("./hub.db"),
+            &data_dir
+        ));
     }
 
     /// KI-21：证书目录只在已存在时收紧，缺失时不得创建空目录掩盖错误。

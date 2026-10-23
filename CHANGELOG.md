@@ -10,6 +10,47 @@
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-10-24
+
+### Added
+
+- `tests/e2e/v035.sh` + `v035_agent.py`：KI-27 单 IP WebSocket 上限、data_dir
+  中间符号链接拒绝、外置 database WARN、`limit=0` 首失败 WARN 回归（48 项）；
+  `probe.py` 增加可选源地址绑定，用于模拟不同来源 IP
+
+### Changed
+
+- KI-27：TLS accept 取得的全局 `max_connections` 与 per-IP 许可通过
+  `ConnectionGuards` 随请求扩展转交 WebSocket upgrade future，持有到会话结束；
+  删除 v0.3.4 为弥补许可提前释放而增加的 `session_slots`，避免每条 WS 占用
+  两个全局槽。超限在 TLS accept 阶段直接关闭 TCP，不再返回 503
+- data_dir 目录创建/权限收紧在 Linux 上改为从 `/` 逐组件 `openat2` + 目录 fd +
+  `mkdirat`/`fchmod`，关闭 validate→create/chmod 的路径替换窗口；祖先必须不可被
+  非特权用户写，最终目录必须由当前 euid 拥有且无 sticky。默认
+  `/var/lib/rustboard/{hub,agent}` 不受影响，非 Linux 仍保留静态路径检查
+- `admin_auth_failure_limit_per_min = 0` 时仍保留每 IP 每 60s 窗口首条失败 WARN，
+  后续降为 DEBUG；仅影响日志，不恢复 429
+- `database` 不在 `data_dir` 下（含相对路径）时 hub 启动打一次 WARN，明确
+  “父目录不收紧、DB 文件仍 0600”；不拒绝启动、不改变权限行为
+
+### Fixed
+
+- KI-27（中危）：同一来源 IP 可用合法 agent 证书建立任意数量 WebSocket，占满全局
+  session slots，导致其他 agent 重连/新纳管 503
+- data_dir 在他人可写祖先下仍存在 validate→create/chmod 本地 TOCTOU 的 v0.3.4
+  残余问题；Linux 下改为 fd 级操作并有确定性路径替换单测
+- `database` 外置时无显式告警，误配下难以发现父目录未被收紧
+
+### Security
+
+- 协议仍为 v2、SQLite schema 仍为 v6、证书格式不变，可滚动升级
+- data_dir owner/祖先可写性校验比 v0.3.4 更严格：root 服务必须使用 root 拥有的
+  最终目录，非 root 必须使用自己拥有的最终目录；使用他人 home 等目录的部署会
+  拒绝启动，需要迁移到专用目录或改用服务用户运行
+- 独立渗透（本地临时实例）无高危/中危；新登记低危 KI-28（连接拒绝 WARN 未采样，
+  既有行为，计划 v0.4.0 处理）
+- 回滚 v0.3.4 只回代码；已收紧的 0700/0600 权限保留，KI-27 风险回归
+
 ## [0.3.4] - 2026-10-23
 
 ### Added

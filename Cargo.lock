@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "rustboard-agent"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -1441,7 +1441,7 @@ dependencies = [
 
 [[package]]
 name = "rustboard-common"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "rustboard-core"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "libc",
@@ -1478,7 +1478,7 @@ dependencies = [
 
 [[package]]
 name = "rustboard-hub"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "rustboard-panel"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "argon2",

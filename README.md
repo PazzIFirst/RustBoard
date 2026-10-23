@@ -12,7 +12,7 @@
 已知问题见 [docs/known-issues.md](docs/known-issues.md)。
 协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面与 v0.3.1/v0.3.2/v0.3.3/v0.3.4 硬化已完成。**
+> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面与 v0.3.1/v0.3.2/v0.3.3/v0.3.4/v0.3.5 硬化已完成。**
 > 告警与归档尚未实现。证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。
 >
 > 线协议版本为 **2**：hub 与 agent 必须严格一致。版本不符时 hub 回 `bad_protocol`
@@ -156,11 +156,15 @@ rustboard-hub token revoke --name panel-prod                 # 不删行，保�
   429 + `Retry-After`，超限路径不再计算 SHA-256 或查询 SQLite，401 WARN 也按窗口采样。
   旧 `admin_token` 常量时间路径不受此限速影响，保留为应急入口。NAT / 反代后多个客户端
   共享来源 IP 时，达到阈值的合法 scoped token 也可能在窗口结束前收到 429；这是为避免
-  未认证请求放大而接受的可用性权衡。
-- v0.3.4 起 `data_dir` 必须是本程序独占的绝对子目录（至少两级，如 `/var/lib/rustboard/hub`）；
+  未认证请求放大而接受的可用性权衡。v0.3.5 起即使设为 0（关闭限速），每个窗口首条
+  认证失败仍打一条 WARN，后续降为 DEBUG，不恢复 429。
+- v0.3.5 起 Linux 下 `data_dir` 的创建与权限收紧使用 `openat2` + 目录 fd：
+  `data_dir` 必须是本程序独占的绝对子目录（至少两级，如 `/var/lib/rustboard/hub`）；
   `/tmp`、`/var/tmp`、`/etc`、`/var/log`、`/` 等共享/系统目录、sticky 目录、相对路径、
-  任一祖先或最终组件为符号链接、非 root 指向他人目录都会拒绝启动。该校验是启动时的
-  静态检查；`data_dir` 祖先必须不可被非特权用户写（推荐 root 拥有的专用目录）。证书目录收紧为 0700；同机以不同用户运行 Panel 且直接
+  任一祖先或最终组件为符号链接、他人拥有的最终目录都会拒绝启动。祖先必须不可被
+  非特权用户写（推荐 root 拥有的专用目录），root 服务只能使用 root 拥有的最终目录。
+  非 Linux 平台保留静态路径检查。数据库位于 `data_dir` 外时启动会 WARN，但不会收紧
+  其父目录（DB 文件仍 0600）。证书目录收紧为 0700；同机以不同用户运行 Panel 且直接
   读取 hub `ca.crt` 时，需要复制 CA 或以同用户运行。
 
 ### 远程面板
@@ -240,6 +244,7 @@ docs/                 需求确认稿、实现进度
 ```bash
 cargo test --workspace --locked
 bash tests/e2e/security.sh
+bash tests/e2e/v035.sh   # v0.3.5 安全收口
 ```
 
 单元与集成测试覆盖：CPU/内存解析、计数器重置容纳、磁盘缓冲落盘与恢复、
@@ -251,6 +256,11 @@ SQLite 批次精确幂等与 v1/v2→v3 迁移、跨 epoch 乱序与 48h 判重�
 实际覆盖 9 项：正常采集与 online/offline、无客户端证书 Hello 被拒、
 证书 CN≠agent_id、跨 agent 伪造 Batch、多连接下线的状态语义、
 协议版本 1 收到 `bad_protocol`、吊销后 ≤3s 断开且重连被拒。
+
+`tests/e2e/v035.sh` 覆盖 v0.3.5 安全收口：同源 IP 的 WebSocket 连接上限
+（第 3 条拒绝、另一源 IP 可用、已有 agent 保持 online）、`data_dir` 中间符号链接
+拒绝启动且不触碰链接目标、外置 `database` 的启动 WARN 与 DB 0600、
+`admin_auth_failure_limit_per_min=0` 时错误 Bearer 仍返回 401 且首条 WARN 可见。
 
 ## License
 
