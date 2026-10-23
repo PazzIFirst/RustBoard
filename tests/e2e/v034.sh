@@ -239,7 +239,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for tool in "$PYTHON" "$CARGO" curl mktemp date tail awk sed grep stat tr cat find wc; do
+for tool in "$PYTHON" "$CARGO" curl mktemp date tail awk sed grep stat tr cat find wc \
+            sha256sum; do
   command -v "$tool" >/dev/null 2>&1 \
     || die "找不到命令: $tool（python3 需 3.8+；cargo 请放进 PATH 或设置 CARGO=...）"
 done
@@ -1014,7 +1015,9 @@ echo "==> 3) KI-18 reset-password 后旧会话失效（≤2s）"
 COOKIE_CODE=$(panel_cookie_code "$PANEL_COOKIE" "/api/overview")
 check_eq "3.1" "重置前旧 Cookie 访问 /api/overview 200" "200" "$COOKIE_CODE"
 
-PANEL_CFG_MTIME_BEFORE=$(stat -c %y "$PANEL_CFG")
+# 用配置内容哈希判断“落盘”，而不是 mtime：并发/高负载下 mtime 的更新与可见性
+# 不够可靠，哈希变化是 reset-password 真正写入新密码哈希的直接证据。
+PANEL_CFG_HASH_BEFORE=$(sha256sum "$PANEL_CFG" | awk '{print $1}')
 RESET_START=$(date +%s%3N)
 "$PANEL_BIN" reset-password --config "$PANEL_CFG" --password "$PANEL_NEW_PASSWORD" \
   > "$PANEL_RESET_LOG" 2>&1 &
@@ -1023,11 +1026,13 @@ PIDS+=("$RESET_PID")
 chmod 600 "$PANEL_RESET_LOG"
 
 RESET_WRITE_MS=""
+# Argon2 在并发/高负载下可能明显变慢，等待窗口放宽到 30s；
+# 下面的 watchdog 60s 只兜底真挂死，避免把“慢”误判成失败后 kill。
 RESET_DEADLINE=$(( $(date +%s%3N) + 30000 ))
 while :; do
-  CURRENT_MTIME=$(stat -c %y "$PANEL_CFG")
+  CURRENT_HASH=$(sha256sum "$PANEL_CFG" 2>/dev/null | awk '{print $1}')
   NOW_MS=$(date +%s%3N)
-  if [[ "$CURRENT_MTIME" != "$PANEL_CFG_MTIME_BEFORE" ]]; then
+  if [[ -n "$CURRENT_HASH" && "$CURRENT_HASH" != "$PANEL_CFG_HASH_BEFORE" ]]; then
     RESET_WRITE_MS=$NOW_MS
     break
   fi
@@ -1041,7 +1046,7 @@ while :; do
 done
 
 RESET_RC=0
-( sleep 10; kill -9 "$RESET_PID" 2>/dev/null || true ) &
+( sleep 60; kill -9 "$RESET_PID" 2>/dev/null || true ) &
 RESET_WATCHDOG=$!
 wait "$RESET_PID" 2>/dev/null || RESET_RC=$?
 kill "$RESET_WATCHDOG" 2>/dev/null || true
