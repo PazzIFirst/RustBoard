@@ -316,8 +316,10 @@ rustboard-hub maintenance status --config hub.toml
   `filter_labels`（精确子集）匹配序列；每个匹配序列独立状态。
 - `agent_offline`：比较 `now - agents.last_seen_at` 与阈值（默认 90s）；每个
   agent 一条状态，agent 恢复 online 后 resolved。
-- `hub_cert`：读取当前 live/disk 服务端证书 `days_left`；低于阈值 firing；
-  hub 证书轮换/续签后自动 resolved。
+- `hub_cert`：读取当前 live/disk 服务端证书 `hours_left`；低于阈值 firing；
+  hub 证书轮换/续签后自动 resolved。证书阈值统一用**小时**，内置规则默认
+  `cert_warn_hours=48`；离线规则默认 `offline_after_secs=90`，二者首次种入时
+  取自 `[alerts]` 配置，之后以规则自身 threshold 为准。
 - 内置规则初始 **disabled**，避免升级后无渠道时产生意外通知；面板“启用”并
   绑定渠道后生效。种子规则 id：
   `builtin-agent-offline`、`builtin-disk-percent`、`builtin-agent-cert`、
@@ -326,7 +328,8 @@ rustboard-hub maintenance status --config hub.toml
   - `disk.used_percent`：每个 mount 的已用百分比 0..100；
   - `buffer.pending_ratio`：本地待发送字节/上限，0..1；
   - `buffer.pending_bytes`：绝对字节数；
-  - `cert.days_left`：客户端证书剩余天数。
+  - `cert.days_left`：客户端证书剩余天数（展示用）；
+  - `cert.hours_left`：客户端证书剩余小时数（告警阈值用，48h 判定不会被天粒度放大）。
   旧 agent 不上报这些指标时，对应规则只跳过，不报错、不误 firing。
 
 ### 6.2 状态机与通知
