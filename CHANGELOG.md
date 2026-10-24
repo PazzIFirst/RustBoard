@@ -10,6 +10,47 @@
 
 ## [Unreleased]
 
+### Added
+
+- M5 Phase A 安装器：新增 `rustboard-install` 库（路径规划、系统探测、ANSI 提示、
+  安装状态、带回滚的事务、systemd unit 渲染、`/healthz` 等待）与
+  `packaging/systemd/rustboard-{hub,panel,agent}.service`
+- `rustboard-hub install|upgrade|uninstall`：自签证书 + SQLite 安装、可选同机面板、
+  配置/证书/unit/二进制事务写入、`--prefix`/`--dry-run`/`--offline`、失败回滚；
+  `upgrade` 可导入旧手工 `hub.toml`，只补 unit/binary/state，不重写数据
+- `rustboard-panel install|uninstall`：复用同机 hub 地址/token，生成初始密码、
+  静态资源校验、systemd 托管与健康检查
+- `rustboard-agent install|uninstall`：`--token-file` 纳管、30s enrollment 等待、
+  私钥/配置权限与失败回滚；token 不接受 argv
+- Phase A e2e `tests/e2e/v100-install.sh`：hub+panel+agent 安装、幂等、失败回滚、
+  agent 真实 enrollment 与数据点、默认/`--purge` 卸载、旧配置 upgrade，121/121
+
+### Changed
+
+- hub/panel/agent 的 systemd unit 以 root 运行并启用 `NoNewPrivileges`、
+  `PrivateTmp`、`ProtectSystem=strict`、最小 `ReadWritePaths`；配置/私钥 0600、
+  数据目录 0700。Phase A 暂不引入专用服务用户，Phase E 评估
+- unit 不启用 `RestrictSUIDSGID`：systemd 257 的该 seccomp 过滤器会让 RustBoard
+  依赖的 `openat2(2)` 返回 ENOSYS，`NoNewPrivileges` 已覆盖 setuid/setgid 提权
+
+### Security
+
+- 安装器不把 token/密码放进 argv、unit、日志或错误输出；token 只从 0600 文件读取，
+  临时 hub→panel token 文件用后即删；所有 systemd 命令走参数数组
+- 安装事务只递归删除本次新建的数据目录；已有数据、配置、证书在失败/卸载默认路径下
+  保留；`--purge` 需显式确认并做符号链接/系统目录/prefix 范围校验
+- 安装前缀必须是 root 拥有、非 sticky、group/other 不可写的路径；`/tmp`、
+  `/var/tmp` 等共享前缀拒绝。state 只接受 root 0600 普通文件、拒绝符号链接及
+  祖先链接，解析错误不回显 TOML 原文
+- 卸载/升级对 config/data/unit/binary 做角色级 allowlist，unit 必须带安装器
+  marker 且 ExecStart 与当前路径精确一致；外来同名 unit 不覆盖、不停止、不删除。
+  删除前整体 preflight，先 purge 再删 state
+- install/upgrade/uninstall 非 dry-run 按角色持有 `/run/rustboard-install-<role>.lock`
+  flock，避免并发安装互相覆盖/回滚删除；txn 回滚失败保留备份目录供人工恢复
+- 修复审查发现的 admin_token TOML 解析回显、panel 卸载误停生产 unit、
+  admin_tls=required 既有配置的 http 健康检查误判、`--dry-run` 读取旧配置时
+  收紧权限等回归
+
 ## [0.4.2] - 2026-10-24
 
 ### Fixed

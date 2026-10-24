@@ -5,6 +5,7 @@
 //! 既不下发浏览器，也不写进日志。
 
 mod auth;
+mod install_cmd;
 mod proxy;
 mod web;
 
@@ -166,6 +167,10 @@ enum Cmd {
         #[arg(long)]
         password: Option<String>,
     },
+    /// 安装面板服务（生成配置、systemd unit 与初始密码）。
+    Install(install_cmd::InstallArgs),
+    /// 卸载面板服务（默认保留配置与数据）。
+    Uninstall(install_cmd::UninstallArgs),
 }
 
 fn main() -> Result<()> {
@@ -185,6 +190,8 @@ fn main() -> Result<()> {
         } => init(config, listen, hub, hub_token, password, static_dir, force),
         Cmd::Ports { config } => ports(config),
         Cmd::ResetPassword { config, password } => reset_password(config, password),
+        Cmd::Install(args) => install_cmd::install(args),
+        Cmd::Uninstall(args) => install_cmd::uninstall(args),
         Cmd::Run {
             config,
             listen,

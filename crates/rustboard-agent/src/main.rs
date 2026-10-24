@@ -4,6 +4,7 @@
 //! 之后：采集 -> 本地磁盘缓冲 -> 按序上报，收到 Ack 才丢弃。
 
 mod control;
+mod install_cmd;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -224,6 +225,10 @@ enum Cmd {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// 安装为 systemd 服务并完成 enrollment。
+    Install(install_cmd::InstallArgs),
+    /// 卸载本机 agent（默认保留配置与数据）。
+    Uninstall(install_cmd::UninstallArgs),
     Init {
         #[arg(short, long)]
         config: Option<PathBuf>,
@@ -294,6 +299,8 @@ fn main() -> Result<()> {
         }
         Cmd::CertInfo { config } => cert_info(config),
         Cmd::Renew { config } => renew(config),
+        Cmd::Install(args) => install_cmd::install(args),
+        Cmd::Uninstall(args) => install_cmd::uninstall(args),
     }
 }
 

@@ -19,7 +19,7 @@
 | M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | v0.4.1 已知问题修复 | 🟢 完成 | KI-29 rowid 竞态、KI-31 64 MiB 配置/下载一致性、KI-28 拒绝日志采样、KI-20 安装命令引用；SFTP 真实环境 29/29，M4 基线渗透无高危；v041 26/26；v0.4.1 发布 |
 | v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
-| M5 安装与交付 | 🟡 计划中 | 安装器/离线包/多架构镜像/ACME/PG/面板 TLS；计划见 `docs/plans/2026-10-24-m5-install-delivery.md` |
+| M5 安装与交付 | 🟡 进行中（Phase A 完成） | 安装器内核、hub/panel/agent `install`/`upgrade`/`uninstall`、systemd、自签三步安装 e2e 121/121；离线包/多架构/ACME/PG/面板 TLS 待 B–D |
 
 ## M1 明细
 
@@ -166,6 +166,32 @@
 - 限制：SFTP 真实服务器联网验证未执行（本机无可用 SSH 测试账户），仅完成
   指纹/路径/私钥权限/错误脱敏单测与编译；vendored `russh`/`ssh-key` 仅支持
   ed25519/ECDSA 主机密钥和 ed25519 用户私钥，RSA 旧服务器不兼容
+
+## M5 安装与交付明细
+
+### Phase A（2026-10-24 完成）
+
+- [x] `rustboard-install`：路径/state/txn/systemd/health 库；`create_owned_dir`
+      只拥有本次新建的数据目录，失败递归删除，已有目录绝不动
+- [x] `rustboard-hub install|upgrade|uninstall`：自签 + SQLite + 可选同机 panel；
+      `--prefix`/`--dry-run`/`--offline`/`--force`；旧手工配置 `upgrade` 导入
+- [x] `rustboard-panel install|uninstall`：hub token 只走 0600 文件、初始密码
+      仅打印一次、静态资源校验、systemd 健康检查
+- [x] `rustboard-agent install|uninstall`：`--token-file`、指纹归一化、30s
+      enrollment 等待、失败停服务并回滚
+- [x] systemd unit：`NoNewPrivileges`/`PrivateTmp`/`ProtectSystem=strict`/
+      最小 `ReadWritePaths`；配置/私钥 0600、data 0700
+- [x] e2e：`tests/e2e/v100-install.sh` 121/121，覆盖安装、重复幂等、admin 端口
+      占用回滚、agent 真实 enrollment 与 3 个数据点、默认/`--purge` 卸载、
+      `hub init` 旧配置 upgrade（config/cert/data hash 不变）
+- [x] 门禁：workspace 1079 tests、fmt/clippy/audit 0；独立评审 + 渗透三轮，
+      高危/严重项修复后由新评审/渗透复验（报告见
+      `docs/security/2026-10-24-m5-phase-a-install-pentest.md`）
+- [ ] Phase B：musl x86_64/arm64、离线包、Docker/多架构、release workflow
+- [ ] Phase C/D/E：ACME/面板 TLS、PostgreSQL/备份迁移、压力/长稳/v1.0.0
+
+> Phase A 的 e2e 只覆盖 x86_64 本机 systemd；arm64、离线 netns、Docker 镜像与
+> 真实 ACME/PG 属于后续 Phase，不作为本阶段完成项。
 
 ## v0.3.4 低风险硬化明细
 
@@ -352,6 +378,20 @@
 21. **直接 SQL 删除 raw 不受 prune 保护**：v0.4.1 的 rowid/generation CAS 只覆盖
     生产路径 `prune_samples_before`；运行中手工 `DELETE FROM samples` 绕过维护状态，
     仍可能造成迟到行漏算。生产/运维应使用 maintenance CLI。
+22. **Phase A 服务以 root 运行**：配置/私钥要求 0600，systemd 用
+    `NoNewPrivileges` + `ProtectSystem=strict` + 最小 `ReadWritePaths` 收紧；
+    专用服务用户 + `LoadCredential` 在 Phase E 评估，未完成前不要把安装器用于
+    不受信任的多用户主机。
+23. **不要给 unit 加 `RestrictSUIDSGID=true`**：systemd 257 的该 seccomp 过滤器会让
+    `openat2(2)` 返回 ENOSYS，而 `fsutil::ensure_private_dir` 以 openat2 做 fd 级
+    校验并 fail-closed；`NoNewPrivileges` 已覆盖 setuid/setgid 提权。此为兼容性
+    约束，新增 unit hardening 时必须用真实 systemd 验证。
+24. **`--prefix` 必须是 root 拥有、非 sticky、group/other 不可写的路径**：
+    安装器安全检查会拒绝 `/tmp`、`/var/tmp` 等共享前缀（除 unit 的
+    `PrivateTmp=true` 会隐藏这两处外，也防止本地用户预置 state/符号链接）。
+    e2e 使用 `/opt`；生产默认 prefix 为 `/`，不受影响。非 root prefix 下
+    `--config`/`--data-dir` 必须位于 prefix 内；root prefix 只允许
+    `/etc/rustboard`、`/var/lib/rustboard` 与 `/usr/local/bin/rustboard-*`。
 
 ## 磁盘清理记录
 
@@ -367,7 +407,10 @@
 ## 下一步建议
 
 v0.4.1 已完成并发布；v0.4.2 修复 CI ANSI 测试助手，并把 vendored SFTP 依赖
-升级到稳定 ECC 栈（crypto-bigint 0.7.6，RUSTSEC-2026-0387）。下一阶段是
-M5 安装与交付（安装器、离线包、多架构镜像、ACME、PostgreSQL、面板 TLS），计划见
-[M5 计划](plans/2026-10-24-m5-install-delivery.md)。控制面/告警/归档均按“默认关闭或
-最小暴露 + 审计/固定错误码”交付。
+升级到稳定 ECC 栈（crypto-bigint 0.7.6，RUSTSEC-2026-0387）。M5 Phase A 已完成
+安装器内核与自签三步安装（e2e 121/121）；下一步按计划进入 Phase B：musl
+x86_64/arm64、离线包、多架构 Docker 与 tag 触发的 release workflow，随后并行
+Phase C（ACME/面板 TLS）与 Phase D（PostgreSQL/备份迁移）。计划见
+[M5 计划](plans/2026-10-24-m5-install-delivery.md) 与
+[Phase A 设计](plans/2026-10-24-m5-phase-a-installer.md)。控制面/告警/归档均按
+“默认关闭或最小暴露 + 审计/固定错误码”交付。

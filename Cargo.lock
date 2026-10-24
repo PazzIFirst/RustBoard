@@ -2652,6 +2652,7 @@ dependencies = [
  "rmp-serde",
  "rustboard-common",
  "rustboard-core",
+ "rustboard-install",
  "rustls",
  "serde",
  "serde_json",
@@ -2728,6 +2729,7 @@ dependencies = [
  "russh-sftp",
  "rustboard-common",
  "rustboard-core",
+ "rustboard-install",
  "rustls",
  "serde",
  "serde_json",
@@ -2739,6 +2741,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "rustboard-install"
+version = "0.4.2"
+dependencies = [
+ "anyhow",
+ "libc",
+ "rustboard-common",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -2757,10 +2770,12 @@ dependencies = [
  "rand 0.8.8",
  "reqwest 0.12.28",
  "rustboard-common",
+ "rustboard-install",
  "serde",
  "serde_json",
  "tokio",
  "tokio-rustls",
+ "toml",
  "tower",
  "tracing",
  "tracing-subscriber",

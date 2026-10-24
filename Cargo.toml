@@ -5,6 +5,7 @@ members = [
     "crates/rustboard-core",
     "crates/rustboard-agent",
     "crates/rustboard-hub",
+    "crates/rustboard-install",
     "crates/rustboard-panel",
 ]
 
@@ -59,6 +60,7 @@ x509-parser = "0.16"
 
 rustboard-common = { path = "crates/rustboard-common" }
 rustboard-core = { path = "crates/rustboard-core" }
+rustboard-install = { path = "crates/rustboard-install" }
 
 # M4-C3 / v0.4.2：vendored `russh` 0.64.1 + `ssh-key` 0.7.0-rc.11，只删除
 # optional `rsa` 依赖 / feature，让 `cargo audit` 不命中 RUSTSEC-2023-0071；

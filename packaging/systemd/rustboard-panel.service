@@ -1,0 +1,24 @@
+# Managed by rustboard-install; do not edit.
+# RustBoard Panel systemd unit（由 rustboard-install 渲染）。
+[Unit]
+Description=RustBoard Panel
+Documentation=https://github.com/pazzifirst/rustboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rustboard-panel run --config /etc/rustboard/panel.toml
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+LockPersonality=true
+ReadWritePaths=/var/lib/rustboard/panel
+
+[Install]
+WantedBy=multi-user.target

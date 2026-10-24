@@ -15,6 +15,7 @@ embedded-web = ["dep:include_dir"]
 
 [dependencies]
 rustboard-common = { workspace = true }
+rustboard-install = { workspace = true }
 anyhow = { workspace = true }
 argon2 = { workspace = true }
 axum = { workspace = true }
@@ -27,6 +28,9 @@ rand = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# 仅安装器使用：dry-run 时只读解析 hub.toml / panel.toml（不能用 load_toml，
+# 它会 chmod 收紧权限，破坏 dry-run 零写入）。
+toml = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }

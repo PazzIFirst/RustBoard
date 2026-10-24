@@ -64,6 +64,7 @@ mod auth;
 mod cert_rotation;
 mod channels;
 mod control;
+mod install_cmd;
 mod notify;
 mod notify_worker;
 mod session;
@@ -297,6 +298,12 @@ enum Cmd {
         #[command(subcommand)]
         action: ArchiveAction,
     },
+    /// M5：安装 hub（自签证书、SQLite、systemd、可选同机面板）。
+    Install(install_cmd::InstallArgs),
+    /// M5：导入/刷新已有安装（旧手工配置），只补齐 unit/binary/state。
+    Upgrade(install_cmd::UpgradeArgs),
+    /// M5：卸载 hub（默认保留配置与数据，--purge 才删除）。
+    Uninstall(install_cmd::UninstallArgs),
 }
 
 /// `maintenance` 子命令（M4-A2）。
@@ -503,6 +510,9 @@ fn main() -> Result<()> {
         Cmd::Ports { config } => print_ports(config),
         Cmd::Maintenance { action } => maintenance_command(action),
         Cmd::Archive { action } => archive_command(action),
+        Cmd::Install(args) => install_cmd::install(args),
+        Cmd::Upgrade(args) => install_cmd::upgrade(args),
+        Cmd::Uninstall(args) => install_cmd::uninstall(args),
     }
 }
 
@@ -1138,7 +1148,7 @@ fn agent_revoke(config: Option<PathBuf>, id: String) -> Result<()> {
     Ok(())
 }
 
-fn new_secret() -> String {
+pub(crate) fn new_secret() -> String {
     format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),

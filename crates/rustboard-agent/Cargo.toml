@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 rustboard-common = { workspace = true }
 rustboard-core = { workspace = true }
+rustboard-install = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
