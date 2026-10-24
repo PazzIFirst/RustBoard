@@ -377,4 +377,24 @@ CI 定义在 `.github/workflows/ci.yml`，与本地门禁保持一致：
 
 ---
 
+## 12. 构建产物与磁盘卫生
+
+阶段收尾、测试全部通过且证据保存后，必须检查并清理可重新生成的构建产物，
+避免多个 worktree 的 `target` 长期累积：
+
+- **触发条件**：根分区使用率 >85%，或本仓库 `target` + `.worktrees/` 占用 >30 GiB。
+- **清理前**：`ps` 确认无 cargo/rustc/rustboard/vite/pnpm 正在写目标目录；
+  不能只凭 Git 状态干净判断 worktree 可删。
+- **主仓库**：只清 `target/debug`、`target/<隔离测试目录>`；**不得**在主仓库直接
+  `cargo clean`，必须显式保留 `target/baseline-bin/`（v0.4.0 冻结基线）。
+- **worktree**：只清各自 `target/`，保留源码、`.git` 与未提交改动；有活动编辑
+  会话时跳过。
+- **前端**：`web/node_modules`、`web/dist`、`.pnpm-store` 可重建；清理前确认无
+  dev/build 进程。
+- **不得清理**：`.git/`、源码、测试、文档、`vendor/`、`tests/pentest/` 证据与脚本。
+- **记录**：清理后在 `docs/status.md` 记释放前后 `df`、清理范围和保留项；
+  新 worktree 结束使用后及时清其 target，不长期保留多个完整 target。
+
+---
+
 本文件的修改属于流程变更，需要单独提交并在提交信息里说明原因。
