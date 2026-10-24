@@ -267,9 +267,11 @@
 - **缓解**：升级/迁移不自动清理历史 raw；归档/retention 前确认无长期离线 agent；
   如怀疑命中，`rustboard-hub maintenance run --task downsample` 后检查
   `maintenance_state` 与 1m/1h 桶。
-- **修复方案（v0.4.1）**：为 raw 增加不复用的单调 ingest 序列（独立计数器或
-  `AUTOINCREMENT` 新表），或在删除最大 rowid 后失效 rowid 水位；补“删最大行后
-  插入迟到行”回归。查询/告警/归档功能不受影响。
+- **修复方案（v0.4.1，不升 schema）**：在 retention 删除的同一写事务内，删除完成后
+  读取新的 `MAX(rowid)`；若 `maintenance_state.downsample_1m_last_raw_rowid` 大于它，
+  原子降低到新值（表空则清除），随后才释放写锁。只降不升，新插入行会大于新水位而被
+  扫描；补“删最大行后插入复用 rowid 迟到行”回归。备选方案（v0.5 需 schema v8）
+  才是独立单调 ingest 序列。查询/告警/归档功能不受影响。
 - **关联**：M4-A2 复审建议；v0.4.0 发布说明。
 
 ### KI-30 SFTP 归档后端依赖审计阻塞（v0.4.0 已修复）

@@ -191,8 +191,9 @@ rustboard-hub token revoke --name panel-prod                 # 不删行，保�
   retention 不会删除 raw。
 - 详细接口、配置与验收见
   [M4 方案](docs/plans/2026-10-24-m4-alerting-archive.md)；已知问题/修复排期见
-  [known-issues](docs/known-issues.md) 与
-  [修复计划](docs/plans/2026-10-24-known-issues-fix.md)。
+  [known-issues](docs/known-issues.md)、
+  [修复计划](docs/plans/2026-10-24-known-issues-fix.md) 与
+  [M4 渗透测试计划](docs/plans/2026-10-24-m4-pentest.md)。
 
 ### 远程面板
 
