@@ -11,6 +11,7 @@ import {
   formatArchiveRows,
   formatArchiveWatermark,
   isArchiveDownloadable,
+  isArchiveObjectDownloadable,
   nextArchiveBeforeId,
   shortSha256,
 } from "../archive";
@@ -53,6 +54,39 @@ describe("archive status helpers", () => {
     for (const status of ["pending", "failed", "", "unknown"]) {
       expect(isArchiveDownloadable(status)).toBe(false);
     }
+  });
+
+  it("prefers the server downloadable flag and falls back to status", () => {
+    // API 明确 false：即使状态为 uploaded / local_deleted 也必须禁用（>64 MiB）。
+    expect(
+      isArchiveObjectDownloadable(archiveObject(1, { downloadable: false })),
+    ).toBe(false);
+    expect(
+      isArchiveObjectDownloadable(
+        archiveObject(1, { status: "local_deleted", downloadable: false }),
+      ),
+    ).toBe(false);
+
+    // 旧版响应没有该字段：按既有 status 规则回退。
+    expect(isArchiveObjectDownloadable(archiveObject(1))).toBe(true);
+    expect(
+      isArchiveObjectDownloadable(archiveObject(1, { status: "local_deleted" })),
+    ).toBe(true);
+    for (const status of ["pending", "failed"] as const) {
+      expect(isArchiveObjectDownloadable(archiveObject(1, { status }))).toBe(false);
+    }
+
+    // 正常 uploaded / 小对象可下载。
+    expect(
+      isArchiveObjectDownloadable(
+        archiveObject(1, { status: "uploaded", downloadable: true }),
+      ),
+    ).toBe(true);
+    expect(
+      isArchiveObjectDownloadable(
+        archiveObject(1, { status: "local_deleted", downloadable: true }),
+      ),
+    ).toBe(true);
   });
 
   it("labels backends without exposing configuration", () => {

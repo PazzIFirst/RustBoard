@@ -16,7 +16,9 @@ use anyhow::Result;
 use rustboard_common::config::HubConfig;
 use serde::Serialize;
 
-use crate::storage::sqlite::{SqliteStorage, DOWNSAMPLE_MAX_CHUNK_ROWS};
+use crate::storage::sqlite::{
+    SqliteStorage, DOWNSAMPLE_MAX_CHUNK_ROWS, STATE_RAW_PRUNE_GENERATION,
+};
 use crate::storage::{Storage, TierStats, BUCKET_1H_MS, BUCKET_1M_MS};
 
 /// `maintenance_state` 键：1m 层已完整聚合到（不含）该时间戳。
@@ -257,6 +259,13 @@ fn run_one_minute_tier(
 
     // 没有 1m 水位时忽略 rowid 进度，从最旧 raw 重新覆盖（安全降级）。
     let scan_after = if stored.is_some() { last_rowid } else { None };
+    // 必须在读 MAX(rowid) 之前拍 generation 快照：prune 若在此后删除最大
+    // rowid 行会把 generation +1，CAS 因代际不一致而失败，即使 rowid key
+    // 恰好缺失也不会把删除前的旧 MAX 写回。缺失按 0；非法值在 CAS 侧视为不匹配。
+    let prune_generation = db
+        .get_maintenance_state(STATE_RAW_PRUNE_GENERATION)?
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0);
     let (max_rowid, min_new_ts) = db.raw_new_rows(scan_after)?;
 
     let mut start = match stored {
@@ -283,9 +292,20 @@ fn run_one_minute_tier(
     // 认领本轮已扫描到的 rowid。必须在回拨水位落库之后：被认领行的 ts 都
     // 不早于已落库的 1m 水位（迟到行已把水位回拨到其桶起点），崩溃后重做不丢；
     // 之后写入的并发行 rowid 更大，下一轮仍会被发现。
+    //
+    // 用 CAS 而不是直接写：若从上面读 MAX 到现在，retention 删除了最大 rowid
+    // 行，prune 会降低或删除本 key；CAS 失败时本轮不认领，下一轮从更低位重扫，
+    // 避免把删除前的旧 MAX 写回、永久吞掉复用该 rowid 的迟到行。
     if let Some(max) = max_rowid {
-        if last_rowid != Some(max) {
-            write_watermark(db, STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID, max, now)?;
+        if last_rowid != Some(max)
+            && !db.claim_raw_rowid_if_unchanged(last_rowid, prune_generation, max)?
+        {
+            tracing::debug!(
+                expected = ?last_rowid,
+                generation = prune_generation,
+                new = max,
+                "raw rowid 水位或 prune 代际已变化，本轮不认领"
+            );
         }
     }
 

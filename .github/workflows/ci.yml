@@ -119,6 +119,9 @@ jobs:
       - name: M4 告警与归档回归
         run: bash tests/e2e/v040.sh
 
+      - name: v0.4.1 已知问题修复回归
+        run: bash tests/e2e/v041.sh
+
   web:
     name: web / tsc / build
     runs-on: ubuntu-latest

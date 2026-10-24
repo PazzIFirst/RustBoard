@@ -43,6 +43,17 @@ export function isArchiveDownloadable(status: string): boolean {
   return status === "uploaded" || status === "local_deleted";
 }
 
+/**
+ * 对象是否可下载：优先信任服务端 `downloadable`（含 64 MiB 下载硬限），
+ * 旧版响应缺少该字段时回退到按状态判断。
+ */
+export function isArchiveObjectDownloadable(object: {
+  status: string;
+  downloadable?: boolean;
+}): boolean {
+  return object.downloadable ?? isArchiveDownloadable(object.status);
+}
+
 const BACKEND_LABELS: Record<string, string> = {
   webdav: "WebDAV",
   s3: "S3 / MinIO",

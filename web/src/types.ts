@@ -309,6 +309,12 @@ export interface ArchiveObject {
   sha256: string;
   status: ArchiveObjectStatus;
   error: string;
+  /**
+   * 服务端是否允许下载：状态为 `uploaded` / `local_deleted` 且对象 ≤ 64 MiB。
+   *
+   * 旧版 hub 不返回该字段；页面回退到按 `status` 判断。
+   */
+  downloadable?: boolean;
   created_at: number;
   uploaded_at: number | null;
   deleted_at: number | null;

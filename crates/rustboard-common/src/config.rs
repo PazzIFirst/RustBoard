@@ -639,7 +639,11 @@ pub struct ArchiveConfig {
     pub after_days: u32,
     /// 每天执行归档任务的 UTC 小时（0–23）。
     pub schedule_hour_utc: u8,
-    /// 单个归档对象压缩后的字节上限，1 MiB–1 GiB。
+    /// 单个归档对象压缩后的字节上限，1 MiB–64 MiB。
+    ///
+    /// 该值决定归档 worker 的分片大小；hub 下载的硬上限固定为 64 MiB，
+    /// 不会随本值缩小。配置超过 64 MiB 只会产出无法下载的对象（KI-31），
+    /// 因此在配置校验阶段直接拒绝。
     pub max_object_bytes: u64,
     /// 对象 key 前缀，只允许 `[A-Za-z0-9._-]`、非空、≤64 字节且不含 `..`。
     pub prefix: String,
@@ -704,9 +708,13 @@ impl ArchiveConfig {
             )));
         }
         if !(MIN_ARCHIVE_OBJECT_BYTES..=MAX_ARCHIVE_OBJECT_BYTES).contains(&self.max_object_bytes) {
+            // KI-31：上限必须与下载硬限一致，否则会产出“上传成功但下载 413”的对象。
             return Err(Error::InvalidConfig(format!(
-                "archive.max_object_bytes 必须在 {MIN_ARCHIVE_OBJECT_BYTES}–\
-                 {MAX_ARCHIVE_OBJECT_BYTES} 字节之间，实际 {}",
+                "archive.max_object_bytes 是单个归档对象与下载内存的硬上限，必须在 \
+                 {MIN_ARCHIVE_OBJECT_BYTES}–{MAX_ARCHIVE_OBJECT_BYTES} 字节（{}–{} MiB）\
+                 之间，实际 {}",
+                MIN_ARCHIVE_OBJECT_BYTES / MIB,
+                MAX_ARCHIVE_OBJECT_BYTES / MIB,
                 self.max_object_bytes
             )));
         }
@@ -1634,8 +1642,14 @@ fn default_maintenance_interval_secs() -> u64 {
 const MIN_ARCHIVE_AFTER_DAYS: u32 = 1;
 const MAX_ARCHIVE_AFTER_DAYS: u32 = 365;
 const MAX_ARCHIVE_SCHEDULE_HOUR_UTC: u8 = 23;
-const MIN_ARCHIVE_OBJECT_BYTES: u64 = 1_048_576;
-const MAX_ARCHIVE_OBJECT_BYTES: u64 = 1_073_741_824;
+/// 归档对象字节上限的换算单位。
+const MIB: u64 = 1024 * 1024;
+/// 单个归档对象的字节上限：1 MiB–64 MiB。
+///
+/// 上界与 hub 下载硬限（64 MiB）保持一致：下载会把整个对象读进内存，
+/// 允许更大的对象只会产生无法下载的归档（KI-31）。
+const MIN_ARCHIVE_OBJECT_BYTES: u64 = MIB;
+const MAX_ARCHIVE_OBJECT_BYTES: u64 = 64 * MIB;
 const MAX_ARCHIVE_PREFIX_BYTES: usize = 64;
 
 /// M4 告警配置的各字段允许范围（与方案 §8.2 一致）。
@@ -2936,9 +2950,11 @@ name = ""
             ("schedule_hour_utc = 23", true),
             ("schedule_hour_utc = 24", false),
             ("max_object_bytes = 1048576", true),
-            ("max_object_bytes = 1073741824", true),
+            ("max_object_bytes = 67108864", true),
             ("max_object_bytes = 1048575", false),
-            ("max_object_bytes = 1073741825", false),
+            ("max_object_bytes = 67108865", false),
+            // KI-31：旧上界 1 GiB 及更大的值必须被拒绝。
+            ("max_object_bytes = 1073741824", false),
         ] {
             let hub: HubConfig =
                 toml::from_str(&format!("[archive]\n{line}\n")).expect("TOML 必须可解析");
@@ -2950,6 +2966,20 @@ name = ""
                 "{line} 的校验结果不符合预期: {result:?}"
             );
         }
+
+        // KI-31：拒绝信息必须点名配置项，并说明这是单对象 / 下载内存上限。
+        let hub: HubConfig = toml::from_str("[archive]\nmax_object_bytes = 67108865\n").unwrap();
+        let err = hub
+            .archive
+            .validate()
+            .expect_err("64 MiB + 1 必须拒绝")
+            .to_string();
+        assert!(
+            err.contains("archive.max_object_bytes"),
+            "错误必须点名字段: {err}"
+        );
+        assert!(err.contains("下载内存"), "错误必须说明下载内存上限: {err}");
+        assert!(err.contains("67108864"), "错误必须给出上界: {err}");
 
         // prefix：仅 [A-Za-z0-9._-]、非空、≤64、不含 ".."。
         for (prefix, ok) in [

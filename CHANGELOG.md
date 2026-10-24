@@ -10,6 +10,31 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- KI-29：raw 保留期删除时在同一写事务内收敛 `downsample_1m_last_raw_rowid`；
+  最大 rowid 行被删且旧水位不高于新 MAX 时清除该键，避免复用 rowid 的迟到行
+  被误判为已认领；downsample 认领改为 CAS，防止并发 retention 的旧 MAX 回写
+- KI-31：`archive.max_object_bytes` 上限收紧到 64 MiB，下载硬限固定 64 MiB
+  且与分片配置解耦；归档对象列表增加 `downloadable`，面板对超限对象显示禁用
+  “不可下载”，不再渲染可点击按钮
+- KI-28：攻击来源 IP 的连接拒绝日志按 60s 窗口采样，首条 WARN、其余 DEBUG；
+  采样表最多 4096 个来源，避免日志放大与无界内存
+- KI-20：`rustboard-hub agent add` 安装命令对 URL/token/指纹/name 统一 POSIX
+  shell 引用，拒绝含 ASCII 控制字符的 name；正常 `web-01` 输出保持不变
+
+### Security
+
+- 新增 M4 专项渗透报告与 SFTP 真实服务器验证：Docker OpenSSH 29/29，覆盖密码
+  与 ed25519、错误指纹/RSA-only 拒绝、2 分片真实上传与 SHA 校验、64 MiB 下载、
+  429/120s 期限、SIGKILL 恢复；基线矩阵无严重/高危发现
+
+### Changed
+
+- `archive.max_object_bytes` 超过 64 MiB 的旧配置将**拒绝启动**（有意 breaking
+  change）：该值只控制 worker 分片，下载内存硬限固定 64 MiB；已有 >64 MiB
+  对象不删除、不重传，列表标记 `downloadable=false`，下载返回 413
+
 ## [0.4.0] - 2026-10-24
 
 ### Added

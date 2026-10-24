@@ -20,6 +20,7 @@ import {
   formatArchiveRows,
   formatArchiveWatermark,
   isArchiveDownloadable,
+  isArchiveObjectDownloadable,
   nextArchiveBeforeId,
   shortSha256,
 } from "../archive";
@@ -268,7 +269,8 @@ function ObjectsPanel() {
         <div>
           <h2>归档对象</h2>
           <p className="muted">
-            按上传时间倒序 · 每页 {ARCHIVE_PAGE_SIZE} 条 · 仅“已上传 / 本地已清理”可下载
+            按上传时间倒序 · 每页 {ARCHIVE_PAGE_SIZE} 条 · 仅“已上传 / 本地已清理”
+            且不超过 64 MiB 的对象可下载
             {objects.length > 0 ? ` · 已加载 ${objects.length} 条` : ""}
           </p>
         </div>
@@ -315,7 +317,15 @@ function ObjectsPanel() {
             <tbody>
               {objects.map((object) => {
                 const url = archiveDownloadUrl(object.id);
-                const downloadable = isArchiveDownloadable(object.status) && url !== "";
+                const ready = isArchiveDownloadable(object.status);
+                const downloadable = isArchiveObjectDownloadable(object) && url !== "";
+                // 状态可下载但服务端明确拒绝：只可能是超过 64 MiB 下载上限。
+                const blockedBySize = ready && object.downloadable === false;
+                const disabledTitle = !ready
+                  ? "归档对象尚未上传完成，暂不可下载"
+                  : blockedBySize
+                    ? "超过 64 MiB 下载上限，请直接访问冷存储"
+                    : "对象标识非法，暂不可下载";
                 return (
                   <tr key={object.id}>
                     <td>
@@ -358,7 +368,7 @@ function ObjectsPanel() {
                           type="button"
                           className="button small"
                           disabled
-                          title="归档对象尚未上传完成，暂不可下载"
+                          title={disabledTitle}
                         >
                           不可下载
                         </button>

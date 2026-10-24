@@ -1035,7 +1035,54 @@ fn print_ports(config: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// KI-20：安装命令里不需要 shell 引用的安全字符集。
+fn shell_arg_safe_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'.' | b'_' | b'/' | b':' | b'@' | b'%' | b'+' | b',' | b'-'
+        )
+}
+
+/// KI-20：把单个参数安全地放进 POSIX shell 命令。
+///
+/// 空串或含安全字符集以外的字符时整体用单引号包裹，内部的 `'` 替换为
+/// `'\''`（关闭引号 → 转义单引号 → 重新打开引号）。正常 host、token、
+/// 指纹、`web-01` 等输出保持逐字节不变。
+fn shell_arg(value: &str) -> String {
+    if !value.is_empty() && value.bytes().all(shell_arg_safe_byte) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// KI-20：渲染可直接粘贴执行的 agent 安装命令。
+///
+/// URL、token、指纹、name 全部经 [`shell_arg`] 引用；正常值不改变输出。
+fn render_install_command(url: &str, token: &str, fingerprint: &str, name: &str) -> String {
+    format!(
+        "rustboard-agent init --hub {} \\\n    --token {} --fingerprint {} --name {}",
+        shell_arg(url),
+        shell_arg(token),
+        shell_arg(fingerprint),
+        shell_arg(name)
+    )
+}
+
+/// KI-20：拒绝含 ASCII 控制字符的 agent name（NUL / 换行 / 回车 / Tab / C0 / DEL）。
+///
+/// 控制字符无法安全地出现在可粘贴的单行安装命令里；必须在创建 enrollment
+/// token **之前**拒绝，避免留下无法使用的 token。除此之外不做白名单限制。
+fn validate_agent_name(name: &str) -> Result<()> {
+    if name.chars().any(|ch| ch.is_ascii_control()) {
+        bail!("agent 名称不得包含 ASCII 控制字符（NUL/换行/回车/Tab/DEL）");
+    }
+    Ok(())
+}
+
 fn agent_add(config: Option<PathBuf>, name: String, ttl_minutes: u32) -> Result<()> {
+    // KI-20：先校验 name，再打开数据库 / 创建 token。
+    validate_agent_name(&name)?;
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
     let cfg = load_config(&path)?;
     let db = SqliteStorage::open(&cfg.sqlite_path()?)?;
@@ -1071,7 +1118,13 @@ fn agent_add(config: Option<PathBuf>, name: String, ttl_minutes: u32) -> Result<
     println!("  {token}");
     println!("\n在目标服务器上执行:");
     println!(
-        "  rustboard-agent init --hub wss://{host}:{port}/agent/ws \\\n    --token {token} --fingerprint {fingerprint} --name {name}"
+        "  {}",
+        render_install_command(
+            &format!("wss://{host}:{port}/agent/ws"),
+            &token,
+            &fingerprint,
+            &name
+        )
     );
     Ok(())
 }
@@ -1616,6 +1669,8 @@ async fn serve_admin_listener(
     let sock = listener.local_addr().context("读取管理 API 监听地址失败")?;
     let permits = Arc::new(Semaphore::new(ADMIN_MAX_CONNECTIONS.max(1)));
     let limits = Arc::new(ConnectionLimiter::new(ADMIN_MAX_CONNECTIONS_PER_IP));
+    // KI-28：每来源拒绝日志采样；accept 循环单任务访问，无需加锁。
+    let mut reject_sampler = RejectLogSampler::new();
     tracing::info!(
         %sock,
         tls = tls.is_some(),
@@ -1652,10 +1707,11 @@ async fn serve_admin_listener(
         let connection = match limits.try_acquire(peer.ip()) {
             Ok(connection) => connection,
             Err(ConnectionLimitRejection::PerIp) => {
-                tracing::warn!(
-                    ip = %peer.ip(),
-                    max_connections_per_ip = ADMIN_MAX_CONNECTIONS_PER_IP,
-                    "管理 API 来源 IP 并发连接已达上限，直接关闭 TCP"
+                log_connection_reject(
+                    &mut reject_sampler,
+                    peer.ip(),
+                    ADMIN_MAX_CONNECTIONS_PER_IP,
+                    "管理 API 来源 IP 并发连接已达上限，直接关闭 TCP",
                 );
                 continue;
             }
@@ -2005,10 +2061,23 @@ struct ArchiveObjectView {
     created_at: i64,
     uploaded_at: Option<i64>,
     deleted_at: Option<i64>,
+    /// 是否可下载：状态就绪且对象大小未超过固定 64 MiB 下载上限。
+    downloadable: bool,
+}
+
+/// 归档对象是否可下载（KI-31）。
+///
+/// 只依赖固定下载硬上限，不受 `archive.max_object_bytes`（worker 分片）影响。
+fn archive_object_downloadable(object: &ArchiveObject) -> bool {
+    matches!(
+        object.status,
+        ArchiveStatus::Uploaded | ArchiveStatus::LocalDeleted
+    ) && object.bytes <= MAX_ARCHIVE_DOWNLOAD_BYTES
 }
 
 impl From<ArchiveObject> for ArchiveObjectView {
     fn from(object: ArchiveObject) -> Self {
+        let downloadable = archive_object_downloadable(&object);
         Self {
             id: object.id,
             object_key: object.object_key,
@@ -2023,6 +2092,7 @@ impl From<ArchiveObject> for ArchiveObjectView {
             created_at: object.created_at,
             uploaded_at: object.uploaded_at,
             deleted_at: object.deleted_at,
+            downloadable,
         }
     }
 }
@@ -2155,6 +2225,12 @@ async fn archive_object_download(
             "归档对象尚未上传完成，暂不可下载",
         ));
     }
+    // KI-31：下载硬上限固定 64 MiB，与 `archive.max_object_bytes`（worker 分片）
+    // 解耦。超限在占全局 permit / build_store / HEAD / GET 之前就拒绝，
+    // 大对象完全不触碰后端、不占下载许可。
+    if object.bytes > MAX_ARCHIVE_DOWNLOAD_BYTES {
+        return Err(archive_too_large());
+    }
 
     // 主体槽拿到后再按 Tokio FIFO 等待全局 permit，不同主体之间公平轮转；
     // 等待全局 permit 时请求被取消，主体槽随 future drop 释放，不会留下占位。
@@ -2171,7 +2247,6 @@ async fn archive_object_download(
 
     let store = archive::build_store(&state.cfg.archive).map_err(|_| archive_unavailable())?;
     archive_download_response(
-        &state.cfg,
         &object,
         store.as_ref(),
         permits,
@@ -2225,26 +2300,32 @@ fn archive_too_large() -> ApiError {
 
 /// 从冷存储读取对象并构造下载响应。
 ///
-/// 先检查数据库记录与 `HEAD` 大小，再 `GET`；对象超过
-/// `min(archive.max_object_bytes, 64 MiB)` 直接 413，避免异常对象一次性占满
-/// 内存。读取后校验长度与 SHA-256 必须与数据库一致，否则固定 502。
+/// 先检查数据库记录与 `HEAD` 大小，再 `GET`；对象超过固定
+/// [`MAX_ARCHIVE_DOWNLOAD_BYTES`]（64 MiB）直接 413，避免异常对象一次性占满
+/// 内存。`archive.max_object_bytes` 只控制 worker 分片，不参与下载上限（KI-31）。
+/// 读取后校验长度与 SHA-256 必须与数据库一致，否则固定 502。
 /// 响应头只由服务端构造：
 /// - `Content-Type: application/gzip`；
 /// - `Content-Disposition: attachment; filename="rustboard-<yyyyMMdd>-part-NNNNN.csv.gz"`；
 /// - `Content-Length` 与 `Cache-Control: private, no-store`。
 async fn archive_download_response(
-    cfg: &HubConfig,
     object: &ArchiveObject,
     store: &dyn ColdStore,
     permits: ArchiveDownloadPermits,
     send_timeout: Duration,
 ) -> Result<Response, ApiError> {
-    let limit = cfg.archive.max_object_bytes.min(MAX_ARCHIVE_DOWNLOAD_BYTES);
-    archive_download_response_with_limit(object, store, limit, permits, send_timeout).await
+    archive_download_response_with_limit(
+        object,
+        store,
+        MAX_ARCHIVE_DOWNLOAD_BYTES,
+        permits,
+        send_timeout,
+    )
+    .await
 }
 
 /// 带可调上限 / 发送期限的下载响应实现；生产上限固定为
-/// `min(archive.max_object_bytes, 64 MiB)`，发送期限固定
+/// [`MAX_ARCHIVE_DOWNLOAD_BYTES`]，发送期限固定
 /// [`ARCHIVE_DOWNLOAD_SEND_TIMEOUT`]，测试用小值覆盖边界。
 ///
 /// 成功时把主体槽与全局 permit 移入 [`ArchiveDownloadBody`]，由 body 生命周期
@@ -2730,6 +2811,128 @@ impl ConnectionLimiter {
     }
 }
 
+/// KI-28：连接拒绝日志采样窗口（60s）。
+const REJECT_LOG_WINDOW_MS: i64 = 60_000;
+/// KI-28：拒绝日志采样器最多跟踪的来源 IP 数。
+const REJECT_LOG_TABLE_CAPACITY: usize = 4096;
+
+/// 单个来源 IP 的拒绝计数窗口。
+#[derive(Debug, Clone, Copy, Default)]
+struct RejectWindow {
+    started_at: i64,
+    count: u64,
+}
+
+/// KI-28：按来源 IP 采样连接拒绝日志。
+///
+/// 同一来源 IP 每 60s 窗口内只有首条拒绝记 WARN，其余记 DEBUG；不同 IP
+/// 独立计数。表有 4096 个 IP 的硬上限：插入新来源前先清理过期窗口，仍然
+/// 满时不再插入（该来源按窗口内后续拒绝记 DEBUG），因此大量来源 IP 无法
+/// 放大内存或 WARN 日志。`now_ms` 可注入，单测可精确覆盖窗口边界。
+struct RejectLogSampler {
+    windows: HashMap<IpAddr, RejectWindow>,
+    now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
+}
+
+/// 一次拒绝的采样结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RejectLogSample {
+    /// 本窗口内该来源的累计拒绝次数。
+    rejected: u64,
+    /// 是否本窗口首条拒绝（只有它记 WARN）。
+    first_in_window: bool,
+}
+
+impl RejectLogSampler {
+    fn new() -> Self {
+        Self::with_clock(Arc::new(rustboard_common::util::now_ms))
+    }
+
+    fn with_clock(now_ms: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        Self {
+            windows: HashMap::new(),
+            now_ms,
+        }
+    }
+
+    /// 记录一次拒绝并返回本窗口计数；不持有其它锁。
+    fn record(&mut self, ip: IpAddr) -> RejectLogSample {
+        let now = (self.now_ms)();
+        if let Some(window) = self.windows.get_mut(&ip) {
+            if now.saturating_sub(window.started_at) >= REJECT_LOG_WINDOW_MS {
+                window.started_at = now;
+                window.count = 1;
+                return RejectLogSample {
+                    rejected: 1,
+                    first_in_window: true,
+                };
+            }
+            window.count = window.count.saturating_add(1);
+            return RejectLogSample {
+                rejected: window.count,
+                first_in_window: false,
+            };
+        }
+
+        // 插入新来源前清理过期窗口；仍然满则不再增长采样表。
+        self.windows
+            .retain(|_, window| now.saturating_sub(window.started_at) < REJECT_LOG_WINDOW_MS);
+        if self.windows.len() >= REJECT_LOG_TABLE_CAPACITY {
+            return RejectLogSample {
+                rejected: 1,
+                first_in_window: false,
+            };
+        }
+        self.windows.insert(
+            ip,
+            RejectWindow {
+                started_at: now,
+                count: 1,
+            },
+        );
+        RejectLogSample {
+            rejected: 1,
+            first_in_window: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn tracked_ips(&self) -> usize {
+        self.windows.len()
+    }
+}
+
+/// KI-28：按采样结果输出一条拒绝日志；窗口首条 WARN，其余 DEBUG。
+///
+/// 字段只含来源 IP、本窗口拒绝次数与窗口秒数，不带端口 / 证书。
+fn log_connection_reject(
+    sampler: &mut RejectLogSampler,
+    ip: IpAddr,
+    max_connections_per_ip: usize,
+    message: &'static str,
+) {
+    let sample = sampler.record(ip);
+    if sample.first_in_window {
+        tracing::warn!(
+            ip = %ip,
+            rejected = sample.rejected,
+            window_secs = REJECT_LOG_WINDOW_MS / 1_000,
+            max_connections_per_ip,
+            "{}",
+            message
+        );
+    } else {
+        tracing::debug!(
+            ip = %ip,
+            rejected = sample.rejected,
+            window_secs = REJECT_LOG_WINDOW_MS / 1_000,
+            max_connections_per_ip,
+            "{}",
+            message
+        );
+    }
+}
+
 /// H2：尝试占用一个连接许可；返回 None 表示已达上限，调用方应关闭 TCP。
 fn try_acquire_connection(permits: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
     permits.clone().try_acquire_owned().ok()
@@ -2775,6 +2978,8 @@ async fn serve_tls(
     let max_connections = max_connections.max(1);
     let permits = Arc::new(Semaphore::new(max_connections));
     let limits = Arc::new(ConnectionLimiter::new(max_connections_per_ip));
+    // KI-28：每来源拒绝日志采样；accept 循环单任务访问，无需加锁。
+    let mut reject_sampler = RejectLogSampler::new();
     tracing::info!(
         %sock,
         max_connections,
@@ -2806,10 +3011,11 @@ async fn serve_tls(
         let connection = match limits.try_acquire(peer.ip()) {
             Ok(connection) => connection,
             Err(ConnectionLimitRejection::PerIp) => {
-                tracing::warn!(
-                    ip = %peer.ip(),
+                log_connection_reject(
+                    &mut reject_sampler,
+                    peer.ip(),
                     max_connections_per_ip,
-                    "来源 IP 并发连接已达上限，直接关闭 TCP"
+                    "来源 IP 并发连接已达上限，直接关闭 TCP",
                 );
                 continue;
             }
@@ -10421,6 +10627,14 @@ mod tests {
         assert_eq!(objects[1]["id"], 2);
         assert_eq!(objects[0]["status"], "failed");
         assert_eq!(objects[0]["error"], "archive_error");
+        assert_eq!(
+            objects[0]["downloadable"], false,
+            "failed 状态不可下载（KI-31）"
+        );
+        assert_eq!(
+            objects[1]["downloadable"], true,
+            "local_deleted 且未超 64 MiB 可下载（KI-31）"
+        );
         assert_eq!(objects[0]["rows"], 42);
         assert_eq!(objects[0]["bytes"], 128);
         assert_eq!(objects[0]["sha256"].as_str().unwrap().len(), 64);
@@ -10445,6 +10659,10 @@ mod tests {
         let objects = body["objects"].as_array().unwrap();
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0]["id"], 1);
+        assert_eq!(
+            objects[0]["downloadable"], true,
+            "uploaded 且未超 64 MiB 可下载（KI-31）"
+        );
         assert!(body["next_before_id"].is_null());
 
         // 参数边界：limit 1..=100、before_id 正整数、重复参数全部 400。
@@ -10555,10 +10773,31 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(json_body(&body)["error"], "archive_too_large");
+        let body = json_body(&body);
+        assert_eq!(body["error"], "archive_too_large");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("64 MiB"),
+            "413 文案必须说明 64 MiB 下载上限"
+        );
         assert!(
             mock.inner.lock().unwrap().requests.is_empty(),
             "超限对象不得触碰后端"
+        );
+        assert_eq!(
+            state.archive_download_slots.available_permits(),
+            1,
+            "超限对象不得占用全局下载许可（KI-31）"
+        );
+        assert_eq!(
+            state
+                .archive_download_principal_slots
+                .lock()
+                .unwrap()
+                .get("archive-dl-large")
+                .expect("主体槽已在取对象前创建")
+                .available_permits(),
+            1,
+            "413 返回时主体槽必须已归还"
         );
     }
 
@@ -11033,13 +11272,11 @@ mod tests {
         use object_store::memory::InMemory;
 
         let store = S3ColdStore::with_store(Arc::new(InMemory::new()));
-        let cfg = HubConfig::default();
         let key = "rustboard/2026/10/24/part-00009.csv.gz";
 
         // 缺失对象 → 502。
         let object = archive_object_record(key, ArchiveStatus::Uploaded, "");
         let error = archive_download_response(
-            &cfg,
             &object,
             &store,
             download_permits(),
@@ -11060,7 +11297,6 @@ mod tests {
         let mut oversized = archive_object_record(key, ArchiveStatus::Uploaded, "");
         oversized.bytes = MAX_ARCHIVE_DOWNLOAD_BYTES + 1;
         let error = archive_download_response(
-            &cfg,
             &oversized,
             &store,
             download_permits(),
@@ -11161,7 +11397,6 @@ mod tests {
             "",
         );
         let error = archive_download_response(
-            &cfg,
             &weird,
             &store,
             download_permits(),
@@ -11989,5 +12224,240 @@ mod tests {
             .unwrap();
         let response = call_router(&router, request).await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // ------------------------------------------------------------------
+    // v0.4.1：KI-31 下载判定 / KI-28 拒绝日志采样 / KI-20 shell 引用
+    // ------------------------------------------------------------------
+
+    /// KI-31：downloadable 只由状态与固定 64 MiB 下载硬限决定。
+    #[test]
+    fn ki31_archive_object_downloadable_uses_fixed_limit() {
+        let mut object = archive_object_record(
+            "rustboard/2026/10/24/part-00001.csv.gz",
+            ArchiveStatus::Uploaded,
+            "",
+        );
+        object.bytes = MAX_ARCHIVE_DOWNLOAD_BYTES;
+        assert!(
+            archive_object_downloadable(&object),
+            "恰好 64 MiB 必须可下载"
+        );
+        object.bytes = MAX_ARCHIVE_DOWNLOAD_BYTES + 1;
+        assert!(
+            !archive_object_downloadable(&object),
+            "64 MiB + 1 必须不可下载"
+        );
+
+        object.bytes = 1;
+        for status in [ArchiveStatus::Failed, ArchiveStatus::Pending] {
+            object.status = status;
+            assert!(!archive_object_downloadable(&object), "{status:?} 不可下载");
+        }
+        for status in [ArchiveStatus::Uploaded, ArchiveStatus::LocalDeleted] {
+            object.status = status;
+            assert!(archive_object_downloadable(&object), "{status:?} 可下载");
+        }
+
+        let view = serde_json::to_value(ArchiveObjectView::from(object)).unwrap();
+        assert_eq!(view["downloadable"], true, "JSON 必须包含 downloadable");
+    }
+
+    /// KI-28：同 IP 每窗口首条采样、不同 IP 独立、60s 边界重置。
+    #[test]
+    fn ki28_reject_log_sampler_window_and_per_ip() {
+        use std::sync::atomic::AtomicI64;
+
+        let clock = Arc::new(AtomicI64::new(1_000_000));
+        let clock_handle = clock.clone();
+        let mut sampler =
+            RejectLogSampler::with_clock(Arc::new(move || clock_handle.load(Ordering::Relaxed)));
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+
+        assert_eq!(
+            sampler.record(ip1),
+            RejectLogSample {
+                rejected: 1,
+                first_in_window: true
+            }
+        );
+        assert_eq!(
+            sampler.record(ip1),
+            RejectLogSample {
+                rejected: 2,
+                first_in_window: false
+            }
+        );
+        assert_eq!(
+            sampler.record(ip1),
+            RejectLogSample {
+                rejected: 3,
+                first_in_window: false
+            }
+        );
+        // 不同 IP 不共享窗口。
+        assert_eq!(
+            sampler.record(ip2),
+            RejectLogSample {
+                rejected: 1,
+                first_in_window: true
+            }
+        );
+
+        // 窗口内 59.999s 仍是后续拒绝。
+        clock.store(1_000_000 + 59_999, Ordering::Relaxed);
+        assert_eq!(
+            sampler.record(ip1),
+            RejectLogSample {
+                rejected: 4,
+                first_in_window: false
+            }
+        );
+        // 恰好 60s：本 IP 进入新窗口，重新 WARN。
+        clock.store(1_000_000 + REJECT_LOG_WINDOW_MS, Ordering::Relaxed);
+        assert_eq!(
+            sampler.record(ip1),
+            RejectLogSample {
+                rejected: 1,
+                first_in_window: true
+            }
+        );
+    }
+
+    /// KI-28：采样表最多 4096 个 IP；插入前清理过期，满表不再增长。
+    #[test]
+    fn ki28_reject_log_sampler_table_capacity_is_bounded() {
+        use std::sync::atomic::AtomicI64;
+
+        let clock = Arc::new(AtomicI64::new(1_000_000));
+        let clock_handle = clock.clone();
+        let mut sampler =
+            RejectLogSampler::with_clock(Arc::new(move || clock_handle.load(Ordering::Relaxed)));
+        for index in 0..REJECT_LOG_TABLE_CAPACITY {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(index as u32 + 1));
+            assert!(
+                sampler.record(ip).first_in_window,
+                "容量内新来源首条应 WARN"
+            );
+        }
+        assert_eq!(sampler.tracked_ips(), REJECT_LOG_TABLE_CAPACITY);
+
+        // 表满且无过期项：新来源不产生 WARN，也不增长采样表。
+        let overflow: IpAddr = "203.0.113.9".parse().unwrap();
+        let sample = sampler.record(overflow);
+        assert!(!sample.first_in_window, "满表时新来源不得放大 WARN");
+        assert_eq!(
+            sampler.tracked_ips(),
+            REJECT_LOG_TABLE_CAPACITY,
+            "采样表必须保持有界"
+        );
+        // 已跟踪 IP 仍正常计数。
+        let tracked = IpAddr::from(std::net::Ipv4Addr::from(1_u32));
+        assert_eq!(sampler.record(tracked).rejected, 2);
+
+        // 推进一个窗口后，过期项被清理，新来源恢复 WARN。
+        clock.store(1_000_000 + REJECT_LOG_WINDOW_MS, Ordering::Relaxed);
+        let sample = sampler.record(overflow);
+        assert!(sample.first_in_window, "过期清理后新来源应重新 WARN");
+        assert!(sampler.tracked_ips() <= REJECT_LOG_TABLE_CAPACITY);
+    }
+
+    /// KI-20：安全字符集不加引号，其余字符用 POSIX 单引号安全包裹。
+    #[test]
+    fn ki20_shell_arg_quotes_only_when_needed() {
+        for safe in [
+            "web-01",
+            "wss://hub.example.com:8443/agent/ws",
+            "0123456789abcdef",
+            "/tmp/rustboard_data",
+            "a.b_c/d:e@f%g+h,i",
+        ] {
+            assert_eq!(shell_arg(safe), safe, "安全值必须逐字节不变");
+        }
+        assert_eq!(shell_arg(""), "''");
+        assert_eq!(shell_arg("web 01"), "'web 01'");
+        assert_eq!(shell_arg("web'01"), r"'web'\''01'");
+        for unsafe_value in [
+            "web$(printf INJECTED)",
+            "web`printf INJECTED`",
+            "web;printf INJECTED",
+            "web|printf INJECTED",
+            "web&printf INJECTED",
+            "web#printf INJECTED",
+            "web\n01",
+        ] {
+            assert_eq!(
+                shell_arg(unsafe_value),
+                format!("'{unsafe_value}'"),
+                "危险字符必须整体单引号包裹: {unsafe_value:?}"
+            );
+        }
+    }
+
+    /// KI-20：正常 name 的安装命令逐字节不变；危险 name 只出现在安全引号里。
+    #[test]
+    fn ki20_render_install_command_quotes_all_fields() {
+        let token = "0123456789abcdef".repeat(4);
+        let fingerprint = "fedcba9876543210".repeat(4);
+        let normal =
+            render_install_command("wss://web-01:8443/agent/ws", &token, &fingerprint, "web-01");
+        assert_eq!(
+            normal,
+            format!(
+                "rustboard-agent init --hub wss://web-01:8443/agent/ws \\\n    \
+                 --token {token} --fingerprint {fingerprint} --name web-01"
+            ),
+            "正常 name 命令必须保持不变"
+        );
+
+        for raw in [
+            "web 01",
+            "web'01",
+            "web$(printf INJECTED)",
+            "web`printf INJECTED`",
+            "web;printf INJECTED",
+            "web|printf INJECTED",
+            "web&printf INJECTED",
+            "web#printf INJECTED",
+        ] {
+            let command =
+                render_install_command("wss://web-01:8443/agent/ws", &token, &fingerprint, raw);
+            assert!(
+                command.ends_with(&format!("--name {}", shell_arg(raw))),
+                "name 必须走 shell_arg: {command}"
+            );
+            assert!(command.contains(&format!("--name '{}'", raw.replace('\'', r"'\''"))));
+        }
+
+        // URL 同样走 shell_arg，避免 host 注入新的 shell 词。
+        let command =
+            render_install_command("wss://web 01:8443/agent/ws", &token, &fingerprint, "web-01");
+        assert!(
+            command.starts_with("rustboard-agent init --hub 'wss://web 01:8443/agent/ws'"),
+            "{command}"
+        );
+    }
+
+    /// KI-20：agent name 的 ASCII 控制字符在创建 token 前拒绝；其余不设白名单。
+    #[test]
+    fn ki20_agent_name_rejects_ascii_control_chars() {
+        for safe in ["web-01", "web 01", "web;$(id)", "web|&`#"] {
+            assert!(validate_agent_name(safe).is_ok(), "不得过度限制: {safe:?}");
+        }
+        for bad in [
+            "web\0",
+            "web\n01",
+            "web\r01",
+            "web\t01",
+            "web\u{01}",
+            "web\u{1f}",
+            "web\u{7f}",
+        ] {
+            assert!(
+                validate_agent_name(bad).is_err(),
+                "必须拒绝控制字符: {bad:?}"
+            );
+        }
     }
 }

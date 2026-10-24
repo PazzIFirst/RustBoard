@@ -416,6 +416,143 @@ const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE rowid IN \
 const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE rowid IN \
      (SELECT rowid FROM samples_1h WHERE bucket_ts < ?1 ORDER BY bucket_ts LIMIT ?2)";
 
+/// `maintenance_state` 中记录降采样已认领 raw rowid 的键。
+///
+/// 必须与 [`crate::downsample::STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID`] 一致；
+/// 这里用同字符串常量，避免存储层反向依赖降采样层。单测
+/// `ki29_rowid_watermark_key_matches_downsample_module` 校验两者相等。
+const DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY: &str = "downsample_1m_last_raw_rowid";
+
+/// `maintenance_state` 中记录 raw prune 代际的键。
+///
+/// raw 删除批次只要删掉「最大 rowid 行」就把值 +1（缺失/非法按 1 写）。
+/// downsample 认领 rowid 水位时用它做 CAS 的第二比较项：即使 rowid key 恰好
+/// 缺失，也能发现期间发生过 prune。仅写 `maintenance_state` 行，无 schema 变更。
+pub const STATE_RAW_PRUNE_GENERATION: &str = "raw_prune_generation";
+
+/// raw 删除批次收敛 rowid 水位的结果；`new == None` 表示水位键被删除/失效。
+///
+/// 只在事务提交后用于日志，不参与返回结构。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowidWatermarkChange {
+    old: i64,
+    new: Option<i64>,
+}
+
+/// 在调用方已开启的写事务内把 `raw_prune_generation` 读-改-写为 +1。
+///
+/// 缺失或非法旧值按 1 写；`saturating_add` 防止极端脏数据下溢出。
+/// 调用方必须已持有写事务，否则 generation 与 raw 删除不在同一原子边界。
+fn bump_raw_prune_generation(tx: &Transaction<'_>, now: i64) -> Result<()> {
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT value FROM maintenance_state WHERE key = ?1",
+            params![STATE_RAW_PRUNE_GENERATION],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let next = current
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .map_or(1, |value| value.saturating_add(1));
+    tx.execute(
+        "INSERT INTO maintenance_state (key, value, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET
+             value = excluded.value,
+             updated_at = excluded.updated_at",
+        params![STATE_RAW_PRUNE_GENERATION, next.to_string(), now],
+    )?;
+    Ok(())
+}
+
+/// 在调用方已开启的写事务内收敛 `downsample_1m_last_raw_rowid`，并在最大
+/// rowid 行被删时推进 `raw_prune_generation`。
+///
+/// `max_before` / `max_after` 由调用方在本批 DELETE 前后读取；函数不再自己
+/// 查 MAX，保证判断依据与删除同属一个事务。
+///
+/// rowid 水位规则：
+/// - raw 表为空：删除水位键（残留键会让复用 rowid 的行永远扫描不到）；
+/// - 最大 rowid 行被删（`max_after < max_before`）且旧水位不高于 `max_after`：
+///   删除键。此时不能保留原值：downsample 可能已用旧值作 CAS 期望，保留会
+///   让并发 downsample 把删除前的旧 MAX 写回；
+/// - 其余情况只降不升：旧水位高于 `max_after` 才更新，否则不动；
+/// - 旧值缺失/非法时不新增 key。
+///
+/// 只要 `max_after < max_before`，无论 rowid 水位是否存在都先把 generation +1，
+/// 让 rowid key 缺失时 CAS 也能发现 prune。
+///
+/// **必须在 `tx` 上直接执行 SQL**：`set_maintenance_state` /
+/// `get_maintenance_state` 会再次抢写/读连接，在同一线程里自锁。
+fn lower_raw_rowid_watermark(
+    tx: &Transaction<'_>,
+    max_before: Option<i64>,
+    max_after: Option<i64>,
+    now: i64,
+) -> Result<Option<RowidWatermarkChange>> {
+    let max_row_deleted = match (max_before, max_after) {
+        (Some(before), Some(after)) => before > after,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if max_row_deleted {
+        bump_raw_prune_generation(tx, now)?;
+    }
+
+    let old_value: Option<String> = tx
+        .query_row(
+            "SELECT value FROM maintenance_state WHERE key = ?1",
+            params![DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let Some(max_after) = max_after else {
+        // raw 已空：残留水位会让复用 rowid 的行永远扫描不到，必须删除。
+        let Some(old_value) = old_value else {
+            return Ok(None);
+        };
+        tx.execute(
+            "DELETE FROM maintenance_state WHERE key = ?1",
+            params![DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY],
+        )?;
+        // 历史脏值无法给出数值日志；清理本身仍然执行。
+        return Ok(old_value
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .map(|old| RowidWatermarkChange { old, new: None }));
+    };
+
+    // 缺失或非法旧值不新增 key，也不据此改写任何状态。
+    let Some(old) = old_value.and_then(|raw| raw.trim().parse::<i64>().ok()) else {
+        return Ok(None);
+    };
+
+    // 最大 rowid 行被删：即使旧水位 <= 新 MAX 也必须让键失效，否则并发
+    // downsample 的 CAS 期望仍成立，会把删除前的旧 MAX 写回。
+    if max_row_deleted && old <= max_after {
+        tx.execute(
+            "DELETE FROM maintenance_state WHERE key = ?1",
+            params![DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY],
+        )?;
+        return Ok(Some(RowidWatermarkChange { old, new: None }));
+    }
+
+    // 只降不升。
+    if old <= max_after {
+        return Ok(None);
+    }
+    tx.execute(
+        "UPDATE maintenance_state SET value = ?2, updated_at = ?3 WHERE key = ?1",
+        params![DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, max_after.to_string(), now],
+    )?;
+    Ok(Some(RowidWatermarkChange {
+        old,
+        new: Some(max_after),
+    }))
+}
+
 /// M4 降采样单事务处理的源行数上限（一个桶本身超限时按整桶处理）。
 pub const DOWNSAMPLE_MAX_CHUNK_ROWS: usize = 5_000;
 
@@ -3500,8 +3637,11 @@ impl SqliteStorage {
     }
 
     /// 分批删除 raw 中 `ts < cutoff` 的行；`cutoff` 是排他边界（等于不删）。
+    ///
+    /// 每批删除都在同一 `BEGIN IMMEDIATE` 事务内收敛
+    /// `downsample_1m_last_raw_rowid`，见 [`Self::prune_raw_batched`]。
     pub fn prune_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
-        self.prune_batched(PRUNE_RAW_SQL, cutoff)
+        self.prune_raw_batched(cutoff)
     }
 
     /// 分批删除 1m 中 `bucket_ts < cutoff` 的行。
@@ -3512,6 +3652,134 @@ impl SqliteStorage {
     /// 分批删除 1h 中 `bucket_ts < cutoff` 的行。
     pub fn prune_samples_1h_before(&self, cutoff: i64) -> Result<PruneResult> {
         self.prune_batched(PRUNE_1H_SQL, cutoff)
+    }
+
+    /// raw 专属分批删除：每批在一个显式 `BEGIN IMMEDIATE` 事务内完成
+    /// 「读 `MAX(rowid)` → 删除 → 再读 `MAX(rowid)` → 收敛 rowid 水位 → commit」。
+    ///
+    /// 不复用 [`Self::prune_batched`]：后者无状态，做不到删除与降水位的原子性。
+    /// 一旦删除的正是最大 rowid 行，下一批之前（或下一次 prune 调用之前）插入
+    /// 的迟到行会复用该 rowid；若水位仍停在高位，这些行会被当成已认领而漏算。
+    /// 因此不能等所有批次结束再更新水位。
+    ///
+    /// 批大小、提前退出条件与返回结构都和 1m / 1h 的 [`Self::prune_batched`]
+    /// 保持一致；1m / 1h 的行为不受影响。
+    fn prune_raw_batched(&self, cutoff: i64) -> Result<PruneResult> {
+        let mut result = PruneResult::default();
+        loop {
+            let (deleted, change) = {
+                let mut conn = self.lock_write();
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                // DELETE 前后各读一次 MAX：只有删除前 = 删除后的批次才允许
+                // 「只降不升」；最大 rowid 行被删时水位键必须失效并推进
+                // generation（见 helper）。
+                let max_before: Option<i64> =
+                    tx.query_row("SELECT MAX(rowid) FROM samples", [], |row| row.get(0))?;
+                let deleted =
+                    tx.execute(PRUNE_RAW_SQL, params![cutoff, PRUNE_BATCH_ROWS as i64])?;
+                let max_after: Option<i64> =
+                    tx.query_row("SELECT MAX(rowid) FROM samples", [], |row| row.get(0))?;
+                // 即使本批删除 0 行也收敛一次：可修复 v0.4.0 遗留的高水位，
+                // 包括 raw 已空但 maintenance_state 仍残留水位键的情况。
+                let change = lower_raw_rowid_watermark(&tx, max_before, max_after, now_ms())?;
+                tx.commit()?;
+                (deleted, change)
+            };
+
+            // 提交后再记日志：回滚时不会出现与实际状态不符的日志。
+            if let Some(change) = change {
+                match change.new {
+                    Some(new) => tracing::info!(
+                        old = change.old,
+                        new,
+                        "raw 保留期删除后下调 downsample_1m_last_raw_rowid"
+                    ),
+                    None => tracing::info!(
+                        old = change.old,
+                        "raw 保留期删除后清除 downsample_1m_last_raw_rowid"
+                    ),
+                }
+            }
+
+            if deleted == 0 {
+                break;
+            }
+            result.deleted += deleted;
+            result.batches += 1;
+            if deleted < PRUNE_BATCH_ROWS {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        Ok(result)
+    }
+
+    /// CAS 认领 raw rowid 水位：rowid 与 generation 都等于期望时才写 `new_max`。
+    ///
+    /// downsample 先读 `MAX(rowid)`、稍后才写水位；两步之间 retention 可能
+    /// 删除最大 rowid 行并降低/删除 rowid key。这里在同一个 `BEGIN IMMEDIATE`
+    /// 事务内做「读当前 rowid + generation + 条件写」，任一不匹配都返回
+    /// `false`，调用方本轮不认领，下一轮从更低位重扫。
+    ///
+    /// generation 缺失视为 0；当前 generation 非法时视为不匹配（不覆盖）。
+    /// 即使 rowid key 恰好缺失，generation 变化也能让 CAS 失败。rowid
+    /// `expected == None` 表示调用方读到 key 缺失，只有当前仍缺失才算匹配。
+    pub fn claim_raw_rowid_if_unchanged(
+        &self,
+        expected_rowid: Option<i64>,
+        expected_generation: i64,
+        new_max: i64,
+    ) -> Result<bool> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_rowid: Option<String> = tx
+            .query_row(
+                "SELECT value FROM maintenance_state WHERE key = ?1",
+                params![DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let current_generation: Option<String> = tx
+            .query_row(
+                "SELECT value FROM maintenance_state WHERE key = ?1",
+                params![STATE_RAW_PRUNE_GENERATION],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let rowid_matches = match expected_rowid {
+            None => current_rowid.is_none(),
+            Some(expected) => {
+                current_rowid
+                    .as_deref()
+                    .and_then(|raw| raw.trim().parse::<i64>().ok())
+                    == Some(expected)
+            }
+        };
+        // 缺失 generation 视为 0；非法值解析失败，不匹配任何期望。
+        let generation_matches = match current_generation.as_deref() {
+            None => expected_generation == 0,
+            Some(raw) => raw.trim().parse::<i64>().ok() == Some(expected_generation),
+        };
+
+        if !rowid_matches || !generation_matches {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO maintenance_state (key, value, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value,
+                 updated_at = excluded.updated_at",
+            params![
+                DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY,
+                new_max.to_string(),
+                now_ms()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// 每批 [`PRUNE_BATCH_ROWS`] 行、每批独立隐式事务。
@@ -6033,6 +6301,316 @@ mod tests {
         assert_eq!(s.samples_1h_stats().unwrap().rows, 2);
         assert_eq!(s.prune_samples_1h_before(hour).unwrap().deleted, 1);
         assert_eq!(s.samples_1h_stats().unwrap().oldest_ts, Some(hour));
+    }
+
+    /// KI-29：raw 删除最大 rowid 行后，水位必须在同一批事务里降到新 MAX。
+    #[test]
+    fn ki29_prune_lowers_rowid_watermark_to_new_max() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        // rowid 1 = 旧行（删）、rowid 2 = 最新行（留）、rowid 3 = 旧行（删）。
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", 1_000, 1.0),
+                ("cpu.usage", "{}", 9_000, 2.0),
+                ("cpu.usage", "{}", 2_000, 3.0),
+            ],
+        );
+        s.set_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, "3", 1)
+            .unwrap();
+
+        let pruned = s.prune_samples_before(5_000).unwrap();
+        assert_eq!(pruned.deleted, 2);
+        assert_eq!(pruned.batches, 1);
+        assert_eq!(s.raw_new_rows(None).unwrap().0, Some(2));
+        assert_eq!(
+            s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("2"),
+            "旧水位 3 高于新 MAX=2，只能降到 2"
+        );
+    }
+
+    /// KI-29：水位只降不升；raw 清空时删键；缺失/非法旧值不得被凭空创建。
+    #[test]
+    fn ki29_prune_only_lowers_and_clears_or_keeps_missing_watermark() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", 1_000, 1.0),
+                ("cpu.usage", "{}", 2_000, 2.0),
+                ("cpu.usage", "{}", 9_000, 3.0),
+            ],
+        );
+        s.set_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, "1", 1)
+            .unwrap();
+
+        // 删掉 rowid 1/2，MAX 仍是 3：旧水位更低，不得抬高。
+        assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 2);
+        assert_eq!(
+            s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("1"),
+            "水位只能降低，不得升高"
+        );
+
+        // 清空 raw：必须删除水位键。
+        assert_eq!(s.prune_samples_before(i64::MAX).unwrap().deleted, 1);
+        assert_eq!(
+            s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap(),
+            None,
+            "raw 表为空时必须删除水位键"
+        );
+
+        // 旧键缺失时，普通删除不得凭空创建水位。
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", 1_000, 1.0),
+                ("cpu.usage", "{}", 9_000, 2.0),
+            ],
+        );
+        assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 1);
+        assert_eq!(
+            s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap(),
+            None,
+            "旧水位缺失时不得新增 key"
+        );
+
+        // 非法旧值不参与比较，也不被改写成推算出的数值。
+        s.set_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, "bogus", 1)
+            .unwrap();
+        insert_samples(&s, "a1", &[("cpu.usage", "{}", 2_000, 4.0)]);
+        assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 1);
+        assert_eq!(
+            s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("bogus"),
+            "非法旧值不是有效水位，不得据此更新或新建"
+        );
+    }
+
+    /// KI-29：raw 已空但残留高水位时，no-op prune（deleted=0）也必须清键。
+    #[test]
+    fn ki29_noop_prune_clears_stale_watermark_on_empty_raw() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        s.set_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, "7", 1)
+            .unwrap();
+
+        let pruned = s.prune_samples_before(i64::MAX).unwrap();
+        assert_eq!(
+            pruned,
+            PruneResult::default(),
+            "空表 prune 不得产生删除或批次"
+        );
+        assert_eq!(s.raw_new_rows(None).unwrap().0, None, "raw 表应为空");
+        assert_eq!(
+            s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap(),
+            None,
+            "raw 表为空时即使 deleted=0 也必须清除残留水位"
+        );
+    }
+
+    /// KI-29 竞态：删掉最大 rowid 行且旧水位 <= 新 MAX 时必须删键（让 CAS 失效）。
+    #[test]
+    fn ki29_prune_clears_watermark_when_max_rowid_row_deleted() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        // rowid 1..9 保留（ts=9_000），rowid 10 是最旧行（ts=1_000，会被删）。
+        let mut rows = vec![("cpu.usage", "{}", 9_000i64, 1.0f64); 9];
+        rows.push(("cpu.usage", "{}", 1_000, 2.0));
+        insert_samples(&s, "a1", &rows);
+        assert_eq!(s.raw_new_rows(None).unwrap().0, Some(10));
+        // old=5 <= max_after=9：若保留 5，并发 downsample 的 CAS(expected=5)
+        // 仍会成功并把 max_before=10 写回，因此必须删键。
+        s.set_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, "5", 1)
+            .unwrap();
+
+        let pruned = s.prune_samples_before(5_000).unwrap();
+        assert_eq!(pruned.deleted, 1);
+        assert_eq!(pruned.batches, 1);
+        assert_eq!(s.raw_new_rows(None).unwrap().0, Some(9));
+        assert_eq!(
+            s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap(),
+            None,
+            "最大 rowid 行被删且旧水位 <= 新 MAX 时必须删键，避免 CAS 误判"
+        );
+    }
+
+    /// KI-29：只有删除最大 rowid 行才推进 `raw_prune_generation`。
+    #[test]
+    fn ki29_prune_generation_increments_only_when_max_rowid_row_deleted() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        // rowid 1=旧、rowid 2=保留、rowid 3=旧（当前最大 rowid）。
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", 1_000, 1.0),
+                ("cpu.usage", "{}", 9_000, 2.0),
+                ("cpu.usage", "{}", 2_000, 3.0),
+            ],
+        );
+
+        // 删 rowid 1：MAX 保持 3，不推进 generation（缺失保持缺失）。
+        assert_eq!(s.prune_samples_before(1_500).unwrap().deleted, 1);
+        assert_eq!(
+            s.get_maintenance_state(STATE_RAW_PRUNE_GENERATION).unwrap(),
+            None,
+            "删非最大 rowid 行不得推进 generation"
+        );
+
+        // 删 rowid 3（最大）：缺失按 1 写。
+        assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 1);
+        assert_eq!(
+            s.get_maintenance_state(STATE_RAW_PRUNE_GENERATION)
+                .unwrap()
+                .as_deref(),
+            Some("1"),
+            "删最大 rowid 行时 generation 缺失按 1 写"
+        );
+
+        // 新迟到行复用 rowid 3，再删一次最大行：1 -> 2。
+        insert_samples(&s, "a1", &[("cpu.usage", "{}", 3_000, 4.0)]);
+        assert_eq!(s.raw_new_rows(None).unwrap().0, Some(3));
+        assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 1);
+        assert_eq!(
+            s.get_maintenance_state(STATE_RAW_PRUNE_GENERATION)
+                .unwrap()
+                .as_deref(),
+            Some("2"),
+            "每次删最大 rowid 行都应 +1"
+        );
+
+        // 非法旧值按 1 写。
+        s.set_maintenance_state(STATE_RAW_PRUNE_GENERATION, "bogus", 1)
+            .unwrap();
+        insert_samples(&s, "a1", &[("cpu.usage", "{}", 3_000, 5.0)]);
+        assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 1);
+        assert_eq!(
+            s.get_maintenance_state(STATE_RAW_PRUNE_GENERATION)
+                .unwrap()
+                .as_deref(),
+            Some("1"),
+            "非法 generation 按 1 写"
+        );
+    }
+
+    /// KI-29 竞态：rowid 水位 CAS 只在当前值仍等于调用方读到的值时才写入。
+    #[test]
+    fn ki29_claim_raw_rowid_if_unchanged_compares_and_swaps() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+
+        // key 缺失 + expected=None（generation 也缺失=0）：可写。
+        assert!(s.claim_raw_rowid_if_unchanged(None, 0, 10).unwrap());
+        assert_eq!(
+            s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("10")
+        );
+
+        // 当前 5、expected=5：写入 new_max。
+        s.set_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, "5", 1)
+            .unwrap();
+        assert!(s.claim_raw_rowid_if_unchanged(Some(5), 0, 12).unwrap());
+        assert_eq!(
+            s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("12")
+        );
+
+        // expected 不匹配：失败且不覆盖。
+        assert!(!s.claim_raw_rowid_if_unchanged(Some(4), 0, 99).unwrap());
+        assert_eq!(
+            s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("12"),
+            "CAS 失败不得改写水位"
+        );
+
+        // key 已存在时 expected=None 不匹配。
+        assert!(!s.claim_raw_rowid_if_unchanged(None, 0, 99).unwrap());
+        assert!(
+            !s.claim_raw_rowid_if_unchanged(Some(12), 1, 99).unwrap(),
+            "generation 单独不匹配也必须失败"
+        );
+        assert_eq!(
+            s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("12")
+        );
+
+        // key 缺失时 expected=Some 不匹配，也不得凭空创建。
+        let empty = SqliteStorage::open_in_memory().unwrap();
+        assert!(!empty.claim_raw_rowid_if_unchanged(Some(5), 0, 10).unwrap());
+        assert_eq!(
+            empty
+                .get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap(),
+            None
+        );
+    }
+
+    /// KI-29 竞态：rowid key 缺失时代际变化仍必须让 CAS 失败。
+    #[test]
+    fn ki29_claim_fails_when_generation_changes_without_rowid_key() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        // 模拟 prune 删除最大 rowid 行：rowid key 缺失，generation 0 -> 1。
+        s.set_maintenance_state(STATE_RAW_PRUNE_GENERATION, "1", 1)
+            .unwrap();
+        assert!(
+            !s.claim_raw_rowid_if_unchanged(None, 0, 10).unwrap(),
+            "generation 从 0 变 1 时，即使 rowid key 缺失也不得认领"
+        );
+        assert_eq!(
+            s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap(),
+            None,
+            "CAS 失败不得创建 rowid key"
+        );
+
+        // generation 对齐后才可写。
+        assert!(s.claim_raw_rowid_if_unchanged(None, 1, 10).unwrap());
+        assert_eq!(
+            s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("10")
+        );
+
+        // 当前 generation 非法：任何期望都不匹配。
+        let bad = SqliteStorage::open_in_memory().unwrap();
+        bad.set_maintenance_state(STATE_RAW_PRUNE_GENERATION, "bogus", 1)
+            .unwrap();
+        assert!(!bad.claim_raw_rowid_if_unchanged(None, 0, 10).unwrap());
+        assert_eq!(
+            bad.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
+                .unwrap(),
+            None
+        );
+    }
+
+    /// KI-29：本地键常量必须与 downsample 模块的公开常量一致。
+    #[test]
+    fn ki29_rowid_watermark_key_matches_downsample_module() {
+        assert_eq!(
+            DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY,
+            crate::downsample::STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID
+        );
     }
 
     // ---- M4-A2b：查询选层（1m/1h 加权聚合、latest_samples 回退） ----
