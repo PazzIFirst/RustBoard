@@ -79,7 +79,7 @@ logs = true
 
 ## 快速开始（开发环境）
 
-需要 Rust 1.80+ 与 C 编译器。
+需要 Rust 1.89+ 与 C 编译器（MSRV 1.89；CI 使用 stable）。
 
 ```bash
 cargo build --release
@@ -166,6 +166,33 @@ rustboard-hub token revoke --name panel-prod                 # 不删行，保�
   非 Linux 平台保留静态路径检查。数据库位于 `data_dir` 外时启动会 WARN，但不会收紧
   其父目录（DB 文件仍 0600）。证书目录收紧为 0700；同机以不同用户运行 Panel 且直接
   读取 hub `ca.crt` 时，需要复制 CA 或以同用户运行。
+
+### 告警与归档（v0.4.0）
+
+- 告警规则、事件、静默与通知渠道在面板 **`/alerts`** 管理；也可用管理 API：
+  `GET/POST /api/v1/alerts/rules`、`GET /events`、`GET/POST/DELETE /silences`、
+  `GET/POST/PUT/DELETE /channels`、`POST /channels/{id}/test`。
+- 内置 5 条规则初始 **disabled**；启用并绑定渠道后才会发送。通知渠道 secret
+  只写不读，API 只返回 `secret_fields`，错误/日志不含 token。
+- 冷归档配置在 hub.toml 的 `[archive]`（`enabled`、`backend=webdav|s3|sftp`、
+  `after_days`、`schedule_hour_utc`、`max_object_bytes`、`prefix` 及对应后端段）。
+  SFTP 必须配置 `host_key_fingerprint`，只支持 ed25519/ECDSA 主机密钥与 ed25519
+  用户私钥（vendored 去掉 optional rsa）；WebDAV/S3 也需显式配置。
+- 手动运维：
+  ```bash
+  rustboard-hub archive test   --config /etc/rustboard/hub.toml
+  rustboard-hub archive status --config /etc/rustboard/hub.toml
+  rustboard-hub archive run    --config /etc/rustboard/hub.toml
+  rustboard-hub maintenance run --task downsample
+  rustboard-hub maintenance run --task retention
+  ```
+  归档对象在面板 **`/archive`** 查看/下载；hub 下载单对象硬限 64 MiB，
+  1 个认证主体并发 + 120s 发送期限。`archive.enabled=true` 但水位未推进时，
+  retention 不会删除 raw。
+- 详细接口、配置与验收见
+  [M4 方案](docs/plans/2026-10-24-m4-alerting-archive.md)；已知问题/修复排期见
+  [known-issues](docs/known-issues.md) 与
+  [修复计划](docs/plans/2026-10-24-known-issues-fix.md)。
 
 ### 远程面板
 
@@ -262,6 +289,10 @@ SQLite 批次精确幂等与 v1/v2→v3 迁移、跨 epoch 乱序与 48h 判重�
 （第 3 条拒绝、另一源 IP 可用、已有 agent 保持 online）、`data_dir` 中间符号链接
 拒绝启动且不触碰链接目标、外置 `database` 的启动 WARN 与 DB 0600、
 `admin_auth_failure_limit_per_min=0` 时错误 Bearer 仍返回 401 且首条 WARN 可见。
+
+`tests/e2e/v040.sh` 覆盖 M4：规则 CRUD/409、事件分页与 `series_key`、静默、
+渠道脱敏、归档 status/objects/download 404、无 Bearer 401 与未知路由先鉴权后 404
+（27 项）。
 
 ## License
 

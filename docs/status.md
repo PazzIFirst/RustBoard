@@ -16,7 +16,7 @@
 | v0.3.3 管理面安全 | 🟢 完成 | #9 scoped token + 管理端 TLS/ Panel `https`+`hub_ca`、#17 吊销窗口、#20 日志 TOCTOU、#21 systemd 未加载 unit；单元/集成 495，v033 100/100、security 9/9、cert 103/103、hardening 36/36、control 100/100、v031 94/94、v032 66/66、panel 159/159 |
 | v0.3.4 低风险硬化 | 🟢 完成 | KI-26 未认证 401 限速、KI-18 重置会话/登录代际、KI-19 Hello 元数据、KI-21 权限与 data_dir 防护、KI-24 多连接能力、备份稳定性；单元/集成 562，v034 97/97，既有 8 套 e2e 全绿 |
 | v0.3.5 安全收口 | 🟢 完成 | KI-27 WS 会话许可、data_dir `openat2` fd/owner 加固、limit=0 与 DB 外置 WARN；单元/集成 569，v035 48/48，既有 9 套 e2e 全绿 |
-| M4 告警与归档 | 🟢 完成 | 降采样/查询选层/保留期、告警/事件/静默/四渠道通知、WebDAV/S3/SFTP 归档与下载；v040 e2e 27/27、panel 159/159、workspace/clippy/audit 全绿；v0.4.0 |
+| M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | M5 安装与交付 | ⬜ 未开始 | |
 
 ## M1 明细
@@ -61,7 +61,7 @@
 - [ ] ACME：域名证书 / 公网 IP 6 天短证书（M5，需公网可达与 80/443 自检）
 - [ ] hub 侧计数器结转（epoch 切换时累计流量归集）
 - [ ] PostgreSQL 存储实现
-- [ ] 降采样与保留期任务
+- [x] 降采样与保留期任务（M4-A，v0.4.0）
 - [ ] 结构化日志与 `RUST_LOG` 文档
 
 ## M2 明细
@@ -142,6 +142,28 @@
 - [x] 独立渗透：本地实例全清单，**无高危/中危**；KI-27 与 data_dir 修复实跑通过；
       新登记低危 KI-28（连接拒绝 WARN 未采样，既有行为，v0.4.0 处理）与 4 条信息项
 - [x] 兼容：协议 v2 / DB schema v6 / 证书格式不变；data_dir owner 规则收紧需发布说明
+
+## M4 告警与归档明细
+
+已完成（v0.4.0）：
+
+- [x] **A**：schema v7（`samples_1m`/`samples_1h`/`maintenance_state` 等）；1m/1h 降采样、
+      迟到 raw 回放、保留期、`maintenance run|status`；查询按 ≤6h raw / ≤7d 1m / >7d 1h
+      选层，跨度 730 天，桶过小自动提升
+- [x] **B**：5 条内置规则、规则 CRUD、pending→firing→resolved 状态机、事件、静默、
+      后台评估（raw-only、每规则 5000 序列/状态上限、5s 预算、每小时清理）；
+      Telegram/企微/钉钉/飞书四渠道，签名/重试/脱敏；面板 `/alerts`
+- [x] **C**：`[archive]` 配置、CSV.gz/manifest、WebDAV/S3/SFTP 三后端、
+      按 UTC 天/分片 worker、归档水位与 retention 门禁、对象列表/下载 API、
+      面板 `/archive`
+- [x] **D**：v040 e2e 27/27、panel e2e 159/159、security 9/9、web 79/79；
+      workspace/clippy/audit 全绿；CI 加入 v040；v0.4.0 发布
+- [x] 文档：CHANGELOG 0.4.0、known-issues KI-30、vendor 说明、升级/回滚说明
+- [x] 评审：B1/B2、C1/C2/C4、C3 均经过独立评审；C4 下载内存/公平性问题经三轮
+      修复（64 MiB、body 期限、按主体限流）；C3 的 rsa 依赖通过 vendor patch 移除
+- 限制：SFTP 真实服务器联网验证未执行（本机无可用 SSH 测试账户），仅完成
+  指纹/路径/私钥权限/错误脱敏单测与编译；vendored `russh`/`ssh-key` 仅支持
+  ed25519/ECDSA 主机密钥和 ed25519 用户私钥，RSA 旧服务器不兼容
 
 ## v0.3.4 低风险硬化明细
 
@@ -317,11 +339,18 @@
     hub 管理面；正常远程负载下未复现，后续可移入 `spawn_blocking` 并收紧 busy_timeout。
 17. `database` 指向 `data_dir` 外或相对路径时 hub 仍启动：会打一次 WARN，DB 文件 0600、
     父目录不收紧；非默认配置建议把数据库放在专用 `data_dir` 内。
-18. **KI-28（低危，v0.4.0）**：单 IP 连接超限时每条被拒 TCP 都打 WARN，持续洪水可
-    放大日志/磁盘并淹没告警；v0.3.5 渗透登记，拒绝行为本身正确，留待后续按窗口采样。
+18. **KI-28（低危，v0.4.1）**：单 IP 连接超限时每条被拒 TCP 都打 WARN，持续洪水可
+    放大日志/磁盘并淹没告警；v0.3.5 渗透登记，v0.4.0 未修，拒绝行为本身正确。
+19. **SFTP 密钥算法**：vendored 去掉 optional `rsa` 后，SFTP 不支持 RSA 主机密钥与
+    RSA 用户私钥；仅支持 ed25519/ECDSA 主机密钥、ed25519 用户私钥。仅提供 RSA
+    主机密钥的旧服务器会握手失败，配置仍接受 SHA256 指纹，部署前需确认算法。
+20. **归档下载内存上限**：hub 下载单对象硬限 64 MiB（1 个主体并发 + 120s 发送期限），
+    而 `archive.max_object_bytes` 可配到 1 GiB；超过 64 MiB 的对象可以上传但无法通过
+    hub 下载（413）。v0.4.1 计划把配置上限收敛到 64 MiB 或改为流式下载，见
+    [known-issues 修复计划](plans/2026-10-24-known-issues-fix.md)。
 
 ## 下一步建议
 
-**M4 告警与归档**（规则引擎、通知渠道、降采样、冷归档）→ 计数器结转 → 安装器与镜像。
-
-控制面已按“默认关闭 + 双端开关 + 审计”交付，可以安全进入告警阶段。
+M4 已完成并发布 v0.4.0；下一阶段是 **v0.4.1 已知问题修复 + M4 专项渗透**，
+随后进入 M5 安装与交付（安装器、镜像、ACME）。控制面/告警/归档均按“默认关闭或
+最小暴露 + 审计/固定错误码”交付。
