@@ -547,6 +547,16 @@ fi
 
 echo "==> 2) 告警事件"
 
+# 先取启用前的事件基线，再启用规则。若在 PUT 之后才取基线，评估线程恰好
+# 在两步之间产生 firing 时，基线会包含本轮事件，随后 30s 内不会再有新状态迁移，
+# 造成门禁偶发 25/27（事件已产生但被基线吞掉）。基线放在 PUT 前可消除该竞态。
+api GET "/api/v1/alerts/events?limit=100"
+if [[ "$STATUS" == "200" ]]; then
+  BASELINE_ID=$("$PYTHON" "$V040_HELPER" event-max "$HTTP_BODY_FILE" "$RULE_ID")
+else
+  BASELINE_ID=0
+fi
+
 FULL_PUT=$(printf \
   '{"name":"%s","enabled":true,"source":"metric","metric":"disk.used_percent",'\
 '"comparator":"gt","threshold":-1,"duration_secs":0,"cooldown_secs":1800,'\
@@ -559,12 +569,6 @@ else
   fail "2.1" "PUT 全部字段重新启用规则失败（实际 $STATUS）"
 fi
 
-api GET "/api/v1/alerts/events?limit=100"
-if [[ "$STATUS" == "200" ]]; then
-  BASELINE_ID=$("$PYTHON" "$V040_HELPER" event-max "$HTTP_BODY_FILE" "$RULE_ID")
-else
-  BASELINE_ID=0
-fi
 if wait_alert_event "$RULE_ID" "${BASELINE_ID:-0}" firing false 30; then
   IFS=$'\t' read -r EV_ID EV_STATE EV_SERIES EV_NOTIFIED EV_SILENCED EV_AGENT EV_NOTIFY_ERROR <<< "$FOUND_EVENT"
   if [[ "$EV_STATE" == "firing" && -n "$EV_SERIES" ]]; then
