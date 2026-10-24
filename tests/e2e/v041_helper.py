@@ -586,6 +586,12 @@ def command_ki28_count(args) -> None:
     except OSError as exc:
         die(f"读取日志失败: {exc}")
 
+    # tracing_subscriber 在部分 CI 会输出 ANSI 颜色码（如 `\x1b[33m WARN\x1b[0m`、
+    # `ip\x1b[0m\x1b[2m=\x1b[0m127.0.0.1`），会破坏按 ` WARN ` / `ip=` 的匹配。
+    # 计数前统一剥离 ANSI，避免门禁依赖终端环境。
+    ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+    lines = [ansi.sub("", line) for line in lines]
+
     counts = {
         "ip1_warn": 0,
         "ip1_debug": 0,
