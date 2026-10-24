@@ -70,6 +70,9 @@ pub fn write_file(path: &Path, bytes: &[u8], mode: u32) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
     }
+    // 先删除旧文件：测试会在同一路径上循环写入更严格的 mode（如 0400），
+    // 非 root 的 CI 用户无法直接覆盖只读文件。
+    let _ = fs::remove_file(path);
     fs::write(path, bytes).unwrap();
     set_mode(path, mode);
 }

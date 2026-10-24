@@ -1,7 +1,8 @@
 //! 安装前缀与卸载路径 allowlist。
 //!
-//! 前缀测试的临时目录放在 workspace `target/` 下（不放 `/tmp`）：`/tmp` 本身
-//! 是 1777，会被 `validate_install_prefix` 正确拒绝，无法用作“通过”用例的祖先。
+//! 前缀测试的临时目录放在 `$HOME` 下（不放 `/tmp`）：`/tmp` 本身是 1777，
+//! 会被 `validate_install_prefix` 正确拒绝；`$HOME` 在 root/CI runner 下都由
+//! 当前用户拥有且非 sticky，可作为“通过”用例的祖先。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,18 @@ use rustboard_install::{validate_install_prefix, validate_managed_path, ManagedP
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// workspace `target/` 下的临时目录；Drop 时递归删除。
+/// 前缀校验要求从 `/` 到 prefix 的每个已存在组件都由当前 euid 拥有；非 root
+/// 环境（GitHub Actions runner）无法构造满足条件的 `/home`/`/tmp` 祖先，跳过
+/// 这些 root-only 行为测试。CI 的 root 容器仍会执行。
+fn skip_if_not_root() -> bool {
+    if rustboard_install::detect_system().euid != 0 {
+        eprintln!("跳过 root-only prefix 测试（euid != 0）");
+        return true;
+    }
+    false
+}
+
+/// `$HOME` 下的临时目录；Drop 时递归删除。
 struct TargetTempDir {
     path: PathBuf,
 }
@@ -19,8 +31,10 @@ struct TargetTempDir {
 impl TargetTempDir {
     fn new(tag: &str) -> Self {
         let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/install-policy-tests");
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("prefix 测试需要 HOME 指向当前用户可写目录");
+        let root = home.join(".rustboard-install-policy-tests");
         fs::create_dir_all(&root).unwrap();
         set_mode(&root, 0o755);
         let path = root.join(format!("{tag}-{}-{sequence}", std::process::id()));
@@ -57,6 +71,9 @@ fn set_mode(path: &Path, mode: u32) {
 
 #[test]
 fn accepts_root_and_clean_temp_prefix() {
+    if skip_if_not_root() {
+        return;
+    }
     validate_install_prefix(Path::new("/")).unwrap();
 
     let temp = TargetTempDir::new("prefix-ok");
@@ -68,6 +85,9 @@ fn accepts_root_and_clean_temp_prefix() {
 #[cfg(unix)]
 #[test]
 fn rejects_group_writable_sticky_prefix() {
+    if skip_if_not_root() {
+        return;
+    }
     let temp = TargetTempDir::new("prefix-1777");
     let sticky = temp.path().join("sticky");
     fs::create_dir(&sticky).unwrap();
@@ -80,6 +100,9 @@ fn rejects_group_writable_sticky_prefix() {
 #[cfg(unix)]
 #[test]
 fn rejects_symlink_prefix_and_ancestor() {
+    if skip_if_not_root() {
+        return;
+    }
     use std::os::unix::fs::symlink;
 
     let temp = TargetTempDir::new("prefix-symlink");
@@ -96,6 +119,9 @@ fn rejects_symlink_prefix_and_ancestor() {
 #[cfg(unix)]
 #[test]
 fn rejects_non_directory_prefix_component() {
+    if skip_if_not_root() {
+        return;
+    }
     let temp = TargetTempDir::new("prefix-file");
     let file = temp.path().join("file");
     fs::write(&file, b"x").unwrap();
@@ -129,6 +155,9 @@ fn rejects_non_normalized_or_injectable_prefixes() {
 
 #[test]
 fn prefixed_managed_paths_stay_under_prefix() {
+    if skip_if_not_root() {
+        return;
+    }
     let prefix = Path::new("/opt/P");
     validate_managed_path(
         Role::Hub,
