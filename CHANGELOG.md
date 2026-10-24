@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-24
+
 ### Fixed
 
 - KI-29：raw 保留期删除时在同一写事务内收敛 `downsample_1m_last_raw_rowid`；
