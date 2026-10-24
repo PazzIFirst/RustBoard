@@ -37,17 +37,17 @@
 | KI-17 | 中 | hub/panel HTTP | 已修复 | v0.3.1 | 管理 API / 面板监听没有 header 读超时与连接上限，未认证慢速连接可长期占 fd |
 | KI-18 | 低 | panel 会话 | 已修复 | v0.3.4 | `reset-password` 不吊销已有会话 Cookie；v0.3.4 起密码变化后 ≤2s 清空全部会话 |
 | KI-19 | 低 | hub Hello | 已修复 | v0.3.4 | `name` / `os` / `arch` / `version` / `boot_id` 未做长度与控制字符校验；v0.3.4 起统一 `bad_frame` 拒绝 |
-| KI-20 | 低 | 安装命令 | 待修复 | v0.4.1 | `agent add --name` 打印的安装命令未对 name 做 shell 转义 |
+| KI-20 | 低 | 安装命令 | 已修复 | v0.4.1 | `agent add --name` 打印的安装命令未对 name 做 shell 转义；v0.4.1 起统一 POSIX 引用并拒绝控制字符 |
 | KI-21 | 低 | 文件权限 | 已修复 | v0.3.4 | SQLite 数据库默认 0644、数据目录 0755；v0.3.4 起数据目录 0700、DB/WAL/SHM 0600 |
 | KI-22 | 低 | 控制面日志 | 待修复 | v0.5.0 | 白名单日志文件的硬链接不会被 openat2 拦截（需目录写权限） |
 | KI-23 | 低 | 控制面白名单 | 不修复 | 文档 | `nginx*` 前缀会匹配 `nginx-evil`；这是前缀通配语义，部署时需写更精确的模式 |
 | KI-24 | 低 | 控制面能力 | 已修复 | v0.3.4 | 同 agent 多连接时能力缓存可被新 Hello 覆盖；v0.3.4 起以最新连接为准并支持断开回退 |
 | KI-26 | 中 | 管理 API 认证 | 已修复 | v0.3.4 | 未认证 401 不受管理限速；v0.3.4 起按来源 IP 失败限速，超限 429 且不查库 |
 | KI-27 | 中 | hub 接入层 | 已修复 | v0.3.5 | WebSocket 升级后 TLS 单 IP 许可提前释放；v0.3.5 起全局 + per-IP 许可持有到会话结束 |
-| KI-28 | 低 | hub 接入层 | 待修复 | v0.4.1 | 单 IP 连接超限的 WARN 未采样，持续洪水可放大日志/告警 |
-| KI-29 | 低 | 降采样 | 待修复 | v0.4.1 | rowid 复用可能漏掉极窄的迟到 raw 回放 |
-| KI-30 | 中 | 归档/SFTP | 已修复 | v0.4.0 | optional rsa 依赖使 audit 非 0；vendor 移除后 audit 0 |
-| KI-31 | 中 | 归档下载 | 待修复 | v0.4.1 | max_object_bytes 可到 1 GiB，但 hub 下载硬限 64 MiB，超大对象不可下载 |
+| KI-28 | 低 | hub 接入层 | 已修复 | v0.4.1 | 单 IP 连接超限的 WARN 未采样，持续洪水可放大日志/告警；v0.4.1 起 60s 窗口首条 WARN |
+| KI-29 | 低 | 降采样 | 已修复 | v0.4.1 | rowid 复用可能漏掉极窄的迟到 raw 回放；v0.4.1 起事务内降水位 + generation CAS |
+| KI-30 | 中 | 归档/SFTP | 已修复 | v0.4.0 | optional rsa 依赖使 audit 非 0；vendor 移除后 audit 0；v0.4.1 完成真实 SFTP 验证 |
+| KI-31 | 中 | 归档下载 | 已修复 | v0.4.1 | max_object_bytes 可到 1 GiB，但 hub 下载硬限 64 MiB；v0.4.1 上限收紧并增加 downloadable |
 | KI-25 | — | 审计信任边界 | 不修复 | 文档 | agent 是控制动作执行者与结果来源，被控 agent 可伪造成功；审计不能抵抗 |
 | KI-13 | — | agent 升级 | 不修复 | 文档 | v0.1 agent 使用指纹钉扎，服务端证书轮换后会失联 |
 | KI-14 | — | 客户端轮换 | 不修复 | 文档 | 续签复用原私钥，无法补救私钥泄露 |
@@ -252,8 +252,9 @@
   统计 hub 日志中的上述 WARN。
 - **根因**：`serve_tls` 在 per-IP `ConnectionLimitRejection::PerIp` 分支逐连接 `warn!`，
   没有按来源 IP + 时间窗口采样。
-- **修复方案（v0.4.1）**：复用认证失败限速的窗口采样思路，每个来源 IP 每窗口首条
-  拒绝 WARN，其余 DEBUG；补单测与 e2e 计数断言。不改变拒绝行为。
+- **修复（v0.4.1，`8d42d03`）**：新增 60s/4096 IP 上限的 `RejectLogSampler`，
+  同 IP 每窗口首条 WARN、其余 DEBUG；agent/admin 的 per-IP 分支接入；拒绝行为不变。
+  单测覆盖窗口边界/表满/多 IP，v041 e2e 40 连断言 WARN=1、DEBUG=39。
 - **关联**：v0.3.5 渗透报告 L1；KI-01 的单 IP 连接限制。
 
 ### KI-29 降采样 rowid 水位复用边界（v0.4.0 已知低风险）
@@ -267,12 +268,14 @@
 - **缓解**：升级/迁移不自动清理历史 raw；归档/retention 前确认无长期离线 agent；
   如怀疑命中，`rustboard-hub maintenance run --task downsample` 后检查
   `maintenance_state` 与 1m/1h 桶。
-- **修复方案（v0.4.1，不升 schema）**：在 retention 删除的同一写事务内，删除完成后
-  读取新的 `MAX(rowid)`；若 `maintenance_state.downsample_1m_last_raw_rowid` 大于它，
-  原子降低到新值（表空则清除），随后才释放写锁。只降不升，新插入行会大于新水位而被
-  扫描；补“删最大行后插入复用 rowid 迟到行”回归。备选方案（v0.5 需 schema v8）
-  才是独立单调 ingest 序列。查询/告警/归档功能不受影响。
-- **关联**：M4-A2 复审建议；v0.4.0 发布说明。
+- **修复（v0.4.1，`8d42d03`，不升 schema）**：raw prune 每批在 `BEGIN IMMEDIATE`
+  内读 `max_before` → DELETE → 读 `max_after`，原子降低/清除 rowid 水位；若删除了
+  最大 rowid 行，同一事务推进 `raw_prune_generation`。downsample 在读取 MAX 前拍
+  generation 快照，认领时用“rowid + generation”CAS；任一变化则本轮不认领、下轮
+  重扫。由此覆盖 max 行删除、rowid key 缺失、时间水位回拨与并发 retention 的交错。
+  独立 `v041_ki29_rowid_reuse` 3/3、v041 e2e 2.4/2.6 全过。手工直接 DELETE raw
+  绕过 prune 仍不受保护（非生产路径）。
+- **关联**：M4-A2 复审建议；v0.4.0 发布说明；M4 渗透报告。
 
 ### KI-30 SFTP 归档后端依赖审计阻塞（v0.4.0 已修复）
 
@@ -282,10 +285,12 @@
   feature/依赖（不是只关 feature），根 `[patch.crates-io]` 指向本地副本；
   `cargo tree -i rsa` 无包、`cargo audit` 0。SFTP 使用 ring + ed25519，
   不支持 RSA 用户密钥/仅 RSA 主机密钥的旧服务器。
-- **验证**：`cargo test --workspace`、`cargo audit`、`v040.sh`；真实 SFTP
-  服务器的手工密码/ed25519 连通测试仍待部署环境执行。
-- **关联**：`vendor/README.md`、CHANGELOG `[0.4.0]`；原 spike
-  `spikes/m4-deps-185`、`spikes/m4-deps-187`。
+- **验证（v0.4.1 补齐）**：`cargo test --workspace`、`cargo audit`、`v040.sh`；
+  Docker OpenSSH 9.2 真实服务器 29/29：密码、ed25519 0600、0644 拒绝、错误
+  指纹/RSA-only 拒绝、逐级目录、2 分片上传、SHA/大小校验、64 MiB 下载、
+  429/120s 期限与 SIGKILL 恢复均通过。
+- **关联**：`vendor/README.md`、CHANGELOG `[0.4.0]`；M4 渗透报告；
+  原 spike `spikes/m4-deps-185`、`spikes/m4-deps-187`。
 
 ### KI-31 归档对象上限与下载硬限不一致
 
@@ -296,9 +301,11 @@
   `32 MiB` + 50k 行分片通常不触发。
 - **复现**：配置 `max_object_bytes=134217728`，让一天数据产生 >64 MiB 分片，
   `GET /api/v1/archive/objects/{id}/download` 返回 413 `archive_too_large`。
-- **修复方案（v0.4.1）**：启动校验将 `max_object_bytes` 上限收敛到 64 MiB
-  （推荐，保持单对象内存上界）；或 v0.5.0 实现 ColdStore 流式下载后恢复 1 GiB。
-  同时补“配置 64MiB 边界 + 已有大对象下载”测试/迁移说明。
+- **修复（v0.4.1，`8d42d03`）**：`archive.max_object_bytes` 上限收敛到 64 MiB
+  （超限拒绝启动，属有意 breaking change）；下载硬限固定 64 MiB，与分片配置解耦。
+  对象列表新增加性 `downloadable` 字段；已有 >64 MiB 对象保留、不重传，列表为
+  false，下载在占 permit/后端前返回 413；面板渲染禁用“不可下载”，title 指向冷存储。
+  v041 1.1/1.2/4.2/4.3 通过，M4 渗透 64 MiB 精确下载 200 + SHA 全等。
 - **验收标准**：新配置无法产生不可下载对象；已有 >64 MiB 对象给出明确状态/文档；
   下载仍保持 64 MiB 内存、1 主体并发、120s 期限与 SHA/长度校验。
 - **关联**：C4 下载内存修复、`archive.max_object_bytes` 配置、面板 `/archive`。
@@ -319,3 +326,4 @@
 | 2026-10-23 | v0.3.4 | KI-18/19/21/24/26 | `97965c2`..`3f78656` | 单元 562；v034 97/97；既有 8 套 e2e 全绿；audit 0；评审后补修 693899f/106b6d4/3a218ea |
 | 2026-10-24 | v0.3.5 | KI-27 | `c6baf4f`/`e9ebe51` | 单元 569；v035 48/48；既有 9 套 e2e 全绿；audit 0 |
 | 2026-10-24 | v0.4.0 | KI-30 | `45a0332`/`d9dad97` | workspace/clippy/audit 0（418 deps）；v040 27/27；panel 159/159；security 9/9 |
+| 2026-10-24 | v0.4.1 | KI-20/28/29/31 | `8d42d03` | workspace 全绿；v041 26/26；v040 27/27；panel 159/159；security 9/9；web 80/80；audit 418 deps/0；SFTP 29/29 |

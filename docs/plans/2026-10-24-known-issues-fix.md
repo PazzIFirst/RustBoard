@@ -1,8 +1,13 @@
 # v0.4.1 已知问题修复计划
 
-> 状态：计划（未开工）　｜　基线：`v0.4.0`（`818d42d`）
+> 状态：已实现（`8d42d03`，v0.4.1 待发布）　｜　基线：`v0.4.0`（`818d42d`）
 > 输入：[known-issues.md](../known-issues.md)、M4 评审/复审记录、v0.4.0 发布说明
 > 目标：在不引入新功能的前提下，修复 v0.4.0 遗留的可修复缺陷，并补齐 SFTP 真实环境验证。
+>
+> 实现备注：KI-31 下载硬限固定 64 MiB（`max_object_bytes` 只控分片），新增加性
+> `downloadable` 字段；KI-29 在每批 prune 事务内降水位并在最大 rowid 行删除时
+> 推进 `raw_prune_generation`，downsample 用 rowid+generation CAS 认领，关闭并发
+> 回写竞态（不升 schema）；SFTP 真实环境 29/29。
 
 ## 1. 目标与非目标
 
@@ -172,12 +177,12 @@ v0.4.1 发布前额外：
 
 ## 7. 完成定义（DoD）
 
-- [ ] KI-29/28/20/31 状态改为“已修复”，补回归用例与修复记录；
-- [ ] KI-31 配置收紧写入 CHANGELOG/README/升级说明；
-- [ ] SFTP 密码与 ed25519 真实验证通过，报告脱敏归档；
-- [ ] v040/panel/security + 新 v041 e2e 全绿；
-- [ ] audit 0、clippy/fmt 0、独立评审无 [严重]；
-- [ ] v0.4.1 tag/GitHub Release 发布，main 与 tag 可追溯。
+- [x] KI-29/28/20/31 状态改为“已修复”，补回归用例与修复记录；
+- [x] KI-31 配置收紧写入 CHANGELOG/README/升级说明；
+- [x] SFTP 密码与 ed25519 真实验证通过，报告脱敏归档；
+- [x] v040/panel/security + 新 v041 e2e 全绿；
+- [x] audit 0、clippy/fmt 0、独立评审无未关闭 [严重]；
+- [ ] v0.4.1 tag/GitHub Release 发布，main 与 tag 可追溯（步骤 5，待发布）。
 
 ## 8. 关联
 

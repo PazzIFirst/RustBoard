@@ -14,7 +14,8 @@
 
 - KI-29：raw 保留期删除时在同一写事务内收敛 `downsample_1m_last_raw_rowid`；
   最大 rowid 行被删且旧水位不高于新 MAX 时清除该键，避免复用 rowid 的迟到行
-  被误判为已认领；downsample 认领改为 CAS，防止并发 retention 的旧 MAX 回写
+  被误判为已认领；prune 删除最大 rowid 行时推进 `raw_prune_generation`，downsample
+  以 rowid+generation CAS 认领，防止并发 retention 的旧 MAX 回写
 - KI-31：`archive.max_object_bytes` 上限收紧到 64 MiB，下载硬限固定 64 MiB
   且与分片配置解耦；归档对象列表增加 `downloadable`，面板对超限对象显示禁用
   “不可下载”，不再渲染可点击按钮

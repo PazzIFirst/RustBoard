@@ -15,6 +15,8 @@
 | `v033.sh` | v0.3.3 管理面安全 #9/#17/#20/#21：scoped token 权限矩阵与审计 actor、admin TLS 与 Panel `https`+`hub_ca`、吊销后 403 `agent_revoked`、systemd 未加载 unit 合并、日志 tail 与跨挂载兼容、日志脱敏 |
 | `v034.sh` | v0.3.4 低风险硬化 KI-26/18/19/21/24：401 失败限速（阈值 5 → 429 + `Retry-After`、旧 `admin_token` 应急旁路、日志不刷屏）、`reset-password` 后 ≤2s 旧会话 401、Hello 元数据 `bad_frame` 且不写库、数据目录/SQLite 权限收紧与重启自愈、多连接能力最新优先/断开回退/旧连接晚到 Hello 不覆盖 |
 | `v035.sh` | v0.3.5 安全收口 KI-27 与 data_dir TOCTOU：同源 IP 2 条 WS 后第 3 条硬失败、另一源 IP 可连且已有 agent 保持 online；data_dir 中间 symlink 拒绝且 victim 不变；外置 database WARN/DB 0600；`limit=0` 两次 401 无 429 且首条 WARN |
+| `v040.sh` | M4 告警与归档：规则 CRUD/上限、事件分页/series_key、静默、四渠道 secret 边界、归档状态/列表/下载鉴权 |
+| `v041.sh` | v0.4.1 已知问题：KI-29 rowid 复用回归、KI-31 64 MiB 配置/大对象 413、KI-28 拒连日志采样、KI-20 安装命令 shell 引用 |
 
 `security.sh` 是最早的一套，下文细节以它为例；其余脚本的断言清单见各自文件头部注释。
 

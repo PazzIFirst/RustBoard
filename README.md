@@ -12,7 +12,7 @@
 已知问题见 [docs/known-issues.md](docs/known-issues.md)。
 协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面、v0.3.x 硬化与 M4 告警/归档已完成（v0.4.0）。**
+> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面、v0.3.x 硬化与 M4 告警/归档已完成（v0.4.0）；v0.4.1 已知问题修复已完成，待发布。**
 > 证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。
 >
 > 线协议版本为 **2**：hub 与 agent 必须严格一致。版本不符时 hub 回 `bad_protocol`
@@ -176,7 +176,9 @@ rustboard-hub token revoke --name panel-prod                 # 不删行，保�
   只写不读，API 只返回 `secret_fields`，错误/日志不含 token。
 - 冷归档配置在 hub.toml 的 `[archive]`（`enabled`、`backend=webdav|s3|sftp`、
   `after_days`、`schedule_hour_utc`、`max_object_bytes`、`prefix` 及对应后端段）。
-  SFTP 必须配置 `host_key_fingerprint`，只支持 ed25519/ECDSA 主机密钥与 ed25519
+  `max_object_bytes` 自 v0.4.1 起限 **1–64 MiB**，只控制 worker 分片；下载硬限
+  固定 64 MiB，超过 64 MiB 的旧配置会拒绝启动（有意 breaking change）。SFTP
+  必须配置 `host_key_fingerprint`，只支持 ed25519/ECDSA 主机密钥与 ed25519
   用户私钥（vendored 去掉 optional rsa）；WebDAV/S3 也需显式配置。
 - 手动运维：
   ```bash
@@ -188,12 +190,15 @@ rustboard-hub token revoke --name panel-prod                 # 不删行，保�
   ```
   归档对象在面板 **`/archive`** 查看/下载；hub 下载单对象硬限 64 MiB，
   1 个认证主体并发 + 120s 发送期限。`archive.enabled=true` 但水位未推进时，
-  retention 不会删除 raw。
+  retention 不会删除 raw。v0.4.1 起对象列表新增 `downloadable`；状态就绪但
+  >64 MiB 的旧对象显示“不可下载”，下载直接 413，不读后端。
 - 详细接口、配置与验收见
   [M4 方案](docs/plans/2026-10-24-m4-alerting-archive.md)；已知问题/修复排期见
   [known-issues](docs/known-issues.md)、
   [修复计划](docs/plans/2026-10-24-known-issues-fix.md) 与
-  [M4 渗透测试计划](docs/plans/2026-10-24-m4-pentest.md)。
+  [M4 渗透测试计划](docs/plans/2026-10-24-m4-pentest.md)；
+  渗透结果与 SFTP 真实验证见
+  [M4 渗透报告](docs/security/2026-10-24-m4-pentest-report.md)。
 
 ### 远程面板
 
@@ -274,6 +279,7 @@ cargo test --workspace --locked
 bash tests/e2e/security.sh
 bash tests/e2e/v035.sh   # v0.3.5 安全收口
 bash tests/e2e/v040.sh   # M4 告警/归档
+bash tests/e2e/v041.sh   # v0.4.1 已知问题修复
 ```
 
 单元与集成测试覆盖：CPU/内存解析、计数器重置容纳、磁盘缓冲落盘与恢复、
@@ -294,6 +300,10 @@ SQLite 批次精确幂等与 v1/v2→v3 迁移、跨 epoch 乱序与 48h 判重�
 `tests/e2e/v040.sh` 覆盖 M4：规则 CRUD/409、事件分页与 `series_key`、静默、
 渠道脱敏、归档 status/objects/download 404、无 Bearer 401 与未知路由先鉴权后 404
 （27 项）。
+
+`tests/e2e/v041.sh` 覆盖 v0.4.1：KI-29 rowid 复用后的 1m/1h 重算、KI-31
+64 MiB 配置边界/`downloadable`/413、KI-28 同 IP 拒连日志采样、KI-20 安装命令
+shell 引用（26 项，另 2 项面板/采样表上界由 web 与单元测试覆盖）。
 
 ## License
 

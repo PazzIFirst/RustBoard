@@ -5,3 +5,7 @@ web/node_modules
 web/dist
 .worktrees/
 .DS_Store
+# 构建缓存与渗透原始证据：可重新生成，不入库（脚本与脱敏报告入库）
+.pnpm-store/
+tests/pentest/evidence/
+tests/pentest/__pycache__/
