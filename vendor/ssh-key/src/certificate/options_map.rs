@@ -9,11 +9,12 @@ use core::{
 use encoding::{CheckedSum, Decode, Encode, Reader, Writer};
 
 /// Key/value map type used for certificate's critical options and extensions.
-#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct OptionsMap(pub BTreeMap<String, String>);
 
 impl OptionsMap {
     /// Create a new [`OptionsMap`].
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -69,20 +70,18 @@ impl Decode for OptionsMap {
 
 impl Encode for OptionsMap {
     fn encoded_len(&self) -> encoding::Result<usize> {
-        self.iter()
-            .try_fold(4, |acc, (name, data)| {
-                [
-                    acc,
-                    name.encoded_len()?,
-                    if data.is_empty() {
-                        4
-                    } else {
-                        data.encoded_len_prefixed()?
-                    },
-                ]
-                .checked_sum()
-            })
-            .map_err(Into::into)
+        self.iter().try_fold(4, |acc, (name, data)| {
+            [
+                acc,
+                name.encoded_len()?,
+                if data.is_empty() {
+                    4
+                } else {
+                    data.encoded_len_prefixed()?
+                },
+            ]
+            .checked_sum()
+        })
     }
 
     fn encode(&self, writer: &mut impl Writer) -> encoding::Result<()> {
@@ -96,7 +95,7 @@ impl Encode for OptionsMap {
             if data.is_empty() {
                 0usize.encode(writer)?;
             } else {
-                data.encode_prefixed(writer)?
+                data.encode_prefixed(writer)?;
             }
         }
 

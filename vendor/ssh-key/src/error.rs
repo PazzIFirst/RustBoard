@@ -9,6 +9,9 @@ use crate::certificate;
 #[cfg(feature = "ppk")]
 use crate::ppk::PpkParseError;
 
+#[cfg(doc)]
+use crate::HashAlg;
+
 /// Result type with `ssh-key`'s [`Error`] as the error type.
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -59,6 +62,9 @@ pub enum Error {
     /// Other format encoding errors.
     FormatEncoding,
 
+    /// Provided hash is the wrong size for a given [`HashAlg`].
+    HashSize,
+
     /// Input/output errors.
     #[cfg(feature = "std")]
     Io(std::io::ErrorKind),
@@ -72,6 +78,13 @@ pub enum Error {
     /// PuTTY format parsing errors.
     #[cfg(feature = "ppk")]
     Ppk(PpkParseError),
+
+    /// Random number generator errors.
+    #[cfg(feature = "rand_core")]
+    RngFailure,
+
+    /// Signature errors.
+    Signature,
 
     /// Invalid timestamp (e.g. in a certificate)
     Time,
@@ -87,8 +100,6 @@ pub enum Error {
         /// Version number.
         number: u32,
     },
-
-    MpintEncoding,
 }
 
 impl fmt::Display for Error {
@@ -110,19 +121,33 @@ impl fmt::Display for Error {
             Error::Encoding(err) => write!(f, "{err}"),
             Error::Encrypted => write!(f, "private key is encrypted"),
             Error::FormatEncoding => write!(f, "format encoding error"),
+            Error::HashSize => write!(f, "hash is the wrong size for the given algorithm"),
             #[cfg(feature = "std")]
             Error::Io(err) => write!(f, "I/O error: {}", std::io::Error::from(*err)),
             Error::Namespace => write!(f, "namespace invalid"),
             #[cfg(feature = "ppk")]
             Error::Ppk(err) => write!(f, "PPK parsing error: {err}"),
             Error::PublicKey => write!(f, "public key is incorrect"),
+            #[cfg(feature = "rand_core")]
+            Error::RngFailure => write!(f, "random number generator failure"),
+            Error::Signature => write!(f, "signature error"),
             Error::Time => write!(f, "invalid time"),
             Error::TrailingData { remaining } => write!(
                 f,
                 "unexpected trailing data at end of message ({remaining} bytes)",
             ),
             Error::Version { number: version } => write!(f, "version unsupported: {version}"),
-            Error::MpintEncoding => write!(f, "mpint encoding error"),
+        }
+    }
+}
+
+impl core::error::Error for Error {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            #[cfg(feature = "ecdsa")]
+            Self::Ecdsa(err) => Some(err),
+            Self::Encoding(err) => Some(err),
+            _ => None,
         }
     }
 }
@@ -169,32 +194,32 @@ impl From<encoding::pem::Error> for Error {
     }
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "alloc"))]
 impl From<signature::Error> for Error {
     fn from(_: signature::Error) -> Error {
-        Error::Crypto
+        Error::Signature
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "alloc")]
 impl From<signature::Error> for Error {
     fn from(err: signature::Error) -> Error {
-        use std::error::Error as _;
+        use core::error::Error as _;
 
         err.source()
             .and_then(|source| source.downcast_ref().cloned())
-            .unwrap_or(Error::Crypto)
+            .unwrap_or(Error::Signature)
     }
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "alloc"))]
 impl From<Error> for signature::Error {
     fn from(_: Error) -> signature::Error {
         signature::Error::new()
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "alloc")]
 impl From<Error> for signature::Error {
     fn from(err: Error) -> signature::Error {
         signature::Error::from_source(err)
@@ -212,6 +237,13 @@ impl From<alloc::string::FromUtf8Error> for Error {
 impl From<sec1::Error> for Error {
     fn from(err: sec1::Error) -> Error {
         Error::Ecdsa(err)
+    }
+}
+
+#[cfg(any(feature = "dsa", feature = "rsa"))]
+impl From<encoding::bigint::DecodeError> for Error {
+    fn from(err: encoding::bigint::DecodeError) -> Error {
+        encoding::Error::from(err).into()
     }
 }
 
@@ -233,17 +265,5 @@ impl From<std::io::Error> for Error {
 impl From<std::time::SystemTimeError> for Error {
     fn from(_: std::time::SystemTimeError) -> Error {
         Error::Time
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            #[cfg(feature = "ecdsa")]
-            Self::Ecdsa(err) => Some(err),
-            Self::Encoding(err) => Some(err),
-            _ => None,
-        }
     }
 }

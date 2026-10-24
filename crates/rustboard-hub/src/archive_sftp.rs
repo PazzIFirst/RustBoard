@@ -1,6 +1,6 @@
 //! M4-C3：SFTP 冷存储后端。
 //!
-//! 使用 vendored `russh` 0.60.3（`ring` 后端）+ `russh-sftp` 3.0.1 实现
+//! 使用 vendored `russh` 0.64.1（`ring` 后端）+ `russh-sftp` 3.0.1 实现
 //! [`ColdStore`]；不调用 `ssh` 子进程，不依赖 openssl / cmake。
 //!
 //! 安全约定：
@@ -48,7 +48,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine as _;
 use russh::client::{Handle, Handler};
-use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg, PublicKey};
+use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::fs::Metadata;
 use russh_sftp::client::SftpSession;
@@ -193,11 +193,15 @@ impl Handler for SftpHostKeyHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        // 不支持 SSH 主机证书；证书会绕过“固定主机公钥指纹”的信任模型，统一拒绝。
+        if server_public_key.certificate().is_some() {
+            return Ok(false);
+        }
         // 使用与 OpenSSH `SHA256:` 指纹相同的算法；比较原始摘要，避免 base64
         // 填充差异（配置允许 43 字符或带一个 `=` 的 44 字符）。
-        let actual = server_public_key.fingerprint(HashAlg::Sha256);
+        let actual = server_public_key.public_key().fingerprint(HashAlg::Sha256);
         Ok(actual.as_bytes() == self.expected.as_slice())
     }
 }
@@ -681,6 +685,7 @@ pub(crate) fn test_config() -> ArchiveSftpConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use russh::keys::PublicKey;
     use russh_sftp::protocol::Status;
 
     fn handler_for(fingerprint: &str) -> SftpHostKeyHandler {
@@ -705,7 +710,9 @@ mod tests {
     /// 固定的测试主机公钥必须与硬编码的 SHA256 指纹一致。
     #[tokio::test]
     async fn host_key_accepts_configured_fingerprint() {
-        let key = PublicKey::from_openssh(TEST_HOST_PUBLIC_KEY).expect("测试公钥必须可解析");
+        let key = PublicKeyOrCertificate::from(
+            PublicKey::from_openssh(TEST_HOST_PUBLIC_KEY).expect("测试公钥必须可解析"),
+        );
         let mut handler = handler_for(TEST_HOST_FINGERPRINT);
         assert!(handler.check_server_key(&key).await.expect("校验不应报错"));
     }
@@ -717,7 +724,9 @@ mod tests {
             decode_host_key_fingerprint(&format!("{TEST_HOST_FINGERPRINT}=")),
             decode_host_key_fingerprint(TEST_HOST_FINGERPRINT)
         );
-        let key = PublicKey::from_openssh(TEST_HOST_PUBLIC_KEY).expect("测试公钥必须可解析");
+        let key = PublicKeyOrCertificate::from(
+            PublicKey::from_openssh(TEST_HOST_PUBLIC_KEY).expect("测试公钥必须可解析"),
+        );
         let mut handler = handler_for(&format!("{TEST_HOST_FINGERPRINT}="));
         assert!(handler.check_server_key(&key).await.expect("校验不应报错"));
     }
@@ -725,7 +734,9 @@ mod tests {
     /// 指纹不符时 handler 必须返回 Ok(false)，不能接受任意主机密钥。
     #[tokio::test]
     async fn host_key_rejects_mismatched_fingerprint() {
-        let key = PublicKey::from_openssh(TEST_HOST_PUBLIC_KEY).expect("测试公钥必须可解析");
+        let key = PublicKeyOrCertificate::from(
+            PublicKey::from_openssh(TEST_HOST_PUBLIC_KEY).expect("测试公钥必须可解析"),
+        );
         let mut handler = SftpHostKeyHandler {
             expected: [0u8; 32],
         };

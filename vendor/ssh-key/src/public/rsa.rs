@@ -6,9 +6,9 @@ use encoding::{CheckedSum, Decode, Encode, Reader, Writer};
 
 #[cfg(feature = "rsa")]
 use {
-    crate::private::RsaKeypair,
-    rsa::sha2::{digest::const_oid::AssociatedOid, Digest},
+    encoding::Uint,
     rsa::{pkcs1v15, traits::PublicKeyParts},
+    sha2::{Digest, digest::const_oid::AssociatedOid},
 };
 
 /// RSA public key.
@@ -17,16 +17,57 @@ use {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RsaPublicKey {
     /// RSA public exponent.
-    pub e: Mpint,
+    e: Mpint,
 
     /// RSA modulus.
-    pub n: Mpint,
+    n: Mpint,
+
+    /// Length of this key in bits.
+    bits: u32,
 }
 
 impl RsaPublicKey {
-    /// Minimum allowed RSA key size.
-    #[cfg(all(feature = "rsa", not(feature = "hazmat-allow-insecure-rsa-keys")))]
-    pub(crate) const MIN_KEY_SIZE: usize = RsaKeypair::MIN_KEY_SIZE;
+    /// Create a new [`RsaPublicKey`] with the given components:
+    ///
+    /// - `e`: RSA public exponent.
+    /// - `n`: RSA modulus.
+    ///
+    /// # Errors
+    /// Returns [`Error::FormatEncoding`] in the event one of the components is odd.
+    pub fn new(e: Mpint, n: Mpint) -> Result<Self> {
+        if !e.is_positive() {
+            return Err(Error::FormatEncoding);
+        }
+
+        let bits = match n.as_positive_bytes() {
+            Some(bytes) => bytes
+                .len()
+                .checked_mul(8)
+                .and_then(|bits| u32::try_from(bits).ok())
+                .ok_or(Error::FormatEncoding)?,
+            None => return Err(Error::FormatEncoding),
+        };
+
+        Ok(Self { e, n, bits })
+    }
+
+    /// Get the RSA public exponent.
+    #[must_use]
+    pub fn e(&self) -> &Mpint {
+        &self.e
+    }
+
+    /// Get the RSA modulus.
+    #[must_use]
+    pub fn n(&self) -> &Mpint {
+        &self.n
+    }
+
+    /// Get the size of the RSA modulus in bits.
+    #[must_use]
+    pub fn key_size(&self) -> u32 {
+        self.bits
+    }
 }
 
 impl Decode for RsaPublicKey {
@@ -35,7 +76,7 @@ impl Decode for RsaPublicKey {
     fn decode(reader: &mut impl Reader) -> Result<Self> {
         let e = Mpint::decode(reader)?;
         let n = Mpint::decode(reader)?;
-        Ok(Self { e, n })
+        Self::new(e, n)
     }
 }
 
@@ -72,16 +113,9 @@ impl TryFrom<&RsaPublicKey> for rsa::RsaPublicKey {
     type Error = Error;
 
     fn try_from(key: &RsaPublicKey) -> Result<rsa::RsaPublicKey> {
-        use rsa::BoxedUint;
-
-        let ret =
-            rsa::RsaPublicKey::new(BoxedUint::try_from(&key.n)?, BoxedUint::try_from(&key.e)?)
-                .map_err(|_| Error::Crypto)?;
-
-        #[cfg(not(feature = "hazmat-allow-insecure-rsa-keys"))]
-        if ret.size().saturating_mul(8) < RsaPublicKey::MIN_KEY_SIZE {
-            return Err(Error::Crypto);
-        }
+        let n = Uint::try_from(&key.n)?;
+        let e = Uint::try_from(&key.e)?;
+        let ret = rsa::RsaPublicKey::new(n, e).map_err(|_| Error::Crypto)?;
 
         Ok(ret)
     }
@@ -101,21 +135,18 @@ impl TryFrom<&rsa::RsaPublicKey> for RsaPublicKey {
     type Error = Error;
 
     fn try_from(key: &rsa::RsaPublicKey) -> Result<RsaPublicKey> {
-        Ok(RsaPublicKey {
-            e: key.e().try_into()?,
-            n: key.n().clone().get().try_into()?,
-        })
+        RsaPublicKey::new(key.e().into(), key.n().as_ref().into())
     }
 }
 
 #[cfg(feature = "rsa")]
-impl<D> TryFrom<&RsaPublicKey> for rsa::pkcs1v15::VerifyingKey<D>
+impl<D> TryFrom<&RsaPublicKey> for pkcs1v15::VerifyingKey<D>
 where
     D: Digest + AssociatedOid,
 {
     type Error = Error;
 
-    fn try_from(key: &RsaPublicKey) -> Result<rsa::pkcs1v15::VerifyingKey<D>> {
-        Ok(rsa::pkcs1v15::VerifyingKey::new(key.try_into()?))
+    fn try_from(key: &RsaPublicKey) -> Result<pkcs1v15::VerifyingKey<D>> {
+        Ok(pkcs1v15::VerifyingKey::new(key.try_into()?))
     }
 }

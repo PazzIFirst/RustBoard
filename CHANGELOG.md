@@ -10,6 +10,21 @@
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-24
+
+### Fixed
+
+- v041 e2e 的 KI-28 日志计数在 GitHub Actions 的 ANSI 颜色码下为 0：
+  计数前统一剥离 ANSI
+
+### Security
+
+- vendored `russh` 升级到 0.64.1、`ssh-key` 到 0.7.0-rc.11，ECC 依赖解析到
+  `crypto-bigint 0.7.6`，修复 **RUSTSEC-2026-0387**（0.7.0-rc.28 时序可变性）；
+  `cargo audit` 410 deps / 0 vulnerabilities
+- SFTP 主机密钥校验适配新 API；SSH 主机证书统一拒绝，仍只接受配置的
+  `SHA256:` 主机公钥指纹；RSA 主机/用户密钥仍不支持
+
 ## [0.4.1] - 2026-10-24
 
 ### Fixed

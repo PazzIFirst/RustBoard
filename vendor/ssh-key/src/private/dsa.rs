@@ -1,13 +1,13 @@
 //! Digital Signature Algorithm (DSA) private keys.
 
-use crate::{public::DsaPublicKey, Error, Mpint, Result};
+use crate::{Error, Mpint, Result, public::DsaPublicKey};
 use core::fmt;
-#[cfg(feature = "dsa")]
-use crypto_bigint::BoxedUint;
+use ctutils::{Choice, CtEq};
 use encoding::{CheckedSum, Decode, Encode, Reader, Writer};
-use subtle::{Choice, ConstantTimeEq};
 use zeroize::Zeroize;
 
+#[cfg(feature = "dsa")]
+use encoding::Uint;
 #[cfg(all(feature = "dsa", feature = "rand_core"))]
 use rand_core::CryptoRng;
 
@@ -24,12 +24,26 @@ pub struct DsaPrivateKey {
 }
 
 impl DsaPrivateKey {
+    /// Create a new DSA private key given the value `x`.
+    ///
+    /// # Errors
+    /// Returns [`Error::FormatEncoding`] if `x` is negative.
+    pub fn new(x: Mpint) -> Result<Self> {
+        if x.is_positive() {
+            Ok(Self { inner: x })
+        } else {
+            Err(Error::FormatEncoding)
+        }
+    }
+
     /// Get the serialized private key as bytes.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         self.inner.as_bytes()
     }
 
     /// Get the inner [`Mpint`].
+    #[must_use]
     pub fn as_mpint(&self) -> &Mpint {
         &self.inner
     }
@@ -41,7 +55,7 @@ impl AsRef<[u8]> for DsaPrivateKey {
     }
 }
 
-impl ConstantTimeEq for DsaPrivateKey {
+impl CtEq for DsaPrivateKey {
     fn ct_eq(&self, other: &Self) -> Choice {
         self.inner.ct_eq(&other.inner)
     }
@@ -55,13 +69,19 @@ impl PartialEq for DsaPrivateKey {
     }
 }
 
+impl TryFrom<Mpint> for DsaPrivateKey {
+    type Error = Error;
+
+    fn try_from(x: Mpint) -> Result<Self> {
+        Self::new(x)
+    }
+}
+
 impl Decode for DsaPrivateKey {
     type Error = Error;
 
     fn decode(reader: &mut impl Reader) -> Result<Self> {
-        Ok(Self {
-            inner: Mpint::decode(reader)?,
-        })
+        Self::new(Mpint::decode(reader)?)
     }
 }
 
@@ -88,40 +108,36 @@ impl Drop for DsaPrivateKey {
 }
 
 #[cfg(feature = "dsa")]
-impl TryFrom<DsaPrivateKey> for BoxedUint {
-    type Error = Error;
-
-    fn try_from(key: DsaPrivateKey) -> Result<BoxedUint> {
-        BoxedUint::try_from(&key.inner)
+impl From<&dsa::SigningKey> for DsaPrivateKey {
+    fn from(key: &dsa::SigningKey) -> DsaPrivateKey {
+        DsaPrivateKey {
+            inner: key.x().as_ref().into(),
+        }
     }
 }
 
 #[cfg(feature = "dsa")]
-impl TryFrom<&DsaPrivateKey> for BoxedUint {
-    type Error = Error;
-
-    fn try_from(key: &DsaPrivateKey) -> Result<BoxedUint> {
-        BoxedUint::try_from(&key.inner)
+impl From<dsa::SigningKey> for DsaPrivateKey {
+    fn from(key: dsa::SigningKey) -> DsaPrivateKey {
+        DsaPrivateKey::from(&key)
     }
 }
 
 #[cfg(feature = "dsa")]
-impl TryFrom<dsa::SigningKey> for DsaPrivateKey {
+impl TryFrom<DsaPrivateKey> for Uint {
     type Error = Error;
 
-    fn try_from(key: dsa::SigningKey) -> Result<DsaPrivateKey> {
-        DsaPrivateKey::try_from(&key)
+    fn try_from(key: DsaPrivateKey) -> Result<Uint> {
+        Ok(Uint::try_from(&key.inner)?)
     }
 }
 
 #[cfg(feature = "dsa")]
-impl TryFrom<&dsa::SigningKey> for DsaPrivateKey {
+impl TryFrom<&DsaPrivateKey> for Uint {
     type Error = Error;
 
-    fn try_from(key: &dsa::SigningKey) -> Result<DsaPrivateKey> {
-        Ok(DsaPrivateKey {
-            inner: key.x().as_ref().try_into()?,
-        })
+    fn try_from(key: &DsaPrivateKey) -> Result<Uint> {
+        Ok(Uint::try_from(&key.inner)?)
     }
 }
 
@@ -129,10 +145,10 @@ impl TryFrom<&dsa::SigningKey> for DsaPrivateKey {
 #[derive(Clone)]
 pub struct DsaKeypair {
     /// Public key.
-    pub public: DsaPublicKey,
+    public: DsaPublicKey,
 
     /// Private key.
-    pub private: DsaPrivateKey,
+    private: DsaPrivateKey,
 }
 
 impl DsaKeypair {
@@ -143,15 +159,39 @@ impl DsaKeypair {
 
     /// Generate a random DSA private key.
     #[cfg(all(feature = "dsa", feature = "rand_core"))]
-    pub fn random(rng: &mut impl CryptoRng) -> Result<Self> {
-        let components = dsa::Components::generate(rng, Self::KEY_SIZE);
-        dsa::SigningKey::generate(rng, components).try_into()
+    #[expect(clippy::missing_errors_doc, reason = "TODO")]
+    pub fn random<R: CryptoRng + ?Sized>(rng: &mut R) -> Result<Self> {
+        let Ok(components) =
+            dsa::Components::try_generate_from_rng_with_key_size(rng, Self::KEY_SIZE);
+        let Ok(sk) = dsa::SigningKey::try_generate_from_rng_with_components(rng, components);
+        Ok(sk.into())
+    }
+
+    /// Create a new [`DsaKeypair`] with the given `public` and `private` components.
+    ///
+    /// # Errors
+    /// Returns [`Error::Crypto`] if the `public` key does not match the `private` key (TODO).
+    pub fn new(public: DsaPublicKey, private: DsaPrivateKey) -> Result<Self> {
+        // TODO(tarcieri): actually validate the `public` and `private` components match
+        Ok(Self { public, private })
+    }
+
+    /// Get the public component of this key.
+    #[must_use]
+    pub fn public(&self) -> &DsaPublicKey {
+        &self.public
+    }
+
+    /// Get the private component of this key.
+    #[must_use]
+    pub fn private(&self) -> &DsaPrivateKey {
+        &self.private
     }
 }
 
-impl ConstantTimeEq for DsaKeypair {
+impl CtEq for DsaKeypair {
     fn ct_eq(&self, other: &Self) -> Choice {
-        Choice::from((self.public == other.public) as u8) & self.private.ct_eq(&other.private)
+        Choice::from(u8::from(self.public == other.public)) & self.private.ct_eq(&other.private)
     }
 }
 
@@ -169,7 +209,7 @@ impl Decode for DsaKeypair {
     fn decode(reader: &mut impl Reader) -> Result<Self> {
         let public = DsaPublicKey::decode(reader)?;
         let private = DsaPrivateKey::decode(reader)?;
-        Ok(DsaKeypair { public, private })
+        DsaKeypair::new(public, private)
     }
 }
 
@@ -220,28 +260,24 @@ impl TryFrom<&DsaKeypair> for dsa::SigningKey {
     fn try_from(key: &DsaKeypair) -> Result<dsa::SigningKey> {
         Ok(dsa::SigningKey::from_components(
             dsa::VerifyingKey::try_from(&key.public)?,
-            BoxedUint::try_from(&key.private)?,
+            key.private.as_mpint().try_into()?,
         )?)
     }
 }
 
 #[cfg(feature = "dsa")]
-impl TryFrom<dsa::SigningKey> for DsaKeypair {
-    type Error = Error;
-
-    fn try_from(key: dsa::SigningKey) -> Result<DsaKeypair> {
-        DsaKeypair::try_from(&key)
+impl From<dsa::SigningKey> for DsaKeypair {
+    fn from(key: dsa::SigningKey) -> DsaKeypair {
+        DsaKeypair::from(&key)
     }
 }
 
 #[cfg(feature = "dsa")]
-impl TryFrom<&dsa::SigningKey> for DsaKeypair {
-    type Error = Error;
-
-    fn try_from(key: &dsa::SigningKey) -> Result<DsaKeypair> {
-        Ok(DsaKeypair {
-            private: key.try_into()?,
-            public: key.verifying_key().try_into()?,
-        })
+impl From<&dsa::SigningKey> for DsaKeypair {
+    fn from(key: &dsa::SigningKey) -> DsaKeypair {
+        DsaKeypair {
+            private: key.into(),
+            public: key.verifying_key().into(),
+        }
     }
 }

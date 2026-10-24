@@ -8,13 +8,11 @@ mod unix_time;
 
 pub use self::{builder::Builder, cert_type::CertType, field::Field, options_map::OptionsMap};
 
-use self::unix_time::UnixTime;
 use crate::{
+    Algorithm, Comment, Error, Fingerprint, HashAlg, Result, Signature,
     public::{KeyData, SshFormat},
-    Algorithm, Error, Fingerprint, HashAlg, Result, Signature,
 };
 use alloc::{
-    borrow::ToOwned,
     string::{String, ToString},
     vec::Vec,
 };
@@ -23,17 +21,21 @@ use encoding::{Base64Reader, CheckedSum, Decode, Encode, Reader, Writer};
 use signature::Verifier;
 
 #[cfg(feature = "serde")]
-use serde::{de, ser, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de, ser};
 
 #[cfg(feature = "std")]
-use std::{fs, path::Path, time::SystemTime};
+use {
+    self::unix_time::UnixTime,
+    std::{fs, path::Path, time::SystemTime},
+};
 
 /// OpenSSH certificate as specified in [PROTOCOL.certkeys].
 ///
 /// OpenSSH supports X.509-like certificate authorities, but using a custom
 /// encoding format.
 ///
-/// # ⚠️ Security Warning
+/// <div class="warning">
+/// <b>Security Warning</b>
 ///
 /// Certificates must be validated before they can be trusted!
 ///
@@ -44,6 +46,7 @@ use std::{fs, path::Path, time::SystemTime};
 ///
 /// See "Certificate Validation" documentation below for more information on
 /// how to properly validate certificates.
+/// </div>
 ///
 /// # Certificate Validation
 ///
@@ -67,7 +70,7 @@ use std::{fs, path::Path, time::SystemTime};
 ///
 #[cfg_attr(all(feature = "p256", feature = "std"), doc = " ```")]
 #[cfg_attr(not(all(feature = "p256", feature = "std")), doc = " ```ignore")]
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # fn main() -> Result<(), ssh_key::Error> {
 /// use ssh_key::{Certificate, Fingerprint};
 /// use std::str::FromStr;
 ///
@@ -115,7 +118,7 @@ use std::{fs, path::Path, time::SystemTime};
 /// human-readable formats like JSON and TOML.
 ///
 /// [PROTOCOL.certkeys]: https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.certkeys?annotate=HEAD
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct Certificate {
     /// CA-provided random bitstring of arbitrary length
     /// (but typically 16 or 32 bytes).
@@ -137,10 +140,10 @@ pub struct Certificate {
     valid_principals: Vec<String>,
 
     /// Valid after.
-    valid_after: UnixTime,
+    valid_after: u64,
 
     /// Valid before.
-    valid_before: UnixTime,
+    valid_before: u64,
 
     /// Critical options.
     critical_options: OptionsMap,
@@ -158,7 +161,7 @@ pub struct Certificate {
     signature: Signature,
 
     /// Comment on the certificate.
-    comment: String,
+    comment: Comment,
 }
 
 impl Certificate {
@@ -170,6 +173,10 @@ impl Certificate {
     /// ```text
     /// ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlc...8REbCaAw== user@example.com
     /// ```
+    ///
+    /// # Errors
+    /// - Returns [`Error::AlgorithmUnknown`] in the event of an algorithm mismatch.
+    /// - Returns [`Error::Encoding`] in the event of an encoding error.
     pub fn from_openssh(certificate_str: &str) -> Result<Self> {
         let encapsulation = SshFormat::decode(certificate_str.trim_end().as_bytes())?;
         let mut reader = Base64Reader::new(encapsulation.base64_data)?;
@@ -180,11 +187,14 @@ impl Certificate {
             return Err(Error::AlgorithmUnknown);
         }
 
-        cert.comment = encapsulation.comment.to_owned();
+        cert.comment = Comment::from(encapsulation.comment);
         Ok(reader.finish(cert)?)
     }
 
     /// Parse a raw binary OpenSSH certificate.
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
     pub fn from_bytes(mut bytes: &[u8]) -> Result<Self> {
         let reader = &mut bytes;
         let cert = Certificate::decode(reader)?;
@@ -192,6 +202,9 @@ impl Certificate {
     }
 
     /// Encode OpenSSH certificate to a [`String`].
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
     pub fn to_openssh(&self) -> Result<String> {
         SshFormat::encode_string(
             &self.algorithm().to_certificate_type(),
@@ -201,13 +214,18 @@ impl Certificate {
     }
 
     /// Serialize OpenSSH certificate as raw bytes.
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut cert_bytes = Vec::new();
-        self.encode(&mut cert_bytes)?;
-        Ok(cert_bytes)
+        Ok(self.encode_vec()?)
     }
 
     /// Read OpenSSH certificate from a file.
+    ///
+    /// # Errors
+    /// - Returns [`Error::Io`] in the event of an I/O error.
+    /// - Returns [`Error::Encoding`] in the event of an encoding error.
     #[cfg(feature = "std")]
     pub fn read_file(path: &Path) -> Result<Self> {
         let input = fs::read_to_string(path)?;
@@ -215,6 +233,10 @@ impl Certificate {
     }
 
     /// Write OpenSSH certificate to a file.
+    ///
+    /// # Errors
+    /// - Returns [`Error::Io`] in the event of an I/O error.
+    /// - Returns [`Error::Encoding`] in the event of an encoding error.
     #[cfg(feature = "std")]
     pub fn write_file(&self, path: &Path) -> Result<()> {
         let encoded = self.to_openssh()?;
@@ -223,13 +245,20 @@ impl Certificate {
     }
 
     /// Get the public key algorithm for this certificate.
+    #[must_use]
     pub fn algorithm(&self) -> Algorithm {
         self.public_key.algorithm()
     }
 
     /// Get the comment on this certificate.
+    #[must_use]
     pub fn comment(&self) -> &str {
-        self.comment.as_str()
+        self.comment.as_str_lossy()
+    }
+
+    /// Set the comment on this certificate.
+    pub fn set_comment(&mut self, comment: impl Into<Comment>) {
+        self.comment = comment.into();
     }
 
     /// Nonces are a CA-provided random bitstring of arbitrary length
@@ -237,11 +266,13 @@ impl Certificate {
     ///
     /// It's included to make attacks that depend on inducing collisions in the
     /// signature hash infeasible.
+    #[must_use]
     pub fn nonce(&self) -> &[u8] {
         &self.nonce
     }
 
     /// Get this certificate's public key data.
+    #[must_use]
     pub fn public_key(&self) -> &KeyData {
         &self.public_key
     }
@@ -251,12 +282,14 @@ impl Certificate {
     ///
     /// If a CA does not wish to number its certificates, it must set this
     /// field to zero.
+    #[must_use]
     pub fn serial(&self) -> u64 {
         self.serial
     }
 
     /// Specifies whether this certificate is for identification of a user or
     /// a host.
+    #[must_use]
     pub fn cert_type(&self) -> CertType {
         self.cert_type
     }
@@ -266,6 +299,7 @@ impl Certificate {
     ///
     /// The intention is that the contents of this field are used to identify
     /// the identity principal in log messages.
+    #[must_use]
     pub fn key_id(&self) -> &str {
         &self.key_id
     }
@@ -277,30 +311,41 @@ impl Certificate {
     ///
     /// As a special case, a zero-length "valid principals" field means the
     /// certificate is valid for any principal of the specified type.
+    #[must_use]
     pub fn valid_principals(&self) -> &[String] {
         &self.valid_principals
     }
 
-    /// Valid after (Unix time).
+    /// Valid after (Unix time), i.e. certificate issuance time.
+    #[must_use]
     pub fn valid_after(&self) -> u64 {
-        self.valid_after.into()
+        self.valid_after
     }
 
-    /// Valid before (Unix time).
+    /// Valid before (Unix time), i.e. certificate expiration time.
+    #[must_use]
     pub fn valid_before(&self) -> u64 {
-        self.valid_before.into()
+        self.valid_before
     }
 
-    /// Valid after (system time).
+    /// Valid after (system time), i.e. certificate issuance time.
+    ///
+    /// # Returns
+    /// - `Some` if the `u64` value is a valid `SystemTime`
+    /// - `None` if it is not (i.e. overflows `i64`)
     #[cfg(feature = "std")]
-    pub fn valid_after_time(&self) -> SystemTime {
-        self.valid_after.into()
+    pub fn valid_after_time(&self) -> Option<SystemTime> {
+        UnixTime::try_from(self.valid_after).ok().map(Into::into)
     }
 
-    /// Valid before (system time).
+    /// Valid before (system time), i.e. certificate expiration time.
+    ///
+    /// # Returns
+    /// - `Some` if the `u64` value is a valid `SystemTime`
+    /// - `None` if it is not (i.e. overflows `i64`, effectively never-expiring)
     #[cfg(feature = "std")]
-    pub fn valid_before_time(&self) -> SystemTime {
-        self.valid_before.into()
+    pub fn valid_before_time(&self) -> Option<SystemTime> {
+        UnixTime::try_from(self.valid_before).ok().map(Into::into)
     }
 
     /// The critical options section of the certificate specifies zero or more
@@ -311,6 +356,7 @@ impl Certificate {
     /// All options are "critical"; if an implementation does not recognize an
     /// option, then the validating party should refuse to accept the
     /// certificate.
+    #[must_use]
     pub fn critical_options(&self) -> &OptionsMap {
         &self.critical_options
     }
@@ -320,17 +366,20 @@ impl Certificate {
     ///
     /// If an implementation does not recognise an extension, then it should
     /// ignore it.
+    #[must_use]
     pub fn extensions(&self) -> &OptionsMap {
         &self.extensions
     }
 
     /// Signature key of signing CA.
+    #[must_use]
     pub fn signature_key(&self) -> &KeyData {
         &self.signature_key
     }
 
     /// Signature computed over all preceding fields from the initial string up
     /// to, and including the signature key.
+    #[must_use]
     pub fn signature(&self) -> &Signature {
         &self.signature
     }
@@ -338,10 +387,15 @@ impl Certificate {
     /// Perform certificate validation using the system clock to check that
     /// the current time is within the certificate's validity window.
     ///
-    /// # ⚠️ Security Warning: Some Assembly Required
+    /// <div class="warning">
+    /// <b>Security Warning: Some Assembly Required</b>
     ///
-    /// See [`Certificate::validate_at`] documentation for important notes on
-    /// how to properly validate certificates!
+    /// See [`Certificate::validate_at`] documentation for important notes on how to properly
+    /// validate certificates!
+    /// </div>
+    ///
+    /// # Errors
+    /// Returns [`Error::CertificateValidation`] if the certificate failed to validate
     #[cfg(feature = "std")]
     pub fn validate<'a, I>(&self, ca_fingerprints: I) -> Result<()>
     where
@@ -355,29 +409,28 @@ impl Certificate {
     /// Checks for the following:
     ///
     /// - Specified Unix timestamp is within the certificate's valid range
-    /// - Certificate's signature validates against the public key included in
-    ///   the certificate
-    /// - Fingerprint of the public key included in the certificate matches one
-    ///   of the trusted certificate authority (CA) fingerprints provided in
-    ///   the `ca_fingerprints` parameter.
+    /// - Certificate's signature validates against the public key included in the certificate
+    /// - Fingerprint of the public key included in the certificate matches one of the trusted
+    ///   certificate authority (CA) fingerprints provided in the `ca_fingerprints` parameter.
     ///
     /// NOTE: only SHA-256 fingerprints are supported at this time.
     ///
-    /// # ⚠️ Security Warning: Some Assembly Required
+    /// <div class="warning">
+    /// <b>Security Warning: Some Assembly Required</b>
     ///
-    /// This method does not perform the full set of validation checks needed
-    /// to determine if a certificate is to be trusted.
+    /// This method does not perform the full set of validation checks needed to determine if a
+    /// certificate is to be trusted.
     ///
-    /// If this method succeeds, the following properties still need to be
-    /// checked to ensure the certificate is valid:
+    /// If this method succeeds, the following properties still need to be checked to ensure the
+    /// certificate is valid:
     ///
-    /// - `valid_principals` is empty or contains the expected principal
-    /// - `critical_options` is empty or contains *only* options which are
-    ///   recognized, and that the recognized options are all valid
+    /// - `valid_principals` is empty or contains the expected principal.
+    /// - `critical_options` is empty or contains *only* options which are recognized, and that the
+    ///   recognized options are all valid.
+    /// </div>
     ///
-    /// ## Returns
-    /// - `Ok` if the certificate validated successfully
-    /// - `Error::CertificateValidation` if the certificate failed to validate
+    /// # Errors
+    /// Returns [`Error::CertificateValidation`] if the certificate failed to validate
     pub fn validate_at<'a, I>(&self, unix_timestamp: u64, ca_fingerprints: I) -> Result<()>
     where
         I: IntoIterator<Item = &'a Fingerprint>,
@@ -390,8 +443,6 @@ impl Certificate {
         if !ca_fingerprints.into_iter().any(|f| f == &cert_fingerprint) {
             return Err(Error::CertificateValidation);
         }
-
-        let unix_timestamp = UnixTime::new(unix_timestamp)?;
 
         // From PROTOCOL.certkeys:
         //
@@ -410,17 +461,17 @@ impl Certificate {
     /// Verify the signature on the certificate against the public key in the
     /// certificate.
     ///
-    /// # ⚠️ Security Warning
-    ///
-    /// DON'T USE THIS!
+    /// <div class="warning">
+    /// <b>Security Warning: DON'T USE THIS!</b>
     ///
     /// This function alone does not provide any security guarantees whatsoever.
     ///
-    /// It verifies the signature in the certificate matches the CA public key
-    /// in the certificate, but does not ensure the CA is trusted.
+    /// It verifies the signature in the certificate matches the CA public key in the certificate,
+    /// but does not ensure the CA is trusted.
     ///
-    /// It is public only for testing purposes, and deliberately hidden from
-    /// the documentation for that reason.
+    /// It is public only for testing purposes, and deliberately hidden from the documentation for
+    /// that reason.
+    /// </div>
     #[doc(hidden)]
     pub fn verify_signature(&self) -> Result<()> {
         let mut tbs_certificate = Vec::new();
@@ -447,14 +498,12 @@ impl Certificate {
         self.reserved.encode(writer)?;
         self.signature_key.encode_prefixed(writer)
     }
-}
 
-impl Decode for Certificate {
-    type Error = Error;
-
-    fn decode(reader: &mut impl Reader) -> Result<Self> {
-        let algorithm = Algorithm::new_certificate(&String::decode(reader)?)?;
-
+    /// Decode [`Certificate`] for the specified algorithm.
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
+    pub fn decode_as(reader: &mut impl Reader, algorithm: Algorithm) -> Result<Self> {
         Ok(Self {
             nonce: Vec::decode(reader)?,
             public_key: KeyData::decode_as(reader, algorithm)?,
@@ -462,15 +511,24 @@ impl Decode for Certificate {
             cert_type: CertType::decode(reader)?,
             key_id: String::decode(reader)?,
             valid_principals: Vec::decode(reader)?,
-            valid_after: UnixTime::decode(reader)?,
-            valid_before: UnixTime::decode(reader)?,
+            valid_after: u64::decode(reader)?,
+            valid_before: u64::decode(reader)?,
             critical_options: OptionsMap::decode(reader)?,
             extensions: OptionsMap::decode(reader)?,
             reserved: Vec::decode(reader)?,
             signature_key: reader.read_prefixed(KeyData::decode)?,
             signature: reader.read_prefixed(Signature::decode)?,
-            comment: String::new(),
+            comment: Comment::default(),
         })
+    }
+}
+
+impl Decode for Certificate {
+    type Error = Error;
+
+    fn decode(reader: &mut impl Reader) -> Result<Self> {
+        let algorithm = Algorithm::new_certificate(&String::decode(reader)?)?;
+        Self::decode_as(reader, algorithm)
     }
 }
 
@@ -509,6 +567,10 @@ impl FromStr for Certificate {
     }
 }
 
+#[allow(
+    clippy::to_string_trait_impl,
+    reason = "`SshFormat` lacks `core::fmt` support"
+)]
 impl ToString for Certificate {
     fn to_string(&self) -> String {
         self.to_openssh().expect("SSH certificate encoding error")

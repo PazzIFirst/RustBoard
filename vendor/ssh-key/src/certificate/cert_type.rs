@@ -4,10 +4,12 @@ use crate::{Error, Result};
 use encoding::{Decode, Encode, Reader, Writer};
 
 /// Types of OpenSSH certificates: user or host.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
+#[derive(Default)]
 pub enum CertType {
     /// User certificate
+    #[default]
     User = 1,
 
     /// Host certificate
@@ -16,19 +18,15 @@ pub enum CertType {
 
 impl CertType {
     /// Is this a host certificate?
+    #[must_use]
     pub fn is_host(self) -> bool {
         self == CertType::Host
     }
 
     /// Is this a user certificate?
+    #[must_use]
     pub fn is_user(self) -> bool {
         self == CertType::User
-    }
-}
-
-impl Default for CertType {
-    fn default() -> Self {
-        Self::User
     }
 }
 
@@ -52,6 +50,7 @@ impl Encode for CertType {
 }
 
 impl From<CertType> for u32 {
+    #[allow(clippy::as_conversions, reason = "repr(u32) enum")]
     fn from(cert_type: CertType) -> u32 {
         cert_type as u32
     }

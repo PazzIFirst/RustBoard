@@ -1,13 +1,9 @@
 //! Signatures (e.g. CA signatures over SSH certificates)
 
-use crate::{private, public, Algorithm, EcdsaCurve, Error, Mpint, PrivateKey, PublicKey, Result};
+use crate::{Algorithm, EcdsaCurve, Error, Mpint, PrivateKey, PublicKey, Result, private, public};
 use alloc::vec::Vec;
 use core::fmt;
-#[cfg(feature = "dsa")]
-use dsa::BoxedUint;
 use encoding::{CheckedSum, Decode, Encode, Reader, Writer};
-#[cfg(feature = "dsa")]
-use sha1::Digest;
 use signature::{SignatureEncoding, Signer, Verifier};
 
 #[cfg(feature = "ed25519")]
@@ -16,6 +12,7 @@ use crate::{private::Ed25519Keypair, public::Ed25519PublicKey};
 #[cfg(feature = "dsa")]
 use {
     crate::{private::DsaKeypair, public::DsaPublicKey},
+    encoding::Uint,
     signature::{DigestSigner, DigestVerifier},
 };
 
@@ -25,22 +22,23 @@ use crate::{
     public::EcdsaPublicKey,
 };
 
-#[cfg(any(feature = "dsa", feature = "p256", feature = "p384", feature = "p521"))]
-use core::iter;
-
 #[cfg(feature = "rsa")]
-use crate::{private::RsaKeypair, public::RsaPublicKey, HashAlg};
+use {
+    crate::{HashAlg, private::RsaKeypair, public::RsaPublicKey},
+    sha2::Sha512,
+};
 
-#[cfg(any(feature = "rsa-sha1", feature = "dsa"))]
+#[cfg(any(all(feature = "sha1", feature = "rsa"), feature = "dsa"))]
 use sha1::Sha1;
 
 #[cfg(any(feature = "ed25519", feature = "rsa", feature = "p256"))]
 use sha2::Sha256;
 
-#[cfg(any(feature = "rsa"))]
-use sha2::Sha512;
+#[cfg(any(feature = "dsa", feature = "ed25519", feature = "p256"))]
+use sha2::Digest;
 
-const DSA_SIGNATURE_SIZE: usize = 40;
+const DSA_COMPONENT_SIZE: usize = 20;
+const DSA_SIGNATURE_SIZE: usize = DSA_COMPONENT_SIZE * 2;
 const ED25519_SIGNATURE_SIZE: usize = 64;
 const SK_SIGNATURE_TRAILER_SIZE: usize = 5; // flags(u8), counter(u32)
 const SK_ED25519_SIGNATURE_SIZE: usize = ED25519_SIGNATURE_SIZE + SK_SIGNATURE_TRAILER_SIZE;
@@ -86,7 +84,7 @@ where
 /// [RFC5656]: https://datatracker.ietf.org/doc/html/rfc5656
 /// [RFC8032]: https://datatracker.ietf.org/doc/html/rfc8032
 /// [RFC8332]: https://datatracker.ietf.org/doc/html/rfc8332
-#[derive(Clone, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Clone, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct Signature {
     /// Signature algorithm.
     algorithm: Algorithm,
@@ -101,12 +99,12 @@ impl Signature {
     /// See specifications in toplevel [`Signature`] documentation for how to
     /// format the raw signature data for a given algorithm.
     ///
-    /// # Returns
-    /// - [`Error::Encoding`] if the signature is not the correct length.
+    /// # Errors
+    /// Returns [`Error::Encoding`] if the signature is not the correct length.
     pub fn new(algorithm: Algorithm, data: impl Into<Vec<u8>>) -> Result<Self> {
         let data = data.into();
 
-        // Validate signature is well-formed per OpensSH encoding
+        // Validate signature is well-formed per OpenSSH encoding
         match algorithm {
             Algorithm::Dsa if data.len() == DSA_SIGNATURE_SIZE => (),
             Algorithm::Ecdsa { curve } => ecdsa_sig_size(&data, curve, false)?,
@@ -122,18 +120,20 @@ impl Signature {
     }
 
     /// Get the [`Algorithm`] associated with this signature.
+    #[must_use]
     pub fn algorithm(&self) -> Algorithm {
         self.algorithm.clone()
     }
 
     /// Get the raw signature as bytes.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
 
     /// Placeholder signature used by the certificate builder.
     ///
-    /// This is guaranteed generate an error if anything attempts to encode it.
+    /// This is guaranteed to generate an error if anything attempts to encode it.
     pub(crate) fn placeholder() -> Self {
         Self {
             algorithm: Algorithm::default(),
@@ -149,22 +149,22 @@ impl Signature {
 
 /// Returns Ok() if data holds an ecdsa signature with components of appropriate size
 /// according to curve.
-fn ecdsa_sig_size(data: &Vec<u8>, curve: EcdsaCurve, sk_trailer: bool) -> Result<()> {
-    let reader = &mut data.as_slice();
+fn ecdsa_sig_size(mut data: &[u8], curve: EcdsaCurve, sk_trailer: bool) -> Result<()> {
+    let reader = &mut data;
 
     for _ in 0..2 {
         let component = Mpint::decode(reader)?;
-
-        if component.as_positive_bytes().ok_or(Error::Crypto)?.len() > curve.field_size() {
+        let bytes = component.as_positive_bytes().ok_or(Error::FormatEncoding)?;
+        if bytes.len() > curve.field_size() {
             return Err(encoding::Error::Length.into());
         }
     }
+
     if sk_trailer {
         reader.drain(SK_SIGNATURE_TRAILER_SIZE)?;
     }
-    reader
-        .finish(())
-        .map_err(|_| encoding::Error::Length.into())
+
+    Ok(reader.finish(())?)
 }
 
 impl AsRef<[u8]> for Signature {
@@ -207,7 +207,10 @@ impl Encode for Signature {
 
         self.algorithm().encode(writer)?;
 
-        if self.algorithm == Algorithm::SkEd25519 {
+        if matches!(
+            self.algorithm,
+            Algorithm::SkEd25519 | Algorithm::SkEcdsaSha2NistP256
+        ) {
             let signature_length = self
                 .as_bytes()
                 .len()
@@ -240,9 +243,7 @@ impl TryFrom<Signature> for Vec<u8> {
     type Error = Error;
 
     fn try_from(signature: Signature) -> Result<Vec<u8>> {
-        let mut ret = Vec::<u8>::new();
-        signature.encode(&mut ret)?;
-        Ok(ret)
+        Ok(signature.encode_vec()?)
     }
 }
 
@@ -329,17 +330,20 @@ impl Verifier<Signature> for public::KeyData {
 impl Signer<Signature> for DsaKeypair {
     fn try_sign(&self, message: &[u8]) -> signature::Result<Signature> {
         let signature = dsa::SigningKey::try_from(self)?
-            .try_sign_digest(|d: &mut Sha1| Ok(d.update(message)))
+            .try_sign_digest(|digest: &mut Sha1| {
+                digest.update(message);
+                Ok(())
+            })
             .map_err(|_| signature::Error::new())?;
 
         // Encode the format specified in RFC4253 section 6.6: two raw 80-bit integers concatenated
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity(DSA_SIGNATURE_SIZE);
 
         for component in [signature.r(), signature.s()] {
-            let mut bytes = component.to_be_bytes();
-            let pad_len = (DSA_SIGNATURE_SIZE / 2).saturating_sub(bytes.len());
-            data.extend(iter::repeat(0).take(pad_len));
-            data.extend(&bytes);
+            let bytes = component.to_be_bytes_trimmed_vartime();
+            let pad_len = DSA_COMPONENT_SIZE.saturating_sub(bytes.len());
+            data.extend(core::iter::repeat_n(0, pad_len));
+            data.extend_from_slice(&bytes);
         }
 
         debug_assert_eq!(data.len(), DSA_SIGNATURE_SIZE);
@@ -356,22 +360,52 @@ impl Verifier<Signature> for DsaPublicKey {
     fn verify(&self, message: &[u8], signature: &Signature) -> signature::Result<()> {
         match signature.algorithm {
             Algorithm::Dsa => {
-                let data = signature.data.as_slice();
-                if data.len() != DSA_SIGNATURE_SIZE {
-                    return Err(signature::Error::new());
-                }
-                let (r, s) = data.split_at(DSA_SIGNATURE_SIZE / 2);
-                let signature = dsa::Signature::from_components(
-                    BoxedUint::from_be_slice_vartime(r),
-                    BoxedUint::from_be_slice_vartime(s),
-                )
-                .ok_or_else(signature::Error::new)?;
+                let signature = dsa::Signature::try_from(signature)?;
                 dsa::VerifyingKey::try_from(self)?
-                    .verify_digest(|d: &mut Sha1| Ok(d.update(message)), &signature)
+                    .verify_digest(
+                        |digest: &mut Sha1| {
+                            digest.update(message);
+                            Ok(())
+                        },
+                        &signature,
+                    )
                     .map_err(|_| signature::Error::new())
             }
             _ => Err(signature.algorithm().unsupported_error().into()),
         }
+    }
+}
+
+#[cfg(feature = "dsa")]
+impl TryFrom<Signature> for dsa::Signature {
+    type Error = Error;
+
+    fn try_from(signature: Signature) -> Result<Self> {
+        dsa::Signature::try_from(&signature)
+    }
+}
+
+#[cfg(feature = "dsa")]
+impl TryFrom<&Signature> for dsa::Signature {
+    type Error = Error;
+
+    fn try_from(signature: &Signature) -> Result<Self> {
+        let data = signature.data.as_slice();
+        if data.len() != DSA_SIGNATURE_SIZE {
+            return Err(encoding::Error::Length.into());
+        }
+
+        let components = data.split_at(DSA_COMPONENT_SIZE);
+
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            reason = "constant"
+        )]
+        const COMPONENT_BITS: u32 = DSA_COMPONENT_SIZE.saturating_mul(8) as u32;
+        let r = Uint::from_be_slice(components.0, COMPONENT_BITS)?;
+        let s = Uint::from_be_slice(components.1, COMPONENT_BITS)?;
+        Ok(Self::from_components(r, s).ok_or(encoding::Error::MpintEncoding)?)
     }
 }
 
@@ -444,8 +478,6 @@ impl Verifier<Signature> for public::SkEcdsaSha2NistP256 {
 
 #[cfg(any(feature = "p256", feature = "ed25519"))]
 fn make_sk_signed_data(application: &str, flags_and_counter: &[u8], message: &[u8]) -> Vec<u8> {
-    use sha2::Digest;
-
     const SHA256_OUTPUT_LENGTH: usize = 32;
     const SIGNED_SK_DATA_LENGTH: usize = 2 * SHA256_OUTPUT_LENGTH + SK_SIGNATURE_TRAILER_SIZE;
 
@@ -490,8 +522,8 @@ macro_rules! impl_signature_for_curve {
                 #[allow(clippy::arithmetic_side_effects)]
                 let mut data = Vec::with_capacity($size * 2 + 4 * 2 + 2);
 
-                Mpint::from_positive_bytes(&r)?.encode(&mut data)?;
-                Mpint::from_positive_bytes(&s)?.encode(&mut data)?;
+                Mpint::from_positive_bytes(&r).encode(&mut data)?;
+                Mpint::from_positive_bytes(&s).encode(&mut data)?;
 
                 Ok(Signature {
                     algorithm: Algorithm::Ecdsa {
@@ -532,9 +564,11 @@ fn zero_pad_field_bytes<B: FromIterator<u8> + Copy>(m: Mpint) -> Option<B> {
     use core::mem::size_of;
 
     let bytes = m.as_positive_bytes()?;
-    size_of::<B>()
-        .checked_sub(bytes.len())
-        .map(|i| B::from_iter(iter::repeat(0u8).take(i).chain(bytes.iter().cloned())))
+    size_of::<B>().checked_sub(bytes.len()).map(|i| {
+        core::iter::repeat_n(0u8, i)
+            .chain(bytes.iter().cloned())
+            .collect()
+    })
 }
 
 #[cfg(feature = "p256")]
@@ -667,27 +701,19 @@ impl Verifier<Signature> for EcdsaPublicKey {
     }
 }
 
-/// Maps between versions of signature crate
-fn remap_sig_result<T>(r: signature::Result<T>) -> signature::Result<T> {
-    r.map_err(|_| signature::Error::new())
-}
-
 #[cfg(feature = "rsa")]
 impl Signer<Signature> for (&RsaKeypair, Option<HashAlg>) {
     fn try_sign(&self, message: &[u8]) -> signature::Result<Signature> {
-        use rsa::signature::SignatureEncoding;
         let data = match self.1 {
-            Some(HashAlg::Sha512) => remap_sig_result(
-                rsa::pkcs1v15::SigningKey::<Sha512>::try_from(self.0)?.try_sign(message),
-            ),
-            Some(HashAlg::Sha256) => remap_sig_result(
-                rsa::pkcs1v15::SigningKey::<Sha256>::try_from(self.0)?.try_sign(message),
-            ),
-            #[cfg(feature = "rsa-sha1")]
-            None => remap_sig_result(
-                rsa::pkcs1v15::SigningKey::<Sha1>::try_from(self.0)?.try_sign(message),
-            ),
-            #[cfg(not(feature = "rsa-sha1"))]
+            Some(HashAlg::Sha512) => {
+                rsa::pkcs1v15::SigningKey::<Sha512>::try_from(self.0)?.try_sign(message)
+            }
+            Some(HashAlg::Sha256) => {
+                rsa::pkcs1v15::SigningKey::<Sha256>::try_from(self.0)?.try_sign(message)
+            }
+            #[cfg(all(feature = "rsa", feature = "sha1"))]
+            None => rsa::pkcs1v15::SigningKey::<Sha1>::try_from(self.0)?.try_sign(message),
+            #[cfg(not(all(feature = "rsa", feature = "sha1")))]
             None => return Err(Algorithm::Rsa { hash: None }.unsupported_error().into()),
         }
         .map_err(|_| signature::Error::new())?;
@@ -709,31 +735,23 @@ impl Signer<Signature> for RsaKeypair {
 #[cfg(feature = "rsa")]
 impl Verifier<Signature> for RsaPublicKey {
     fn verify(&self, message: &[u8], signature: &Signature) -> signature::Result<()> {
-        use signature::Verifier;
         match signature.algorithm {
             Algorithm::Rsa { hash } => {
-                let signature =
-                    remap_sig_result(rsa::pkcs1v15::Signature::try_from(signature.data.as_ref()))?;
+                let signature = rsa::pkcs1v15::Signature::try_from(signature.data.as_ref())?;
 
                 match hash {
-                    #[cfg(not(feature = "rsa-sha1"))]
+                    #[cfg(not(all(feature = "rsa", feature = "sha1")))]
                     None => Err(Algorithm::Rsa { hash: None }.unsupported_error().into()),
-                    #[cfg(feature = "rsa-sha1")]
-                    None => remap_sig_result(
-                        rsa::pkcs1v15::VerifyingKey::<sha1::Sha1>::try_from(self)?
-                            .verify(message, &signature),
-                    )
-                    .map_err(|_| signature::Error::new()),
-                    Some(HashAlg::Sha256) => remap_sig_result(
-                        rsa::pkcs1v15::VerifyingKey::<rsa::sha2::Sha256>::try_from(self)?
-                            .verify(message, &signature),
-                    )
-                    .map_err(|_| signature::Error::new()),
-                    Some(HashAlg::Sha512) => remap_sig_result(
-                        rsa::pkcs1v15::VerifyingKey::<rsa::sha2::Sha512>::try_from(self)?
-                            .verify(message, &signature),
-                    )
-                    .map_err(|_| signature::Error::new()),
+                    #[cfg(all(feature = "rsa", feature = "sha1"))]
+                    None => rsa::pkcs1v15::VerifyingKey::<Sha1>::try_from(self)?
+                        .verify(message, &signature)
+                        .map_err(|_| signature::Error::new()),
+                    Some(HashAlg::Sha256) => rsa::pkcs1v15::VerifyingKey::<Sha256>::try_from(self)?
+                        .verify(message, &signature)
+                        .map_err(|_| signature::Error::new()),
+                    Some(HashAlg::Sha512) => rsa::pkcs1v15::VerifyingKey::<Sha512>::try_from(self)?
+                        .verify(message, &signature)
+                        .map_err(|_| signature::Error::new()),
                 }
             }
             _ => Err(signature.algorithm().unsupported_error().into()),
@@ -749,29 +767,41 @@ mod tests {
     use encoding::Encode;
     use hex_literal::hex;
 
+    #[cfg(any(feature = "ed25519", all(feature = "rsa", feature = "sha1")))]
+    use signature::Verifier;
     #[cfg(feature = "ed25519")]
-    use {
-        super::Ed25519Keypair,
-        signature::{Signer, Verifier},
-    };
+    use {super::Ed25519Keypair, signature::Signer};
 
     #[cfg(feature = "p256")]
-    use super::{zero_pad_field_bytes, Mpint};
+    use super::{Mpint, zero_pad_field_bytes};
 
-    const DSA_SIGNATURE: &[u8] = &hex!("000000077373682d6473730000002866725bf3c56100e975e21fff28a60f73717534d285ea3e1beefc2891f7189d00bd4d94627e84c55c");
-    const ECDSA_SHA2_P256_SIGNATURE: &[u8] = &hex!("0000001365636473612d736861322d6e6973747032353600000048000000201298ab320720a32139cda8a40c97a13dc54ce032ea3c6f09ea9e87501e48fa1d0000002046e4ac697a6424a9870b9ef04ca1182cd741965f989bd1f1f4a26fd83cf70348");
-    const ED25519_SIGNATURE: &[u8] = &hex!("0000000b7373682d65643235353139000000403d6b9906b76875aef1e7b2f1e02078a94f439aebb9a4734da1a851a81e22ce0199bbf820387a8de9c834c9c3cc778d9972dcbe70f68d53cc6bc9e26b02b46d04");
-    const SK_ED25519_SIGNATURE: &[u8] = &hex!("0000001a736b2d7373682d65643235353139406f70656e7373682e636f6d000000402f5670b6f93465d17423878a74084bf331767031ed240c627c8eb79ab8fa1b935a1fd993f52f5a13fec1797f8a434f943a6096246aea8dd5c8aa922cba3d95060100000009");
-    const RSA_SHA512_SIGNATURE: &[u8] = &hex!("0000000c7273612d736861322d3531320000018085a4ad1a91a62c00c85de7bb511f38088ff2bce763d76f4786febbe55d47624f9e2cffce58a680183b9ad162c7f0191ea26cab001ac5f5055743eced58e9981789305c208fc98d2657954e38eb28c7e7f3fbe92393a14324ed77aebb772a41aa7a107b38cb9bd1d9ad79b275135d1d7e019bb1d56d74f2450be6db0771f48f6707d3fcf9789592ca2e55595acc16b6e8d0139b56c5d1360b3a1e060f4151a3d7841df2c2a8c94d6f8a1bf633165ee0bcadac5642763df0dd79d3235ae5506595145f199d8abe8f9980411bf70a16e30f273736324d047043317044c36374d6a5ed34cac251e01c6795e4578393f9090bf4ae3e74a0009275a197315fc9c62f1c9aec1ba3b2d37c3b207e5500df19e090e7097ebc038fb9c9e35aea9161479ba6b5190f48e89e1abe51e8ec0e120ef89776e129687ca52d1892c8e88e6ef062a7d96b8a87682ca6a42ff1df0cdf5815c3645aeed7267ca7093043db0565e0f109b796bf117b9d2bb6d6debc0c67a4c9fb3aae3e29b00c7bd70f6c11cf53c295ff");
+    const DSA_SIGNATURE: &[u8] = &hex!(
+        "000000077373682d6473730000002866725bf3c56100e975e21fff28a60f73717534d285ea3e1beefc2891f7189d00bd4d94627e84c55c"
+    );
+    const ECDSA_SHA2_P256_SIGNATURE: &[u8] = &hex!(
+        "0000001365636473612d736861322d6e6973747032353600000048000000201298ab320720a32139cda8a40c97a13dc54ce032ea3c6f09ea9e87501e48fa1d0000002046e4ac697a6424a9870b9ef04ca1182cd741965f989bd1f1f4a26fd83cf70348"
+    );
+    const ED25519_SIGNATURE: &[u8] = &hex!(
+        "0000000b7373682d65643235353139000000403d6b9906b76875aef1e7b2f1e02078a94f439aebb9a4734da1a851a81e22ce0199bbf820387a8de9c834c9c3cc778d9972dcbe70f68d53cc6bc9e26b02b46d04"
+    );
+    const SK_ED25519_SIGNATURE: &[u8] = &hex!(
+        "0000001a736b2d7373682d65643235353139406f70656e7373682e636f6d000000402f5670b6f93465d17423878a74084bf331767031ed240c627c8eb79ab8fa1b935a1fd993f52f5a13fec1797f8a434f943a6096246aea8dd5c8aa922cba3d95060100000009"
+    );
+    const SK_ECDSA_SHA2_P256_SIGNATURE: &[u8] = &hex!(
+        "00000022736b2d65636473612d736861322d6e69737470323536406f70656e7373682e636f6d00000048000000201298ab320720a32139cda8a40c97a13dc54ce032ea3c6f09ea9e87501e48fa1d0000002046e4ac697a6424a9870b9ef04ca1182cd741965f989bd1f1f4a26fd83cf703480100000009"
+    );
+    const RSA_SHA512_SIGNATURE: &[u8] = &hex!(
+        "0000000c7273612d736861322d3531320000018085a4ad1a91a62c00c85de7bb511f38088ff2bce763d76f4786febbe55d47624f9e2cffce58a680183b9ad162c7f0191ea26cab001ac5f5055743eced58e9981789305c208fc98d2657954e38eb28c7e7f3fbe92393a14324ed77aebb772a41aa7a107b38cb9bd1d9ad79b275135d1d7e019bb1d56d74f2450be6db0771f48f6707d3fcf9789592ca2e55595acc16b6e8d0139b56c5d1360b3a1e060f4151a3d7841df2c2a8c94d6f8a1bf633165ee0bcadac5642763df0dd79d3235ae5506595145f199d8abe8f9980411bf70a16e30f273736324d047043317044c36374d6a5ed34cac251e01c6795e4578393f9090bf4ae3e74a0009275a197315fc9c62f1c9aec1ba3b2d37c3b207e5500df19e090e7097ebc038fb9c9e35aea9161479ba6b5190f48e89e1abe51e8ec0e120ef89776e129687ca52d1892c8e88e6ef062a7d96b8a87682ca6a42ff1df0cdf5815c3645aeed7267ca7093043db0565e0f109b796bf117b9d2bb6d6debc0c67a4c9fb3aae3e29b00c7bd70f6c11cf53c295ff"
+    );
 
     /// Example test vector for signing.
-    #[cfg(feature = "ed25519")]
+    #[cfg(any(feature = "ed25519", all(feature = "rsa", feature = "sha1")))]
     const EXAMPLE_MSG: &[u8] = b"Hello, world!";
 
     #[cfg(feature = "p256")]
     #[test]
     fn convert_ecdsa_sha2_p256() {
-        let p256_signature = p256::ecdsa::Signature::try_from(hex!("00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000001").as_ref()).unwrap();
+        let p256_signature = p256::ecdsa::Signature::try_from(&hex!("00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000001")[..]).unwrap();
         let _ssh_signature = Signature::try_from(p256_signature).unwrap();
     }
 
@@ -834,6 +864,12 @@ mod tests {
     }
 
     #[test]
+    fn decode_sk_ecdsa_sha2_p256() {
+        let signature = Signature::try_from(SK_ECDSA_SHA2_P256_SIGNATURE).unwrap();
+        assert_eq!(Algorithm::SkEcdsaSha2NistP256, signature.algorithm());
+    }
+
+    #[test]
     fn decode_rsa() {
         let signature = Signature::try_from(RSA_SHA512_SIGNATURE).unwrap();
         assert_eq!(
@@ -847,47 +883,48 @@ mod tests {
     #[test]
     fn encode_dsa() {
         let signature = Signature::try_from(DSA_SIGNATURE).unwrap();
-
-        let mut result = Vec::new();
-        signature.encode(&mut result).unwrap();
+        let result = signature.encode_vec().unwrap();
         assert_eq!(DSA_SIGNATURE, &result);
     }
 
     #[test]
     fn encode_ecdsa_sha2_p256() {
         let signature = Signature::try_from(ECDSA_SHA2_P256_SIGNATURE).unwrap();
-
-        let mut result = Vec::new();
-        signature.encode(&mut result).unwrap();
+        let result = signature.encode_vec().unwrap();
         assert_eq!(ECDSA_SHA2_P256_SIGNATURE, &result);
     }
 
     #[test]
     fn encode_ed25519() {
         let signature = Signature::try_from(ED25519_SIGNATURE).unwrap();
-
-        let mut result = Vec::new();
-        signature.encode(&mut result).unwrap();
+        let result = signature.encode_vec().unwrap();
         assert_eq!(ED25519_SIGNATURE, &result);
     }
 
     #[test]
     fn encode_sk_ed25519() {
         let signature = Signature::try_from(SK_ED25519_SIGNATURE).unwrap();
+        let result = signature.encode_vec().unwrap();
+        assert_eq!(SK_ED25519_SIGNATURE, &result);
+    }
+
+    #[test]
+    fn encode_sk_ecdsa_sha2_p256() {
+        let signature = Signature::try_from(SK_ECDSA_SHA2_P256_SIGNATURE).unwrap();
 
         let mut result = Vec::new();
         signature.encode(&mut result).unwrap();
-        assert_eq!(SK_ED25519_SIGNATURE, &result);
+        assert_eq!(SK_ECDSA_SHA2_P256_SIGNATURE, &result);
     }
 
     #[cfg(feature = "dsa")]
     #[test]
     fn try_sign_and_verify_dsa() {
-        use super::{DsaKeypair, DSA_SIGNATURE_SIZE};
+        use super::{DSA_COMPONENT_SIZE, DsaKeypair};
         use encoding::Decode as _;
         use signature::{Signer as _, Verifier as _};
 
-        fn check_signature_component_lens(
+        fn check_signature_component_lengths(
             keypair: &DsaKeypair,
             data: &[u8],
             r_len: usize,
@@ -898,10 +935,13 @@ mod tests {
 
             let signature = dsa::SigningKey::try_from(keypair)
                 .expect("valid DSA signing key")
-                .try_sign_digest(|d: &mut Sha1| Ok(d.update(data)))
+                .try_sign_digest(|digest: &mut Sha1| {
+                    digest.update(data);
+                    Ok(())
+                })
                 .expect("valid DSA signature");
 
-            let r = signature.r().to_be_bytes();
+            let r = signature.r().to_be_bytes_trimmed_vartime();
             assert_eq!(
                 r.len(),
                 r_len,
@@ -909,7 +949,7 @@ mod tests {
                 r.len(),
                 r_len
             );
-            let s = signature.s().to_be_bytes();
+            let s = signature.s().to_be_bytes_trimmed_vartime();
             assert_eq!(
                 s.len(),
                 s_len,
@@ -919,35 +959,36 @@ mod tests {
             );
         }
 
-        let keypair = hex!("0000008100c161fb30c9e4e3602c8510f93bbd48d813da845dfcc75f3696e440cd019d609809608cd592b8430db901d7b43740740045b547c60fb035d69f9c64d3dfbfb13bb3edd8ccfdd44705739a639eb70f4aed16b0b8355de1b21cd9d442eff250895573a8af7ce2fb71fb062e887482dab5c68139845fb8afafc5f3819dc782920d510000001500f3fb6762430332bd5950edc5cd1ae6f17b88514f0000008061ef1394d864905e8efec3b610b7288a6522893af2a475f910796e0de47c8b065d365e942e80e471d1e6d4abdee1d3d3ede7103c6996432f1a9f9a671a31388672d63555077911fc69e641a997087260d22cdbf4965aa64bb382204f88987890ec225a5a7723a977dc1ecc5e04cf678f994692b20470adbf697489f800817b920000008100a9a6f1b65fc724d65df7441908b34af66489a4a3872cbbba25ea1bcfc83f25c4af1a62e339eefc814907cfaf0cb6d2d16996212a32a27a63013f01c57d0630f0be16c8c69d16fc25438e613b904b98aeb3e7c356fa8e75ee1d474c9f82f1280c5a6c18e9e607fcf7586eefb75ea9399da893b807375ac1396fd586bf277161980000001500ced95f1c7bbb39be4987837ad1f71be31bb7b0d9");
+        let keypair = hex!(
+            "0000008100c161fb30c9e4e3602c8510f93bbd48d813da845dfcc75f3696e440cd019d609809608cd592b8430db901d7b43740740045b547c60fb035d69f9c64d3dfbfb13bb3edd8ccfdd44705739a639eb70f4aed16b0b8355de1b21cd9d442eff250895573a8af7ce2fb71fb062e887482dab5c68139845fb8afafc5f3819dc782920d510000001500f3fb6762430332bd5950edc5cd1ae6f17b88514f0000008061ef1394d864905e8efec3b610b7288a6522893af2a475f910796e0de47c8b065d365e942e80e471d1e6d4abdee1d3d3ede7103c6996432f1a9f9a671a31388672d63555077911fc69e641a997087260d22cdbf4965aa64bb382204f88987890ec225a5a7723a977dc1ecc5e04cf678f994692b20470adbf697489f800817b920000008100a9a6f1b65fc724d65df7441908b34af66489a4a3872cbbba25ea1bcfc83f25c4af1a62e339eefc814907cfaf0cb6d2d16996212a32a27a63013f01c57d0630f0be16c8c69d16fc25438e613b904b98aeb3e7c356fa8e75ee1d474c9f82f1280c5a6c18e9e607fcf7586eefb75ea9399da893b807375ac1396fd586bf277161980000001500ced95f1c7bbb39be4987837ad1f71be31bb7b0d9"
+        );
         let keypair = DsaKeypair::decode(&mut &keypair[..]).expect("properly encoded DSA keypair");
 
-        let data = hex!("F0000040713d5f6fffe0000e6421ab0b3a69774d3da02fd72b107d6b32b6dad7c1660bbf507bf3eac3304cc5058f7e6f81b04239b8471459b1f3b387e2626f7eb8f6bcdd3200000006626c616465320000000e7373682d636f6e6e656374696f6e00000009686f73746261736564000000077373682d647373000001b2000000077373682d6473730000008100c161fb30c9e4e3602c8510f93bbd48d813da845dfcc75f3696e440cd019d609809608cd592b8430db901d7b43740740045b547c60fb035d69f9c64d3dfbfb13bb3edd8ccfdd44705739a639eb70f4aed16b0b8355de1b21cd9d442eff250895573a8af7ce2fb71fb062e887482dab5c68139845fb8afafc5f3819dc782920d510000001500f3fb6762430332bd5950edc5cd1ae6f17b88514f0000008061ef1394d864905e8efec3b610b7288a6522893af2a475f910796e0de47c8b065d365e942e80e471d1e6d4abdee1d3d3ede7103c6996432f1a9f9a671a31388672d63555077911fc69e641a997087260d22cdbf4965aa64bb382204f88987890ec225a5a7723a977dc1ecc5e04cf678f994692b20470adbf697489f800817b920000008100a9a6f1b65fc724d65df7441908b34af66489a4a3872cbbba25ea1bcfc83f25c4af1a62e339eefc814907cfaf0cb6d2d16996212a32a27a63013f01c57d0630f0be16c8c69d16fc25438e613b904b98aeb3e7c356fa8e75ee1d474c9f82f1280c5a6c18e9e607fcf7586eefb75ea9399da893b807375ac1396fd586bf2771619800000015746f6d61746f7373682e6c6f63616c646f6d61696e00000009746f6d61746f737368");
-        check_signature_component_lens(
-            &keypair,
-            &data,
-            DSA_SIGNATURE_SIZE / 2,
-            DSA_SIGNATURE_SIZE / 2,
+        let data = hex!(
+            "F0000040713d5f6fffe0000e6421ab0b3a69774d3da02fd72b107d6b32b6dad7c1660bbf507bf3eac3304cc5058f7e6f81b04239b8471459b1f3b387e2626f7eb8f6bcdd3200000006626c616465320000000e7373682d636f6e6e656374696f6e00000009686f73746261736564000000077373682d647373000001b2000000077373682d6473730000008100c161fb30c9e4e3602c8510f93bbd48d813da845dfcc75f3696e440cd019d609809608cd592b8430db901d7b43740740045b547c60fb035d69f9c64d3dfbfb13bb3edd8ccfdd44705739a639eb70f4aed16b0b8355de1b21cd9d442eff250895573a8af7ce2fb71fb062e887482dab5c68139845fb8afafc5f3819dc782920d510000001500f3fb6762430332bd5950edc5cd1ae6f17b88514f0000008061ef1394d864905e8efec3b610b7288a6522893af2a475f910796e0de47c8b065d365e942e80e471d1e6d4abdee1d3d3ede7103c6996432f1a9f9a671a31388672d63555077911fc69e641a997087260d22cdbf4965aa64bb382204f88987890ec225a5a7723a977dc1ecc5e04cf678f994692b20470adbf697489f800817b920000008100a9a6f1b65fc724d65df7441908b34af66489a4a3872cbbba25ea1bcfc83f25c4af1a62e339eefc814907cfaf0cb6d2d16996212a32a27a63013f01c57d0630f0be16c8c69d16fc25438e613b904b98aeb3e7c356fa8e75ee1d474c9f82f1280c5a6c18e9e607fcf7586eefb75ea9399da893b807375ac1396fd586bf2771619800000015746f6d61746f7373682e6c6f63616c646f6d61696e00000009746f6d61746f737368"
         );
+        check_signature_component_lengths(&keypair, &data, DSA_COMPONENT_SIZE, DSA_COMPONENT_SIZE);
         let signature = keypair.try_sign(&data[..]).expect("dsa try_sign is ok");
         keypair
-            .public
+            .public()
             .verify(&data[..], &signature)
             .expect("dsa verify is ok");
 
-        let data = hex!("00000040713d5f6fffe0000e6421ab0b3a69774d3da02fd72b107d6b32b6dad7c1660bbf507bf3eac3304cc5058f7e6f81b04239b8471459b1f3b387e2626f7eb8f6bcdd3200000006626c616465320000000e7373682d636f6e6e656374696f6e00000009686f73746261736564000000077373682d647373000001b2000000077373682d6473730000008100c161fb30c9e4e3602c8510f93bbd48d813da845dfcc75f3696e440cd019d609809608cd592b8430db901d7b43740740045b547c60fb035d69f9c64d3dfbfb13bb3edd8ccfdd44705739a639eb70f4aed16b0b8355de1b21cd9d442eff250895573a8af7ce2fb71fb062e887482dab5c68139845fb8afafc5f3819dc782920d510000001500f3fb6762430332bd5950edc5cd1ae6f17b88514f0000008061ef1394d864905e8efec3b610b7288a6522893af2a475f910796e0de47c8b065d365e942e80e471d1e6d4abdee1d3d3ede7103c6996432f1a9f9a671a31388672d63555077911fc69e641a997087260d22cdbf4965aa64bb382204f88987890ec225a5a7723a977dc1ecc5e04cf678f994692b20470adbf697489f800817b920000008100a9a6f1b65fc724d65df7441908b34af66489a4a3872cbbba25ea1bcfc83f25c4af1a62e339eefc814907cfaf0cb6d2d16996212a32a27a63013f01c57d0630f0be16c8c69d16fc25438e613b904b98aeb3e7c356fa8e75ee1d474c9f82f1280c5a6c18e9e607fcf7586eefb75ea9399da893b807375ac1396fd586bf2771619800000015746f6d61746f7373682e6c6f63616c646f6d61696e00000009746f6d61746f737368");
+        let data = hex!(
+            "00000040713d5f6fffe0000e6421ab0b3a69774d3da02fd72b107d6b32b6dad7c1660bbf507bf3eac3304cc5058f7e6f81b04239b8471459b1f3b387e2626f7eb8f6bcdd3200000006626c616465320000000e7373682d636f6e6e656374696f6e00000009686f73746261736564000000077373682d647373000001b2000000077373682d6473730000008100c161fb30c9e4e3602c8510f93bbd48d813da845dfcc75f3696e440cd019d609809608cd592b8430db901d7b43740740045b547c60fb035d69f9c64d3dfbfb13bb3edd8ccfdd44705739a639eb70f4aed16b0b8355de1b21cd9d442eff250895573a8af7ce2fb71fb062e887482dab5c68139845fb8afafc5f3819dc782920d510000001500f3fb6762430332bd5950edc5cd1ae6f17b88514f0000008061ef1394d864905e8efec3b610b7288a6522893af2a475f910796e0de47c8b065d365e942e80e471d1e6d4abdee1d3d3ede7103c6996432f1a9f9a671a31388672d63555077911fc69e641a997087260d22cdbf4965aa64bb382204f88987890ec225a5a7723a977dc1ecc5e04cf678f994692b20470adbf697489f800817b920000008100a9a6f1b65fc724d65df7441908b34af66489a4a3872cbbba25ea1bcfc83f25c4af1a62e339eefc814907cfaf0cb6d2d16996212a32a27a63013f01c57d0630f0be16c8c69d16fc25438e613b904b98aeb3e7c356fa8e75ee1d474c9f82f1280c5a6c18e9e607fcf7586eefb75ea9399da893b807375ac1396fd586bf2771619800000015746f6d61746f7373682e6c6f63616c646f6d61696e00000009746f6d61746f737368"
+        );
         // verify that this data produces signature with `r` integer component that is less than 160 bits/20 bytes.
-        check_signature_component_lens(
+        check_signature_component_lengths(
             &keypair,
             &data,
-            DSA_SIGNATURE_SIZE / 2 - 1,
-            DSA_SIGNATURE_SIZE / 2,
+            DSA_COMPONENT_SIZE - 1,
+            DSA_COMPONENT_SIZE,
         );
         let signature = keypair
             .try_sign(&data[..])
             .expect("dsa try_sign for r.len() == 19 is ok");
         keypair
-            .public
+            .public()
             .verify(&data[..], &signature)
             .expect("dsa verify is ok");
     }
@@ -962,9 +1003,11 @@ mod tests {
 
     #[test]
     fn placeholder() {
-        assert!(!Signature::try_from(ED25519_SIGNATURE)
-            .unwrap()
-            .is_placeholder());
+        assert!(
+            !Signature::try_from(ED25519_SIGNATURE)
+                .unwrap()
+                .is_placeholder()
+        );
 
         let placeholder = Signature::placeholder();
         assert!(placeholder.is_placeholder());
@@ -974,5 +1017,23 @@ mod tests {
             placeholder.encode(&mut writer),
             Err(encoding::Error::Length)
         );
+    }
+
+    #[cfg(all(feature = "rsa", feature = "sha1"))]
+    #[test]
+    fn sign_and_verify_rsa_sha1() {
+        use encoding::Decode;
+
+        use crate::PrivateKey;
+
+        let key = PrivateKey::from_openssh(include_str!("../tests/examples/id_rsa_3072")).unwrap();
+        let key = key.key_data().rsa().unwrap();
+        let encoded = hex!(
+            "000000077373682d727361000001809485247d72bf853272c86dd8c1c3fa0d2bebcdea9d91a376525a4bcc4a9ca2b19d31af48cfc07da086b244c65b37f3eb8fcab9661ccf777ed2f45404dd602b405526e19323f065b44d19f1bbda3eaf87b922b01049fcd8b82f08ffab6582e8427b0af3305f32961816d499d7b4925c1293b2d658dc6ca7cfb2d47c203c7d9512c0ee33e3d74f362d339a112fc94a74e8f388fc7fd1e9b95c7dd94e62ff16c9463476b7cf0e42af0f17fd2b9e325a50fc40ffd02b4a39e692727186b47c8ce9d7037de7e94615966df462238e214e7440bedabc5fbf79cfa93b96be5f27268da7c1ae2246bcabcc18a0d2c507be8727d04e41ed38686e5c455c159ee371f477668e89720191a72fbdb4eef86f1aa5c3596cefad12b20b1a1220accf6145f8583d7559751b2d0445e2e8a8fda85bf30f24b446ac6d0b943f7c519e5a021b1468cf120ed565d95ed8ddf022f97537ec5491226198ec58dd96c6bd218ddb237aa80785ceafa7722f1d2ba3e39dce2a9fdb0038f4124e2aa27d28eef927d87c8708f6"
+        );
+
+        let decoded = Signature::decode(&mut &encoded[..]).unwrap();
+
+        assert!(Verifier::verify(key.public(), EXAMPLE_MSG, &decoded).is_ok());
     }
 }

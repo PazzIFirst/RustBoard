@@ -2,9 +2,10 @@
 
 use crate::{Error, Mpint, Result};
 use core::hash::{Hash, Hasher};
-#[cfg(feature = "dsa")]
-use crypto_bigint::BoxedUint;
 use encoding::{CheckedSum, Decode, Encode, Reader, Writer};
+
+#[cfg(feature = "dsa")]
+use encoding::Uint;
 
 /// Digital Signature Algorithm (DSA) public key.
 ///
@@ -12,17 +13,62 @@ use encoding::{CheckedSum, Decode, Encode, Reader, Writer};
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DsaPublicKey {
     /// Prime modulus.
-    pub p: Mpint,
+    p: Mpint,
 
     /// Prime divisor of `p - 1`.
-    pub q: Mpint,
+    q: Mpint,
 
-    /// Generator of a subgroup of order `q` in the multiplicative group
-    /// `GF(p)`, such that `1 < g < p`.
-    pub g: Mpint,
+    /// Generator of a subgroup of order `q` in the multiplicative group `GF(p)`, such that
+    /// `1 < g < p`.
+    g: Mpint,
 
     /// The public key, where `y = gˣ mod p`.
-    pub y: Mpint,
+    y: Mpint,
+}
+
+impl DsaPublicKey {
+    /// Create a new [`DsaPublicKey`] with the following components:
+    ///
+    /// - `p`: prime modulus.
+    /// - `q`: prime divisor of `p - 1`.
+    /// - `g`: generator of a subgroup of order `q` in the multiplicative group `GF(p)`, such
+    ///   that `1 < g < p`.
+    /// - `y`: the public key, where `y = gˣ mod p`.
+    ///
+    /// # Errors
+    /// Returns [`Error::FormatEncoding`] in the event any of the components are negative.
+    pub fn new(p: Mpint, q: Mpint, g: Mpint, y: Mpint) -> Result<Self> {
+        if p.is_positive() && q.is_positive() && g.is_positive() && y.is_positive() {
+            Ok(Self { p, q, g, y })
+        } else {
+            Err(Error::FormatEncoding)
+        }
+    }
+
+    /// Prime modulus.
+    #[must_use]
+    pub fn p(&self) -> &Mpint {
+        &self.p
+    }
+
+    /// Prime divisor of `p - 1`.
+    #[must_use]
+    pub fn q(&self) -> &Mpint {
+        &self.q
+    }
+
+    /// Generator of a subgroup of order `q` in the multiplicative group `GF(p)`, such that
+    /// `1 < g < p`.
+    #[must_use]
+    pub fn g(&self) -> &Mpint {
+        &self.g
+    }
+
+    /// The public key, where `y = gˣ mod p`.
+    #[must_use]
+    pub fn y(&self) -> &Mpint {
+        &self.y
+    }
 }
 
 impl Decode for DsaPublicKey {
@@ -33,7 +79,7 @@ impl Decode for DsaPublicKey {
         let q = Mpint::decode(reader)?;
         let g = Mpint::decode(reader)?;
         let y = Mpint::decode(reader)?;
-        Ok(Self { p, q, g, y })
+        Self::new(p, q, g, y)
     }
 }
 
@@ -80,36 +126,31 @@ impl TryFrom<&DsaPublicKey> for dsa::VerifyingKey {
     type Error = Error;
 
     fn try_from(key: &DsaPublicKey) -> Result<dsa::VerifyingKey> {
-        let components = dsa::Components::from_components(
-            BoxedUint::try_from(&key.p)?,
-            BoxedUint::try_from(&key.q)?,
-            BoxedUint::try_from(&key.g)?,
-        )?;
+        let p = Uint::try_from(&key.p)?;
+        let q = Uint::try_from(&key.q)?;
+        let g = Uint::try_from(&key.g)?;
+        let y = Uint::try_from(&key.y)?;
 
-        dsa::VerifyingKey::from_components(components, BoxedUint::try_from(&key.y)?)
-            .map_err(|_| Error::Crypto)
+        let components = dsa::Components::from_components(p, q, g)?;
+        dsa::VerifyingKey::from_components(components, y).map_err(|_| Error::Crypto)
     }
 }
 
 #[cfg(feature = "dsa")]
-impl TryFrom<dsa::VerifyingKey> for DsaPublicKey {
-    type Error = Error;
-
-    fn try_from(key: dsa::VerifyingKey) -> Result<DsaPublicKey> {
-        DsaPublicKey::try_from(&key)
+impl From<dsa::VerifyingKey> for DsaPublicKey {
+    fn from(key: dsa::VerifyingKey) -> DsaPublicKey {
+        DsaPublicKey::from(&key)
     }
 }
 
 #[cfg(feature = "dsa")]
-impl TryFrom<&dsa::VerifyingKey> for DsaPublicKey {
-    type Error = Error;
-
-    fn try_from(key: &dsa::VerifyingKey) -> Result<DsaPublicKey> {
-        Ok(DsaPublicKey {
-            p: key.components().p().as_ref().try_into()?,
-            q: key.components().q().as_ref().try_into()?,
-            g: key.components().g().as_ref().try_into()?,
-            y: key.y().as_ref().try_into()?,
-        })
+impl From<&dsa::VerifyingKey> for DsaPublicKey {
+    fn from(key: &dsa::VerifyingKey) -> DsaPublicKey {
+        DsaPublicKey {
+            p: key.components().p().as_ref().into(),
+            q: key.components().q().as_ref().into(),
+            g: key.components().g().as_ref().into(),
+            y: key.y().as_ref().into(),
+        }
     }
 }

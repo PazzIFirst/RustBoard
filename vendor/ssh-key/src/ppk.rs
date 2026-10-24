@@ -9,28 +9,30 @@ use core::fmt::{Debug, Display};
 use core::num::ParseIntError;
 use core::str::FromStr;
 use hex::FromHex;
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::digest::KeyInit;
+use hmac::{Hmac, Mac};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
 use crate::private::KeypairData;
 use crate::public::KeyData;
 use crate::{Algorithm, Error, PublicKey};
+use ctutils::CtEq;
 use encoding::base64::{self, Base64, Encoding};
 use encoding::{Decode, Encode, LabelError, Reader};
-use subtle::ConstantTimeEq;
 
-pub enum Kdf {
+#[derive(Debug)]
+pub(crate) enum Kdf {
     Argon2 { kdf: Argon2<'static>, salt: Vec<u8> },
     PpkV2,
 }
 
 impl Kdf {
-    pub fn new_v2() -> Self {
+    pub(crate) fn new_v2() -> Self {
         Self::PpkV2
     }
 
-    pub fn new_v3(algorithm: &str, ppk: &PpkWrapper) -> Result<Self, PpkParseError> {
+    pub(crate) fn new_v3(algorithm: &str, ppk: &PpkWrapper) -> Result<Self, PpkParseError> {
         let argon_algorithm = match algorithm {
             "Argon2i" => Ok(argon2::Algorithm::Argon2i),
             "Argon2d" => Ok(argon2::Algorithm::Argon2d),
@@ -67,7 +69,7 @@ impl Kdf {
         Ok(Self::Argon2 { kdf: argon, salt })
     }
 
-    pub fn derive(&self, password: &[u8], output: &mut [u8]) -> Result<(), argon2::Error> {
+    pub(crate) fn derive(&self, password: &[u8], output: &mut [u8]) -> Result<(), argon2::Error> {
         match self {
             Kdf::Argon2 { kdf, salt } => kdf.hash_password_into(password, salt, output),
             Kdf::PpkV2 => Ok(()),
@@ -76,7 +78,7 @@ impl Kdf {
 }
 
 #[derive(Debug)]
-pub enum Cipher {
+pub(crate) enum Cipher {
     Aes256Cbc,
 }
 
@@ -104,24 +106,24 @@ impl Cipher {
                     key.try_into().unwrap(),
                     #[allow(clippy::unwrap_used)] // const size
                     iv.try_into().unwrap(),
-                    #[allow(clippy::unwrap_used)] // const size
-                    mac_key.try_into().unwrap(),
+                    mac_key.into(),
                 ))
             }
             Kdf::PpkV2 => {
                 let mut hashes = {
                     let mut hash = Sha1::default();
-                    hash.update(&[0, 0, 0, 0]);
+                    hash.update([0, 0, 0, 0]);
                     hash.update(password.as_bytes());
                     hash.finalize().to_vec()
                 };
-                hashes.extend_from_slice({
+                hashes.extend_from_slice(&{
                     let mut hash = Sha1::default();
-                    hash.update(&[0, 0, 0, 1]);
+                    hash.update([0, 0, 0, 1]);
                     hash.update(password.as_bytes());
-                    hash.finalize().as_slice()
+                    hash.finalize()
                 });
 
+                #[allow(clippy::unwrap_used)] // known size
                 let aes_key = hashes[..32].try_into().unwrap();
                 let iv = [0; 16];
 
@@ -138,11 +140,11 @@ impl Cipher {
         }
     }
 
-    pub fn derive_mac_key(&self, kdf: &Kdf, password: &str) -> Result<HmacKey, Error> {
+    pub(crate) fn derive_mac_key(&self, kdf: &Kdf, password: &str) -> Result<HmacKey, Error> {
         Ok(Cipher::derive_aes_params(kdf, password)?.2)
     }
 
-    pub fn decrypt(&self, buf: &mut [u8], kdf: &Kdf, password: &str) -> Result<(), Error> {
+    pub(crate) fn decrypt(&self, buf: &mut [u8], kdf: &Kdf, password: &str) -> Result<(), Error> {
         let (key, iv, _) = Cipher::derive_aes_params(kdf, password)?;
         match self {
             Cipher::Aes256Cbc => cipher::Cipher::Aes256Cbc
@@ -152,7 +154,8 @@ impl Cipher {
     }
 }
 
-pub struct PpkEncryption {
+#[derive(Debug)]
+pub(crate) struct PpkEncryption {
     pub cipher: Cipher,
     pub kdf: Kdf,
     pub passphrase: String,
@@ -188,7 +191,7 @@ impl TryFrom<&str> for PpkKey {
     }
 }
 
-pub struct PpkWrapper {
+pub(crate) struct PpkWrapper {
     pub version: u8,
     pub algorithm: Algorithm,
     pub public_key: Option<Vec<u8>>,
@@ -220,7 +223,7 @@ pub enum PpkParseError {
     MissingValue(PpkKey),
     MissingPublicKey,
     MissingPrivateKey,
-    Base64(base64::InvalidEncodingError),
+    Base64(base64::Error),
     Eof,
     UnsupportedFormatVersion(u8),
     UnsupportedEncryption(String),
@@ -308,8 +311,8 @@ impl TryFrom<&str> for PpkWrapper {
                     content.extend_from_slice(line.as_bytes());
                 }
 
-                let decoded =
-                    Base64::decode_in_place(&mut content).map_err(PpkParseError::Base64)?;
+                let decoded = Base64::decode_in_place(&mut content)
+                    .map_err(|e| PpkParseError::Base64(e.into()))?;
 
                 match key {
                     "Public-Lines" => public_key = Some(decoded.to_vec()),
@@ -335,13 +338,13 @@ impl TryFrom<&str> for PpkWrapper {
 }
 
 #[derive(Debug)]
-pub struct PpkContainer {
+pub(crate) struct PpkContainer {
     pub public_key: PublicKey,
     pub keypair_data: KeypairData,
 }
 
 impl PpkContainer {
-    pub fn new(mut ppk: PpkWrapper, passphrase: Option<String>) -> Result<Self, Error> {
+    pub(crate) fn new(mut ppk: PpkWrapper, passphrase: Option<String>) -> Result<Self, Error> {
         let encryption = match ppk.values.get(&PpkKey::Encryption).map(String::as_str) {
             None | Some("none") => None,
             Some("aes256-cbc") => {
@@ -443,7 +446,7 @@ impl PpkContainer {
         let keypair_data =
             decode_private_key_as(&mut private_key_cursor, public_key.clone(), ppk.algorithm)?;
 
-        public_key.comment = comment.unwrap_or_default();
+        public_key.comment = comment.unwrap_or_default().into();
 
         Ok(PpkContainer {
             public_key,
@@ -458,35 +461,33 @@ fn decode_private_key_as(
     algorithm: Algorithm,
 ) -> Result<KeypairData, Error> {
     match (&algorithm, public.key_data()) {
-        (Algorithm::Dsa { .. }, KeyData::Dsa(pk)) => {
+        (Algorithm::Dsa, KeyData::Dsa(pk)) => {
             use crate::private::{DsaKeypair, DsaPrivateKey};
-            Ok(KeypairData::Dsa(DsaKeypair {
-                private: DsaPrivateKey::decode(reader)?,
-                public: pk.clone(),
-            }))
+
+            Ok(KeypairData::Dsa(DsaKeypair::new(
+                pk.clone(),
+                DsaPrivateKey::decode(reader)?,
+            )?))
         }
 
         #[cfg(feature = "rsa")]
         (Algorithm::Rsa { .. }, KeyData::Rsa(pk)) => {
-            use crate::private::{RsaKeypair, RsaPrivateKey};
             use crate::Mpint;
+            use crate::private::{RsaKeypair, RsaPrivateKey};
 
             let d = Mpint::decode(reader)?;
             let p = Mpint::decode(reader)?;
             let q = Mpint::decode(reader)?;
             let iqmp = Mpint::decode(reader)?;
-            let private = RsaPrivateKey { d, iqmp, p, q };
-            Ok(KeypairData::Rsa(RsaKeypair {
-                private,
-                public: pk.clone(),
-            }))
+            let private = RsaPrivateKey::new(d, iqmp, p, q)?;
+            Ok(KeypairData::Rsa(RsaKeypair::new(pk.clone(), private)?))
         }
 
         #[cfg(feature = "ed25519")]
-        (Algorithm::Ed25519 { .. }, KeyData::Ed25519(pk)) => {
+        (Algorithm::Ed25519, KeyData::Ed25519(pk)) => {
             // PPK encodes Ed25519 private exponent as an mpint
-            use crate::private::{Ed25519Keypair, Ed25519PrivateKey};
             use crate::Mpint;
+            use crate::private::{Ed25519Keypair, Ed25519PrivateKey};
             use zeroize::Zeroizing;
 
             // Copy and pad exponent

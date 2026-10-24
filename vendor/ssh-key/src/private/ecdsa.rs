@@ -1,14 +1,20 @@
 //! Elliptic Curve Digital Signature Algorithm (ECDSA) private keys.
 
-use crate::{public::EcdsaPublicKey, Algorithm, EcdsaCurve, Error, Result};
+use crate::{Algorithm, EcdsaCurve, Error, Result, public::EcdsaPublicKey};
 use core::fmt;
+use ctutils::{Choice, CtEq};
 use encoding::{CheckedSum, Decode, Encode, Reader, Writer};
 use sec1::consts::{U32, U48, U66};
-use subtle::{Choice, ConstantTimeEq};
 use zeroize::Zeroize;
 
 #[cfg(feature = "rand_core")]
 use rand_core::CryptoRng;
+
+#[cfg(all(
+    feature = "rand_core",
+    any(feature = "p256", feature = "p384", feature = "p521")
+))]
+use cipher::cipher::common::Generate;
 
 /// Elliptic Curve Digital Signature Algorithm (ECDSA) private key.
 #[derive(Clone)]
@@ -19,11 +25,13 @@ pub struct EcdsaPrivateKey<const SIZE: usize> {
 
 impl<const SIZE: usize> EcdsaPrivateKey<SIZE> {
     /// Borrow the inner byte array as a slice.
+    #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         self.bytes.as_ref()
     }
 
     /// Convert to the inner byte array.
+    #[must_use]
     pub fn into_bytes(self) -> [u8; SIZE] {
         self.bytes
     }
@@ -39,27 +47,31 @@ impl<const SIZE: usize> Decode for EcdsaPrivateKey<SIZE> {
 
     fn decode(reader: &mut impl Reader) -> Result<Self> {
         reader.read_prefixed(|reader| {
-            let len = reader.remaining_len();
+            let mut len = reader.remaining_len();
+
+            // Strip leading zero if necessary:
+            // `mpint` is signed and may need a leading zero for unsigned integers
             if len == SIZE.checked_add(1).ok_or(encoding::Error::Length)? {
-                // Strip leading zero
                 // TODO(tarcieri): make sure leading zero was necessary
                 if u8::decode(reader)? != 0 {
                     return Err(Error::FormatEncoding);
                 }
+
+                len = SIZE;
             }
 
-            let mut bytes = [0u8; SIZE];
-            if SIZE == 66 {
-                // https://stackoverflow.com/questions/50002149/why-p-521-public-key-x-y-some-time-is-65-bytes-some-time-is-66-bytes
-                // although lower keys than 64 are vanishingly possible, but lets stop here
-                if len > 63 {
-                    reader.read(&mut bytes[..core::cmp::min(len, SIZE)])?;
-                } else {
-                    return Err(encoding::Error::Length.into());
-                }
-            } else {
-                reader.read(&mut bytes)?;
+            // Minimum allowed key size: may be smaller than modulus size
+            const MIN_SIZE: usize = 32;
+            if len < MIN_SIZE || len > SIZE {
+                return Err(encoding::Error::Length.into());
             }
+
+            // Add leading zeros if the encoded key is smaller than `SIZE`.
+            // The resulting value is big endian and needs leading zero padding.
+            let leading_zeros = SIZE.checked_sub(len).ok_or(encoding::Error::Length)?;
+
+            let mut bytes = [0u8; SIZE];
+            reader.read(&mut bytes[leading_zeros..])?;
             Ok(Self { bytes })
         })
     }
@@ -84,13 +96,19 @@ impl<const SIZE: usize> Encode for EcdsaPrivateKey<SIZE> {
     }
 }
 
+impl<const SIZE: usize> From<[u8; SIZE]> for EcdsaPrivateKey<SIZE> {
+    fn from(bytes: [u8; SIZE]) -> Self {
+        Self { bytes }
+    }
+}
+
 impl<const SIZE: usize> AsRef<[u8; SIZE]> for EcdsaPrivateKey<SIZE> {
     fn as_ref(&self) -> &[u8; SIZE] {
         &self.bytes
     }
 }
 
-impl<const SIZE: usize> ConstantTimeEq for EcdsaPrivateKey<SIZE> {
+impl<const SIZE: usize> CtEq for EcdsaPrivateKey<SIZE> {
     fn ct_eq(&self, other: &Self) -> Choice {
         self.as_ref().ct_eq(other.as_ref())
     }
@@ -195,14 +213,16 @@ pub enum EcdsaKeypair {
 
 impl EcdsaKeypair {
     /// Generate a random ECDSA private key.
+    ///
+    /// # Errors
+    /// Returns [`Error::AlgorithmUnsupported`] if support has not been enabled for the given
+    /// elliptic curve, e.g. the `p256`, `p384`, or `p521` crate feature has not been enabled.
     #[cfg(feature = "rand_core")]
     #[allow(unused_variables)]
-    pub fn random(rng: &mut impl CryptoRng, curve: EcdsaCurve) -> Result<Self> {
+    pub fn random<R: CryptoRng + ?Sized>(rng: &mut R, curve: EcdsaCurve) -> Result<Self> {
         match curve {
             #[cfg(feature = "p256")]
             EcdsaCurve::NistP256 => {
-                use p256::elliptic_curve::Generate;
-
                 let private = p256::SecretKey::generate_from_rng(rng);
                 let public = private.public_key();
                 Ok(EcdsaKeypair::NistP256 {
@@ -212,8 +232,6 @@ impl EcdsaKeypair {
             }
             #[cfg(feature = "p384")]
             EcdsaCurve::NistP384 => {
-                use p256::elliptic_curve::Generate;
-
                 let private = p384::SecretKey::generate_from_rng(rng);
                 let public = private.public_key();
                 Ok(EcdsaKeypair::NistP384 {
@@ -223,8 +241,6 @@ impl EcdsaKeypair {
             }
             #[cfg(feature = "p521")]
             EcdsaCurve::NistP521 => {
-                use p256::elliptic_curve::Generate;
-
                 let private = p521::SecretKey::generate_from_rng(rng);
                 let public = private.public_key();
                 Ok(EcdsaKeypair::NistP521 {
@@ -233,11 +249,14 @@ impl EcdsaKeypair {
                 })
             }
             #[cfg(not(all(feature = "p256", feature = "p384", feature = "p521")))]
-            _ => Err(Error::AlgorithmUnknown),
+            _ => Err(Error::AlgorithmUnsupported {
+                algorithm: curve.into(),
+            }),
         }
     }
 
     /// Get the [`Algorithm`] for this public key type.
+    #[must_use]
     pub fn algorithm(&self) -> Algorithm {
         Algorithm::Ecdsa {
             curve: self.curve(),
@@ -245,6 +264,7 @@ impl EcdsaKeypair {
     }
 
     /// Get the [`EcdsaCurve`] for this key.
+    #[must_use]
     pub fn curve(&self) -> EcdsaCurve {
         match self {
             Self::NistP256 { .. } => EcdsaCurve::NistP256,
@@ -254,6 +274,7 @@ impl EcdsaKeypair {
     }
 
     /// Get the bytes representing the public key.
+    #[must_use]
     pub fn public_key_bytes(&self) -> &[u8] {
         match self {
             Self::NistP256 { public, .. } => public.as_ref(),
@@ -263,6 +284,7 @@ impl EcdsaKeypair {
     }
 
     /// Get the bytes representing the private key.
+    #[must_use]
     pub fn private_key_bytes(&self) -> &[u8] {
         match self {
             Self::NistP256 { private, .. } => private.as_ref(),
@@ -272,10 +294,11 @@ impl EcdsaKeypair {
     }
 }
 
-impl ConstantTimeEq for EcdsaKeypair {
+impl CtEq for EcdsaKeypair {
     fn ct_eq(&self, other: &Self) -> Choice {
-        let public_eq =
-            Choice::from((EcdsaPublicKey::from(self) == EcdsaPublicKey::from(other)) as u8);
+        let public_eq = Choice::from(u8::from(
+            EcdsaPublicKey::from(self) == EcdsaPublicKey::from(other),
+        ));
 
         let private_key_a = match self {
             Self::NistP256 { private, .. } => private.as_slice(),

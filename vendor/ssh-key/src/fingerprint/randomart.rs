@@ -6,13 +6,15 @@
 //!
 //! <http://www.dirk-loss.de/sshvis/drunken_bishop.pdf>
 
+#![allow(clippy::as_conversions, clippy::integer_division_remainder_used)]
+
 use super::Fingerprint;
 use core::fmt;
 
-const WIDTH: usize = 17;
+const NVALUES: u8 = 16;
+const WIDTH: usize = (NVALUES + 1) as usize;
 const HEIGHT: usize = 9;
-const VALUES: &[u8; 17] = b" .o+=*BOX@%&#/^SE";
-const NVALUES: u8 = VALUES.len() as u8 - 1;
+const VALUES: &[u8; WIDTH] = b" .o+=*BOX@%&#/^SE";
 
 type Field = [[u8; WIDTH]; HEIGHT];
 
@@ -25,8 +27,6 @@ pub(super) struct Randomart<'a> {
 
 impl<'a> Randomart<'a> {
     /// Create new "randomart" from the given fingerprint.
-    // TODO: Remove this when the pipeline toolchain is updated beyond 1.69
-    #[allow(clippy::arithmetic_side_effects)]
     pub(super) fn new(header: &'a str, fingerprint: Fingerprint) -> Self {
         let mut field = Field::default();
         let mut x = WIDTH / 2;

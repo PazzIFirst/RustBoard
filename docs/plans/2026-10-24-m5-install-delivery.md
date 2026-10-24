@@ -1,6 +1,6 @@
 # M5 安装与交付计划（v1.0.0）
 
-> 状态：计划（未开工）　｜　基线：`v0.4.2`（`ada9d19`）　｜　目标版本：`v1.0.0`
+> 状态：计划（未开工）　｜　基线：`v0.4.2` 发布 tag　｜　目标版本：`v1.0.0`
 > 输入：[requirements.md](../requirements.md) §3/§9/§10/§12/§14、[AGENTS.md](../../AGENTS.md) §6/§8、
 > [status.md](../status.md)、[known-issues.md](../known-issues.md)
 > 目标：把现有 hub/agent/panel 从“源码可运行”交付为**可在全新 Linux 机器上安装、

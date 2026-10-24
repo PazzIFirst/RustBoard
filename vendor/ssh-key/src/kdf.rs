@@ -9,7 +9,7 @@ use encoding::{CheckedSum, Decode, Encode, Reader, Writer};
 use alloc::vec::Vec;
 
 #[cfg(feature = "encryption")]
-use {crate::Cipher, bcrypt_pbkdf::bcrypt_pbkdf, rand_core::Rng, zeroize::Zeroizing};
+use {crate::Cipher, bcrypt_pbkdf::bcrypt_pbkdf, rand_core::TryCryptoRng, zeroize::Zeroizing};
 
 /// Default number of rounds to use for bcrypt-pbkdf.
 #[cfg(feature = "encryption")]
@@ -22,8 +22,10 @@ const DEFAULT_SALT_SIZE: usize = 16;
 /// Key Derivation Functions (KDF).
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
+#[derive(Default)]
 pub enum Kdf {
     /// No KDF.
+    #[default]
     None,
 
     /// bcrypt-pbkdf options.
@@ -39,10 +41,14 @@ pub enum Kdf {
 
 impl Kdf {
     /// Initialize KDF configuration for the given algorithm.
+    ///
+    /// # Errors
+    /// Returns [`Error::RngFailure`] on RNG errors.
     #[cfg(feature = "encryption")]
-    pub fn new(algorithm: KdfAlg, rng: &mut impl Rng) -> Result<Self> {
+    pub fn new<R: TryCryptoRng + ?Sized>(algorithm: KdfAlg, rng: &mut R) -> Result<Self> {
         let mut salt = vec![0u8; DEFAULT_SALT_SIZE];
-        rng.fill_bytes(&mut salt);
+        rng.try_fill_bytes(&mut salt)
+            .map_err(|_| Error::RngFailure)?;
 
         match algorithm {
             KdfAlg::None => {
@@ -57,6 +63,7 @@ impl Kdf {
     }
 
     /// Get the KDF algorithm.
+    #[must_use]
     pub fn algorithm(&self) -> KdfAlg {
         match self {
             Self::None => KdfAlg::None,
@@ -66,6 +73,10 @@ impl Kdf {
     }
 
     /// Derive an encryption key from the given password.
+    ///
+    /// # Errors
+    /// Returns [`Error::Crypto`] in the event the underlying password hashing primitive returns an
+    /// error.
     #[cfg(feature = "encryption")]
     pub fn derive(&self, password: impl AsRef<[u8]>, output: &mut [u8]) -> Result<()> {
         match self {
@@ -80,6 +91,10 @@ impl Kdf {
     /// Derive key and IV for the given [`Cipher`].
     ///
     /// Returns two byte vectors containing the key and IV respectively.
+    ///
+    /// # Errors
+    /// - Returns [`Error::Decrypted`] if `cipher` is [`Cipher::None`].
+    /// - Returns [`Error::Encoding`] in the event of a length error.
     #[cfg(feature = "encryption")]
     pub fn derive_key_and_iv(
         &self,
@@ -87,36 +102,42 @@ impl Kdf {
         password: impl AsRef<[u8]>,
     ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
         let (key_size, iv_size) = cipher.key_and_iv_size().ok_or(Error::Decrypted)?;
+
         let okm_size = key_size
             .checked_add(iv_size)
             .ok_or(encoding::Error::Length)?;
 
         let mut okm = Zeroizing::new(vec![0u8; okm_size]);
         self.derive(password, &mut okm)?;
-        let iv = okm.split_off(key_size);
+        let mut iv = okm.split_off(key_size);
+
+        // For whatever reason `chacha20-poly1305@openssh.com` uses a nonce of all zeros for private
+        // key encryption, relying on a unique salt used in the password-based encryption key
+        // derivation to ensure that each encryption key is only used once.
+        if cipher == Cipher::ChaCha20Poly1305 {
+            iv.copy_from_slice(&cipher::ChaChaNonce::default());
+        }
+
         Ok((okm, iv))
     }
 
     /// Is the KDF configured as `none`?
+    #[must_use]
     pub fn is_none(&self) -> bool {
         self == &Self::None
     }
 
     /// Is the KDF configured as anything other than `none`?
+    #[must_use]
     pub fn is_some(&self) -> bool {
         !self.is_none()
     }
 
     /// Is the KDF configured as `bcrypt` (i.e. bcrypt-pbkdf)?
     #[cfg(feature = "alloc")]
+    #[must_use]
     pub fn is_bcrypt(&self) -> bool {
         matches!(self, Self::Bcrypt { .. })
-    }
-}
-
-impl Default for Kdf {
-    fn default() -> Self {
-        Self::None
     }
 }
 
@@ -168,7 +189,7 @@ impl Encode for Kdf {
             Self::Bcrypt { salt, rounds } => {
                 [8, salt.len()].checked_sum()?.encode(writer)?;
                 salt.encode(writer)?;
-                rounds.encode(writer)?
+                rounds.encode(writer)?;
             }
         }
 

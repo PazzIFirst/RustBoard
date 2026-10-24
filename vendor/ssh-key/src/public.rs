@@ -30,25 +30,29 @@ pub use self::{ecdsa::EcdsaPublicKey, sk::SkEcdsaSha2NistP256};
 pub(crate) use self::ssh_format::SshFormat;
 
 use crate::{Algorithm, Error, Fingerprint, HashAlg, Result};
-use core::str::FromStr;
+use core::str::{self, FromStr};
 use encoding::{Base64Reader, Decode, Reader};
 
 #[cfg(feature = "alloc")]
 use {
-    crate::SshSig,
+    crate::{AssociatedHashAlg, Comment, SshSig},
     alloc::{
         borrow::ToOwned,
         string::{String, ToString},
         vec::Vec,
     },
     encoding::Encode,
+    sha2::Digest,
 };
 
 #[cfg(all(feature = "alloc", feature = "serde"))]
-use serde::{de, ser, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de, ser};
 
 #[cfg(feature = "std")]
-use std::{fs, path::Path};
+use std::{fs::File, path::Path};
+
+#[cfg(feature = "std")]
+use std::io::{self, Read, Write};
 
 #[cfg(doc)]
 use crate::PrivateKey;
@@ -67,7 +71,7 @@ use crate::PrivateKey;
 ///
 /// 1. Algorithm identifier (in this example `ssh-ed25519`)
 /// 2. Key data encoded as Base64
-/// 3. Comment (optional): arbitrary label describing a key. Usually an email address
+/// 3. [`Comment`] (optional): arbitrary label describing a key. Usually an email address
 ///
 /// The [`PublicKey::from_openssh`] and [`PublicKey::to_openssh`] methods can be
 /// used to decode/encode public keys, or alternatively, the [`FromStr`] and
@@ -81,14 +85,25 @@ use crate::PrivateKey;
 /// The serialization uses a binary encoding with binary formats like bincode
 /// and CBOR, and the OpenSSH string serialization when used with
 /// human-readable formats like JSON and TOML.
+///
+/// Note that since the `comment` is an artifact on the string serialization of
+/// a public key, it will be implicitly dropped when encoding as a binary
+/// format. To ensure it's always preserved even when using binary formats, you
+/// will first need to convert the [`PublicKey`] to a string using e.g.
+/// [`PublicKey::to_openssh`].
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PublicKey {
     /// Key data.
     pub(crate) key_data: KeyData,
 
     /// Comment on the key (e.g. email address)
+    ///
+    /// Note that when a [`PublicKey`] is serialized in a private key, the
+    /// comment is encoded as an RFC4251 `string` which may contain arbitrary
+    /// binary data, so `Vec<u8>` is used to store the comment to ensure keys
+    /// containing such comments successfully round-trip.
     #[cfg(feature = "alloc")]
-    pub(crate) comment: String,
+    pub(crate) comment: Comment,
 }
 
 impl PublicKey {
@@ -96,7 +111,7 @@ impl PublicKey {
     ///
     /// On `no_std` platforms, use `PublicKey::from(key_data)` instead.
     #[cfg(feature = "alloc")]
-    pub fn new(key_data: KeyData, comment: impl Into<String>) -> Self {
+    pub fn new(key_data: KeyData, comment: impl Into<Comment>) -> Self {
         Self {
             key_data,
             comment: comment.into(),
@@ -110,6 +125,9 @@ impl PublicKey {
     /// ```text
     /// ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti foo@bar.com
     /// ```
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
     pub fn from_openssh(public_key: &str) -> Result<Self> {
         let encapsulation = SshFormat::decode(public_key.trim_end().as_bytes())?;
         let mut reader = Base64Reader::new(encapsulation.base64_data)?;
@@ -123,13 +141,16 @@ impl PublicKey {
         let public_key = Self {
             key_data,
             #[cfg(feature = "alloc")]
-            comment: encapsulation.comment.to_owned(),
+            comment: encapsulation.comment.to_owned().into(),
         };
 
         Ok(reader.finish(public_key)?)
     }
 
     /// Parse a raw binary SSH public key.
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
     pub fn from_bytes(mut bytes: &[u8]) -> Result<Self> {
         let reader = &mut bytes;
         let key_data = KeyData::decode(reader)?;
@@ -137,32 +158,41 @@ impl PublicKey {
     }
 
     /// Encode OpenSSH-formatted public key.
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
     pub fn encode_openssh<'o>(&self, out: &'o mut [u8]) -> Result<&'o str> {
-        SshFormat::encode(
+        #[cfg(not(feature = "alloc"))]
+        let comment = "";
+        #[cfg(feature = "alloc")]
+        let comment = self.comment.as_str_lossy();
+
+        SshFormat::encode(self.algorithm().as_str(), &self.key_data, comment, out)
+    }
+
+    /// Encode an OpenSSH-formatted public key, allocating a [`String`] for the result.
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
+    #[cfg(feature = "alloc")]
+    pub fn to_openssh(&self) -> Result<String> {
+        SshFormat::encode_string(
             self.algorithm().as_str(),
             &self.key_data,
-            self.comment(),
-            out,
+            self.comment.as_str_lossy(),
         )
     }
 
-    /// Encode an OpenSSH-formatted public key, allocating a [`String`] for
-    /// the result.
-    #[cfg(feature = "alloc")]
-    pub fn to_openssh(&self) -> Result<String> {
-        SshFormat::encode_string(self.algorithm().as_str(), &self.key_data, self.comment())
-    }
-
     /// Serialize SSH public key as raw bytes.
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
     #[cfg(feature = "alloc")]
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut public_key_bytes = Vec::new();
-        self.key_data.encode(&mut public_key_bytes)?;
-        Ok(public_key_bytes)
+        Ok(self.key_data.encode_vec()?)
     }
 
-    /// Verify the [`SshSig`] signature over the given message using this
-    /// public key.
+    /// Verify the [`SshSig`] signature is valid the given message using this public key.
     ///
     /// These signatures can be produced using `ssh-keygen -Y sign`. They're
     /// encoded as PEM and begin with the following:
@@ -172,6 +202,12 @@ impl PublicKey {
     /// ```
     ///
     /// See [PROTOCOL.sshsig] for more information.
+    ///
+    /// # Notes
+    ///
+    /// This method loads the  entire message has to be loaded into memory for verification.
+    /// If loading the entire message into memory is a problem consider computing a [Digest]
+    /// of the data first, and using [`PublicKey::verify_prehash`].
     ///
     /// # Usage
     ///
@@ -209,8 +245,59 @@ impl PublicKey {
     /// ```
     ///
     /// [PROTOCOL.sshsig]: https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.sshsig?annotate=HEAD
+    /// [Digest]: https://docs.rs/digest/latest/digest/trait.Digest.html
+    ///
+    /// # Errors
+    /// - Returns [`Error::PublicKey`] if this key does not match the one in the signature.
+    /// - Returns [`Error::Namespace`] if the provided `namespace` does not match the signature.
+    /// - Returns [`Error::Signature`] in the event signature verification failed.
     #[cfg(feature = "alloc")]
     pub fn verify(&self, namespace: &str, msg: &[u8], signature: &SshSig) -> Result<()> {
+        self.verify_prehash(
+            namespace,
+            signature.hash_alg().digest(msg).as_slice(),
+            signature,
+        )
+    }
+
+    /// Verify the [`SshSig`] signature is valid the given message [`Digest`] using this public key.
+    ///
+    /// See [`PublicKey::verify`] for more information.
+    ///
+    /// # Errors
+    /// - Returns [`Error::PublicKey`] if this key does not match the one in the signature.
+    /// - Returns [`Error::Namespace`] if the provided `namespace` does not match the signature.
+    /// - Returns [`Error::Signature`] in the event signature verification failed.
+    #[cfg(feature = "alloc")]
+    pub fn verify_digest<D: AssociatedHashAlg + Digest>(
+        &self,
+        namespace: &str,
+        digest: D,
+        signature: &SshSig,
+    ) -> Result<()> {
+        if D::HASH_ALG != signature.hash_alg() {
+            return Err(Error::Crypto);
+        }
+
+        self.verify_prehash(namespace, digest.finalize().as_slice(), signature)
+    }
+
+    /// Verify the [`SshSig`] signature matches the given prehashed message digest using this
+    /// public key.
+    ///
+    /// See [`PublicKey::verify`] for more information.
+    ///
+    /// # Errors
+    /// - Returns [`Error::PublicKey`] if this key does not match the one in the signature.
+    /// - Returns [`Error::Namespace`] if the provided `namespace` does not match the signature.
+    /// - Returns [`Error::Signature`] in the event signature verification failed.
+    #[cfg(feature = "alloc")]
+    pub fn verify_prehash(
+        &self,
+        namespace: &str,
+        prehash: &[u8],
+        signature: &SshSig,
+    ) -> Result<()> {
         if self.key_data() != signature.public_key() {
             return Err(Error::PublicKey);
         }
@@ -219,44 +306,71 @@ impl PublicKey {
             return Err(Error::Namespace);
         }
 
-        signature.verify(msg)
+        signature.verify_prehash(prehash)
     }
 
-    /// Read public key from an OpenSSH-formatted file.
+    /// Read public key from an OpenSSH-formatted source.
+    ///
+    /// # Errors
+    /// - Returns [`Error::Io`] in the event of an I/O error.
+    /// - Returns [`Error::Encoding`] in the event of an encoding error.
     #[cfg(feature = "std")]
-    pub fn read_openssh_file(path: &Path) -> Result<Self> {
-        let input = fs::read_to_string(path)?;
+    pub fn read_openssh(reader: &mut impl Read) -> Result<Self> {
+        let input = io::read_to_string(reader)?;
         Self::from_openssh(&input)
     }
 
-    /// Write public key as an OpenSSH-formatted file.
+    /// Read public key from an OpenSSH-formatted file.
+    ///
+    /// # Errors
+    /// - Returns [`Error::Io`] in the event of an I/O error.
+    /// - Returns [`Error::Encoding`] in the event of an encoding error.
     #[cfg(feature = "std")]
-    pub fn write_openssh_file(&self, path: &Path) -> Result<()> {
+    pub fn read_openssh_file(path: impl AsRef<Path>) -> Result<Self> {
+        let mut file = File::open(path)?;
+        Self::read_openssh(&mut file)
+    }
+
+    /// Write public key as an OpenSSH-formatted file.
+    ///
+    /// # Errors
+    /// - Returns [`Error::Io`] in the event of an I/O error.
+    /// - Returns [`Error::Encoding`] in the event of an encoding error.
+    #[cfg(feature = "std")]
+    pub fn write_openssh(&self, writer: &mut impl Write) -> Result<()> {
         let mut encoded = self.to_openssh()?;
         encoded.push('\n'); // TODO(tarcieri): OS-specific line endings?
 
-        fs::write(path, encoded.as_bytes())?;
+        writer.write_all(encoded.as_bytes())?;
         Ok(())
     }
 
+    /// Write public key as an OpenSSH-formatted file.
+    ///
+    /// # Errors
+    /// - Returns [`Error::Io`] in the event of an I/O error.
+    /// - Returns [`Error::Encoding`] in the event of an encoding error.
+    #[cfg(feature = "std")]
+    pub fn write_openssh_file(&self, path: impl AsRef<Path>) -> Result<()> {
+        let mut file = File::create(path)?;
+        self.write_openssh(&mut file)
+    }
+
     /// Get the digital signature [`Algorithm`] used by this key.
+    #[must_use]
     pub fn algorithm(&self) -> Algorithm {
         self.key_data.algorithm()
     }
 
     /// Comment on the key (e.g. email address).
-    #[cfg(not(feature = "alloc"))]
-    pub fn comment(&self) -> &str {
-        ""
-    }
-
-    /// Comment on the key (e.g. email address).
     #[cfg(feature = "alloc")]
-    pub fn comment(&self) -> &str {
+    #[must_use]
+    pub fn comment(&self) -> &Comment {
         &self.comment
     }
 
     /// Public key data.
+    #[must_use]
     pub fn key_data(&self) -> &KeyData {
         &self.key_data
     }
@@ -264,13 +378,14 @@ impl PublicKey {
     /// Compute key fingerprint.
     ///
     /// Use [`Default::default()`] to use the default hash function (SHA-256).
+    #[must_use]
     pub fn fingerprint(&self, hash_alg: HashAlg) -> Fingerprint {
         self.key_data.fingerprint(hash_alg)
     }
 
     /// Set the comment on the key.
     #[cfg(feature = "alloc")]
-    pub fn set_comment(&mut self, comment: impl Into<String>) {
+    pub fn set_comment(&mut self, comment: impl Into<Comment>) {
         self.comment = comment.into();
     }
 
@@ -286,7 +401,7 @@ impl PublicKey {
     /// Decode comment (e.g. email address)
     #[cfg(feature = "alloc")]
     pub(crate) fn decode_comment(&mut self, reader: &mut impl Reader) -> Result<()> {
-        self.comment = String::decode(reader)?;
+        self.comment = Comment::decode(reader)?;
         Ok(())
     }
 }
@@ -296,7 +411,7 @@ impl From<KeyData> for PublicKey {
         PublicKey {
             key_data,
             #[cfg(feature = "alloc")]
-            comment: String::new(),
+            comment: Comment::default(),
         }
     }
 }
@@ -362,6 +477,7 @@ impl FromStr for PublicKey {
 }
 
 #[cfg(feature = "alloc")]
+#[allow(clippy::to_string_trait_impl)]
 impl ToString for PublicKey {
     fn to_string(&self) -> String {
         self.to_openssh().expect("SSH public key encoding error")

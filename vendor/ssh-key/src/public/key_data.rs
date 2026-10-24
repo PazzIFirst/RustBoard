@@ -5,7 +5,11 @@ use crate::{Algorithm, Error, Fingerprint, HashAlg, Result};
 use encoding::{CheckedSum, Decode, Encode, Reader, Writer};
 
 #[cfg(feature = "alloc")]
-use super::{DsaPublicKey, OpaquePublicKey, RsaPublicKey};
+use {
+    super::{DsaPublicKey, OpaquePublicKey, RsaPublicKey},
+    crate::Certificate,
+    alloc::boxed::Box,
+};
 
 #[cfg(feature = "ecdsa")]
 use super::{EcdsaPublicKey, SkEcdsaSha2NistP256};
@@ -40,6 +44,14 @@ pub enum KeyData {
     /// [PROTOCOL.u2f]: https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD
     SkEd25519(SkEd25519),
 
+    /// Certificate key as specified in [draft-miller-ssh-cert]
+    /// (and [PROTOCOL.certkeys], now deprecated in favor of the IETF draft).
+    ///
+    /// [draft-miller-ssh-cert]: https://datatracker.ietf.org/doc/draft-miller-ssh-cert
+    /// [PROTOCOL.certkeys]: https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.certkeys?annotate=HEAD
+    #[cfg(feature = "alloc")]
+    Certificate(Box<Certificate>),
+
     /// Opaque public key data.
     #[cfg(feature = "alloc")]
     Other(OpaquePublicKey),
@@ -47,6 +59,7 @@ pub enum KeyData {
 
 impl KeyData {
     /// Get the [`Algorithm`] for this public key.
+    #[must_use]
     pub fn algorithm(&self) -> Algorithm {
         match self {
             #[cfg(feature = "alloc")]
@@ -60,12 +73,15 @@ impl KeyData {
             Self::SkEcdsaSha2NistP256(_) => Algorithm::SkEcdsaSha2NistP256,
             Self::SkEd25519(_) => Algorithm::SkEd25519,
             #[cfg(feature = "alloc")]
+            Self::Certificate(cert) => cert.algorithm(),
+            #[cfg(feature = "alloc")]
             Self::Other(key) => key.algorithm(),
         }
     }
 
     /// Get DSA public key if this key is the correct type.
     #[cfg(feature = "alloc")]
+    #[must_use]
     pub fn dsa(&self) -> Option<&DsaPublicKey> {
         match self {
             Self::Dsa(key) => Some(key),
@@ -75,6 +91,7 @@ impl KeyData {
 
     /// Get ECDSA public key if this key is the correct type.
     #[cfg(feature = "ecdsa")]
+    #[must_use]
     pub fn ecdsa(&self) -> Option<&EcdsaPublicKey> {
         match self {
             Self::Ecdsa(key) => Some(key),
@@ -83,6 +100,7 @@ impl KeyData {
     }
 
     /// Get Ed25519 public key if this key is the correct type.
+    #[must_use]
     pub fn ed25519(&self) -> Option<&Ed25519PublicKey> {
         match self {
             Self::Ed25519(key) => Some(key),
@@ -94,12 +112,14 @@ impl KeyData {
     /// Compute key fingerprint.
     ///
     /// Use [`Default::default()`] to use the default hash function (SHA-256).
+    #[must_use]
     pub fn fingerprint(&self, hash_alg: HashAlg) -> Fingerprint {
         Fingerprint::new(hash_alg, self)
     }
 
     /// Get RSA public key if this key is the correct type.
     #[cfg(feature = "alloc")]
+    #[must_use]
     pub fn rsa(&self) -> Option<&RsaPublicKey> {
         match self {
             Self::Rsa(key) => Some(key),
@@ -109,6 +129,7 @@ impl KeyData {
 
     /// Get FIDO/U2F ECDSA/NIST P-256 public key if this key is the correct type.
     #[cfg(feature = "ecdsa")]
+    #[must_use]
     pub fn sk_ecdsa_p256(&self) -> Option<&SkEcdsaSha2NistP256> {
         match self {
             Self::SkEcdsaSha2NistP256(sk) => Some(sk),
@@ -117,6 +138,7 @@ impl KeyData {
     }
 
     /// Get FIDO/U2F Ed25519 public key if this key is the correct type.
+    #[must_use]
     pub fn sk_ed25519(&self) -> Option<&SkEd25519> {
         match self {
             Self::SkEd25519(sk) => Some(sk),
@@ -126,6 +148,7 @@ impl KeyData {
 
     /// Get the custom, opaque public key if this key is the correct type.
     #[cfg(feature = "alloc")]
+    #[must_use]
     pub fn other(&self) -> Option<&OpaquePublicKey> {
         match self {
             Self::Other(key) => Some(key),
@@ -133,48 +156,87 @@ impl KeyData {
         }
     }
 
+    /// Get the certificate if this key is the correct type.
+    #[cfg(feature = "alloc")]
+    #[must_use]
+    pub fn certificate(&self) -> Option<&Certificate> {
+        match self {
+            Self::Certificate(certificate) => Some(certificate.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Get the certificate, consuming the [`KeyData`], if this key is the correct type.
+    #[cfg(feature = "alloc")]
+    #[must_use]
+    pub fn into_certificate(self) -> Option<Certificate> {
+        match self {
+            Self::Certificate(certificate) => Some(*certificate),
+            _ => None,
+        }
+    }
+
     /// Is this key a DSA key?
     #[cfg(feature = "alloc")]
+    #[must_use]
     pub fn is_dsa(&self) -> bool {
         matches!(self, Self::Dsa(_))
     }
 
     /// Is this key an ECDSA key?
     #[cfg(feature = "ecdsa")]
+    #[must_use]
     pub fn is_ecdsa(&self) -> bool {
         matches!(self, Self::Ecdsa(_))
     }
 
     /// Is this key an Ed25519 key?
+    #[must_use]
     pub fn is_ed25519(&self) -> bool {
         matches!(self, Self::Ed25519(_))
     }
 
     /// Is this key an RSA key?
     #[cfg(feature = "alloc")]
+    #[must_use]
     pub fn is_rsa(&self) -> bool {
         matches!(self, Self::Rsa(_))
     }
 
     /// Is this key a FIDO/U2F ECDSA/NIST P-256 key?
     #[cfg(feature = "ecdsa")]
+    #[must_use]
     pub fn is_sk_ecdsa_p256(&self) -> bool {
         matches!(self, Self::SkEcdsaSha2NistP256(_))
     }
 
     /// Is this key a FIDO/U2F Ed25519 key?
+    #[must_use]
     pub fn is_sk_ed25519(&self) -> bool {
         matches!(self, Self::SkEd25519(_))
     }
 
     /// Is this a key with a custom algorithm?
     #[cfg(feature = "alloc")]
+    #[must_use]
     pub fn is_other(&self) -> bool {
         matches!(self, Self::Other(_))
     }
 
+    /// Is this a certificate?
+    #[cfg(feature = "alloc")]
+    #[must_use]
+    pub fn is_certificate(&self) -> bool {
+        matches!(self, Self::Certificate(_))
+    }
+
     /// Decode [`KeyData`] for the specified algorithm.
-    pub(crate) fn decode_as(reader: &mut impl Reader, algorithm: Algorithm) -> Result<Self> {
+    ///
+    /// # Errors
+    /// - Returns [`Error::AlgorithmUnknown`] if the provided `algorithm` is unknown or unsupported
+    ///   by this library.
+    /// - Returns [`Error::Encoding`] in the event of an encoding error.
+    pub fn decode_as(reader: &mut impl Reader, algorithm: Algorithm) -> Result<Self> {
         match algorithm {
             #[cfg(feature = "alloc")]
             Algorithm::Dsa => DsaPublicKey::decode(reader).map(Self::Dsa),
@@ -198,6 +260,15 @@ impl KeyData {
         }
     }
 
+    /// Decode [`KeyData`] as a certificate with the specified algorithm.
+    ///
+    /// # Errors
+    /// Propagates errors from [`Certificate::decode_as`].
+    #[cfg(feature = "alloc")]
+    pub fn decode_as_certificate(reader: &mut impl Reader, algorithm: Algorithm) -> Result<Self> {
+        Certificate::decode_as(reader, algorithm).map(|cert| Self::Certificate(Box::new(cert)))
+    }
+
     /// Get the encoded length of this key data without a leading algorithm
     /// identifier.
     pub(crate) fn encoded_key_data_len(&self) -> encoding::Result<usize> {
@@ -212,6 +283,8 @@ impl KeyData {
             #[cfg(feature = "ecdsa")]
             Self::SkEcdsaSha2NistP256(sk) => sk.encoded_len(),
             Self::SkEd25519(sk) => sk.encoded_len(),
+            #[cfg(feature = "alloc")]
+            Self::Certificate(cert) => cert.encoded_len(),
             #[cfg(feature = "alloc")]
             Self::Other(other) => other.key.encoded_len(),
         }
@@ -231,6 +304,8 @@ impl KeyData {
             Self::SkEcdsaSha2NistP256(sk) => sk.encode(writer),
             Self::SkEd25519(sk) => sk.encode(writer),
             #[cfg(feature = "alloc")]
+            Self::Certificate(cert) => cert.encode(writer),
+            #[cfg(feature = "alloc")]
             Self::Other(other) => other.key.encode(writer),
         }
     }
@@ -241,12 +316,24 @@ impl Decode for KeyData {
 
     fn decode(reader: &mut impl Reader) -> Result<Self> {
         let algorithm = Algorithm::decode(reader)?;
+        #[cfg(feature = "alloc")]
+        if let Algorithm::Other(name) = &algorithm {
+            if let Ok(certificate_algorithm) = Algorithm::new_certificate(name.as_str()) {
+                return Self::decode_as_certificate(reader, certificate_algorithm);
+            }
+        }
         Self::decode_as(reader, algorithm)
     }
 }
 
 impl Encode for KeyData {
     fn encoded_len(&self) -> encoding::Result<usize> {
+        #[cfg(feature = "alloc")]
+        if self.is_certificate() {
+            // Certificate encodes its own Algorithm
+            return self.encoded_key_data_len();
+        }
+
         [
             self.algorithm().encoded_len()?,
             self.encoded_key_data_len()?,
@@ -255,6 +342,12 @@ impl Encode for KeyData {
     }
 
     fn encode(&self, writer: &mut impl Writer) -> encoding::Result<()> {
+        #[cfg(feature = "alloc")]
+        if self.is_certificate() {
+            // Certificate encodes its own Algorithm
+            return self.encode_key_data(writer);
+        }
+
         self.algorithm().encode(writer)?;
         self.encode_key_data(writer)
     }
@@ -297,5 +390,12 @@ impl From<SkEcdsaSha2NistP256> for KeyData {
 impl From<SkEd25519> for KeyData {
     fn from(public_key: SkEd25519) -> KeyData {
         Self::SkEd25519(public_key)
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl From<Certificate> for KeyData {
+    fn from(certificate: Certificate) -> KeyData {
+        Self::Certificate(Box::new(certificate))
     }
 }

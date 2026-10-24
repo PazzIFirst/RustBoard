@@ -18,7 +18,8 @@
 | v0.3.5 安全收口 | 🟢 完成 | KI-27 WS 会话许可、data_dir `openat2` fd/owner 加固、limit=0 与 DB 外置 WARN；单元/集成 569，v035 48/48，既有 9 套 e2e 全绿 |
 | M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | v0.4.1 已知问题修复 | 🟢 完成 | KI-29 rowid 竞态、KI-31 64 MiB 配置/下载一致性、KI-28 拒绝日志采样、KI-20 安装命令引用；SFTP 真实环境 29/29，M4 基线渗透无高危；v041 26/26；v0.4.1 发布 |
-| M5 安装与交付 | ⬜ 未开始 | |
+| v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
+| M5 安装与交付 | 🟡 计划中 | 安装器/离线包/多架构镜像/ACME/PG/面板 TLS；计划见 `docs/plans/2026-10-24-m5-install-delivery.md` |
 
 ## M1 明细
 
@@ -365,6 +366,8 @@
 
 ## 下一步建议
 
-v0.4.1 已完成并发布：基线渗透、KI-29/31/28/20 修复、SFTP 真实验证、全量门禁、
-tag/GitHub Release。下一阶段是 M5 安装与交付（安装器、镜像、ACME）。控制面/告警/
-归档均按“默认关闭或最小暴露 + 审计/固定错误码”交付。
+v0.4.1 已完成并发布；v0.4.2 修复 CI ANSI 测试助手，并把 vendored SFTP 依赖
+升级到稳定 ECC 栈（crypto-bigint 0.7.6，RUSTSEC-2026-0387）。下一阶段是
+M5 安装与交付（安装器、离线包、多架构镜像、ACME、PostgreSQL、面板 TLS），计划见
+[M5 计划](plans/2026-10-24-m5-install-delivery.md)。控制面/告警/归档均按“默认关闭或
+最小暴露 + 审计/固定错误码”交付。

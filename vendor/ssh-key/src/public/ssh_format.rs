@@ -111,7 +111,7 @@ impl<'a> SshFormat<'a> {
 /// rather than this estimate.
 #[cfg(feature = "alloc")]
 fn base64_len_approx(input_len: usize) -> usize {
-    (((input_len.saturating_mul(4)) / 3).saturating_add(3)) & !3
+    input_len.div_ceil(3).saturating_mul(4)
 }
 
 /// Parse a segment of the public key.
@@ -121,8 +121,10 @@ fn decode_segment<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8]> {
 
     loop {
         match *bytes {
-            [b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'-' | b'/' | b'=' | b'@' | b'.', rest @ ..] =>
-            {
+            [
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'-' | b'/' | b'=' | b'@' | b'.',
+                rest @ ..,
+            ] => {
                 // Valid character; continue
                 *bytes = rest;
                 len = len.checked_add(1).ok_or(encoding::Error::Length)?;

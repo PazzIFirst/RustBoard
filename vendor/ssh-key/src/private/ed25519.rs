@@ -2,10 +2,10 @@
 //!
 //! Edwards Digital Signature Algorithm (EdDSA) over Curve25519.
 
-use crate::{public::Ed25519PublicKey, Error, Result};
+use crate::{Error, Result, public::Ed25519PublicKey};
 use core::fmt;
+use ctutils::{Choice, CtEq};
 use encoding::{CheckedSum, Decode, Encode, Reader, Writer};
-use subtle::{Choice, ConstantTimeEq};
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(feature = "rand_core")]
@@ -22,18 +22,20 @@ impl Ed25519PrivateKey {
 
     /// Generate a random Ed25519 private key.
     #[cfg(feature = "rand_core")]
-    pub fn random(rng: &mut impl CryptoRng) -> Self {
+    pub fn random<R: CryptoRng + ?Sized>(rng: &mut R) -> Self {
         let mut key_bytes = [0u8; Self::BYTE_SIZE];
         rng.fill_bytes(&mut key_bytes);
         Self(key_bytes)
     }
 
     /// Parse Ed25519 private key from bytes.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8; Self::BYTE_SIZE]) -> Self {
         Self(*bytes)
     }
 
     /// Convert to the inner byte array.
+    #[must_use]
     pub fn to_bytes(&self) -> [u8; Self::BYTE_SIZE] {
         self.0
     }
@@ -45,7 +47,7 @@ impl AsRef<[u8; Self::BYTE_SIZE]> for Ed25519PrivateKey {
     }
 }
 
-impl ConstantTimeEq for Ed25519PrivateKey {
+impl CtEq for Ed25519PrivateKey {
     fn ct_eq(&self, other: &Self) -> Choice {
         self.as_ref().ct_eq(other.as_ref())
     }
@@ -157,18 +159,21 @@ impl Ed25519Keypair {
 
     /// Generate a random Ed25519 private keypair.
     #[cfg(feature = "ed25519")]
-    pub fn random(rng: &mut impl CryptoRng) -> Self {
+    pub fn random<R: CryptoRng + ?Sized>(rng: &mut R) -> Self {
         Ed25519PrivateKey::random(rng).into()
     }
 
     /// Expand a keypair from a 32-byte seed value.
     #[cfg(feature = "ed25519")]
+    #[must_use]
     pub fn from_seed(seed: &[u8; Ed25519PrivateKey::BYTE_SIZE]) -> Self {
         Ed25519PrivateKey::from_bytes(seed).into()
     }
 
-    /// Parse Ed25519 keypair from 64-bytes which comprise the serialized
-    /// private and public keys.
+    /// Parse Ed25519 keypair from 64-bytes which comprise the serialized private and public keys.
+    ///
+    /// # Errors
+    /// Returns [`Error::Crypto`] if the public key does not match the private key.
     pub fn from_bytes(bytes: &[u8; Self::BYTE_SIZE]) -> Result<Self> {
         let (priv_bytes, pub_bytes) = bytes.split_at(Ed25519PrivateKey::BYTE_SIZE);
         let private = Ed25519PrivateKey::try_from(priv_bytes)?;
@@ -184,6 +189,8 @@ impl Ed25519Keypair {
     }
 
     /// Serialize an Ed25519 keypair as bytes.
+    #[must_use]
+    #[allow(clippy::integer_division_remainder_used, reason = "constant")]
     pub fn to_bytes(&self) -> [u8; Self::BYTE_SIZE] {
         let mut result = [0u8; Self::BYTE_SIZE];
         result[..(Self::BYTE_SIZE / 2)].copy_from_slice(self.private.as_ref());
@@ -192,9 +199,9 @@ impl Ed25519Keypair {
     }
 }
 
-impl ConstantTimeEq for Ed25519Keypair {
+impl CtEq for Ed25519Keypair {
     fn ct_eq(&self, other: &Self) -> Choice {
-        Choice::from((self.public == other.public) as u8) & self.private.ct_eq(&other.private)
+        Choice::from(u8::from(self.public == other.public)) & self.private.ct_eq(&other.private)
     }
 }
 
@@ -237,7 +244,7 @@ impl Encode for Ed25519Keypair {
 
     fn encode(&self, writer: &mut impl Writer) -> encoding::Result<()> {
         self.public.encode(writer)?;
-        Zeroizing::new(self.to_bytes()).as_ref().encode(writer)?;
+        Zeroizing::new(self.to_bytes()).as_slice().encode(writer)?;
         Ok(())
     }
 }

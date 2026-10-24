@@ -10,9 +10,9 @@
 //! When the `encryption` feature of this crate is enabled, it's possible to
 //! decrypt keys which have been encrypted under a password:
 //!
-#![cfg_attr(all(feature = "encryption", feature = "std"), doc = " ```")]
-#![cfg_attr(not(all(feature = "encryption", feature = "std")), doc = " ```ignore")]
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+#![cfg_attr(feature = "encryption", doc = " ```")]
+#![cfg_attr(not(feature = "encryption"), doc = " ```ignore")]
+//! # fn main() -> Result<(), ssh_key::Error> {
 //! use ssh_key::PrivateKey;
 //!
 //! // WARNING: don't actually hardcode private keys in source code!!!
@@ -47,33 +47,24 @@
 //! The example below also requires enabling this crate's `getrandom` feature.
 //!
 #![cfg_attr(
-    all(
-        feature = "ed25519",
-        feature = "encryption",
-        feature = "getrandom",
-        feature = "std"
-    ),
+    all(feature = "ed25519", feature = "encryption", feature = "getrandom",),
     doc = " ```"
 )]
 #![cfg_attr(
-    not(all(
-        feature = "ed25519",
-        feature = "encryption",
-        feature = "getrandom",
-        feature = "std"
-    )),
+    not(all(feature = "ed25519", feature = "encryption", feature = "getrandom",)),
     doc = " ```ignore"
 )]
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use ssh_key::{Algorithm, PrivateKey, rand_core::OsRng};
+//! # fn main() -> Result<(), ssh_key::Error> {
+//! use ssh_key::{Algorithm, PrivateKey, getrandom::SysRng, rand_core::UnwrapErr};
 //!
 //! // Generate a random key
-//! let unencrypted_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+//! let mut rng = UnwrapErr(SysRng);
+//! let unencrypted_key = PrivateKey::random(&mut rng, Algorithm::Ed25519)?;
 //!
 //! // WARNING: don't hardcode passwords, and this one's bad anyway
 //! let password = "hunter42";
 //!
-//! let encrypted_key = unencrypted_key.encrypt(&mut OsRng, password)?;
+//! let encrypted_key = unencrypted_key.encrypt(&mut SysRng, password)?;
 //! assert!(encrypted_key.is_encrypted());
 //! # Ok(())
 //! # }
@@ -88,18 +79,16 @@
 //! well as the crate feature identified in backticks in the title of each
 //! example.
 //!
+#![cfg_attr(all(feature = "ed25519", feature = "getrandom"), doc = " ```")]
 #![cfg_attr(
-    all(feature = "ed25519", feature = "getrandom", feature = "std"),
-    doc = " ```"
-)]
-#![cfg_attr(
-    not(all(feature = "ed25519", feature = "getrandom", feature = "std")),
+    not(all(feature = "ed25519", feature = "getrandom")),
     doc = " ```ignore"
 )]
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use ssh_key::{Algorithm, PrivateKey, rand_core::OsRng};
+//! # fn main() -> Result<(), ssh_key::Error> {
+//! use ssh_key::{Algorithm, PrivateKey, getrandom::SysRng, rand_core::UnwrapErr};
 //!
-//! let private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+//! let mut rng = UnwrapErr(SysRng);
+//! let private_key = PrivateKey::random(&mut rng, Algorithm::Ed25519)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -124,13 +113,14 @@ pub use self::{
 
 #[cfg(feature = "alloc")]
 pub use crate::{
+    Comment, SshSig,
     private::{
         dsa::{DsaKeypair, DsaPrivateKey},
         opaque::{OpaqueKeypair, OpaqueKeypairBytes, OpaquePrivateKeyBytes},
         rsa::{RsaKeypair, RsaPrivateKey},
         sk::SkEd25519,
     },
-    SshSig,
+    sha2::Digest,
 };
 
 #[cfg(feature = "ecdsa")]
@@ -139,29 +129,36 @@ pub use self::ecdsa::{EcdsaKeypair, EcdsaPrivateKey};
 #[cfg(all(feature = "alloc", feature = "ecdsa"))]
 pub use self::sk::SkEcdsaSha2NistP256;
 
-use crate::{public, Algorithm, Cipher, Error, Fingerprint, HashAlg, Kdf, PublicKey, Result};
+use crate::{Algorithm, Cipher, Error, Fingerprint, HashAlg, Kdf, PublicKey, Result, public};
 use cipher::Tag;
 use core::str;
+use ctutils::{Choice, CtEq};
 use encoding::{
-    pem::{LineEnding, PemLabel},
     CheckedSum, Decode, DecodePem, Encode, EncodePem, Reader, Writer,
+    pem::{LineEnding, PemLabel},
 };
-use subtle::{Choice, ConstantTimeEq};
 
 #[cfg(feature = "alloc")]
 use {
+    crate::AssociatedHashAlg,
     alloc::{string::String, vec::Vec},
     zeroize::Zeroizing,
 };
+
+#[cfg(feature = "encryption")]
+use rand_core::TryCryptoRng;
 
 #[cfg(feature = "rand_core")]
 use rand_core::CryptoRng;
 
 #[cfg(feature = "std")]
-use std::{fs, path::Path};
+use std::{fs::File, path::Path};
+
+#[cfg(feature = "std")]
+use std::io::{self, Read, Write};
 
 #[cfg(all(unix, feature = "std"))]
-use std::{io::Write, os::unix::fs::OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 
 /// Error message for infallible conversions (used by `expect`)
 const CONVERSION_ERROR_MSG: &str = "SSH private key conversion error";
@@ -210,9 +207,12 @@ impl PrivateKey {
 
     /// Create a new unencrypted private key with the given keypair data and comment.
     ///
-    /// On `no_std` platforms, use `PrivateKey::from(key_data)` instead.
+    /// On `no_alloc` platforms, use `PrivateKey::try_from(key_data)` instead.
+    ///
+    /// # Errors
+    /// Returns [`Error::Encrypted`] if the key is encrypted.
     #[cfg(feature = "alloc")]
-    pub fn new(key_data: KeypairData, comment: impl Into<String>) -> Result<Self> {
+    pub fn new(key_data: KeypairData, comment: impl Into<Comment>) -> Result<Self> {
         if key_data.is_encrypted() {
             return Err(Error::Encrypted);
         }
@@ -229,6 +229,9 @@ impl PrivateKey {
     /// ```text
     /// -----BEGIN OPENSSH PRIVATE KEY-----
     /// ```
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
     pub fn from_openssh(pem: impl AsRef<[u8]>) -> Result<Self> {
         Self::decode_pem(pem)
     }
@@ -240,6 +243,9 @@ impl PrivateKey {
     /// ```text
     /// PuTTY-User-Key-File-<VERSION>: <ALGORITHM>
     /// ```
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
     #[cfg(feature = "ppk")]
     pub fn from_ppk(ppk: impl AsRef<str>, passphrase: Option<String>) -> Result<Self> {
         use crate::ppk::PpkContainer;
@@ -257,6 +263,9 @@ impl PrivateKey {
     }
 
     /// Parse a raw binary SSH private key.
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
     pub fn from_bytes(mut bytes: &[u8]) -> Result<Self> {
         let reader = &mut bytes;
         let private_key = Self::decode(reader)?;
@@ -264,6 +273,9 @@ impl PrivateKey {
     }
 
     /// Encode OpenSSH-formatted (PEM) private key.
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
     pub fn encode_openssh<'o>(
         &self,
         line_ending: LineEnding,
@@ -272,14 +284,20 @@ impl PrivateKey {
         Ok(self.encode_pem(line_ending, out)?)
     }
 
-    /// Encode an OpenSSH-formatted PEM private key, allocating a
-    /// self-zeroizing [`String`] for the result.
+    /// Encode an OpenSSH-formatted PEM private key, allocating a self-zeroizing [`String`] for the
+    /// result.
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
     #[cfg(feature = "alloc")]
     pub fn to_openssh(&self, line_ending: LineEnding) -> Result<Zeroizing<String>> {
         Ok(self.encode_pem_string(line_ending).map(Zeroizing::new)?)
     }
 
     /// Serialize SSH private key as raw bytes.
+    ///
+    /// # Errors
+    /// Returns [`Error::Encoding`] in the event of an encoding error.
     #[cfg(feature = "alloc")]
     pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>> {
         let mut private_key_bytes = Vec::with_capacity(self.encoded_len()?);
@@ -333,41 +351,109 @@ impl PrivateKey {
     /// ```
     ///
     /// [PROTOCOL.sshsig]: https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.sshsig?annotate=HEAD
+    ///
+    /// # Errors
+    /// Propagates errors from [`SshSig::sign`].
     #[cfg(feature = "alloc")]
     pub fn sign(&self, namespace: &str, hash_alg: HashAlg, msg: &[u8]) -> Result<SshSig> {
         SshSig::sign(self, namespace, hash_alg, msg)
     }
 
-    /// Read private key from an OpenSSH-formatted PEM file.
+    /// Sign the given message [`Digest`] using this private key, returning an [`SshSig`].
+    ///
+    /// These signatures can be produced using `ssh-keygen -Y sign`.
+    ///
+    /// For more information, see [`PrivateKey::sign`].
+    ///
+    /// # Errors
+    /// Propagates errors from [`SshSig::sign_digest`].
+    #[cfg(feature = "alloc")]
+    pub fn sign_digest<D: AssociatedHashAlg + Digest>(
+        &self,
+        namespace: &str,
+        digest: D,
+    ) -> Result<SshSig> {
+        SshSig::sign_digest(self, namespace, digest)
+    }
+
+    /// Sign the given raw message prehash using this private key, returning an [`SshSig`].
+    ///
+    /// These signatures can be produced using `ssh-keygen -Y sign`.
+    ///
+    /// For more information, see [`PrivateKey::sign`].
+    ///
+    /// # Errors
+    /// Propagates errors from [`SshSig::sign_prehash`].
+    #[cfg(feature = "alloc")]
+    pub fn sign_prehash(
+        &self,
+        namespace: &str,
+        hash_alg: HashAlg,
+        prehash: &[u8],
+    ) -> Result<SshSig> {
+        SshSig::sign_prehash(self, namespace, hash_alg, prehash)
+    }
+
+    /// Read private key from an OpenSSH-formatted PEM source.
+    ///
+    /// # Errors
+    /// - Returns [`Error::Io`] on I/O errors.
+    /// - Returns [`Error::Encoding`] in the event of an encoding error.
     #[cfg(feature = "std")]
-    pub fn read_openssh_file(path: &Path) -> Result<Self> {
-        // TODO(tarcieri): verify file permissions match `UNIX_FILE_PERMISSIONS`
-        let pem = Zeroizing::new(fs::read_to_string(path)?);
+    pub fn read_openssh(reader: &mut impl Read) -> Result<Self> {
+        let pem = Zeroizing::new(io::read_to_string(reader)?);
         Self::from_openssh(&*pem)
     }
 
-    /// Write private key as an OpenSSH-formatted PEM file.
+    /// Read private key from an OpenSSH-formatted PEM file.
+    ///
+    /// # Errors
+    /// - Returns [`Error::Io`] on I/O errors.
+    /// - Returns [`Error::Encoding`] in the event of an encoding error.
     #[cfg(feature = "std")]
-    pub fn write_openssh_file(&self, path: &Path, line_ending: LineEnding) -> Result<()> {
+    pub fn read_openssh_file(path: impl AsRef<Path>) -> Result<Self> {
+        // TODO(tarcieri): verify file permissions match `UNIX_FILE_PERMISSIONS`
+        let mut file = File::open(path)?;
+        Self::read_openssh(&mut file)
+    }
+
+    /// Write private key as an OpenSSH-formatted PEM file.
+    ///
+    /// # Errors
+    /// - Returns [`Error::Io`] on I/O errors.
+    /// - Returns [`Error::Encoding`] in the event of an encoding error.
+    #[cfg(feature = "std")]
+    pub fn write_openssh(&self, writer: &mut impl Write, line_ending: LineEnding) -> Result<()> {
         let pem = self.to_openssh(line_ending)?;
-
-        #[cfg(not(unix))]
-        fs::write(path, pem.as_bytes())?;
-        #[cfg(unix)]
-        fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(UNIX_FILE_PERMISSIONS)
-            .open(path)
-            .and_then(|mut file| file.write_all(pem.as_bytes()))?;
-
+        writer.write_all(pem.as_bytes())?;
         Ok(())
+    }
+
+    /// Write private key as an OpenSSH-formatted PEM file.
+    ///
+    /// # Errors
+    /// - Returns [`Error::Io`] on I/O errors.
+    /// - Returns [`Error::Encoding`] in the event of an encoding error.
+    #[cfg(feature = "std")]
+    pub fn write_openssh_file(
+        &self,
+        path: impl AsRef<Path>,
+        line_ending: LineEnding,
+    ) -> Result<()> {
+        let mut options = File::options();
+
+        #[cfg(unix)]
+        options.mode(UNIX_FILE_PERMISSIONS);
+
+        let mut file = options.write(true).create(true).truncate(true).open(path)?;
+
+        self.write_openssh(&mut file, line_ending)
     }
 
     /// Attempt to decrypt an encrypted private key using the provided
     /// password to derive an encryption key.
     ///
+    /// # Errors
     /// Returns [`Error::Decrypted`] if the private key is already decrypted.
     #[cfg(feature = "encryption")]
     pub fn decrypt(&self, password: impl AsRef<[u8]>) -> Result<Self> {
@@ -377,6 +463,7 @@ impl PrivateKey {
         let mut buffer = Zeroizing::new(ciphertext.to_vec());
         self.cipher.decrypt(&key, &iv, &mut buffer, self.auth_tag)?;
 
+        #[allow(clippy::arithmetic_side_effects)] // block sizes are constants
         Self::decode_privatekey_comment_pair(
             &mut &**buffer,
             self.public_key.key_data.clone(),
@@ -392,11 +479,12 @@ impl PrivateKey {
     /// - Cipher: [`Cipher::Aes256Ctr`]
     /// - KDF: [`Kdf::Bcrypt`] (i.e. `bcrypt-pbkdf`)
     ///
+    /// # Errors
     /// Returns [`Error::Encrypted`] if the private key is already encrypted.
     #[cfg(feature = "encryption")]
-    pub fn encrypt(
+    pub fn encrypt<R: TryCryptoRng + ?Sized>(
         &self,
-        rng: &mut impl CryptoRng,
+        rng: &mut R,
         password: impl AsRef<[u8]>,
     ) -> Result<Self> {
         self.encrypt_with_cipher(rng, Cipher::Aes256Ctr, password)
@@ -405,15 +493,16 @@ impl PrivateKey {
     /// Encrypt an unencrypted private key using the provided password to
     /// derive an encryption key for the provided [`Cipher`].
     ///
+    /// # Errors
     /// Returns [`Error::Encrypted`] if the private key is already encrypted.
     #[cfg(feature = "encryption")]
-    pub fn encrypt_with_cipher(
+    pub fn encrypt_with_cipher<R: TryCryptoRng + ?Sized>(
         &self,
-        rng: &mut impl CryptoRng,
+        rng: &mut R,
         cipher: Cipher,
         password: impl AsRef<[u8]>,
     ) -> Result<Self> {
-        let checkint = rng.next_u32();
+        let checkint = rng.try_next_u32().map_err(|_| Error::RngFailure)?;
 
         self.encrypt_with(
             cipher,
@@ -426,6 +515,7 @@ impl PrivateKey {
     /// Encrypt an unencrypted private key using the provided cipher and KDF
     /// configuration.
     ///
+    /// # Errors
     /// Returns [`Error::Encrypted`] if the private key is already encrypted.
     #[cfg(feature = "encryption")]
     pub fn encrypt_with(
@@ -458,16 +548,20 @@ impl PrivateKey {
     }
 
     /// Get the digital signature [`Algorithm`] used by this key.
+    #[must_use]
     pub fn algorithm(&self) -> Algorithm {
         self.public_key.algorithm()
     }
 
     /// Comment on the key (e.g. email address).
-    pub fn comment(&self) -> &str {
+    #[cfg(feature = "alloc")]
+    #[must_use]
+    pub fn comment(&self) -> &Comment {
         self.public_key.comment()
     }
 
     /// Cipher algorithm (a.k.a. `ciphername`).
+    #[must_use]
     pub fn cipher(&self) -> Cipher {
         self.cipher
     }
@@ -475,11 +569,13 @@ impl PrivateKey {
     /// Compute key fingerprint.
     ///
     /// Use [`Default::default()`] to use the default hash function (SHA-256).
+    #[must_use]
     pub fn fingerprint(&self, hash_alg: HashAlg) -> Fingerprint {
         self.public_key.fingerprint(hash_alg)
     }
 
     /// Is this key encrypted?
+    #[must_use]
     pub fn is_encrypted(&self) -> bool {
         let ret = self.key_data.is_encrypted();
         debug_assert_eq!(ret, self.cipher.is_some());
@@ -489,28 +585,32 @@ impl PrivateKey {
     /// Key Derivation Function (KDF) used to encrypt this key.
     ///
     /// Returns [`Kdf::None`] if this key is not encrypted.
+    #[must_use]
     pub fn kdf(&self) -> &Kdf {
         &self.kdf
     }
 
     /// Keypair data.
+    #[must_use]
     pub fn key_data(&self) -> &KeypairData {
         &self.key_data
     }
 
     /// Get the [`PublicKey`] which corresponds to this private key.
+    #[must_use]
     pub fn public_key(&self) -> &PublicKey {
         &self.public_key
     }
 
     /// Generate a random key which uses the given algorithm.
     ///
-    /// # Returns
-    /// - `Error::AlgorithmUnknown` if the algorithm is unsupported.
+    /// # Errors
+    /// Returns `Error::AlgorithmUnknown` if the algorithm is unsupported.
     #[cfg(feature = "rand_core")]
     #[allow(unreachable_code, unused_variables)]
-    pub fn random(rng: &mut impl CryptoRng, algorithm: Algorithm) -> Result<Self> {
+    pub fn random<R: CryptoRng + ?Sized>(rng: &mut R, algorithm: Algorithm) -> Result<Self> {
         let checkint = rng.next_u32();
+
         let key_data = match algorithm {
             #[cfg(feature = "dsa")]
             Algorithm::Dsa => KeypairData::from(DsaKeypair::random(rng)?),
@@ -538,7 +638,7 @@ impl PrivateKey {
 
     /// Set the comment on the key.
     #[cfg(feature = "alloc")]
-    pub fn set_comment(&mut self, comment: impl Into<String>) {
+    pub fn set_comment(&mut self, comment: impl Into<Comment>) {
         self.public_key.set_comment(comment);
     }
 
@@ -644,7 +744,13 @@ impl PrivateKey {
         checkint.encode(writer)?;
         checkint.encode(writer)?;
         self.key_data.encode(writer)?;
+
+        // Serialize comment
+        #[cfg(not(feature = "alloc"))]
+        b"".encode(writer)?;
+        #[cfg(feature = "alloc")]
         self.comment().encode(writer)?;
+
         writer.write(&PADDING_BYTES[..padding_len])?;
         Ok(())
     }
@@ -664,24 +770,29 @@ impl PrivateKey {
         // This method is intended for use with unencrypted keys only
         debug_assert!(!self.is_encrypted(), "called on encrypted key");
 
+        #[cfg(not(feature = "alloc"))]
+        let comment_len = 0;
+        #[cfg(feature = "alloc")]
+        let comment_len = self.comment().encoded_len()?;
+
         [
             8, // 2 x uint32 checkints,
             self.key_data.encoded_len()?,
-            self.comment().encoded_len()?,
+            comment_len,
         ]
         .checked_sum()
     }
 }
 
-impl ConstantTimeEq for PrivateKey {
+impl CtEq for PrivateKey {
     fn ct_eq(&self, other: &Self) -> Choice {
         // Constant-time with respect to private key data
         self.key_data.ct_eq(&other.key_data)
-            & Choice::from(
-                (self.cipher == other.cipher
+            & Choice::from(u8::from(
+                self.cipher == other.cipher
                     && self.kdf == other.kdf
-                    && self.public_key == other.public_key) as u8,
-            )
+                    && self.public_key == other.public_key,
+            ))
     }
 }
 
@@ -797,7 +908,7 @@ impl Encode for PrivateKey {
             4, // number of keys (uint32)
             self.public_key.key_data().encoded_len_prefixed()?,
             private_key_len,
-            self.auth_tag.map(|tag| tag.len()).unwrap_or(0),
+            self.auth_tag.map_or(0, |tag| tag.len()),
         ]
         .checked_sum()
     }

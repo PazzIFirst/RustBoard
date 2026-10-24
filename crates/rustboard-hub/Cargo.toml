@@ -27,8 +27,8 @@ reqwest = { workspace = true }
 reqwest13 = { package = "reqwest", version = "0.13.3", default-features = false, features = ["rustls-no-provider", "http2"] }
 object_store = { workspace = true }
 # M4-C3：SFTP 冷存储。显式关闭默认 aws-lc-rs，改用纯 Rust `ring`；不启用 rsa。
-# 根 Cargo.toml 的 `[patch.crates-io]` 把 russh 指到 vendor/russh（删 optional rsa）。
-russh = { version = "=0.60.3", default-features = false, features = ["ring"] }
+# 根 Cargo.toml 的 `[patch.crates-io]` 把 russh 0.64.1 / ssh-key 指到 vendor（删 optional rsa）。
+russh = { version = "=0.64.1", default-features = false, features = ["ring"] }
 # 只对 AsyncRead/AsyncWrite 泛型，不直接依赖 russh。
 russh-sftp = "3.0.1"
 rustls = { workspace = true }

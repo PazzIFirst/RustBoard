@@ -1,47 +1,41 @@
 # Vendored 依赖
 
-本目录包含两个**只改 manifest**的 vendored crate，用于满足 M4-C3 的
-`cargo audit` 为 0 的要求。所有 `src/` 代码与 crates.io 发布包逐字节一致，
-SSH 协议实现与 SFTP 相关逻辑完全来自上游。
+本目录包含两个**只改 manifest**的 vendored crate，用于满足 `cargo audit`
+为 0 的要求。所有 `src/` 代码与 crates.io 发布包逐字节一致，SSH 协议实现与
+SFTP 相关逻辑完全来自上游。
 
 | 目录 | 包名 | 版本 | 许可证 | 改动 |
 | --- | --- | --- | --- | --- |
-| `russh/` | `russh` | `0.60.3` | Apache-2.0（`russh/LICENSE`） | 删除 optional `rsa` 依赖、`rsa` feature、`default` 中的 `"rsa"`；增加 `[lints]` 关闭第三方包 warning |
-| `ssh-key/` | `internal-russh-forked-ssh-key` | `0.6.18+upstream-0.6.7` | Apache-2.0 OR MIT（两个 LICENSE 均保留） | 删除 optional `rsa` 依赖、`rsa` / `rsa-sha1` feature、`crypto` feature 中的 `"rsa"`、`std` feature 中的弱引用 `"rsa?/std"`；增加 `[lints]` |
-
-`[lints]` 只关闭这两个第三方包自身的 warning（新版 rustc 对源码里残留的
-`cfg(feature = "rsa")` 报 `unexpected_cfgs`，以及未启用分支产生的
-`unused` / `dead_code`）。它不会影响 rustboard 代码的 `-D warnings` 门禁。
+| `russh/` | `russh` | `0.64.1` | Apache-2.0（`russh/LICENSE`） | 删除 optional `rsa` / `pkcs1` 依赖、`rsa` feature、`default` 中的 `"rsa"` |
+| `ssh-key/` | `ssh-key` | `0.7.0-rc.11` | Apache-2.0 OR MIT（两个 LICENSE 均保留） | 删除 optional `rsa` 依赖、`rsa` feature、`crypto` feature 中的 `"rsa"` |
 
 上游：
 
 - <https://github.com/warp-tech/russh>
-- <https://github.com/Eugeny/RustCrypto-SSH/>（`ssh-key` fork；russh 将其
-  重命名为 `ssh-key` 依赖）
+- <https://github.com/RustCrypto/SSH>（crates.io `ssh-key`）
 - crates.io 发布包 checksum：
-  - `russh 0.60.3`：`324b92f459d3e42da294e14e8eb150d2215fcfb7c966838bc1127cd68bc05a0d`
-  - `internal-russh-forked-ssh-key 0.6.18+upstream-0.6.7`：`25f8a978272e3cbdf4768f7363eb1c8e1e6ba63c52a3ed05e29e222da4aec7cb`
+  - `russh 0.64.1`：`ba61e87b9ec9a39a59a6bbed4c0b8ff7fb07073405b24a767a1f2c8560ac8f58`
+  - `ssh-key 0.7.0-rc.11`：`f9a32fae177b74a22aa9c5b01bf7e68b33545be32d9e381e248058d2adc15ce3`
 
-## 为什么需要两个 vendor
+## 为什么需要 vendor
 
-`russh 0.60.3` 的 `Cargo.toml` 声明了 optional `rsa = "=0.10.0-rc.16"`。
-即使不启用该 feature、rsa 不进入编译图，Cargo 仍会把它写进 `Cargo.lock`，
-`cargo audit` 会命中 **RUSTSEC-2023-0071**（rsa Marvin 侧信道，截至 vendor
-时上游无修复版本）。项目门禁要求 audit 0，且不允许 `--ignore` 静默放行。
+`russh 0.64.1` 的 `Cargo.toml` 仍声明 optional `rsa = "=0.10.0-rc.18"` /
+`pkcs1`。即使构建不启用 `rsa` feature，Cargo 仍会把 optional 依赖写进
+`Cargo.lock`，`cargo audit` 会命中 **RUSTSEC-2023-0071**（rsa Marvin 侧信道，
+上游无修复版本）。项目门禁要求 audit 0，且不允许 `--ignore` 静默放行，因此：
 
-只在 `russh` 里删掉 `rsa` **还不够**：它的依赖
-`internal-russh-forked-ssh-key` 在已启用的 `std` feature 中带有弱引用
-`rsa?/std`。Cargo 解析 lockfile 时会把弱引用的 optional 依赖也写进
-`Cargo.lock`，因此 audit 仍会报告 `rsa`。所以第二个 patch 只做一件事：
-从 fork 的 `std` feature 删除 `"rsa?/std"`，并同时删除不再可用的
-`rsa` / `rsa-sha1` feature 与依赖声明。
+- `russh` 删除 `rsa` / `pkcs1` 依赖与 `rsa` feature，并从 `default` 移除 `"rsa"`；
+- `ssh-key` 删除 `rsa` 依赖、`rsa` feature 与 `crypto` feature 中的 `"rsa"`；
+- 根 `Cargo.toml` 通过 `[patch.crates-io]` 指向本目录。
 
-根 `Cargo.toml`：
+`russh 0.64.1` 使用稳定的 `elliptic-curve 0.14.1` / `ecdsa 0.17.0` /
+`p256/p384/p521 0.14.0`，依赖解析到 **`crypto-bigint 0.7.6`**，同时修复
+**RUSTSEC-2026-0387**（`0.7.0-rc.28` 的时序可变性；2026-10-23 披露）。
 
 ```toml
 [patch.crates-io]
 russh = { path = "vendor/russh" }
-internal-russh-forked-ssh-key = { path = "vendor/ssh-key" }
+ssh-key = { path = "vendor/ssh-key" }
 ```
 
 ## 限制：RSA 密钥不再支持
@@ -55,6 +49,8 @@ internal-russh-forked-ssh-key = { path = "vendor/ssh-key" }
   握手阶段失败，不会降级到 RSA。
 - **主机指纹只接受 `SHA256:<base64>`**（不接受 MD5 / SHA1），且必须显式配置；
   ECDSA 主机密钥同样用 SHA256 指纹固定。
+- **SSH 主机证书统一拒绝**：证书会绕过固定主机公钥指纹的信任模型；只接受
+  原始主机公钥（与 v0.4.1 行为一致，旧实现也无法处理证书类型）。
 - 私钥文件在 Unix 上必须 group/other 无权限（0600），否则启动 / 连接前固定
   失败。
 
@@ -63,21 +59,21 @@ RSA 主机密钥，需要升级服务器或改用 WebDAV / S3 后端，不能通
 
 ## 文件清理
 
-为减小仓库体积，两个目录都只保留构建所需的 `src/`、`Cargo.toml`、`README.md`
-与许可证；删除了发布包里的 `Cargo.lock`、`Cargo.toml.orig`、`.cargo-ok`、
-`.cargo_vcs_info.json`、`tests/`、`examples/`、`benches/`、`CHANGELOG.md`。
-这些文件不参与本仓库构建。`ssh-key` 的 `Cargo.toml` 同时移除了指向已删除
-`tests/` 的 `[[test]]` 段。
+为减小仓库体积，两个目录保留构建所需的 `src/`、`Cargo.toml`、`README.md`
+与许可证；删除发布包里的 `Cargo.lock`、`Cargo.toml.orig`、
+`.cargo_vcs_info.json`、`.cargo-ok`。`russh` 的 `tests/`、`examples/`、
+`benches/` 因 manifest 显式声明保留，不参与本仓库构建。
+
+`ssh-key` 上游 manifest 自带 `[lints]`；`russh` 源码中残留的
+`cfg(feature = "rsa")` 在依赖编译时只产生 warning（Cargo cap-lints），
+不影响 rustboard 自身的 `-D warnings` 门禁。
 
 ## 升级 / 重新生成步骤
 
-升级任一 crate 或重新生成 vendor 时：
-
-1. 从 crates.io 下载目标版本并校验 checksum（应与 `Cargo.lock` 的
-   registry 条目、或上表 checksum 一致）：
+1. 从 crates.io 下载目标版本并校验 checksum：
 
    ```bash
-   VERSION=0.60.3
+   VERSION=0.64.1
    TMP=$(mktemp -d)
    curl -fsSL "https://crates.io/api/v1/crates/russh/${VERSION}/download" \
      -o "$TMP/russh-${VERSION}.crate"
@@ -85,33 +81,33 @@ RSA 主机密钥，需要升级服务器或改用 WebDAV / S3 后端，不能通
    tar -xzf "$TMP/russh-${VERSION}.crate" -C "$TMP"
    ```
 
-   `ssh-key` 同理：`https://crates.io/api/v1/crates/internal-russh-forked-ssh-key/0.6.18+upstream-0.6.7/download`。
+   `ssh-key` 从 `https://crates.io/api/v1/crates/ssh-key/0.7.0-rc.11/download`
+   下载，checksum 必须与 `Cargo.lock` 的 registry 条目一致。
 
 2. 用发布包内容替换对应目录（保留本 README）：
 
    ```bash
    rm -rf vendor/russh && mkdir -p vendor/russh
    cp -a "$TMP/russh-${VERSION}/." vendor/russh/
-   rm -rf vendor/russh/{tests,examples,benches} \
-          vendor/russh/Cargo.lock vendor/russh/Cargo.toml.orig \
-          vendor/russh/.cargo-ok vendor/russh/.cargo_vcs_info.json
+   rm -f vendor/russh/Cargo.lock vendor/russh/Cargo.toml.orig \
+         vendor/russh/.cargo-ok vendor/russh/.cargo_vcs_info.json
    cp /path/to/Apache-2.0.txt vendor/russh/LICENSE
    ```
 
-3. 按上表逐项编辑 manifest；不要改任何 `src/` 文件，否则升级 diff 会失去
-   可审计性。
+3. 按上表编辑 manifest；不要改任何 `src/` 文件，否则升级 diff 会失去可审计性。
 
 4. 同步根 `Cargo.toml` 的 `[patch.crates-io]` 与
    `crates/rustboard-hub/Cargo.toml` 中固定的 `russh` 版本，然后：
 
    ```bash
    cargo update -p russh --precise <version>
-   cargo tree -i rsa        # 必须无输出
+   cargo tree -i rsa        # 必须无包
+   cargo tree -i crypto-bigint
    cargo audit              # 必须 0
    cargo test --workspace --locked
    ```
 
-5. 在 `CHANGELOG.md` 的 `[Unreleased]` 中记录 vendor 版本与改动原因。
+5. 在 `CHANGELOG.md` 中记录 vendor 版本、advisory 与 SFTP 真实验证结果。
 
 ## 上游修复后
 
