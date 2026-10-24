@@ -340,20 +340,31 @@
     hub 管理面；正常远程负载下未复现，后续可移入 `spawn_blocking` 并收紧 busy_timeout。
 17. `database` 指向 `data_dir` 外或相对路径时 hub 仍启动：会打一次 WARN，DB 文件 0600、
     父目录不收紧；非默认配置建议把数据库放在专用 `data_dir` 内。
-18. **KI-28（低危，v0.4.1）**：单 IP 连接超限时每条被拒 TCP 都打 WARN，持续洪水可
-    放大日志/磁盘并淹没告警；v0.3.5 渗透登记，v0.4.0 未修，拒绝行为本身正确。
+18. **KI-28（v0.4.1 已修复）**：单 IP 连接超限日志改为 60s 窗口首条 WARN、其余
+    DEBUG；采样表 4096 IP 上限，拒绝行为不变。
 19. **SFTP 密钥算法**：vendored 去掉 optional `rsa` 后，SFTP 不支持 RSA 主机密钥与
     RSA 用户私钥；仅支持 ed25519/ECDSA 主机密钥、ed25519 用户私钥。仅提供 RSA
     主机密钥的旧服务器会握手失败，配置仍接受 SHA256 指纹，部署前需确认算法。
-20. **归档下载内存上限**：hub 下载单对象硬限 64 MiB（1 个主体并发 + 120s 发送期限），
-    而 `archive.max_object_bytes` 可配到 1 GiB；超过 64 MiB 的对象可以上传但无法通过
-    hub 下载（413）。v0.4.1 计划把配置上限收敛到 64 MiB 或改为流式下载，见
-    [known-issues 修复计划](plans/2026-10-24-known-issues-fix.md)。
+20. **归档下载内存上限（v0.4.1 已收敛）**：`archive.max_object_bytes` 上限 64 MiB，
+    下载硬限固定 64 MiB；已有 >64 MiB 旧对象不删除/不重传，列表
+    `downloadable=false`，下载 413。流式下载仍留待 v0.5.0。
+21. **直接 SQL 删除 raw 不受 prune 保护**：v0.4.1 的 rowid/generation CAS 只覆盖
+    生产路径 `prune_samples_before`；运行中手工 `DELETE FROM samples` 绕过维护状态，
+    仍可能造成迟到行漏算。生产/运维应使用 maintenance CLI。
+
+## 磁盘清理记录
+
+- **2026-10-24 安全窗口**（按 [AGENTS.md](../AGENTS.md) §12）：根分区
+  `/dev/sda1` 从 **141G 已用 / 11G 可用（93%）** 降到 **68G 已用 / 84G 可用（45%）**，
+  释放约 **73 GiB**。
+- 清理：主仓库 `target/debug`、`target/v040-t1`；`.worktrees/*/target`；
+  `web/node_modules`、`web/dist`、`.pnpm-store`。
+- 保留：`target/baseline-bin`（3 个 v0.4.0 冻结二进制 + `SHA256SUMS`，校验 OK）、
+  `.git`、源码、docs、vendor、`tests/pentest` 脚本与本地证据。
+- 清理前确认无 cargo/rustc/rustboard/vite/pnpm 写目标目录；前端 dev 进程属于其他项目。
 
 ## 下一步建议
 
-M4 已完成并发布 v0.4.0；下一阶段是 **v0.4.1 已知问题修复 + M4 专项渗透**，
-随后进入 M5 安装与交付（安装器、镜像、ACME）。计划见
-[v0.4.1 修复计划](plans/2026-10-24-known-issues-fix.md) 与
-[M4 渗透测试计划](plans/2026-10-24-m4-pentest.md)。控制面/告警/归档均按“默认关闭或
-最小暴露 + 审计/固定错误码”交付。
+v0.4.1 的步骤 1–4 已完成：基线渗透、KI-29/31/28/20 修复、SFTP 真实验证、全量门禁。
+剩余步骤 5 是 v0.4.1 tag/GitHub Release；之后进入 M5 安装与交付（安装器、镜像、
+ACME）。控制面/告警/归档均按“默认关闭或最小暴露 + 审计/固定错误码”交付。
