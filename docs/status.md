@@ -272,7 +272,10 @@
 Pebble **3/3**（HTTP-01、TLS-ALPN-01、IP shortlived）真实签发；另跑通
 `hub install --tls acme-domain`（Pebble TLS-ALPN）→ `--force --tls self-signed`
 切换，确认 ACME 证书被既有 CA 重签、`openssl verify` 通过；该流程已固化为
-[v100-acme-upgrade.sh](tests/e2e/v100-acme-upgrade.sh)。本地 arm64（非 LTO
+[v100-acme-upgrade.sh](tests/e2e/v100-acme-upgrade.sh)；
+[v100-admin-panel-tls.sh](tests/e2e/v100-admin-panel-tls.sh) 验证
+`admin_tls=required` + panel `hub_ca` 的 HTTPS 登录与 `/api/overview` 代理；
+本地 arm64（非 LTO
 快速构建，不替代发布 profile）`v100-arm64.sh` **40 PASS / 0 FAIL / 2 SKIP**：
 两个 SKIP 是 x86 宿主无法执行 aarch64 包内 install.sh/原生 systemd 路径，已用
 qemu 直接运行 hub/panel/agent 验证；hosted 原生仍待 RC。panel
