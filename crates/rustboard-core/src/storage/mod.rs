@@ -8,6 +8,7 @@
 //! [`StorageHandle`] 是 Phase D 引入的多后端边界：内部是 `Arc<dyn Storage>`，
 //! 可构造 SQLite 或 PostgreSQL；调用点只依赖 [`Deref`] 后的 trait 方法。
 
+pub mod migrate;
 pub mod postgres;
 pub mod sqlite;
 
