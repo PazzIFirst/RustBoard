@@ -194,8 +194,8 @@ db_sslrootcert = "/etc/rustboard/pg-ca.pem"
 > Phase D5 的统一入口已交付：`backup` / `restore` / `migrate`。`backup` 可在 hub
 > 运行时生成一致性快照（SQLite `VACUUM INTO` / PG `pg_dump`）；`migrate` 与
 > `restore` 要求**先停 hub**：有 systemd 时用 `systemctl is-active
-> rustboard-hub` 检查，无 systemd 时打印 WARN，由确认与迁移前备份兜底。不要用
-> `cp` 直接复制运行中的 PG 数据目录。
+> rustboard-hub` 检查；无 systemd、unit 不存在或状态无法确认时 fail-closed，
+> 必须显式加 `--hub-stopped`。不要用 `cp` 直接复制运行中的 PG 数据目录。
 
 ### 6.1 备份
 

@@ -19,7 +19,7 @@
 | M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | v0.4.1 已知问题修复 | 🟢 完成 | KI-29 rowid 竞态、KI-31 64 MiB 配置/下载一致性、KI-28 拒绝日志采样、KI-20 安装命令引用；SFTP 真实环境 29/29，M4 基线渗透无高危；v041 26/26；v0.4.1 发布 |
 | v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
-| M5 安装与交付 | 🟢 Phase D 实现完成（checkpoint 待打），Phase E 待 | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126；Phase C RC `v1.0.0-rc.2`（ACME/LE staging/评审/渗透/hosted RC 全绿）；Phase D PostgreSQL 显式 opt-in、迁移/备份/恢复 CLI、L-01/L-03；storage 级 200 agent load 已过，hub 端 200 agent/100-1000/24h 在 Phase E；`v1.0.0` 未发布 |
+| M5 安装与交付 | 🟢 Phase D 实现完成（checkpoint 已打），Phase E 待 | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126；Phase C RC `v1.0.0-rc.2`（ACME/LE staging/评审/渗透/hosted RC 全绿）；Phase D PostgreSQL 显式 opt-in、迁移/备份/恢复 CLI、L-01/L-03；storage 级 200 agent load 已过，hub 端 200 agent/100-1000/24h 在 Phase E；`v1.0.0` 未发布 |
 
 ## 构建产物清理（2026-10-25 Phase C 收尾）
 
@@ -316,10 +316,11 @@ workspace/构建 Docker 镜像。arm64 机器到位后按同一方法复测并�
 默认 compose 不发布 80/443，需要 ACME 叠加文件；旧 v0.4 指纹 agent 不兼容 ACME
 hub，需升级。
 
-### Phase D（2026-10-26，实现完成；checkpoint tag 待打）
+### Phase D（2026-10-26，实现完成；checkpoint `checkpoint/2026-10-26-m5-phase-d-postgres-backup`）
 
-当前实现已提交；Phase D checkpoint tag **尚未创建**（名称待定），`v1.0.0-rc.2`
-不移动，`v1.0.0` 未发布。默认 SQLite 行为不变，PostgreSQL 为显式 opt-in、
+当前实现已提交；Phase D checkpoint tag 为
+`checkpoint/2026-10-26-m5-phase-d-postgres-backup`，`v1.0.0-rc.2` 不移动，
+`v1.0.0` 未发布。默认 SQLite 行为不变，PostgreSQL 为显式 opt-in、
 不自动双写。
 
 - [x] **L-01**：hub 启动把既有 `certs/acme/account.json` / `state.toml` 收紧到
@@ -349,7 +350,7 @@ hub，需升级。
       只改配置；CI 新增 PostgreSQL service job
       （`postgres_schema`/`postgres_core`/`postgres_parity`/`postgres_migrate`/
       `postgres_load`）
-- [ ] **Phase D checkpoint**：最终门禁复核通过后打 tag；当前未创建
+- [x] **Phase D checkpoint**：`checkpoint/2026-10-26-m5-phase-d-postgres-backup`
 
 #### Phase D 验收矩阵
 
@@ -364,7 +365,7 @@ hub，需升级。
 | D-G7 | 备份/恢复后点数、范围、告警状态、token 数一致 | ✅ | `phase_d_backup` 14；manifest SHA256、PG dump/restore、SQLite VACUUM INTO、旧 WAL/恶意路径/并发 migrate |
 | D-G8 | 安装器 `--db` 探测、配置、脱敏，不自动建库/角色 | ✅ | 安装器 PG 探测先于写盘；失败不改 hub.toml/unit/二进制 |
 | D-G9 | Docker 可接 PG；默认 compose 仍 SQLite | ✅ | `docker/compose.postgres.example.yml`、`RUSTBOARD_DATABASE*`；默认 compose 未变 |
-| D-G10 | 全量 fmt/clippy/test/audit、独立评审/渗透、checkpoint | ⏳ 待评审/渗透/checkpoint | 全 workspace `cargo test --workspace --locked` 已通过：**1380 passed / 0 failed / 5 ignored**（2026-10-26，`RUSTBOARD_TEST_PG` + 本机 PG16 client）；独立评审/渗透与 checkpoint 仍待完成 |
+| D-G10 | 全量 fmt/clippy/test/audit、独立评审/渗透、checkpoint | ✅ | 全 workspace **1380 passed / 0 failed / 5 ignored**；fmt/clippy/audit 通过；初评/修复/两名独立复审与本地渗透见 [Phase D 评审渗透](security/2026-10-26-m5-phase-d-review-pentest.md)；checkpoint 已打 |
 
 #### Phase D 测试证据（2026-10-26，全 workspace 已复跑）
 
@@ -420,7 +421,7 @@ Phase E 仍保留 hub 级真实压测。
       100/500/1000 agent 三档压力与 ≥24h 长稳（RSS 增长 >10% 视为不通过）
 - [ ] 真实 TLS PostgreSQL 的 `verify-full` 安装→启动→读写 smoke
 - [ ] Phase D 收口：独立评审/渗透、`fmt`/`clippy -D warnings`/`audit`、
-      同 commit CI `postgres` job 全绿，然后打 checkpoint tag（名称待定）
+      同 commit CI `postgres` job 全绿，然后打 checkpoint tag `checkpoint/2026-10-26-m5-phase-d-postgres-backup`
 - [ ] `v1.0.0`：CHANGELOG 归档、tag、GitHub Release、镜像与 `latest`；
       **不移动 `v1.0.0-rc.2`**，未完成上述门禁前不发布
 
@@ -651,7 +652,7 @@ Phase E 仍保留 hub 级真实压测。
 
 Phase D 已完成 PostgreSQL 显式 opt-in、`migrate`/`backup`/`restore` CLI 与
 L-01/L-03 收口，全 workspace 测试 **1380 passed / 0 failed / 5 ignored**；
-默认 SQLite 不变，`v1.0.0-rc.2` 不移动，Phase D checkpoint tag 待打。下一步：
+默认 SQLite 不变，`v1.0.0-rc.2` 不移动，Phase D checkpoint tag 已打。下一步：
 hub 端真实 200 agent、100/500/1000 与 24h 长稳、真实 TLS PG smoke、独立评审/
 渗透与最终 fmt/clippy/audit，门禁全绿后归档 CHANGELOG、发布 `v1.0.0`。计划见
 [M5 计划](plans/2026-10-24-m5-install-delivery.md)、
