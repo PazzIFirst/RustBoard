@@ -84,6 +84,7 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
             backup_cmd::SQLITE_SCHEMA_VERSION
         );
     }
+    backup_cmd::validate_sqlite_source_tables(&source)?;
 
     let mut target_cfg = cfg.clone();
     target_cfg.database = args.to.clone();
@@ -125,6 +126,9 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
             &target_state,
             args.force,
         )?;
+        if matches!(target_state, TargetState::NonEmpty) && !args.force {
+            bail!("dry-run 检测到目标非空且未指定 --force；实际 migrate 会被拒绝");
+        }
         return Ok(());
     }
 
@@ -151,7 +155,7 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
 
     // 5. 先备份源 SQLite + hub.toml（失败则不迁移）。
     let backup_root = cfg.data_dir.join("backups");
-    let backup_dir = backup_cmd::snapshot_to(&backup_root, &cfg, &config_bytes)
+    let backup_dir = backup_cmd::snapshot_to(&backup_root, &cfg, &config_bytes, true)
         .context("迁移前备份 SQLite / hub.toml 失败，已中止（未修改源库与配置）")?;
     println!("迁移前备份: {}", backup_dir.display());
 
@@ -257,7 +261,7 @@ pub(crate) fn ensure_hub_stopped(operation: &str) -> Result<()> {
         }
         Err(err) => {
             return Err(err).with_context(|| {
-                format!("执行 systemctl is-active rustboard-hub 失败，无法确认 hub 是否已停止；请先停 hub 后重试")
+                "执行 systemctl is-active rustboard-hub 失败，无法确认 hub 是否已停止；请先停 hub 后重试"
             })
         }
     };
@@ -403,9 +407,10 @@ fn print_dry_run(
     state: &TargetState,
     force: bool,
 ) -> Result<()> {
+    let samples = backup_cmd::sqlite_sample_count(source)?;
     println!("migrate --dry-run（只读校验，不写数据/不备份/不改配置）");
     println!(
-        "  源: sqlite://{}（schema v{source_version}）",
+        "  源: sqlite://{}（schema v{source_version}，samples {samples} 行，21 张表齐全）",
         source.display()
     );
     println!("  目标: {target_redacted}");

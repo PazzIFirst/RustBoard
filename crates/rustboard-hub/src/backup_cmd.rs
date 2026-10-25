@@ -205,13 +205,14 @@ pub fn backup(args: BackupArgs) -> Result<()> {
             backend_name(&kind)
         ),
     )?;
-    let dir = snapshot_to(&args.out, &cfg, &config_bytes)?;
+    let dir = snapshot_to(&args.out, &cfg, &config_bytes, false)?;
+    let manifest = read_manifest(&dir)?;
     println!("备份完成: {}", dir.display());
     println!(
         "后端: {}；schema: {}；文件: {} 个",
         backend_name(&kind),
-        read_manifest(&dir)?.schema,
-        read_manifest(&dir)?.files.len()
+        manifest.schema,
+        manifest.files.len()
     );
     Ok(())
 }
@@ -326,7 +327,13 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
         ),
     )?;
 
-    // 8. 非空目标先尽力备份（失败只告警；--force 已由用户显式确认）。
+    // 8. 配置 .bak 在数据恢复前写好：它失败时目标库/证书尚未被改动。
+    let config_bak = match &current {
+        Some((current_bytes, _)) => Some(backup_file_next_to(&config_path, current_bytes, "bak")?),
+        None => None,
+    };
+
+    // 9. 非空目标先尽力备份（失败只告警；--force 已由用户显式确认）。
     if target_non_empty {
         match pre_restore_snapshot(&backup_cfg, &config_path, &backup_config_bytes) {
             Ok(path) => println!("恢复前目标备份: {}", path.display()),
@@ -334,7 +341,7 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
         }
     }
 
-    // 9. 先恢复数据，再恢复证书，最后写配置（配置决定下次启动读哪里）。
+    // 10. 先恢复数据，再恢复证书，最后写配置（配置决定下次启动读哪里）。
     match &backup_kind {
         DatabaseKind::Sqlite(path) => {
             restore_sqlite_file(&verified[db_name], path)
@@ -354,10 +361,10 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
     );
 
     // 配置写最后：数据/证书失败时旧配置仍指向旧路径，避免启动到半恢复状态。
-    if let Some((current_bytes, _)) = &current {
-        backup_file_next_to(&config_path, current_bytes, "bak")?;
-    }
     write_private_file(&config_path, &backup_config_bytes)?;
+    if let Some(path) = config_bak {
+        println!("旧配置备份: {}", path.display());
+    }
     println!("配置文件已恢复: {}", config_path.display());
 
     Ok(())
@@ -365,12 +372,15 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
 
 /// 把 manifest、DB、配置和证书写入 `<out_root>/<timestamp>/`，返回目录。
 ///
-/// 仅供 `backup` 与 restore 的 best-effort 预备份使用；调用方负责确认与参数
-/// 校验。失败时会删除本次新建的时间戳目录，不留下半成品 manifest。
+/// 仅供 `backup`、`migrate` 与 restore 的 best-effort 预备份使用；调用方负责
+/// 确认与参数校验。`assume_stopped` 为 true 且源库没有 `-wal` 时以 immutable
+/// 只读方式打开 SQLite，避免为迁移前备份创建 sidecar。失败时会删除本次新建的
+/// 时间戳目录，不留下半成品 manifest。
 pub(crate) fn snapshot_to(
     out_root: &Path,
     cfg: &HubConfig,
     config_bytes: &[u8],
+    assume_stopped: bool,
 ) -> Result<PathBuf> {
     validate_user_path(out_root, "备份根目录")?;
     fsutil::ensure_dir(out_root, 0o700)
@@ -392,7 +402,7 @@ pub(crate) fn snapshot_to(
     match &kind {
         DatabaseKind::Sqlite(path) => {
             let dump = dir.join("rustboard.db");
-            sqlite_backup_to(path, &dump, false)?;
+            sqlite_backup_to(path, &dump, assume_stopped)?;
         }
         DatabaseKind::Postgres(dsn) => {
             let dump = dir.join("rustboard.dump");
@@ -664,6 +674,37 @@ pub(crate) fn sqlite_schema_version(path: &Path) -> Result<i64> {
         .with_context(|| format!("读取 SQLite schema 版本失败: {}", path.display()))
 }
 
+/// 校验 SQLite 源库包含 schema v7 的全部 21 张业务表。
+///
+/// 只读；供 `migrate` 在备份/写目标之前做 dry-run 级别的源检查。核心迁移会
+/// 再做一次同样的检查，这里提前失败可以避免先备份一个不可迁移的源库。
+pub(crate) fn validate_sqlite_source_tables(path: &Path) -> Result<()> {
+    let conn = open_sqlite_readonly(path)?;
+    for table in HUB_TABLES {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("检查 SQLite 源库表 {table} 失败"))?;
+        if exists == 0 {
+            bail!(
+                "SQLite 源库缺少表 {table}（schema 不是完整的 v{}）；拒绝迁移",
+                SQLITE_SCHEMA_VERSION
+            );
+        }
+    }
+    Ok(())
+}
+
+/// SQLite 源库的 raw samples 行数（只读，dry-run 展示用）。
+pub(crate) fn sqlite_sample_count(path: &Path) -> Result<i64> {
+    open_sqlite_readonly(path)?
+        .query_row("SELECT COUNT(*) FROM samples", [], |row| row.get(0))
+        .with_context(|| format!("统计 SQLite 源库 samples 行数失败: {}", path.display()))
+}
+
 /// SQLite 目标是否已有业务数据。
 ///
 /// 文件不存在、没有用户表、或所有用户表都为空时视为空目标；任何一行数据都
@@ -905,6 +946,12 @@ pub(crate) fn pg_dump_to(dsn: &str, destination: &Path) -> Result<()> {
     fsutil::harden(destination, 0o600)
         .with_context(|| format!("收紧 PostgreSQL 备份权限失败: {}", destination.display()))?;
     sync_file(destination)?;
+    let size = fs::metadata(destination)
+        .with_context(|| format!("读取 PostgreSQL 备份大小失败: {}", destination.display()))?
+        .len();
+    if size == 0 {
+        bail!("pg_dump 成功但备份文件为空: {}", destination.display());
+    }
     Ok(())
 }
 
@@ -1251,10 +1298,13 @@ fn pre_restore_snapshot(
         None => target_config_bytes.to_vec(),
     };
     let out_root = target_cfg.data_dir.join("backups");
-    snapshot_to(&out_root, target_cfg, &config_bytes).context("创建恢复前目标备份失败")
+    snapshot_to(&out_root, target_cfg, &config_bytes, false).context("创建恢复前目标备份失败")
 }
 
 fn same_database(left: &HubConfig, right: &HubConfig) -> bool {
+    if left.data_dir != right.data_dir {
+        return false;
+    }
     match (left.database_kind(), right.database_kind()) {
         (Ok(DatabaseKind::Sqlite(a)), Ok(DatabaseKind::Sqlite(b))) => a == b,
         (Ok(DatabaseKind::Postgres(a)), Ok(DatabaseKind::Postgres(b))) => a == b,

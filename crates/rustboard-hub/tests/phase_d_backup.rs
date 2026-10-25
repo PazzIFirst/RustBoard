@@ -398,7 +398,7 @@ fn sqlite_backup_restore_roundtrip_manifest_and_permissions() {
 #[test]
 fn restore_rejects_tampered_manifest_and_path_traversal() {
     let root = TestRoot::new("sqlite-tamper");
-    let (config_path, db_path, data_dir, _config_bytes) = setup_sqlite(root.path());
+    let (config_path, db_path, _data_dir, _config_bytes) = setup_sqlite(root.path());
     let out = root.path().join("backups");
     let output = hub(&[
         "backup",
@@ -458,7 +458,6 @@ fn restore_rejects_tampered_manifest_and_path_traversal() {
     assert!(!output.status.success(), "路径穿越必须拒绝");
     assert!(combined(&output).contains(".."), "{}", combined(&output));
     assert_eq!(file_sha(&db_path), target_before, "路径穿越不得写目标");
-    let _ = data_dir;
 }
 
 #[test]
@@ -518,8 +517,10 @@ fn reset_pg(dsn: &str) {
 }
 
 fn pg_storage(dsn: &str) -> PostgresStorage {
-    let mut cfg = HubConfig::default();
-    cfg.database = dsn.to_string();
+    let cfg = HubConfig {
+        database: dsn.to_string(),
+        ..HubConfig::default()
+    };
     PostgresStorage::open_from_config(&cfg).expect("打开 PostgreSQL")
 }
 
@@ -538,8 +539,10 @@ fn pg_config(root: &Path, dsn: &str) -> (PathBuf, PathBuf, Vec<u8>) {
 }
 
 fn seed_pg(dsn: &str) {
-    let mut cfg = HubConfig::default();
-    cfg.database = dsn.to_string();
+    let cfg = HubConfig {
+        database: dsn.to_string(),
+        ..HubConfig::default()
+    };
     let pg = PostgresStorage::open_from_config(&cfg).expect("打开 PG");
     pg.apply_schema().expect("apply schema");
     let storage = StorageHandle::postgres(pg);
@@ -693,6 +696,71 @@ fn pg_migrate_dry_run_success_force_and_config_switch() {
     // 真实 pg_dump 用例见 `pg_backup_restore_requires_real_client_tools`，缺工具时 SKIP。
     fs::write(&config_path, &config_bytes).unwrap();
     fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    // 目标非空、未带 --force：dry-run 也必须明确失败，不能假绿。
+    let output = hub(&[
+        "migrate",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--to",
+        &dsn,
+        "--dry-run",
+    ]);
+    assert!(!output.status.success(), "非空目标 dry-run 必须失败");
+    assert!(combined(&output).contains("非空"), "{}", combined(&output));
+    assert_eq!(fs::read(&config_path).unwrap(), config_bytes);
+    let storage = StorageHandle::postgres(pg_storage(&dsn));
+    assert_seeded(&storage);
+    drop(storage);
+
+    // pg_dump 失败：不得清空目标、不得改配置、不得删 SQLite。
+    let fail_bin = root.path().join("fakebin-fail");
+    fs::create_dir_all(&fail_bin).unwrap();
+    let fail_dump = fail_bin.join("pg_dump");
+    fs::write(
+        &fail_dump,
+        "#!/bin/sh\n\
+         if [ \"${1:-}\" = \"--version\" ]; then echo 'pg_dump (fake) 1'; exit 0; fi\n\
+         echo 'fake pg_dump failure' >&2\n\
+         exit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fail_dump, fs::Permissions::from_mode(0o755)).unwrap();
+    let source_sha = file_sha(&db_path);
+    let fail_path = format!(
+        "{}:{}",
+        fail_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_rustboard-hub"))
+        .args([
+            "migrate",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--to",
+            &dsn,
+            "--force",
+            "--yes",
+        ])
+        .env("PATH", fail_path)
+        .env_remove("RUSTBOARD_DATABASE_PASSWORD")
+        .output()
+        .expect("执行失败注入 migrate");
+    assert!(!output.status.success(), "pg_dump 失败时 migrate 必须失败");
+    assert!(
+        combined(&output).contains("备份目标 PostgreSQL 失败"),
+        "{}",
+        combined(&output)
+    );
+    assert_eq!(fs::read(&config_path).unwrap(), config_bytes);
+    assert_eq!(file_sha(&db_path), source_sha);
+    let storage = StorageHandle::postgres(pg_storage(&dsn));
+    assert_seeded(&storage);
+    drop(storage);
+    assert!(
+        find_file(&data_dir.join("backups"), "target-before-migrate.dump").is_none(),
+        "pg_dump 失败时不得留下目标备份/清空步骤"
+    );
+
     let fake_bin = root.path().join("fakebin");
     fs::create_dir_all(&fake_bin).unwrap();
     let fake_dump = fake_bin.join("pg_dump");
