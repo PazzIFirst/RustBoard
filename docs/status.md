@@ -283,7 +283,7 @@ Pebble **3/3**（HTTP-01、TLS-ALPN-01、IP shortlived）真实签发；另跑�
 `shortlived` 三路均签发成功（见证据文档）；本地 arm64（非 LTO 快速构建，
 不替代发布 profile）`v100-arm64.sh` **40 PASS / 0 FAIL / 2 SKIP**：
 两个 SKIP 是 x86 宿主无法执行 aarch64 包内 install.sh/原生 systemd 路径，已用
-qemu 直接运行 hub/panel/agent 验证；hosted 原生仍待 RC。panel
+qemu 直接运行 hub/panel/agent 验证；hosted 原生 `delivery-arm64` 已在 rc.2 通过。panel
 `phase_c_panel_tls` **14/14**；web 80/80 + build。独立渗透报告
 [2026-10-25-m5-phase-c-pentest.md](security/2026-10-25-m5-phase-c-pentest.md)：
 **高危 0 / 中危 0 / 低危 3**；L-02（TLS-ALPN 无 ALPN 客户端仍见挑战证书）
