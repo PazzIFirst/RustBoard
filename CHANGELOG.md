@@ -18,7 +18,8 @@
   持久化到 `<data_dir>/certs`，新增 `rustboard-hub tls status|issue|renew`
 - Phase C 安装器：ACME 参数校验、80/443 四层只读诊断（本地 bind、ufw/firewalld/
   nftables/iptables、云元数据、staging 实跑）、最多 3 轮失败回退 self-signed、
-  `--admin-tls required` 的 HTTPS 健康检查（自定义 SNI/CA）
+  `--admin-tls required` 的 HTTPS 健康检查（自定义 SNI/CA）；私有 ACME 新增
+  `--agent-ca`/`tls.agent_ca_file` 稳定信任锚，未设置时从签发链尾派生
 - Phase C agent TLS 三模式：`fingerprint`（旧默认）/ `system-roots` / `custom-ca`，
   安装器新增 `--tls-mode` / `--server-ca`；ACME hub 的 `agent add` 输出按模式
   生成命令并提示旧指纹 agent 升级
