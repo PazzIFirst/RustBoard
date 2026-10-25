@@ -100,6 +100,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: 安装 PostgreSQL 客户端（pg_dump/pg_restore 16）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-16
+          # 服务端固定 postgres:16；显式优先 16 的客户端，避免 runner 上已有
+          # 更高版本导致 pg_dump 生成 PG16 不认识的 SET transaction_timeout。
+          echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
+          /usr/lib/postgresql/16/bin/pg_dump --version
+          /usr/lib/postgresql/16/bin/pg_restore --version
+
       - name: 等待 PostgreSQL 就绪
         run: |
           for i in $(seq 1 30); do
@@ -121,6 +131,11 @@ jobs:
           --test postgres_migrate
           --test postgres_load
           --locked
+
+      - name: Phase D5b backup/restore + 安装器 PG 探测
+        run: |
+          cargo test -p rustboard-hub --test phase_d_backup --locked
+          cargo test -p rustboard-hub --bin rustboard-hub install_cmd::tests --locked
 
   e2e:
     name: e2e 安全回归

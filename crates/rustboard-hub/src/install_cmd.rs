@@ -36,6 +36,9 @@ use rustboard_install::{
     PathOverrides, Paths, Prompt, Role, RoleState, ServiceManager,
 };
 
+// 与备份/迁移使用同一份 21 张业务表清单，避免守卫与迁移校验的表集合漂移。
+use crate::backup_cmd::HUB_TABLES;
+
 // C5 只读诊断。用 `#[path]` 直接挂到 install_cmd 下，避免改 main.rs 与 C4 的
 // `mod acme;` / `tls` 子命令冲突。
 #[path = "tls_diag.rs"]
@@ -516,19 +519,12 @@ fn ensure_db_args_match_backend(args: &InstallArgs, cfg: &HubConfig) -> Result<(
     )
 }
 
-/// 判断旧 SQLite 是否已有业务数据时探测的表（任一非空即拒绝切换）。
-///
-/// 不遍历全部 21 张表：`samples` 是主数据，`agents` / `api_tokens` 覆盖已纳管
-/// 与现有凭据；真正的全表校验由随后的 `rustboard-hub migrate` 负责。
-const SQLITE_DATA_PROBE_TABLES: [&str; 3] = ["samples", "api_tokens", "agents"];
-
 /// 只读判断 SQLite 是否已有业务数据；返回第一张非空表。
 ///
-/// - 文件不存在：视为空（全新安装 / 尚未创建）；
-/// - 只有 schema、没有行，或 0 字节文件：视为空；
-/// - 符号链接 / 非普通文件 / 打开或读取失败：fail-closed 返回错误，不能在
-///   无法确认时允许切换（避免掩盖数据）；
-/// - 缺表按空处理，兼容旧 schema / 尚未迁移的库。
+/// 探测全部 21 张业务表（复用 `backup_cmd::HUB_TABLES`，与备份/迁移同一份
+/// 清单）。文件不存在、只有 schema 没有行、或 0 字节文件视为空；
+/// 符号链接 / 非普通文件 / 打开或读取失败时 fail-closed 返回错误，不能在
+/// 无法确认时允许切换（避免掩盖数据）；缺表按空处理，兼容旧 schema。
 fn sqlite_business_data_table(path: &Path) -> Result<Option<&'static str>> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -559,7 +555,7 @@ fn sqlite_business_data_table(path: &Path) -> Result<Option<&'static str>> {
             })?;
     conn.busy_timeout(Duration::from_secs(5))
         .context("设置 SQLite busy_timeout 失败")?;
-    for table in SQLITE_DATA_PROBE_TABLES {
+    for table in HUB_TABLES {
         let exists: i64 = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -2724,6 +2720,9 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
                 guard.disarm();
             }
             print_install_success(&plan);
+            // systemd 不继承安装进程环境；无密码 DSN + env 密码必须显式提示
+            // 手工写 EnvironmentFile，否则重启后 PG 认证失败。
+            warn_systemd_pg_password_env(&plan);
             if requested_tls.is_acme() && !plan.cfg.tls.mode.is_acme() {
                 eprintln!(concat!(
                     "注意：本次请求的是 ACME，但签发失败后已回退为 self-signed 安装；",
@@ -3312,6 +3311,73 @@ fn redacted_database(cfg: &HubConfig) -> String {
     match cfg.database_kind() {
         Ok(kind) => kind.redacted(),
         Err(_) => "<database 配置非法>".to_string(),
+    }
+}
+
+/// PostgreSQL 密码环境变量（与 D3 `PostgresStorage` 读取的变量名一致）。
+const DATABASE_PASSWORD_ENV: &str = "RUSTBOARD_DATABASE_PASSWORD";
+
+/// systemd 托管 + 无密码 DSN + 密码来自进程环境变量时的 WARN 文案。
+///
+/// systemd unit 不会继承安装进程的 `RUSTBOARD_DATABASE_PASSWORD`，重启后 hub
+/// 会认证失败。返回值只含配置路径与命令，不含密码 / DSN。
+fn systemd_pg_password_env_warning(
+    cfg: &HubConfig,
+    manage: bool,
+    env_password_present: bool,
+    paths: &Paths,
+) -> Option<String> {
+    if !manage || !env_password_present {
+        return None;
+    }
+    let Ok(DatabaseKind::Postgres(dsn)) = cfg.database_kind() else {
+        return None;
+    };
+    // URL 自带密码时重启仍能认证（env 只是覆盖），不需要这条 WARN。
+    if redact_database_url(&dsn) != dsn {
+        return None;
+    }
+    let config_dir = paths
+        .config
+        .parent()
+        .unwrap_or_else(|| Path::new("/etc/rustboard"));
+    let env_file = config_dir.join("hub.env");
+    let unit_dir = paths
+        .unit
+        .parent()
+        .unwrap_or_else(|| Path::new("/etc/systemd/system"));
+    let dropin = unit_dir
+        .join(format!("{}.d", Role::Hub.unit_name()))
+        .join("10-rustboard-env.conf");
+    Some(format!(
+        "警告：当前 PostgreSQL DSN 不含密码，密码来自本次安装进程的 \
+         {DATABASE_PASSWORD_ENV}。\n\
+         systemd 不会继承该环境变量，hub 重启后会认证失败。请手工持久化：\n  \
+         1) 创建 {}（0600，属主 root），内容：\n       \
+         {DATABASE_PASSWORD_ENV}=<密码>\n  \
+         2) 创建 {}：\n       \
+         [Service]\n       \
+         EnvironmentFile={}\n  \
+         3) systemctl daemon-reload && systemctl restart {}\n\
+         或改用带密码的 0600 hub.toml（不推荐：密码会进配置）。",
+        env_file.display(),
+        dropin.display(),
+        env_file.display(),
+        Role::Hub.unit_name()
+    ))
+}
+
+/// 安装成功后按当前进程环境打印 systemd 密码持久化 WARN（不输出密码）。
+fn warn_systemd_pg_password_env(plan: &InstallPlan<'_>) {
+    let env_password_present =
+        std::env::var_os(DATABASE_PASSWORD_ENV).is_some_and(|value| !value.is_empty());
+    if let Some(warning) = systemd_pg_password_env_warning(
+        plan.cfg,
+        plan.manager.manage,
+        env_password_present,
+        plan.paths,
+    ) {
+        eprintln!("{warning}");
     }
 }
 
@@ -4552,7 +4618,12 @@ mod tests {
         fs::write(&zero, b"").unwrap();
         assert_eq!(sqlite_business_data_table(&zero).unwrap(), None);
 
-        for table in SQLITE_DATA_PROBE_TABLES {
+        // 守卫与备份/迁移共用 21 张业务表清单；显式锁定 samples_1m / audit_log
+        // 也必须在探测范围内（评审要求：非主数据表同样不能被静默丢弃）。
+        assert_eq!(HUB_TABLES.len(), 21);
+        assert!(HUB_TABLES.contains(&"samples_1m"));
+        assert!(HUB_TABLES.contains(&"audit_log"));
+        for table in HUB_TABLES {
             let path = dir.path().join(format!("{table}.db"));
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(&format!(
@@ -4604,7 +4675,7 @@ mod tests {
     #[test]
     fn install_db_postgres_refuses_nonempty_sqlite_without_rewriting_config() {
         let secret = "switch-secret-91ac";
-        for table in SQLITE_DATA_PROBE_TABLES {
+        for table in HUB_TABLES {
             let dir = TempDir::new(&format!("pg-switch-nonempty-{table}"));
             let paths = Paths::for_role(Role::Hub, dir.path(), PathOverrides::default()).unwrap();
             fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
@@ -4716,6 +4787,45 @@ mod tests {
             fs::write(data_dir.join("rustboard.db"), b"").unwrap();
         });
         check_case("pg-switch-missing-file", &|_data_dir| {});
+    }
+
+    /// systemd + 无密码 DSN + env 密码：安装完成必须给出可执行的持久化提示，
+    /// 且提示不包含密码/DSN；URL 自带密码、非托管、SQLite 都不提示。
+    #[test]
+    fn systemd_pg_password_env_warning_is_actionable() {
+        let paths = Paths::for_role(Role::Hub, Path::new("/"), PathOverrides::default()).unwrap();
+        let pg = HubConfig {
+            database: "postgres://rustboard@db.example.com:5432/rustboard?sslmode=verify-full"
+                .to_string(),
+            ..HubConfig::default()
+        };
+        let warning = systemd_pg_password_env_warning(&pg, true, true, &paths)
+            .expect("无密码 DSN + env 密码 + systemd 必须提示");
+        for needle in [
+            "RUSTBOARD_DATABASE_PASSWORD",
+            "hub.env",
+            "EnvironmentFile=",
+            "daemon-reload",
+            "systemctl restart rustboard-hub.service",
+        ] {
+            assert!(warning.contains(needle), "缺少 {needle}: {warning}");
+        }
+        assert!(
+            !warning.contains("db.example.com"),
+            "提示不应回显 DSN: {warning}"
+        );
+
+        // 非 systemd 托管、没有 env 密码、URL 自带密码、SQLite：均不提示。
+        assert!(systemd_pg_password_env_warning(&pg, false, true, &paths).is_none());
+        assert!(systemd_pg_password_env_warning(&pg, true, false, &paths).is_none());
+        let pg_url_password = HubConfig {
+            database: "postgres://rustboard:url-pw@db.example.com/rustboard".to_string(),
+            ..HubConfig::default()
+        };
+        assert!(systemd_pg_password_env_warning(&pg_url_password, true, true, &paths).is_none());
+        assert!(
+            systemd_pg_password_env_warning(&HubConfig::default(), true, true, &paths).is_none()
+        );
     }
 
     /// 有本地 PG 时验证真实探测链路（open → apply_schema → ping）；无 env 明确 SKIP。

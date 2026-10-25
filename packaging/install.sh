@@ -55,11 +55,16 @@ usage() {
                            且从 / 到 prefix 的已存在组件必须 root 所有、非符号
                            链接、group/other 不可写。测试建议用 /opt 下的新目录，
                            不要用 /tmp（通常 1777）。
-  --offline                离线安装（自签默认）。与 --tls acme-* 互斥；
-                           未显式给出时，自签安装会自动追加。
+  --offline                离线安装（自签默认）。与 --tls acme-*、--db postgres://…
+                           互斥；未显式给出时，自签 + SQLite 安装会自动追加。
   --tls MODE               hub 服务端证书来源：self-signed（默认）/
                            acme-domain / acme-ip。ACME 模式必须同时给
                            --acme-email 与 --domain，且不会自动追加 --offline。
+  --db DSN                 hub 数据库：sqlite（默认）或 postgres:// /
+                           postgresql:// 连接串。PostgreSQL 安装需要联网执行
+                           schema + ping，本脚本不会自动追加 --offline；
+                           显式 --offline 会失败。不会自动建库/建角色，
+                           有数据的 SQLite 切 PG 需先用 hub migrate。
   --dry-run                只打印计划，不写文件；本脚本也不会写 web。
   --token-file F           agent enrollment token 文件（0600）
   --hub-token-file F       panel 读取的 hub 管理 token 文件（0600）
@@ -84,11 +89,15 @@ usage() {
   ACME（--tls acme-domain|acme-ip）必须联网完成 80/443 挑战：显式给 ACME
   模式时本脚本不会追加 --offline；--offline 与 ACME 同时出现会在写任何文件
   之前失败。ACME 的端口 / 防火墙 / 安全组只做只读诊断，脚本不会自动修改。
+  PostgreSQL（--db postgres:// / postgresql://）同样需要联网探测：本脚本不会
+  追加 --offline，显式 --offline 会在写任何文件之前失败。
 
 示例:
   sudo ./install.sh hub --yes
   sudo ./install.sh hub --yes --tls acme-domain \
       --acme-email admin@example.com --domain board.example.com
+  sudo ./install.sh hub --yes \
+      --db 'postgres://rustboard@db.example.com:5432/rustboard?sslmode=verify-full'
   sudo ./install.sh panel --yes --prefix /opt/rustboard-test
   sudo ./install.sh agent --yes --hub wss://<hub-host>:8443/agent/ws \
       --token-file /root/agent.token --fingerprint SHA256:<64-hex>
@@ -699,6 +708,30 @@ read_tls_mode() {
     printf '%s' "$mode"
 }
 
+# 本次参数里的 --db 是否为 PostgreSQL（最后一个 --db 生效，与 clap 一致）。
+# 只判断 scheme，不解析/打印 DSN；密码不会进入日志。
+db_is_postgres() {
+    local i=0 arg db=""
+    while ((i < ${#ARGS[@]})); do
+        arg=${ARGS[i]}
+        case $arg in
+            --db)
+                ((i + 1 < ${#ARGS[@]})) || die "--db 缺少取值"
+                db=${ARGS[i + 1]}
+                i=$((i + 2))
+                ;;
+            --db=*)
+                db=${arg#--db=}
+                i=$((i + 1))
+                ;;
+            *)
+                i=$((i + 1))
+                ;;
+        esac
+    done
+    [[ $db == postgres://* || $db == postgresql://* ]]
+}
+
 # 是否是 ACME 证书模式。
 is_acme_tls_mode() {
     case $1 in
@@ -750,6 +783,11 @@ fi
 # 在任何写文件 / 校验和 / 解包之前拒绝 offline + ACME。
 if is_acme_tls_mode "$TLS_MODE" && has_arg --offline; then
     die "--offline 与 --tls $TLS_MODE 互斥：ACME 必须联网完成证书挑战；请去掉 --offline，或改用 --tls self-signed"
+fi
+# 同理，PostgreSQL 安装需要联网执行 schema + ping：显式 --offline 必须在写
+# 任何文件之前失败，不能等到 hub install 才拒绝。
+if [[ $ROLE == hub ]] && db_is_postgres && has_arg --offline; then
+    die "--offline 与 --db postgres://… 互斥：PostgreSQL 安装需要联网探测（apply_schema/ping）；请去掉 --offline，或改用 SQLite"
 fi
 
 scan_secret_args
@@ -859,6 +897,10 @@ fi
 if is_acme_tls_mode "$TLS_MODE"; then
     # 显式 ACME 时绝不追加 --offline（用户也可能把参数写在数组里）。
     log "证书模式: $TLS_MODE（需要访问 ACME 目录，不追加 --offline）"
+elif [[ $ROLE == hub ]] && db_is_postgres; then
+    # PostgreSQL 安装必须连接数据库执行 apply_schema + ping；显式 --offline
+    # 已在入口校验阶段拒绝，这里只说明不追加。
+    log "数据库: PostgreSQL（需要联网探测；不自动追加 --offline，连接串不回显）"
 elif has_arg --force; then
     # 已有配置可能是 ACME，脚本看不到 hub.toml 的 tls.mode；--force 时不要
     # 自动注入 --offline，由 hub install 读取既有配置后决定（既有 ACME 会

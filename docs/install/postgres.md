@@ -83,6 +83,9 @@ schema 与探活，因此：
 
 - `install --offline --db postgres://…` 在写盘前明确失败；
 - 已有 `hub.toml` 是 PG、又被注入 `--offline`（例如打包脚本）时同样失败；
+- `packaging/install.sh` 会检测透传的 `--db postgres://…`：**不会**自动追加
+  `--offline`，显式 `--offline` 会在写任何文件之前失败（与 Docker entrypoint
+  一致）；`--db sqlite` / 未给 `--db` 仍按原逻辑自动追加；
 - 不能“离线写一个未验证的 PG URL 等启动时再试”。
 
 需要离线时请继续用 SQLite。
@@ -137,8 +140,28 @@ db_sslrootcert = "/etc/rustboard/pg-ca.pem"
 约定：
 
 - 不要把密码写进 unit 的 `ExecStart`、Compose 文件或仓库；
-- systemd 部署可用 0600 的 `EnvironmentFile`（如 `/etc/rustboard/hub.env`，
-  `RUSTBOARD_DATABASE_PASSWORD=...`），unit 里只写 `EnvironmentFile=`；
+- **systemd 托管 + 无密码 DSN**：密码只来自安装进程的
+  `RUSTBOARD_DATABASE_PASSWORD`，unit 默认**不会**继承该环境变量，重启后会认证
+  失败。安装器检测到该组合时会打印 WARN；必须手工持久化（0600，root 所有）：
+
+  ```bash
+  install -d -m 0700 /etc/rustboard
+  printf '%s\n' 'RUSTBOARD_DATABASE_PASSWORD=REPLACE_WITH_STRONG_PASSWORD' \
+    > /etc/rustboard/hub.env
+  chmod 0600 /etc/rustboard/hub.env
+
+  install -d -m 0755 /etc/systemd/system/rustboard-hub.service.d
+  cat >/etc/systemd/system/rustboard-hub.service.d/10-rustboard-env.conf <<'EOF'
+  [Service]
+  EnvironmentFile=/etc/rustboard/hub.env
+  EOF
+
+  systemctl daemon-reload
+  systemctl restart rustboard-hub
+  ```
+
+  也可以用带密码的 0600 `hub.toml`（不推荐：密码会进配置）。容器部署由
+  entrypoint 导出环境变量，不受此限制。
 - 日志、错误、`--dry-run`、`docker inspect` 都可能暴露环境变量；限制访问，
   排障时只贴脱敏后的 DSN（`postgres://user:***@host/db`）；
 - 安装器 / hub 的错误信息不会回显 userinfo 密码。
@@ -183,7 +206,7 @@ rustboard-hub backup --out /var/lib/rustboard/backups --yes
 - `--out` 只给根目录，命令会在其下创建 `<UTC timestamp>/`；`restore --from`
   指向这个具体子目录。备份目录包含：
   - SQLite：`rustboard.db`（`VACUUM INTO` 快照）；PostgreSQL：`rustboard.dump`
-    （`pg_dump --format=custom`）；
+    （`pg_dump --format=custom --no-owner --no-privileges`）；
   - `hub.toml`、`certs/`（证书与私钥）和 `manifest.json`；
 - `manifest.json` 记录 manifest 格式版本、RustBoard 版本、schema、后端、创建时间，
   以及每个文件的相对路径、SHA256、大小和权限；目录 0700，配置/私钥/备份文件 0600；
@@ -195,16 +218,40 @@ rustboard-hub backup --out /var/lib/rustboard/backups --yes
 ### 6.2 恢复
 
 ```bash
+# 当前 /etc/rustboard/hub.toml 存在：目标 data_dir/database 以该配置为准
 rustboard-hub restore --from /var/lib/rustboard/backups/<timestamp> --yes
+
+# 当前配置不存在（裸机/新主机）：必须显式给 --data-dir（绝对路径）
+rustboard-hub restore --from /var/lib/rustboard/backups/<timestamp> \
+  --data-dir /var/lib/rustboard/hub --yes
+
+# 恢复 PostgreSQL 备份且配置不存在：还必须给 --db 指向当前目标
+rustboard-hub restore --from /var/lib/rustboard/backups/<timestamp> \
+  --data-dir /var/lib/rustboard/hub \
+  --db 'postgres://rustboard@db.example.com:5432/rustboard?sslmode=verify-full' \
+  --yes
 ```
 
 - 只接受包含 `manifest.json` 的备份目录；先完整校验 manifest 版本与每个文件的
-  SHA256/大小/路径，任何不一致都在写目标前失败；
-- 依次恢复数据库、证书、配置（配置最后写）；PG 需要外部 `pg_restore`；
-- 目标非空时默认拒绝，必须 `--force`；恢复前会尽量备份当前目标（失败只 WARN）；
-  目标路径含符号链接或 `..` 会在写入前拒绝；
-- 恢复用的 `data_dir`/后端来自备份内的 `hub.toml`，`--config` 只决定配置写回
-  的位置；恢复同样要求 hub 已停止；
+  SHA256/大小/路径，任何不一致都在写目标前失败；备份目录中的 `hub.toml` **不会**
+  被信任为写入路径；
+- **目标路径只来自本机当前 `--config`**：当前配置存在时，`data_dir` / `database`
+  以配置为准；配置不存在时必须给 `--data-dir`（绝对路径），SQLite 的 DB 固定为
+  `<data-dir>/rustboard.db`，PG 还必须用 `--db` 指定当前目标。恢复时会打印
+  绝对目标（数据库、`certs/`、`hub.toml`）；备份内 hub.toml 的这两个路径会被
+  重写为目标值后写回，其余字段保留；
+- 当前配置存在时不允许再给 `--data-dir`/`--db`（避免配置与参数打架）；配置不存在
+  且缺 `--data-dir`（SQLite/PG）或 PG 缺 `--db`，在写任何文件前失败；
+- 依次恢复数据库、证书、配置（配置最后写）；PG 需要外部 `pg_restore`
+  （`--clean --if-exists --no-owner --no-privileges --single-transaction`）；
+- 目标非空时默认拒绝，必须 `--force`；非空目标的恢复前快照失败会**直接中止**，
+  不会在无备份情况下覆盖。只有显式 `--no-pre-restore-backup` 才跳过这个保护；
+- 目标路径含符号链接或 `..` 会在写入前拒绝。**SQLite 目标若存在 `-wal`/`-shm`/
+  `-journal`，restore 直接拒绝**：必须先干净停止 hub 并确认/删除这些 sidecar，
+  否则 SQLite 会重放旧 WAL。rename 前后还会校验 SHA256、`quick_check` 与 21 张
+  表行数；失败会用恢复前副本回滚（没有旧库则删除新库）并报错；
+- 恢复同样要求 hub 已停止：有 systemd unit 且明确 inactive 可继续；无 systemd、
+  unit 不存在或状态无法确认时，必须显式 `--hub-stopped`；
 - **文件属主**：恢复以哪个用户执行，写出的配置/证书/数据库就归哪个用户。root
   执行后需把 `/etc/rustboard`、`/var/lib/rustboard` 交回 hub 运行用户；Docker
   `--user 10001:10001` 场景需 `chown -R 10001:10001`，或直接以该用户运行恢复，
@@ -235,16 +282,24 @@ rustboard-hub migrate \
   不删除 SQLite**；
 - 只有迁移与校验全部成功后才原子改写 `hub.toml` 的 `database`，并保留旧配置
   `.bak-<ts>`；随后启动 hub，检查 `/healthz`、agent、面板与告警；
-- `--dry-run` 不 apply schema、不写数据、不创建备份目录、不改配置；但**目标非空
-  且未指定 `--force` 时仍以非零码退出**，提示实际迁移会被拒绝；
+- `--dry-run` 不 apply schema、不写数据、不创建备份目录、不改配置；源库预检在
+  无 `-wal`/`-journal` 时用 immutable 只读打开，存在未 checkpoint WAL 时先复制
+  DB+WAL 到 0700 临时目录再读，源目录零写入；但**目标非空且未指定 `--force`
+  时仍以非零码退出**，提示实际迁移会被拒绝；
 - 有 `/run/systemd/system` 时用 `systemctl is-active rustboard-hub` 拒绝运行中的
-  hub；没有 systemd 时只打印 WARN，不读取/伪造 PID 文件，由 `--yes`/交互确认与
-  迁移前备份兜底；
+  hub；unit 明确 `inactive`/`failed` 可继续；没有 systemd、unit 不存在或状态无法
+  确认时**必须显式 `--hub-stopped`**（先停 hub，再由人工确认）。不读取/伪造 PID
+  文件；迁移开始即持有目标端的会话级 advisory lock，覆盖
+  `inspect → pg_dump → TRUNCATE → import → 配置切换`，并发 migrate 会串行等待。
+  该锁使用 `sslmode=disable` 的专用连接；`verify-full` 目标拿不到锁时非 force
+  迁移会 WARN 并依赖 core 导入事务的空库复验与表锁，`--force` 非空目标仍要求
+  `sslmode=disable`；
 - 目标非空：默认拒绝；`--force` 会先 `pg_dump` 目标、二次确认后清空 21 张业务表
   （保留 `schema_migrations`）。**当前限制**：`--force` 的清空路径只支持显式
   `sslmode=disable`（内部使用 NoTls）；`verify-full` 的非空目标需先手工备份并
   `TRUNCATE` 21 张业务表，再不带 `--force` 迁移；
-- `--force` 目标非空时需要外部 `pg_dump`；目标为空时不需要；
+- `--force` 目标非空时需要外部 `pg_dump`（`--format=custom --no-owner
+  --no-privileges`）；目标为空时不需要；
 - 回滚：把 `database` 改回 SQLite 路径，或 `install --force --db sqlite`；
   SQLite 文件全程未被修改，迁移不是双写。
 
@@ -268,11 +323,11 @@ TS=$(date +%Y%m%dT%H%M%S)
 OUT=/var/lib/rustboard/backups/pg-$TS
 install -d -m 0700 "$OUT"
 # 重定向由 root shell 完成，备份文件不会以 postgres 用户身份落到目录外
-sudo -u postgres pg_dump --format=custom --no-owner rustboard > "$OUT/rustboard.dump"
+sudo -u postgres pg_dump --format=custom --no-owner --no-privileges rustboard > "$OUT/rustboard.dump"
 chmod 0600 "$OUT/rustboard.dump"
 
 # 3) 恢复前先备份当前目标；恢复到空库或全新数据库
-sudo -u postgres pg_restore --clean --if-exists --no-owner \
+sudo -u postgres pg_restore --clean --if-exists --no-owner --no-privileges \
   --dbname=rustboard "$OUT/rustboard.dump"
 
 # 4) 启动并验证
@@ -302,10 +357,15 @@ docker compose -f docker/compose.example.yml \
   -f docker/compose.postgres.example.yml up -d
 ```
 
-- `postgres` 服务不发布 5432，只走 compose 内网；
+- `postgres` 服务默认 pin `postgres:16-alpine`，与 CI/文档的 PG16 备份客户端
+  （`pg_dump`/`pg_restore`）对齐；换 17 时需同步 client 版本。**不发布 5432**，
+  只走 compose 内网；
 - 密码用 Docker secret：PG 侧 `POSTGRES_PASSWORD_FILE`，hub 侧
   `RUSTBOARD_DATABASE_PASSWORD_FILE`（entrypoint 读取后导出为
   `RUSTBOARD_DATABASE_PASSWORD`，不打印）；
+- 只设 `RUSTBOARD_DATABASE_PASSWORD(_FILE)`、未设 `RUSTBOARD_DATABASE` 时：
+  全新 volume 直接失败（拒绝静默 SQLite）；已初始化 volume 仅当 `hub.toml`
+  已使用 `postgres://` 时允许（运行时密码），否则失败；
 - `RUSTBOARD_DATABASE_SSLROOTCERT` 对应 `--db-sslrootcert`，需只读挂载 PEM；
 - 示例为 stock 镜像无 TLS，使用 `sslmode=disable`；生产请给 PG 配证书并改成
   `verify-full`；

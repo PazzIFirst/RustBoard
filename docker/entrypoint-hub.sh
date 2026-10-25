@@ -14,7 +14,8 @@
 #   首次安装时映射为 `--db`，已有配置不改写；该模式需要联网探测，安装阶段不
 #   追加 --offline。RUSTBOARD_DATABASE_SSLROOTCERT 映射 `--db-sslrootcert`；
 #   RUSTBOARD_DATABASE_PASSWORD_FILE 读取后导出为 RUSTBOARD_DATABASE_PASSWORD；
-#   连接串与密码绝不打印；
+#   连接串与密码绝不打印。未设 RUSTBOARD_DATABASE 时，密码变量只允许用于
+#   已有 PostgreSQL 配置；全新 volume 或 SQLite 配置会直接失败，不静默回退；
 # - 已初始化的 volume 支持 `docker run --user 10001:10001`，此时只校验配置可读，
 #   不执行 install / chown；非 root 启动不保留绑定低端口的能力，不建议用于 ACME；
 # - 失败时以非零码退出，不启动服务，也不删除已有 /data 数据。
@@ -83,9 +84,12 @@ validate_tls_mode_env() {
 #   容器内绝对路径的普通文件；
 # - RUSTBOARD_DATABASE_PASSWORD_FILE 读取后导出为 RUSTBOARD_DATABASE_PASSWORD
 #   （hub 只认环境变量），便于使用 Docker secret；与直接设置密码互斥。
-#   文件末尾的换行会被命令替换去掉。
+#   文件末尾的换行会被命令替换去掉；
+# - 只设 RUSTBOARD_DATABASE_PASSWORD(_FILE) 而不设 RUSTBOARD_DATABASE 时：
+#   全新 volume 直接失败（拒绝静默初始化 SQLite）；已初始化 volume 仅在
+#   hub.toml 的 database 已是 postgres:// 时允许（运行时密码），否则失败。
 validate_database_env() {
-  local raw cert pw_file pw authority userinfo
+  local raw cert pw_file pw authority userinfo have_password
 
   raw="$(trim "${RUSTBOARD_DATABASE:-}")"
   if [ -n "$raw" ]; then
@@ -125,9 +129,27 @@ validate_database_env() {
   DATABASE_SSLROOTCERT="$cert"
 
   pw_file="$(trim "${RUSTBOARD_DATABASE_PASSWORD_FILE:-}")"
+  [ -z "$pw_file" ] || [ -z "${RUSTBOARD_DATABASE_PASSWORD:-}" ] \
+    || die "RUSTBOARD_DATABASE_PASSWORD 与 RUSTBOARD_DATABASE_PASSWORD_FILE 不能同时设置"
+  have_password=0
+  [ -n "${RUSTBOARD_DATABASE_PASSWORD:-}" ] && have_password=1
+  [ -n "$pw_file" ] && have_password=1
+
+  # 只设密码、没设 DSN：全新 volume 会静默初始化 SQLite，必须拒绝；已初始化
+  # volume 允许（密码用于运行时连接已有 PG 配置），但配置必须确实是 postgres。
+  if [ -z "$raw" ] && [ "$have_password" -eq 1 ]; then
+    if [ ! -e "$CONFIG_FILE" ]; then
+      die "设置了 RUSTBOARD_DATABASE_PASSWORD(_FILE) 但没有 RUSTBOARD_DATABASE：\
+首次初始化拒绝静默使用 SQLite；请同时设置 PostgreSQL DSN"
+    fi
+    if ! grep -qE "^[[:space:]]*database[[:space:]]*=[[:space:]]*[\"'](postgres|postgresql)://" "$CONFIG_FILE"; then
+      die "已设置 RUSTBOARD_DATABASE_PASSWORD(_FILE)，但 $CONFIG_FILE 的 database 不是 postgres://；\
+请移除密码变量或修正配置（不打印配置内容）"
+    fi
+    log "提示: 未设置 RUSTBOARD_DATABASE；密码环境变量只用于已有 PostgreSQL 配置的运行时连接"
+  fi
+
   if [ -n "$pw_file" ]; then
-    [ -z "${RUSTBOARD_DATABASE_PASSWORD:-}" ] \
-      || die "RUSTBOARD_DATABASE_PASSWORD 与 RUSTBOARD_DATABASE_PASSWORD_FILE 不能同时设置"
     case "$pw_file" in
       /*) ;;
       *) die "RUSTBOARD_DATABASE_PASSWORD_FILE 必须是容器内绝对路径" ;;

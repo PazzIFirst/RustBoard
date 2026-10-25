@@ -580,9 +580,10 @@ docker compose -f docker/compose.example.yml \
   -f docker/compose.postgres.example.yml up -d
 ```
 
-叠加文件增加 `postgres:17-alpine`（16 也可）、`postgres_data` volume，并给 hub
-注入数据库环境变量。**5432 不发布**，只在 compose 默认网络内可达。完整的
-安装/权限/备份说明见 [PostgreSQL 安装文档](../docs/install/postgres.md)。
+叠加文件增加 `postgres:16-alpine`（与 CI/文档的 PG16 备份客户端对齐；17 需自行
+同步 client 版本）、`postgres_data` volume，并给 hub 注入数据库环境变量。
+**5432 不发布**，只在 compose 默认网络内可达。完整的安装/权限/备份说明见
+[PostgreSQL 安装文档](../docs/install/postgres.md)。
 
 ### 14.1 数据库环境变量
 
@@ -604,6 +605,10 @@ docker compose -f docker/compose.example.yml \
 - 示例用 `sslmode=disable`（stock 镜像无 TLS），只适合本机/受信内网。生产请给
   PostgreSQL 配证书，把 DSN 改成 `?sslmode=verify-full`，并用
   `RUSTBOARD_DATABASE_SSLROOTCERT` 只读挂载私有 CA。不要用 `require`/`prefer`。
+- **只设密码、不设 `RUSTBOARD_DATABASE` 时**：全新 volume 会直接失败（拒绝静默
+  初始化 SQLite）；已初始化 volume 仅当 `hub.toml` 的 `database` 已是
+  `postgres://` 时允许（密码用于运行时连接），否则同样失败。不要只挂密码
+  secret 就启动一个空 volume。
 
 ### 14.2 已有 volume / 迁移
 

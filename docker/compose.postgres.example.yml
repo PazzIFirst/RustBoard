@@ -40,8 +40,9 @@
 
 services:
   postgres:
-    # 16、17 都支持；需要固定小版本时改成 postgres:17.2-alpine 之类的 tag。
-    image: postgres:17-alpine
+    # 与 CI/文档的 PostgreSQL 16 客户端（pg_dump/pg_restore）对齐，默认 pin 16。
+    # 需要 17 时改成 postgres:17-alpine，并同步升级备份工具的 client 版本。
+    image: postgres:16-alpine
     restart: unless-stopped
     environment:
       POSTGRES_DB: rustboard

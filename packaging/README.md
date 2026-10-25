@@ -102,11 +102,16 @@ hub / panel 会把包内 `share/rustboard/web` 原子安装到：
 网络探测**；本地端口 bind、loopback `/healthz` 检查、systemd 操作仍会发生。安装
 本身不需要外网，包内已包含二进制、前端和 unit。
 
+例外：显式 ACME 模式、`--force` 已有安装、以及透传 `--db postgres://…`
+（PostgreSQL 安装需要联网执行 schema + ping）时**不会**自动追加 `--offline`。
+`--db postgres://…` 与显式 `--offline` 同时出现会在写任何文件之前失败；SQLite
+默认路径不变。详见 `docs/install/postgres.md` §2.4。
+
 离线安装示例：
 
 ```bash
 sudo ./install.sh hub --offline --yes --prefix /opt/rustboard-v100-offline
-# 或者不写 --offline，脚本会自动追加
+# 或者不写 --offline，脚本会自动追加（SQLite + 自签）
 sudo ./install.sh hub --yes --prefix /opt/rustboard-v100-offline
 ```
 
