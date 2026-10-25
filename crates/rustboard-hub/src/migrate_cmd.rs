@@ -46,6 +46,54 @@ pub struct MigrateArgs {
     /// 非交互执行（不读取 stdin）。
     #[arg(long)]
     pub yes: bool,
+    /// 显式声明 hub 已停止（无 systemd / unit 不存在时必须提供）。
+    #[arg(long)]
+    pub hub_stopped: bool,
+}
+
+/// 迁移 CLI 的会话级 advisory lock：固定 key，与 core 的 schema/维护锁区分。
+///
+/// 覆盖 `inspect_target → pg_dump → TRUNCATE → core import → 配置切换` 整个流程。
+/// 多进程同时 `migrate --force` 时，第二个会在 `pg_advisory_lock` 上等待，不会在
+/// 第一个清空/导入期间再次 dump+TRUNCATE。
+const MIGRATE_ADVISORY_LOCK_KEY: i64 = 0x5242_5047_0000_0013;
+
+/// 持有 session 级 advisory lock 的 RAII guard。
+///
+/// 用 `Box<dyn FnOnce()>` 持有连接，避免在 hub 里直接命名 `postgres::Client`
+/// （hub 不是 `postgres` crate 的直接依赖）。Drop 时先 unlock 再关闭连接；
+/// 即使 unlock 失败，连接关闭也会释放 session lock。
+struct MigrateLock {
+    release: Option<Box<dyn FnOnce()>>,
+}
+
+impl MigrateLock {
+    fn acquire(dsn: &str) -> Result<Self> {
+        let mut client =
+            connect_for_schema(dsn).context("建立迁移串行化连接失败（需要 sslmode=disable）")?;
+        client
+            .query_one("SELECT pg_advisory_lock($1)", &[&MIGRATE_ADVISORY_LOCK_KEY])
+            .context("获取迁移 advisory lock 失败（可能有另一个 migrate 正在运行）")?;
+        let release: Box<dyn FnOnce()> = Box::new(move || {
+            if let Err(err) = client.query_one(
+                "SELECT pg_advisory_unlock($1)",
+                &[&MIGRATE_ADVISORY_LOCK_KEY],
+            ) {
+                eprintln!("WARN: 释放迁移 advisory lock 失败（连接关闭仍会释放）: {err}");
+            }
+        });
+        Ok(Self {
+            release: Some(release),
+        })
+    }
+}
+
+impl Drop for MigrateLock {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
 }
 
 /// 目标 PostgreSQL 当前状态。
@@ -76,7 +124,10 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
             source.display()
         );
     }
-    let source_version = backup_cmd::sqlite_schema_version(&source)?;
+    // 预检一次性读取版本/21 张表/samples；有未 checkpoint WAL 时会在临时副本
+    // 上读取，dry-run 不会在源目录创建 -shm/-wal。
+    let source_info = backup_cmd::sqlite_source_info(&source)?;
+    let source_version = source_info.schema_version;
     if source_version != backup_cmd::SQLITE_SCHEMA_VERSION {
         bail!(
             "SQLite 源库 schema 版本为 {source_version}，migrate 只支持 v{}；\
@@ -84,7 +135,6 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
             backup_cmd::SQLITE_SCHEMA_VERSION
         );
     }
-    backup_cmd::validate_sqlite_source_tables(&source)?;
 
     let mut target_cfg = cfg.clone();
     target_cfg.database = args.to.clone();
@@ -99,8 +149,32 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
     };
     let target_redacted = dsn_redacted(&target_dsn);
 
-    // 2. 运行中的 hub 会持续写源库，迁移必须离线。
-    ensure_hub_stopped("migrate")?;
+    // 2. 运行中的 hub 会持续写源库，迁移必须离线。无 systemd/无法确认时必须
+    //    显式 --hub-stopped，不能仅凭 WARN 继续。
+    ensure_hub_stopped("migrate", args.hub_stopped)?;
+
+    // 2.1 串行化整个迁移流程。force 清空只支持 sslmode=disable；TLS 目标拿不到
+    //     会话锁时，非 force 路径仍可依赖 core 导入事务的空库复验与表锁，但这里
+    //     明确 WARN，避免声称覆盖了 dump/clear 阶段。
+    let _migrate_lock = match MigrateLock::acquire(&target_dsn) {
+        Ok(lock) => Some(lock),
+        Err(_) if args.force => {
+            return Err(anyhow!(
+                "--force 迁移必须获取会话级 advisory lock（{}）；请使用 sslmode=disable 目标或先用单进程手工串行",
+                target_redacted
+            ))
+        }
+        Err(_) => {
+            // 不打印底层错误链：postgres DSN 解析错误可能回显连接串。只报告
+            // 脱敏目标和事实，避免密码进日志。
+            eprintln!(
+                "WARN: 无法获取会话级迁移锁（{}）；非 force 迁移仅依赖 core 的导入事务空库复验/表锁，\
+                 并发 migrate 请使用 sslmode=disable 目标或手工串行",
+                target_redacted
+            );
+            None
+        }
+    };
 
     // 3. 连接目标（PostgresStorage::open 只做 SELECT 1，不 apply schema），
     //    只读校验空库/版本。同步 PG 驱动不能在 tokio runtime 内，CLI 本身安全。
@@ -122,6 +196,7 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
         print_dry_run(
             &source,
             source_version,
+            source_info.sample_count,
             &target_redacted,
             &target_state,
             args.force,
@@ -238,43 +313,91 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
 ///
 /// 不读取、也不伪造 PID 文件：systemd 部署用 `systemctl is-active`，其它部署
 /// 形态无法可靠判断，强行检查只会误报或漏报。
-pub(crate) fn ensure_hub_stopped(operation: &str) -> Result<()> {
+pub(crate) fn ensure_hub_stopped(operation: &str, declared_stopped: bool) -> Result<()> {
     if !Path::new("/run/systemd/system").is_dir() {
-        eprintln!(
-            "WARN: 未检测到 systemd，无法自动确认 rustboard-hub 是否已停止；\
-             请自行确认没有 hub/容器在写数据库（{operation} 前必须离线）"
-        );
-        return Ok(());
-    }
-    let output = match Command::new("systemctl")
-        .args(["is-active", "--quiet", "rustboard-hub"])
-        .stdin(Stdio::null())
-        .output()
-    {
-        Ok(output) => output,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "WARN: 存在 /run/systemd/system 但找不到 systemctl，无法确认 hub 状态；\
-                 请自行确认已停止（{operation} 前必须离线）"
-            );
+        if declared_stopped {
             return Ok(());
         }
-        Err(err) => {
-            return Err(err).with_context(|| {
-                "执行 systemctl is-active rustboard-hub 失败，无法确认 hub 是否已停止；请先停 hub 后重试"
-            })
-        }
-    };
-    if output.status.success() {
         bail!(
-            "检测到 rustboard-hub 正在运行（systemctl is-active rustboard-hub）；\
-             {operation} 必须在 hub 停止后执行：sudo systemctl stop rustboard-hub"
+            "无法确认 rustboard-hub 已停止（未检测到 systemd）；请先停 hub，\
+             确认后加 --hub-stopped 重试（{operation} 前必须离线）"
         );
     }
-    if output.status.code().is_none() {
-        bail!("无法确认 rustboard-hub 状态（systemctl 被信号终止）；请先停 hub 后重试");
+
+    let active = Command::new("systemctl")
+        .args(["is-active", "rustboard-hub"])
+        .stdin(Stdio::null())
+        .output();
+    let state = match active {
+        Ok(output) => {
+            let state = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_ascii_lowercase();
+            if output.status.success()
+                || matches!(
+                    state.as_str(),
+                    "active" | "activating" | "reloading" | "deactivating"
+                )
+            {
+                bail!(
+                    "检测到 rustboard-hub 正在运行（systemctl is-active: {state}）；\
+                     {operation} 必须在 hub 停止后执行：sudo systemctl stop rustboard-hub"
+                );
+            }
+            state
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if declared_stopped {
+                return Ok(());
+            }
+            bail!(
+                "存在 /run/systemd/system 但找不到 systemctl，无法确认 hub 已停止；\
+                 请先停 hub，确认后加 --hub-stopped 重试（{operation} 前必须离线）"
+            );
+        }
+        Err(err) => {
+            if declared_stopped {
+                return Ok(());
+            }
+            return Err(err).with_context(|| {
+                format!(
+                    "执行 systemctl is-active rustboard-hub 失败，无法确认 hub 是否已停止；\
+                     请先停 hub 后加 --hub-stopped 重试（{operation} 前必须离线）"
+                )
+            });
+        }
+    };
+
+    // `is-active` 对不存在的 unit 也可能输出 inactive（exit 4），不能只凭状态
+    // 判断。用 LoadState 区分「unit 已加载且未运行」与「unit 不存在/无法确认」。
+    let loaded = Command::new("systemctl")
+        .args(["show", "rustboard-hub", "-p", "LoadState", "--value"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .is_some_and(|state| state == "loaded");
+    if loaded && matches!(state.as_str(), "inactive" | "failed") {
+        return Ok(());
     }
-    Ok(())
+    if declared_stopped {
+        return Ok(());
+    }
+    bail!(
+        "无法确认 rustboard-hub 已停止（systemctl is-active: {}，unit {}）；\
+         请先停 hub，确认后加 --hub-stopped 重试（{operation} 前必须离线）",
+        if state.is_empty() { "<empty>" } else { &state },
+        if loaded {
+            "已加载"
+        } else {
+            "不存在或状态无法确认"
+        }
+    )
 }
 
 fn inspect_target(target: &PostgresStorage, redacted: &str) -> Result<TargetState> {
@@ -403,11 +526,11 @@ fn switch_config(config_path: &Path, old_bytes: &[u8], new_dsn: &str) -> Result<
 fn print_dry_run(
     source: &Path,
     source_version: i64,
+    samples: i64,
     target_redacted: &str,
     state: &TargetState,
     force: bool,
 ) -> Result<()> {
-    let samples = backup_cmd::sqlite_sample_count(source)?;
     println!("migrate --dry-run（只读校验，不写数据/不备份/不改配置）");
     println!(
         "  源: sqlite://{}（schema v{source_version}，samples {samples} 行，21 张表齐全）",

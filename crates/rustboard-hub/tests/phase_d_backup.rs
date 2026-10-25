@@ -15,9 +15,9 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use rustboard_common::config::HubConfig;
 use rustboard_common::model::{AgentRecord, Sample, SampleBatch};
@@ -29,15 +29,7 @@ use rustboard_core::storage::StorageHandle;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-/// 同一测试二进制内串行化所有真实 PG 用例（共用 RUSTBOARD_TEST_PG 数据库）。
-static PG_SERIAL: Mutex<()> = Mutex::new(());
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
-
-fn pg_serial() -> MutexGuard<'static, ()> {
-    PG_SERIAL
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 /// 测试目录；Drop 时递归删除。
 struct TestRoot {
@@ -68,11 +60,103 @@ impl Drop for TestRoot {
 }
 
 fn hub(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rustboard-hub"))
-        .args(args)
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rustboard-hub"));
+    command.args(args);
+    // 本地测试机没有 rustboard-hub unit（systemd 视为无法确认），显式声明已停。
+    if matches!(args.first(), Some(&"migrate") | Some(&"restore")) {
+        command.arg("--hub-stopped");
+    }
+    command
         .env_remove("RUSTBOARD_DATABASE_PASSWORD")
         .output()
         .expect("执行 rustboard-hub")
+}
+
+fn remove_sqlite_sidecars(path: &Path) {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = path.with_file_name(format!(
+            "{}{suffix}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("db")
+        ));
+        match fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("清理 {} 失败: {err}", sidecar.display()),
+        }
+    }
+}
+
+fn read_config(path: &Path) -> HubConfig {
+    let text = fs::read_to_string(path).expect("读配置");
+    toml::from_str(&text).expect("解析配置")
+}
+
+/// 列出测试目录下的所有文件/目录相对路径，用于断言 dry-run 零新文件。
+fn list_tree(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, current: &Path, out: &mut Vec<String>) {
+        let mut entries: Vec<_> = fs::read_dir(current)
+            .expect("读取目录")
+            .map(|entry| entry.expect("目录项").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            out.push(
+                path.strip_prefix(root)
+                    .expect("相对路径")
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+            if path.is_dir() {
+                walk(root, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+fn sqlite_sidecar(db: &Path, suffix: &str) -> PathBuf {
+    let mut os = db.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+/// 重写备份 manifest 中某个文件的 sha256/size，模拟“哈希自洽的恶意备份”。
+fn refresh_manifest_file(backup: &Path, rel: &str) {
+    let file_path = backup.join(rel);
+    let bytes = fs::read(&file_path).expect("读备份文件");
+    let manifest_path = backup.join("manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("读 manifest")).expect("解析");
+    let mut found = false;
+    for file in manifest["files"].as_array_mut().expect("files") {
+        if file["path"] == rel {
+            file["sha256"] = Value::String(sha256(&bytes));
+            file["size"] = Value::Number(bytes.len().into());
+            found = true;
+        }
+    }
+    assert!(found, "manifest 缺少 {rel}");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn quick_check_ok(path: &Path) {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("打开 SQLite 校验");
+    let check: String = conn
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .expect("quick_check");
+    assert_eq!(check, "ok");
 }
 
 fn combined(output: &Output) -> String {
@@ -345,6 +429,9 @@ fn sqlite_backup_restore_roundtrip_manifest_and_permissions() {
     let storage = StorageHandle::sqlite(&db_path, 4).expect("恢复后打开 SQLite");
     assert_seeded(&storage);
     drop(storage);
+    // 模拟干净停机：测试里刚打开的 StorageHandle 可能留下空 -wal，force 恢复
+    // 前必须清掉；带旧 WAL 的场景由专门用例覆盖「拒绝恢复」。
+    remove_sqlite_sidecars(&db_path);
     assert_eq!(
         fs::read(&config_path).unwrap(),
         config_bytes,
@@ -502,6 +589,69 @@ fn pg_dsn() -> Option<String> {
     }
 }
 
+static NEXT_DB: AtomicU64 = AtomicU64::new(0);
+
+/// 每个 PG 用例使用独立的临时数据库，避免与同进程/其它 cargo test（以及并行
+/// 的开发者测试）争用同一个 `RUSTBOARD_TEST_PG` 库。CI 的测试角色是 superuser，
+/// 本地测试库角色也需要 CREATEDB（与 core 的 PG 测试前提一致）。
+struct PgTestDb {
+    dsn: String,
+    admin_dsn: String,
+    name: String,
+}
+
+impl Drop for PgTestDb {
+    fn drop(&mut self) {
+        if let Ok(mut admin) = connect_for_schema(&self.admin_dsn) {
+            if let Err(err) = admin.batch_execute(&format!(
+                "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
+                self.name
+            )) {
+                eprintln!("WARN: 删除测试数据库 {} 失败: {err}", self.name);
+            }
+        }
+    }
+}
+
+fn dsn_with_database(base: &str, name: &str) -> String {
+    let (before_query, query) = match base.split_once('?') {
+        Some((before, query)) => (before, Some(query)),
+        None => (base, None),
+    };
+    let (prefix, _old) = before_query
+        .rsplit_once('/')
+        .expect("测试 DSN 必须包含数据库路径");
+    match query {
+        Some(query) => format!("{prefix}/{name}?{query}"),
+        None => format!("{prefix}/{name}"),
+    }
+}
+
+impl PgTestDb {
+    fn create() -> Option<Self> {
+        let base = pg_dsn()?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let name = format!(
+            "rb_d5b_{}_{}_{}",
+            std::process::id(),
+            nanos,
+            NEXT_DB.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut admin = connect_for_schema(&base).expect("连接 RUSTBOARD_TEST_PG 管理库");
+        admin
+            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+            .unwrap_or_else(|err| panic!("创建测试数据库 {name} 失败: {err}"));
+        Some(Self {
+            dsn: dsn_with_database(&base, &name),
+            admin_dsn: base,
+            name,
+        })
+    }
+}
+
 fn dsn_password(dsn: &str) -> Option<String> {
     let authority = dsn.split_once("://")?.1.split(['/', '?']).next()?;
     let userinfo = authority.rsplit_once('@')?.0;
@@ -615,11 +765,10 @@ fn seed_pg(dsn: &str) {
 
 #[test]
 fn pg_migrate_dry_run_success_force_and_config_switch() {
-    let Some(dsn) = pg_dsn() else {
+    let Some(db) = PgTestDb::create() else {
         return;
     };
-    let _guard = pg_serial();
-    reset_pg(&dsn);
+    let dsn = db.dsn.clone();
     let root = TestRoot::new("pg-migrate");
     let (config_path, db_path, data_dir, config_bytes) = setup_sqlite(root.path());
     let source_db_sha = file_sha(&db_path);
@@ -740,6 +889,7 @@ fn pg_migrate_dry_run_success_force_and_config_switch() {
             &dsn,
             "--force",
             "--yes",
+            "--hub-stopped",
         ])
         .env("PATH", fail_path)
         .env_remove("RUSTBOARD_DATABASE_PASSWORD")
@@ -797,6 +947,7 @@ fn pg_migrate_dry_run_success_force_and_config_switch() {
             &dsn,
             "--force",
             "--yes",
+            "--hub-stopped",
         ])
         .env("PATH", path)
         .env("RB_FAKE_ARGV", &argv_file)
@@ -841,11 +992,25 @@ fn tool_available(tool: &str) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+fn pg_server_major(dsn: &str) -> Option<u32> {
+    let mut client = connect_for_schema(dsn).ok()?;
+    let version: String = client.query_one("SHOW server_version", &[]).ok()?.get(0);
+    version.split('.').next()?.parse().ok()
+}
+
+fn pg_tool_major(tool: &str) -> Option<u32> {
+    let output = Command::new(tool).arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split_whitespace()
+        .find_map(|word| word.trim_start_matches('(').split('.').next()?.parse().ok())
+}
+
 #[test]
 fn pg_backup_restore_requires_real_client_tools() {
-    let Some(dsn) = pg_dsn() else {
+    let Some(db) = PgTestDb::create() else {
         return;
     };
+    let dsn = db.dsn.clone();
     if !tool_available("pg_dump") || !tool_available("pg_restore") {
         eprintln!(
             "SKIP: pg_dump/pg_restore 不在 PATH，跳过真实 PostgreSQL backup/restore 用例\
@@ -853,8 +1018,20 @@ fn pg_backup_restore_requires_real_client_tools() {
         );
         return;
     }
-    let _guard = pg_serial();
-    reset_pg(&dsn);
+    // pg_dump/pg_restore 大版本高于服务端时，17 的 dump 会带
+    // `SET transaction_timeout`，PG16 服务端无法执行；这是客户端/服务端版本
+    // 不匹配，不是产品回归。CI 固定 postgres:16 + postgresql-client 16。
+    if let Some(server) = pg_server_major(&dsn) {
+        if let Some(client) = pg_tool_major("pg_dump") {
+            if client > server {
+                eprintln!(
+                    "SKIP: pg_dump 大版本 {client} 高于服务端 {server}（transaction_timeout 不兼容）；\
+                     请安装与 postgres:16 匹配的 postgresql-client-16 后重跑"
+                );
+                return;
+            }
+        }
+    }
     seed_pg(&dsn);
     let root = TestRoot::new("pg-backup");
     let (config_path, data_dir, _config_bytes) = pg_config(root.path(), &dsn);
@@ -911,4 +1088,656 @@ fn pg_backup_restore_requires_real_client_tools() {
     );
     assert_seeded(&StorageHandle::postgres(pg_storage(&dsn)));
     assert!(data_dir.join("certs").is_dir());
+}
+
+/// 恶意备份：把备份内 hub.toml 的 data_dir/database 改到目标外，并同步刷新
+/// manifest 的 SHA256/大小（哈希完全自洽）。restore 必须忽略它，只写当前配置
+/// 指向的目标。
+#[test]
+fn restore_ignores_malicious_backup_paths_even_with_valid_manifest() {
+    let root = TestRoot::new("restore-malicious-target");
+    let (config_path, db_path, data_dir, _config_bytes) = setup_sqlite(root.path());
+    let out = root.path().join("backups");
+    let output = hub(&[
+        "backup",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--yes",
+    ]);
+    assert!(output.status.success(), "{}", combined(&output));
+    let backup = backup_dirs(&out).remove(0);
+    remove_sqlite_sidecars(&db_path);
+
+    let evil = root.path().join("evil-target");
+    let backup_config_path = backup.join("hub.toml");
+    let mut evil_cfg: toml::Value =
+        toml::from_str(&fs::read_to_string(&backup_config_path).unwrap()).unwrap();
+    evil_cfg["data_dir"] = toml::Value::String(evil.display().to_string());
+    evil_cfg["database"] = toml::Value::String(format!("sqlite://{}/rustboard.db", evil.display()));
+    fs::write(
+        &backup_config_path,
+        toml::to_string_pretty(&evil_cfg).unwrap(),
+    )
+    .unwrap();
+    refresh_manifest_file(&backup, "hub.toml");
+
+    let output = hub(&[
+        "restore",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--from",
+        backup.to_str().unwrap(),
+        "--force",
+        "--yes",
+    ]);
+    assert!(
+        output.status.success(),
+        "恶意备份路径不应阻止合法恢复: {}",
+        combined(&output)
+    );
+    assert!(!evil.exists(), "绝不能写到备份 hub.toml 指定目录");
+    let restored = read_config(&config_path);
+    assert_eq!(restored.data_dir, data_dir);
+    assert_eq!(restored.database, format!("sqlite://{}", db_path.display()));
+    assert_eq!(restored.admin_token, "d5b-canary-admin-token");
+    let storage = StorageHandle::sqlite(&db_path, 4).expect("打开恢复后的 SQLite");
+    assert_seeded(&storage);
+}
+
+#[test]
+fn restore_without_config_requires_explicit_data_dir() {
+    let root = TestRoot::new("restore-no-config");
+    let (config_path, _db_path, _data_dir, _config_bytes) = setup_sqlite(root.path());
+    let out = root.path().join("backups");
+    let output = hub(&[
+        "backup",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--yes",
+    ]);
+    assert!(output.status.success(), "{}", combined(&output));
+    let backup = backup_dirs(&out).remove(0);
+    fs::remove_file(&config_path).expect("删除当前配置");
+
+    let new_config = root.path().join("new/etc/hub.toml");
+    let new_data = root.path().join("new-data");
+    let output = hub(&[
+        "restore",
+        "--config",
+        new_config.to_str().unwrap(),
+        "--from",
+        backup.to_str().unwrap(),
+        "--yes",
+    ]);
+    assert!(!output.status.success(), "缺 --data-dir 必须拒绝");
+    assert!(
+        combined(&output).contains("--data-dir"),
+        "{}",
+        combined(&output)
+    );
+    assert!(!new_data.exists(), "拒绝时不得创建目标目录");
+
+    let output = hub(&[
+        "restore",
+        "--config",
+        new_config.to_str().unwrap(),
+        "--from",
+        backup.to_str().unwrap(),
+        "--data-dir",
+        new_data.to_str().unwrap(),
+        "--db",
+        "postgres://u:p@127.0.0.1/db?sslmode=disable",
+        "--yes",
+    ]);
+    assert!(!output.status.success(), "SQLite 备份不接受 --db");
+    assert!(
+        combined(&output).contains("不接受 --db"),
+        "{}",
+        combined(&output)
+    );
+
+    let output = hub(&[
+        "restore",
+        "--config",
+        new_config.to_str().unwrap(),
+        "--from",
+        backup.to_str().unwrap(),
+        "--data-dir",
+        new_data.to_str().unwrap(),
+        "--yes",
+    ]);
+    assert!(
+        output.status.success(),
+        "显式 --data-dir 应恢复成功: {}",
+        combined(&output)
+    );
+    let restored_db = new_data.join("rustboard.db");
+    assert!(restored_db.is_file());
+    assert_eq!(mode_of(&restored_db), 0o600);
+    assert_eq!(mode_of(&new_data.join("certs/server.key")), 0o600);
+    let restored = read_config(&new_config);
+    assert_eq!(restored.data_dir, new_data);
+    assert_eq!(
+        restored.database,
+        format!("sqlite://{}", restored_db.display())
+    );
+    let storage = StorageHandle::sqlite(&restored_db, 4).expect("打开恢复后的 SQLite");
+    assert_seeded(&storage);
+}
+
+/// PG 备份在配置缺失时：缺 --data-dir / 缺 --db 都必须拒绝，而且发生在
+/// `pg_restore` 工具检查之前（本机没有 pg_restore 也能验证参数校验）。
+#[test]
+fn restore_pg_without_config_requires_data_dir_and_db() {
+    let root = TestRoot::new("restore-pg-no-config");
+    let dsn = "postgres://rustboard:secret@127.0.0.1:1/rustboard?sslmode=disable";
+    let backup = root.path().join("pg-backup");
+    fs::create_dir_all(&backup).unwrap();
+    let cfg = HubConfig {
+        data_dir: root.path().join("original-data"),
+        database: dsn.to_string(),
+        ..HubConfig::default()
+    };
+    let cfg_bytes = toml::to_string_pretty(&cfg).unwrap().into_bytes();
+    fs::write(backup.join("hub.toml"), &cfg_bytes).unwrap();
+    let dump = b"fake-pg-dump";
+    fs::write(backup.join("rustboard.dump"), dump).unwrap();
+    let manifest = serde_json::json!({
+        "manifest_version": 1,
+        "version": "test",
+        "schema": 7,
+        "backend": "postgres",
+        "created_at": "2026-01-01T00:00:00.000Z",
+        "created_at_ms": 0,
+        "files": [
+            {"path": "hub.toml", "sha256": sha256(&cfg_bytes), "size": cfg_bytes.len(), "mode": "0600"},
+            {"path": "rustboard.dump", "sha256": sha256(dump), "size": dump.len(), "mode": "0600"}
+        ]
+    });
+    fs::write(
+        backup.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(
+        backup.join("manifest.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+
+    let config_path = root.path().join("missing/hub.toml");
+    let data_dir = root.path().join("restore-data");
+    let output = hub(&[
+        "restore",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--from",
+        backup.to_str().unwrap(),
+        "--yes",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        combined(&output).contains("--data-dir"),
+        "{}",
+        combined(&output)
+    );
+
+    let output = hub(&[
+        "restore",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--from",
+        backup.to_str().unwrap(),
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--yes",
+    ]);
+    assert!(!output.status.success(), "缺 --db 必须拒绝");
+    assert!(combined(&output).contains("--db"), "{}", combined(&output));
+    assert!(!data_dir.exists(), "拒绝时不得创建目标目录");
+}
+
+/// `--force` 的 pre-restore 快照失败必须中止；只有显式
+/// `--no-pre-restore-backup` 才允许在无备份情况下继续。
+#[test]
+fn restore_force_aborts_when_pre_restore_backup_fails() {
+    let root = TestRoot::new("restore-prebackup-fail");
+    let (config_path, db_path, data_dir, config_bytes) = setup_sqlite(root.path());
+    let out = root.path().join("backups");
+    let output = hub(&[
+        "backup",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--yes",
+    ]);
+    assert!(output.status.success(), "{}", combined(&output));
+    let backup = backup_dirs(&out).remove(0);
+    remove_sqlite_sidecars(&db_path);
+    // 让 pre-restore 快照的 certs 复制失败。
+    fs::remove_dir_all(data_dir.join("certs")).unwrap();
+    let before_db = file_sha(&db_path);
+    let before_config = fs::read(&config_path).unwrap();
+
+    let output = hub(&[
+        "restore",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--from",
+        backup.to_str().unwrap(),
+        "--force",
+        "--yes",
+    ]);
+    assert!(!output.status.success(), "pre-restore 失败必须中止");
+    assert!(
+        combined(&output).contains("恢复前备份当前目标失败"),
+        "{}",
+        combined(&output)
+    );
+    assert_eq!(file_sha(&db_path), before_db, "中止时不得改目标库");
+    assert_eq!(fs::read(&config_path).unwrap(), before_config);
+
+    remove_sqlite_sidecars(&db_path);
+    let output = hub(&[
+        "restore",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--from",
+        backup.to_str().unwrap(),
+        "--force",
+        "--no-pre-restore-backup",
+        "--yes",
+    ]);
+    assert!(
+        output.status.success(),
+        "显式跳过预备份后应成功: {}",
+        combined(&output)
+    );
+    assert_seeded(&StorageHandle::sqlite(&db_path, 4).expect("打开 SQLite"));
+    assert_eq!(mode_of(&data_dir.join("certs/server.key")), 0o600);
+    let _ = config_bytes;
+}
+
+/// 恢复前存在旧 `-wal`：必须拒绝；清理 sidecar 后再恢复，旧 WAL 中的旧表不能
+/// 重现，且新库 `quick_check` 通过。
+#[test]
+fn restore_refuses_stale_wal_and_never_replays_old_table() {
+    let root = TestRoot::new("restore-stale-wal");
+    let (config_path, db_path, data_dir, _config_bytes) = setup_sqlite(root.path());
+    let out = root.path().join("backups");
+    let output = hub(&[
+        "backup",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--yes",
+    ]);
+    assert!(output.status.success(), "{}", combined(&output));
+    let backup = backup_dirs(&out).remove(0);
+    remove_sqlite_sidecars(&db_path);
+
+    // 目标旧库多一张备份里没有的表，模拟旧 WAL 可能带回的历史数据。
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE old_marker (value TEXT);\
+             INSERT INTO old_marker (value) VALUES ('stale');",
+        )
+        .unwrap();
+    }
+    remove_sqlite_sidecars(&db_path);
+    fs::write(sqlite_sidecar(&db_path, "-wal"), b"stale-wal").unwrap();
+    let before = file_sha(&db_path);
+
+    let output = hub(&[
+        "restore",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--from",
+        backup.to_str().unwrap(),
+        "--force",
+        "--yes",
+    ]);
+    assert!(!output.status.success(), "带旧 WAL 必须拒绝恢复");
+    let text = combined(&output);
+    assert!(text.contains("-wal"), "{text}");
+    assert_eq!(file_sha(&db_path), before, "拒绝时不得改目标库");
+
+    remove_sqlite_sidecars(&db_path);
+    let output = hub(&[
+        "restore",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--from",
+        backup.to_str().unwrap(),
+        "--force",
+        "--yes",
+    ]);
+    assert!(
+        output.status.success(),
+        "清理 sidecar 后应恢复成功: {}",
+        combined(&output)
+    );
+    quick_check_ok(&db_path);
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let old: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='old_marker'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old, 0, "旧表不能从旧 WAL 重现");
+    drop(conn);
+    let storage = StorageHandle::sqlite(&db_path, 4).expect("打开恢复后的 SQLite");
+    assert_seeded(&storage);
+    assert_eq!(mode_of(&data_dir.join("certs/server.key")), 0o600);
+}
+
+/// dry-run 只读：源目录在命令前后不能多出 `-shm/-wal` 或备份目录。
+#[test]
+fn migrate_dry_run_does_not_create_sqlite_sidecars() {
+    let root = TestRoot::new("migrate-dry-run-sidecars");
+    let (config_path, db_path, data_dir, _config_bytes) = setup_sqlite(root.path());
+    remove_sqlite_sidecars(&db_path);
+    let before = list_tree(&data_dir);
+    let output = hub(&[
+        "migrate",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--to",
+        "postgres://u:p@127.0.0.1:1/rustboard?sslmode=disable",
+        "--dry-run",
+    ]);
+    assert!(!output.status.success(), "不可达目标应失败");
+    assert!(
+        !combined(&output).contains("panicked"),
+        "{}",
+        combined(&output)
+    );
+    let after = list_tree(&data_dir);
+    assert_eq!(before, after, "dry-run 不得在源目录创建任何新文件");
+    assert!(
+        !data_dir.join("backups").exists(),
+        "dry-run 不得创建备份目录"
+    );
+}
+
+/// 无 systemd unit / 状态 unknown 时 fail-closed；有 unit 且 active 时即使给了
+/// `--hub-stopped` 也必须拒绝。
+#[test]
+fn migrate_hub_stopped_is_fail_closed() {
+    let root = TestRoot::new("migrate-hub-stopped");
+    let (config_path, _db_path, _data_dir, config_bytes) = setup_sqlite(root.path());
+    let fake_bin = root.path().join("fake-systemctl");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let systemctl = fake_bin.join("systemctl");
+    fs::write(
+        &systemctl,
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+           show) echo not-found; exit 0;;\n\
+           is-active) echo unknown; exit 4;;\n\
+         esac\n\
+         exit 4\n",
+    )
+    .unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_rustboard-hub"))
+        .args([
+            "migrate",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--to",
+            "postgres://u:p@127.0.0.1:1/rustboard?sslmode=disable",
+            "--yes",
+        ])
+        .env("PATH", &path)
+        .env_remove("RUSTBOARD_DATABASE_PASSWORD")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "无法确认 hub 状态必须拒绝");
+    assert!(
+        combined(&output).contains("--hub-stopped"),
+        "{}",
+        combined(&output)
+    );
+    assert_eq!(fs::read(&config_path).unwrap(), config_bytes);
+
+    if Path::new("/run/systemd/system").is_dir() {
+        fs::write(
+            &systemctl,
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               show) echo loaded; exit 0;;\n\
+               is-active) echo active; exit 0;;\n\
+             esac\n\
+             exit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_rustboard-hub"))
+            .args([
+                "migrate",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--to",
+                "postgres://u:p@127.0.0.1:1/rustboard?sslmode=disable",
+                "--yes",
+                "--hub-stopped",
+            ])
+            .env("PATH", path)
+            .env_remove("RUSTBOARD_DATABASE_PASSWORD")
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "active 时 --hub-stopped 也不能放行"
+        );
+        assert!(
+            combined(&output).contains("正在运行"),
+            "{}",
+            combined(&output)
+        );
+    }
+}
+
+/// 两个进程同时 `migrate --force`：CLI 的会话级 advisory lock 必须让
+/// pg_dump/TRUNCATE/import 串行；否则第二个会在第一个导入期间清空目标。
+#[test]
+fn concurrent_force_migrate_is_serialized_by_advisory_lock() {
+    let Some(db) = PgTestDb::create() else {
+        return;
+    };
+    let dsn = db.dsn.clone();
+    seed_pg(&dsn);
+    let root = TestRoot::new("pg-concurrent-force");
+    let (config_path, _db_path, data_dir, _config_bytes) = setup_sqlite(root.path());
+
+    let fake_bin = root.path().join("fakebin-concurrent");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let fake_dump = fake_bin.join("pg_dump");
+    fs::write(
+        &fake_dump,
+        "#!/bin/sh\n\
+         if [ \"${1:-}\" = \"--version\" ]; then echo 'pg_dump (fake) 2'; exit 0; fi\n\
+         out=''\n\
+         prev=''\n\
+         for arg in \"$@\"; do\n\
+           if [ \"$prev\" = '--file' ]; then out=\"$arg\"; fi\n\
+           prev=\"$arg\"\n\
+         done\n\
+         if [ -z \"$out\" ]; then echo 'missing --file' >&2; exit 1; fi\n\
+         start=$(date +%s%N)\n\
+         printf '%s start %s\\n' \"$$\" \"$start\" >> \"$RB_FAKE_LOG\"\n\
+         sleep 2\n\
+         printf 'FAKE-CONCURRENT' > \"$out\"\n\
+         end=$(date +%s%N)\n\
+         printf '%s end %s\\n' \"$$\" \"$end\" >> \"$RB_FAKE_LOG\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_dump, fs::Permissions::from_mode(0o755)).unwrap();
+    let log = root.path().join("pgdump.log");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let spawn = || {
+        Command::new(env!("CARGO_BIN_EXE_rustboard-hub"))
+            .args([
+                "migrate",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--to",
+                &dsn,
+                "--force",
+                "--yes",
+                "--hub-stopped",
+            ])
+            .env("PATH", &path)
+            .env("RB_FAKE_LOG", &log)
+            .env_remove("RUSTBOARD_DATABASE_PASSWORD")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("启动 migrate")
+    };
+
+    let first = spawn();
+    // 等第一个进程真正进入 pg_dump（说明它已持有 advisory lock）。
+    let mut saw_start = false;
+    for _ in 0..100 {
+        if fs::read_to_string(&log)
+            .map(|text| text.contains(" start "))
+            .unwrap_or(false)
+        {
+            saw_start = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(saw_start, "第一个 migrate 未进入 pg_dump");
+    let second = spawn();
+    let first = first.wait_with_output().expect("等待第一个 migrate");
+    let second = second.wait_with_output().expect("等待第二个 migrate");
+    assert!(
+        first.status.success(),
+        "第一个 migrate 失败: {}{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "第二个 migrate 失败: {}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    // 两个 pg_dump 的时间区间必须不重叠。
+    let mut intervals: Vec<(u128, u128)> = Vec::new();
+    let mut starts = std::collections::BTreeMap::new();
+    for line in fs::read_to_string(&log).unwrap().lines() {
+        let mut parts = line.split_whitespace();
+        let pid = parts.next().expect("pid");
+        let phase = parts.next().expect("phase");
+        let ns: u128 = parts.next().expect("ns").parse().expect("ns");
+        match phase {
+            "start" => {
+                starts.insert(pid.to_string(), ns);
+            }
+            "end" => {
+                let start = starts
+                    .remove(pid)
+                    .unwrap_or_else(|| panic!("{pid} 缺 start"));
+                intervals.push((start, ns));
+            }
+            other => panic!("未知日志 phase: {other}"),
+        }
+    }
+    assert_eq!(intervals.len(), 2, "应观察到两次 pg_dump: {intervals:?}");
+    intervals.sort();
+    assert!(
+        intervals[0].1 <= intervals[1].0,
+        "pg_dump 区间重叠，说明 force migrate 未被串行化: {intervals:?}"
+    );
+
+    let storage = StorageHandle::postgres(pg_storage(&dsn));
+    assert_seeded(&storage);
+    assert!(
+        fs::read_to_string(&config_path).unwrap().contains(&dsn),
+        "最终配置应指向 PG"
+    );
+    let _ = data_dir;
+}
+
+/// pentest 回归：v7 源库有未 checkpoint 的 `-wal` 时，immutable 只看主库会把
+/// user_version 读成 0。预检必须复制 DB+WAL 到临时目录读取；dry-run 成功、
+/// 能识别 21 表与 WAL 中的新增行，且源目录不新增任何文件。
+#[test]
+fn migrate_dry_run_reads_uncheckpointed_wal_source() {
+    let Some(db) = PgTestDb::create() else {
+        return;
+    };
+    let dsn = db.dsn.clone();
+    let root = TestRoot::new("migrate-wal-source");
+    let (config_path, db_path, data_dir, _config_bytes) = setup_sqlite(root.path());
+    remove_sqlite_sidecars(&db_path);
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("打开 SQLite");
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        conn.execute(
+            "INSERT INTO samples(agent_id, metric, labels, ts, value) \
+             VALUES('a1', 'cpu', '{}', 3000, 3.5)",
+            [],
+        )
+        .expect("写入 WAL");
+        // 模拟崩溃/未 checkpoint：不 close，保留 WAL 供读取。
+        std::mem::forget(conn);
+    }
+    let wal = sqlite_sidecar(&db_path, "-wal");
+    assert!(wal.is_file(), "测试未生成 -wal");
+    assert!(
+        fs::metadata(&wal).unwrap().len() > 0,
+        "测试 -wal 为空，无法覆盖未 checkpoint 场景"
+    );
+    let before = list_tree(&data_dir);
+    let output = hub(&[
+        "migrate",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--to",
+        &dsn,
+        "--dry-run",
+    ]);
+    assert!(
+        output.status.success(),
+        "带 WAL 的 dry-run 失败: {}",
+        combined(&output)
+    );
+    let text = combined(&output);
+    assert!(text.contains("schema v7"), "{text}");
+    assert!(
+        text.contains("samples 4 行"),
+        "必须读到 WAL 中的新增行: {text}"
+    );
+    assert!(text.contains("21 张表齐全"), "{text}");
+    let after = list_tree(&data_dir);
+    assert_eq!(before, after, "dry-run 不得在源目录创建/删除文件");
+    assert_pg_empty(&dsn);
 }

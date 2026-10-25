@@ -14,7 +14,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::SystemTime;
@@ -93,9 +93,21 @@ pub struct RestoreArgs {
     /// hub 配置文件；默认 `/etc/rustboard/hub.toml`。
     #[arg(short, long)]
     pub config: Option<PathBuf>,
-    /// 目标非空时仍恢复（恢复前尽可能备份当前目标）。
+    /// 配置文件不存在时的目标 data_dir（必须绝对路径；SQLite 的 DB 固定为该目录下 rustboard.db）。
+    #[arg(long, value_name = "DIR")]
+    pub data_dir: Option<PathBuf>,
+    /// 配置文件不存在且恢复 PostgreSQL 备份时的目标 DSN。
+    #[arg(long, value_name = "DSN")]
+    pub db: Option<String>,
+    /// 目标非空时仍恢复（必须先成功备份当前目标）。
     #[arg(long)]
     pub force: bool,
+    /// 显式跳过恢复前目标备份（不推荐；仅在目标非空时相关）。
+    #[arg(long)]
+    pub no_pre_restore_backup: bool,
+    /// 显式声明 hub 已停止（无 systemd / unit 不存在时必须提供）。
+    #[arg(long)]
+    pub hub_stopped: bool,
     /// 非交互执行（不读取 stdin）。
     #[arg(long)]
     pub yes: bool,
@@ -219,7 +231,8 @@ pub fn backup(args: BackupArgs) -> Result<()> {
 
 /// `restore` 子命令。
 pub fn restore(args: RestoreArgs) -> Result<()> {
-    let config_path = config_path(args.config);
+    let config_path = std::path::absolute(config_path(args.config.clone()))
+        .context("解析 --config 绝对路径失败")?;
     validate_user_path(&args.from, "备份源目录")?;
     let from_meta = fs::symlink_metadata(&args.from)
         .with_context(|| format!("备份目录不存在: {}", args.from.display()))?;
@@ -267,54 +280,86 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
             backup_kind.redacted()
         );
     }
-    if !backup_cfg.data_dir.is_absolute() {
+
+    // 2. 目标路径只信任本机当前配置 / 显式 CLI 参数，**绝不**用备份内
+    //    hub.toml 的 data_dir/database 作为写入目标。恶意备份即使 manifest
+    //    哈希自洽，也只能恢复到当前安装的目标路径。
+    let current = load_optional_config_snapshot(&config_path)?;
+    let (target_cfg, target_config_bytes) = resolve_restore_target(
+        &args,
+        &config_path,
+        &backup_cfg,
+        &backup_config_bytes,
+        backend,
+        current.as_ref(),
+    )?;
+    let target_kind = target_cfg
+        .database_kind()
+        .context("解析恢复目标 database 失败")?;
+    if backend_of(&target_kind) != backend {
         bail!(
-            "备份中的 data_dir 不是绝对路径: {}；拒绝恢复",
-            backup_cfg.data_dir.display()
+            "备份 backend={} 与恢复目标 backend={} 不一致；不支持跨后端恢复，请恢复同一后端的备份",
+            manifest.backend,
+            backend_name(&target_kind)
         );
     }
-    match &backup_kind {
-        DatabaseKind::Sqlite(path) if !path.is_absolute() => {
+    if !target_cfg.data_dir.is_absolute() {
+        bail!(
+            "恢复目标 data_dir 必须是绝对路径: {}；请修正当前配置或 --data-dir",
+            target_cfg.data_dir.display()
+        );
+    }
+    validate_user_path(&target_cfg.data_dir, "目标 data_dir")?;
+    if let DatabaseKind::Sqlite(path) = &target_kind {
+        if !path.is_absolute() {
             bail!(
-                "备份中的 SQLite 路径不是绝对路径: {}；拒绝恢复",
+                "恢复目标 SQLite 路径必须是绝对路径: {}；拒绝恢复",
                 path.display()
             );
         }
-        _ => {}
+        validate_user_path(path, "目标 SQLite 数据库")?;
+        // 不能带着旧 WAL/SHM/journal 覆盖主库：SQLite 下次打开会重放旧 WAL，
+        // 可能把新库覆盖成旧数据。必须先干净停机并人工确认/清理。
+        ensure_no_sqlite_sidecars(path)?;
+    }
+    let certs_dst = tls::cert_dir(&target_cfg.data_dir);
+    println!("恢复目标配置: {}", config_path.display());
+    println!("恢复目标证书目录: {}", certs_dst.display());
+    match &target_kind {
+        DatabaseKind::Sqlite(path) => println!("恢复目标数据库: {}", path.display()),
+        DatabaseKind::Postgres(dsn) => {
+            println!("恢复目标数据库: {}", dsn_redacted(dsn));
+        }
     }
 
-    // 2. 外部工具预检（PG 恢复必须在写入任何文件前失败）。
+    // 3. 外部工具预检（PG 恢复必须在写入任何文件前失败）。
     if backend == Backend::Postgres {
         ensure_tool("pg_restore")?;
     }
 
-    // 3. 检查目标是否可覆盖。
-    let target_non_empty = target_has_data(&backup_cfg, &backup_kind)
-        .with_context(|| format!("检查恢复目标是否为空失败（{}）", backup_kind.redacted()))?;
+    // 4. 检查目标是否可覆盖。
+    let target_non_empty = target_has_data(&target_cfg, &target_kind)
+        .with_context(|| format!("检查恢复目标是否为空失败（{}）", target_kind.redacted()))?;
     if target_non_empty && !args.force {
         bail!(
             "恢复目标非空（{}）；请先备份并使用 --force，或恢复到一个空数据库",
-            backup_kind.redacted()
+            target_kind.redacted()
         );
     }
 
-    // 4. 运行中的 hub 会持续写数据库，恢复会与写入竞争；与 migrate 同样拒绝。
-    super::migrate_cmd::ensure_hub_stopped("restore")?;
+    // 5. 运行中的 hub 会持续写数据库，恢复会与写入竞争；与 migrate 同样拒绝。
+    super::migrate_cmd::ensure_hub_stopped("restore", args.hub_stopped)?;
 
-    // 5. 目标路径安全检查必须在任何破坏性写入之前完成。
-    let certs_dst = tls::cert_dir(&backup_cfg.data_dir);
+    // 6. 目标路径安全检查必须在任何破坏性写入之前完成。
     reject_existing_symlinks(&certs_dst)?;
     reject_existing_symlinks(&config_path)?;
-    if let DatabaseKind::Sqlite(path) = &backup_kind {
+    if let DatabaseKind::Sqlite(path) = &target_kind {
         reject_existing_symlinks(path)?;
     }
 
-    // 6. 当前配置（如果存在）与当前目标：用于 best-effort 预备份与 .bak。
-    let current = load_optional_config_snapshot(&config_path)?;
-
     // 7. 确认。
     let action = if target_non_empty {
-        "恢复目标非空：将先尽可能备份当前目标，再覆盖数据库/配置/证书"
+        "恢复目标非空：将先备份当前目标，再覆盖数据库/配置/证书"
     } else {
         "将恢复数据库/配置/证书到目标位置"
     };
@@ -323,7 +368,7 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
         &format!(
             "从 {} 恢复 {} 备份？{action}。",
             args.from.display(),
-            backend_name(&backup_kind)
+            backend_name(&target_kind)
         ),
     )?;
 
@@ -333,16 +378,31 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
         None => None,
     };
 
-    // 9. 非空目标先尽力备份（失败只告警；--force 已由用户显式确认）。
-    if target_non_empty {
-        match pre_restore_snapshot(&backup_cfg, &config_path, &backup_config_bytes) {
-            Ok(path) => println!("恢复前目标备份: {}", path.display()),
-            Err(err) => eprintln!("WARN: 恢复前目标备份失败（best effort，继续恢复）: {err:#}"),
-        }
+    // 9. 非空目标必须先成功备份当前目标；失败立即中止，不做 best-effort 继续。
+    //    只有显式 --no-pre-restore-backup 才允许在无备份的情况下覆盖。
+    if target_non_empty && args.no_pre_restore_backup {
+        eprintln!(
+            "WARN: 已显式指定 --no-pre-restore-backup，跳过恢复前目标备份；\
+             目标非空，覆盖后无法用本工具回滚"
+        );
+    } else if target_non_empty {
+        let pre_bytes = current
+            .as_ref()
+            .map(|(bytes, _)| bytes.clone())
+            .unwrap_or_else(|| target_config_bytes.clone());
+        let path = pre_restore_snapshot(&target_cfg, &pre_bytes)
+            .context("恢复前备份当前目标失败；已中止（未修改目标数据库/证书/配置）")?;
+        println!("恢复前目标备份: {}", path.display());
     }
 
-    // 10. 先恢复数据，再恢复证书，最后写配置（配置决定下次启动读哪里）。
-    match &backup_kind {
+    // 10. 预检/预备份可能由只读连接创建空 sidecar；rename 前清掉。
+    if let DatabaseKind::Sqlite(path) = &target_kind {
+        remove_restore_sidecars(path)
+            .context("清理恢复前只读检查产生的 SQLite sidecar 失败；已中止")?;
+    }
+
+    // 11. 先恢复数据，再恢复证书，最后写配置（配置决定下次启动读哪里）。
+    match &target_kind {
         DatabaseKind::Sqlite(path) => {
             restore_sqlite_file(&verified[db_name], path)
                 .with_context(|| format!("恢复 SQLite 数据库失败: {}", path.display()))?;
@@ -354,20 +414,120 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
         }
     }
 
-    restore_certs(&args.from, &manifest, &backup_cfg.data_dir)?;
-    println!(
-        "证书目录已恢复: {}",
-        tls::cert_dir(&backup_cfg.data_dir).display()
-    );
+    restore_certs(&args.from, &manifest, &target_cfg.data_dir)?;
+    println!("证书目录已恢复: {}", certs_dst.display());
 
     // 配置写最后：数据/证书失败时旧配置仍指向旧路径，避免启动到半恢复状态。
-    write_private_file(&config_path, &backup_config_bytes)?;
+    write_private_file(&config_path, &target_config_bytes)?;
     if let Some(path) = config_bak {
         println!("旧配置备份: {}", path.display());
     }
     println!("配置文件已恢复: {}", config_path.display());
 
     Ok(())
+}
+
+/// 解析恢复目标：只使用本机当前 `hub.toml` 或显式 CLI 参数，忽略备份内的路径。
+fn resolve_restore_target(
+    args: &RestoreArgs,
+    config_path: &Path,
+    backup_cfg: &HubConfig,
+    backup_config_bytes: &[u8],
+    backend: Backend,
+    current: Option<&(Vec<u8>, HubConfig)>,
+) -> Result<(HubConfig, Vec<u8>)> {
+    let (target_data_dir, target_database, mut target_cfg) = match current {
+        Some((_, cfg)) => {
+            if args.data_dir.is_some() || args.db.is_some() {
+                bail!(
+                    "配置文件已存在（{}），恢复目标以该配置为准；不要同时指定 --data-dir/--db",
+                    config_path.display()
+                );
+            }
+            (cfg.data_dir.clone(), cfg.database.clone(), cfg.clone())
+        }
+        None => {
+            let data_dir = args.data_dir.clone().ok_or_else(|| {
+                anyhow!(
+                    "配置文件不存在（{}），必须指定 --data-dir <绝对路径> 作为恢复目标",
+                    config_path.display()
+                )
+            })?;
+            if !data_dir.is_absolute() {
+                bail!("--data-dir 必须是绝对路径: {}", data_dir.display());
+            }
+            let database = match backend {
+                Backend::Sqlite => {
+                    if args.db.is_some() {
+                        bail!(
+                            "恢复 SQLite 备份时 DB 路径固定为 <data-dir>/rustboard.db，不接受 --db"
+                        );
+                    }
+                    format!("sqlite://{}", data_dir.join("rustboard.db").display())
+                }
+                Backend::Postgres => args.db.clone().ok_or_else(|| {
+                    anyhow!(
+                        "配置文件不存在且恢复 PostgreSQL 备份时必须指定 --db <DSN> 作为恢复目标"
+                    )
+                })?,
+            };
+            let mut cfg = backup_cfg.clone();
+            cfg.data_dir = data_dir.clone();
+            cfg.database = database.clone();
+            (data_dir, database, cfg)
+        }
+    };
+    let kind = target_cfg
+        .database_kind()
+        .context("解析恢复目标 database 失败")?;
+    if backend_of(&kind) != backend {
+        bail!(
+            "恢复目标 database 是 {}，与备份 backend={} 不一致",
+            kind.redacted(),
+            backend_name_of(backend)
+        );
+    }
+    let bytes = rewrite_config_paths(
+        backup_cfg,
+        backup_config_bytes,
+        &target_data_dir,
+        &target_database,
+    )?;
+    target_cfg.data_dir = target_data_dir;
+    target_cfg.database = target_database;
+    Ok((target_cfg, bytes))
+}
+
+/// 只把备份配置里的 `data_dir` / `database` 重写为目标值，其余字段（含未知字段）
+/// 保留；两个值本来就相等时直接复用备份原始字节，保留注释与排版。
+fn rewrite_config_paths(
+    backup_cfg: &HubConfig,
+    backup_bytes: &[u8],
+    data_dir: &Path,
+    database: &str,
+) -> Result<Vec<u8>> {
+    if backup_cfg.data_dir == data_dir && backup_cfg.database == database {
+        return Ok(backup_bytes.to_vec());
+    }
+    let data_dir_text = data_dir
+        .to_str()
+        .ok_or_else(|| anyhow!("目标 data_dir 不是合法 UTF-8: {}", data_dir.display()))?;
+    let text = std::str::from_utf8(backup_bytes).context("备份中的 hub.toml 不是合法 UTF-8")?;
+    let mut value: toml::Value = toml::from_str(text).context("解析备份中的 hub.toml 失败")?;
+    let table = value
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("备份中的 hub.toml 顶层不是 TOML table"))?;
+    table.insert(
+        "data_dir".to_string(),
+        toml::Value::String(data_dir_text.to_string()),
+    );
+    table.insert(
+        "database".to_string(),
+        toml::Value::String(database.to_string()),
+    );
+    Ok(toml::to_string_pretty(&value)
+        .context("序列化恢复后的 hub.toml 失败")?
+        .into_bytes())
 }
 
 /// 把 manifest、DB、配置和证书写入 `<out_root>/<timestamp>/`，返回目录。
@@ -394,7 +554,11 @@ pub(crate) fn snapshot_to(
             if !path.is_file() {
                 bail!("SQLite 数据库不存在: {}", path.display());
             }
-            sqlite_schema_version(path)?
+            if assume_stopped {
+                sqlite_schema_version_immutable(path)?
+            } else {
+                sqlite_schema_version(path)?
+            }
         }
         DatabaseKind::Postgres(dsn) => postgres_schema_version(dsn),
     };
@@ -674,35 +838,128 @@ pub(crate) fn sqlite_schema_version(path: &Path) -> Result<i64> {
         .with_context(|| format!("读取 SQLite schema 版本失败: {}", path.display()))
 }
 
-/// 校验 SQLite 源库包含 schema v7 的全部 21 张业务表。
-///
-/// 只读；供 `migrate` 在备份/写目标之前做 dry-run 级别的源检查。核心迁移会
-/// 再做一次同样的检查，这里提前失败可以避免先备份一个不可迁移的源库。
-pub(crate) fn validate_sqlite_source_tables(path: &Path) -> Result<()> {
-    let conn = open_sqlite_readonly(path)?;
-    for table in HUB_TABLES {
-        let exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                [table],
-                |row| row.get(0),
-            )
-            .with_context(|| format!("检查 SQLite 源库表 {table} 失败"))?;
-        if exists == 0 {
-            bail!(
-                "SQLite 源库缺少表 {table}（schema 不是完整的 v{}）；拒绝迁移",
-                SQLITE_SCHEMA_VERSION
-            );
-        }
-    }
-    Ok(())
+/// SQLite 源库预检结果。
+pub(crate) struct SqliteSourceInfo {
+    pub schema_version: i64,
+    pub sample_count: i64,
 }
 
-/// SQLite 源库的 raw samples 行数（只读，dry-run 展示用）。
-pub(crate) fn sqlite_sample_count(path: &Path) -> Result<i64> {
-    open_sqlite_readonly(path)?
-        .query_row("SELECT COUNT(*) FROM samples", [], |row| row.get(0))
-        .with_context(|| format!("统计 SQLite 源库 samples 行数失败: {}", path.display()))
+/// 迁移 dry-run / 源预检的只读连接。
+///
+/// - 无 `-wal` / `-journal`：直接 immutable 打开，源目录零写入；
+/// - 有未 checkpoint 的 `-wal` / 热 `-journal`：immutable 会忽略它们（会把 v7
+///   库读成 v0 / 漏数据），因此把主库与 sidecar 复制到 0700 临时目录，在副本上
+///   用普通只读连接读取。副本里 SQLite 可以自由建 `-shm`，源目录不受影响。
+struct SqlitePreflight {
+    conn: Option<SqliteConnection>,
+    _temp: Option<TempDirGuard>,
+}
+
+impl SqlitePreflight {
+    fn open(path: &Path) -> Result<Self> {
+        let meta = fs::symlink_metadata(path)
+            .with_context(|| format!("打开 SQLite 数据库失败: {}", path.display()))?;
+        if meta.file_type().is_symlink() {
+            bail!("SQLite 数据库是符号链接，拒绝打开: {}", path.display());
+        }
+        if !meta.is_file() {
+            bail!("SQLite 数据库不是普通文件: {}", path.display());
+        }
+        let wal = sidecar_path(path, "-wal");
+        let journal = sidecar_path(path, "-journal");
+        if !wal.exists() && !journal.exists() {
+            let conn = open_sqlite_readonly_immutable(path)?;
+            return Ok(Self {
+                conn: Some(conn),
+                _temp: None,
+            });
+        }
+
+        // 有 WAL/热 journal：复制到临时目录再读。临时文件全部 0600，目录 0700。
+        let temp = TempDirGuard::new(create_private_temp_dir("sqlite-preflight")?);
+        let copy = temp.path().join("source.db");
+        copy_private_database(path, &copy)?;
+        if wal.exists() {
+            copy_private_database(&wal, &sidecar_path(&copy, "-wal"))?;
+        }
+        if journal.exists() {
+            copy_private_database(&journal, &sidecar_path(&copy, "-journal"))?;
+        }
+        let conn = SqliteConnection::open_with_flags(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| {
+                format!(
+                    "在临时副本上只读打开 SQLite 失败: {}（源 {}）",
+                    copy.display(),
+                    path.display()
+                )
+            })?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("设置 SQLite busy_timeout 失败")?;
+        Ok(Self {
+            conn: Some(conn),
+            _temp: Some(temp),
+        })
+    }
+
+    fn conn(&self) -> &SqliteConnection {
+        self.conn.as_ref().expect("SqlitePreflight conn 已关闭")
+    }
+
+    fn schema_version(&self) -> Result<i64> {
+        self.conn()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .context("读取 SQLite schema 版本失败")
+    }
+
+    fn validate_tables(&self) -> Result<()> {
+        for table in HUB_TABLES {
+            let exists: i64 = self
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .with_context(|| format!("检查 SQLite 源库表 {table} 失败"))?;
+            if exists == 0 {
+                bail!(
+                    "SQLite 源库缺少表 {table}（schema 不是完整的 v{}）；拒绝迁移",
+                    SQLITE_SCHEMA_VERSION
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn sample_count(&self) -> Result<i64> {
+        self.conn()
+            .query_row("SELECT COUNT(*) FROM samples", [], |row| row.get(0))
+            .context("统计 SQLite 源库 samples 行数失败")
+    }
+}
+
+impl Drop for SqlitePreflight {
+    fn drop(&mut self) {
+        // 先关连接，再让 TempDirGuard 删目录（字段顺序也保证，但这里显式关闭）。
+        drop(self.conn.take());
+    }
+}
+
+/// 迁移预检：版本 + 21 张表 + samples 行数，一次打开（WAL 库只复制一次）。
+pub(crate) fn sqlite_source_info(path: &Path) -> Result<SqliteSourceInfo> {
+    let preflight = SqlitePreflight::open(path)?;
+    let schema_version = preflight.schema_version()?;
+    preflight.validate_tables()?;
+    let sample_count = preflight.sample_count()?;
+    Ok(SqliteSourceInfo {
+        schema_version,
+        sample_count,
+    })
+}
+
+/// 以 immutable/临时副本方式读取 schema 版本（无源目录写入）。
+pub(crate) fn sqlite_schema_version_immutable(path: &Path) -> Result<i64> {
+    SqlitePreflight::open(path)?.schema_version()
 }
 
 /// SQLite 目标是否已有业务数据。
@@ -716,7 +973,7 @@ fn target_sqlite_has_data(path: &Path) -> Result<bool> {
     if fs::symlink_metadata(path)?.file_type().is_symlink() {
         bail!("SQLite 目标是符号链接，拒绝操作: {}", path.display());
     }
-    let conn = open_sqlite_readonly(path)?;
+    let conn = open_sqlite_readonly_immutable(path)?;
     let mut statement = conn
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
         .context("读取 SQLite 表列表失败")?;
@@ -784,6 +1041,32 @@ fn open_sqlite_readonly(path: &Path) -> Result<SqliteConnection> {
     }
     let conn = SqliteConnection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("以只读方式打开 SQLite 数据库失败: {}", path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .context("设置 SQLite busy_timeout 失败")?;
+    Ok(conn)
+}
+
+/// 以 `immutable=1` 只读打开 SQLite；不创建 `-shm/-wal`。
+fn open_sqlite_readonly_immutable(path: &Path) -> Result<SqliteConnection> {
+    let meta = fs::symlink_metadata(path)
+        .with_context(|| format!("打开 SQLite 数据库失败: {}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!("SQLite 数据库是符号链接，拒绝打开: {}", path.display());
+    }
+    if !meta.is_file() {
+        bail!("SQLite 数据库不是普通文件: {}", path.display());
+    }
+    let uri = immutable_sqlite_uri(path)?;
+    let conn = SqliteConnection::open_with_flags(
+        uri.as_str(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| {
+        format!(
+            "以 immutable 方式打开 SQLite 数据库失败: {}",
+            path.display()
+        )
+    })?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .context("设置 SQLite busy_timeout 失败")?;
     Ok(conn)
@@ -865,14 +1148,270 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 }
 
 /// 把已验证的 SQLite 备份原子替换到目标路径。
-fn restore_sqlite_file(source: &Path, destination: &Path) -> Result<()> {
-    // 先在旁路验证备份文件，避免覆盖目标后才发现文件损坏。
-    let check = open_sqlite_readonly(source)?
-        .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
-        .context("校验待恢复 SQLite 文件失败")?;
-    if check != "ok" {
-        bail!("待恢复 SQLite 文件完整性校验失败: {check}");
+/// 目标 SQLite 旁路文件后缀；存在任何一个都拒绝恢复。
+const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// 拒绝带 sidecar 的 SQLite 目标。
+///
+/// 旧 WAL 里的页面会在下一次打开时重放；如果先替换主库再删 WAL，中间崩溃或
+/// 删除失败就会把新库覆盖回旧数据。因此恢复前必须先干净停止 hub 并确认这些
+/// 文件不存在，而不是由工具在 rename 后“顺手”删除。
+fn ensure_no_sqlite_sidecars(path: &Path) -> Result<()> {
+    for suffix in SQLITE_SIDECARS {
+        let sidecar = sidecar_path(path, suffix);
+        match fs::symlink_metadata(&sidecar) {
+            Ok(meta) => {
+                let kind = if meta.file_type().is_symlink() {
+                    "符号链接"
+                } else {
+                    "残留文件"
+                };
+                bail!(
+                    "目标 SQLite 存在 {kind} {}；恢复前必须先干净停止 hub 并确认/删除该 sidecar，\
+                     不能让 SQLite 重放旧 WAL 覆盖新库",
+                    sidecar.display()
+                );
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("检查 SQLite sidecar 失败: {}", sidecar.display()))
+            }
+        }
     }
+    Ok(())
+}
+
+/// 私有临时目录 guard；Drop 递归删除。
+struct TempDirGuard {
+    path: PathBuf,
+}
+
+impl TempDirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// 在系统临时目录下创建随机 0700 目录（不跟随预先放好的名字/链接）。
+fn create_private_temp_dir(tag: &str) -> Result<PathBuf> {
+    let base = std::env::temp_dir();
+    for _ in 0..32 {
+        let path = base.join(format!(
+            ".rustboard-{tag}-{}-{:016x}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("创建临时目录失败: {}", path.display()))
+            }
+        }
+    }
+    bail!("无法创建 SQLite 预检临时目录（随机名连续冲突）")
+}
+
+/// 删除本次恢复的只读检查可能产生的 sidecar，并 fsync 父目录。
+///
+/// 调用前提：进入 restore 时已确认目标没有 sidecar（外部残留会提前拒绝），且
+/// hub 已停止/由 `--hub-stopped` 声明。只读连接可能在目标目录创建空 `-shm` /
+/// `-wal`；这些不是用户数据，必须在 rename 前清掉，否则 SQLite 会重放它们。
+/// 删除失败（含 sidecar 是目录/权限不足）仍然 fail-closed。
+fn remove_restore_sidecars(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("SQLite 目标没有父目录: {}", path.display()))?;
+    match fs::symlink_metadata(parent) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => bail!("SQLite 目标父路径不是目录，拒绝恢复: {}", parent.display()),
+        // 新目标目录尚不存在：没有任何 sidecar/目录需要清理或 fsync。
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("检查 SQLite 目标父目录失败: {}", parent.display()))
+        }
+    }
+    for suffix in SQLITE_SIDECARS {
+        let sidecar = sidecar_path(path, suffix);
+        match fs::symlink_metadata(&sidecar) {
+            Ok(meta) => {
+                if meta.is_dir() {
+                    bail!(
+                        "目标 SQLite sidecar 是目录，拒绝删除/恢复: {}",
+                        sidecar.display()
+                    );
+                }
+                fs::remove_file(&sidecar).with_context(|| {
+                    format!(
+                        "清理只读检查产生的 SQLite sidecar 失败: {}；已中止恢复",
+                        sidecar.display()
+                    )
+                })?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("检查 SQLite sidecar 失败: {}", sidecar.display()))
+            }
+        }
+    }
+    sync_dir(parent)?;
+    ensure_no_sqlite_sidecars(path)
+}
+
+/// 临时文件 guard：未 `disarm` 时 Drop 删除，避免失败后留下半成品/回滚副本。
+struct TempPathGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempPathGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm(mut self) -> PathBuf {
+        self.armed = false;
+        self.path.clone()
+    }
+}
+
+impl Drop for TempPathGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// 复制数据库文件到新路径（create_new，0600，fsync）。
+fn copy_private_database(source: &Path, destination: &Path) -> Result<()> {
+    let mut src =
+        File::open(source).with_context(|| format!("打开数据库失败: {}", source.display()))?;
+    let mut dst = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(destination)
+        .with_context(|| format!("创建数据库临时文件失败: {}", destination.display()))?;
+    std::io::copy(&mut src, &mut dst).context("复制数据库失败")?;
+    dst.sync_all().context("fsync 数据库临时文件失败")?;
+    drop(dst);
+    fsutil::harden(destination, 0o600)
+        .with_context(|| format!("收紧数据库文件权限失败: {}", destination.display()))?;
+    Ok(())
+}
+
+fn temp_database_path(destination: &Path, tag: &str) -> PathBuf {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        ".{}.{tag}.{}.{:016x}",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("rustboard.db"),
+        std::process::id(),
+        rand_suffix()
+    ))
+}
+
+fn sqlite_quick_check(path: &Path) -> Result<()> {
+    let check = open_sqlite_readonly_immutable(path)?
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
+        .with_context(|| format!("SQLite quick_check 失败: {}", path.display()))?;
+    if check != "ok" {
+        bail!("SQLite 完整性校验失败（{}）: {check}", path.display());
+    }
+    Ok(())
+}
+
+/// 关键表行数：只统计存在的业务表，源/目标必须完全一致。
+fn sqlite_key_table_counts(path: &Path) -> Result<Vec<(&'static str, i64)>> {
+    let conn = open_sqlite_readonly_immutable(path)?;
+    let mut counts = Vec::new();
+    for table in HUB_TABLES {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("检查 SQLite 表 {table} 失败: {}", path.display()))?;
+        if exists == 0 {
+            continue;
+        }
+        // `table` 只来自 HUB_TABLES 常量。
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+                row.get(0)
+            })
+            .with_context(|| format!("统计 SQLite 表 {table} 失败: {}", path.display()))?;
+        counts.push((table, count));
+    }
+    Ok(counts)
+}
+
+/// 恢复后校验失败时回滚：有旧库副本则原子替换回去，否则删除新库。
+fn rollback_sqlite_target(destination: &Path, rollback: Option<&Path>) -> Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("SQLite 目标没有父目录: {}", destination.display()))?;
+    remove_restore_sidecars(destination)?;
+    match rollback {
+        Some(source) => {
+            let tmp = TempPathGuard::new(temp_database_path(destination, "rollback"));
+            copy_private_database(source, tmp.path())?;
+            let tmp = tmp.disarm();
+            fs::rename(&tmp, destination)
+                .with_context(|| format!("回滚 SQLite 数据库失败: {}", destination.display()))?;
+        }
+        None => match fs::remove_file(destination) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("回滚时删除新 SQLite 数据库失败: {}", destination.display())
+                })
+            }
+        },
+    }
+    fsutil::harden(destination, 0o600)?;
+    ensure_no_sqlite_sidecars(destination)?;
+    sync_dir(parent)?;
+    Ok(())
+}
+
+/// 用已验证的 SQLite 快照替换目标。
+///
+/// 安全顺序：
+/// 1. 目标存在任何 `-wal/-shm/-journal` 直接拒绝（不把旧 WAL 留在 rename 之后）；
+/// 2. 目标旧库先复制一份本地回滚副本（即使目标为空/只有空 schema）；
+/// 3. 新库写入同目录临时文件，校验 SHA256、`quick_check` 与 21 张表行数；
+/// 4. 再检查一次无 sidecar 后 rename；
+/// 5. rename 后再次校验；失败则用回滚副本原子替换回去（没有旧库则删除新库），
+///    并返回明确错误，绝不静默留下半恢复状态。
+fn restore_sqlite_file(source: &Path, destination: &Path) -> Result<()> {
+    ensure_no_sqlite_sidecars(destination)?;
+    let source_hash = sha256_file(source)?;
+    let source_counts = sqlite_key_table_counts(source)?;
+    sqlite_quick_check(source)?;
+
     let parent = destination
         .parent()
         .ok_or_else(|| anyhow!("SQLite 目标没有父目录: {}", destination.display()))?;
@@ -883,41 +1422,70 @@ fn restore_sqlite_file(source: &Path, destination: &Path) -> Result<()> {
         bail!("SQLite 目标是目录，拒绝覆盖: {}", destination.display());
     }
 
-    // 同目录临时文件 + fsync + rename，避免半写数据库。
-    let tmp = parent.join(format!(
-        ".{}.restore.{}.{:016x}",
-        destination
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("rustboard.db"),
-        std::process::id(),
-        rand_suffix()
-    ));
-    let mut src =
-        File::open(source).with_context(|| format!("打开备份数据库失败: {}", source.display()))?;
-    let mut dst = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| format!("创建临时数据库失败: {}", tmp.display()))?;
-    std::io::copy(&mut src, &mut dst).context("复制 SQLite 备份失败")?;
-    dst.sync_all().context("fsync 临时数据库失败")?;
-    drop(dst);
+    // 本地回滚副本：不依赖 restore 的 pre-restore 快照，空目标/只有空 schema
+    // 的旧库也能在 post-rename 校验失败时恢复原文件。
+    let rollback = if fs::symlink_metadata(destination).is_ok() {
+        let path = temp_database_path(destination, "pre-restore");
+        let guard = TempPathGuard::new(path.clone());
+        copy_private_database(destination, &path)
+            .with_context(|| format!("备份当前 SQLite 数据库失败: {}", destination.display()))?;
+        Some(guard)
+    } else {
+        None
+    };
+
+    let tmp = TempPathGuard::new(temp_database_path(destination, "restore"));
+    copy_private_database(source, tmp.path())
+        .with_context(|| format!("复制 SQLite 备份失败: {}", source.display()))?;
+    let tmp_hash = sha256_file(tmp.path())?;
+    if tmp_hash != source_hash {
+        bail!(
+            "SQLite 临时副本 SHA256 与备份不一致: {}",
+            tmp.path().display()
+        );
+    }
+    sqlite_quick_check(tmp.path())?;
+    let tmp_counts = sqlite_key_table_counts(tmp.path())?;
+    if tmp_counts != source_counts {
+        bail!(
+            "SQLite 临时副本行数与备份不一致（期望 {:?}，实际 {:?}）",
+            source_counts,
+            tmp_counts
+        );
+    }
+    // 只读校验/临时副本准备期间可能在目标目录留下空 sidecar；rename 前删除
+    // 并 fsync。删除失败仍 fail-closed。
+    remove_restore_sidecars(destination)?;
+    let tmp = tmp.disarm();
     fs::rename(&tmp, destination)
         .with_context(|| format!("替换 SQLite 数据库失败: {}", destination.display()))?;
-    // 备份文件是独立快照；旧 WAL/SHM 必须删除，否则会和新主库不匹配。
-    for suffix in ["-wal", "-shm"] {
-        let sidecar = sidecar_path(destination, suffix);
-        match fs::remove_file(&sidecar) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("清理旧 SQLite sidecar 失败: {}", sidecar.display()))
-            }
+
+    let post_check = (|| -> Result<()> {
+        ensure_no_sqlite_sidecars(destination)?;
+        if sha256_file(destination)? != source_hash {
+            bail!("恢复后的 SQLite 文件 SHA256 与备份不一致");
         }
+        sqlite_quick_check(destination)?;
+        let counts = sqlite_key_table_counts(destination)?;
+        if counts != source_counts {
+            bail!(
+                "恢复后的 SQLite 关键表行数与备份不一致（期望 {:?}，实际 {:?}）",
+                source_counts,
+                counts
+            );
+        }
+        Ok(())
+    })();
+    if let Err(err) = post_check {
+        let rollback_ref = rollback.as_ref().map(|guard| guard.path());
+        return match rollback_sqlite_target(destination, rollback_ref) {
+            Ok(()) => Err(err).context("恢复后校验失败；已回滚到恢复前 SQLite 数据库"),
+            Err(rb) => Err(err).context(format!(
+                "恢复后校验失败；回滚也失败（需要人工处理）: {rb:#}"
+            )),
+        };
     }
+
     fsutil::harden(destination, 0o600)?;
     sync_dir(parent)?;
     Ok(())
@@ -937,6 +1505,7 @@ pub(crate) fn pg_dump_to(dsn: &str, destination: &Path) -> Result<()> {
     command
         .arg("--format=custom")
         .arg("--no-owner")
+        .arg("--no-privileges")
         .arg("--file")
         .arg(destination)
         .arg("--dbname")
@@ -964,6 +1533,7 @@ fn pg_restore_from(dsn: &str, dump: &Path) -> Result<()> {
         .arg("--clean")
         .arg("--if-exists")
         .arg("--no-owner")
+        .arg("--no-privileges")
         .arg("--single-transaction")
         .arg("--dbname")
         .arg(&secrets.sanitized)
@@ -1279,37 +1849,10 @@ fn restore_certs(backup_dir: &Path, manifest: &Manifest, data_dir: &Path) -> Res
     Ok(())
 }
 
-/// restore 前对当前目标做 best-effort 快照。
-fn pre_restore_snapshot(
-    target_cfg: &HubConfig,
-    config_path: &Path,
-    target_config_bytes: &[u8],
-) -> Result<PathBuf> {
-    // 优先用当前配置字节；若当前配置描述的并不是本恢复目标，则用备份里的配置，
-    // 保证快照自身的 manifest.backend 与 hub.toml 一致。
-    let config_bytes = match load_optional_config_snapshot(config_path)? {
-        Some((bytes, cfg)) => {
-            if same_database(&cfg, target_cfg) {
-                bytes
-            } else {
-                target_config_bytes.to_vec()
-            }
-        }
-        None => target_config_bytes.to_vec(),
-    };
+/// restore 前对当前目标做快照；失败时调用方必须中止恢复。
+fn pre_restore_snapshot(target_cfg: &HubConfig, target_config_bytes: &[u8]) -> Result<PathBuf> {
     let out_root = target_cfg.data_dir.join("backups");
-    snapshot_to(&out_root, target_cfg, &config_bytes, false).context("创建恢复前目标备份失败")
-}
-
-fn same_database(left: &HubConfig, right: &HubConfig) -> bool {
-    if left.data_dir != right.data_dir {
-        return false;
-    }
-    match (left.database_kind(), right.database_kind()) {
-        (Ok(DatabaseKind::Sqlite(a)), Ok(DatabaseKind::Sqlite(b))) => a == b,
-        (Ok(DatabaseKind::Postgres(a)), Ok(DatabaseKind::Postgres(b))) => a == b,
-        _ => false,
-    }
+    snapshot_to(&out_root, target_cfg, target_config_bytes, true).context("创建恢复前目标备份失败")
 }
 
 fn load_optional_config_snapshot(path: &Path) -> Result<Option<(Vec<u8>, HubConfig)>> {
@@ -1370,6 +1913,13 @@ fn backend_of(kind: &DatabaseKind) -> Backend {
     match kind {
         DatabaseKind::Sqlite(_) => Backend::Sqlite,
         DatabaseKind::Postgres(_) => Backend::Postgres,
+    }
+}
+
+fn backend_name_of(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Sqlite => "sqlite",
+        Backend::Postgres => "postgres",
     }
 }
 
