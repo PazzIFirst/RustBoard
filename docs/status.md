@@ -256,10 +256,12 @@
       `v100-acme-ip.sh`、`v100-acme-renew.sh`、`v100-acme-fallback.sh`、
       `v100-tls-agent.sh`、`v100-panel-tls.sh`、`v100-admin-tls.sh`，以及
       install/offline/arm64/docker 回归
-- [ ] 独立评审（只读）与渗透（本地实例）：ACME 目录 SSRF、挑战端口、key 权限、
-      token 日志、旧 agent 降级、admin/panel TLS、Docker 端口/证书卷
-- [ ] RC 前手工门禁：真实 Let's Encrypt staging（域名 HTTP-01/TLS-ALPN +
-      公网 IPv4 `shortlived`），记录 SAN/链/到期/续期；不得伪造成功
+- [x] 独立评审（只读）与渗透（本地实例）：ACME 目录 SSRF、挑战端口、key 权限、
+      token 日志、旧 agent 降级、admin/panel TLS、Docker 端口/证书卷；报告
+      [Phase C 渗透](security/2026-10-25-m5-phase-c-pentest.md)，高危 0/中危 0/低危 2
+- [x] RC 前手工门禁：真实 Let's Encrypt staging（域名 HTTP-01/TLS-ALPN +
+      公网 IPv4 `shortlived`），见
+      [LE staging 证据](security/2026-10-25-m5-phase-c-le-staging-evidence.md)
 - [ ] `v1.0.0-rc.1`：版本/CHANGELOG 归档、tag、真实 release workflow
       （`delivery-e2e`/`delivery-docker`/`delivery-arm64`、staging 镜像、SBOM、
       attestation、pre-release 不 latest）；RC 通过后才进入 Phase D/E
@@ -275,8 +277,9 @@ Pebble **3/3**（HTTP-01、TLS-ALPN-01、IP shortlived）真实签发；另跑�
 [v100-acme-upgrade.sh](tests/e2e/v100-acme-upgrade.sh)；
 [v100-admin-panel-tls.sh](tests/e2e/v100-admin-panel-tls.sh) 验证
 `admin_tls=required` + panel `hub_ca` 的 HTTPS 登录与 `/api/overview` 代理；
-本地 arm64（非 LTO
-快速构建，不替代发布 profile）`v100-arm64.sh` **40 PASS / 0 FAIL / 2 SKIP**：
+真实 LE staging 已完成：域名 HTTP-01、域名 TLS-ALPN-01、公网 IPv4
+`shortlived` 三路均签发成功（见证据文档）；本地 arm64（非 LTO 快速构建，
+不替代发布 profile）`v100-arm64.sh` **40 PASS / 0 FAIL / 2 SKIP**：
 两个 SKIP 是 x86 宿主无法执行 aarch64 包内 install.sh/原生 systemd 路径，已用
 qemu 直接运行 hub/panel/agent 验证；hosted 原生仍待 RC。panel
 `phase_c_panel_tls` **14/14**；web 80/80 + build。独立渗透报告
@@ -286,16 +289,10 @@ qemu 直接运行 hub/panel/agent 验证；hosted 原生仍待 RC。panel
 回环 admin required 被 fail-closed 拒绝）保留为低危/文档约束。O.hub/O.union 已同步 80/443 元数据，C.3/H.13/H.14 仍断言
 默认 compose 不发布 80/443、8444 不发布。
 
-**仍未完成 / RC 阻断**：本地 arm64 最终包未重建（QEMU 构建超时，hosted
-`delivery-arm64` 待 RC）；升级/回退虽已补事务 guard、new data_dir OwnedDir、
-ACME→self-signed 强制重签与 wrapper `--force` 不再自动 offline，但尚无独立
-升级/回退 e2e；私有 ACME 已支持 `tls.agent_ca_file`/`--agent-ca` 显式稳定根，
-未设置时仍从 `server.crt` 链尾派生（intermediate 轮换需人工更新已分发锚）；
-真实 Let's Encrypt staging 已尝试：用 `185-180-19-163.sslip.io` + LE staging
-`tls-alpn-01`，DNS 解析正确（DoH 确认）但订单 `Invalid`，本机 NAT/公网 443
-入站未打通；改用 `example.com` 邮箱时被 LE `invalidContact` 拒绝，属测试邮箱
-问题。hosted release workflow、完整面板→hub HTTPS `hub_ca`/arm64 原生门禁
-未执行。
+**仍未完成 / RC 阻断**：hosted release workflow、`delivery-arm64` 原生
+runner、GHCR/SBOM/attestation 尚未执行；本地 arm64 包是 `LTO=false` 快速构建，
+不替代发布 profile；私有 ACME 未设置 `tls.agent_ca_file` 时仍从链尾派生
+intermediate（轮换需人工更新已分发锚）；低危 L-01/L-03 保留。
 
 **Phase C 内存基线（2026-10-25，x86_64 release 静态包）**：hub
 `self_monitor=false`、panel HTTP、agent 已 enrollment 的独立空闲进程，60s 后：
