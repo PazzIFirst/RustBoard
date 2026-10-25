@@ -35,7 +35,7 @@ use rustboard_common::control::{
 };
 use rustboard_common::util::now_ms;
 use rustboard_common::wire::Frame;
-use rustboard_core::storage::{AuditEntry, NewAuditEntry, Storage};
+use rustboard_core::storage::{AuditEntry, NewAuditEntry};
 use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;

@@ -33,7 +33,8 @@ use rustboard_core::archive::{
     ArchiveStatus, ArchiveStoreError, ColdStore, CsvArchiveOutput, CsvArchiveWriter,
 };
 use rustboard_core::downsample::ArchiveGate;
-use rustboard_core::storage::sqlite::{ArchiveRawRow, SqliteStorage};
+use rustboard_core::storage::sqlite::ArchiveRawRow;
+use rustboard_core::storage::StorageHandle;
 use serde::Serialize;
 
 use crate::archive_sftp::SftpColdStore;
@@ -198,7 +199,7 @@ pub(crate) fn download_filename(object_key: &str) -> Option<String> {
 }
 
 /// 读取归档水位；key 不存在 / 空串视为 `None`，非法整数返回错误。
-fn read_archive_i64(storage: &SqliteStorage, key: &str) -> Result<Option<i64>> {
+fn read_archive_i64(storage: &StorageHandle, key: &str) -> Result<Option<i64>> {
     let Some(raw) = storage.get_archive_state(key)? else {
         return Ok(None);
     };
@@ -218,7 +219,7 @@ fn read_archive_i64(storage: &SqliteStorage, key: &str) -> Result<Option<i64>> {
 /// - 有合法水位 → `Enabled { watermark: Some(..) }`；
 /// - 水位缺失 / 为空 / 损坏 → `Enabled { watermark: None }`，**阻止 raw 删除**，
 ///   避免「还没成功归档就被保留期删掉唯一副本」。
-pub(crate) fn archive_gate(storage: &SqliteStorage, cfg: &HubConfig) -> ArchiveGate {
+pub(crate) fn archive_gate(storage: &StorageHandle, cfg: &HubConfig) -> ArchiveGate {
     if !cfg.archive.enabled {
         return ArchiveGate::Disabled;
     }
@@ -238,7 +239,7 @@ pub(crate) fn archive_gate(storage: &SqliteStorage, cfg: &HubConfig) -> ArchiveG
 ///
 /// `last_error` 可能是旧版本写入的原始 `{err:#}`，读取时再做一次白名单 / 掩码，
 /// 防止历史库里的 URL、凭据或路径经由 API / 面板回显。
-pub(crate) fn status(storage: &SqliteStorage, cfg: &HubConfig) -> Result<ArchiveStatusOutput> {
+pub(crate) fn status(storage: &StorageHandle, cfg: &HubConfig) -> Result<ArchiveStatusOutput> {
     let last_error = storage
         .get_archive_state(STATE_LAST_ERROR)?
         .map(|value| sanitize_last_error(&value))
@@ -277,7 +278,7 @@ fn sanitize_last_error(raw: &str) -> String {
 /// - 启动补跑：今天已过 `schedule_hour_utc` 且水位落后于「最新可归档天结束」
 ///   时立即执行一轮，之后按每天计划时间运行；
 /// - 每轮错误只 WARN，任务不退出；不修改 raw，保留期仍受 [`archive_gate`] 门禁。
-pub(crate) fn spawn_archive_worker(storage: Arc<SqliteStorage>, cfg: HubConfig) {
+pub(crate) fn spawn_archive_worker(storage: Arc<StorageHandle>, cfg: HubConfig) {
     if !cfg.archive.enabled {
         tracing::info!("归档 worker 未启用（archive.enabled = false）");
         return;
@@ -323,7 +324,7 @@ pub(crate) fn spawn_archive_worker(storage: Arc<SqliteStorage>, cfg: HubConfig) 
 }
 
 /// 启动补跑判定：今天已过计划时间，且水位早于最新可归档天的结束边界。
-fn should_catch_up(storage: &SqliteStorage, cfg: &HubConfig, now: i64) -> Result<bool> {
+fn should_catch_up(storage: &StorageHandle, cfg: &HubConfig, now: i64) -> Result<bool> {
     let scheduled = day_start(now) + i64::from(cfg.archive.schedule_hour_utc) * HOUR_MS;
     if now < scheduled {
         return Ok(false);
@@ -354,7 +355,7 @@ fn next_run_delay(now: i64, schedule_hour_utc: u8) -> Duration {
 /// 写入 `last_error`（成功清空），不存后端错误原文。
 /// 返回的 [`ArchiveRunReport`] 只用于日志 / CLI，不包含 secret。
 pub(crate) async fn run_archive_once(
-    storage: &SqliteStorage,
+    storage: &StorageHandle,
     cfg: &HubConfig,
     store: &dyn ColdStore,
     now: i64,
@@ -364,7 +365,7 @@ pub(crate) async fn run_archive_once(
 
 /// 带可调分片 / 扫描行数的实现；测试用小分片覆盖多分片路径。
 async fn run_archive_once_with_limits(
-    storage: &SqliteStorage,
+    storage: &StorageHandle,
     cfg: &HubConfig,
     store: &dyn ColdStore,
     now: i64,
@@ -385,7 +386,7 @@ async fn run_archive_once_with_limits(
 }
 
 /// 访问数据库失败时只 WARN，不覆盖调用方真正关心的归档错误。
-fn record_run_state(storage: &SqliteStorage, now: i64, result: &Result<ArchiveRunReport>) {
+fn record_run_state(storage: &StorageHandle, now: i64, result: &Result<ArchiveRunReport>) {
     // 只写固定码：后端错误即使意外带出 URL / 凭据，也不会进入状态表。
     let last_error = match result {
         Ok(_) => String::new(),
@@ -401,7 +402,7 @@ fn record_run_state(storage: &SqliteStorage, now: i64, result: &Result<ArchiveRu
 
 /// 一轮归档的主体：按 UTC 天推进，逐日切分片并上传。
 async fn run_archive_cycle(
-    storage: &SqliteStorage,
+    storage: &StorageHandle,
     cfg: &HubConfig,
     store: &dyn ColdStore,
     now: i64,
@@ -491,7 +492,7 @@ struct ShardOutcome {
 /// 用显式 `VecDeque` 代替递归，避免 async 递归的 boxed future 与额外分配；
 /// 拆分保持行顺序，分片编号连续。
 async fn upload_shard(
-    storage: &SqliteStorage,
+    storage: &StorageHandle,
     cfg: &HubConfig,
     store: &dyn ColdStore,
     day: ArchiveDay,
@@ -722,7 +723,7 @@ mod tests {
     use crate::archive_webdav::WebdavColdStore;
     use rustboard_common::model::{Sample, SampleBatch};
     use rustboard_core::downsample::{run_retention, STATE_DOWNSAMPLE_1M_WATERMARK};
-    use rustboard_core::storage::{IngestOutcome, Storage};
+    use rustboard_core::storage::IngestOutcome;
 
     /// 固定测试时间：第 20,000 天 12:00 UTC（与真实日期无关，便于算边界）。
     const TEST_DAY_MS: i64 = 86_400_000;
@@ -738,7 +739,7 @@ mod tests {
         cfg
     }
 
-    fn insert_raw_rows(storage: &SqliteStorage, at: i64, values: &[f64]) {
+    fn insert_raw_rows(storage: &StorageHandle, at: i64, values: &[f64]) {
         let samples = values
             .iter()
             .map(|value| Sample::new("cpu.usage", at, *value).with_label("host", "a"))
@@ -778,7 +779,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_uploads_two_shards_and_advances_watermark() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let mock = MockDav::spawn().await;
         let store = WebdavColdStore::new(&mock.config()).unwrap();
         let cfg = test_cfg();
@@ -886,7 +887,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_failure_keeps_raw_and_does_not_advance_watermark() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let mock = MockDav::spawn().await;
         let store = WebdavColdStore::new(&mock.config()).unwrap();
         let cfg = test_cfg();
@@ -923,7 +924,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_rerun_is_idempotent_and_skips_uploaded_objects() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let mock = MockDav::spawn().await;
         let store = WebdavColdStore::new(&mock.config()).unwrap();
         let cfg = test_cfg();
@@ -962,7 +963,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_day_advances_watermark_without_objects() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let mock = MockDav::spawn().await;
         let store = WebdavColdStore::new(&mock.config()).unwrap();
         let cfg = test_cfg();
@@ -992,7 +993,7 @@ mod tests {
 
     #[test]
     fn retention_gate_blocks_raw_until_watermark_covers_cutoff() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         let now = TEST_NOW;
         insert_raw_rows(&storage, now - 10 * TEST_DAY_MS, &[1.0, 2.0, 3.0]);
@@ -1003,7 +1004,7 @@ mod tests {
         // 归档启用但没有水位：raw 一律不删。
         let gate = archive_gate(&storage, &cfg);
         assert_eq!(gate, ArchiveGate::Enabled { watermark: None });
-        let report = run_retention(&storage, &cfg, now, gate).unwrap();
+        let report = run_retention(&*storage, &cfg, now, gate).unwrap();
         assert_eq!(report.raw.deleted, 0);
         assert!(report.raw.blocked_by_archive);
         assert_eq!(storage.raw_stats().unwrap().rows, 3);
@@ -1019,7 +1020,7 @@ mod tests {
                 watermark: Some(now)
             }
         );
-        let report = run_retention(&storage, &cfg, now, gate).unwrap();
+        let report = run_retention(&*storage, &cfg, now, gate).unwrap();
         assert_eq!(report.raw.deleted, 3);
         assert!(!report.raw.blocked_by_archive);
         assert_eq!(storage.raw_stats().unwrap().rows, 0);
@@ -1027,7 +1028,7 @@ mod tests {
 
     #[test]
     fn retention_gate_disabled_keeps_legacy_raw_deletion() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = HubConfig::default();
         let now = TEST_NOW;
         insert_raw_rows(&storage, now - 10 * TEST_DAY_MS, &[1.0, 2.0]);
@@ -1036,14 +1037,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(archive_gate(&storage, &cfg), ArchiveGate::Disabled);
-        let report = run_retention(&storage, &cfg, now, archive_gate(&storage, &cfg)).unwrap();
+        let report = run_retention(&*storage, &cfg, now, archive_gate(&storage, &cfg)).unwrap();
         assert_eq!(report.raw.deleted, 2);
         assert!(!report.raw.blocked_by_archive);
     }
 
     #[test]
     fn status_reports_archive_state_and_object_count() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         storage
             .set_archive_state(STATE_LAST_ARCHIVED_TS, "123", 1)
@@ -1071,7 +1072,7 @@ mod tests {
     /// status 必须掩码；固定中文与固定码仍可展示。
     #[test]
     fn status_masks_unsafe_last_error_values() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
 
         let long = "a".repeat(512);
@@ -1160,7 +1161,7 @@ mod tests {
             Duration::from_millis(TEST_DAY_MS as u64)
         );
 
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         assert!(!should_catch_up(&storage, &cfg, base + 2 * 3_600_000).unwrap());
         assert!(should_catch_up(&storage, &cfg, base + 3 * 3_600_000).unwrap());
@@ -1243,7 +1244,7 @@ mod tests {
         use crate::archive_s3::S3ColdStore;
         use object_store::memory::InMemory;
 
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let store = S3ColdStore::with_store(Arc::new(InMemory::new()));
         let cfg = test_cfg_s3();
         insert_raw_rows(&storage, ARCHIVE_DAY_START + 3_600_000, &[1.0, 2.0, 3.0]);

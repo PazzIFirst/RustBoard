@@ -34,8 +34,7 @@ use rustboard_core::alerts::{
     AlertEvent, AlertRule, AlertRuleInput, AlertRuleStoreError, AlertSilence, AlertSilenceInput,
     AlertSilenceStoreError, AlertSource, Comparator, MAX_ALERT_RULES, MAX_ALERT_SILENCES,
 };
-use rustboard_core::storage::sqlite::SqliteStorage;
-use rustboard_core::storage::Storage;
+use rustboard_core::storage::StorageHandle;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
@@ -165,7 +164,7 @@ enum RuleChannelIssue {
 /// 渠道 id 仍会生成永不发送的规则；这里在写规则前显式拒绝。返回固定错误码，
 /// 不回显渠道 id 或配置。
 async fn validate_rule_channels(
-    storage: Arc<SqliteStorage>,
+    storage: Arc<StorageHandle>,
     channel_ids: &[String],
 ) -> Result<(), ApiError> {
     if channel_ids.is_empty() {
@@ -433,7 +432,6 @@ mod tests {
     use rustboard_common::config::HubConfig;
     use rustboard_core::alerts::{builtin_rules, AlertRuleStoreError, BUILTIN_AGENT_OFFLINE};
     use rustboard_core::channels::{ChannelConfig, ChannelKind, NotificationChannel, Secret};
-    use rustboard_core::storage::sqlite::SqliteStorage;
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
@@ -454,7 +452,7 @@ mod tests {
             ..HubConfig::default()
         };
         AppState {
-            storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
+            storage: Arc::new(StorageHandle::sqlite_memory().unwrap()),
             cfg: Arc::new(cfg.clone()),
             sessions: SessionRegistry::new(),
             renewal: RenewalContext::new(PathBuf::from("/tmp/rb-hub-alerts-test-unused-ca"), 90),

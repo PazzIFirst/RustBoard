@@ -28,8 +28,7 @@ use rustboard_common::config::HubConfig;
 use rustboard_common::util::now_ms;
 use rustboard_core::alerts::{AlertEvent, AlertRule, AlertStateKind};
 use rustboard_core::channels::{build_text, NotificationChannel};
-use rustboard_core::storage::sqlite::SqliteStorage;
-use rustboard_core::storage::Storage;
+use rustboard_core::storage::StorageHandle;
 
 use crate::notify::{Notifier, NotifyError};
 
@@ -72,7 +71,7 @@ enum EventOutcome {
 /// - 已有合法游标：直接返回（重启不补发）；
 /// - 不存在 / 非法：取当前 `MAX(alert_events.id)` 写入，返回该值。B1b 阶段所有
 ///   历史事件都是 `notified = 0`，绝不能直接投递。
-pub(crate) fn initialize_notify_cursor(storage: &SqliteStorage, now: i64) -> Result<i64> {
+pub(crate) fn initialize_notify_cursor(storage: &StorageHandle, now: i64) -> Result<i64> {
     if let Some(raw) = storage.get_maintenance_state(NOTIFY_CURSOR_KEY)? {
         match raw.trim().parse::<i64>() {
             Ok(cursor) if cursor >= 0 => return Ok(cursor),
@@ -100,7 +99,7 @@ pub(crate) fn initialize_notify_cursor(storage: &SqliteStorage, now: i64) -> Res
 /// - 每轮在 `spawn_blocking` 内读库，发送阶段走 async `Notifier`；任务本身
 ///   不退出，错误只 WARN。
 pub(crate) fn spawn_notify_worker(
-    storage: Arc<SqliteStorage>,
+    storage: Arc<StorageHandle>,
     cfg: HubConfig,
     notifier: Arc<dyn Notifier>,
 ) {
@@ -158,7 +157,7 @@ pub(crate) fn spawn_notify_worker(
 /// 供后台任务与单元测试共用；调用方保证 `cursor` 已持久化。每个事件的发送结果
 /// 都落库后才推进内存游标，批末再持久化一次。
 pub(crate) async fn notify_once(
-    storage: Arc<SqliteStorage>,
+    storage: Arc<StorageHandle>,
     notifier: Arc<dyn Notifier>,
     cursor: i64,
     now: i64,
@@ -234,7 +233,7 @@ pub(crate) async fn notify_once(
 
 /// 处理单个事件；所有「不发送」路径都会写 `notified = 1` + 固定原因。
 async fn process_event(
-    storage: &Arc<SqliteStorage>,
+    storage: &Arc<StorageHandle>,
     notifier: &Arc<dyn Notifier>,
     event: &AlertEvent,
     rules: &HashMap<String, AlertRule>,
@@ -389,7 +388,7 @@ async fn process_event(
 }
 
 /// 标记事件已处理但未发送；原因固定且已脱敏。
-async fn mark_skipped(storage: &Arc<SqliteStorage>, event_id: i64, reason: &str) -> Result<()> {
+async fn mark_skipped(storage: &Arc<StorageHandle>, event_id: i64, reason: &str) -> Result<()> {
     let storage = storage.clone();
     let reason = reason.to_string();
     blocking(storage, move |storage| {
@@ -413,10 +412,10 @@ fn failure_summary(failures: &[(&str, NotifyError)]) -> String {
 }
 
 /// 在 `spawn_blocking` 中执行一次存储读取 / 写入，避免阻塞 async worker。
-async fn blocking<T, F>(storage: Arc<SqliteStorage>, task: F) -> Result<T>
+async fn blocking<T, F>(storage: Arc<StorageHandle>, task: F) -> Result<T>
 where
     T: Send + 'static,
-    F: FnOnce(&SqliteStorage) -> Result<T> + Send + 'static,
+    F: FnOnce(&StorageHandle) -> Result<T> + Send + 'static,
 {
     tokio::task::spawn_blocking(move || task(&storage))
         .await
@@ -429,8 +428,6 @@ mod tests {
 
     use rustboard_core::alerts::{AlertRule, AlertSilence, AlertSource, AlertState, Comparator};
     use rustboard_core::channels::{ChannelConfig, ChannelKind, Secret};
-    use rustboard_core::storage::sqlite::SqliteStorage;
-    use rustboard_core::storage::Storage;
 
     use super::*;
     use crate::notify::MockNotifier;
@@ -500,11 +497,11 @@ mod tests {
         }
     }
 
-    fn insert_event(storage: &SqliteStorage, event: AlertEvent) -> i64 {
+    fn insert_event(storage: &StorageHandle, event: AlertEvent) -> i64 {
         storage.insert_alert_event(&event).unwrap()
     }
 
-    fn stored_event(storage: &SqliteStorage, id: i64) -> AlertEvent {
+    fn stored_event(storage: &StorageHandle, id: i64) -> AlertEvent {
         storage
             .list_alert_events(100, None)
             .unwrap()
@@ -513,11 +510,11 @@ mod tests {
             .expect("事件必须存在")
     }
 
-    fn seed_rule(storage: &SqliteStorage, rule: &AlertRule) {
+    fn seed_rule(storage: &StorageHandle, rule: &AlertRule) {
         storage.create_alert_rule(rule).unwrap();
     }
 
-    fn seed_channel(storage: &SqliteStorage, channel: &NotificationChannel) {
+    fn seed_channel(storage: &StorageHandle, channel: &NotificationChannel) {
         storage.create_notification_channel(channel).unwrap();
     }
 
@@ -542,7 +539,7 @@ mod tests {
     /// 首次启动跳过 B1b 存量事件；处理新事件后游标持久化，重启继续。
     #[tokio::test]
     async fn m4_b2b_worker_first_start_skips_backlog_and_persists_cursor() {
-        let storage = Arc::new(SqliteStorage::open_in_memory().unwrap());
+        let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
         let mock = Arc::new(MockNotifier::new());
         let mut backlog_rule = rule("rule-old", 0);
         let backlog_channel = channel("存量渠道", true);
@@ -623,7 +620,7 @@ mod tests {
     /// 新事件发送成功：事件 notified、状态 last_notified_at 更新、文本含事件快照。
     #[tokio::test]
     async fn m4_b2b_worker_sends_new_event_and_updates_state() {
-        let storage = Arc::new(SqliteStorage::open_in_memory().unwrap());
+        let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
         let mock = Arc::new(MockNotifier::new());
         let mut rule = rule("rule-send", 1_800);
         let channel = channel("运维群", true);
@@ -670,7 +667,7 @@ mod tests {
     /// 冷却抑制 firing、但不抑制 resolved；resolved 不刷新冷却锚点。
     #[tokio::test]
     async fn m4_b2b_worker_cooldown_and_resolve_exemption() {
-        let storage = Arc::new(SqliteStorage::open_in_memory().unwrap());
+        let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
         let mock = Arc::new(MockNotifier::new());
         let mut rule = rule("rule-cooldown", 1_800);
         let channel = channel("冷却群", true);
@@ -740,7 +737,7 @@ mod tests {
     /// 无渠道 / 渠道不存在 / 渠道全禁用 / 规则不存在都标记固定原因且不阻塞。
     #[tokio::test]
     async fn m4_b2b_worker_marks_no_channel_missing_rule_and_disabled() {
-        let storage = Arc::new(SqliteStorage::open_in_memory().unwrap());
+        let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
         let mock = Arc::new(MockNotifier::new());
 
         let no_channel = rule("rule-no-channel", 0);
@@ -821,7 +818,7 @@ mod tests {
     /// 部分失败：至少一个成功 → 事件成功且错误为空；全部失败 → 固定摘要。
     #[tokio::test]
     async fn m4_b2b_worker_partial_and_total_failure() {
-        let storage = Arc::new(SqliteStorage::open_in_memory().unwrap());
+        let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
         let mock = Arc::new(MockNotifier::new());
 
         let first = channel("渠道-1", true);
@@ -909,7 +906,7 @@ mod tests {
     /// 静默事件永不发送；单 tick 严格限制 50 条，游标在批末推进。
     #[tokio::test]
     async fn m4_b2b_worker_silence_defense_and_batch_limit() {
-        let storage = Arc::new(SqliteStorage::open_in_memory().unwrap());
+        let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
         let mock = Arc::new(MockNotifier::new());
         let mut rule = rule("rule-batch", 0);
         let channel = channel("批量渠道", true);
@@ -965,7 +962,7 @@ mod tests {
     /// 首次 firing 不能被 A 的通知时间误判成冷却中。
     #[tokio::test]
     async fn m4_b2b_worker_cooldown_is_per_series() {
-        let storage = Arc::new(SqliteStorage::open_in_memory().unwrap());
+        let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
         let mock = Arc::new(MockNotifier::new());
         let mut rule = rule("rule-two-series", 1_800);
         let channel = channel("双序列渠道", true);
@@ -1023,7 +1020,7 @@ mod tests {
     /// 事件落库后新建的静默：发送前重新检查当前生效静默，命中不发送。
     #[tokio::test]
     async fn m4_b2b_worker_rechecks_late_silence_before_send() {
-        let storage = Arc::new(SqliteStorage::open_in_memory().unwrap());
+        let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
         let mock = Arc::new(MockNotifier::new());
         let mut rule = rule("rule-late-silence", 0);
         let channel = channel("晚到静默渠道", true);
@@ -1067,7 +1064,7 @@ mod tests {
     /// 恢复通知关闭：标记 resolve_disabled，不发送。
     #[tokio::test]
     async fn m4_b2b_worker_resolve_disabled_is_marked() {
-        let storage = Arc::new(SqliteStorage::open_in_memory().unwrap());
+        let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
         let mock = Arc::new(MockNotifier::new());
         let mut rule = rule("rule-no-resolve", 0);
         rule.notify_on_resolve = false;

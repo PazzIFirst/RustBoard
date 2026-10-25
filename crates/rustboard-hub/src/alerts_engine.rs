@@ -46,8 +46,7 @@ use rustboard_core::alerts::{
     self, AlertEvent, AlertRule, AlertSilence, AlertSource, AlertState, AlertStateKind,
     MAX_ALERT_RULES,
 };
-use rustboard_core::storage::sqlite::SqliteStorage;
-use rustboard_core::storage::Storage;
+use rustboard_core::storage::StorageHandle;
 
 /// metric 规则回看窗口下限：60 秒。
 ///
@@ -145,7 +144,7 @@ pub(crate) struct EvaluationReport {
 /// 任何单条规则的查询失败只记 WARN 与计数，**不会**把状态误判成 resolved；
 /// 存储写入失败则整轮返回错误，下一轮重试。
 pub(crate) fn evaluate_once(
-    storage: &SqliteStorage,
+    storage: &StorageHandle,
     cfg: &HubConfig,
     now: i64,
 ) -> Result<EvaluationReport> {
@@ -157,7 +156,7 @@ pub(crate) fn evaluate_once(
 /// 生产路径使用 [`evaluate_once`]；测试传 `|_| Ok(20)` 之类的闭包即可覆盖
 /// hub_cert 规则，无需真实证书文件。单位与规则阈值一致：**小时**。
 pub(crate) fn evaluate_once_with_cert_hours<F>(
-    storage: &SqliteStorage,
+    storage: &StorageHandle,
     cfg: &HubConfig,
     now: i64,
     cert_hours: F,
@@ -183,7 +182,7 @@ fn round_budget(cfg: &HubConfig) -> Duration {
 /// 评估入口的完整参数版本：测试可注入更小的序列上限 / 预算，避免构造 5001
 /// 条序列或等待真实时间。
 fn evaluate_with_options<F>(
-    storage: &SqliteStorage,
+    storage: &StorageHandle,
     cfg: &HubConfig,
     now: i64,
     cert_hours: F,
@@ -492,7 +491,7 @@ fn budget_exhausted(started: Instant, budget: Duration) -> bool {
 /// 读取水位失败时照常清理（避免坏键让清理永久停摆）；清理失败只 WARN，水位仍
 /// 推进到本轮，最多一小时后重试，避免每轮反复 COUNT / DELETE。
 fn prune_history_if_due(
-    storage: &SqliteStorage,
+    storage: &StorageHandle,
     cfg: &HubConfig,
     now: i64,
     report: &mut EvaluationReport,
@@ -519,7 +518,7 @@ fn prune_history_if_due(
 
 /// 清理过期事件 / resolved 状态 / 静默。失败只 WARN，不影响本轮评估结果。
 fn prune_history(
-    storage: &SqliteStorage,
+    storage: &StorageHandle,
     cfg: &HubConfig,
     now: i64,
     report: &mut EvaluationReport,
@@ -579,7 +578,7 @@ fn hub_cert_hours_left(cfg: &HubConfig, now: i64) -> Result<i64> {
 /// - 启动后先睡一个周期，避免与监听启动抢 SQLite 写锁；
 /// - 每轮在 `spawn_blocking` 内串行执行，错误只 WARN，任务不退出；
 /// - 日志只输出计数，不输出 secret。
-pub(crate) fn spawn_alert_engine(storage: Arc<SqliteStorage>, cfg: HubConfig) {
+pub(crate) fn spawn_alert_engine(storage: Arc<StorageHandle>, cfg: HubConfig) {
     if !cfg.alerts.enabled {
         tracing::info!("告警引擎未启用（alerts.enabled = false）");
         return;
@@ -622,6 +621,7 @@ mod tests {
 
     use rustboard_common::model::{Labels, Sample, SampleBatch};
     use rustboard_core::alerts::{AlertState, Comparator};
+    use rustboard_core::storage::sqlite::DEFAULT_READ_POOL_SIZE;
 
     use super::*;
 
@@ -632,7 +632,7 @@ mod tests {
         }
     }
 
-    fn seed_agent(storage: &SqliteStorage, id: &str, last_seen_at: i64) {
+    fn seed_agent(storage: &StorageHandle, id: &str, last_seen_at: i64) {
         storage
             .upsert_agent(&AgentRecord {
                 agent_id: id.to_string(),
@@ -650,7 +650,7 @@ mod tests {
     }
 
     fn seed_sample(
-        storage: &SqliteStorage,
+        storage: &StorageHandle,
         seq: u64,
         agent: &str,
         metric: &str,
@@ -704,7 +704,7 @@ mod tests {
         }
     }
 
-    fn store(storage: &SqliteStorage, rule: &AlertRule) {
+    fn store(storage: &StorageHandle, rule: &AlertRule) {
         storage.create_alert_rule(rule).unwrap();
     }
 
@@ -722,7 +722,7 @@ mod tests {
     /// metric：多 agent 每个序列独立、labels 精确子集、窗口外样本不评估、不重复触发。
     #[test]
     fn m4_b1b_metric_rule_multi_agent_labels_and_no_duplicate_event() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         let now = 1_700_000_000_000;
 
@@ -831,7 +831,7 @@ mod tests {
     /// metric：duration 未满只更新 pending，满后触发一次。
     #[test]
     fn m4_b1b_metric_rule_waits_for_duration() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         let now = 1_700_000_000_000;
         store(&storage, &metric_rule("slow-disk", 90.0, 60));
@@ -899,7 +899,7 @@ mod tests {
     /// 恢复与重触发：firing → resolved → firing，事件依次落库。
     #[test]
     fn m4_b1b_metric_rule_resolves_and_retriggers() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         let now = 1_700_000_000_000;
         store(&storage, &metric_rule("flap", 90.0, 0));
@@ -962,7 +962,7 @@ mod tests {
     /// 无样本 / 证书读取失败不得把 firing 误判成 resolved。
     #[test]
     fn m4_b1b_missing_samples_and_cert_errors_never_resolve() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         let now = 1_700_000_000_000;
 
@@ -1025,7 +1025,7 @@ mod tests {
     /// agent_offline：阈值比较、吊销跳过、恢复后 resolved。
     #[test]
     fn m4_b1b_offline_rule_fires_skips_revoked_and_resolves() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         let now = 1_700_000_000_000;
 
@@ -1092,7 +1092,7 @@ mod tests {
     /// （30 天）在旧语义下 30 < 48 → 误报；新语义 720 > 48 → 不得触发。
     #[test]
     fn m4_b1fix_hub_cert_rule_uses_injected_hours_not_days() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         let now = 1_700_000_000_000;
         store(
@@ -1142,7 +1142,7 @@ mod tests {
     /// 静默：事件仍落库，silenced=true、notified=false；静默过期后不再标记。
     #[test]
     fn m4_b1b_silence_marks_events_but_keeps_them() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         let now = 1_700_000_000_000;
         store(&storage, &metric_rule("silenced", 90.0, 0));
@@ -1220,7 +1220,7 @@ mod tests {
         let now = 1_700_000_000_000;
 
         {
-            let storage = SqliteStorage::open(&db).unwrap();
+            let storage = StorageHandle::sqlite(&db, DEFAULT_READ_POOL_SIZE).unwrap();
             store(&storage, &metric_rule("persist", 90.0, 0));
             seed_sample(
                 &storage,
@@ -1236,7 +1236,7 @@ mod tests {
         }
 
         {
-            let storage = SqliteStorage::open(&db).unwrap();
+            let storage = StorageHandle::sqlite(&db, DEFAULT_READ_POOL_SIZE).unwrap();
             let state = storage
                 .get_alert_state(
                     "persist",
@@ -1266,7 +1266,7 @@ mod tests {
     /// pending / firing 状态不清理。
     #[test]
     fn m4_b1b_round_prunes_expired_history() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let mut cfg = test_cfg();
         cfg.alerts.event_retention_days = 1;
         let now = 1_700_000_000_000;
@@ -1354,7 +1354,7 @@ mod tests {
     /// 旧实现 `latest_samples` 会回退到 1m/1h，把旧桶的 `last_value` 当当前值。
     #[test]
     fn m4_b1b_metric_rule_never_uses_downsampled_buckets() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let mut cfg = test_cfg();
         // 窗口 3 小时，确保 1m 桶落在回看范围内。
         cfg.alerts.evaluation_interval_secs = 3_600;
@@ -1406,7 +1406,7 @@ mod tests {
     /// 每规则序列数上限：超出时截断并计数，不产生错误。
     #[test]
     fn m4_b1b_metric_series_are_bounded_and_marked_truncated() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         let now = 1_700_000_000_000;
         store(&storage, &metric_rule("bounded", 90.0, 0));
@@ -1439,7 +1439,7 @@ mod tests {
     /// 时间预算耗尽：跳过剩余规则并记录，不产生事件。
     #[test]
     fn m4_b1b_budget_skips_remaining_rules_and_reports() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         let now = 1_700_000_000_000;
         store(&storage, &metric_rule("first", 90.0, 0));
@@ -1474,7 +1474,7 @@ mod tests {
     /// 10k 历史状态 + 5k 新观测：加载 ≤ 硬上限、旧状态被逐出、重复评估不重复事件。
     #[test]
     fn m4_b1b_state_load_is_capped_and_old_states_evicted() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         let now = 1_700_000_000_000;
         let day_ms = 24 * 60 * 60 * 1_000;
@@ -1566,7 +1566,7 @@ mod tests {
     /// 清理按小时节流：一轮内不重复 COUNT / DELETE，一小时后恢复。
     #[test]
     fn m4_b1b_prune_runs_at_most_hourly() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let mut cfg = test_cfg();
         cfg.alerts.event_retention_days = 1;
         let now = 1_700_000_000_000;
@@ -1606,7 +1606,7 @@ mod tests {
     /// 禁用的规则不评估（引擎只看 `list_enabled_alert_rules`）。
     #[test]
     fn m4_b1b_disabled_rules_are_not_evaluated() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         let now = 1_700_000_000_000;
         let mut disabled = metric_rule("disabled", 90.0, 0);

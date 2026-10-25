@@ -286,7 +286,7 @@ mod tests {
     use rustboard_common::config::HubConfig;
     use rustboard_core::alerts::{AlertRule, AlertSource, Comparator};
     use rustboard_core::channels::{test_message, ChannelConfig, Secret};
-    use rustboard_core::storage::sqlite::SqliteStorage;
+    use rustboard_core::storage::StorageHandle;
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
@@ -310,7 +310,7 @@ mod tests {
             ..HubConfig::default()
         };
         AppState {
-            storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
+            storage: Arc::new(StorageHandle::sqlite_memory().unwrap()),
             cfg: Arc::new(cfg.clone()),
             sessions: SessionRegistry::new(),
             renewal: RenewalContext::new(PathBuf::from("/tmp/rb-hub-channels-test-unused-ca"), 90),

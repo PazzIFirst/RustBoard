@@ -45,9 +45,10 @@ use rustboard_core::alerts::builtin_rules;
 use rustboard_core::archive::{sha256_hex, ArchiveObject, ArchiveStatus, ColdStore};
 use rustboard_core::collect::default_collectors;
 use rustboard_core::downsample;
-use rustboard_core::storage::sqlite::SqliteStorage;
+use rustboard_core::storage::sqlite::DEFAULT_READ_POOL_SIZE;
+use rustboard_core::storage::StorageHandle;
 use rustboard_core::storage::{
-    AgentSeriesRow, IngestOutcome, QueryTooLarge, SampleTier, Storage, AUDIT_RETENTION_MS,
+    AgentSeriesRow, IngestOutcome, QueryTooLarge, SampleTier, AUDIT_RETENTION_MS,
 };
 use tokio::net::TcpListener;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
@@ -435,7 +436,7 @@ enum TokenAction {
 
 #[derive(Clone)]
 struct AppState {
-    storage: Arc<SqliteStorage>,
+    storage: Arc<StorageHandle>,
     cfg: Arc<HubConfig>,
     sessions: Arc<SessionRegistry>,
     /// 客户端证书续签的准入控制（按 agent 的冷却窗口 + 读盘/签名上下文）。
@@ -716,10 +717,10 @@ fn validate_token_name(name: &str) -> Result<()> {
 }
 
 /// 打开配置文件指向的 SQLite（CLI 与运行中的 hub 通过 WAL 并发）。
-fn open_token_storage(config: Option<PathBuf>) -> Result<SqliteStorage> {
+fn open_token_storage(config: Option<PathBuf>) -> Result<StorageHandle> {
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
     let cfg = load_config(&path)?;
-    SqliteStorage::open(&cfg.sqlite_path()?)
+    StorageHandle::sqlite(&cfg.sqlite_path()?, DEFAULT_READ_POOL_SIZE)
 }
 
 /// 把 `--scope` 解析成枚举，非法值给出可读错误。
@@ -799,12 +800,12 @@ fn maintenance_command(action: MaintenanceAction) -> Result<()> {
 /// 只要求配置本身合法（retention 倒挂/越界必须在这里拒绝，否则删除边界不可信），
 /// **不要求 admin_token / 证书材料**：排障与 e2e 可在 hub 未运行时独立执行。
 /// `cfg.validate()` 不读取证书文件，也不校验 token 强度。
-fn open_maintenance_storage(config: Option<PathBuf>) -> Result<(SqliteStorage, HubConfig)> {
+fn open_maintenance_storage(config: Option<PathBuf>) -> Result<(StorageHandle, HubConfig)> {
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
     let cfg = load_config(&path)?;
     cfg.validate().context("维护任务配置校验失败")?;
     let db_path = cfg.sqlite_path()?;
-    let storage = SqliteStorage::open(&db_path)
+    let storage = StorageHandle::sqlite(&db_path, DEFAULT_READ_POOL_SIZE)
         .with_context(|| format!("打开维护数据库失败: {}", db_path.display()))?;
     Ok((storage, cfg))
 }
@@ -819,13 +820,13 @@ fn maintenance_run_json(config: Option<PathBuf>, task: MaintenanceTask) -> Resul
     let now = now_ms();
     let report = match task {
         MaintenanceTask::Downsample => {
-            let report = downsample::run_downsample(&storage, now, None)
+            let report = downsample::run_downsample(&*storage, now, None)
                 .context("降采样任务失败（task=downsample）")?;
             serde_json::to_value(report)?
         }
         MaintenanceTask::Retention => {
             let gate = archive::archive_gate(&storage, &cfg);
-            let report = downsample::run_retention(&storage, &cfg, now, gate)
+            let report = downsample::run_retention(&*storage, &cfg, now, gate)
                 .context("保留期任务失败（task=retention）")?;
             serde_json::to_value(report)?
         }
@@ -847,7 +848,7 @@ struct MaintenanceStatusOutput {
 /// 读取维护状态并返回 JSON（调用方负责打印）。
 fn maintenance_status_json(config: Option<PathBuf>) -> Result<String> {
     let (storage, cfg) = open_maintenance_storage(config)?;
-    let status = downsample::maintenance_status(&storage).context("读取维护状态失败")?;
+    let status = downsample::maintenance_status(&*storage).context("读取维护状态失败")?;
     let output = MaintenanceStatusOutput {
         status,
         retention_raw_days: cfg.retention_raw_days,
@@ -1352,7 +1353,7 @@ fn agent_add(config: Option<PathBuf>, name: String, ttl_minutes: u32) -> Result<
         }
     };
 
-    let db = SqliteStorage::open(&cfg.sqlite_path()?)?;
+    let db = StorageHandle::sqlite(&cfg.sqlite_path()?, DEFAULT_READ_POOL_SIZE)?;
     let now = now_ms();
     let expires = now + (ttl_minutes as i64) * 60_000;
     db.create_enroll_token(&tls::sha256_hex(&token), &name, now, expires)?;
@@ -1416,7 +1417,7 @@ fn hub_agent_ws_url(cfg: &HubConfig) -> Result<String> {
 fn agent_revoke(config: Option<PathBuf>, id: String) -> Result<()> {
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
     let cfg = load_config(&path)?;
-    let db = SqliteStorage::open(&cfg.sqlite_path()?)?;
+    let db = StorageHandle::sqlite(&cfg.sqlite_path()?, DEFAULT_READ_POOL_SIZE)?;
     db.revoke_agent(&id, now_ms())?;
     println!("已吊销 agent: {id}");
     Ok(())
@@ -1770,7 +1771,7 @@ fn print_issued_cert(issued: &acme::client::IssuedCert) {
 
 /// 数据库文件的直接父目录是否就是要声明的私有 `data_dir`。///
 /// 只有「非空父目录且恰好等于 `data_dir`」才允许走
-/// [`SqliteStorage::open_with_private_data_dir`] 收紧目录权限；相对路径（父目录为空）
+/// [`StorageHandle::sqlite_with_private_data_dir`] 收紧目录权限；相对路径（父目录为空）
 /// 与外置数据库一律返回 false，调用方走普通构造，绝不 chmod 可能共享的父目录。
 fn storage_uses_private_data_dir(db_path: &FsPath, data_dir: &FsPath) -> bool {
     db_path
@@ -1788,7 +1789,7 @@ fn open_storage(
     db_path: &FsPath,
     data_dir: &FsPath,
     read_pool_size: usize,
-) -> Result<SqliteStorage> {
+) -> Result<StorageHandle> {
     let uses_private_data_dir = storage_uses_private_data_dir(db_path, data_dir);
     if !uses_private_data_dir {
         // 只告警不拒绝：外置 DB 是允许的部署形态，只是父目录不会被收紧。
@@ -1799,9 +1800,9 @@ fn open_storage(
         );
     }
     if uses_private_data_dir {
-        SqliteStorage::open_with_private_data_dir(db_path, read_pool_size, data_dir)
+        StorageHandle::sqlite_with_private_data_dir(db_path, read_pool_size, data_dir)
     } else {
-        SqliteStorage::open_with_readers(db_path, read_pool_size)
+        StorageHandle::sqlite(db_path, read_pool_size)
     }
 }
 
@@ -5467,7 +5468,7 @@ fn mark_seen(state: &AppState, agent_id: &str) {
 /// - 「最后一条连接注销 + 状态写入」在注册表的 per-agent slot 锁内原子完成，
 ///   同一 agent 的新连接注册会被串行化，不会出现旧 offline 覆盖新 online。
 struct SessionCleanup {
-    storage: Arc<SqliteStorage>,
+    storage: Arc<StorageHandle>,
     sessions: Arc<SessionRegistry>,
     agent_id: String,
     conn_id: u64,
@@ -5476,7 +5477,7 @@ struct SessionCleanup {
 
 impl SessionCleanup {
     fn new(
-        storage: Arc<SqliteStorage>,
+        storage: Arc<StorageHandle>,
         sessions: Arc<SessionRegistry>,
         agent_id: String,
         conn_id: u64,
@@ -5637,7 +5638,7 @@ async fn control_revocation_gate(
 ///
 /// 存储层没有暴露「列出全部吊销记录」的只读接口，这里对活跃连接逐个查
 /// `is_revoked`；活跃连接数通常很小，语义与全表扫描一致。
-fn spawn_revoke_watcher(storage: Arc<SqliteStorage>, sessions: Arc<SessionRegistry>) {
+fn spawn_revoke_watcher(storage: Arc<StorageHandle>, sessions: Arc<SessionRegistry>) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(REVOKE_POLL_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -5785,7 +5786,7 @@ async fn send_frame(socket: &mut WebSocket, frame: &Frame) -> Result<()> {
 }
 
 /// hub 自身作为一台 agent 采集，直接写库，不经过网络。
-fn spawn_self_monitor(storage: Arc<SqliteStorage>, cfg: HubConfig) {
+fn spawn_self_monitor(storage: Arc<StorageHandle>, cfg: HubConfig) {
     tokio::spawn(async move {
         let collectors = default_collectors(cfg.per_core, &cfg.excluded_interfaces);
         let agent_id = HUB_SELF_AGENT_ID.to_string();
@@ -5859,7 +5860,7 @@ fn spawn_self_monitor(storage: Arc<SqliteStorage>, cfg: HubConfig) {
 /// - SQLite 读写全部在 `spawn_blocking` 里，单轮串行不重叠；
 /// - 任何错误只 WARN 并写入 `maintenance_state.last_error`，任务不退出，
 ///   下一轮重试。
-fn spawn_maintenance(storage: Arc<SqliteStorage>, cfg: HubConfig) {
+fn spawn_maintenance(storage: Arc<StorageHandle>, cfg: HubConfig) {
     tokio::spawn(async move {
         // 配置校验已保证 1–3600；这里 max(1) 只是防御非法配置造成的忙循环。
         let interval = Duration::from_secs(cfg.maintenance_interval_secs.max(1));
@@ -5884,11 +5885,15 @@ fn spawn_maintenance(storage: Arc<SqliteStorage>, cfg: HubConfig) {
 /// 降采样失败时仍执行保留期：水面未推进，保留期门禁会阻止删除未聚合数据，
 /// 不会因一次失败丢数据。只有整轮都成功才清空 `last_error`，否则保留本轮
 /// 错误供 `maintenance status` 排障。错误字符串不含 secret。
-fn run_maintenance_round(storage: &SqliteStorage, cfg: &HubConfig) {
+fn run_maintenance_round(storage: &StorageHandle, cfg: &HubConfig) {
     let now = now_ms();
     let mut errors: Vec<String> = Vec::new();
 
-    match downsample::run_downsample(storage, now, Some(MAINTENANCE_MAX_BACKFILL_HOURS)) {
+    match downsample::run_downsample(
+        storage.as_storage(),
+        now,
+        Some(MAINTENANCE_MAX_BACKFILL_HOURS),
+    ) {
         Ok(report) => tracing::debug!(?report, "维护任务：降采样完成"),
         Err(err) => {
             let message = format!("downsample: {err:#}");
@@ -5897,7 +5902,7 @@ fn run_maintenance_round(storage: &SqliteStorage, cfg: &HubConfig) {
         }
     }
     let gate = archive::archive_gate(storage, cfg);
-    match downsample::run_retention(storage, cfg, now, gate) {
+    match downsample::run_retention(storage.as_storage(), cfg, now, gate) {
         Ok(report) => tracing::debug!(?report, "维护任务：保留期完成"),
         Err(err) => {
             let message = format!("retention: {err:#}");
@@ -6537,7 +6542,7 @@ mod tests {
             cfg.admin_auth_failure_limit_per_min,
         ));
         let state = AppState {
-            storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
+            storage: Arc::new(StorageHandle::sqlite_memory().unwrap()),
             cfg: Arc::new(cfg),
             sessions: SessionRegistry::new(),
             renewal: RenewalContext::new(tls::cert_dir(&dir), 90),
@@ -6599,7 +6604,7 @@ mod tests {
             cfg.admin_auth_failure_limit_per_min,
         ));
         let state = AppState {
-            storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
+            storage: Arc::new(StorageHandle::sqlite_memory().unwrap()),
             cfg: Arc::new(cfg),
             sessions: SessionRegistry::new(),
             renewal: RenewalContext::new(tls::cert_dir(&dir), 90),
@@ -6898,7 +6903,7 @@ mod tests {
             cfg.admin_auth_failure_limit_per_min,
         ));
         AppState {
-            storage: Arc::new(SqliteStorage::open_in_memory().unwrap()),
+            storage: Arc::new(StorageHandle::sqlite_memory().unwrap()),
             cfg: Arc::new(cfg),
             sessions: SessionRegistry::new(),
             renewal: RenewalContext::new(PathBuf::from("/tmp/rb-hub-test-unused-ca"), 90),
@@ -9500,13 +9505,16 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// 真实 SQLite（临时目录文件库）+ 独立注册表，用于会话清理测试。
-    fn session_cleanup_fixture(tag: &str) -> (PathBuf, Arc<SqliteStorage>, Arc<SessionRegistry>) {
+    fn session_cleanup_fixture(tag: &str) -> (PathBuf, Arc<StorageHandle>, Arc<SessionRegistry>) {
         let dir = temp_dir(tag);
-        let storage = Arc::new(SqliteStorage::open(&dir.join("hub.db")).expect("打开测试库失败"));
+        let storage = Arc::new(
+            StorageHandle::sqlite(&dir.join("hub.db"), DEFAULT_READ_POOL_SIZE)
+                .expect("打开测试库失败"),
+        );
         (dir, storage, SessionRegistry::new())
     }
 
-    fn agent_status(storage: &SqliteStorage, agent_id: &str) -> String {
+    fn agent_status(storage: &StorageHandle, agent_id: &str) -> String {
         storage
             .get_agent(agent_id)
             .expect("读取 agent 失败")
@@ -9516,7 +9524,7 @@ mod tests {
 
     /// KI-24：按 `handle_session` 的方式登记能力（slot 锁内写库），返回是否为最新连接。
     fn register_connection_capabilities(
-        storage: &SqliteStorage,
+        storage: &StorageHandle,
         sessions: &SessionRegistry,
         agent_id: &str,
         conn_id: u64,
@@ -9533,7 +9541,7 @@ mod tests {
             .expect("写入控制能力失败")
     }
 
-    fn stored_control_capabilities(storage: &SqliteStorage, agent_id: &str) -> Vec<String> {
+    fn stored_control_capabilities(storage: &StorageHandle, agent_id: &str) -> Vec<String> {
         storage
             .get_agent_control(agent_id)
             .expect("读取控制能力失败")
@@ -10606,7 +10614,7 @@ mod tests {
         assert_eq!(token.len(), 64, "明文必须是 64 位 hex");
         assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
 
-        let db = SqliteStorage::open(&db_path).unwrap();
+        let db = StorageHandle::sqlite(&db_path, DEFAULT_READ_POOL_SIZE).unwrap();
         let records = db.list_api_tokens().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name, "panel");
@@ -10970,7 +10978,7 @@ mod tests {
 
         let now = now_ms();
         let db_path = dir.join("rustboard.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
+        let storage = StorageHandle::sqlite(&db_path, DEFAULT_READ_POOL_SIZE).unwrap();
         let batch = SampleBatch {
             agent_id: "agent-1".to_string(),
             epoch: 1,
@@ -10997,7 +11005,7 @@ mod tests {
         assert_eq!(report["raw"]["deleted"], 0);
         assert_eq!(report["raw"]["blocked_by_archive"], true);
         assert_eq!(
-            SqliteStorage::open(&db_path)
+            StorageHandle::sqlite(&db_path, DEFAULT_READ_POOL_SIZE)
                 .unwrap()
                 .raw_stats()
                 .unwrap()
@@ -11006,7 +11014,7 @@ mod tests {
             "无归档水位时 raw 必须保留"
         );
 
-        let storage = SqliteStorage::open(&db_path).unwrap();
+        let storage = StorageHandle::sqlite(&db_path, DEFAULT_READ_POOL_SIZE).unwrap();
         storage
             .set_archive_state("last_archived_ts", &now.to_string(), now)
             .unwrap();
@@ -11018,7 +11026,7 @@ mod tests {
         assert_eq!(report["raw"]["deleted"], 3);
         assert_eq!(report["raw"]["blocked_by_archive"], false);
         assert_eq!(
-            SqliteStorage::open(&db_path)
+            StorageHandle::sqlite(&db_path, DEFAULT_READ_POOL_SIZE)
                 .unwrap()
                 .raw_stats()
                 .unwrap()
@@ -12071,7 +12079,7 @@ mod tests {
     /// M4-A2：后台单轮串行执行，失败写 last_error、整轮成功后清空。
     #[test]
     fn m4a_maintenance_round_records_and_clears_last_error() {
-        let storage = SqliteStorage::open_in_memory().unwrap();
+        let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = HubConfig::default();
 
         // 先留一条旧错误：成功一轮必须清空。
