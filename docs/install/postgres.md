@@ -152,36 +152,112 @@ db_sslrootcert = "/etc/rustboard/pg-ca.pem"
 - Docker entrypoint 只在**首次初始化**把 `RUSTBOARD_DATABASE` 传给安装器；已有
   volume 不会因环境变量改变数据库。切换方式：
   1. 停 hub；
-  2. 备份 SQLite 与配置；
-  3. 用 `rustboard-hub migrate --to postgres://…`（D5 交付后）或
-     `install --force --db …` + 数据导入；
-  4. 启动并检查 `/healthz`、agent、面板与告警；
-  5. 保留 SQLite 与备份，观察后再清理。
+  2. 备份 SQLite、配置与证书（或先执行 `rustboard-hub backup`）；
+  3. `rustboard-hub migrate --to 'postgres://…' --dry-run` 预检；
+  4. `rustboard-hub migrate --to 'postgres://…' --yes` 迁移；
+  5. 启动并检查 `/healthz`、agent、面板与告警；
+  6. 保留 SQLite 与备份，观察后再清理。
+- 迁移命令的细节、非空目标与回滚见 §6；SQLite 文件全程保持原样。
+- **不要用 `install --db postgres://…` 直接切换有数据的 SQLite**：安装器只改写
+  `hub.toml`、不迁移数据；已有业务数据必须用 `rustboard-hub migrate`。只有全新
+  安装或空 SQLite 才可直接安装到 PostgreSQL。
 - 回滚：把 `database` 改回 SQLite 路径并重启；SQLite 文件全程保持原样。
 
 > **迁移前必须停 hub**。运行中的 hub 会持续写入 SQLite / PG，边写边迁移无法保证
 > 一致性；迁移失败不得切换配置、不得删除 SQLite。
 
-## 6. 备份与恢复
+## 6. 迁移、备份与恢复
 
-### 6.1 统一入口（D5）
+> Phase D5 的统一入口已交付：`backup` / `restore` / `migrate`。`backup` 可在 hub
+> 运行时生成一致性快照（SQLite `VACUUM INTO` / PG `pg_dump`）；`migrate` 与
+> `restore` 要求**先停 hub**：有 systemd 时用 `systemctl is-active
+> rustboard-hub` 检查，无 systemd 时打印 WARN，由确认与迁移前备份兜底。不要用
+> `cp` 直接复制运行中的 PG 数据目录。
 
-Phase D5 提供：
+### 6.1 备份
 
 ```bash
-rustboard-hub backup --out /var/lib/rustboard/backups/<timestamp> --yes
+rustboard-hub backup --out /var/lib/rustboard/backups --yes
+```
+
+- `--out` 只给根目录，命令会在其下创建 `<UTC timestamp>/`；`restore --from`
+  指向这个具体子目录。备份目录包含：
+  - SQLite：`rustboard.db`（`VACUUM INTO` 快照）；PostgreSQL：`rustboard.dump`
+    （`pg_dump --format=custom`）；
+  - `hub.toml`、`certs/`（证书与私钥）和 `manifest.json`；
+- `manifest.json` 记录 manifest 格式版本、RustBoard 版本、schema、后端、创建时间，
+  以及每个文件的相对路径、SHA256、大小和权限；目录 0700，配置/私钥/备份文件 0600；
+- PG 备份在创建目录前检查 `pg_dump`；缺失时直接失败，不留下半成品目录；
+- 备份含 agent secret、API token 哈希、证书私钥，必须按 secret 管理；
+- `--config` 指定 `hub.toml`（默认 `/etc/rustboard/hub.toml`）；`--yes` 用于
+  非交互执行。
+
+### 6.2 恢复
+
+```bash
 rustboard-hub restore --from /var/lib/rustboard/backups/<timestamp> --yes
 ```
 
-- `backup` 生成 `<timestamp>/` + `manifest.json`（文件 SHA256、版本、schema、
-  后端类型）；配置/证书 0600，归档目录 0700；
-- PG 后端内部使用 `pg_dump --format=custom`；SQLite 使用 `VACUUM INTO`；
-- `restore` 只允许空目标或 `--force`，恢复前会备份当前目标。
+- 只接受包含 `manifest.json` 的备份目录；先完整校验 manifest 版本与每个文件的
+  SHA256/大小/路径，任何不一致都在写目标前失败；
+- 依次恢复数据库、证书、配置（配置最后写）；PG 需要外部 `pg_restore`；
+- 目标非空时默认拒绝，必须 `--force`；恢复前会尽量备份当前目标（失败只 WARN）；
+  目标路径含符号链接或 `..` 会在写入前拒绝；
+- 恢复用的 `data_dir`/后端来自备份内的 `hub.toml`，`--config` 只决定配置写回
+  的位置；恢复同样要求 hub 已停止；
+- **文件属主**：恢复以哪个用户执行，写出的配置/证书/数据库就归哪个用户。root
+  执行后需把 `/etc/rustboard`、`/var/lib/rustboard` 交回 hub 运行用户；Docker
+  `--user 10001:10001` 场景需 `chown -R 10001:10001`，或直接以该用户运行恢复，
+  否则下次启动会因权限失败；
+- 恢复后核对：samples 点数/时间范围、agents、alert_states/events、api_tokens
+  数量、archive 对象数量。
 
-> D5 命令在当前分支尚未交付时，请按 6.2 手工执行，并遵循同样的“先停 hub、
-> 再备份”规则。不要用 `cp` 直接复制运行中的 PG 数据目录。
+### 6.3 迁移 SQLite → PostgreSQL
 
-### 6.2 手工备份 / 恢复（PG）
+```bash
+# 1) 停 hub
+sudo systemctl stop rustboard-hub
+
+# 2) 预检：只连接源/目标、校验 schema 与目标是否为空，不写数据
+rustboard-hub migrate \
+  --to 'postgres://rustboard@db.example.com:5432/rustboard?sslmode=verify-full' \
+  --dry-run
+
+# 3) 正式迁移（非交互）
+rustboard-hub migrate \
+  --to 'postgres://rustboard@db.example.com:5432/rustboard?sslmode=verify-full' \
+  --yes
+```
+
+- 源必须是 SQLite v7；`--to` 必须是 `postgres://`/`postgresql://`；
+- 迁移前在 `<data_dir>/backups/<timestamp>/` 备份 SQLite、`hub.toml` 与证书；
+  导入在单个目标事务中完成并逐表校验；失败自动回滚目标事务，**不改写配置、
+  不删除 SQLite**；
+- 只有迁移与校验全部成功后才原子改写 `hub.toml` 的 `database`，并保留旧配置
+  `.bak-<ts>`；随后启动 hub，检查 `/healthz`、agent、面板与告警；
+- `--dry-run` 不 apply schema、不写数据、不创建备份目录、不改配置；但**目标非空
+  且未指定 `--force` 时仍以非零码退出**，提示实际迁移会被拒绝；
+- 有 `/run/systemd/system` 时用 `systemctl is-active rustboard-hub` 拒绝运行中的
+  hub；没有 systemd 时只打印 WARN，不读取/伪造 PID 文件，由 `--yes`/交互确认与
+  迁移前备份兜底；
+- 目标非空：默认拒绝；`--force` 会先 `pg_dump` 目标、二次确认后清空 21 张业务表
+  （保留 `schema_migrations`）。**当前限制**：`--force` 的清空路径只支持显式
+  `sslmode=disable`（内部使用 NoTls）；`verify-full` 的非空目标需先手工备份并
+  `TRUNCATE` 21 张业务表，再不带 `--force` 迁移；
+- `--force` 目标非空时需要外部 `pg_dump`；目标为空时不需要；
+- 回滚：把 `database` 改回 SQLite 路径，或 `install --force --db sqlite`；
+  SQLite 文件全程未被修改，迁移不是双写。
+
+### 6.4 手工备份 / 恢复（PG）
+
+统一命令不可用、或需要 `pg_restore` 选择性恢复时，可在宿主手工执行。此时
+`pg_dump`/`pg_restore` 必须已安装（Debian/Ubuntu 包名 `postgresql-client`）。
+单纯备份可用一致性快照在线执行；迁移/切换/恢复场景仍要求先停 hub。
+
+> **客户端版本尽量与服务端主版本一致**：本机用 PG16 client 对 PG16 验证通过；
+> PG17 client 对 PG16 会因 `transaction_timeout` 参数失败。安装前用
+> `pg_dump --version` 与 `psql --version` 确认版本；跨大版本时优先装与服务端
+> 匹配的客户端，或临时用 `postgres:<major>` 容器执行。
 
 ```bash
 # 1) 停 hub，确保没有写入
@@ -210,7 +286,7 @@ curl -fsS http://127.0.0.1:8444/healthz
 - 密码不要写在命令行：用 `PGPASSWORD` 环境变量或 0600 的 `~/.pgpass`；
 - 备份文件含 agent secret、API token 哈希等敏感数据，按 secret 管理；
 - 恢复后核对：samples 点数/时间范围、agents、alert_states/events、api_tokens
-  数量、archive 对象数量（D5 校验器会做同样检查）。
+  数量、archive 对象数量。
 
 ## 7. Docker
 
@@ -243,10 +319,33 @@ docker compose -f docker/compose.example.yml \
 
 ## 8. 测试与排错
 
-- 单元测试：`cargo test -p rustboard-hub --locked --bin rustboard-hub install_cmd::tests`
-  （无 PG 时真实探测用例打印 `SKIP`）。
-- 集成测试：设置 `RUSTBOARD_TEST_PG`（本地测试库，角色需能建表）后可跑
-  `postgres_probe_applies_schema_when_test_pg_available`；未设置时明确 SKIP。
+- PG 实库测试（需要本地 PostgreSQL 16/17，登录角色需 `CREATEDB`；
+  `postgres_load` 还需要 `pg_terminate_backend` 权限，superuser 或
+  `pg_signal_backend`）：
+
+  ```bash
+  RUSTBOARD_TEST_PG='postgres://rustboard:<TEST_PASSWORD>@127.0.0.1:5432/rustboard?sslmode=disable' \
+    cargo test -p rustboard-core --locked \
+      --test postgres_schema --test postgres_core \
+      --test postgres_parity --test postgres_migrate --test postgres_load
+  ```
+
+  未设置 `RUSTBOARD_TEST_PG` 时每个用例打印 `SKIP` 并返回（cargo 记为 passed），
+  不能把“0 failed”当作已执行；CI 的 `postgres` job 会设置该变量并跑上述五个 target。
+  `postgres_load` 3/3 通过：200 OS 线程/200 agent，每 agent 5 批×3 点，3000
+  samples / 1000 ingest_batches / 0 失败，pool=8，总耗时 1.45–2.83s；kill 4 条
+  池连接后首次重试成功、53 行无丢失；并发同键每轮 1 Inserted + 1 Duplicate。
+  **这是 storage 级压测，不是 hub 端 200 agent 端到端。**
+- CLI/备份/L-01：先安装 PG16 client，再跑
+  `cargo test -p rustboard-hub --locked --test phase_d_backup --test phase_d_l01_l03`。
+  本机 `phase_d_backup` **5/5 通过**（含真实 PG `pg_dump`/`pg_restore`）；缺
+  `pg_dump`/`pg_restore` 时该用例明确 SKIP（不假绿），不能据此声称已覆盖 PG 备份。
+- L-01 的权限收紧失败用例默认 `#[ignore]`，root + `CAP_LINUX_IMMUTABLE` 门禁额外执行：
+
+  ```bash
+  sudo cargo test -p rustboard-hub --locked --test phase_d_l01_l03 -- \
+    --ignored --exact run_fails_when_account_hardening_is_denied
+  ```
 
 常见错误：
 
@@ -259,6 +358,33 @@ docker compose -f docker/compose.example.yml \
 | `UnknownIssuer` / 根证书错误 | 私有 CA 未通过 `db_sslrootcert` / `--db-sslrootcert` 提供，或 PEM 不含 CA |
 | `schema 版本高于当前二进制` | 用旧二进制连了已迁移的新库；升级二进制，不要降 schema |
 | `--offline 与 PostgreSQL 互斥` | 去掉 `--offline`，或改用 SQLite |
+| `pg_dump 不存在或不在 PATH` / `pg_restore 不存在` | 安装 `postgresql-client`，并让客户端主版本与服务端一致；见 §6.4 |
+| `pg_dump: error: parameter "transaction_timeout"` | PG17 client 连 PG16 服务端；换 PG16 client 或与服务端匹配的客户端 |
 | 安装卡在 schema | 另有实例持有 advisory lock（正在迁移）；等待其完成，不要强杀事务 |
 
 排障时不要粘贴含密码的完整 DSN、`docker inspect` 全量环境或 `pg_dump` 内容。
+
+## 9. 部署限制（Phase D）
+
+1. **单 hub 语义**：PG 后端没有 leader 选举或多活协调。同一数据库只允许一个
+   active hub；多个 hub 同时连接会重复评估告警、重复发送通知/归档。需要 HA 时
+   由部署方保证单写者；当前版本不承诺多活。
+2. **`migrate --force` 的 TLS 限制**：非空 PG 目标清空路径内部使用 NoTls，目前
+   只支持显式 `sslmode=disable`；`verify-full` 非空目标必须手工备份并清空
+   21 张业务表（保留 `schema_migrations`）后，再不带 `--force` 迁移。
+3. **外部 `pg_dump`/`pg_restore`**：hub 静态构建、离线包与 Docker 镜像不内置
+   PostgreSQL 客户端；PG 备份/恢复缺少命令时会失败并提示安装
+   `postgresql-client`。客户端主版本最好与服务端一致；PG17 client 对 PG16 会
+   因 `transaction_timeout` 失败，验证环境使用 PG16 client + PG16 服务端。
+4. **恢复后的文件属主**：root 执行 `restore` 后文件归 root；systemd 部署需交回
+   hub 用户，Docker `--user 10001:10001` 需先 `chown -R 10001:10001`，否则启动
+   会因权限失败。
+5. **TLS verify-full 端到端**：已有配置层/单元测试与 D0 spike（本地 TLS PG
+   连接、证书链与主机名校验）证据；尚未在真实 TLS PostgreSQL 上做完整
+   “安装→启动→读写” smoke，生产启用前请先用测试实例复核 CA/SAN/
+   `db_sslrootcert`。
+6. **压力与长稳**：storage 级 200 agent（`postgres_load`）已通过；hub 端真实
+   200 agent 端到端、100/500/1000 agent 与 24h 长稳仍在 Phase E。storage 级
+   load 只验证并发写入/查询与断连重连，不能替代 hub 端真实压测。
+7. 备份含 agent secret、API token 哈希、证书私钥与数据库内容，必须按 secret
+   管理；迁移/恢复前必须停 hub。

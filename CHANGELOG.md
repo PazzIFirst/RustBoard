@@ -10,6 +10,65 @@
 
 ## [Unreleased]
 
+### Added
+
+- Phase D PostgreSQL 后端（显式 opt-in）：`database = "postgres://..."` 时启用；
+  默认 SQLite 与既有配置行为不变，不做自动双写。PG schema v7（21 张业务表、
+  19 个显式索引、独立 `schema_migrations`、事务级 advisory lock）；`postgres`
+  同步驱动 + `tokio-postgres-rustls`（ring）+ r2d2 连接池；新增 `db_sslrootcert`
+  与 `RUSTBOARD_DATABASE_PASSWORD`，`sslmode` 只接受 `verify-full`（默认）/
+  `disable`，拒绝 `require`/`prefer`/`verify-ca`/`allow`
+- Phase D 迁移/备份/恢复 CLI：`rustboard-hub migrate --to <dsn>
+  [--dry-run|--force|--yes]`、`backup --out <dir> [--yes]`、
+  `restore --from <dir> [--force] [--yes]`；SQLite 使用 `VACUUM INTO`，PG 使用
+  `pg_dump --format=custom` / `pg_restore`；备份目录含 `manifest.json`
+  （SHA256/大小/权限/版本/schema/后端）；迁移/恢复成功后切换配置，失败不改配置、
+  不删除 SQLite
+- Phase D 安装与交付：安装器 `--db postgres://`、`--db-sslrootcert`；Docker
+  `RUSTBOARD_DATABASE` / `RUSTBOARD_DATABASE_SSLROOTCERT` /
+  `RUSTBOARD_DATABASE_PASSWORD(_FILE)` 与 `docker/compose.postgres.example.yml`；
+  CI 新增 PostgreSQL service job（`postgres_schema`、`postgres_core`、
+  `postgres_parity`、`postgres_migrate`、`postgres_load`）；`postgres_load`
+  覆盖 200 agent storage 级并发写入/查询与断连重连
+- Phase D L-01/L-03 收口：hub 启动收紧既有 `certs/acme/account.json` /
+  `state.toml` 为 0600、目录 0700，符号链接/非普通文件/收紧失败 fail-closed，
+  `tls status` 只读 WARN；L-03 保持 fail-closed，错误信息与 `acme`/`tls`/
+  `troubleshooting` 文档给出三种可用部署路径
+- `docs/install/postgres.md`：PostgreSQL 安装、TLS/`sslmode`、迁移、备份/恢复、
+  Docker 与限制说明
+
+### Changed
+
+- hub 的 PostgreSQL 读写路径统一走 `spawn_blocking`；PG 连接池在 Tokio runtime
+  外创建，Drop 时移交线程，避免同步驱动阻塞 runtime
+- PostgreSQL 为显式 opt-in：默认 SQLite、协议 v2、证书格式与既有配置默认行为
+  不变；不做自动双写，默认 compose 仍不包含 PostgreSQL
+- 离线安装与 PostgreSQL 硬互斥：`--offline` + `--db postgres://...` 在写盘前失败；
+  PG 备份/恢复要求外部 `postgresql-client`，静态构建与 hub 镜像不内置
+- `migrate`/`restore` 要求先停 hub；`migrate` 目标非空必须 `--force`，当前清空
+  路径仅支持 `sslmode=disable` 目标，`verify-full` 非空目标需手工备份并清空后
+  再迁移
+
+### Fixed
+
+- L-01：修复旧 ACME `account.json`/`state.toml` 的 0644 权限只在签发时收紧的问题；
+  hub 启动即收紧，`tls status` 不再写文件
+- PostgreSQL：修复并发 ingest 幂等/CAS、非法批次处理与迁移源库只读快照问题，
+  统一 DSN 错误脱敏
+- 备份/恢复：配置写入原子化，恢复前完整校验 manifest/SHA256；迁移/恢复的破坏性
+  操作前完成预检，失败不改配置、不删 SQLite
+
+### Security
+
+- PostgreSQL 密码优先级为 `RUSTBOARD_DATABASE_PASSWORD` > URL 内密码；日志、
+  错误与 `--dry-run` 统一脱敏，Docker 支持 `RUSTBOARD_DATABASE_PASSWORD_FILE`
+- `sslmode` 只允许 `verify-full`（默认）或显式 `disable`；`db_sslrootcert` 只接受
+  绝对路径普通 PEM（拒绝符号链接），`verify-full` 使用 rustls 校验证书链与主机名
+- 备份目录 0700、配置/私钥/备份文件 0600；manifest 路径必须是相对路径，恢复拒绝
+  `..` 与符号链接；`pg_dump`/`pg_restore` 使用参数数组，密码只通过环境变量传递，
+  不进入 argv
+- L-01 对符号链接/非普通文件/权限收紧失败 fail-closed；`tls status` 只告警不改文件
+
 ## [1.0.0-rc.2] - 2026-10-26
 
 ### Fixed

@@ -614,9 +614,12 @@ docker compose -f docker/compose.example.yml \
 
 1. **停 hub**（`docker compose ... stop hub panel`）并备份：`hub_data` +
    PostgreSQL 逻辑备份；
-2. 用 D5 的 `rustboard-hub backup --out ...`（交付后）或手工 `pg_dump
-   --format=custom`；
-3. 用 `rustboard-hub migrate --to postgres://...`（D5 交付后）或按文档导入；
+2. 在宿主用 release 二进制执行
+   `rustboard-hub backup --config <hub.toml> --out /var/lib/rustboard/backups --yes`
+   （PG 备份需要宿主 `pg_dump`），或手工 `pg_dump --format=custom`；
+3. 在 hub 停止后，用 release 二进制执行
+   `rustboard-hub migrate --config <hub.toml> --to 'postgres://...' --dry-run`
+   预检，再 `--yes` 迁移；非空 PG 目标见下方限制；
 4. 改 `hub.toml` 的 `database`（和 `db_sslrootcert`）后 `up -d`；
 5. 验证 `/healthz`、agent、面板与告警；保留 SQLite 与备份，观察后再清理。
 
@@ -632,7 +635,17 @@ docker compose -f docker/compose.example.yml \
   宿主执行，或临时用 `postgres:16` 容器；不要为了备份给 hub 镜像加包。
 - `pg_dump` 的一致性快照适合日常备份；迁移/切换场景仍要求先停 hub。
   `postgres_data` 是 PG 自己管理的目录，运行中直接复制不保证一致。
+- 客户端主版本最好与 PG 服务端一致（PG16 client 对 PG16 验证通过；PG17 client
+  对 PG16 会因 `transaction_timeout` 失败）。
 - 备份文件含 agent secret 与 token 哈希，按 secret 管理（0600/0700）。
+- **单 hub 限制**：PG 后端没有 leader 选举；同一数据库只允许一个 active hub，
+  多个 hub 会重复告警/归档。需要多活时当前版本不支持，见
+  [postgres.md](../docs/install/postgres.md) §9。
+- **`migrate --force` 限制**：清空非空 PG 目标目前只支持 `sslmode=disable`；
+  `verify-full` 目标需先手工备份并 `TRUNCATE` 21 张业务表，再不带 `--force`
+  迁移。
+- **恢复属主**：root 执行 `restore` 后文件属主是 root；`--user 10001:10001`
+  启动前需 `chown -R 10001:10001`，或以该用户运行恢复。
 
 ### 14.4 验证
 

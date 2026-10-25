@@ -1,15 +1,17 @@
-# Docker 部署（M5 Phase B/C）
+# Docker 部署（M5 Phase B/C/D）
 
 Phase B 提供 hub / panel / agent 三个运行时镜像，基础镜像固定为 Debian bookworm
 slim，镜像内只复制静态 musl 二进制和前端资源，不在镜像里编译 Rust。Phase C 在
 同一镜像上增加 ACME 端口元数据、`RUSTBOARD_TLS_MODE`/`RUSTBOARD_ACME_*` 环境变量
-与降权后的 `NET_BIND_SERVICE` 保留。
+与降权后的 `NET_BIND_SERVICE` 保留；Phase D 增加 PostgreSQL 显式 opt-in
+（`RUSTBOARD_DATABASE*` 与 `docker/compose.postgres.example.yml`），默认 compose
+仍使用 SQLite。
 
 > 完整构建/运行说明、故障排查与安全边界见
 > [docker/README.md](../../docker/README.md)。本文只给最短路径与关键限制。
 >
-> 当前 `Cargo.toml`/本地验证版本仍为 `0.4.2`；Phase C 的 ACME/面板 TLS 已在主线
-> 实现，但尚未完成 C9 全量 e2e、评审/渗透与 `v1.0.0-rc.1` 真实 RC。正式镜像
+> 当前 `Cargo.toml`/本地验证版本为 `1.0.0-rc.2`；Phase C 已以 `v1.0.0-rc.2`
+> 发布，Phase D 已实现 PostgreSQL 显式 opt-in 与迁移/备份/恢复 CLI。正式镜像
 > `v1.0.0` 在 Phase E 版本归档后由 release workflow 推送。
 
 ## 1. 构建前提
@@ -24,7 +26,7 @@ packaging/build-release.sh
 # 3) 单架构本地镜像（多架构由 release workflow 构建）
 docker buildx build --load --platform linux/amd64 \
   -f docker/Dockerfile --target hub \
-  --build-arg VERSION=0.4.2 --build-arg REVISION="$(git rev-parse HEAD)" \
+  --build-arg VERSION=1.0.0-rc.2 --build-arg REVISION="$(git rev-parse HEAD)" \
   -t ghcr.io/pazzifirst/rustboard-hub:dev .
 ```
 
@@ -242,3 +244,9 @@ docker compose -f docker/compose.example.yml \
 - Phase C 支持 ACME、面板直连 HTTPS 与管理端 TLS；不提供 Kubernetes Operator、
   HA 或内置 DNS-01。远程 panel 的直连 TLS 仍建议认证/审计后按
   [panel-tls.md](panel-tls.md) 配置，默认示例不发布面板端口。
+- 默认 compose 仍 SQLite。PostgreSQL 通过
+  `docker/compose.postgres.example.yml` 显式叠加，使用 `RUSTBOARD_DATABASE`、
+  `RUSTBOARD_DATABASE_SSLROOTCERT`、`RUSTBOARD_DATABASE_PASSWORD(_FILE)`；
+  5432 不发布，默认不包含 PG。PG 备份/恢复需要宿主 `pg_dump`/`pg_restore`，
+  且当前为单 hub 语义。详见 [postgres.md](postgres.md) §7 与
+  [docker/README.md](../../docker/README.md) §14。

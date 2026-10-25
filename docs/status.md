@@ -1,6 +1,6 @@
 # 实现进度
 
-> 最后更新：2026-10-25　｜　对应需求稿：[requirements.md](requirements.md)
+> 最后更新：2026-10-26　｜　对应需求稿：[requirements.md](requirements.md)
 
 ## 总体
 
@@ -19,7 +19,7 @@
 | M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | v0.4.1 已知问题修复 | 🟢 完成 | KI-29 rowid 竞态、KI-31 64 MiB 配置/下载一致性、KI-28 拒绝日志采样、KI-20 安装命令引用；SFTP 真实环境 29/29，M4 基线渗透无高危；v041 26/26；v0.4.1 发布 |
 | v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
-| M5 安装与交付 | 🟢 Phase C RC 完成（`v1.0.0-rc.2`），Phase D/E 待 | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126；Phase C C0–C8 + 真实 LE staging + 独立评审/渗透 + hosted RC（offline/Docker/arm64/镜像/SBOM/attestation）全绿；`v1.0.0` 未发布，Phase D/E 待 |
+| M5 安装与交付 | 🟢 Phase D 实现完成（checkpoint 待打），Phase E 待 | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126；Phase C RC `v1.0.0-rc.2`（ACME/LE staging/评审/渗透/hosted RC 全绿）；Phase D PostgreSQL 显式 opt-in、迁移/备份/恢复 CLI、L-01/L-03；storage 级 200 agent load 已过，hub 端 200 agent/100-1000/24h 在 Phase E；`v1.0.0` 未发布 |
 
 ## 构建产物清理（2026-10-25 Phase C 收尾）
 
@@ -67,9 +67,9 @@
 - [x] 服务端证书热续签（watch 推送，新连接立即生效）与启动自愈（key/cert 不匹配）
 - [x] 客户端证书会话内轮换（复用私钥，CN 强制为会话身份，按 agent 冷却）
 - [x] 服务端证书成对备份、CA 链/SAN 校验
-- [ ] ACME：域名证书 / 公网 IP 6 天短证书（M5，需公网可达与 80/443 自检）
+- [x] ACME：域名证书 / 公网 IP 6 天短证书（M5 Phase C，`v1.0.0-rc.2`）
 - [ ] hub 侧计数器结转（epoch 切换时累计流量归集）
-- [ ] PostgreSQL 存储实现
+- [x] PostgreSQL 存储实现（M5 Phase D，显式 opt-in）
 - [x] 降采样与保留期任务（M4-A，v0.4.0）
 - [ ] 结构化日志与 `RUST_LOG` 文档
 
@@ -276,8 +276,8 @@
 Pebble **3/3**（HTTP-01、TLS-ALPN-01、IP shortlived）真实签发；另跑通
 `hub install --tls acme-domain`（Pebble TLS-ALPN）→ `--force --tls self-signed`
 切换，确认 ACME 证书被既有 CA 重签、`openssl verify` 通过；该流程已固化为
-[v100-acme-upgrade.sh](tests/e2e/v100-acme-upgrade.sh)；
-[v100-admin-panel-tls.sh](tests/e2e/v100-admin-panel-tls.sh) 验证
+[v100-acme-upgrade.sh](../tests/e2e/v100-acme-upgrade.sh)；
+[v100-admin-panel-tls.sh](../tests/e2e/v100-admin-panel-tls.sh) 验证
 `admin_tls=required` + panel `hub_ca` 的 HTTPS 登录与 `/api/overview` 代理；
 真实 LE staging 已完成：域名 HTTP-01、域名 TLS-ALPN-01、公网 IPv4
 `shortlived` 三路均签发成功（见证据文档）；本地 arm64（非 LTO 快速构建，
@@ -288,15 +288,16 @@ qemu 直接运行 hub/panel/agent 验证；hosted 原生 `delivery-arm64` 已在
 [2026-10-25-m5-phase-c-pentest.md](security/2026-10-25-m5-phase-c-pentest.md)：
 **高危 0 / 中危 0 / 低危 3**；L-02（TLS-ALPN 无 ALPN 客户端仍见挑战证书）
 已修复并补单测，L-01（account.json 旧权限仅 issue 时收紧）与 L-03（域名证书+
-回环 admin required 被 fail-closed 拒绝）保留为低危/文档约束。O.hub/O.union 已同步 80/443 元数据，C.3/H.13/H.14 仍断言
+回环 admin required 被 fail-closed 拒绝）保留为低危/文档约束（两者已在 Phase D
+修复）。O.hub/O.union 已同步 80/443 元数据，C.3/H.13/H.14 仍断言
 默认 compose 不发布 80/443、8444 不发布。
 
 **RC 已发布**：`v1.0.0-rc.2`（prerelease）通过 hosted `delivery-e2e`、
 `delivery-docker`、原生 `delivery-arm64`、SBOM 与 attestation；详见
 [RC 证据](security/2026-10-25-m5-phase-c-rc-evidence.md)。**`v1.0.0` 未发布，
 Phase B tag 未移动**。残余风险：私有 ACME 未设置 `tls.agent_ca_file` 时仍从
-链尾派生 intermediate；低危 L-01/L-03 保留；24h 长稳/千 agent 压力留待
-正式里程碑发布前。
+链尾派生 intermediate；低危 L-01/L-03 已在 Phase D 修复；24h 长稳/千 agent
+压力留待正式里程碑发布前。
 
 **Phase C 内存基线（2026-10-25，x86_64 release 静态包）**：hub
 `self_monitor=false`、panel HTTP、agent 已 enrollment 的独立空闲进程，60s 后：
@@ -315,14 +316,121 @@ workspace/构建 Docker 镜像。arm64 机器到位后按同一方法复测并�
 默认 compose 不发布 80/443，需要 ACME 叠加文件；旧 v0.4 指纹 agent 不兼容 ACME
 hub，需升级。
 
+### Phase D（2026-10-26，实现完成；checkpoint tag 待打）
+
+当前实现已提交；Phase D checkpoint tag **尚未创建**（名称待定），`v1.0.0-rc.2`
+不移动，`v1.0.0` 未发布。默认 SQLite 行为不变，PostgreSQL 为显式 opt-in、
+不自动双写。
+
+- [x] **L-01**：hub 启动把既有 `certs/acme/account.json` / `state.toml` 收紧到
+      0600，`certs/acme` 0700；符号链接、非普通文件、权限收紧失败均 fail-closed；
+      `tls status` 只读检查并输出 WARN，不写文件
+- [x] **L-03**：保持 fail-closed，不放宽 `validate_admin_tls`；错误信息给出三条
+      可用路径（非回环管理口 + 防火墙、同机面板 HTTP + 反代 TLS、含回环 SAN 的
+      self-signed 证书），且不诱导给公共 ACME 证书加回环 IP；`acme`/`tls`/
+      `troubleshooting` 文档同步
+- [x] **PostgreSQL 后端**：`database = "postgres://..."` 显式 opt-in；schema v7
+      （21 张业务表、19 个显式索引、独立 `schema_migrations`、advisory lock）；
+      `postgres` 同步驱动 + `tokio-postgres-rustls`（ring）+ r2d2；
+      只接受 `sslmode=verify-full`（默认）或 `disable`，拒绝
+      `require`/`prefer`/`verify-ca`/`allow`；`db_sslrootcert`、
+      `RUSTBOARD_DATABASE_PASSWORD`
+- [x] **异步边界**：hub 异步路径全部 `spawn_blocking`；PG 池在 runtime 外创建、
+      Drop 移交线程
+- [x] **迁移/备份/恢复 CLI**：`migrate --to <dsn> [--dry-run|--force|--yes]`、
+      `backup --out <dir> [--yes]`、`restore --from <dir> [--force] [--yes]`；
+      SQLite `VACUUM INTO` / PG `pg_dump`/`pg_restore`；manifest SHA256；
+      迁移成功后切换配置，失败不改配置、不删 SQLite
+- [x] **安装器/Docker/CI**：`--db postgres://`、`--db-sslrootcert`；Docker
+      `RUSTBOARD_DATABASE`/`RUSTBOARD_DATABASE_SSLROOTCERT`/
+      `RUSTBOARD_DATABASE_PASSWORD(_FILE)`，新增
+      `docker/compose.postgres.example.yml`，默认 compose 仍 SQLite；已有业务
+      数据的 SQLite 必须通过 `migrate` 切换，不能用 `install --db postgres://`
+      只改配置；CI 新增 PostgreSQL service job
+      （`postgres_schema`/`postgres_core`/`postgres_parity`/`postgres_migrate`/
+      `postgres_load`）
+- [ ] **Phase D checkpoint**：最终门禁复核通过后打 tag；当前未创建
+
+#### Phase D 验收矩阵
+
+| # | 验收 | 状态 | 证据 / 说明 |
+|---|---|---|---|
+| D-G1 | PG 可安装、启动、迁移；默认 SQLite 不变 | ✅ | 安装器 PG 探测、hub PG 运行期、`migrate`；默认 SQLite 路径未改 |
+| D-G2 | SQLite v7 的 21 表在 PG 等价，独立 migration 表 | ✅ | `postgres_schema` 10；19 个显式索引 + `schema_migrations` + advisory lock |
+| D-G3 | SQLite/PG 查询结果一致 | ✅ | `postgres_parity` 16：排序、分页、时间边界、NULL/labels、浮点容差 |
+| D-G4 | ingest 幂等、吊销、retention、downsample、alert、archive、audit、token 全绿 | ✅ | `postgres_core` 10 + parity；并发幂等/CAS 与非法批次已修；PG downsample 生成另有 `archive.rs` 单测（未计入上述 10/16 实库计数） |
+| D-G5 | PG 200 agent 写入/查询达标 | ✅ Storage 级 200 agent；hub 端真实 200 agent 端到端仍 Phase E | `postgres_load` 3 passed：200 OS 线程/200 agent，5 批×3 点，3000 samples、1000 ingest_batches、0 失败，pool=8；断连 kill 4 条池连接后首次重试成功、53 行无丢失；并发同键每轮 1 Inserted+1 Duplicate。**不是** hub 端真实 200 agent 端到端 |
+| D-G6 | `migrate` 失败不切换/不破坏 SQLite，成功可回切 | ✅ | `postgres_migrate` 6；失败不改配置、不删 SQLite，成功后配置原子切换 |
+| D-G7 | 备份/恢复后点数、范围、告警状态、token 数一致 | ✅ | `phase_d_backup` 5；manifest SHA256、PG dump/restore、SQLite VACUUM INTO |
+| D-G8 | 安装器 `--db` 探测、配置、脱敏，不自动建库/角色 | ✅ | 安装器 PG 探测先于写盘；失败不改 hub.toml/unit/二进制 |
+| D-G9 | Docker 可接 PG；默认 compose 仍 SQLite | ✅ | `docker/compose.postgres.example.yml`、`RUSTBOARD_DATABASE*`；默认 compose 未变 |
+| D-G10 | 全量 fmt/clippy/test/audit、独立评审/渗透、checkpoint | ⏳ 待评审/渗透/checkpoint | 全 workspace `cargo test --workspace --locked` 已通过：**1364 passed / 0 failed / 5 ignored**（2026-10-26，`RUSTBOARD_TEST_PG` + 本机 PG16 client）；独立评审/渗透与 checkpoint 仍待完成 |
+
+#### Phase D 测试证据（2026-10-26，全 workspace 已复跑）
+
+| 套件 | 结果 |
+|---|---|
+| `postgres_schema` | 10 passed |
+| `postgres_core` | 10 passed |
+| `postgres_parity` | 16 passed |
+| `postgres_migrate` | 6 passed |
+| `postgres_load` | 3 passed（200 OS 线程/200 agent，3000 samples/1000 batches，0 失败；总耗时 1.45–2.83s；断连恢复与同键并发见 D-G5） |
+| `phase_d_backup` | 5 passed（含真实 PG backup/restore；本机安装 PG16 client 后执行，不使用 mock 冒充 PG dump） |
+| `phase_d_l01_l03` | 7 passed + 1 ignored（root + `chattr +i` 权限失败用例） |
+| `rustboard-hub` | 420 passed + 3 ignored |
+| 全 workspace | **1364 passed / 0 failed / 5 ignored**（`cargo test --workspace --locked`，2026-10-26，`RUSTBOARD_TEST_PG` + 本机 PG16 client；含上述 PG 测试） |
+
+CI 的 PostgreSQL service job 覆盖 `postgres_schema`/`postgres_core`/
+`postgres_parity`/`postgres_migrate`/`postgres_load`，同 commit 必须全绿。
+`postgres_load` 是 storage 级 200 agent 压测，不等于 hub 端 200 agent 端到端；
+Phase E 仍保留 hub 级真实压测。
+
+#### Phase D 已知限制
+
+1. **单 hub 语义**：PG 后端没有 leader 选举或多活协调；同一数据库只允许一个
+   active hub，多个 hub 会重复评估告警、重复通知/归档。需要 HA 时由部署方保证
+   单写者，当前版本不承诺多活。
+2. **`migrate --force` 的 TLS 限制**：非空 PG 目标清空路径内部使用 NoTls，目前
+   只支持显式 `sslmode=disable`；`verify-full` 非空目标需先手工备份并清空
+   21 张业务表（保留 `schema_migrations`），再不带 `--force` 迁移。
+3. **外部 `pg_dump`/`pg_restore`**：静态构建、离线包与 hub Docker 镜像不内置
+   PostgreSQL 客户端；PG 备份/恢复缺少命令时会失败并提示安装
+   `postgresql-client`，SQLite 备份/恢复不需要外部工具。客户端主版本最好与
+   服务端一致；PG17 client 对 PG16 会因 `transaction_timeout` 失败，当前验证
+   使用 PG16 client + PG16 服务端。
+4. **恢复后的文件属主**：root 执行 `restore` 后配置/证书/数据库归 root；
+   systemd 部署需交回 hub 运行用户，Docker `--user 10001:10001` 需先
+   `chown -R 10001:10001`，否则下次启动会因权限失败。
+5. **TLS verify-full 端到端**：已有配置层/单元测试与 D0 spike（本地 TLS PG
+   连接、证书链与主机名校验）证据；尚未在真实 TLS PostgreSQL 上做完整
+   “安装→启动→读写” smoke，生产启用前需用测试实例复核 CA/SAN/
+   `db_sslrootcert`。
+6. **压力与长稳仍部分在 Phase E**：storage 级 200 agent（`postgres_load`）
+   已通过；hub 端真实 200 agent 端到端、100/500/1000 agent、≥24h 长稳与 RSS
+   门禁尚未执行，storage 级 load 不能替代 hub 端真实压测。
+7. 备份包含 agent secret、API token 哈希、证书私钥与数据库内容，必须按 secret
+   管理；迁移/恢复前必须停 hub。`migrate` 在有 systemd 时拒绝运行中的 hub；
+   无 systemd 时只 WARN，不做 PID 伪造检查；`--dry-run` 目标非空且未给
+   `--force` 也会非零退出。
+
+### Phase E 剩余
+
+- [ ] hub 端真实 200 agent 端到端（storage 级 200 已通过，不等同）；
+      100/500/1000 agent 三档压力与 ≥24h 长稳（RSS 增长 >10% 视为不通过）
+- [ ] 真实 TLS PostgreSQL 的 `verify-full` 安装→启动→读写 smoke
+- [ ] Phase D 收口：独立评审/渗透、`fmt`/`clippy -D warnings`/`audit`、
+      同 commit CI `postgres` job 全绿，然后打 checkpoint tag（名称待定）
+- [ ] `v1.0.0`：CHANGELOG 归档、tag、GitHub Release、镜像与 `latest`；
+      **不移动 `v1.0.0-rc.2`**，未完成上述门禁前不发布
+
 计划：[Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)；
-[Phase C 计划](plans/2026-10-25-m5-phase-c-tls-release-gates.md)。
+[Phase C 计划](plans/2026-10-25-m5-phase-c-tls-release-gates.md)；
+[Phase D 计划](plans/2026-10-26-m5-phase-d-postgres-backup-l01-l03.md)。
 离线/Docker/发布文档：[offline](install/offline.md)、[docker](install/docker.md)、
 [release](install/release.md)；TLS 文档：[tls](install/tls.md)、
 [acme](install/acme.md)、[panel-tls](install/panel-tls.md)、
-[troubleshooting](install/troubleshooting.md)。
-
-- [ ] Phase D/E：PostgreSQL/备份迁移、压力/长稳/v1.0.0
+[troubleshooting](install/troubleshooting.md)；PostgreSQL 文档：
+[postgres](install/postgres.md)。
 
 > Phase A 的 e2e 只覆盖 x86_64 本机 systemd；arm64、离线 netns、Docker 镜像与
 > 真实 ACME/PG 属于后续 Phase，不作为本阶段完成项。
@@ -540,15 +648,11 @@ hub，需升级。
 
 ## 下一步建议
 
-v0.4.1 已完成并发布；v0.4.2 修复 CI ANSI 测试助手，并把 vendored SFTP 依赖
-升级到稳定 ECC 栈（crypto-bigint 0.7.6，RUSTSEC-2026-0387）。M5 Phase A 已完成
-安装器内核与自签三步安装（e2e 121/121）；Phase B 已完成两架构静态 musl、离线包、
-Docker/多架构与 tag 触发 release workflow 的本地验收。Phase C 的 ACME、agent TLS、
-面板 TLS、管理端 TLS、Docker/文档已实现 C0–C8，C9 完成真实 LE staging（域名
-HTTP-01/TLS-ALPN、公网 IP `shortlived`）、独立评审/渗透与 hosted RC
-**`v1.0.0-rc.2`**（prerelease，未提升 latest）；`v1.0.0` 尚未发布。之后进入
-Phase D（PostgreSQL/备份迁移），v1.0.0 正式发布在 Phase E。
-计划见
+Phase D 已完成 PostgreSQL 显式 opt-in、`migrate`/`backup`/`restore` CLI 与
+L-01/L-03 收口，全 workspace 测试 **1364 passed / 0 failed / 5 ignored**；
+默认 SQLite 不变，`v1.0.0-rc.2` 不移动，Phase D checkpoint tag 待打。下一步：
+hub 端真实 200 agent、100/500/1000 与 24h 长稳、真实 TLS PG smoke、独立评审/
+渗透与最终 fmt/clippy/audit，门禁全绿后归档 CHANGELOG、发布 `v1.0.0`。计划见
 [M5 计划](plans/2026-10-24-m5-install-delivery.md)、
 [Phase A 设计](plans/2026-10-24-m5-phase-a-installer.md) 与
 [Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)、

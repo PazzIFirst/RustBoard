@@ -1,16 +1,17 @@
-# 发布流水线与产物验证（M5 Phase B/C）
+# 发布流水线与产物验证（M5 Phase B/C/D）
 
 Phase B 新增 `.github/workflows/release.yml`：只由 `v*` tag push 触发。流水线负责
 静态离线包、多架构镜像、SBOM、artifact attestation 与 GitHub Release；普通 push
 只跑现有 CI，不推镜像。Phase C 的 C1 补齐了 Docker 与原生 arm64 运行时门禁，并给
-正式发布 job 增加 `environment: release` 人工闸门。
+正式发布 job 增加 `environment: release` 人工闸门；Phase D 增加 PostgreSQL
+显式 opt-in，不改变发布流水线或默认 SQLite。
 
-> **当前状态**：workflow 已随 Phase B 落地，Phase C C1 已增加 `delivery-docker`、
-> `delivery-arm64` 与 release environment；Phase C 的 ACME/面板 TLS 已在主线实现，
-> 但尚未完成 C9 全量 e2e/评审/渗透，也尚未用真实 `v1.0.0-rc.1` tag 执行。
-> `Cargo.toml` 仍是 `0.4.2`，版本归档、CHANGELOG `[v1.0.0]` 与正式发布属于 Phase E；
-> hosted arm64 与真实 LE staging 的完整验证留到 Phase C 的 `v1.0.0-rc.1`。
-> Phase B/C 的 checkpoint 不创建/移动 `v1.0.0` tag。
+> **当前状态**：Phase B/C workflow 已由 `v1.0.0-rc.2` 真实执行并通过
+> `delivery-e2e`、`delivery-docker`、`delivery-arm64`、SBOM 与 attestation；
+> Phase D 已实现 PostgreSQL 与迁移/备份/恢复，全 workspace 测试 **1364 passed /
+> 0 failed / 5 ignored**（含 PG load），本地测试证据已记录。
+> `Cargo.toml` 为 `1.0.0-rc.2`，版本归档、CHANGELOG `[v1.0.0]` 与正式发布属于
+> Phase E；`v1.0.0-rc.2` 不移动，Phase D checkpoint 不创建/移动 `v1.0.0`。
 
 ## 1. 触发条件
 
@@ -101,7 +102,7 @@ ghcr.io/pazzifirst/rustboard-agent:v1.0.0
 # 同一 digest 另打 sha-<12-hex>（稳定版还打 latest）
 ```
 
-稳定版同时推 `latest`；预发布（如 `v1.0.0-rc.1`）不推 `latest`。三个镜像均带
+稳定版同时推 `latest`；预发布（如 `v1.0.0-rc.2`）不推 `latest`。三个镜像均带
 `org.opencontainers.image.source/revision/version/licenses` label，并同时包含
 `linux/amd64` 与 `linux/arm64` manifest。
 
@@ -146,7 +147,7 @@ revision 对应；镜像 digest 以 registry 的不可变 digest 为准，不只
   role 的正式 tag（registry 无法跨三个仓库原子操作），需重跑同一 tag 覆盖或人工
   按 digest 清理；不会自动 publish。
 - 同一 tag 重跑：允许复用/覆盖 draft 资产；已发布 Release 拒绝重跑。
-- RC/预发布（如 `v1.0.0-rc.1`）：`stable=false`，Release 以 prerelease 创建，
+- RC/预发布（如 `v1.0.0-rc.2`）：`stable=false`，Release 以 prerelease 创建，
   `latest` 提升步骤不执行；正式 RC tag 与 `sha-<short>` 仍会生成用于验证，但
   `latest` 保持指向最近稳定版。提升为稳定版必须发布新的 `vX.Y.Z`。
 - 发布后发现缺陷：发新 patch 版本（如 `v1.0.1`），不移动 `v1.0.0`；旧镜像 digest
@@ -175,18 +176,26 @@ sudo env PACKAGE="$PACKAGE" SKIP_BUILD=1 STRICT=1 bash tests/e2e/v100-arm64.sh
 
 # SPDX SBOM
 packaging/sbom.py --output /tmp/sbom.spdx.json \
-  --version 0.4.2 --revision "$(git rev-parse HEAD)" --arch x86_64
+  --version 1.0.0-rc.2 --revision "$(git rev-parse HEAD)" --arch x86_64
 
 # release notes 提取
-packaging/release-notes.sh 0.4.2 CHANGELOG.md
+packaging/release-notes.sh 1.0.0-rc.2 CHANGELOG.md
 
 # workflow 静态检查
 actionlint .github/workflows/release.yml
 
-# Compose（默认与 ACME 叠加）语法
+# Compose（默认、ACME 与 PostgreSQL 叠加）语法
 docker compose -f docker/compose.example.yml config >/dev/null
 docker compose -f docker/compose.example.yml \
   -f docker/compose.acme.example.yml config >/dev/null
+docker compose -f docker/compose.example.yml \
+  -f docker/compose.postgres.example.yml config >/dev/null
+
+# PostgreSQL 实库测试（本地 postgres:16；角色需要 CREATEDB + pg_terminate_backend）
+RUSTBOARD_TEST_PG='postgres://rustboard:<TEST_PASSWORD>@127.0.0.1:5432/rustboard?sslmode=disable' \
+  cargo test -p rustboard-core --locked \
+    --test postgres_schema --test postgres_core \
+    --test postgres_parity --test postgres_migrate --test postgres_load
 ```
 
 `tests/e2e/v100-offline.sh`、`tests/e2e/v100-docker.sh`、`tests/e2e/v100-arm64.sh`
@@ -194,7 +203,7 @@ docker compose -f docker/compose.example.yml \
 `delivery-docker` 在 amd64 runner 上只跑原生 amd64（`SKIP_ARM64=1`），
 `delivery-arm64` 在 `ubuntu-24.04-arm` 上原生跑包安装与容器 e2e，不使用 QEMU。
 真正的 tag 触发、GHCR 推送、多架构 manifest、GitHub Release、attestation 与
-hosted arm64 完整链路只能在 `v1.0.0-rc.1`/正式 tag 的发布环境验证。
+hosted arm64 完整链路只能在 RC（当前为 `v1.0.0-rc.2`）/正式 tag 的发布环境验证。
 
 ## 7. ACME 与发布门禁
 
@@ -209,7 +218,7 @@ ACME 是**运行期/安装期**能力，不改变 tag 触发条件、版本一�
 
 **RC 前手工门禁**（不放进 CI，因为需要真实公网入口/DNS 与 Let's Encrypt 配额）：
 
-1. 用 `v1.0.0-rc.1` 二进制 + staging directory 验证域名 `http-01` 与
+1. 用当前 RC（如 `v1.0.0-rc.2`）二进制 + staging directory 验证域名 `http-01` 与
    `tls-alpn-01`，记录证书 SAN/链/到期；
 2. 至少在一种公网 IPv4 上验证 `acme-ip` + `shortlived`（或等价 6 天证书）；
 3. 验证 80/443 四层诊断（本地 bind、本机防火墙、云安全组、staging 实跑）与
@@ -221,3 +230,32 @@ ACME 是**运行期/安装期**能力，不改变 tag 触发条件、版本一�
 操作步骤见 [acme.md](acme.md) 与 [tls.md](tls.md)；Docker 叠加见
 [docker.md §6](docker.md#6-acme-与证书持久化) 与
 [docker/README.md](../../docker/README.md)。
+
+## 8. PostgreSQL 与发布门禁
+
+PostgreSQL 是**运行期/安装期**的显式 opt-in，不改变 tag 触发条件、版本一致性、
+main 祖先或 `delivery-*` 门禁；默认 SQLite 路径与发布资产不变。发布前仍需确认：
+
+1. **同一 commit 的 CI `postgres` job 全绿**：覆盖 `postgres_schema`、
+   `postgres_core`、`postgres_parity`、`postgres_migrate`、`postgres_load`，
+   使用 `postgres:16` service。该 job 独立于 release workflow 的 `verify`，
+   不能拿 `verify` 代替 PG job 的结论。
+2. **PG 压力/长稳不在 release workflow**：`postgres_load` 是 storage 级
+   200 agent 压测，不等于 hub 端 200 agent 端到端；hub 端真实 200 agent ingest、
+   100/500/1000 与 24h 长稳仍按 Phase E 门禁执行，未完成前不发布 `v1.0.0`。
+3. **外部客户端**：`pg_dump`/`pg_restore` 不在离线包、静态二进制或 hub 镜像内；
+   发布说明应提示 PG 备份/恢复需要宿主安装 `postgresql-client`，并尽量使用与
+   PG 服务端相同主版本的客户端。
+4. **不改默认交付**：默认 compose、离线包和镜像仍以 SQLite 为默认；PG 只通过
+   `database = "postgres://..."` 或叠加文件启用，不自动建库/建角色。
+5. **不泄露**：发布资产、SBOM、镜像与构建日志不得包含数据库密码、完整 DSN、
+   PG 数据或备份文件；CI 的测试 DSN 只存在于 job 环境。
+6. **单 hub 语义**：PG 后端没有 leader 选举；发布说明不得暗示多 hub 多活。
+   `migrate --force` 对非空目标目前只支持 `sslmode=disable`，该限制应写入
+   release notes。
+7. **发布演练**：至少在一个测试 PG 上执行 `backup → restore` 与
+   `migrate → 启动 → 回切 SQLite`；不得用 mock 或“仅编译通过”代替。
+
+操作与限制见 [postgres.md](postgres.md)；Docker 场景见
+[docker.md §7](docker.md#7-升级回滚与限制) 与
+[docker/README.md](../../docker/README.md) §14。

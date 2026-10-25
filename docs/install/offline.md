@@ -1,12 +1,13 @@
-# 离线安装（M5 Phase B/C）
+# 离线安装（M5 Phase B/C/D）
 
 离线包面向不能访问外网、也不允许安装器做任何外部网络探测的服务器。包内已经包含
 hub / panel / agent 三个静态 musl 二进制、前端静态资源、systemd unit 参考文件和
 `install.sh`；安装时不需要下载依赖。
 
-> 当前版本按 `Cargo.toml` 为 `0.4.2`，Phase B 产物用 `v0.4.2` 验证；Phase C 的
-> ACME/面板 TLS 已在主线实现，但尚未完成 C9 全量 e2e/评审/RC。正式 `v1.0.0`
-> 发布在 Phase E 完成版本归档后触发。包布局与命令不随版本变化。
+> 当前版本按 `Cargo.toml` 为 `1.0.0-rc.2`；Phase C 已以 `v1.0.0-rc.2` 发布，
+> Phase D 已实现 PostgreSQL 显式 opt-in、迁移/备份/恢复 CLI 与 L-01/L-03 收口，
+> 默认安装仍是 SQLite。正式 `v1.0.0` 发布在 Phase E 完成版本归档后触发。包布局
+> 与命令不随版本变化。
 >
 > 构建/维护说明见 [packaging/README.md](../../packaging/README.md)；Docker 交付见
 > [docker.md](docker.md)。
@@ -37,8 +38,8 @@ serverdashboard-v<version>-<arch>/
 
 ```bash
 sha256sum -c SHA256SUMS.x86_64
-tar -xzf serverdashboard-v0.4.2-x86_64.tar.gz
-cd serverdashboard-v0.4.2-x86_64
+tar -xzf serverdashboard-v1.0.0-rc.2-x86_64.tar.gz
+cd serverdashboard-v1.0.0-rc.2-x86_64
 sha256sum -c --strict SHA256SUMS
 ```
 
@@ -170,6 +171,26 @@ sudo ./install.sh hub --yes --offline \
 的等效开关是 `RUSTBOARD_TLS_MODE`（ACME 时不追加 `--offline`），见
 [docker.md](docker.md)。
 
+### 4.2 离线与 PostgreSQL 互斥
+
+PostgreSQL 安装必须连接数据库执行 `apply_schema` 与 `ping`，因此离线安装器
+拒绝 `--db postgres://…`：
+
+```bash
+sudo ./install.sh hub --yes --offline \
+  --db 'postgres://rustboard@db.example.com:5432/rustboard?sslmode=verify-full'
+# 错误: --offline 与 PostgreSQL 互斥：安装器需要连接数据库执行 apply_schema 与 ping，
+#       离线模式不会发起任何网络请求。请去掉 --offline，或改用默认 SQLite
+```
+
+已有 `hub.toml` 是 PostgreSQL 时，打包脚本自动注入 `--offline` 也会在写盘前
+失败；不能用“先写一个未验证的 PG URL、启动时再试”绕过。离线环境请继续用
+SQLite，或在联网环境完成 PG 安装/迁移后再离线运行。
+
+PostgreSQL 备份/恢复还依赖外部 `pg_dump`/`pg_restore`，离线包与 hub Docker 镜像
+都不内置；客户端主版本应尽量与服务端一致。详见 [postgres.md](postgres.md)
+§6/§9。
+
 ## 5. systemd、升级与回滚
 
 - 默认 root prefix 且系统有 systemd 时，安装器写 unit、`enable --now`，通过
@@ -180,6 +201,9 @@ sudo ./install.sh hub --yes --offline \
   替换文件，已有 data/config 不删除。
 - 回滚：保留旧 tarball 与安装前备份，重新解包旧版本并执行 `--force`。如果数据库
   已被新版本迁移，优先恢复升级前的数据快照，不要只回退二进制。
+- PostgreSQL 切换/迁移后回滚：先停 hub，把 `hub.toml` 的 `database` 改回 SQLite
+  路径（或 `restore` 迁移前备份），再启动；SQLite 文件不会被迁移删除。仅回退
+  二进制不会把配置改回 SQLite。
 - 已发布 tag 不移动；缺陷用新 patch 版本修复。
 
 ## 6. 故障排查
@@ -194,4 +218,6 @@ sudo ./install.sh hub --yes --offline \
 | 面板页面 503 | 包内 `web/` 未安装到 prefix；检查 `share/rustboard/web/index.html` 与安装日志 |
 | 服务启动失败 | `journalctl -u rustboard-<role>`；不要删除 `/var/lib/rustboard` 数据目录 |
 | `--offline 与 ACME 互斥` | 去掉 `--offline` 或改 self-signed；ACME 必须联网，见 §4.1 |
+| `--offline 与 PostgreSQL 互斥` | 去掉 `--offline`，或改用默认 SQLite；PG 安装必须联网，见 §4.2 |
+| `pg_dump 不存在` / `pg_restore 不存在` | 离线包/镜像不含 PostgreSQL 客户端；在宿主安装匹配版本的 `postgresql-client`，见 [postgres.md](postgres.md) §6.4 |
 | Docker ACME 端口不通 | 默认 compose 不发布 80/443；用 `docker/compose.acme.example.yml` 叠加，见 [docker.md](docker.md) |
