@@ -79,7 +79,8 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// 建立 PostgreSQL 连接所需的参数。
 ///
-/// 不 `derive(Debug)`：`dsn` 可能带 URL 密码，日志/panic 只能输出脱敏形式。
+/// 不 `derive(Debug)`：`dsn` 字段在 `Debug` 中固定输出 `"<redacted>"`，不输出
+/// URL 的任何部分（scheme/user/host/db/query）。
 pub struct PostgresOptions {
     /// `postgres://` / `postgresql://` 连接串；后续 D4 由 `HubConfig::database`
     /// 提供。query 中的 `sslmode` 与 `sslrootcert` 在 [`PostgresStorage::open`]
@@ -99,7 +100,8 @@ pub struct PostgresOptions {
 impl fmt::Debug for PostgresOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PostgresOptions")
-            .field("dsn", &redact_database_url(&self.dsn))
+            // 固定占位符：不输出 URL 的任何部分（scheme/user/host/db/query）。
+            .field("dsn", &"<redacted>")
             .field("pool_size", &self.pool_size)
             .field("connect_timeout", &self.connect_timeout)
             .field("statement_timeout", &self.statement_timeout)
@@ -142,6 +144,10 @@ pub struct PostgresStorage {
     redactor: Redactor,
     /// 成功写入的批次数，用于每 512 批清理一次过期判重记录。
     inserted_batches: AtomicU64,
+    /// 成功写入的审计条数，用于每 1000 条清理一次 180 天前的记录。
+    ///
+    /// 每个 `PostgresStorage` 实例独立计数，多实例不会互相叠加。
+    audit_writes: AtomicU64,
 }
 
 impl fmt::Debug for PostgresStorage {
@@ -237,6 +243,7 @@ impl PostgresStorage {
             redacted_dsn: redacted,
             redactor,
             inserted_batches: AtomicU64::new(0),
+            audit_writes: AtomicU64::new(0),
         };
         // 失败时 `storage` 的 Drop 会把池交给独立线程，避免在 runtime 内
         // drop 同步 Client（见 `impl Drop`）。
@@ -580,6 +587,21 @@ fn build_rustls_connector(root: Option<&Path>) -> Result<MakeRustlsConnect> {
     let mut roots = RootCertStore::empty();
     match root {
         Some(path) => {
+            // 只接受普通文件：拒绝符号链接和目录/设备。错误只带路径，绝不回显
+            // 文件内容。注意这是打开前的检查（不解决 TOCTOU），但足以阻止把
+            // 可被替换的符号链接当作信任根。
+            let metadata = std::fs::symlink_metadata(path).with_context(|| {
+                format!(
+                    "读取 PostgreSQL 根证书文件失败：{}（需要 PEM 编码的 CA 证书）",
+                    path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() {
+                bail!("PostgreSQL 根证书不能是符号链接：{}", path.display());
+            }
+            if !metadata.file_type().is_file() {
+                bail!("PostgreSQL 根证书必须是普通文件：{}", path.display());
+            }
             let certificates = CertificateDer::pem_file_iter(path).with_context(|| {
                 format!(
                     "读取 PostgreSQL 根证书文件失败：{}（需要 PEM 编码的 CA 证书）",
@@ -789,7 +811,79 @@ mod tests {
         };
         let debug = format!("{options:?}");
         assert!(!debug.contains("topsecret"), "Debug 泄露密码：{debug}");
-        assert!(debug.contains("***"));
+        assert!(
+            debug.contains("dsn: \"<redacted>\""),
+            "dsn 必须固定输出占位符：{debug}"
+        );
+        // 不输出 URL 的任何部分：scheme/user/host/port/db/query 都不能出现。
+        for fragment in [
+            "postgres://",
+            "postgresql://",
+            "rustboard",
+            "127.0.0.1",
+            "sslmode",
+        ] {
+            assert!(
+                !debug.contains(fragment),
+                "Debug 泄露 URL 片段 {fragment}：{debug}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_cert_symlink_and_non_regular_file_are_rejected() {
+        let unique = format!(
+            "rb-postgres-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).expect("创建临时目录失败");
+        let regular = dir.join("ca.pem");
+        std::fs::write(&regular, b"-----BEGIN CERTIFICATE-----\nnot-a-cert\n")
+            .expect("写入临时证书文件失败");
+
+        // 普通文件（即使内容非法）应进入 PEM 解析，而不是被文件类型检查拒绝。
+        let err = match build_rustls_connector(Some(&regular)) {
+            Ok(_) => panic!("非法 PEM 内容必须解析失败"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(
+            !message.contains("普通文件") && !message.contains("符号链接"),
+            "普通文件不应被文件类型检查拒绝：{message}"
+        );
+        assert!(message.contains("根证书"), "错误应指出根证书：{message}");
+
+        // 目录不是普通文件。
+        let err = match build_rustls_connector(Some(&dir)) {
+            Ok(_) => panic!("目录不能作为根证书"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(message.contains("普通文件"), "目录必须被拒绝：{message}");
+        assert!(message.contains(&dir.display().to_string()));
+
+        #[cfg(unix)]
+        {
+            let link = dir.join("ca-link.pem");
+            std::os::unix::fs::symlink(&regular, &link).expect("创建符号链接失败");
+            let err = match build_rustls_connector(Some(&link)) {
+                Ok(_) => panic!("符号链接不能作为根证书"),
+                Err(err) => err,
+            };
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("符号链接"),
+                "符号链接必须被拒绝：{message}"
+            );
+            assert!(message.contains(&link.display().to_string()));
+        }
+
+        std::fs::remove_dir_all(&dir).expect("清理临时目录失败");
     }
 
     #[test]

@@ -25,7 +25,7 @@
 //! 所有方法都通过 [`PostgresStorage::with_client`] 取连接；调用方必须位于
 //! blocking 线程（spike §4：tokio worker 内直接调用同步 PG 会 panic）。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use anyhow::{anyhow, bail, Context, Result};
 use postgres::error::SqlState;
@@ -52,18 +52,6 @@ const API_TOKEN_SCOPES: [&str; 3] = ["read", "write", "admin"];
 
 /// `api_tokens` 的 SELECT 列表；列顺序必须与 [`api_token_from_row`] 一致。
 const API_TOKEN_COLUMNS: &str = "id, name, scope, created_at, last_used_at, revoked_at";
-
-/// 进程级审计写入计数器：每 1000 条成功写入触发一次保留期清理。
-///
-/// `PostgresStorage` 没有本域可用的计数字段（`mod.rs` 不在本域修改范围），
-/// 所以用进程级 `AtomicU64`。生产通常只有一个 `PostgresStorage` 实例，语义
-/// 与 SQLite 的 per-storage 计数器一致；多实例时各进程独立计数，清理仍按
-/// 「约每 1000 条一次」发生，且**不会**每行都执行 `DELETE`。
-///
-/// 后续若允许改 `mod.rs`，最小改动是给 `PostgresStorage` 增加
-/// `audit_writes: AtomicU64` 字段并在 `open` 里初始化为 0，再把这里替换为
-/// `self.audit_writes`，即可得到严格的 per-storage 计数。
-static AUDIT_WRITES: AtomicU64 = AtomicU64::new(0);
 
 impl PostgresStorage {
     // ---- M3 审计 ----
@@ -102,7 +90,8 @@ impl PostgresStorage {
                 .get(0);
 
             // 每 1000 条成功写入清理一次 180 天前的记录，避免每条都 DELETE。
-            let written = AUDIT_WRITES.fetch_add(1, Ordering::Relaxed) + 1;
+            // 计数器属于当前 storage 实例，多实例互不叠加。
+            let written = self.audit_writes.fetch_add(1, Ordering::Relaxed) + 1;
             if written.is_multiple_of(AUDIT_CLEANUP_EVERY) {
                 prune_expired_audit(client);
             }
@@ -504,7 +493,6 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use anyhow::Context;
@@ -523,14 +511,6 @@ mod tests {
 
     /// 每次调用返回递增序号，避免同一纳秒内两个用例撞库名。
     static DB_SEQ: AtomicU64 = AtomicU64::new(0);
-
-    /// 审计相关用例串行化。
-    ///
-    /// [`AUDIT_WRITES`](super::AUDIT_WRITES) 是进程级计数器（`mod.rs` 不允许
-    /// 增加字段），并发用例可能让「1000 的整数倍」落在别的测试库上，使自动
-    /// 清理断言偶发失败。持有这把锁后，每个审计用例的写入是计数器上唯一
-    /// 的增量来源，断言可复现；不影响生产路径。
-    static AUDIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn skip(test_name: &str) {
         eprintln!("SKIP {test_name}: 未设置 {PG_ENV}（D3 Admin 实库测试需要 PostgreSQL）");
@@ -687,9 +667,6 @@ mod tests {
     #[test]
     fn audit_pagination_filters_and_prune() {
         const NAME: &str = "audit_pagination_filters_and_prune";
-        let _serial = AUDIT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(db) = TestDatabase::create("audit") else {
             skip(NAME);
             return;
@@ -781,9 +758,6 @@ mod tests {
     #[test]
     fn audit_truncates_params_and_preserves_error_fields() {
         const NAME: &str = "audit_truncates_params_and_preserves_error_fields";
-        let _serial = AUDIT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(db) = TestDatabase::create("audit_trunc") else {
             skip(NAME);
             return;
@@ -829,9 +803,6 @@ mod tests {
     #[test]
     fn audit_auto_prunes_every_thousand_writes() {
         const NAME: &str = "audit_auto_prunes_every_thousand_writes";
-        let _serial = AUDIT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(db) = TestDatabase::create("audit_prune") else {
             skip(NAME);
             return;
@@ -844,8 +815,8 @@ mod tests {
             .insert_audit(&audit_entry("a1", "systemd", "list", stale_ts))
             .unwrap();
 
-        // 再写 1000 条：无论进程级计数器从哪个值开始，这 1000 次递增必然
-        // 跨过至少一个 1000 的整数倍，触发本库的保留期清理。
+        // 再写 1000 条：计数器从本实例的 0 开始，第 1000 次写入恰好触发
+        // 本库的保留期清理。
         for _ in 0..AUDIT_CLEANUP_EVERY {
             storage
                 .insert_audit(&audit_entry("a1", "systemd", "list", now))
@@ -858,6 +829,59 @@ mod tests {
             "180 天前的审计必须被自动清理"
         );
         assert_eq!(rows.len(), 1_000, "新写入的审计必须全部保留");
+    }
+
+    /// 审计计数器是 per-storage：两个实例各自计数，合计到 1000 不会触发
+    /// 清理；只有某个实例自己写满 1000 条才触发。
+    #[test]
+    fn audit_cleanup_counter_is_per_storage_instance() {
+        const NAME: &str = "audit_cleanup_counter_is_per_storage_instance";
+        let Some(db) = TestDatabase::create("audit_per_storage") else {
+            skip(NAME);
+            return;
+        };
+        let first = db.open_storage();
+        let second = db.open_storage();
+
+        let now = now_ms();
+        let stale_ts = now - AUDIT_RETENTION_MS - 1;
+        first
+            .insert_audit(&audit_entry("a1", "systemd", "list", stale_ts))
+            .unwrap();
+        // 合计写满 1000 条，但两个实例各自都未到 1000。
+        for _ in 1..600 {
+            first
+                .insert_audit(&audit_entry("a1", "systemd", "list", now))
+                .unwrap();
+        }
+        for _ in 0..400 {
+            second
+                .insert_audit(&audit_entry("a1", "systemd", "list", now))
+                .unwrap();
+        }
+        assert!(
+            second
+                .list_audit(2_000, None, None, None)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.ts == stale_ts),
+            "合计 1000 条但单实例未到阈值时，不得触发保留期清理"
+        );
+
+        // first 自己写满 1000 条：只清理 first 触发的这一轮。
+        for _ in 0..400 {
+            first
+                .insert_audit(&audit_entry("a1", "systemd", "list", now))
+                .unwrap();
+        }
+        assert!(
+            second
+                .list_audit(2_000, None, None, None)
+                .unwrap()
+                .iter()
+                .all(|entry| entry.ts > stale_ts),
+            "单实例达到 1000 条后必须清理 180 天前的审计"
+        );
     }
 
     /// maintenance_state：缺失返回 None；UPSERT 覆盖；list 按 key 升序；

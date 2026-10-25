@@ -29,6 +29,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use postgres::config::SslMode;
@@ -460,6 +461,154 @@ fn ingest_batches_match_sqlite() {
         let (pg_rows, sqlite_rows) = both!(pg, sqlite, |s| s.query_series(&query).unwrap());
         assert_series_eq(&pg_rows, &sqlite_rows);
     }
+}
+
+/// NUL / NaN / Inf 在 SQLite 与 PostgreSQL 上都必须返回 Invalid，且不落任何行。
+#[test]
+fn invalid_batches_are_rejected_by_both_backends() {
+    const NAME: &str = "invalid_batches_are_rejected_by_both_backends";
+    let Some(db) = TestDatabase::create("invalid") else {
+        skip(NAME);
+        return;
+    };
+    let pg = db.open_storage();
+    let sqlite = SqliteStorage::open_in_memory().expect("打开内存 SQLite 失败");
+
+    let base = || sample_batch("a1", 1, 0, vec![Sample::new("cpu.usage", 1_000, 1.0)]);
+    let mut nul_agent = base();
+    nul_agent.agent_id = "a\0b".into();
+    let mut nul_metric = base();
+    nul_metric.samples[0].metric = "cpu\0usage".into();
+    let mut nul_label_key = base();
+    nul_label_key.samples[0]
+        .labels
+        .insert("co\0re".into(), "0".into());
+    let mut nul_label_value = base();
+    nul_label_value.samples[0]
+        .labels
+        .insert("core".into(), "0\0".into());
+    let mut nan = base();
+    nan.samples[0].value = f64::NAN;
+    let mut inf = base();
+    inf.samples[0].value = f64::INFINITY;
+    let mut neg_inf = base();
+    neg_inf.samples[0].value = f64::NEG_INFINITY;
+    let mut nan_second_sample = base();
+    nan_second_sample
+        .samples
+        .push(Sample::new("mem.used", 2_000, f64::NAN));
+
+    for (what, invalid) in [
+        ("agent_id 含 NUL", nul_agent),
+        ("metric 含 NUL", nul_metric),
+        ("labels key 含 NUL", nul_label_key),
+        ("labels value 含 NUL", nul_label_value),
+        ("NaN", nan),
+        ("+Inf", inf),
+        ("-Inf", neg_inf),
+        ("第二个采样点 NaN", nan_second_sample),
+    ] {
+        let (pg_outcome, sqlite_outcome) = both!(pg, sqlite, |s| s.insert_batch(&invalid).unwrap());
+        assert_eq!(
+            pg_outcome,
+            IngestOutcome::Rejected(RejectReason::Invalid),
+            "{what} 在 PostgreSQL 上必须返回 Invalid"
+        );
+        assert_eq!(
+            sqlite_outcome,
+            IngestOutcome::Rejected(RejectReason::Invalid),
+            "{what} 在 SQLite 上必须返回 Invalid"
+        );
+    }
+
+    let (pg_samples, sqlite_samples) = both!(pg, sqlite, |s| s.sample_count("a1").unwrap());
+    assert_eq!(
+        (pg_samples, sqlite_samples),
+        (0, 0),
+        "非法批次不得写入采样点"
+    );
+    let mut client = db.client();
+    let pg_all_samples: i64 = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM samples", &[])
+        .expect("统计 PG samples 失败")
+        .get(0);
+    let pg_batches: i64 = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM ingest_batches", &[])
+        .expect("统计 PG ingest_batches 失败")
+        .get(0);
+    assert_eq!(pg_all_samples, 0, "PG samples 不得有行");
+    assert_eq!(pg_batches, 0, "PG ingest_batches 不得有占位行");
+}
+
+/// 两个线程同时插入同一 `(agent_id, epoch, seq)`：恰好一个 Inserted、一个
+/// Duplicate，samples 只有一份。
+#[test]
+fn concurrent_duplicate_batch_is_inserted_exactly_once() {
+    const NAME: &str = "concurrent_duplicate_batch_is_inserted_exactly_once";
+    let Some(db) = TestDatabase::create("concurrent_dup") else {
+        skip(NAME);
+        return;
+    };
+    let storage = Arc::new(db.open_storage());
+    let batch = Arc::new(sample_batch(
+        "a1",
+        1,
+        7,
+        vec![
+            Sample::new("cpu.usage", 1_000, 10.0),
+            Sample::new("mem.used", 1_000, 1024.0),
+        ],
+    ));
+    let barrier = Arc::new(Barrier::new(2));
+
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let storage = Arc::clone(&storage);
+            let batch = Arc::clone(&batch);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                storage
+                    .insert_batch(&batch)
+                    .expect("并发 insert_batch 失败")
+            })
+        })
+        .collect();
+    let outcomes: Vec<IngestOutcome> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("并发测试线程 panic"))
+        .collect();
+
+    let inserted = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, IngestOutcome::Inserted { inserted: 2 }))
+        .count();
+    let duplicates = outcomes
+        .iter()
+        .filter(|outcome| **outcome == IngestOutcome::Duplicate)
+        .count();
+    assert_eq!(inserted, 1, "必须恰好一个线程真正插入：{outcomes:?}");
+    assert_eq!(duplicates, 1, "另一个线程必须返回 Duplicate：{outcomes:?}");
+    assert_eq!(
+        storage.sample_count("a1").unwrap(),
+        2,
+        "samples 只能有一份（2 个点）"
+    );
+
+    let mut client = db.client();
+    let batch_rows: i64 = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM ingest_batches", &[])
+        .expect("统计 ingest_batches 失败")
+        .get(0);
+    assert_eq!(batch_rows, 1, "ingest_batches 只能有一行占位");
+    let last_seq: i64 = client
+        .query_one(
+            "SELECT last_seq FROM ingest_state WHERE agent_id = 'a1' AND epoch = 1",
+            &[],
+        )
+        .expect("读取 ingest_state 失败")
+        .get(0);
+    assert_eq!(last_seq, 7, "ingest_state 必须记录本次 seq");
 }
 
 // ---------------------------------------------------------------------------

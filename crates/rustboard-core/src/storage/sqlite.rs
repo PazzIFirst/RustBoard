@@ -20,9 +20,10 @@ use crate::archive::{ArchiveObject, ArchiveStatus, ArchiveStoreError};
 use crate::channels::{ChannelConfig, ChannelKind, NotificationChannel};
 
 use super::{
-    AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, DownsampleRangeResult,
-    IngestOutcome, MaintenanceStateEntry, NewAuditEntry, PruneResult, QueryTooLarge, RejectReason,
-    SampleTier, Storage, TierStats, AUDIT_RETENTION_MS, BUCKET_1H_MS, BUCKET_1M_MS,
+    invalid_batch, AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry,
+    DownsampleRangeResult, IngestOutcome, MaintenanceStateEntry, NewAuditEntry, PruneResult,
+    QueryTooLarge, RejectReason, SampleTier, Storage, TierStats, AUDIT_RETENTION_MS, BUCKET_1H_MS,
+    BUCKET_1M_MS,
 };
 
 /// 默认只读连接池大小（与 `HubConfig::read_pool_size` 默认值一致）。
@@ -1268,6 +1269,11 @@ impl Storage for SqliteStorage {
     }
 
     fn insert_batch(&self, batch: &SampleBatch) -> Result<IngestOutcome> {
+        // NUL / NaN / Inf 必须在开启事务前拒绝：不占位、不写任何行。
+        if let Some(reason) = invalid_batch(batch) {
+            return Ok(IngestOutcome::Rejected(reason));
+        }
+
         let mut conn = self.lock_write();
         let tx = conn.transaction()?;
 
@@ -4601,6 +4607,57 @@ mod tests {
         let again = s.insert_batch(&batch(1)).unwrap();
         assert_eq!(again, IngestOutcome::Duplicate);
         assert_eq!(s.sample_count("a1").unwrap(), 2);
+    }
+
+    /// NUL / NaN / Inf 必须在开启事务前整批拒绝：三张表都不能留下任何行。
+    #[test]
+    fn insert_rejects_nul_and_non_finite_without_rows() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+
+        let mut nul_agent = batch(1);
+        nul_agent.agent_id = "a\0b".into();
+        let mut nul_metric = batch(2);
+        nul_metric.samples[0].metric = "cpu\0usage".into();
+        let mut nul_label_key = batch(3);
+        nul_label_key.samples[0]
+            .labels
+            .insert("co\0re".into(), "0".into());
+        let mut nul_label_value = batch(4);
+        nul_label_value.samples[0]
+            .labels
+            .insert("core".into(), "0\0".into());
+        let mut nan = batch(5);
+        nan.samples[0].value = f64::NAN;
+        let mut inf = batch(6);
+        inf.samples[0].value = f64::INFINITY;
+        let mut neg_inf = batch(7);
+        neg_inf.samples[0].value = f64::NEG_INFINITY;
+
+        for (what, invalid) in [
+            ("agent_id 含 NUL", nul_agent),
+            ("metric 含 NUL", nul_metric),
+            ("labels key 含 NUL", nul_label_key),
+            ("labels value 含 NUL", nul_label_value),
+            ("NaN", nan),
+            ("+Inf", inf),
+            ("-Inf", neg_inf),
+        ] {
+            assert_eq!(
+                s.insert_batch(&invalid).unwrap(),
+                IngestOutcome::Rejected(RejectReason::Invalid),
+                "{what} 必须返回 Invalid"
+            );
+        }
+
+        let conn = s.lock_read();
+        for table in ["samples", "ingest_batches", "ingest_state"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "非法批次不得写入 {table}");
+        }
     }
 
     /// issue #4：A -> B -> A 重放已确认批次，不增加样本。

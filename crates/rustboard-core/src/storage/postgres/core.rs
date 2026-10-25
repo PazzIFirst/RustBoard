@@ -7,8 +7,8 @@
 //! 行为对照 `sqlite.rs`：
 //!
 //! - `revoked` 是终态：`upsert_agent` / `mark_seen` / `set_status` 都不覆盖；
-//! - `insert_batch` 单事务完成吊销检查、`(agent_id, epoch, seq)` 精确判重、
-//!   逐点插入与 `ingest_batches` / `ingest_state` 写入；重复批次整批跳过；
+//! - `insert_batch` 单事务完成吊销检查、`(agent_id, epoch, seq)` 原子占位判重、
+//!   逐点插入与 `ingest_state` 写入；重复批次整批跳过，NUL/NaN/Inf 整批拒绝；
 //! - 查询值全部用 `$N` 绑定，只有占位符数量由 metrics 数量决定；
 //! - 文本排序显式 `COLLATE "C"`，与 SQLite 默认 BINARY 的字节序一致；
 //! - `latest_samples` 与 SQLite 一样先 raw，raw 为空才依次回退 1m、1h；
@@ -28,8 +28,8 @@ use rustboard_common::util::{constant_time_eq, now_ms};
 
 use super::PostgresStorage;
 use crate::storage::{
-    AgentControlRecord, AgentSeriesRow, IngestOutcome, QueryTooLarge, RejectReason, SampleTier,
-    BUCKET_1H_MS, BUCKET_1M_MS,
+    invalid_batch, AgentControlRecord, AgentSeriesRow, IngestOutcome, QueryTooLarge, RejectReason,
+    SampleTier, BUCKET_1H_MS, BUCKET_1M_MS,
 };
 
 /// 与 SQLite 一致：`ingest_batches` 判重记录保留 48 小时。
@@ -139,7 +139,15 @@ impl PostgresStorage {
     }
 
     /// 写入一批采样点，按 `(agent_id, epoch, seq)` 幂等；吊销检查同事务。
+    ///
+    /// 非法数据（NUL / NaN / Inf）在建立连接前直接拒绝；判重用
+    /// `INSERT ... ON CONFLICT DO NOTHING RETURNING` 原子占位，两个并发同键
+    /// 批次只会有一个真正插入 samples，另一个返回 [`IngestOutcome::Duplicate`]。
     pub fn insert_batch(&self, batch: &SampleBatch) -> Result<IngestOutcome> {
+        // NUL / NaN / Inf 必须在任何数据库操作之前拒绝：不占位、不写任何行。
+        if let Some(reason) = invalid_batch(batch) {
+            return Ok(IngestOutcome::Rejected(reason));
+        }
         let epoch = i64::try_from(batch.epoch).context("insert_batch: epoch 超出 BIGINT 范围")?;
         let seq = i64::try_from(batch.seq).context("insert_batch: seq 超出 BIGINT 范围")?;
 
@@ -159,18 +167,21 @@ impl PostgresStorage {
                 return Ok(IngestOutcome::Rejected(RejectReason::Revoked));
             }
 
-            // 精确到 seq 判重；不能只用 last_seq，否则同 epoch 乱序重传会误杀。
-            let already_processed: bool = tx
-                .query_one(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM ingest_batches
-                         WHERE agent_id = $1 AND epoch = $2 AND seq = $3
-                     )",
-                    &[&batch.agent_id, &epoch, &seq],
+            // 原子占位：并发同键事务由主键唯一约束串行化，只有一个能拿到行；
+            // 拿不到说明另一个事务已（或正在）写入同一批次，整批按 Duplicate
+            // 处理。占位与 samples/ingest_state 同事务，后续失败会整体回滚。
+            // TTL 以 hub 接收时间为准，避免 agent 时钟偏差导致过早/永不清理。
+            let received_at = now_ms();
+            let claimed = tx
+                .query_opt(
+                    "INSERT INTO ingest_batches (agent_id, epoch, seq, ts)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (agent_id, epoch, seq) DO NOTHING
+                     RETURNING agent_id",
+                    &[&batch.agent_id, &epoch, &seq, &received_at],
                 )
-                .context("检查 ingest_batches 判重失败")?
-                .get(0);
-            if already_processed {
+                .context("原子占位 ingest_batches 失败")?;
+            if claimed.is_none() {
                 tx.commit().context("提交重复批次事务失败")?;
                 return Ok(IngestOutcome::Duplicate);
             }
@@ -199,14 +210,6 @@ impl PostgresStorage {
                 inserted += 1;
             }
 
-            // TTL 以 hub 接收时间为准，避免 agent 时钟偏差导致过早/永不清理。
-            let received_at = now_ms();
-            tx.execute(
-                "INSERT INTO ingest_batches (agent_id, epoch, seq, ts)
-                 VALUES ($1, $2, $3, $4)",
-                &[&batch.agent_id, &epoch, &seq, &received_at],
-            )
-            .context("写入 ingest_batches 失败")?;
             tx.execute(
                 "INSERT INTO ingest_state (agent_id, epoch, last_seq, updated_at)
                  VALUES ($1, $2, $3, $4)

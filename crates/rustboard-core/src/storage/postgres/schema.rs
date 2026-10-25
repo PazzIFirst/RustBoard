@@ -418,6 +418,11 @@ fn apply_schema_inner(client: &mut postgres::Client) -> Result<()> {
         .transaction()
         .context("开启 PostgreSQL schema 迁移事务失败")?;
 
+    // schema DDL/校验可能在大库上超过连接级 statement_timeout；只在迁移事务内
+    // 取消超时（SET LOCAL 随提交/回滚自动失效），不改变连接池里其它语句。
+    tx.batch_execute("SET LOCAL statement_timeout = 0")
+        .context("关闭 schema 迁移事务的 statement_timeout 失败")?;
+
     // 锁必须在读版本之前：两个实例同时启动时，后到者阻塞到前者提交，
     // 再看到 version=7 走纯校验路径，不会重复执行 DDL。
     tx.query_one(

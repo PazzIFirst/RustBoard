@@ -1,9 +1,10 @@
 //! 存储抽象。
 //!
-//! [`Storage`] 是同步 trait：当前只有 SQLite 实现，PostgreSQL 在 Phase D（D3）
-//! 接入。PG 的网络阻塞不在这层 await，而是由上层用 `block_in_place` / 专用
-//! 线程池包装（调用点由 D3 基准确定），因此 trait 保持同步、可直接作为
-//! `dyn Storage` 使用。
+//! [`Storage`] 是同步 trait，SQLite 与 PostgreSQL 共用同一接口。PG 驱动是
+//! 同步网络 I/O，**本层不做运行时适配，也不自动把调用搬离 tokio worker**。
+//! 唯一受支持的调用路径是调用方在 hub 的 `spawn_blocking` 中执行，或走独立的
+//! blocking CLI 线程/进程；在 tokio worker 内直接调用 PG 方法会 panic
+//! （`Cannot start a runtime from within a runtime`）。
 //!
 //! [`StorageHandle`] 是 Phase D 引入的多后端边界：内部是 `Arc<dyn Storage>`，
 //! 可构造 SQLite 或 PostgreSQL；调用点只依赖 [`Deref`] 后的 trait 方法。
@@ -212,6 +213,30 @@ pub enum IngestOutcome {
 pub enum RejectReason {
     /// agent 已被吊销。
     Revoked,
+    /// 批次数据非法（字符串含 NUL，或采样值不是有限浮点数）。
+    Invalid,
+}
+
+/// 批次是否含有不能落库的数据；非法时返回 [`RejectReason::Invalid`]。
+///
+/// 检查项：`agent_id`、`metric`、labels 的 key/value 是否含 NUL 字符，以及
+/// 采样值是否为有限浮点数（拒绝 NaN / ±Inf）。SQLite 与 PostgreSQL 的
+/// `insert_batch` 都在开启事务之前调用本函数，命中后整批拒绝、不写任何行。
+pub(crate) fn invalid_batch(batch: &SampleBatch) -> Option<RejectReason> {
+    if batch.agent_id.contains('\0') {
+        return Some(RejectReason::Invalid);
+    }
+    for sample in &batch.samples {
+        if sample.metric.contains('\0') || !sample.value.is_finite() {
+            return Some(RejectReason::Invalid);
+        }
+        for (key, value) in &sample.labels {
+            if key.contains('\0') || value.contains('\0') {
+                return Some(RejectReason::Invalid);
+            }
+        }
+    }
+    None
 }
 
 /// 查询结果达到存储层的行数硬上限。
@@ -251,9 +276,10 @@ pub struct AgentSeriesRow {
 
 /// 同步存储接口：SQLite 实现见 [`sqlite::SqliteStorage`]。
 ///
-/// 所有方法都是同步阻塞调用。PostgreSQL 的网络阻塞不在这层 await，而是由
-/// 上层用 `block_in_place` / 专用线程池包装（D3 基准后确定范围），因此这里
-/// 不加 `async`，保持 `dyn Storage` 可用。
+/// 所有方法都是同步阻塞调用。PostgreSQL 的同步网络 I/O **不会**被本层自动
+/// 搬到 blocking 线程：调用方必须在 hub 的 `spawn_blocking` 或 blocking CLI
+/// 路径中调用（在 tokio worker 内直接调用会 panic）。因此这里不加 `async`，
+/// 保持 `dyn Storage` 可用。
 pub trait Storage: Send + Sync {
     /// 插入或更新 agent 元信息。
     fn upsert_agent(&self, agent: &AgentRecord) -> Result<()>;
@@ -272,7 +298,9 @@ pub trait Storage: Send + Sync {
 
     /// 写入一批采样点，按 `(agent_id, epoch, seq)` 幂等。
     ///
-    /// 已吊销 agent 的批次始终返回 `Rejected(Revoked)`，且不写入任何数据。
+    /// 已吊销 agent 的批次始终返回 `Rejected(Revoked)`；含 NUL 字符或非有限
+    /// 数值（NaN / ±Inf）的批次返回 `Rejected(Invalid)`。两种拒绝都不写入任何
+    /// 数据。
     fn insert_batch(&self, batch: &SampleBatch) -> Result<IngestOutcome>;
 
     fn list_agents(&self) -> Result<Vec<AgentRecord>>;

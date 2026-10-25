@@ -120,6 +120,17 @@ const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE id IN \
 const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE id IN \
      (SELECT id FROM samples_1h WHERE bucket_ts < $1 ORDER BY bucket_ts LIMIT $2)";
 
+/// raw 保留期删除与 rowid 水位 CAS 共用的固定事务级 advisory lock key。
+///
+/// 两处操作都会读改写 `maintenance_state` 的 raw 水位/代际；取同一把固定锁
+/// 后，claim 的「读 rowid + generation → 条件写」与 prune 的「删行 → 收敛
+/// 水位/推进代际」在数据库侧严格串行，避免 claim 把 prune 删除前的旧 MAX
+/// 在删除提交后写回。必须与 [`SCHEMA_ADVISORY_LOCK_KEY`] 使用不同 key：schema
+/// 锁只串行化启动迁移，不能与高频维护事务互相阻塞。
+///
+/// [`SCHEMA_ADVISORY_LOCK_KEY`]: super::schema::SCHEMA_ADVISORY_LOCK_KEY
+const RAW_MAINTENANCE_ADVISORY_LOCK_KEY: i64 = 0x5242_5047_0000_0012;
+
 /// raw 删除后收敛 `downsample_1m_last_raw_rowid` 的结果；`new == None`
 /// 表示水位键被删除/失效，只在事务提交后用于日志。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,6 +553,12 @@ impl PostgresStorage {
                 let mut tx = client
                     .transaction()
                     .context("开启 raw 保留期删除事务失败")?;
+                // 与 claim 共用固定事务级锁：删除+收敛水位必须是一个原子边界。
+                tx.query_one(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    &[&RAW_MAINTENANCE_ADVISORY_LOCK_KEY],
+                )
+                .context("获取 raw 维护 advisory lock 失败")?;
                 let max_before: Option<i64> = tx
                     .query_one("SELECT MAX(id) FROM samples", &[])
                     .context("读取删除前 samples.MAX(id) 失败")?
@@ -606,6 +623,13 @@ impl PostgresStorage {
             let mut tx = client
                 .transaction()
                 .context("开启 rowid 水位 CAS 事务失败")?;
+            // 与 raw 保留期删除共用同一把事务级锁：读水位/代际与条件写不能被
+            // prune 的「删行 + 推进代际」穿插，否则可能写回删除前的旧 MAX。
+            tx.query_one(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&RAW_MAINTENANCE_ADVISORY_LOCK_KEY],
+            )
+            .context("获取 raw 维护 advisory lock 失败")?;
             let current_rowid: Option<String> = tx
                 .query_opt(
                     "SELECT value FROM maintenance_state WHERE key = $1",
@@ -921,6 +945,7 @@ mod tests {
     //! DSN 必须显式 `sslmode=disable`（与 `PostgresStorage::open` 的明文路径一致）。
 
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use postgres::config::SslMode;
@@ -998,6 +1023,10 @@ mod tests {
 
     impl TestPg {
         fn create(test_name: &str, tag: &str) -> Option<Self> {
+            Self::create_with_pool(test_name, tag, 1)
+        }
+
+        fn create_with_pool(test_name: &str, tag: &str, pool_size: usize) -> Option<Self> {
             let base = match base_dsn(test_name) {
                 Some(base) => base,
                 None => {
@@ -1023,7 +1052,7 @@ mod tests {
             let dsn = dsn_with_database(&base, &name);
             let storage = PostgresStorage::open(PostgresOptions {
                 dsn,
-                pool_size: 1,
+                pool_size,
                 connect_timeout: Duration::from_secs(10),
                 statement_timeout: Duration::from_secs(60),
                 sslrootcert: None,
@@ -1042,6 +1071,11 @@ mod tests {
 
         fn storage(&self) -> &PostgresStorage {
             self.storage.as_ref().expect("测试存储已释放")
+        }
+
+        /// 取出存储用于并发测试；`TestPg` 仍负责最终删库。
+        fn take_storage(&mut self) -> PostgresStorage {
+            self.storage.take().expect("测试存储已释放")
         }
     }
 
@@ -2017,5 +2051,187 @@ mod tests {
             .iter()
             .all(|row| row.ts == base + 10));
         assert_eq!(storage.count_archive_objects().expect("对象计数失败"), 0);
+    }
+
+    /// raw 维护锁必须固定，且不能与 schema 迁移锁同 key。
+    #[test]
+    fn raw_maintenance_lock_key_is_fixed_and_distinct_from_schema_lock() {
+        assert_eq!(RAW_MAINTENANCE_ADVISORY_LOCK_KEY, 0x5242_5047_0000_0012);
+        assert_ne!(
+            RAW_MAINTENANCE_ADVISORY_LOCK_KEY,
+            crate::storage::postgres::schema::SCHEMA_ADVISORY_LOCK_KEY,
+            "raw 维护锁不能复用 schema 迁移锁"
+        );
+    }
+
+    /// 在 raw 维护 advisory lock 内读取「水位 / 代际 / MAX(id)」，得到一致的
+    /// 快照；同时验证测试侧取同一把锁不会与生产事务死锁。
+    fn locked_raw_state(
+        storage: &PostgresStorage,
+    ) -> (Option<String>, Option<String>, Option<i64>) {
+        storage
+            .with_client(|client| {
+                let mut tx = client.transaction()?;
+                tx.query_one(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    &[&RAW_MAINTENANCE_ADVISORY_LOCK_KEY],
+                )?;
+                let watermark: Option<String> = tx
+                    .query_opt(
+                        "SELECT value FROM maintenance_state WHERE key = $1",
+                        &[&STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID],
+                    )?
+                    .map(|row| row.get(0));
+                let generation: Option<String> = tx
+                    .query_opt(
+                        "SELECT value FROM maintenance_state WHERE key = $1",
+                        &[&STATE_RAW_PRUNE_GENERATION],
+                    )?
+                    .map(|row| row.get(0));
+                let max_id: Option<i64> = tx.query_one("SELECT MAX(id) FROM samples", &[])?.get(0);
+                tx.commit()?;
+                Ok((watermark, generation, max_id))
+            })
+            .expect("读取 raw 维护状态失败")
+    }
+
+    /// claim 与 prune 两线程并发循环：同一把事务级 advisory lock 串行化
+    /// 「读水位/代际 + 条件写」与「删行 + 收敛水位/推进代际」。
+    ///
+    /// 断言：
+    /// - 每轮 prune 删光本轮所有行，水位不得残留、代际恰好 +1；
+    /// - 并发期间 claim 只要求无错、不 panic（可能一直输给 prune 返回 false），
+    ///   且不能在 raw 已空时留下高水位；
+    /// - 空闲后 claim 返回 true 时水位等于写入值；再 prune 清空后不保留已删行、
+    ///   水位删除、代际 +1。
+    #[test]
+    fn pg_claim_and_prune_are_serialized_by_advisory_lock() {
+        const NAME: &str = "pg_claim_and_prune_are_serialized_by_advisory_lock";
+        let Some(mut pg) = TestPg::create_with_pool(NAME, "lockrace", 2) else {
+            return;
+        };
+        let storage = Arc::new(pg.take_storage());
+        let base = 1_700_000_000_000_i64;
+
+        for cycle in 0..12i64 {
+            let start = base + cycle * 100;
+            execute(
+                &storage,
+                "INSERT INTO samples (agent_id, metric, labels, ts, value)
+                 SELECT 'a', 'cpu.usage', '{}', $1::BIGINT + g, 1.0
+                 FROM generate_series(0, 7) AS g",
+                &[&start],
+            );
+            let cutoff = start + 8;
+            let barrier = Arc::new(Barrier::new(2));
+
+            let claim_storage = Arc::clone(&storage);
+            let claim_barrier = Arc::clone(&barrier);
+            let claim_handle = std::thread::spawn(move || -> Result<()> {
+                claim_barrier.wait();
+                for _ in 0..40 {
+                    // 与 downsample 调用方相同的快照顺序：先水位、再代际、
+                    // 最后 MAX(id)。否则可能在 prune 提交后拿新代际配旧 MAX。
+                    let expected_rowid = claim_storage
+                        .get_maintenance_state(STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID)?
+                        .and_then(|raw| raw.trim().parse::<i64>().ok());
+                    let generation = claim_storage
+                        .get_maintenance_state(STATE_RAW_PRUNE_GENERATION)?
+                        .and_then(|raw| raw.trim().parse::<i64>().ok())
+                        .unwrap_or(0);
+                    let Some(max_id) = claim_storage.raw_new_rows(None)?.0 else {
+                        continue;
+                    };
+                    // 竞态下 claim 可能一直输给 prune（返回 false）而得不到
+                    // 成功；这里只要求无错、不 panic，成功路径由下面的空闲期
+                    // 断言覆盖。
+                    let _ = claim_storage.claim_raw_rowid_if_unchanged(
+                        expected_rowid,
+                        generation,
+                        max_id,
+                    )?;
+                }
+                Ok(())
+            });
+
+            let prune_storage = Arc::clone(&storage);
+            let prune_barrier = Arc::clone(&barrier);
+            let prune_handle = std::thread::spawn(move || -> Result<()> {
+                prune_barrier.wait();
+                for _ in 0..8 {
+                    prune_storage.prune_samples_before(cutoff)?;
+                }
+                Ok(())
+            });
+
+            claim_handle
+                .join()
+                .expect("claim 线程 panic")
+                .expect("claim 线程返回错误");
+            prune_handle
+                .join()
+                .expect("prune 线程 panic")
+                .expect("prune 线程返回错误");
+
+            let (watermark, generation, max_id) = locked_raw_state(&storage);
+            assert_eq!(max_id, None, "第 {cycle} 轮 prune 必须删光本轮的行");
+            assert_eq!(
+                watermark, None,
+                "第 {cycle} 轮 raw 为空时不得残留 rowid 水位"
+            );
+            assert_eq!(
+                generation,
+                Some((cycle + 1).to_string()),
+                "第 {cycle} 轮删除最大 id 行必须恰好推进一代"
+            );
+        }
+
+        // 空闲期：claim 返回 true 后水位必须等于写入值。
+        let start = base + 10_000;
+        execute(
+            &storage,
+            "INSERT INTO samples (agent_id, metric, labels, ts, value)
+             SELECT 'a', 'cpu.usage', '{}', $1::BIGINT + g, 1.0
+             FROM generate_series(0, 2) AS g",
+            &[&start],
+        );
+        let max_id = storage
+            .raw_new_rows(None)
+            .expect("读取 MAX(id) 失败")
+            .0
+            .expect("应有 raw 行");
+        let expected_rowid = get_state(&storage, STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID)
+            .and_then(|raw| raw.trim().parse::<i64>().ok());
+        let generation = get_state(&storage, STATE_RAW_PRUNE_GENERATION)
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        assert!(
+            storage
+                .claim_raw_rowid_if_unchanged(expected_rowid, generation, max_id)
+                .expect("空闲期 CAS 失败"),
+            "空闲期 CAS 必须命中"
+        );
+        assert_eq!(
+            get_state(&storage, STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID),
+            Some(max_id.to_string()),
+            "claim 返回 true 后水位必须等于写入值"
+        );
+
+        // 再 prune 全部：已删行不保留，水位清空，代际 +1。
+        storage
+            .prune_samples_before(start + 3)
+            .expect("最终 raw 删除失败");
+        let rows: i64 = fetch(&storage, "SELECT COUNT(*)::BIGINT FROM samples", &[])[0].get(0);
+        assert_eq!(rows, 0, "prune 后不得保留已删行");
+        assert_eq!(
+            get_state(&storage, STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID),
+            None,
+            "raw 清空后必须删除 rowid 水位"
+        );
+        assert_eq!(
+            get_state(&storage, STATE_RAW_PRUNE_GENERATION),
+            Some((generation + 1).to_string()),
+            "最终 prune 删除最大 id 行必须再推进一代"
+        );
     }
 }
