@@ -55,7 +55,11 @@ usage() {
                            且从 / 到 prefix 的已存在组件必须 root 所有、非符号
                            链接、group/other 不可写。测试建议用 /opt 下的新目录，
                            不要用 /tmp（通常 1777）。
-  --offline                离线安装。幂等；未显式给出时自动追加。
+  --offline                离线安装（自签默认）。与 --tls acme-* 互斥；
+                           未显式给出时，自签安装会自动追加。
+  --tls MODE               hub 服务端证书来源：self-signed（默认）/
+                           acme-domain / acme-ip。ACME 模式必须同时给
+                           --acme-email 与 --domain，且不会自动追加 --offline。
   --dry-run                只打印计划，不写文件；本脚本也不会写 web。
   --token-file F           agent enrollment token 文件（0600）
   --hub-token-file F       panel 读取的 hub 管理 token 文件（0600）
@@ -77,9 +81,14 @@ usage() {
 离线语义:
   --offline 只表示“不发起外部网络探测”；本地端口 bind、loopback /healthz、
   systemd 操作仍可能发生，这是正常安装行为。
+  ACME（--tls acme-domain|acme-ip）必须联网完成 80/443 挑战：显式给 ACME
+  模式时本脚本不会追加 --offline；--offline 与 ACME 同时出现会在写任何文件
+  之前失败。ACME 的端口 / 防火墙 / 安全组只做只读诊断，脚本不会自动修改。
 
 示例:
   sudo ./install.sh hub --yes
+  sudo ./install.sh hub --yes --tls acme-domain \
+      --acme-email admin@example.com --domain board.example.com
   sudo ./install.sh panel --yes --prefix /opt/rustboard-test
   sudo ./install.sh agent --yes --hub wss://<hub-host>:8443/agent/ws \
       --token-file /root/agent.token --fingerprint SHA256:<64-hex>
@@ -162,9 +171,11 @@ print_failure_help() {
                 repro+=("$name")
                 ;;
             --prefix | --panel | --listen | --admin-listen | --advertise | --san | \
-            --name | --retention | --db | --tls | --config | --data-dir | --unit-dir | \
-            --hub-url | --hub-token-file | --password-file | --token-file | \
-            --fingerprint | --server-ca | --static-dir | --panel-static-dir | --hub)
+            --name | --retention | --db | --tls | --acme-email | --acme-directory | \
+            --acme-challenge | --domain | --acme-profile | --acme-ca | --admin-tls | \
+            --config | --data-dir | --unit-dir | --hub-url | --hub-token-file | \
+            --password-file | --token-file | --fingerprint | --server-ca | \
+            --static-dir | --panel-static-dir | --hub)
                 # 只打印白名单选项名；值一律 <redacted>。
                 repro+=("$name" "<redacted>")
                 ;;
@@ -665,6 +676,37 @@ has_option() {
     return 1
 }
 
+# 读取最后一个 --tls 值（与 clap 的“后者覆盖”一致）。
+read_tls_mode() {
+    local i=0 arg mode=""
+    while ((i < ${#ARGS[@]})); do
+        arg=${ARGS[i]}
+        case $arg in
+            --tls)
+                ((i + 1 < ${#ARGS[@]})) || die "--tls 缺少取值"
+                mode=${ARGS[i + 1]}
+                i=$((i + 2))
+                ;;
+            --tls=*)
+                mode=${arg#--tls=}
+                i=$((i + 1))
+                ;;
+            *)
+                i=$((i + 1))
+                ;;
+        esac
+    done
+    printf '%s' "$mode"
+}
+
+# 是否是 ACME 证书模式。
+is_acme_tls_mode() {
+    case $1 in
+        acme-domain | acme-ip) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # 用户是否显式传了角色对应的静态目录参数。
 has_static_option() {
     case $ROLE in
@@ -699,6 +741,16 @@ case $ROLE in
         exit 2
         ;;
 esac
+
+# 只对 hub 解析 --tls；panel / agent 没有该选项，保持默认离线行为。
+TLS_MODE=""
+if [[ $ROLE == hub ]]; then
+    TLS_MODE=$(read_tls_mode)
+fi
+# 在任何写文件 / 校验和 / 解包之前拒绝 offline + ACME。
+if is_acme_tls_mode "$TLS_MODE" && has_arg --offline; then
+    die "--offline 与 --tls $TLS_MODE 互斥：ACME 必须联网完成证书挑战；请去掉 --offline，或改用 --tls self-signed"
+fi
 
 scan_secret_args
 # secret 参数扫描通过后再挂 trap：失败提示中的参数已确认不含明文 secret。
@@ -804,8 +856,13 @@ if [[ $ROLE == hub || $ROLE == panel ]] && ! has_static_option; then
     fi
 fi
 
-if ! has_arg --offline; then
-    ARGS+=(--offline)
+if is_acme_tls_mode "$TLS_MODE"; then
+    # 显式 ACME 时绝不追加 --offline（用户也可能把参数写在数组里）。
+    log "证书模式: $TLS_MODE（需要访问 ACME 目录，不追加 --offline）"
+else
+    if ! has_arg --offline; then
+        ARGS+=(--offline)
+    fi
 fi
 
 log "包版本: $VERSION"
@@ -818,7 +875,11 @@ if [[ -n $WEB_DEST ]]; then
         log "静态资源: $WEB_DEST"
     fi
 fi
-log "离线语义: 不发起外部网络探测；本地 bind / loopback healthz / systemd 仍可发生"
+if is_acme_tls_mode "$TLS_MODE"; then
+    log "联网语义: ACME 将访问证书颁发机构并完成 80/443 挑战；不会自动修改防火墙/安全组"
+else
+    log "离线语义: 不发起外部网络探测；本地 bind / loopback healthz / systemd 仍可发生"
+fi
 log "若安装失败，可用本脚本加 --dry-run 复现；systemd 日志: journalctl -u rustboard-$ROLE"
 
 # 收到信号时转发给 Phase A，并让 EXIT trap 有机会恢复旧 web。

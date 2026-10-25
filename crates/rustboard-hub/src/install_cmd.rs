@@ -10,25 +10,33 @@
 //! - 安装失败由 [`InstallTxn`] 逆序回滚，且绝不删除安装前已存在的数据目录；
 //! - `--dry-run` 不写文件、不调用 systemctl。
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
-use rustboard_common::config::{AdminTlsMode, HubConfig};
+use rustboard_common::config::{AcmeChallenge, AdminTlsMode, HubConfig, ServerTlsMode, TlsConfig};
 use rustboard_common::fsutil;
 use rustboard_common::tls;
 use rustboard_common::util::{hostname, port_of};
 use rustboard_install::{
     detect_system, is_systemd_unit_dir, pick_free_port, render_unit, require_root, shell_arg,
-    unit_is_ours, validate_install_prefix, validate_managed_path, wait_http_ok, InstallLock,
-    InstallState, InstallTxn, ManagedPathKind, PathOverrides, Paths, Prompt, Role, RoleState,
-    ServiceManager,
+    unit_is_ours, validate_install_prefix, validate_managed_path, wait_http_ok,
+    wait_https_ok_with_server_name, InstallLock, InstallState, InstallTxn, ManagedPathKind,
+    PathOverrides, Paths, Prompt, Role, RoleState, ServiceManager,
 };
+
+// C5 只读诊断。用 `#[path]` 直接挂到 install_cmd 下，避免改 main.rs 与 C4 的
+// `mod acme;` / `tls` 子命令冲突。
+#[path = "tls_diag.rs"]
+mod tls_diag;
+use tls_diag::{Diagnostics, StagingOutcome};
 
 /// 健康检查等待上限（库内部还会再截断到 30s）。
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -36,13 +44,49 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 const PRODUCTION_DATA_ROOT: &str = "/var/lib/rustboard";
 /// systemd 系统级 unit 目录：`uninstall` 清理 enable 生成的 wants 链接时一并检查。
 const SYSTEMD_SYSTEM_DIR: &str = "/etc/systemd/system";
-/// Phase A 安装器不做 HTTPS 健康检查，遇到 required 必须在写盘 / 停服务前拒绝。
-const ADMIN_TLS_REQUIRED_UNSUPPORTED: &str =
-    "Phase A 安装器不支持 admin_tls=required；请使用 upgrade 或手工部署，避免健康检查 http 误判";
+/// ACME 最多尝试轮数（D9：失败最多 3 轮后回退）。
+const ACME_MAX_ATTEMPTS: usize = 3;
+/// 两轮 `tls issue` 之间的等待，避免 ACME 目录短暂故障时立刻打满重试。
+const ACME_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+/// 单轮 `tls issue` 上限。ACME HTTP-01 / TLS-ALPN-01 通常远低于此值。
+const ACME_ISSUE_TIMEOUT: Duration = Duration::from_secs(180);
+/// `--domain` 上限与 `TlsConfig` 的 1–20 保持一致。
+const MAX_ACME_DOMAINS: usize = 20;
+/// Let's Encrypt staging directory；仅用于安装前的链路检查（证书不可信、可丢弃）。
+const LE_STAGING_DIRECTORY: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
 /// systemd 只读取固定目录中的 unit；写进 prefix 的 unit 不会被读取，也就不能
 /// 用来 enable / restart / stop，必须在写盘和调用 systemctl 之前拒绝。
 const SYSTEMD_UNIT_DIR_REQUIRED: &str =
     "systemd 不会读取 prefix 内 unit；请用 --unit-dir /etc/systemd/system 或 /run/systemd/system";
+
+/// `rustboard-hub install` 的 ACME / 管理端 TLS 参数组。
+///
+/// 单独装箱再 flatten：这些字段直接内联会让 `Cmd` 枚举超过 clippy 的
+/// `large_enum_variant` 阈值；clap 的 `Args for Box<T>` 支持这种写法。
+#[derive(Args, Debug, Default)]
+pub(crate) struct TlsCliArgs {
+    /// ACME 账户联系邮箱（ACME 模式必填）。
+    #[arg(long, value_name = "EMAIL")]
+    pub(crate) acme_email: Option<String>,
+    /// ACME directory URL；默认 Let's Encrypt production。
+    #[arg(long, value_name = "URL")]
+    pub(crate) acme_directory: Option<String>,
+    /// ACME 挑战类型。
+    #[arg(long, value_parser = ["http-01", "tls-alpn-01"])]
+    pub(crate) acme_challenge: Option<String>,
+    /// ACME 证书标识，可重复（acme-domain：1–20 个 DNS 名；acme-ip：恰好一个 IPv4）。
+    #[arg(long = "domain", value_name = "DNS|IPv4")]
+    pub(crate) domains: Vec<String>,
+    /// ACME profile（例如 `shortlived`）；留空按 C4 默认。
+    #[arg(long, value_name = "PROFILE")]
+    pub(crate) acme_profile: Option<String>,
+    /// 私有 / Pebble ACME 的根 CA PEM（绝对路径）；留空使用系统根。
+    #[arg(long, value_name = "PEM")]
+    pub(crate) acme_ca: Option<PathBuf>,
+    /// 管理 API 传输模式：`off`（默认，仅回环明文）/ `required`（HTTPS）。
+    #[arg(long, value_parser = ["off", "required"])]
+    pub(crate) admin_tls: Option<String>,
+}
 
 /// `rustboard-hub install` 参数。
 #[derive(Args, Debug)]
@@ -50,7 +94,7 @@ pub(crate) struct InstallArgs {
     /// 非交互执行（不读取 stdin）。
     #[arg(long)]
     pub(crate) yes: bool,
-    /// 离线安装：不做任何网络探测（Phase A 安装器本身不联网）。
+    /// 离线安装：不做任何网络探测；与 ACME（--tls acme-* / ACME 参数）互斥。
     #[arg(long)]
     pub(crate) offline: bool,
     /// 只打印计划，不写文件、不调用 systemctl。
@@ -92,9 +136,12 @@ pub(crate) struct InstallArgs {
     /// 数据库后端；Phase A 只支持 `sqlite`。
     #[arg(long)]
     pub(crate) db: Option<String>,
-    /// TLS 模式；Phase A 只支持 `self-signed`。
-    #[arg(long)]
+    /// 服务端证书来源：`self-signed`（默认）/ `acme-domain` / `acme-ip`。
+    #[arg(long, value_parser = ["self-signed", "acme-domain", "acme-ip"])]
     pub(crate) tls: Option<String>,
+    /// ACME / 管理端 TLS 参数组（装箱以控制枚举体积）。
+    #[command(flatten)]
+    pub(crate) tls_options: Box<TlsCliArgs>,
     /// 是否安装同机面板（`yes` / `no`）；`--yes` 时默认 `yes`。
     #[arg(long, value_parser = ["yes", "no"])]
     pub(crate) panel: Option<String>,
@@ -157,8 +204,13 @@ struct InstallPlan<'a> {
     manager: ServiceManager,
     write_unit: bool,
     install_panel: bool,
+    /// 需要生成自签服务端材料（ACME 成功时由 `tls issue` 负责）。
     need_certs: bool,
+    /// ACME 失败回退 self-signed 时强制重签，避免沿用上一轮的 ACME 证书。
+    force_self_signed: bool,
     restart: bool,
+    /// 管理 API 健康检查（HTTP 或 HTTPS+SNI/CA）。
+    health: HealthCheck,
 }
 
 /// 保留期覆盖值；`None` 表示沿用配置/默认值。
@@ -169,14 +221,113 @@ struct Retention {
     h_days: Option<u32>,
 }
 
-/// `--tls` 只允许 Phase A 的 self-signed；其余取值明确指向 Phase C。
-fn check_tls_mode(value: Option<&str>) -> Result<()> {
+/// 解析 `--tls`；`None` 保持旧行为（self-signed）。
+fn parse_tls_mode(value: Option<&str>) -> Result<ServerTlsMode> {
     match value {
-        None | Some("self-signed") => Ok(()),
-        Some(other) => bail!(
-            "--tls {other:?} 暂不支持：Phase A 只提供 self-signed；ACME（acme-domain / acme-ip）在 Phase C 实现"
-        ),
+        None | Some("self-signed") => Ok(ServerTlsMode::SelfSigned),
+        Some("acme-domain") => Ok(ServerTlsMode::AcmeDomain),
+        Some("acme-ip") => Ok(ServerTlsMode::AcmeIp),
+        Some(other) => bail!("--tls 只接受 self-signed / acme-domain / acme-ip，实际 {other:?}"),
     }
+}
+
+/// 解析 `--acme-challenge`；`None` 保持配置默认（http-01）。
+fn parse_acme_challenge(value: Option<&str>) -> Result<AcmeChallenge> {
+    match value {
+        None | Some("http-01") => Ok(AcmeChallenge::Http01),
+        Some("tls-alpn-01") => Ok(AcmeChallenge::TlsAlpn01),
+        Some(other) => bail!("--acme-challenge 只接受 http-01 / tls-alpn-01，实际 {other:?}"),
+    }
+}
+
+/// 解析 `--admin-tls`。
+fn parse_admin_tls(value: Option<&str>) -> Result<AdminTlsMode> {
+    match value {
+        None | Some("off") => Ok(AdminTlsMode::Off),
+        Some("required") => Ok(AdminTlsMode::Required),
+        Some(other) => bail!("--admin-tls 只接受 off / required，实际 {other:?}"),
+    }
+}
+
+/// 是否出现任何 ACME-only 参数。
+fn has_acme_args(args: &InstallArgs) -> bool {
+    args.tls_options.acme_email.is_some()
+        || args.tls_options.acme_directory.is_some()
+        || args.tls_options.acme_challenge.is_some()
+        || !args.tls_options.domains.is_empty()
+        || args.tls_options.acme_profile.is_some()
+        || args.tls_options.acme_ca.is_some()
+}
+
+/// 写盘 / 网络之前的 TLS 参数互斥与必填校验。
+///
+/// 这一步必须在读取安装状态、调用 systemctl、访问网络之前执行：
+/// - `--offline` 与任何 ACME 模式 / 参数同时出现 → 失败（ACME 不可能离线完成）；
+/// - 显式 `--tls self-signed` 与 ACME-only 参数同时出现 → 明确拒绝，避免静默忽略；
+/// - ACME 模式要求 email 与 domain；acme-ip 要求恰好一个 IPv4。
+///
+/// 未显式给 `--tls` 时不在这一步判定“是否为 self-signed”：已有配置可能本来
+/// 就是 ACME，需要读到配置后由 [`ensure_acme_args_match_mode`] 再判定。
+fn validate_tls_args(args: &InstallArgs) -> Result<ServerTlsMode> {
+    let mode = parse_tls_mode(args.tls.as_deref())?;
+    let acme_args = has_acme_args(args);
+
+    if args.offline && (mode.is_acme() || acme_args) {
+        bail!(concat!(
+            "--offline 与 ACME 互斥：ACME 必须访问证书颁发机构并完成 80/443 挑战，",
+            "离线模式不会发起任何网络请求。请去掉 --offline，或改用 --tls self-signed（默认）"
+        ));
+    }
+    if args.tls.as_deref() == Some("self-signed") && acme_args {
+        bail!(concat!(
+            "--tls self-signed 不接受 ACME 参数（--acme-email / --acme-directory / ",
+            "--acme-challenge / --domain / --acme-profile / --acme-ca）；",
+            "如需 ACME 请显式指定 --tls acme-domain 或 --tls acme-ip"
+        ));
+    }
+    if mode.is_acme() {
+        let email = args
+            .tls_options
+            .acme_email
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default();
+        if email.is_empty() {
+            bail!(
+                "--tls {} 需要 --acme-email <邮箱>（ACME 账户联系邮箱）",
+                mode.as_str()
+            );
+        }
+        if args.tls_options.domains.is_empty() {
+            bail!(
+                "--tls {} 需要至少一个 --domain（acme-domain：DNS 名；acme-ip：公网 IPv4）",
+                mode.as_str()
+            );
+        }
+        if args.tls_options.domains.len() > MAX_ACME_DOMAINS {
+            bail!(
+                "--domain 最多 {MAX_ACME_DOMAINS} 个，实际 {} 个",
+                args.tls_options.domains.len()
+            );
+        }
+        if mode == ServerTlsMode::AcmeIp && args.tls_options.domains.len() != 1 {
+            bail!(
+                "--tls acme-ip 需要恰好一个 --domain <IPv4>，实际 {} 个",
+                args.tls_options.domains.len()
+            );
+        }
+        if let Some(path) = &args.tls_options.acme_ca {
+            if !path.is_absolute() {
+                bail!("--acme-ca 必须是绝对路径: {}", path.display());
+            }
+            let meta = fs::metadata(path)
+                .with_context(|| format!("读取 --acme-ca {} 失败", path.display()))?;
+            if !meta.is_file() {
+                bail!("--acme-ca 不是普通文件: {}", path.display());
+            }
+        }
+    }
+    Ok(mode)
 }
 
 /// `--db` 只允许 SQLite；PostgreSQL 明确指向 Phase D。
@@ -254,6 +405,72 @@ fn parse_retention_days(value: &str) -> Result<u32> {
     number
         .checked_mul(multiplier)
         .ok_or_else(|| anyhow!("--retention 的值 {value:?} 超出范围"))
+}
+
+/// 把 CLI 的 TLS / admin TLS 参数应用到配置。
+///
+/// 只覆盖显式给出的字段：`--force` 重装已有配置时，未给出的 ACME 字段保持原值，
+/// 避免无参数重装把 ACME directory / profile 重置成默认。
+fn apply_tls_flags(cfg: &mut HubConfig, args: &InstallArgs) -> Result<()> {
+    if let Some(value) = args.tls.as_deref() {
+        let mode = parse_tls_mode(Some(value))?;
+        if mode == ServerTlsMode::SelfSigned {
+            // 显式切回 self-signed：清空上一轮 ACME 参数，避免留下半份 ACME 配置。
+            cfg.tls = TlsConfig::default();
+        } else {
+            cfg.tls.mode = mode;
+        }
+    }
+    if let Some(email) = &args.tls_options.acme_email {
+        cfg.tls.acme_email = email.trim().to_string();
+    }
+    if let Some(directory) = &args.tls_options.acme_directory {
+        cfg.tls.acme_directory = directory.trim().to_string();
+    }
+    if let Some(challenge) = &args.tls_options.acme_challenge {
+        cfg.tls.challenge = parse_acme_challenge(Some(challenge))?;
+    }
+    if let Some(profile) = &args.tls_options.acme_profile {
+        cfg.tls.acme_profile = profile.trim().to_string();
+    }
+    if let Some(path) = &args.tls_options.acme_ca {
+        let path = path
+            .to_str()
+            .ok_or_else(|| anyhow!("--acme-ca 不是有效 UTF-8: {}", path.display()))?;
+        cfg.tls.acme_ca_file = path.to_string();
+    }
+    if !args.tls_options.domains.is_empty() {
+        let mut domains = Vec::with_capacity(args.tls_options.domains.len());
+        for domain in &args.tls_options.domains {
+            push_server_name(&mut domains, domain)?;
+        }
+        cfg.tls.domains = domains;
+    }
+    if let Some(admin_tls) = &args.tls_options.admin_tls {
+        cfg.admin_tls = parse_admin_tls(Some(admin_tls))?;
+    }
+    // 主程序的 `validate_admin_tls` 与管理端证书加载都看 `server_names`；
+    // ACME 模式把证书标识同步进去，既让 `--admin-tls required` 能通过非回环
+    // 绑定的校验，也让回退 self-signed 时的证书覆盖这些名字。
+    if cfg.tls.mode.is_acme() {
+        let domains = cfg.tls.domains.clone();
+        for domain in domains {
+            push_server_name(&mut cfg.server_names, &domain)?;
+        }
+    }
+    Ok(())
+}
+
+/// 读到最终配置后，确认 ACME-only 参数没有被 self-signed 配置静默忽略。
+fn ensure_acme_args_match_mode(cfg: &HubConfig, args: &InstallArgs) -> Result<()> {
+    if cfg.tls.mode == ServerTlsMode::SelfSigned && has_acme_args(args) {
+        bail!(concat!(
+            "当前安装为 self-signed，不接受 ACME 参数（--acme-email / --acme-directory / ",
+            "--acme-challenge / --domain / --acme-profile / --acme-ca）；",
+            "如需 ACME 请加 --tls acme-domain 或 --tls acme-ip"
+        ));
+    }
+    Ok(())
 }
 
 /// 应用保留期覆盖。
@@ -408,6 +625,7 @@ fn new_hub_config(args: &InstallArgs, paths: &Paths, retention: Retention) -> Re
         admin_token: crate::new_secret(),
         ..HubConfig::default()
     };
+    apply_tls_flags(&mut cfg, args)?;
     apply_retention(&mut cfg, retention);
     Ok(cfg)
 }
@@ -445,6 +663,7 @@ fn apply_explicit_flags(
     } else if args.db.is_some() {
         cfg.database = sqlite_database(&cfg.data_dir);
     }
+    apply_tls_flags(cfg, args)?;
     apply_retention(cfg, retention);
     Ok(())
 }
@@ -462,19 +681,25 @@ fn prepare_config(
     if config_present {
         let mut cfg = load_hub_config_checked(&paths.config)?;
         apply_explicit_flags(&mut cfg, args, retention)?;
+        ensure_acme_args_match_mode(&cfg, args)?;
         cfg.validate()
             .context("已有配置校验失败（检查 --san / --retention / --data-dir）")?;
         validate_listen(&cfg)?;
         crate::validate_admin_tls(&cfg).context("管理 API 监听地址不安全")?;
         let missing = missing_cert_files(&cfg.data_dir)?;
-        Ok((cfg, !missing.is_empty()))
+        // ACME 模式的服务端证书由 `tls issue` 负责；不能用自签的缺文件检查
+        // 阻止 ACME 在已有数据目录上补签。
+        let need_certs = !missing.is_empty() && !cfg.tls.mode.is_acme();
+        Ok((cfg, need_certs))
     } else {
         let cfg = new_hub_config(args, paths, retention)?;
+        ensure_acme_args_match_mode(&cfg, args)?;
         cfg.validate()
             .context("安装参数校验失败（检查 --san / --retention / --data-dir）")?;
         validate_listen(&cfg)?;
         crate::validate_admin_tls(&cfg).context("管理 API 监听地址不安全")?;
-        Ok((cfg, true))
+        let need_certs = !cfg.tls.mode.is_acme();
+        Ok((cfg, need_certs))
     }
 }
 
@@ -543,13 +768,148 @@ fn validate_hub_config(cfg: &HubConfig) -> Result<()> {
     crate::validate_admin_tls(cfg).context("管理 API 监听地址不安全")
 }
 
-/// 安装器只用 `http://` 做健康检查；已有/新配置为 `admin_tls=required` 时
-/// 继续安装会把 HTTPS 监听的 `/healthz` 误判为失败并回滚，必须在写盘前拒绝。
-fn ensure_admin_tls_supported(cfg: &HubConfig) -> Result<()> {
-    if cfg.admin_tls == AdminTlsMode::Required {
-        bail!("{ADMIN_TLS_REQUIRED_UNSUPPORTED}");
+/// 健康检查信任来源：ACME 公共证书用系统根，自签 / 私有 ACME 用指定 CA 文件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HealthCa {
+    SystemRoots,
+    PemFile(PathBuf),
+}
+
+/// 管理 API 健康检查计划（不读文件、不联网）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HealthCheck {
+    Http {
+        url: String,
+    },
+    Https {
+        /// 实际连接地址：通配绑定改为回环；其他绑定用绑定 IP。
+        addr: SocketAddr,
+        /// 配置中的主机名 / IP，用于 SNI 与证书主机名校验。
+        server_name: String,
+        ca: HealthCa,
+    },
+}
+
+impl HealthCheck {
+    /// 展示用 URL（只含公开的地址 / 主机名）。
+    fn display_url(&self) -> String {
+        match self {
+            Self::Http { url } => url.clone(),
+            Self::Https {
+                addr, server_name, ..
+            } => format!("https://{server_name}:{}/healthz", addr.port()),
+        }
     }
-    Ok(())
+}
+
+/// 规划管理 API 健康检查。
+///
+/// - `admin_tls=off`：沿用 v0.4 的 `http://<bind>/healthz`；
+/// - `admin_tls=required`：HTTPS，SNI 取配置里的 SAN（`effective_server_names`）。
+///   通配绑定时连回环；证书主机名校验仍使用配置里的名字，因此 ACME 域名证书
+///   不需要包含回环 IP。`--admin-tls required` 不再被一律拒绝，但必须能推导出
+///   一个配置覆盖的主机名，否则在写盘前失败。
+fn health_check_for(cfg: &HubConfig) -> Result<HealthCheck> {
+    let addr = parse_listen(&cfg.admin_listen, "管理 API 监听地址")?;
+    if cfg.admin_tls == AdminTlsMode::Off {
+        return Ok(HealthCheck::Http {
+            url: health_url(&cfg.admin_listen)?,
+        });
+    }
+
+    let connect_ip = if addr.ip().is_unspecified() {
+        if addr.is_ipv6() {
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        } else {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        }
+    } else {
+        addr.ip()
+    };
+    let connect = SocketAddr::new(connect_ip, addr.port());
+    let names: Vec<String> = cfg
+        .effective_server_names()
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.is_empty() {
+        bail!(
+            "admin_tls=required 需要管理端证书覆盖的主机名，但当前服务端 SAN 为空；\
+             自签模式请用 --san 指定，ACME 模式请用 --domain 指定"
+        );
+    }
+    // 优先用与连接 IP 精确匹配的 SAN（自签默认含 127.0.0.1）；否则用可用的
+    // DNS 名（ACME 域名），最后才退回第一个名字（acme-ip 的公网 IP）。
+    let server_name = names
+        .iter()
+        .find(|name| name.parse::<IpAddr>().is_ok_and(|ip| ip == connect_ip))
+        .or_else(|| {
+            names.iter().find(|name| {
+                name.parse::<IpAddr>().is_err() && !name.eq_ignore_ascii_case("localhost")
+            })
+        })
+        .or_else(|| names.first())
+        .cloned()
+        .ok_or_else(|| anyhow!("管理 API 健康检查无法确定 server_name"))?;
+
+    let ca = match cfg.tls.mode {
+        ServerTlsMode::SelfSigned => {
+            HealthCa::PemFile(tls::cert_dir(&cfg.data_dir).join(tls::CA_CERT_FILE))
+        }
+        ServerTlsMode::AcmeDomain | ServerTlsMode::AcmeIp => {
+            let ca_file = cfg.tls.acme_ca_file.trim();
+            if ca_file.is_empty() {
+                HealthCa::SystemRoots
+            } else {
+                HealthCa::PemFile(PathBuf::from(ca_file))
+            }
+        }
+    };
+    Ok(HealthCheck::Https {
+        addr: connect,
+        server_name,
+        ca,
+    })
+}
+
+/// 写盘 / 启动前的健康检查可用性校验。
+///
+/// 不再拒绝 `admin_tls=required`：改为确认能构造 HTTPS 健康检查（SNI + CA）。
+/// 真正启动后由 [`run_health_check`] 用 rustls 验证证书链与主机名。
+fn ensure_admin_tls_supported(cfg: &HubConfig) -> Result<()> {
+    health_check_for(cfg)
+        .map(|_| ())
+        .context("管理 API TLS 健康检查不可用（检查 admin_listen / server_names / tls.domains）")
+}
+
+/// 启动后执行管理 API 健康检查；HTTP 与 HTTPS 语义不同但超时一致。
+fn run_health_check(health: &HealthCheck, timeout: Duration) -> Result<()> {
+    match health {
+        HealthCheck::Http { url } => {
+            wait_http_ok(url, timeout).with_context(|| format!("等待 hub 健康检查失败: {url}"))
+        }
+        HealthCheck::Https {
+            addr,
+            server_name,
+            ca,
+        } => {
+            let ca_pem = match ca {
+                HealthCa::SystemRoots => None,
+                HealthCa::PemFile(path) => Some(
+                    fs::read_to_string(path)
+                        .with_context(|| format!("读取健康检查 CA 失败: {}", path.display()))?,
+                ),
+            };
+            wait_https_ok_with_server_name(*addr, server_name, ca_pem.as_deref(), timeout)
+                .with_context(|| {
+                    format!(
+                        "等待 hub HTTPS 健康检查失败: https://{server_name}:{}/healthz",
+                        addr.port()
+                    )
+                })
+        }
+    }
 }
 
 /// 受管路径允许写入 unit / 配置的字符集检查。
@@ -860,10 +1220,447 @@ fn acquire_install_lock(dry_run: bool) -> Result<Option<InstallLock>> {
     }
 }
 
+/// `tls issue` 单轮失败原因。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AcmeIssueFailure {
+    /// 当前二进制没有 `tls` 子命令（Phase C C4 未合入），重试没有意义。
+    Unsupported(String),
+    /// 网络 / ACME / 配置错误，可重试。
+    Failed(String),
+}
+
+/// 执行最多 `attempts` 轮签发；`Unsupported` 立即停止（重试也不会出现子命令）。
+fn retry_issue<F>(
+    attempts: usize,
+    backoff: Duration,
+    mut issue: F,
+) -> (usize, std::result::Result<(), AcmeIssueFailure>)
+where
+    F: FnMut(usize) -> std::result::Result<(), AcmeIssueFailure>,
+{
+    debug_assert!(attempts >= 1);
+    let mut last = AcmeIssueFailure::Failed("未执行任何签发尝试".to_string());
+    for attempt in 1..=attempts {
+        match issue(attempt) {
+            Ok(()) => return (attempt, Ok(())),
+            Err(AcmeIssueFailure::Unsupported(message)) => {
+                return (attempt, Err(AcmeIssueFailure::Unsupported(message)))
+            }
+            Err(err) => {
+                if attempt == attempts {
+                    return (attempts, Err(err));
+                }
+                last = err;
+                if !backoff.is_zero() {
+                    eprintln!("  {backoff:?} 后重试（{attempt}/{attempts} 轮失败）...");
+                    thread::sleep(backoff);
+                }
+            }
+        }
+    }
+    (attempts, Err(last))
+}
+
+/// 旧二进制 / C4 未合入时 clap 的报错特征。
+fn looks_like_missing_tls_cli(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("unrecognized subcommand")
+        || lower.contains("invalid subcommand")
+        || (lower.contains("unexpected argument") && lower.contains("tls"))
+}
+
+/// 过滤 `tls issue` 输出中的敏感内容：私钥块、key authorization、超长行。
+///
+/// 安装器不解析 ACME 账户 key / keyAuth；这里做兜底，即使子命令误打印也不会
+/// 出现在终端 / 日志里。
+fn sanitize_acme_output(text: &str) -> String {
+    let mut rendered = String::new();
+    let mut in_private_key = false;
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("begin") && lower.contains("private key") {
+            in_private_key = true;
+            rendered.push_str("[已隐藏私钥内容]\n");
+            continue;
+        }
+        if in_private_key {
+            if lower.contains("end") && lower.contains("private key") {
+                in_private_key = false;
+            }
+            continue;
+        }
+        if lower.contains("keyauth") || lower.contains("key authorization") {
+            rendered.push_str("[已隐藏 ACME key authorization]\n");
+            continue;
+        }
+        if line.len() > 512 {
+            rendered.push_str("[已隐藏超长输出行]\n");
+            continue;
+        }
+        rendered.push_str(line);
+        rendered.push('\n');
+    }
+    if rendered.len() > 16 * 1024 {
+        let mut truncated = rendered;
+        while !truncated.is_char_boundary(16 * 1024) {
+            truncated.pop();
+        }
+        truncated.push_str("\n[输出已截断]\n");
+        return truncated;
+    }
+    rendered
+}
+
+/// 调用当前可执行文件的 `tls issue --config <path>`。
+///
+/// 不依赖 C4 的 Rust 函数签名：配置先由安装事务写到目标路径，再以子进程方式
+/// 调用。子进程有超时，输出经脱敏后再打印。
+fn run_tls_issue(config: &Path, timeout: Duration) -> std::result::Result<(), AcmeIssueFailure> {
+    let exe = std::env::current_exe()
+        .map_err(|err| AcmeIssueFailure::Failed(format!("读取当前可执行文件路径失败: {err}")))?;
+    let args = vec![
+        OsString::from("tls"),
+        OsString::from("issue"),
+        OsString::from("--config"),
+        config.as_os_str().to_os_string(),
+    ];
+    let output = tls_diag::run_program_capture(&exe, &args, timeout).ok_or_else(|| {
+        AcmeIssueFailure::Failed("无法执行当前 hub 二进制的 tls issue 子命令".to_string())
+    })?;
+    let combined = sanitize_acme_output(&format!("{}{}", output.stdout, output.stderr));
+    if output.timed_out {
+        return Err(AcmeIssueFailure::Failed(format!(
+            "tls issue 超时（上限 {}s）{combined}",
+            timeout.as_secs()
+        )));
+    }
+    if output.success() {
+        if !combined.trim().is_empty() {
+            println!("{combined}");
+        }
+        return Ok(());
+    }
+    if looks_like_missing_tls_cli(&combined) {
+        return Err(AcmeIssueFailure::Unsupported(combined));
+    }
+    Err(AcmeIssueFailure::Failed(combined))
+}
+
+/// 校验 `tls issue` 写出的服务端证书：存在、可解析、与私钥配套、未过期。
+///
+/// C4 未合入 `validate_public_server_cert` 时也能工作：只依赖长期存在的
+/// `cert_summary` / `cert_matches_key`，不修改 `rustboard-common::tls`。
+fn verify_acme_server_material(data_dir: &Path) -> Result<String> {
+    let dir = tls::cert_dir(data_dir);
+    let cert_path = dir.join(tls::SERVER_CERT_FILE);
+    let key_path = dir.join(tls::SERVER_KEY_FILE);
+    let cert_pem = fs::read_to_string(&cert_path)
+        .with_context(|| format!("ACME 签发后缺少服务端证书: {}", cert_path.display()))?;
+    let key_pem = fs::read_to_string(&key_path)
+        .with_context(|| format!("ACME 签发后缺少服务端私钥: {}", key_path.display()))?;
+    fsutil::harden(&key_path, 0o600).context("收紧 ACME 服务端私钥权限失败")?;
+    if !tls::cert_matches_key(&cert_pem, &key_pem).context("校验 ACME 证书/私钥配对失败")?
+    {
+        bail!(
+            "ACME 签发后的服务端证书与私钥不匹配（{} / {}）；拒绝继续安装",
+            cert_path.display(),
+            key_path.display()
+        );
+    }
+    let summary = tls::cert_summary(&cert_pem).context("解析 ACME 服务端证书失败")?;
+    let now_s = rustboard_common::util::now_ms() / 1_000;
+    if summary.not_after <= now_s {
+        bail!(
+            "ACME 服务端证书已过期（到期 {}）；请检查系统时间后重试",
+            tls::format_unix_utc(summary.not_after)
+        );
+    }
+    if summary.not_before > now_s + 60 {
+        bail!(
+            "ACME 服务端证书尚未生效（notBefore {}）；请检查系统时间",
+            tls::format_unix_utc(summary.not_before)
+        );
+    }
+    Ok(format!(
+        "CN={}, 到期={}",
+        summary.common_name.as_deref().unwrap_or("<无 CN>"),
+        tls::format_unix_utc(summary.not_after)
+    ))
+}
+
+/// 安装前服务端证书材料的快照；ACME 成功后若后续安装失败，回滚时恢复旧证书。
+///
+/// 只保存安装前**成对存在**的 `server.crt` / `server.key`；全新安装没有旧材料，
+/// 由事务的 OwnedDir 回滚删除整个数据目录。恢复只用 `fsutil::atomic_write`，
+/// 路径仍来自经过 allowlist 校验的 `data_dir`。
+struct AcmeCertGuard {
+    dir: PathBuf,
+    old: Option<(Vec<u8>, Vec<u8>)>,
+    armed: bool,
+}
+
+impl AcmeCertGuard {
+    fn capture(data_dir: &Path) -> Self {
+        let dir = tls::cert_dir(data_dir);
+        let cert = fs::read(dir.join(tls::SERVER_CERT_FILE)).ok();
+        let key = fs::read(dir.join(tls::SERVER_KEY_FILE)).ok();
+        let old = match (cert, key) {
+            (Some(cert), Some(key)) => Some((cert, key)),
+            _ => None,
+        };
+        Self {
+            dir,
+            old,
+            armed: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        self.armed = self.old.is_some();
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// 恢复安装前的证书 / 私钥；没有旧材料或未 arm 时是空操作。
+    fn restore(&mut self) -> Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        let Some((cert, key)) = &self.old else {
+            return Ok(());
+        };
+        fsutil::atomic_write(&self.dir.join(tls::SERVER_KEY_FILE), key, 0o600)
+            .context("恢复安装前的服务端私钥失败")?;
+        fsutil::atomic_write(&self.dir.join(tls::SERVER_CERT_FILE), cert, 0o644)
+            .context("恢复安装前的服务端证书失败")?;
+        println!("已恢复安装前的服务端证书（ACME 安装未完成）。");
+        Ok(())
+    }
+}
+
+/// ACME 签发的最终结果。
+enum AcmeOutcome {
+    /// 已成功签发；guard 在本次安装失败时恢复旧证书。
+    Issued { guard: AcmeCertGuard },
+    /// 失败后按 `fallback_to_self_signed` 回退，调用方继续 self-signed 安装。
+    FellBack,
+}
+
+/// 构造修复后重试命令（只含公开参数，不含 token / key）。
+fn acme_retry_command(cfg: &HubConfig) -> String {
+    let mut command = format!(
+        "rustboard-hub install --force --tls {} --acme-email {}",
+        cfg.tls.mode.as_str(),
+        shell_arg(&cfg.tls.acme_email)
+    );
+    command.push_str(&format!(" --acme-challenge {}", cfg.tls.challenge.as_str()));
+    for domain in &cfg.tls.domains {
+        command.push_str(&format!(" --domain {}", shell_arg(domain)));
+    }
+    if !cfg.tls.acme_profile.trim().is_empty() {
+        command.push_str(&format!(
+            " --acme-profile {}",
+            shell_arg(&cfg.tls.acme_profile)
+        ));
+    }
+    if !cfg.tls.acme_ca_file.trim().is_empty() {
+        command.push_str(&format!(" --acme-ca {}", shell_arg(&cfg.tls.acme_ca_file)));
+    }
+    if !cfg.tls.acme_directory.trim().is_empty()
+        && cfg.tls.acme_directory != rustboard_common::config::DEFAULT_ACME_DIRECTORY
+    {
+        command.push_str(&format!(
+            " --acme-directory {}",
+            shell_arg(&cfg.tls.acme_directory)
+        ));
+    }
+    if cfg.admin_tls == AdminTlsMode::Required {
+        command.push_str(" --admin-tls required");
+    }
+    command
+}
+
+/// 是否需要先跑一次 LE staging：只有默认 production directory 且
+/// `staging_check = true` 时执行；`acme-ip` 默认跳过（shortlived profile 在
+/// staging 的支持依 LE 策略，直接以 production 结果为准，避免误判）。
+fn staging_directory_for(cfg: &HubConfig) -> Option<&'static str> {
+    if !cfg.tls.staging_check {
+        return None;
+    }
+    if cfg.tls.acme_directory != rustboard_common::config::DEFAULT_ACME_DIRECTORY {
+        return None;
+    }
+    if cfg.tls.mode == ServerTlsMode::AcmeIp {
+        return None;
+    }
+    Some(LE_STAGING_DIRECTORY)
+}
+
+/// 把 ACME 失败转成“回退 self-signed”或硬错误，并打印分层诊断与重试命令。
+fn handle_acme_failure(
+    cfg: &mut HubConfig,
+    diag: Option<&Diagnostics>,
+    attempts: usize,
+    failure: AcmeIssueFailure,
+) -> Result<AcmeOutcome> {
+    let (message, outcome) = match &failure {
+        AcmeIssueFailure::Unsupported(message) => (
+            message.clone(),
+            StagingOutcome::Unavailable(
+                concat!(
+                    "当前 hub 二进制没有 `tls issue` 子命令（Phase C C4 尚未合入）；",
+                    "安装器无法完成 ACME 签发"
+                )
+                .to_string(),
+            ),
+        ),
+        AcmeIssueFailure::Failed(message) => (
+            message.clone(),
+            StagingOutcome::Failed(format!(
+                "{attempts} 轮 tls issue 均失败；最后一次输出: {message}"
+            )),
+        ),
+    };
+    if !message.trim().is_empty() {
+        eprintln!("ACME 失败输出（已脱敏）: {message}");
+    }
+    if let Some(diag) = diag {
+        diag.print(outcome);
+    }
+    eprintln!("修复后重试命令: {}", acme_retry_command(cfg));
+
+    if cfg.tls.fallback_to_self_signed {
+        eprintln!(concat!(
+            "警告：ACME 签发失败，按 tls.fallback_to_self_signed=true 回退为自签证书继续安装；",
+            "本次不会留下 ACME 模式的配置。自签模式下已纳管 agent 继续使用证书指纹钉扎。"
+        ));
+        cfg.tls = TlsConfig::default();
+        cfg.validate()
+            .context("ACME 回退 self-signed 后的配置校验失败")?;
+        ensure_admin_tls_supported(cfg)?;
+        Ok(AcmeOutcome::FellBack)
+    } else {
+        bail!(concat!(
+            "ACME 签发失败，且 tls.fallback_to_self_signed=false；",
+            "安装已中止（配置/证书由事务回滚）。修复网络/端口后可用上面的重试命令重新安装。"
+        ))
+    }
+}
+
+/// ACME 安装：事务内先写配置，再最多 3 轮 `tls issue`；失败按配置回退。
+///
+/// 端口 / 防火墙 / 云诊断在调用本函数前已完成（任何写盘之前）。本函数只负责
+/// 配置落盘（事务内，可回滚）、签发、校验与回退决策。
+fn issue_acme_with_fallback(
+    cfg: &mut HubConfig,
+    paths: &Paths,
+    txn: &mut InstallTxn,
+    diag: Option<&Diagnostics>,
+) -> Result<AcmeOutcome> {
+    // 客户端 CA 与 ACME 账户是两条独立材料链：先确保 mTLS 用的客户端 CA 可用，
+    // 再让 `tls issue` 只负责服务端证书。全新安装失败时由事务回滚整个数据目录。
+    let policy = tls::CertPolicy {
+        ca_days: cfg.ca_validity_days,
+        server_days: cfg.server_cert_validity_days,
+        client_days: cfg.client_cert_validity_days,
+    };
+    tls::ensure_client_ca(&cfg.data_dir, policy).context("准备 ACME 模式下的客户端 CA 失败")?;
+
+    // `tls issue` 需要一个已落盘的合法配置路径；写进事务，失败可恢复旧配置。
+    // 先跑 staging（仅默认 LE production + acme-domain）：staging 证书不可信、
+    // 会被 production 覆盖，但能提前暴露 DNS / 80 / 443 / 安全组问题。
+    let mut guard = AcmeCertGuard::capture(&cfg.data_dir);
+    guard.arm();
+
+    if let Some(staging_directory) = staging_directory_for(cfg) {
+        println!(
+            "ACME staging 检查：先向 {staging_directory} 申请一次临时证书（仅验证域名与 80/443 链路）..."
+        );
+        let mut staging_cfg = cfg.clone();
+        staging_cfg.tls.acme_directory = staging_directory.to_string();
+        let staging_text =
+            toml::to_string_pretty(&staging_cfg).context("序列化 ACME staging 配置失败")?;
+        txn.write(&paths.config, staging_text.as_bytes(), 0o600)?;
+        if let Err(failure) = run_tls_issue(&paths.config, ACME_ISSUE_TIMEOUT) {
+            if let Err(err) = guard.restore() {
+                eprintln!("警告：恢复安装前的服务端证书失败: {err:#}");
+            }
+            return handle_acme_failure(cfg, diag, 1, failure);
+        }
+        println!("ACME staging 检查通过；继续向 production 申请受信任证书。");
+    }
+
+    // 配置序列化 / 事务写入失败时，staging 证书可能已经落盘；必须先恢复安装前
+    // 材料再返回错误，不能把不可信 staging 证书留给下一次启动。
+    let production = (|| -> Result<(usize, std::result::Result<(), AcmeIssueFailure>)> {
+        let config_text = toml::to_string_pretty(cfg).context("序列化 ACME 配置失败")?;
+        txn.write(&paths.config, config_text.as_bytes(), 0o600)?;
+        let config_path = paths.config.clone();
+        Ok(retry_issue(
+            ACME_MAX_ATTEMPTS,
+            ACME_RETRY_BACKOFF,
+            |attempt| {
+                println!(
+                    "ACME 签发：第 {attempt}/{ACME_MAX_ATTEMPTS} 轮调用 `rustboard-hub tls issue`（production）..."
+                );
+                match run_tls_issue(&config_path, ACME_ISSUE_TIMEOUT) {
+                    Ok(()) => Ok(()),
+                    Err(failure) => {
+                        if let AcmeIssueFailure::Failed(message) = &failure {
+                            eprintln!("  第 {attempt}/{ACME_MAX_ATTEMPTS} 轮失败: {message}");
+                        }
+                        Err(failure)
+                    }
+                }
+            },
+        ))
+    })();
+    let (attempts, result) = match production {
+        Ok(value) => value,
+        Err(err) => {
+            if let Err(restore_err) = guard.restore() {
+                eprintln!("警告：恢复安装前的服务端证书失败: {restore_err:#}");
+            }
+            return Err(err);
+        }
+    };
+
+    match result {
+        Ok(()) => match verify_acme_server_material(&cfg.data_dir) {
+            Ok(summary) => {
+                println!("ACME 服务端证书已签发并校验通过：{summary}");
+                if let Some(diag) = diag {
+                    diag.print(StagingOutcome::Succeeded);
+                }
+                Ok(AcmeOutcome::Issued { guard })
+            }
+            Err(err) => {
+                // 校验失败同样不能留下来源不明的新证书。
+                if let Err(restore_err) = guard.restore() {
+                    eprintln!("警告：恢复安装前的服务端证书失败: {restore_err:#}");
+                }
+                Err(err)
+            }
+        },
+        Err(failure) => {
+            // production 失败时可能已留下 staging 证书；恢复安装前材料（全新安装
+            // 没有旧材料，由后续 self-signed 生成或事务回滚清理）。
+            if let Err(err) = guard.restore() {
+                eprintln!("警告：恢复安装前的服务端证书失败: {err:#}");
+            }
+            handle_acme_failure(cfg, diag, attempts, failure)
+        }
+    }
+}
+
 /// install 子命令入口。
 pub(crate) fn install(args: InstallArgs) -> Result<()> {
+    // 离线/ACME 互斥与 ACME 必填参数必须在读状态、写盘、访问网络之前失败。
+    let requested_tls = validate_tls_args(&args)?;
     let prefix = args.prefix.clone().unwrap_or_else(|| PathBuf::from("/"));
-    check_tls_mode(args.tls.as_deref())?;
     check_db_mode(args.db.as_deref())?;
     let retention = match args.retention.as_deref() {
         Some(value) => parse_retention(value)?,
@@ -905,11 +1702,19 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
     }
 
     if args.dry_run {
+        // dry-run 不读已有配置；ACME 参数必须配显式 --tls，计划里的证书来源才
+        // 不含歧义（否则可能把已有 ACME 配置误显示成 self-signed）。
+        if args.tls.is_none() && has_acme_args(&args) {
+            bail!(concat!(
+                "--dry-run 下使用 ACME 参数必须显式指定 --tls acme-domain 或 --tls acme-ip；",
+                "否则无法判断计划中的证书来源"
+            ));
+        }
         let panel_yes = match args.panel.as_deref() {
             Some(value) => parse_panel(value)?,
             None => args.yes,
         };
-        print_install_plan(&args, &paths, manage, write_unit, panel_yes);
+        print_install_plan(&args, &paths, manage, write_unit, panel_yes, requested_tls);
         return Ok(());
     }
 
@@ -1026,11 +1831,11 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
         );
     }
 
-    let (cfg, need_certs) = prepare_config(&args, &paths, retention, config_present)?;
+    let (mut cfg, need_certs) = prepare_config(&args, &paths, retention, config_present)?;
     // 已有配置的 data_dir 是权威值：升级/重装不跟随 flag 默认值漂移。
     paths.data_dir = cfg.data_dir.clone();
-    // R-S5：配置来自 state/磁盘，required 的健康检查是 HTTPS，安装器必须拒绝而
-    // 不是启动服务后误判失败并回滚。
+    // 配置来自 state/磁盘：admin_tls=required 在 Phase C 用 HTTPS 健康检查支持，
+    // 但必须在写盘前确认能推导出 SNI / CA，不能等到启动后误判并回滚。
     ensure_admin_tls_supported(&cfg)?;
     validate_install_paths(&paths)?;
     // L7：需要补证书但数据目录已存在（可能有旧 CA / agent 指纹）时拒绝重建。
@@ -1041,10 +1846,62 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
         );
     }
 
+    // ACME 预检：只读端口 / 防火墙 / 云诊断必须在写配置、unit、二进制之前。
+    // 挑战端口不可用时按 fallback_to_self_signed 立即回退，不产生任何 ACME 写盘。
+    let mut diag: Option<Diagnostics> = None;
+    let mut force_self_signed = false;
+    if cfg.tls.mode.is_acme() {
+        let diagnostics = Diagnostics::collect(args.offline, cfg.tls.mode, cfg.tls.challenge);
+        diagnostics.print(StagingOutcome::NotRun);
+        if diagnostics.challenge_ready() {
+            diag = Some(diagnostics);
+        } else if cfg.tls.fallback_to_self_signed {
+            eprintln!(concat!(
+                "警告：ACME 挑战端口在本机不可用，按 tls.fallback_to_self_signed=true ",
+                "回退为自签证书继续安装（尚未写入任何文件）。"
+            ));
+            cfg.tls = TlsConfig::default();
+            cfg.validate()
+                .context("ACME 端口预检失败后回退 self-signed 的配置校验失败")?;
+            ensure_admin_tls_supported(&cfg)?;
+            force_self_signed = true;
+        } else {
+            bail!(concat!(
+                "ACME 挑战端口在本机不可用，且 tls.fallback_to_self_signed=false；",
+                "未写入任何文件。请释放 80/443 后重试（见上面的分层诊断）"
+            ));
+        }
+    }
+
     // 只有新装、或旧面板状态丢失、或本次重新生成了 admin_token 时才重跑面板：
     // 已有配置的 --force 会保留 token，不需要动面板。
     let install_panel =
         panel_yes && (state.role(Role::Panel).is_none() || existing.is_none() || !config_present);
+
+    let mut txn = InstallTxn::begin(&paths, false)?;
+    // ACME 先写配置并调用 `tls issue`：成功后继续原事务；失败回退 self-signed
+    // 后继续，确保最终落盘的配置与证书来源一致。
+    let mut acme_guard: Option<AcmeCertGuard> = None;
+    if cfg.tls.mode.is_acme() {
+        match issue_acme_with_fallback(&mut cfg, &paths, &mut txn, diag.as_ref()) {
+            Ok(AcmeOutcome::Issued { guard }) => acme_guard = Some(guard),
+            Ok(AcmeOutcome::FellBack) => {
+                force_self_signed = true;
+            }
+            Err(err) => {
+                // 尚未触碰服务 / unit；回滚配置与本次创建的文件。
+                let rollback = txn.rollback();
+                return match rollback {
+                    Ok(()) => Err(err),
+                    Err(rollback_err) => {
+                        Err(err.context(format!("ACME 安装失败后回滚失败: {rollback_err:#}")))
+                    }
+                };
+            }
+        }
+    }
+    // 回退后重新计算健康检查计划（self-signed 的 SNI/CA 可能不同）。
+    let health = health_check_for(&cfg)?;
 
     let plan = InstallPlan {
         args: &args,
@@ -1054,19 +1911,35 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
         write_unit,
         install_panel,
         need_certs,
+        force_self_signed,
         restart: manage && active,
+        health,
     };
 
-    let mut txn = InstallTxn::begin(&paths, false)?;
     let mut service_touched = false;
     match run_install(&plan, &mut txn, &mut service_touched) {
         Ok(()) => {
             txn.commit()?;
+            if let Some(mut guard) = acme_guard.take() {
+                guard.disarm();
+            }
             print_install_success(&plan);
+            if requested_tls.is_acme() && !plan.cfg.tls.mode.is_acme() {
+                eprintln!(concat!(
+                    "注意：本次请求的是 ACME，但签发失败后已回退为 self-signed 安装；",
+                    "修复上面的诊断项后，用打印出的重试命令重新安装。"
+                ));
+            }
             Ok(())
         }
         Err(err) => {
             let rollback = txn.rollback();
+            // 事务只恢复 config/unit/binary；ACME 写出的证书/私钥由 guard 恢复。
+            if let Some(mut guard) = acme_guard.take() {
+                if let Err(restore_err) = guard.restore() {
+                    eprintln!("警告：恢复安装前的服务端证书失败: {restore_err:#}");
+                }
+            }
             if plan.manager.manage {
                 if let Err(reload_err) = plan.manager.daemon_reload() {
                     eprintln!("警告：回滚后 systemctl daemon-reload 失败: {reload_err:#}");
@@ -1117,12 +1990,19 @@ fn run_install(
     let result = (|| -> Result<()> {
         // 数据目录 0700；只有本次新建时回滚才递归删除（已有数据绝不动）。
         txn.create_owned_dir(&plan.paths.data_dir, 0o700)?;
-        if plan.need_certs {
-            let policy = tls::CertPolicy {
-                ca_days: plan.cfg.ca_validity_days,
-                server_days: plan.cfg.server_cert_validity_days,
-                client_days: plan.cfg.client_cert_validity_days,
-            };
+        let policy = tls::CertPolicy {
+            ca_days: plan.cfg.ca_validity_days,
+            server_days: plan.cfg.server_cert_validity_days,
+            client_days: plan.cfg.client_cert_validity_days,
+        };
+        if plan.cfg.tls.mode.is_acme() {
+            // 服务端证书已由 `tls issue` 写入并校验；这里只确保 mTLS 客户端 CA
+            // 存在，并把证书目录/私钥权限收紧。绝不能再调用 ensure_hub_material，
+            // 否则会用自签证书覆盖 ACME 证书。
+            tls::ensure_client_ca(&plan.paths.data_dir, policy)
+                .context("准备 ACME 模式下的客户端 CA 失败")?;
+            tls::harden_hub_material(&plan.paths.data_dir).context("收紧已有证书私钥权限失败")?;
+        } else if plan.need_certs || plan.force_self_signed {
             tls::ensure_hub_material(&plan.paths.data_dir, &plan.cfg.server_names, policy)
                 .context("生成本地自签证书失败")?;
         } else {
@@ -1162,9 +2042,7 @@ fn run_install(
             manager
                 .ensure_fragment_is(Role::Hub.unit_name(), &plan.paths.unit)
                 .context("启用后 systemd 解析的 hub unit 发生变化")?;
-            let url = health_url(&plan.cfg.admin_listen)?;
-            wait_http_ok(&url, HEALTH_TIMEOUT)
-                .with_context(|| format!("等待 hub 健康检查失败: {url}"))?;
+            run_health_check(&plan.health, HEALTH_TIMEOUT)?;
         }
 
         // state 必须在服务健康之后写入；失败时由事务恢复旧状态。
@@ -1236,11 +2114,59 @@ fn install_binary(txn: &mut InstallTxn, dest: &Path) -> Result<()> {
         .with_context(|| format!("安装 hub 二进制到 {} 失败", dest.display()))
 }
 
+/// 同机面板连接 hub 管理 API 的地址与信任来源。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelEndpoint {
+    hub_url: String,
+    /// 自签 / 私有 ACME 时传给 `--hub-ca`；公共 ACME 用系统根，不传。
+    hub_ca: Option<PathBuf>,
+}
+
+/// 根据 hub 的 admin TLS 模式选择同机 panel 的连接方式。
+///
+/// - `off`：保持 v0.4 行为，回环明文 `http://127.0.0.1:<port>`；
+/// - `required`：`https://<SAN 覆盖的主机名>:<port>`，自签 / 私有 ACME 附
+///   `--hub-ca`。公共 ACME 证书用系统根，传自签 CA 反而会校验失败，因此不传。
+fn panel_endpoint(cfg: &HubConfig) -> Result<PanelEndpoint> {
+    let admin_port = port_of(&cfg.admin_listen)
+        .ok_or_else(|| anyhow!("无法从 admin_listen 解析端口: {}", cfg.admin_listen))?;
+    if admin_port == 0 {
+        bail!("管理 API 端口为 0，拒绝安装面板");
+    }
+    match cfg.admin_tls {
+        AdminTlsMode::Off => Ok(PanelEndpoint {
+            hub_url: format!("http://127.0.0.1:{admin_port}"),
+            hub_ca: None,
+        }),
+        AdminTlsMode::Required => {
+            let health = health_check_for(cfg).context("同机面板无法确定 hub 的 HTTPS 地址")?;
+            let HealthCheck::Https {
+                server_name, ca, ..
+            } = health
+            else {
+                unreachable!("admin_tls=required 规划出的健康检查一定是 HTTPS")
+            };
+            let host = if server_name.contains(':') {
+                format!("[{server_name}]")
+            } else {
+                server_name
+            };
+            let hub_ca = match ca {
+                HealthCa::PemFile(path) => Some(path),
+                HealthCa::SystemRoots => None,
+            };
+            Ok(PanelEndpoint {
+                hub_url: format!("https://{host}:{admin_port}"),
+                hub_ca,
+            })
+        }
+    }
+}
+
 /// 同机面板安装：token 走 0600 临时文件，参数用数组传递，stdout 直接透传。
 fn install_panel(args: &InstallArgs, paths: &Paths, cfg: &HubConfig, manage: bool) -> Result<()> {
-    // 面板安装器通过 http:// 回调 hub 管理 API；required 下会误把 HTTPS 健康检查
-    // 当成失败。这里再兜底一次，保证任何调用路径都不会用 http 对接 required。
-    ensure_admin_tls_supported(cfg).context("拒绝用 http 安装同机面板")?;
+    // 先确认能从配置推导出 HTTPS 健康检查 / panel 连接目标；不支持的组合在写盘前失败。
+    ensure_admin_tls_supported(cfg).context("同机面板的 hub TLS 配置不可用")?;
 
     let current = std::env::current_exe()
         .context("读取当前可执行文件路径失败")?
@@ -1263,11 +2189,7 @@ fn install_panel(args: &InstallArgs, paths: &Paths, cfg: &HubConfig, manage: boo
         );
     }
 
-    let admin_port = port_of(&cfg.admin_listen)
-        .ok_or_else(|| anyhow!("无法从 admin_listen 解析端口: {}", cfg.admin_listen))?;
-    if admin_port == 0 {
-        bail!("管理 API 端口为 0，拒绝安装面板");
-    }
+    let endpoint = panel_endpoint(cfg)?;
 
     let temp = TempTokenFile::create(&paths.prefix, &cfg.admin_token)?;
     let panel_config = paths
@@ -1276,16 +2198,20 @@ fn install_panel(args: &InstallArgs, paths: &Paths, cfg: &HubConfig, manage: boo
         .join(Role::Panel.config_name());
     let force_panel = args.force || panel_config.is_file();
 
-    let hub_url = format!("http://127.0.0.1:{admin_port}");
     let mut command = Command::new(&panel_bin);
     command
         .args(["install", "--yes"])
         .arg("--prefix")
         .arg(&paths.prefix)
         .arg("--hub-url")
-        .arg(&hub_url)
+        .arg(&endpoint.hub_url)
         .arg("--hub-token-file")
         .arg(temp.path());
+    if let Some(hub_ca) = &endpoint.hub_ca {
+        // C7 的 panel 安装器支持 --hub-ca；未合入时会以未知参数失败，错误里给出
+        // `--panel no` 的退路，绝不静默降级成不校验证书。
+        command.arg("--hub-ca").arg(hub_ca);
+    }
     if let Some(static_dir) = &args.panel_static_dir {
         command.arg("--static-dir").arg(static_dir);
     }
@@ -1305,11 +2231,28 @@ fn install_panel(args: &InstallArgs, paths: &Paths, cfg: &HubConfig, manage: boo
     command.env("RUSTBOARD_INSTALL_LOCK_HELD", "1");
     command.stdin(Stdio::null());
 
-    println!("正在安装同机面板（hub={hub_url}）...");
+    println!(
+        "正在安装同机面板（hub={}，证书校验={}）...",
+        endpoint.hub_url,
+        if cfg.admin_tls == AdminTlsMode::Off {
+            "HTTP（回环）"
+        } else if endpoint.hub_ca.is_some() {
+            "hub CA"
+        } else {
+            "系统根"
+        }
+    );
     let status = command
         .status()
         .with_context(|| format!("执行面板安装失败: {}", panel_bin.display()))?;
     if !status.success() {
+        if cfg.admin_tls == AdminTlsMode::Required {
+            bail!(concat!(
+                "同机面板安装失败；hub 安装将回滚。",
+                "若 panel 尚未支持 --hub-ca（Phase C C7），请加 --panel no 重试，",
+                "或先升级 panel 再重新安装"
+            ));
+        }
         bail!("同机面板安装失败（退出状态 {status}）；hub 安装将回滚");
     }
     println!("同机面板安装完成。");
@@ -1437,8 +2380,9 @@ fn print_install_plan(
     manage: bool,
     write_unit: bool,
     panel_yes: bool,
+    requested_tls: ServerTlsMode,
 ) {
-    println!("RustBoard Hub 安装计划（--dry-run：不写文件、不调用 systemctl）");
+    println!("RustBoard Hub 安装计划（--dry-run：不写文件、不调用 systemctl、不联网）");
     println!("  安装前缀: {}", paths.prefix.display());
     println!("  配置: {}", paths.config.display());
     println!("  数据目录: {}", paths.data_dir.display());
@@ -1458,6 +2402,22 @@ fn print_install_plan(
             "不写 unit、不调用 systemctl"
         }
     );
+    println!(
+        "  TLS: {}（管理 API: {}）",
+        requested_tls.as_str(),
+        match args.tls_options.admin_tls.as_deref() {
+            Some("required") => "HTTPS",
+            _ => "HTTP（仅回环）",
+        }
+    );
+    if requested_tls.is_acme() {
+        println!(
+            "  ACME: 写 unit 前先做 80/443/防火墙/云只读诊断，再调用 `tls issue` \
+             （staging / production 由 C4 CLI 负责）；最多 {ACME_MAX_ATTEMPTS} 轮，\
+             失败按 tls.fallback_to_self_signed 回退"
+        );
+        println!("  ACME 需要：--acme-email / --domain；不会自动修改防火墙或安全组");
+    }
     if panel_yes {
         println!("  同机面板: 将调用同目录的 {}", Role::Panel.binary_name());
         if let Some(dir) = &args.panel_static_dir {
@@ -1478,9 +2438,14 @@ fn print_install_success(plan: &InstallPlan<'_>) {
     println!("  配置: {}", plan.paths.config.display());
     println!("  数据目录: {}", plan.paths.data_dir.display());
     println!("  agent 接入: {}", plan.cfg.agent_listen);
-    let admin_url =
-        health_url(&plan.cfg.admin_listen).unwrap_or_else(|_| plan.cfg.admin_listen.clone());
-    println!("  管理 API: {admin_url}");
+    println!("  管理 API: {}", plan.health.display_url());
+    println!("  服务端证书来源: {}", plan.cfg.tls.mode.as_str());
+    if plan.cfg.tls.mode.is_acme() {
+        println!("  ACME 证书标识: {}", plan.cfg.tls.domains.join(", "));
+        println!("  agent 信任: --tls-mode system-roots（公共 ACME）或 custom-ca（私有 ACME）");
+    } else {
+        println!("  agent 信任: 证书指纹钉扎（self-signed 默认）");
+    }
     if plan.manager.manage {
         println!("  systemd: 已 enable --now，/healthz 健康检查通过");
     } else if plan.write_unit {
@@ -2288,14 +3253,50 @@ mod tests {
     }
 
     #[test]
-    fn install_requires_admin_tls_off() {
-        let mut cfg = HubConfig::default();
+    fn admin_tls_required_uses_https_health_check() {
+        // 默认回环绑定 + self-signed：required 不再被拒绝，健康检查用 127.0.0.1。
+        let mut cfg = HubConfig {
+            admin_tls: AdminTlsMode::Required,
+            admin_listen: "127.0.0.1:9000".to_string(),
+            ..HubConfig::default()
+        };
+
         assert!(ensure_admin_tls_supported(&cfg).is_ok());
-        cfg.admin_tls = AdminTlsMode::Required;
-        let err = ensure_admin_tls_supported(&cfg).unwrap_err().to_string();
-        assert!(err.contains("admin_tls=required"), "{err}");
-        assert!(err.contains("Phase A"), "{err}");
-        assert!(err.contains("http"), "{err}");
+        let health = health_check_for(&cfg).expect("required 应能规划 HTTPS 健康检查");
+        match health {
+            HealthCheck::Https {
+                addr,
+                server_name,
+                ca,
+            } => {
+                assert_eq!(addr, "127.0.0.1:9000".parse::<SocketAddr>().unwrap());
+                assert_eq!(server_name, "127.0.0.1");
+                assert_eq!(
+                    ca,
+                    HealthCa::PemFile(tls::cert_dir(&cfg.data_dir).join(tls::CA_CERT_FILE))
+                );
+            }
+            other => panic!("expected HTTPS health check, got {other:?}"),
+        }
+
+        // 非回环绑定也支持：SNI 取 server_names 里可用的名字（默认含 localhost）。
+        cfg.admin_listen = "192.0.2.10:9000".to_string();
+        assert!(ensure_admin_tls_supported(&cfg).is_ok());
+        match health_check_for(&cfg).unwrap() {
+            HealthCheck::Https { addr, .. } => {
+                assert_eq!(addr, "192.0.2.10:9000".parse::<SocketAddr>().unwrap())
+            }
+            other => panic!("expected HTTPS health check, got {other:?}"),
+        }
+
+        // off 仍保持 v0.4 的明文回环 healthz。
+        cfg.admin_tls = AdminTlsMode::Off;
+        assert_eq!(
+            health_check_for(&cfg).unwrap(),
+            HealthCheck::Http {
+                url: "http://192.0.2.10:9000/healthz".to_string()
+            }
+        );
     }
 
     #[test]
@@ -2466,13 +3467,22 @@ mod tests {
     }
 
     #[test]
-    fn phase_c_tls_and_phase_d_db_are_rejected() {
-        assert!(check_tls_mode(None).is_ok());
-        assert!(check_tls_mode(Some("self-signed")).is_ok());
-        for mode in ["acme-domain", "acme-ip", "bogus"] {
-            let err = check_tls_mode(Some(mode)).unwrap_err().to_string();
-            assert!(err.contains("Phase C"), "{mode}: {err}");
-        }
+    fn phase_c_tls_modes_parse_and_phase_d_db_is_rejected() {
+        assert_eq!(parse_tls_mode(None).unwrap(), ServerTlsMode::SelfSigned);
+        assert_eq!(
+            parse_tls_mode(Some("self-signed")).unwrap(),
+            ServerTlsMode::SelfSigned
+        );
+        assert_eq!(
+            parse_tls_mode(Some("acme-domain")).unwrap(),
+            ServerTlsMode::AcmeDomain
+        );
+        assert_eq!(
+            parse_tls_mode(Some("acme-ip")).unwrap(),
+            ServerTlsMode::AcmeIp
+        );
+        let err = parse_tls_mode(Some("bogus")).unwrap_err().to_string();
+        assert!(err.contains("--tls"), "{err}");
 
         assert!(check_db_mode(None).is_ok());
         assert!(check_db_mode(Some("sqlite")).is_ok());
@@ -2874,6 +3884,477 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("符号链接"), "data_dir: {err}");
+        }
+    }
+
+    /// 构造测试用 InstallArgs；显式端口避免 `pick_free_port` 触碰真实端口。
+    fn test_install_args() -> InstallArgs {
+        InstallArgs {
+            yes: true,
+            offline: false,
+            dry_run: true,
+            force: false,
+            prefix: None,
+            config: None,
+            data_dir: None,
+            unit_dir: None,
+            listen: Some("0.0.0.0:18443".to_string()),
+            admin_listen: Some("127.0.0.1:19000".to_string()),
+            advertise: None,
+            sans: Vec::new(),
+            name: None,
+            retention: None,
+            db: None,
+            tls: None,
+            tls_options: Box::default(),
+            panel: None,
+            panel_static_dir: None,
+            systemd: false,
+            no_systemd: true,
+        }
+    }
+
+    fn acme_args() -> InstallArgs {
+        let mut args = test_install_args();
+        args.tls = Some("acme-domain".to_string());
+        args.tls_options.acme_email = Some("admin@example.com".to_string());
+        args.tls_options.domains = vec!["board.example.com".to_string()];
+        args
+    }
+
+    #[test]
+    fn offline_and_acme_are_mutually_exclusive() {
+        let mut args = acme_args();
+        args.offline = true;
+        let err = validate_tls_args(&args).unwrap_err().to_string();
+        assert!(err.contains("--offline"), "{err}");
+        assert!(err.contains("ACME"), "{err}");
+
+        // 即使没有显式 --tls，只要出现 ACME 参数也必须拒绝。
+        let mut args = test_install_args();
+        args.offline = true;
+        args.tls_options.acme_email = Some("admin@example.com".to_string());
+        let err = validate_tls_args(&args).unwrap_err().to_string();
+        assert!(err.contains("--offline"), "{err}");
+        assert!(err.contains("ACME"), "{err}");
+
+        // self-signed（默认）本身仍可离线安装。
+        let mut args = test_install_args();
+        args.offline = true;
+        assert!(validate_tls_args(&args).is_ok());
+    }
+
+    #[test]
+    fn explicit_self_signed_rejects_acme_only_args() {
+        let mut args = acme_args();
+        args.tls = Some("self-signed".to_string());
+        let err = validate_tls_args(&args).unwrap_err().to_string();
+        assert!(err.contains("self-signed"), "{err}");
+        assert!(err.contains("ACME"), "{err}");
+        assert!(err.contains("--domain"), "{err}");
+    }
+
+    #[test]
+    fn acme_mode_requires_email_domains_and_valid_ca_path() {
+        let mut args = acme_args();
+        args.tls_options.acme_email = None;
+        let err = validate_tls_args(&args).unwrap_err().to_string();
+        assert!(err.contains("--acme-email"), "{err}");
+
+        let mut args = acme_args();
+        args.tls_options.domains.clear();
+        let err = validate_tls_args(&args).unwrap_err().to_string();
+        assert!(err.contains("--domain"), "{err}");
+
+        let mut args = acme_args();
+        args.tls = Some("acme-ip".to_string());
+        args.tls_options.domains = vec!["203.0.113.10".to_string(), "203.0.113.11".to_string()];
+        let err = validate_tls_args(&args).unwrap_err().to_string();
+        assert!(err.contains("acme-ip"), "{err}");
+
+        let mut args = acme_args();
+        args.tls_options.domains = (0..=MAX_ACME_DOMAINS)
+            .map(|index| format!("d{index}.example.com"))
+            .collect();
+        let err = validate_tls_args(&args).unwrap_err().to_string();
+        assert!(err.contains("最多"), "{err}");
+
+        let mut args = acme_args();
+        args.tls_options.acme_ca = Some(PathBuf::from("relative-ca.pem"));
+        let err = validate_tls_args(&args).unwrap_err().to_string();
+        assert!(err.contains("绝对路径"), "{err}");
+
+        let dir = TempDir::new("acme-ca");
+        let ca = dir.path().join("ca.pem");
+        fs::write(&ca, "not a real ca").unwrap();
+        let mut args = acme_args();
+        args.tls_options.acme_ca = Some(ca);
+        assert!(validate_tls_args(&args).is_ok());
+    }
+
+    #[test]
+    fn new_hub_config_applies_acme_and_admin_tls() {
+        let mut args = acme_args();
+        args.tls_options.domains = vec![
+            "board.example.com".to_string(),
+            "www.board.example.com".to_string(),
+        ];
+        args.tls_options.acme_challenge = Some("tls-alpn-01".to_string());
+        args.tls_options.acme_profile = Some("shortlived".to_string());
+        args.tls_options.admin_tls = Some("required".to_string());
+        args.admin_listen = Some("0.0.0.0:19000".to_string());
+
+        let paths = Paths::for_role(
+            Role::Hub,
+            Path::new("/opt/rustboard-test"),
+            PathOverrides::default(),
+        )
+        .unwrap();
+        let cfg = new_hub_config(&args, &paths, Retention::default()).unwrap();
+        assert_eq!(cfg.tls.mode, ServerTlsMode::AcmeDomain);
+        assert_eq!(cfg.tls.acme_email, "admin@example.com");
+        assert_eq!(cfg.tls.domains.len(), 2);
+        assert_eq!(cfg.tls.challenge, AcmeChallenge::TlsAlpn01);
+        assert_eq!(cfg.tls.acme_profile, "shortlived");
+        assert_eq!(cfg.admin_tls, AdminTlsMode::Required);
+        assert_eq!(cfg.effective_server_names(), cfg.tls.domains);
+        // ACME 标识同步进 server_names，供主程序 validate_admin_tls 使用。
+        assert!(cfg
+            .server_names
+            .iter()
+            .any(|name| name == "board.example.com"));
+        cfg.validate().expect("ACME 配置应通过校验");
+        ensure_acme_args_match_mode(&cfg, &args).unwrap();
+
+        // 新建默认 self-signed 配置 + ACME-only 参数：即使没显式 --tls 也不能静默忽略。
+        let mut args = test_install_args();
+        args.tls_options.acme_email = Some("admin@example.com".to_string());
+        let cfg = new_hub_config(&args, &paths, Retention::default()).unwrap();
+        let err = ensure_acme_args_match_mode(&cfg, &args)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("self-signed"), "{err}");
+        assert!(err.contains("ACME"), "{err}");
+    }
+
+    #[test]
+    fn explicit_self_signed_clears_previous_acme_fields() {
+        let mut cfg = HubConfig::default();
+        cfg.tls.mode = ServerTlsMode::AcmeDomain;
+        cfg.tls.acme_email = "old@example.com".to_string();
+        cfg.tls.domains = vec!["old.example.com".to_string()];
+
+        let mut args = test_install_args();
+        args.tls = Some("self-signed".to_string());
+        apply_tls_flags(&mut cfg, &args).unwrap();
+        assert_eq!(cfg.tls.mode, ServerTlsMode::SelfSigned);
+        assert!(cfg.tls.acme_email.is_empty());
+        assert!(cfg.tls.domains.is_empty());
+    }
+
+    #[test]
+    fn admin_health_plan_prefers_san_and_selects_ca() {
+        // self-signed + 通配绑定：连 127.0.0.1，SNI 用 127.0.0.1，信任本地 CA。
+        let mut cfg = HubConfig {
+            admin_tls: AdminTlsMode::Required,
+            admin_listen: "0.0.0.0:9000".to_string(),
+            ..HubConfig::default()
+        };
+        match health_check_for(&cfg).unwrap() {
+            HealthCheck::Https {
+                addr,
+                server_name,
+                ca,
+            } => {
+                assert_eq!(addr, "127.0.0.1:9000".parse::<SocketAddr>().unwrap());
+                assert_eq!(server_name, "127.0.0.1");
+                assert_eq!(
+                    ca,
+                    HealthCa::PemFile(tls::cert_dir(&cfg.data_dir).join(tls::CA_CERT_FILE))
+                );
+            }
+            other => panic!("expected HTTPS, got {other:?}"),
+        }
+
+        // ACME 公共证书：SNI 用第一个域名，信任系统根。
+        cfg.tls.mode = ServerTlsMode::AcmeDomain;
+        cfg.tls.domains = vec!["board.example.com".to_string()];
+        match health_check_for(&cfg).unwrap() {
+            HealthCheck::Https {
+                server_name, ca, ..
+            } => {
+                assert_eq!(server_name, "board.example.com");
+                assert_eq!(ca, HealthCa::SystemRoots);
+            }
+            other => panic!("expected HTTPS, got {other:?}"),
+        }
+
+        // 私有 / Pebble ACME：信任 acme_ca_file。
+        cfg.tls.acme_ca_file = "/etc/rustboard/pebble-ca.pem".to_string();
+        match health_check_for(&cfg).unwrap() {
+            HealthCheck::Https { ca, .. } => assert_eq!(
+                ca,
+                HealthCa::PemFile(PathBuf::from("/etc/rustboard/pebble-ca.pem"))
+            ),
+            other => panic!("expected HTTPS, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn panel_endpoint_follows_admin_tls_mode() {
+        let mut cfg = HubConfig {
+            admin_listen: "127.0.0.1:9000".to_string(),
+            ..HubConfig::default()
+        };
+        assert_eq!(
+            panel_endpoint(&cfg).unwrap(),
+            PanelEndpoint {
+                hub_url: "http://127.0.0.1:9000".to_string(),
+                hub_ca: None,
+            }
+        );
+
+        cfg.admin_tls = AdminTlsMode::Required;
+        assert_eq!(
+            panel_endpoint(&cfg).unwrap(),
+            PanelEndpoint {
+                hub_url: "https://127.0.0.1:9000".to_string(),
+                hub_ca: Some(tls::cert_dir(&cfg.data_dir).join(tls::CA_CERT_FILE)),
+            }
+        );
+
+        // 公共 ACME：系统根，不传自签 CA。
+        cfg.admin_listen = "0.0.0.0:9000".to_string();
+        cfg.tls.mode = ServerTlsMode::AcmeDomain;
+        cfg.tls.domains = vec!["board.example.com".to_string()];
+        assert_eq!(
+            panel_endpoint(&cfg).unwrap(),
+            PanelEndpoint {
+                hub_url: "https://board.example.com:9000".to_string(),
+                hub_ca: None,
+            }
+        );
+
+        // 私有 ACME：传 acme CA。
+        let dir = TempDir::new("panel-ca");
+        let ca = dir.path().join("pebble-ca.pem");
+        fs::write(&ca, "pem").unwrap();
+        cfg.tls.acme_ca_file = ca.display().to_string();
+        assert_eq!(panel_endpoint(&cfg).unwrap().hub_ca, Some(ca.clone()));
+    }
+
+    #[test]
+    fn acme_retry_command_is_reproducible_and_has_no_secret() {
+        let mut cfg = HubConfig::default();
+        cfg.tls.mode = ServerTlsMode::AcmeDomain;
+        cfg.tls.acme_email = "admin@example.com".to_string();
+        cfg.tls.domains = vec!["board.example.com".to_string()];
+        cfg.tls.challenge = AcmeChallenge::TlsAlpn01;
+        cfg.admin_tls = AdminTlsMode::Required;
+
+        let command = acme_retry_command(&cfg);
+        for needle in [
+            "rustboard-hub install --force",
+            "--tls acme-domain",
+            "--acme-email admin@example.com",
+            "--domain board.example.com",
+            "--acme-challenge tls-alpn-01",
+            "--admin-tls required",
+        ] {
+            assert!(command.contains(needle), "缺少 {needle:?}: {command}");
+        }
+        assert!(!command.to_ascii_lowercase().contains("token"), "{command}");
+    }
+
+    #[test]
+    fn retry_issue_retries_three_times_and_stops_on_unsupported() {
+        let mut calls = 0;
+        let (attempts, result) = retry_issue(ACME_MAX_ATTEMPTS, Duration::ZERO, |_| {
+            calls += 1;
+            Err(AcmeIssueFailure::Failed(format!("mock-{calls}")))
+        });
+        assert_eq!(attempts, ACME_MAX_ATTEMPTS);
+        assert_eq!(calls, ACME_MAX_ATTEMPTS);
+        assert!(matches!(result, Err(AcmeIssueFailure::Failed(_))));
+
+        // 第二轮成功：不应继续第三轮。
+        let mut calls = 0;
+        let (attempts, result) = retry_issue(ACME_MAX_ATTEMPTS, Duration::ZERO, |_| {
+            calls += 1;
+            if calls == 2 {
+                Ok(())
+            } else {
+                Err(AcmeIssueFailure::Failed("mock".to_string()))
+            }
+        });
+        assert_eq!(attempts, 2);
+        assert!(result.is_ok());
+
+        // 当前二进制没有 tls 子命令：立即停止，不重试。
+        let mut calls = 0;
+        let (attempts, result) = retry_issue(ACME_MAX_ATTEMPTS, Duration::ZERO, |_| {
+            calls += 1;
+            Err(AcmeIssueFailure::Unsupported("no tls".to_string()))
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(attempts, 1);
+        assert!(matches!(result, Err(AcmeIssueFailure::Unsupported(_))));
+    }
+
+    #[test]
+    fn acme_output_sanitizer_hides_keys_and_key_authorization() {
+        let raw = "正常输出\n\
+                   -----BEGIN EC PRIVATE KEY-----\n\
+                   SUPER-SECRET-KEY-BYTES\n\
+                   -----END EC PRIVATE KEY-----\n\
+                   keyAuthorization: super-secret-keyauth\n\
+                   another normal line\n";
+        let sanitized = sanitize_acme_output(raw);
+        assert!(sanitized.contains("正常输出"), "{sanitized}");
+        assert!(sanitized.contains("another normal line"), "{sanitized}");
+        assert!(!sanitized.contains("SUPER-SECRET-KEY-BYTES"), "{sanitized}");
+        assert!(!sanitized.contains("super-secret-keyauth"), "{sanitized}");
+        assert!(sanitized.contains("[已隐藏私钥内容]"), "{sanitized}");
+        assert!(
+            sanitized.contains("[已隐藏 ACME key authorization]"),
+            "{sanitized}"
+        );
+
+        let long = format!("x{}\n", "y".repeat(600));
+        assert!(sanitize_acme_output(&long).contains("[已隐藏超长输出行]"));
+    }
+
+    #[test]
+    fn missing_tls_cli_is_detected_from_clap_error() {
+        for text in [
+            "error: unrecognized subcommand 'tls'",
+            "error: unexpected argument 'tls' found",
+        ] {
+            assert!(looks_like_missing_tls_cli(text), "{text}");
+        }
+        assert!(!looks_like_missing_tls_cli("network timeout"));
+    }
+
+    #[test]
+    fn verifies_acme_server_material_pair_and_expiry() {
+        let dir = TempDir::new("acme-material");
+        let cert_dir = tls::cert_dir(dir.path());
+        fs::create_dir_all(&cert_dir).unwrap();
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["board.example.com".to_string()]).unwrap();
+        let cert_path = cert_dir.join(tls::SERVER_CERT_FILE);
+        let key_path = cert_dir.join(tls::SERVER_KEY_FILE);
+        fs::write(&cert_path, certified.cert.pem()).unwrap();
+        fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+
+        let summary = verify_acme_server_material(dir.path()).expect("成对证书应通过");
+        assert!(summary.contains("到期"), "{summary}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "ACME 私钥应收紧到 0600");
+        }
+
+        // 私钥换成另一把：必须拒绝。
+        let other =
+            rcgen::generate_simple_self_signed(vec!["board.example.com".to_string()]).unwrap();
+        fs::write(&key_path, other.key_pair.serialize_pem()).unwrap();
+        let err = verify_acme_server_material(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不匹配"), "{err}");
+    }
+
+    #[test]
+    fn staging_runs_only_for_default_le_production_domain_cert() {
+        let mut cfg = HubConfig::default();
+        cfg.tls.mode = ServerTlsMode::AcmeDomain;
+        cfg.tls.acme_directory = rustboard_common::config::DEFAULT_ACME_DIRECTORY.to_string();
+        cfg.tls.staging_check = true;
+        assert_eq!(staging_directory_for(&cfg), Some(LE_STAGING_DIRECTORY));
+
+        // acme-ip / shortlived 默认跳过 staging（以 production 结果为准）。
+        cfg.tls.mode = ServerTlsMode::AcmeIp;
+        assert_eq!(staging_directory_for(&cfg), None);
+
+        // 显式关闭 staging_check。
+        cfg.tls.mode = ServerTlsMode::AcmeDomain;
+        cfg.tls.staging_check = false;
+        assert_eq!(staging_directory_for(&cfg), None);
+
+        // 自定义 directory（Pebble / 用户指定 staging）不再套一层 staging。
+        cfg.tls.staging_check = true;
+        cfg.tls.acme_directory = "https://pebble:14000/dir".to_string();
+        assert_eq!(staging_directory_for(&cfg), None);
+    }
+
+    #[test]
+    fn failed_acme_falls_back_or_aborts_by_config() {
+        let mut cfg = HubConfig {
+            admin_tls: AdminTlsMode::Off,
+            ..HubConfig::default()
+        };
+        cfg.tls.mode = ServerTlsMode::AcmeDomain;
+        cfg.tls.acme_email = "admin@example.com".to_string();
+        cfg.tls.domains = vec!["board.example.com".to_string()];
+        cfg.tls.fallback_to_self_signed = true;
+        let outcome = handle_acme_failure(
+            &mut cfg,
+            None,
+            3,
+            AcmeIssueFailure::Failed("mock acme error".to_string()),
+        )
+        .expect("默认应回退 self-signed");
+        assert!(matches!(outcome, AcmeOutcome::FellBack));
+        assert_eq!(cfg.tls.mode, ServerTlsMode::SelfSigned);
+        assert!(cfg.tls.domains.is_empty());
+        assert!(cfg.tls.acme_email.is_empty());
+
+        // 关闭回退：必须在写盘前返回错误，调用方会回滚事务。
+        cfg.tls.mode = ServerTlsMode::AcmeDomain;
+        cfg.tls.acme_email = "admin@example.com".to_string();
+        cfg.tls.domains = vec!["board.example.com".to_string()];
+        cfg.tls.fallback_to_self_signed = false;
+        let result = handle_acme_failure(
+            &mut cfg,
+            None,
+            3,
+            AcmeIssueFailure::Unsupported("no tls issue".to_string()),
+        );
+        assert!(result.is_err(), "fallback=false 必须中止");
+        let err = result.err().expect("必须有错误");
+        assert!(err.to_string().contains("fallback_to_self_signed"), "{err}");
+    }
+
+    #[test]
+    fn self_signed_admin_tls_required_supports_non_loopback_bind() {
+        // 非回环管理口 + 显式 SAN：安装器不再拒绝，且健康检查连绑定 IP、
+        // 用该 IP 做 SNI / 主机名校验。
+        let mut args = test_install_args();
+        args.tls_options.admin_tls = Some("required".to_string());
+        args.admin_listen = Some("192.0.2.10:9000".to_string());
+        args.sans = vec!["192.0.2.10".to_string()];
+
+        let paths = Paths::for_role(
+            Role::Hub,
+            Path::new("/opt/rustboard-test"),
+            PathOverrides::default(),
+        )
+        .unwrap();
+        let cfg = new_hub_config(&args, &paths, Retention::default()).unwrap();
+        cfg.validate().expect("配置应自洽");
+        crate::validate_admin_tls(&cfg).expect("非回环 required 应通过主程序校验");
+        assert!(ensure_admin_tls_supported(&cfg).is_ok());
+
+        match health_check_for(&cfg).unwrap() {
+            HealthCheck::Https {
+                addr, server_name, ..
+            } => {
+                assert_eq!(addr, "192.0.2.10:9000".parse::<SocketAddr>().unwrap());
+                assert_eq!(server_name, "192.0.2.10");
+            }
+            other => panic!("expected HTTPS, got {other:?}"),
         }
     }
 }

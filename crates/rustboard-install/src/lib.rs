@@ -20,6 +20,7 @@
 
 mod files;
 mod lock;
+mod network;
 mod path_validate;
 mod paths;
 mod policy;
@@ -33,6 +34,7 @@ mod util;
 
 pub use files::read_private_file;
 pub use lock::{InstallLock, GLOBAL_LOCK_PATH, LOCK_HELD_ENV};
+pub use network::wait_https_ok_with_server_name;
 pub use paths::{PathOverrides, Paths};
 pub use policy::{validate_install_prefix, validate_managed_path, ManagedPathKind};
 pub use prompt::Prompt;

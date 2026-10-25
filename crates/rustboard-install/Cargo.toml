@@ -11,3 +11,10 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 libc = { workspace = true }
+# C5：admin_tls=required 的 HTTPS 健康检查。工作区 rustls 已固定 ring provider，
+# 不引入 openssl / aws-lc；证书校验走 rustboard-common 的客户端配置构造。
+rustls = { workspace = true }
+
+[dev-dependencies]
+# C5：本地自签 TLS 服务，验证错误 SNI / 错误 CA 必须失败。
+rcgen = { workspace = true }
