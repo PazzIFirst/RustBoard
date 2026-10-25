@@ -1249,15 +1249,30 @@ fn prepare_private_acme_agent_ca(cfg: &HubConfig, config_path: &FsPath) -> Resul
     Ok(agent_ca_path)
 }
 
+/// `agent add` 只校验生成安装命令所需的 TLS 字段。
+///
+/// 不能调用完整 `HubConfig::validate()`：容器中 hub CLI 以 root 执行，而
+/// `data_dir` 已 chown 给运行用户 10001，完整校验会因“目录属于其他用户”拒绝。
+fn validate_agent_add_config(cfg: &HubConfig) -> Result<()> {
+    cfg.tls
+        .validate()
+        .context("hub TLS 配置校验失败（检查 tls / domains 等）")?;
+    tls::parse_server_sans(&cfg.effective_server_names())
+        .context("hub 证书名字（server_names / tls.domains）非法")?;
+    Ok(())
+}
+
 fn agent_add(config: Option<PathBuf>, name: String, ttl_minutes: u32) -> Result<()> {
     // KI-20：先校验 name，再打开数据库 / 创建 token。
     validate_agent_name(&name)?;
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
     let cfg = load_config(&path)?;
-    // 配置必须在创建 token / 写 agent CA 之前自洽；ACME 无 domains 等错误
-    // 不能留下一个已入库但无法使用的 enrollment token。
-    cfg.validate()
-        .context("hub 配置校验失败（检查 tls / server_names 等）")?;
+    // 这里只校验生成安装命令所需的 TLS 字段，不能调用完整的
+    // `HubConfig::validate()`：容器里 hub 以 root 执行 CLI，而 data_dir 已
+    // chown 给 10001，完整校验会以“私有目录属于其他用户”拒绝，导致
+    // `docker exec ... agent add` 永远失败。ACME 无 domains 等错误仍需在
+    // 创建 token 之前暴露。
+    validate_agent_add_config(&cfg)?;
 
     let trust = hub_agent_trust(&cfg);
     let url = hub_agent_ws_url(&cfg)?;
@@ -12820,6 +12835,18 @@ mod tests {
                 "危险字符必须整体单引号包裹: {unsafe_value:?}"
             );
         }
+    }
+
+    /// 容器升级回归：`agent add` 只校验 TLS，不得因 data_dir 属于 10001 而失败。
+    #[test]
+    fn c2_agent_add_validation_ignores_data_dir_owner() {
+        let cfg = HubConfig {
+            // 容器中该目录属于 UID 10001，root CLI 不能通过完整 HubConfig::validate。
+            data_dir: PathBuf::from("/data/var/lib/rustboard/hub"),
+            database: "sqlite:///data/var/lib/rustboard/hub/rustboard.db".to_string(),
+            ..HubConfig::default()
+        };
+        validate_agent_add_config(&cfg).expect("agent add 不得校验 data_dir 属主");
     }
 
     /// C2：`hub agent add` 的输出必须跟随 hub 的 TLS 模式；ACME hub 绝不输出指纹。
