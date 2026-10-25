@@ -4944,15 +4944,9 @@ async fn handle_session(mut socket: WebSocket, state: AppState, hello: AgentHell
     // 入库错误 / 任务失败）都由 `cleanup` 统一执行状态清理。
     // `register` 对同一 agent 会等旧连接的清理回调（写 offline/revoked）结束才插入
     // 新连接，因此下面的 `upsert_agent(online)` 一定晚于旧 offline 落库。
-    // 注册在 blocking 线程执行：旧连接清理可能正持有 slot 锁做 PG 写入，不能
-    // 让 tokio worker 卡在这把锁上。
-    let handle = {
-        let sessions = state.sessions.clone();
-        let agent = agent_id.clone();
-        tokio::task::spawn_blocking(move || sessions.register(&agent))
-            .await
-            .context("注册 agent 会话失败")?
-    };
+    // register 只操作内存注册表，不直接触达数据库；旧连接的 PG 清理在 blocking
+    // 线程执行，这里最多等待一次写入完成，不会在 worker 上跑同步 PG。
+    let handle = state.sessions.register(&agent_id);
     let mut cleanup = SessionCleanup::new(
         state.storage.clone(),
         state.sessions.clone(),
