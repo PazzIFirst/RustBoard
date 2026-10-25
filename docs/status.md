@@ -257,13 +257,20 @@
       （`delivery-e2e`/`delivery-docker`/`delivery-arm64`、staging 镜像、SBOM、
       attestation、pre-release 不 latest）；RC 通过后才进入 Phase D/E
 
-**Phase C 已验证（本地）**：`bash -n docker/entrypoint-hub.sh`；默认与 ACME 叠加
-Compose `config` 语法；`docker/Dockerfile` hub `EXPOSE 8443 80 443`；
-`DOCKER_ARCH=amd64 SKIP_ARM64=1 bash tests/e2e/v100-docker.sh`
-**123 PASS / 0 FAIL / 1 SKIP**（可选 arm64/QEMU 检查按设计 SKIP，由
-`delivery-arm64` 原生覆盖）；O.hub/O.union 已同步 80/443 元数据，C.3/H.13/H.14
-仍断言默认 compose 不发布 80/443、8444 不发布。**未验证**：真实 ACME 签发、
-Docker 内 ACME 端到端、面板 HTTPS e2e、管理端 TLS e2e、hosted RC。
+**Phase C 已验证（本地，2026-10-25）**：`cargo fmt/clippy/check`、workspace
+**1220 passed / 0 failed / 4 ignored**、MSRV 1.89 `cargo check --workspace
+--all-targets` 通过、`cargo audit` 0 高危、actionlint 通过；`v100-offline.sh`
+**122 PASS / 0 FAIL / 0 SKIP（STRICT=1）**；`v100-docker.sh` amd64
+**123 PASS / 0 FAIL / 1 SKIP**（可选 arm64/QEMU 按设计 SKIP）；`v100-acme.sh`
+Pebble **3/3**（HTTP-01、TLS-ALPN-01、IP shortlived）真实签发；panel
+`phase_c_panel_tls` **14/14**；web 80/80 + build。O.hub/O.union 已同步 80/443
+元数据，C.3/H.13/H.14 仍断言默认 compose 不发布 80/443、8444 不发布。
+
+**仍未完成 / RC 阻断**：本地 arm64 最终包未重建（QEMU 构建超时，hosted
+`delivery-arm64` 待 RC）；既有 ACME 升级/回退/显式切 self-signed 的事务边界仍有
+评审严重项（回退后失败可能留下配置与证书不一致；wrapper 对既有 ACME 自动注入
+`--offline`），修复后再打 RC；真实 Let's Encrypt staging（域名 + 公网 IPv4
+shortlived）、独立渗透、hosted release workflow 未执行。
 
 **Phase C 限制**：面板证书无热加载，续期后需重启；ACME volume 用非 root
 `--user 10001` 启动时没有 `NET_BIND_SERVICE`，自动续期可能无法绑定 80/443；
