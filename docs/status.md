@@ -270,16 +270,20 @@
 **122 PASS / 0 FAIL / 0 SKIP（STRICT=1）**；`v100-docker.sh` amd64
 **123 PASS / 0 FAIL / 1 SKIP**（可选 arm64/QEMU 按设计 SKIP）；`v100-acme.sh`
 Pebble **3/3**（HTTP-01、TLS-ALPN-01、IP shortlived）真实签发；panel
-`phase_c_panel_tls` **14/14**；web 80/80 + build。O.hub/O.union 已同步 80/443
-元数据，C.3/H.13/H.14 仍断言默认 compose 不发布 80/443、8444 不发布。
+`phase_c_panel_tls` **14/14**；web 80/80 + build。独立渗透报告
+[2026-10-25-m5-phase-c-pentest.md](security/2026-10-25-m5-phase-c-pentest.md)：
+**高危 0 / 中危 0 / 低危 3**（L-01 account.json 旧权限仅 issue 时收紧、L-02
+TLS-ALPN 无 ALPN 客户端仍见挑战证书、L-03 域名证书+回环 admin required 被
+fail-closed 拒绝）。O.hub/O.union 已同步 80/443 元数据，C.3/H.13/H.14 仍断言
+默认 compose 不发布 80/443、8444 不发布。
 
 **仍未完成 / RC 阻断**：本地 arm64 最终包未重建（QEMU 构建超时，hosted
 `delivery-arm64` 待 RC）；升级/回退虽已补事务 guard、new data_dir OwnedDir、
 ACME→self-signed 强制重签与 wrapper `--force` 不再自动 offline，但尚无独立
 升级/回退 e2e；私有 ACME 已支持 `tls.agent_ca_file`/`--agent-ca` 显式稳定根，
 未设置时仍从 `server.crt` 链尾派生（intermediate 轮换需人工更新已分发锚）；
-真实 Let's Encrypt staging（域名 + 公网 IPv4 shortlived）、独立渗透、hosted
-release workflow 未执行。
+真实 Let's Encrypt staging（域名 + 公网 IPv4 shortlived）、hosted release
+workflow、完整面板→hub HTTPS `hub_ca`/arm64 原生门禁未执行。
 
 **Phase C 限制**：面板证书无热加载，续期后需重启；ACME volume 用非 root
 `--user 10001` 启动时没有 `NET_BIND_SERVICE`，自动续期可能无法绑定 80/443；
