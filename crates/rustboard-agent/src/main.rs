@@ -2748,7 +2748,7 @@ mod tests {
             .to_string();
         assert!(err.contains("server_ca"), "错误信息: {err}");
         assert!(
-            err.contains("不是合法 PEM 证书"),
+            err.contains("不是仅含 CERTIFICATE 的 PEM"),
             "错误应说明 PEM 非法: {err}"
         );
 

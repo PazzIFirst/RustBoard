@@ -137,6 +137,10 @@ pub fn read_account(data_dir: &Path) -> Result<Option<String>> {
             return Err(err).with_context(|| format!("读取 ACME 账户失败: {}", path.display()))
         }
     };
+    // 升级路径：旧版本可能把 account.json 写成 0644（其中含账户私钥）。
+    // 读取后立即基于路径收紧；harden 只收紧不放宽，已是 0600 时不做任何事。
+    fsutil::harden(&path, 0o600)
+        .with_context(|| format!("收紧 ACME 账户文件权限失败: {}", path.display()))?;
     // 只校验 JSON 结构；账户 key 的解析交给 instant-acme，避免在本模块重复实现。
     if let Err(err) = serde_json::from_str::<serde_json::Value>(&text) {
         let backup = backup_corrupt(&path)
@@ -164,7 +168,9 @@ pub fn write_account(data_dir: &Path, credentials_json: &str) -> Result<()> {
 }
 
 /// 读取当前生效的服务端材料；缺失一半时报错，两份都不存在返回 `None`。
-#[derive(Debug, Clone)]
+///
+/// 不实现 `Debug`：结构体含 `key_pem`，避免被 `{:?}` / 日志意外打印。
+#[derive(Clone)]
 pub struct ServerMaterial {
     pub cert_pem: String,
     pub key_pem: String,
@@ -229,12 +235,17 @@ pub fn install_server_material_locked(
     if key_pem.trim().is_empty() {
         bail!("ACME 返回的服务端私钥为空，拒绝写入");
     }
+    // WFE 可能返回 cert+key 混合 PEM；先拒绝块外内容/非 CERTIFICATE 区块，
+    // 避免把私钥原样写进 0644 的 server.crt。
+    tls::ensure_certificate_only_pem(cert_pem)
+        .context("ACME 返回的服务端证书不是纯 CERTIFICATE PEM，拒绝写入")?;
     if !tls::cert_matches_key(cert_pem, key_pem).context("校验 ACME 证书与私钥是否配套失败")?
     {
         bail!("ACME 返回的服务端证书与私钥不配套，拒绝写入（旧材料保持不变）");
     }
-    tls::validate_public_server_cert(cert_pem, expected_sans, now_ms())
-        .context("ACME 服务端证书校验失败，拒绝写入（旧材料保持不变）")?;
+    // 至少叶子 + CA，且叶子确实由链中下一张证书签发；单证书/自签/缺失链一律拒绝。
+    tls::validate_acme_chain(cert_pem, expected_sans, now_ms())
+        .context("ACME 服务端证书链校验失败，拒绝写入（旧材料保持不变）")?;
 
     let dir = tls::cert_dir(data_dir);
     fsutil::ensure_private_dir(&dir, 0o700)
@@ -330,8 +341,8 @@ fn backup_corrupt(path: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use rcgen::{
-        CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-        KeyUsagePurpose,
+        BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
+        DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -345,16 +356,38 @@ mod tests {
         dir
     }
 
-    /// 生成 ACME 风格的测试证书：SAN 指定域名、无 CN、serverAuth、非 CA。
+    /// 生成 ACME 风格的测试证书链：叶子由测试 CA 真实签名（不是 self-signed），
+    /// SAN 指定域名、无 CN、serverAuth、非 CA；返回「叶子 + CA」与叶子私钥。
     fn leaf(domain: &str) -> (String, String) {
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "Test ACME CA");
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_pem = ca_cert.pem();
+
         let mut params = CertificateParams::new(vec![domain.to_string()]).unwrap();
+        let subject_alt_names = params.subject_alt_names.clone();
         params.distinguished_name = DistinguishedName::new();
         params.is_ca = IsCa::NoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let key = KeyPair::generate().unwrap();
-        let cert = params.self_signed(&key).unwrap();
-        (cert.pem(), key.serialize_pem())
+        let csr = params.serialize_request(&key).unwrap();
+        let mut csr = CertificateSigningRequestParams::from_pem(&csr.pem().unwrap()).unwrap();
+        csr.params.subject_alt_names = subject_alt_names;
+        csr.params.is_ca = IsCa::NoCa;
+        csr.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let cert = csr.signed_by(&ca_cert, &ca_key).unwrap();
+        (format!("{}{}", cert.pem(), ca_pem), key.serialize_pem())
     }
 
     #[test]
@@ -428,6 +461,21 @@ mod tests {
                 .mode()
                 & 0o777;
             assert_eq!(mode, 0o600);
+
+            // 升级路径：既有 0644 account.json 读取时必须收紧到 0600。
+            std::fs::set_permissions(account_path(&dir), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+        assert_eq!(read_account(&dir).unwrap().as_deref(), Some(json));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(account_path(&dir))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "读取既有 0644 账户文件后必须收紧到 0600");
         }
         std::fs::write(account_path(&dir), b"{broken").unwrap();
         let err = read_account(&dir).expect_err("损坏账户必须报错");
@@ -497,13 +545,50 @@ mod tests {
     }
 
     #[test]
+    fn install_rejects_self_signed_and_mixed_pem() {
+        let dir = temp_dir("reject-chain");
+        let sans = vec!["board.example.com".to_string()];
+
+        // 旧的 self-signed leaf：形状合法但不是 ACME 链，必须拒绝。
+        let mut params = CertificateParams::new(vec!["board.example.com".to_string()]).unwrap();
+        params.distinguished_name = DistinguishedName::new();
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let key = KeyPair::generate().unwrap();
+        let self_signed = params.self_signed(&key).unwrap().pem();
+        let err = install_server_material(&dir, &self_signed, &key.serialize_pem(), &sans)
+            .expect_err("单证书 self-signed 必须拒绝");
+        assert!(format!("{err:#}").contains("至少需要"), "错误信息: {err:#}");
+        assert!(!tls::cert_dir(&dir).join(tls::SERVER_CERT_FILE).exists());
+
+        // WFE 返回 cert+key 混合 PEM：写盘前直接拒绝，不能把私钥写进 0644。
+        let (chain, leaf_key) = leaf("board.example.com");
+        let mixed = format!("{chain}{leaf_key}");
+        let err = install_server_material(&dir, &mixed, &leaf_key, &sans)
+            .expect_err("cert+key 混合 PEM 必须拒绝");
+        assert!(
+            format!("{err:#}").contains("只允许 CERTIFICATE"),
+            "错误信息: {err:#}"
+        );
+        assert!(!tls::cert_dir(&dir).join(tls::SERVER_CERT_FILE).exists());
+
+        // 合法链仍然可以安装。
+        install_server_material(&dir, &chain, &leaf_key, &sans).expect("合法链必须可以安装");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn read_server_material_detects_half_pair() {
         let dir = temp_dir("half-pair");
         assert!(read_server_material(&dir).unwrap().is_none());
         let certs = tls::cert_dir(&dir);
         std::fs::create_dir_all(&certs).unwrap();
         std::fs::write(certs.join(tls::SERVER_CERT_FILE), "cert").unwrap();
-        let err = read_server_material(&dir).expect_err("半套材料必须报错");
+        let err = match read_server_material(&dir) {
+            Ok(_) => panic!("半套材料必须报错"),
+            Err(err) => err,
+        };
         assert!(format!("{err:#}").contains("私钥缺失"), "错误信息: {err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }

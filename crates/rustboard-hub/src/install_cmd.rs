@@ -54,6 +54,11 @@ const ACME_ISSUE_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_ACME_DOMAINS: usize = 20;
 /// Let's Encrypt staging directory；仅用于安装前的链路检查（证书不可信、可丢弃）。
 const LE_STAGING_DIRECTORY: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
+/// 私有 ACME 安装时从 `server.crt` 链尾提取的 agent 信任锚（0644）。
+///
+/// `tls.acme_ca_file` 是 ACME WFE 的 HTTPS 根，**不是** hub 服务端证书的 CA；
+/// 同机 panel 的 `--hub-ca` 与安装器健康检查都必须用本文件。
+const ACME_AGENT_CA_FILE: &str = "agent-ca.pem";
 /// systemd 只读取固定目录中的 unit；写进 prefix 的 unit 不会被读取，也就不能
 /// 用来 enable / restart / stop，必须在写盘和调用 systemctl 之前拒绝。
 const SYSTEMD_UNIT_DIR_REQUIRED: &str =
@@ -238,6 +243,22 @@ fn parse_acme_challenge(value: Option<&str>) -> Result<AcmeChallenge> {
         Some("tls-alpn-01") => Ok(AcmeChallenge::TlsAlpn01),
         Some(other) => bail!("--acme-challenge 只接受 http-01 / tls-alpn-01，实际 {other:?}"),
     }
+}
+
+/// 读到最终配置后，`--offline` 仍必须与 ACME 模式互斥。
+///
+/// CLI 参数阶段的检查看不到磁盘上的既有配置：`packaging/install.sh` 会为既有
+/// 安装自动注入 `--offline`，如果不在这里拒绝，后续诊断与 `tls issue` 仍会联网。
+/// 必须在 Diagnostics / InstallTxn 之前调用。
+fn ensure_offline_not_acme(args: &InstallArgs, cfg: &HubConfig) -> Result<()> {
+    if args.offline && cfg.tls.mode.is_acme() {
+        bail!(concat!(
+            "--offline 与已有 ACME 配置互斥：当前配置的 tls.mode 为 ACME，",
+            "安装需要诊断 80/443 链路并调用 tls issue 联网签发；",
+            "请去掉 --offline，或显式使用 --tls self-signed 切回自签（会重建服务端证书）"
+        ));
+    }
+    Ok(())
 }
 
 /// 解析 `--admin-tls`。
@@ -768,7 +789,8 @@ fn validate_hub_config(cfg: &HubConfig) -> Result<()> {
     crate::validate_admin_tls(cfg).context("管理 API 监听地址不安全")
 }
 
-/// 健康检查信任来源：ACME 公共证书用系统根，自签 / 私有 ACME 用指定 CA 文件。
+/// 健康检查信任来源：ACME 公共证书用系统根，自签用本地 `ca.crt`，
+/// 私有 ACME 用从 `server.crt` 链尾提取的 `agent-ca.pem`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HealthCa {
     SystemRoots,
@@ -858,11 +880,13 @@ fn health_check_for(cfg: &HubConfig) -> Result<HealthCheck> {
             HealthCa::PemFile(tls::cert_dir(&cfg.data_dir).join(tls::CA_CERT_FILE))
         }
         ServerTlsMode::AcmeDomain | ServerTlsMode::AcmeIp => {
-            let ca_file = cfg.tls.acme_ca_file.trim();
-            if ca_file.is_empty() {
+            // 公共 ACME 用系统根；私有 ACME 的信任锚是服务端证书链尾（签发后由
+            // `prepare_private_acme_agent_ca` 提取），绝不能把 ACME WFE 的 HTTPS
+            // 根当作 hub 证书 CA。
+            if cfg.tls.acme_ca_file.trim().is_empty() {
                 HealthCa::SystemRoots
             } else {
-                HealthCa::PemFile(PathBuf::from(ca_file))
+                HealthCa::PemFile(tls::cert_dir(&cfg.data_dir).join(ACME_AGENT_CA_FILE))
             }
         }
     };
@@ -1388,56 +1412,167 @@ fn verify_acme_server_material(data_dir: &Path) -> Result<String> {
     ))
 }
 
+/// 私有 ACME：从 `server.crt` 链尾提取 hub 服务端证书的 CA，写 `agent-ca.pem`。
+///
+/// `tls.acme_ca_file` 只用于校验 ACME WFE 的 HTTPS 连接（Pebble / 私有 CA），
+/// 与 hub 服务端证书链无关；把它传给同机 panel 的 `--hub-ca` 会让 panel 校验证书
+/// 失败。公共 ACME（`acme_ca_file` 为空）与 self-signed 返回 `None`。
+fn prepare_private_acme_agent_ca(cfg: &HubConfig) -> Result<Option<PathBuf>> {
+    if !cfg.tls.mode.is_acme() || cfg.tls.acme_ca_file.trim().is_empty() {
+        return Ok(None);
+    }
+    let dir = tls::cert_dir(&cfg.data_dir);
+    let chain_path = dir.join(tls::SERVER_CERT_FILE);
+    let chain = fs::read_to_string(&chain_path)
+        .with_context(|| format!("读取私有 ACME 服务端证书链失败: {}", chain_path.display()))?;
+    let anchor = tls::last_certificate_pem(&chain)
+        .with_context(|| format!("提取私有 ACME 证书链尾 CA 失败: {}", chain_path.display()))?;
+    if !tls::certificate_is_ca(&anchor).context("校验私有 ACME 链尾证书失败")? {
+        bail!(
+            "私有 ACME 服务端证书链尾不是 CA 证书（{}）；拒绝把它作为 agent / panel 的信任锚",
+            chain_path.display()
+        );
+    }
+    let dest = dir.join(ACME_AGENT_CA_FILE);
+    fsutil::atomic_write(&dest, anchor.as_bytes(), 0o644)
+        .with_context(|| format!("写入私有 ACME agent CA 失败: {}", dest.display()))?;
+    Ok(Some(dest))
+}
+
 /// 安装前服务端证书材料的快照；ACME 成功后若后续安装失败，回滚时恢复旧证书。
 ///
-/// 只保存安装前**成对存在**的 `server.crt` / `server.key`；全新安装没有旧材料，
-/// 由事务的 OwnedDir 回滚删除整个数据目录。恢复只用 `fsutil::atomic_write`，
-/// 路径仍来自经过 allowlist 校验的 `data_dir`。
+/// 只保存安装前**成对存在**的 `server.crt` / `server.key`。全新安装（安装前
+/// `data_dir` 不存在）没有旧材料，失败时清理本次创建的 `certs` 目录，并仅在
+/// `data_dir` 已空时删除它；**绝不**递归删除 `data_dir`，避免误删并发写入或
+/// 用户预置的其它文件。安装前已存在 `data_dir` 但没有旧证书时不做任何删除。
 struct AcmeCertGuard {
-    dir: PathBuf,
+    /// 数据目录（可能由本次安装创建）。
+    data_dir_path: PathBuf,
+    /// 本次 ACME 写入的证书目录 `<data_dir>/certs`。
+    certs_path: PathBuf,
+    /// 安装前的 `server.crt` / `server.key`（只有成对存在才记录）。
     old: Option<(Vec<u8>, Vec<u8>)>,
+    /// 安装前的 `agent-ca.pem`（私有 ACME 派生信任锚）；`None` 表示原先不存在。
+    old_agent_ca: Option<Vec<u8>>,
+    /// `issue_acme_with_fallback` 开始前 `data_dir` 是否已存在。
+    data_dir_existed_before: bool,
     armed: bool,
 }
 
 impl AcmeCertGuard {
-    fn capture(data_dir: &Path) -> Self {
-        let dir = tls::cert_dir(data_dir);
-        let cert = fs::read(dir.join(tls::SERVER_CERT_FILE)).ok();
-        let key = fs::read(dir.join(tls::SERVER_KEY_FILE)).ok();
+    fn capture(data_dir: &Path, data_dir_existed_before: bool) -> Self {
+        let certs_path = tls::cert_dir(data_dir);
+        let cert = fs::read(certs_path.join(tls::SERVER_CERT_FILE)).ok();
+        let key = fs::read(certs_path.join(tls::SERVER_KEY_FILE)).ok();
         let old = match (cert, key) {
             (Some(cert), Some(key)) => Some((cert, key)),
             _ => None,
         };
+        // agent-ca.pem 由新证书链尾派生；回滚旧证书时必须一起恢复/删除，
+        // 否则面板会信任新链尾而 hub 已回到旧证书，导致连接校验失败。
+        let old_agent_ca = fs::read(certs_path.join(ACME_AGENT_CA_FILE)).ok();
         Self {
-            dir,
+            data_dir_path: data_dir.to_path_buf(),
+            certs_path,
             old,
+            old_agent_ca,
+            data_dir_existed_before,
             armed: false,
         }
     }
 
+    /// 有旧材料要恢复，或本次是全新安装（失败时需要清理新建目录）。
     fn arm(&mut self) {
-        self.armed = self.old.is_some();
+        self.armed = self.old.is_some() || !self.data_dir_existed_before;
     }
 
     fn disarm(&mut self) {
         self.armed = false;
     }
 
-    /// 恢复安装前的证书 / 私钥；没有旧材料或未 arm 时是空操作。
+    /// 恢复安装前的证书 / 私钥；全新安装失败时清理本次创建的证书材料。
     fn restore(&mut self) -> Result<()> {
         if !self.armed {
             return Ok(());
         }
         self.armed = false;
-        let Some((cert, key)) = &self.old else {
+        if let Some((cert, key)) = &self.old {
+            fsutil::atomic_write(&self.certs_path.join(tls::SERVER_KEY_FILE), key, 0o600)
+                .context("恢复安装前的服务端私钥失败")?;
+            fsutil::atomic_write(&self.certs_path.join(tls::SERVER_CERT_FILE), cert, 0o644)
+                .context("恢复安装前的服务端证书失败")?;
+            let agent_ca = self.certs_path.join(ACME_AGENT_CA_FILE);
+            match &self.old_agent_ca {
+                Some(bytes) => fsutil::atomic_write(&agent_ca, bytes, 0o644)
+                    .context("恢复安装前的 agent CA 失败")?,
+                None => match fs::remove_file(&agent_ca) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!("删除本次派生的 agent CA {} 失败", agent_ca.display())
+                        })
+                    }
+                },
+            }
+            println!("已恢复安装前的服务端证书（ACME 安装未完成）。");
             return Ok(());
-        };
-        fsutil::atomic_write(&self.dir.join(tls::SERVER_KEY_FILE), key, 0o600)
-            .context("恢复安装前的服务端私钥失败")?;
-        fsutil::atomic_write(&self.dir.join(tls::SERVER_CERT_FILE), cert, 0o644)
-            .context("恢复安装前的服务端证书失败")?;
-        println!("已恢复安装前的服务端证书（ACME 安装未完成）。");
+        }
+        if self.data_dir_existed_before {
+            // 安装前已有数据目录：这里没有旧证书可恢复，也绝不删除目录内容。
+            return Ok(());
+        }
+        self.remove_created_material()
+    }
+
+    /// 全新安装失败：删除本次创建的 `certs`（CA / account / state / staging 残留），
+    /// 再仅当 `data_dir` 为空时用 `remove_dir` 删除它。
+    fn remove_created_material(&self) -> Result<()> {
+        match fs::symlink_metadata(&self.certs_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                bail!(
+                    "证书目录 {} 在安装期间变成符号链接，拒绝递归删除（避免删除链接目标）",
+                    self.certs_path.display()
+                )
+            }
+            Ok(meta) if meta.is_dir() => {
+                fs::remove_dir_all(&self.certs_path).with_context(|| {
+                    format!("清理本次创建的证书目录 {} 失败", self.certs_path.display())
+                })?
+            }
+            Ok(_) => bail!("证书路径 {} 不是目录，拒绝清理", self.certs_path.display()),
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("检查本次创建的证书目录 {} 失败", self.certs_path.display())
+                })
+            }
+        }
+        match fs::remove_dir(&self.data_dir_path) {
+            Ok(()) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "删除本次创建的空数据目录 {} 失败",
+                        self.data_dir_path.display()
+                    )
+                })
+            }
+        }
+        println!("已清理本次安装创建的证书材料（ACME 安装未完成）。");
         Ok(())
+    }
+}
+
+/// 恢复 guard，失败只警告（不能掩盖原始安装错误）。
+fn restore_acme_guard(guard: &mut AcmeCertGuard) {
+    if let Err(err) = guard.restore() {
+        eprintln!("警告：恢复/清理 ACME 证书材料失败: {err:#}");
     }
 }
 
@@ -1499,6 +1634,167 @@ fn staging_directory_for(cfg: &HubConfig) -> Option<&'static str> {
     Some(LE_STAGING_DIRECTORY)
 }
 
+/// staging 专用的临时 data_dir；Drop 时递归清理（覆盖 panic / 提前返回路径）。
+///
+/// staging 绝不能复用真实 `data_dir`：ACME `account.json` 会绑定首次使用的
+/// directory（staging），写入真实数据目录后 production 的 `ensure_same_directory`
+/// 必然拒绝继续，同时 staging 证书还会覆盖 live `server.crt`。
+///
+/// 临时目录放在真实 `data_dir` 的私有子目录下（`<data_dir>/.acme-staging-<uuid>`，
+/// 0700）：不能直接用 `std::env::temp_dir()`，因为 `tls issue` 会执行
+/// `HubConfig::validate()` → `validate_private_dir_path(data_dir)`，共享 / sticky
+/// 顶层目录或某些 TMPDIR 布局会被拒绝，导致 staging 永远失败。
+struct AcmeStagingDir {
+    path: PathBuf,
+    removed: bool,
+}
+
+impl AcmeStagingDir {
+    fn create(data_dir: &Path) -> Result<Self> {
+        let path = data_dir.join(format!(".acme-staging-{}", uuid::Uuid::new_v4().simple()));
+        fsutil::ensure_private_dir(&path, 0o700)
+            .with_context(|| format!("创建 ACME staging 临时目录 {} 失败", path.display()))?;
+        Ok(Self {
+            path,
+            removed: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 立即清理；失败由调用方决定警告还是上报。
+    fn cleanup(&mut self) -> Result<()> {
+        if self.removed {
+            return Ok(());
+        }
+        self.removed = true;
+        match fs::remove_dir_all(&self.path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).with_context(|| {
+                format!("删除 ACME staging 临时目录 {} 失败", self.path.display())
+            }),
+        }
+    }
+}
+
+impl Drop for AcmeStagingDir {
+    fn drop(&mut self) {
+        if self.removed {
+            return;
+        }
+        if let Err(err) = fs::remove_dir_all(&self.path) {
+            if err.kind() != ErrorKind::NotFound {
+                eprintln!(
+                    "警告：清理 ACME staging 临时目录 {} 失败: {err}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+}
+
+/// staging 配置：`data_dir` 指向独立临时目录，并关闭二次 staging。
+///
+/// 配置本身可以写真实 `paths.config`（由事务回滚），但 `tls issue` 写出的
+/// 证书 / 账户 / 状态必须全部落在临时目录。
+fn staging_config(cfg: &HubConfig, staging_dir: &Path, staging_directory: &str) -> HubConfig {
+    let mut staging_cfg = cfg.clone();
+    staging_cfg.data_dir = staging_dir.to_path_buf();
+    staging_cfg.database = sqlite_database(staging_dir);
+    staging_cfg.tls.acme_directory = staging_directory.to_string();
+    staging_cfg.tls.staging_check = false;
+    staging_cfg
+}
+
+/// staging 单轮失败：`Issue` 走回退/错误决策，`Fatal` 是本地配置或目录错误。
+enum StagingFailure {
+    Issue(AcmeIssueFailure),
+    Fatal(anyhow::Error),
+}
+
+/// 在独立临时目录跑一次 staging 签发；无论成功失败都清理临时目录。
+fn run_staging_issue(
+    cfg: &HubConfig,
+    staging_directory: &str,
+    paths: &Paths,
+    txn: &mut InstallTxn,
+    policy: tls::CertPolicy,
+) -> std::result::Result<(), StagingFailure> {
+    let mut staging = AcmeStagingDir::create(&cfg.data_dir).map_err(StagingFailure::Fatal)?;
+    let staging_cfg = staging_config(cfg, staging.path(), staging_directory);
+    // 先准备 staging 自己的客户端 CA（mTLS 材料与 ACME 账户互相独立），再写配置。
+    tls::ensure_client_ca(staging.path(), policy)
+        .context("准备 ACME staging 临时客户端 CA 失败")
+        .map_err(StagingFailure::Fatal)?;
+    let staging_text = toml::to_string_pretty(&staging_cfg)
+        .context("序列化 ACME staging 配置失败")
+        .map_err(StagingFailure::Fatal)?;
+    txn.write(&paths.config, staging_text.as_bytes(), 0o600)
+        .map_err(StagingFailure::Fatal)?;
+    let result = run_tls_issue(&paths.config, ACME_ISSUE_TIMEOUT).map_err(StagingFailure::Issue);
+    if let Err(err) = staging.cleanup() {
+        eprintln!("警告：{err:#}");
+    }
+    result
+}
+
+/// 已有数据目录的客户端 CA 完整性检查。
+///
+/// `ensure_client_ca` 在两个 CA 文件都不存在时会**新建** CA；对已有数据目录这是
+/// 静默替换信任锚，会让所有已纳管 agent 失联。只有全新安装（`data_dir` 完全
+/// 不存在）才允许自动创建；已有目录缺少任一文件都必须拒绝并提示从备份恢复。
+///
+/// 本函数只读、不创建任何目录；安装器在 ACME 预检（包括可能回退 self-signed
+/// 的分支）之前也必须调用它，不能只在 `tls issue` 前才检查。
+fn ensure_existing_acme_ca_complete(data_dir: &Path, data_dir_existed_before: bool) -> Result<()> {
+    if !data_dir_existed_before {
+        return Ok(());
+    }
+    match fs::symlink_metadata(data_dir) {
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "已有数据目录 {} 是符号链接，拒绝在其上准备 ACME 证书材料",
+            data_dir.display()
+        ),
+        Ok(meta) if !meta.is_dir() => bail!(
+            "已有数据路径 {} 不是目录，拒绝在其上准备 ACME 证书材料",
+            data_dir.display()
+        ),
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("检查已有数据目录 {} 失败", data_dir.display()))
+        }
+    }
+    let dir = tls::cert_dir(data_dir);
+    let ca_cert = dir.join(tls::CA_CERT_FILE);
+    let ca_key = dir.join(tls::CA_KEY_FILE);
+    let cert_ok = regular_file_exists(&ca_cert, "客户端 CA 证书")?;
+    let key_ok = regular_file_exists(&ca_key, "客户端 CA 私钥")?;
+    if !cert_ok || !key_ok {
+        bail!(
+            "已有数据目录缺少客户端 CA，拒绝静默重建；请从备份恢复或显式迁移\
+             （{} 与 {} 必须成对存在）",
+            ca_cert.display(),
+            ca_key.display()
+        );
+    }
+    Ok(())
+}
+
+/// ACME 签发前准备客户端 CA：已有数据目录只校验，全新安装才创建。
+fn ensure_acme_client_ca(
+    data_dir: &Path,
+    data_dir_existed_before: bool,
+    policy: tls::CertPolicy,
+) -> Result<()> {
+    ensure_existing_acme_ca_complete(data_dir, data_dir_existed_before)?;
+    tls::ensure_client_ca(data_dir, policy).context("准备 ACME 模式下的客户端 CA 失败")
+}
+
 /// 把 ACME 失败转成“回退 self-signed”或硬错误，并打印分层诊断与重试命令。
 fn handle_acme_failure(
     cfg: &mut HubConfig,
@@ -1554,47 +1850,51 @@ fn handle_acme_failure(
 ///
 /// 端口 / 防火墙 / 云诊断在调用本函数前已完成（任何写盘之前）。本函数只负责
 /// 配置落盘（事务内，可回滚）、签发、校验与回退决策。
+///
+/// 事务边界：`InstallTxn` 只管理配置 / unit / 二进制；`certs/` 下的 CA、ACME
+/// 账户/状态与服务端证书由 [`AcmeCertGuard`] 负责。全新安装失败时清理本次创建
+/// 的 `certs`，已有安装则恢复旧 `server.crt/key`（账户/状态保留）。
 fn issue_acme_with_fallback(
     cfg: &mut HubConfig,
     paths: &Paths,
     txn: &mut InstallTxn,
     diag: Option<&Diagnostics>,
+    data_dir_existed_before: bool,
 ) -> Result<AcmeOutcome> {
     // 客户端 CA 与 ACME 账户是两条独立材料链：先确保 mTLS 用的客户端 CA 可用，
-    // 再让 `tls issue` 只负责服务端证书。全新安装失败时由事务回滚整个数据目录。
+    // 再让 `tls issue` 只负责服务端证书。已有数据目录缺 CA 时绝不静默重建。
     let policy = tls::CertPolicy {
         ca_days: cfg.ca_validity_days,
         server_days: cfg.server_cert_validity_days,
         client_days: cfg.client_cert_validity_days,
     };
-    tls::ensure_client_ca(&cfg.data_dir, policy).context("准备 ACME 模式下的客户端 CA 失败")?;
-
-    // `tls issue` 需要一个已落盘的合法配置路径；写进事务，失败可恢复旧配置。
-    // 先跑 staging（仅默认 LE production + acme-domain）：staging 证书不可信、
-    // 会被 production 覆盖，但能提前暴露 DNS / 80 / 443 / 安全组问题。
-    let mut guard = AcmeCertGuard::capture(&cfg.data_dir);
+    let mut guard = AcmeCertGuard::capture(&cfg.data_dir, data_dir_existed_before);
     guard.arm();
+    if let Err(err) = ensure_acme_client_ca(&cfg.data_dir, data_dir_existed_before, policy) {
+        restore_acme_guard(&mut guard);
+        return Err(err);
+    }
 
+    // staging 使用独立临时 data_dir：账户不属于 production directory，证书也不
+    // 会写进 live server.crt。staging 失败立即走回退/错误路径，不进入 3 轮 production。
     if let Some(staging_directory) = staging_directory_for(cfg) {
         println!(
             "ACME staging 检查：先向 {staging_directory} 申请一次临时证书（仅验证域名与 80/443 链路）..."
         );
-        let mut staging_cfg = cfg.clone();
-        staging_cfg.tls.acme_directory = staging_directory.to_string();
-        let staging_text =
-            toml::to_string_pretty(&staging_cfg).context("序列化 ACME staging 配置失败")?;
-        txn.write(&paths.config, staging_text.as_bytes(), 0o600)?;
-        if let Err(failure) = run_tls_issue(&paths.config, ACME_ISSUE_TIMEOUT) {
-            if let Err(err) = guard.restore() {
-                eprintln!("警告：恢复安装前的服务端证书失败: {err:#}");
+        match run_staging_issue(cfg, staging_directory, paths, txn, policy) {
+            Ok(()) => println!("ACME staging 检查通过；继续向 production 申请受信任证书。"),
+            Err(StagingFailure::Issue(failure)) => {
+                restore_acme_guard(&mut guard);
+                return handle_acme_failure(cfg, diag, 1, failure);
             }
-            return handle_acme_failure(cfg, diag, 1, failure);
+            Err(StagingFailure::Fatal(err)) => {
+                restore_acme_guard(&mut guard);
+                return Err(err);
+            }
         }
-        println!("ACME staging 检查通过；继续向 production 申请受信任证书。");
     }
 
-    // 配置序列化 / 事务写入失败时，staging 证书可能已经落盘；必须先恢复安装前
-    // 材料再返回错误，不能把不可信 staging 证书留给下一次启动。
+    // 配置序列化 / 事务写入失败时，staging 已清理；仍先恢复 guard 再返回错误。
     let production = (|| -> Result<(usize, std::result::Result<(), AcmeIssueFailure>)> {
         let config_text = toml::to_string_pretty(cfg).context("序列化 ACME 配置失败")?;
         txn.write(&paths.config, config_text.as_bytes(), 0o600)?;
@@ -1621,9 +1921,7 @@ fn issue_acme_with_fallback(
     let (attempts, result) = match production {
         Ok(value) => value,
         Err(err) => {
-            if let Err(restore_err) = guard.restore() {
-                eprintln!("警告：恢复安装前的服务端证书失败: {restore_err:#}");
-            }
+            restore_acme_guard(&mut guard);
             return Err(err);
         }
     };
@@ -1631,7 +1929,22 @@ fn issue_acme_with_fallback(
     match result {
         Ok(()) => match verify_acme_server_material(&cfg.data_dir) {
             Ok(summary) => {
+                // 私有 ACME 的 agent/panel 信任锚来自服务端证书链尾；必须在
+                // production 材料校验通过后提取，否则会缓存半套/错误证书。
+                let agent_ca = match prepare_private_acme_agent_ca(cfg) {
+                    Ok(agent_ca) => agent_ca,
+                    Err(err) => {
+                        restore_acme_guard(&mut guard);
+                        return Err(err);
+                    }
+                };
                 println!("ACME 服务端证书已签发并校验通过：{summary}");
+                if let Some(path) = agent_ca {
+                    println!(
+                        "私有 ACME：已从服务端证书链尾提取 agent / panel 信任锚 {}",
+                        path.display()
+                    );
+                }
                 if let Some(diag) = diag {
                     diag.print(StagingOutcome::Succeeded);
                 }
@@ -1639,18 +1952,13 @@ fn issue_acme_with_fallback(
             }
             Err(err) => {
                 // 校验失败同样不能留下来源不明的新证书。
-                if let Err(restore_err) = guard.restore() {
-                    eprintln!("警告：恢复安装前的服务端证书失败: {restore_err:#}");
-                }
+                restore_acme_guard(&mut guard);
                 Err(err)
             }
         },
         Err(failure) => {
-            // production 失败时可能已留下 staging 证书；恢复安装前材料（全新安装
-            // 没有旧材料，由后续 self-signed 生成或事务回滚清理）。
-            if let Err(err) = guard.restore() {
-                eprintln!("警告：恢复安装前的服务端证书失败: {err:#}");
-            }
+            // production 失败：恢复旧服务端材料；全新安装由 guard 清理 certs。
+            restore_acme_guard(&mut guard);
             handle_acme_failure(cfg, diag, attempts, failure)
         }
     }
@@ -1798,6 +2106,11 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
                 let cfg = load_hub_config_checked(&paths.config)?;
                 validate_hub_config(&cfg).context("已有配置校验失败，拒绝补装面板")?;
                 ensure_admin_tls_supported(&cfg)?;
+                // 旧版本安装的私有 ACME 可能还没有 agent-ca.pem：补装面板前从
+                // 现有 server.crt 链尾派生信任锚，避免把 ACME WFE 根当作 hub CA。
+                if let Some(path) = prepare_private_acme_agent_ca(&cfg)? {
+                    println!("私有 ACME：已刷新 agent / panel 信任锚 {}", path.display());
+                }
                 install_panel(&args, &paths, &cfg, manage)?;
                 println!("RustBoard Hub 已安装；本次只补装了缺失的同机面板。");
             } else {
@@ -1832,12 +2145,23 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
     }
 
     let (mut cfg, need_certs) = prepare_config(&args, &paths, retention, config_present)?;
+    // B：--offline 的 CLI 参数检查只覆盖本次显式 ACME；已有配置可能本来就是
+    // ACME。必须在任何诊断 / 事务 / 联网之前拒绝，且不得改写配置。
+    ensure_offline_not_acme(&args, &cfg)?;
     // 已有配置的 data_dir 是权威值：升级/重装不跟随 flag 默认值漂移。
     paths.data_dir = cfg.data_dir.clone();
     // 配置来自 state/磁盘：admin_tls=required 在 Phase C 用 HTTPS 健康检查支持，
     // 但必须在写盘前确认能推导出 SNI / CA，不能等到启动后误判并回滚。
     ensure_admin_tls_supported(&cfg)?;
     validate_install_paths(&paths)?;
+    // ACME 材料（CA / 账户 / 状态 / 证书）不在 InstallTxn 的备份模型里：在诊断与
+    // 任何回退路径之前记录 data_dir 是否已存在。只有全新安装才允许自动建 CA。
+    let data_dir_existed_before = !path_is_missing(&paths.data_dir, "数据目录")?;
+    if cfg.tls.mode.is_acme() {
+        // 必须在可能回退 self-signed 的端口预检之前拒绝：否则回退路径会调用
+        // ensure_hub_material，在已有数据目录里静默新建 CA，导致所有 agent 失联。
+        ensure_existing_acme_ca_complete(&paths.data_dir, data_dir_existed_before)?;
+    }
     // L7：需要补证书但数据目录已存在（可能有旧 CA / agent 指纹）时拒绝重建。
     ensure_cert_rebuild_allowed(&paths.data_dir, need_certs)?;
     if !need_certs && (args.advertise.is_some() || !args.sans.is_empty()) {
@@ -1883,7 +2207,13 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
     // 后继续，确保最终落盘的配置与证书来源一致。
     let mut acme_guard: Option<AcmeCertGuard> = None;
     if cfg.tls.mode.is_acme() {
-        match issue_acme_with_fallback(&mut cfg, &paths, &mut txn, diag.as_ref()) {
+        match issue_acme_with_fallback(
+            &mut cfg,
+            &paths,
+            &mut txn,
+            diag.as_ref(),
+            data_dir_existed_before,
+        ) {
             Ok(AcmeOutcome::Issued { guard }) => acme_guard = Some(guard),
             Ok(AcmeOutcome::FellBack) => {
                 force_self_signed = true;
@@ -1936,9 +2266,7 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
             let rollback = txn.rollback();
             // 事务只恢复 config/unit/binary；ACME 写出的证书/私钥由 guard 恢复。
             if let Some(mut guard) = acme_guard.take() {
-                if let Err(restore_err) = guard.restore() {
-                    eprintln!("警告：恢复安装前的服务端证书失败: {restore_err:#}");
-                }
+                restore_acme_guard(&mut guard);
             }
             if plan.manager.manage {
                 if let Err(reload_err) = plan.manager.daemon_reload() {
@@ -4089,12 +4417,13 @@ mod tests {
             other => panic!("expected HTTPS, got {other:?}"),
         }
 
-        // 私有 / Pebble ACME：信任 acme_ca_file。
+        // 私有 / Pebble ACME：信任从 server.crt 链尾提取的 agent-ca.pem，
+        // 不是 ACME WFE 的 HTTPS 根（acme_ca_file）。
         cfg.tls.acme_ca_file = "/etc/rustboard/pebble-ca.pem".to_string();
         match health_check_for(&cfg).unwrap() {
             HealthCheck::Https { ca, .. } => assert_eq!(
                 ca,
-                HealthCa::PemFile(PathBuf::from("/etc/rustboard/pebble-ca.pem"))
+                HealthCa::PemFile(tls::cert_dir(&cfg.data_dir).join(ACME_AGENT_CA_FILE))
             ),
             other => panic!("expected HTTPS, got {other:?}"),
         }
@@ -4135,12 +4464,15 @@ mod tests {
             }
         );
 
-        // 私有 ACME：传 acme CA。
+        // 私有 ACME：传从 server.crt 链尾提取的 agent-ca.pem，而不是 acme_ca_file。
         let dir = TempDir::new("panel-ca");
         let ca = dir.path().join("pebble-ca.pem");
         fs::write(&ca, "pem").unwrap();
         cfg.tls.acme_ca_file = ca.display().to_string();
-        assert_eq!(panel_endpoint(&cfg).unwrap().hub_ca, Some(ca.clone()));
+        assert_eq!(
+            panel_endpoint(&cfg).unwrap().hub_ca,
+            Some(tls::cert_dir(&cfg.data_dir).join(ACME_AGENT_CA_FILE))
+        );
     }
 
     #[test]
@@ -4264,6 +4596,278 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("不匹配"), "{err}");
+    }
+
+    #[test]
+    fn private_acme_agent_ca_extracts_chain_tail() {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+        let dir = TempDir::new("acme-agent-ca");
+        let certs = tls::cert_dir(dir.path());
+        fs::create_dir_all(&certs).unwrap();
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "RustBoard Test ACME CA");
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let mut leaf_params =
+            CertificateParams::new(vec!["board.example.com".to_string()]).unwrap();
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "board.example.com");
+        let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+        let chain = format!("{}{}", leaf.pem(), ca.pem());
+        fs::write(certs.join(tls::SERVER_CERT_FILE), &chain).unwrap();
+
+        let mut cfg = HubConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..HubConfig::default()
+        };
+        cfg.tls.mode = ServerTlsMode::AcmeDomain;
+        cfg.tls.acme_email = "admin@example.com".to_string();
+        cfg.tls.domains = vec!["board.example.com".to_string()];
+        cfg.tls.acme_ca_file = "/etc/rustboard/pebble-ca.pem".to_string();
+
+        let path = prepare_private_acme_agent_ca(&cfg)
+            .unwrap()
+            .expect("私有 ACME 必须生成 agent CA");
+        assert_eq!(path, certs.join(ACME_AGENT_CA_FILE));
+        let written = fs::read_to_string(&path).unwrap();
+        assert_eq!(written, tls::last_certificate_pem(&chain).unwrap());
+        assert!(tls::certificate_is_ca(&written).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o644);
+        }
+
+        // 公共 ACME / self-signed 不生成 agent CA。
+        cfg.tls.acme_ca_file.clear();
+        assert!(prepare_private_acme_agent_ca(&cfg).unwrap().is_none());
+        cfg.tls.mode = ServerTlsMode::SelfSigned;
+        cfg.tls.acme_ca_file = "/etc/rustboard/pebble-ca.pem".to_string();
+        assert!(prepare_private_acme_agent_ca(&cfg).unwrap().is_none());
+
+        // 链尾不是 CA：拒绝把 leaf 当信任锚。
+        cfg.tls.mode = ServerTlsMode::AcmeDomain;
+        let only_leaf =
+            rcgen::generate_simple_self_signed(vec!["board.example.com".to_string()]).unwrap();
+        fs::write(certs.join(tls::SERVER_CERT_FILE), only_leaf.cert.pem()).unwrap();
+        let err = prepare_private_acme_agent_ca(&cfg).unwrap_err().to_string();
+        assert!(err.contains("不是 CA"), "{err}");
+    }
+
+    #[test]
+    fn staging_config_uses_isolated_subdir_and_never_touches_live_material() {
+        let live = TempDir::new("staging-live");
+        let data_dir = live.path().join("data");
+        let mut cfg = HubConfig {
+            data_dir: data_dir.clone(),
+            database: sqlite_database(&data_dir),
+            ..HubConfig::default()
+        };
+        cfg.tls.mode = ServerTlsMode::AcmeDomain;
+        cfg.tls.acme_email = "admin@example.com".to_string();
+        cfg.tls.domains = vec!["board.example.com".to_string()];
+
+        // 已有 production CA / server.crt；staging 不得改写它们。
+        tls::ensure_client_ca(&cfg.data_dir, tls::CertPolicy::default()).unwrap();
+        let live_certs = tls::cert_dir(&cfg.data_dir);
+        fs::write(live_certs.join(tls::SERVER_CERT_FILE), b"live-cert").unwrap();
+
+        let mut staging = AcmeStagingDir::create(&cfg.data_dir).unwrap();
+        assert!(
+            staging.path().starts_with(&cfg.data_dir),
+            "staging 临时目录必须位于真实 data_dir 内: {}",
+            staging.path().display()
+        );
+        assert!(
+            !staging.path().starts_with(&live_certs),
+            "staging 不得使用 live certs 目录"
+        );
+        let staging_cfg = staging_config(&cfg, staging.path(), LE_STAGING_DIRECTORY);
+        assert_eq!(staging_cfg.data_dir, staging.path());
+        assert_eq!(staging_cfg.database, sqlite_database(staging.path()));
+        assert_eq!(staging_cfg.tls.mode, cfg.tls.mode);
+        assert_eq!(staging_cfg.tls.domains, cfg.tls.domains);
+        assert_eq!(staging_cfg.tls.acme_directory, LE_STAGING_DIRECTORY);
+        assert!(!staging_cfg.tls.staging_check);
+        staging_cfg
+            .validate()
+            .expect("staging 配置的 data_dir 必须通过 HubConfig::validate");
+        // 原始配置不被修改。
+        assert_eq!(
+            cfg.tls.acme_directory,
+            rustboard_common::config::DEFAULT_ACME_DIRECTORY
+        );
+        assert!(cfg.tls.staging_check);
+
+        // 模拟 `tls issue` 在 staging 下写入证书 / ACME 账户；live 材料保持原样。
+        let staging_certs = tls::cert_dir(staging.path());
+        fs::create_dir_all(staging_certs.join("acme")).unwrap();
+        fs::write(staging_certs.join(tls::SERVER_CERT_FILE), b"staging-cert").unwrap();
+        fs::write(staging_certs.join("acme/account.json"), b"{}").unwrap();
+        staging.cleanup().unwrap();
+        assert_eq!(
+            fs::read(live_certs.join(tls::SERVER_CERT_FILE)).unwrap(),
+            b"live-cert",
+            "staging 失败/结束不得改写 live server.crt"
+        );
+        assert!(
+            !live_certs.join("acme").exists(),
+            "staging 账户状态不得写进 live certs"
+        );
+        assert!(!staging.path().exists(), "staging 临时目录必须清理");
+    }
+
+    #[test]
+    fn acme_staging_dir_drop_cleans_up() {
+        let root = TempDir::new("staging-drop");
+        let data_dir = root.path().join("data");
+        let staging = AcmeStagingDir::create(&data_dir).unwrap();
+        let path = staging.path().to_path_buf();
+        assert!(path.starts_with(&data_dir));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "staging 临时目录必须 0700");
+        }
+        assert!(path.exists());
+        drop(staging);
+        assert!(!path.exists(), "Drop 必须清理 staging 临时目录");
+    }
+
+    #[test]
+    fn acme_guard_cleans_new_data_dir_and_allows_self_signed_retry() {
+        let root = TempDir::new("acme-guard-new");
+        let data_dir = root.path().join("data");
+        let mut guard = AcmeCertGuard::capture(&data_dir, false);
+        guard.arm();
+        tls::ensure_client_ca(&data_dir, tls::CertPolicy::default()).unwrap();
+        let cert_dir = tls::cert_dir(&data_dir);
+        fs::create_dir_all(cert_dir.join("acme")).unwrap();
+        fs::write(cert_dir.join("acme/account.json"), b"{}").unwrap();
+        fs::write(cert_dir.join("acme/state.toml"), b"").unwrap();
+        fs::write(cert_dir.join(tls::SERVER_CERT_FILE), b"leaf").unwrap();
+
+        guard.restore().unwrap();
+        assert!(!data_dir.exists(), "全新安装失败后 data_dir 必须被清理");
+        assert!(!cert_dir.exists(), "certs（CA / account / state）不得残留");
+        // 后续 self-signed 重试不应被“证书不完整”拦截。
+        ensure_cert_rebuild_allowed(&data_dir, true).expect("清理后应允许重建自签材料");
+    }
+
+    #[test]
+    fn acme_guard_restores_old_server_material() {
+        let root = TempDir::new("acme-guard-old");
+        let data_dir = root.path().join("data");
+        let cert_dir = tls::cert_dir(&data_dir);
+        fs::create_dir_all(&cert_dir).unwrap();
+        fs::write(cert_dir.join(tls::SERVER_CERT_FILE), b"old-cert").unwrap();
+        fs::write(cert_dir.join(tls::SERVER_KEY_FILE), b"old-key").unwrap();
+        fs::write(cert_dir.join(ACME_AGENT_CA_FILE), b"old-agent-ca").unwrap();
+
+        let mut guard = AcmeCertGuard::capture(&data_dir, true);
+        guard.arm();
+        fs::write(cert_dir.join(tls::SERVER_CERT_FILE), b"new-cert").unwrap();
+        fs::write(cert_dir.join(tls::SERVER_KEY_FILE), b"new-key").unwrap();
+        fs::write(cert_dir.join(ACME_AGENT_CA_FILE), b"new-agent-ca").unwrap();
+        guard.restore().unwrap();
+        assert_eq!(
+            fs::read(cert_dir.join(tls::SERVER_CERT_FILE)).unwrap(),
+            b"old-cert"
+        );
+        assert_eq!(
+            fs::read(cert_dir.join(tls::SERVER_KEY_FILE)).unwrap(),
+            b"old-key"
+        );
+        assert_eq!(
+            fs::read(cert_dir.join(ACME_AGENT_CA_FILE)).unwrap(),
+            b"old-agent-ca",
+            "私有 ACME 的 agent 信任锚必须随旧证书一起恢复"
+        );
+        assert!(data_dir.exists(), "已有数据目录不得被删除");
+
+        // 安装前没有 agent-ca.pem：回滚时必须删除本次新派生的文件。
+        fs::remove_file(cert_dir.join(ACME_AGENT_CA_FILE)).unwrap();
+        let mut guard = AcmeCertGuard::capture(&data_dir, true);
+        guard.arm();
+        fs::write(cert_dir.join(ACME_AGENT_CA_FILE), b"derived-ca").unwrap();
+        guard.restore().unwrap();
+        assert!(!cert_dir.join(ACME_AGENT_CA_FILE).exists());
+    }
+
+    #[test]
+    fn acme_guard_never_deletes_existing_data_dir_without_old_material() {
+        let root = TempDir::new("acme-guard-existing");
+        let data_dir = root.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let sentinel = data_dir.join("rustboard.db");
+        fs::write(&sentinel, b"db").unwrap();
+
+        let mut guard = AcmeCertGuard::capture(&data_dir, true);
+        guard.arm();
+        assert!(!guard.armed, "已有 data_dir 且无旧证书时不应进入清理模式");
+        guard.restore().unwrap();
+        assert!(sentinel.exists());
+    }
+
+    #[test]
+    fn existing_data_dir_without_ca_refuses_silent_rebuild() {
+        let root = TempDir::new("acme-existing-ca");
+        let data_dir = root.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let sentinel = data_dir.join("rustboard.db");
+        fs::write(&sentinel, b"db").unwrap();
+
+        let err = ensure_acme_client_ca(&data_dir, true, tls::CertPolicy::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("拒绝静默重建"), "{err}");
+        assert!(!tls::cert_dir(&data_dir).exists(), "不得创建 certs/CA");
+        assert!(sentinel.exists());
+
+        // 只有一半 CA 材料：同样拒绝，且不补建另一半。
+        let partial = root.path().join("partial");
+        let partial_certs = tls::cert_dir(&partial);
+        fs::create_dir_all(&partial_certs).unwrap();
+        fs::write(partial_certs.join(tls::CA_CERT_FILE), b"pem").unwrap();
+        let err = ensure_acme_client_ca(&partial, true, tls::CertPolicy::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("拒绝静默重建"), "{err}");
+        assert!(!partial_certs.join(tls::CA_KEY_FILE).exists());
+
+        // 全新安装（data_dir 不存在）才允许创建 CA。
+        let fresh = root.path().join("fresh");
+        ensure_acme_client_ca(&fresh, false, tls::CertPolicy::default()).unwrap();
+        assert!(tls::cert_dir(&fresh).join(tls::CA_CERT_FILE).is_file());
+        assert!(tls::cert_dir(&fresh).join(tls::CA_KEY_FILE).is_file());
+    }
+
+    #[test]
+    fn offline_rejects_existing_acme_config() {
+        let mut args = test_install_args();
+        args.offline = true;
+        let mut cfg = HubConfig::default();
+        cfg.tls.mode = ServerTlsMode::AcmeDomain;
+        cfg.tls.acme_email = "admin@example.com".to_string();
+        cfg.tls.domains = vec!["board.example.com".to_string()];
+        let err = ensure_offline_not_acme(&args, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--offline"), "{err}");
+        assert!(err.contains("ACME"), "{err}");
+
+        cfg.tls = TlsConfig::default();
+        ensure_offline_not_acme(&args, &cfg).expect("self-signed 离线安装仍允许");
     }
 
     #[test]

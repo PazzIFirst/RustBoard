@@ -1124,6 +1124,88 @@ pub fn validate_public_server_cert(
     Ok(())
 }
 
+/// 校验 ACME 返回的**服务端证书链**：叶子 + 至少一张 CA，并逐级验签。
+///
+/// 仅做形状校验的 [`validate_public_server_cert`] 无法区分「真正由 CA 签发的
+/// ACME 叶子」与「旧的 self-signed 服务端证书」：两者都可以有合法 SAN / 有效期。
+/// 本函数在形状校验之外强制：
+/// 1. 至少两张证书（叶子 + 至少一张 CA），拒绝单证书与自签叶子；
+/// 2. 叶子 issuer == 下一张证书 subject，且叶子由下一张证书公钥验签；
+/// 3. 链中每一张后续证书都必须是 CA（`BasicConstraints.ca = true`）；
+/// 4. 逐级向上验证 issuer / 签名，直到链尾（链尾可以是 intermediate 或 root）。
+///
+/// 链尾**不做信任锚校验**：公共根由 TLS 客户端（系统根 / 自定义根）验证，
+/// 私有链由 `agent-ca.pem` / 配置的 CA 验证；但链尾不是 CA 时直接拒绝。
+///
+/// 同时要求 PEM 只含 CERTIFICATE 区块，防止把 cert+key 混合内容或裸 base64
+/// 当作证书链写盘。所有错误只包含证书序号/公开主题匹配结果，不含私钥。
+pub fn validate_acme_chain(cert_pem: &str, expected_sans: &[String], now_ms: i64) -> Result<()> {
+    ensure_certificate_only_pem(cert_pem)
+        .context("ACME 证书 PEM 只允许 CERTIFICATE 区块，拒绝私钥/公钥/CSR/块外文本")?;
+    validate_public_server_cert(cert_pem, expected_sans, now_ms)
+        .context("ACME 叶子证书形状校验失败")?;
+
+    let ders = load_certs(cert_pem).context("解析 ACME 证书链 PEM 失败")?;
+    if ders.len() < 2 {
+        bail!(
+            "ACME 证书链不完整：只包含 {} 张证书，至少需要叶子证书 + 一张 CA；\
+             拒绝把自签证书或单证书当作 ACME 证书",
+            ders.len()
+        );
+    }
+
+    let certs = ders
+        .iter()
+        .enumerate()
+        .map(|(index, der)| {
+            x509_parser::parse_x509_certificate(der.as_ref())
+                .map(|(_, cert)| cert)
+                .map_err(|err| anyhow!("解析 ACME 证书链第 {} 张证书失败: {err:?}", index + 1))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // 逐级验证 issuer / subject 匹配与签名；链尾没有下一张证书，不做锚校验。
+    for (index, pair) in certs.windows(2).enumerate() {
+        let child = &pair[0];
+        let issuer = &pair[1];
+        // 按 DER 原始字节比较：证书链要求 issuer 与上一级 subject 完全一致。
+        if child.issuer().as_raw() != issuer.subject().as_raw() {
+            bail!(
+                "ACME 证书链第 {} 张证书的 issuer 与第 {} 张证书的 subject 不匹配；\
+                 请确认 WFE 返回完整且顺序正确的证书链",
+                index + 1,
+                index + 2
+            );
+        }
+        if child.verify_signature(Some(issuer.public_key())).is_err() {
+            bail!(
+                "ACME 证书链第 {} 张证书不是由第 {} 张证书签发（签名校验失败）；\
+                 拒绝使用伪造/错配的证书链",
+                index + 1,
+                index + 2
+            );
+        }
+    }
+
+    // 链尾同样必须是 CA；这里覆盖叶子之后的所有证书（intermediate / root）。
+    for (index, cert) in certs.iter().enumerate().skip(1) {
+        let mut is_ca = false;
+        for extension in cert.extensions() {
+            if let ParsedExtension::BasicConstraints(basic) = extension.parsed_extension() {
+                is_ca = basic.ca;
+            }
+        }
+        if !is_ca {
+            bail!(
+                "ACME 证书链第 {} 张证书不是 CA（BasicConstraints.ca 不是 true）；\
+                 链尾可以是 intermediate 或 root，但必须是 CA",
+                index + 1
+            );
+        }
+    }
+    Ok(())
+}
+
 /// 读取证书里的公开 SAN 列表（`DNS:example.com` / `IP:192.0.2.1`），供 CLI 展示。
 ///
 /// 只解析叶子证书扩展，不做任何信任判断；绝不含私钥/账户信息。
@@ -1228,34 +1310,75 @@ pub fn load_certs(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
 
 /// 校验 PEM 文本只包含 `CERTIFICATE` 区块，拒绝混入任何私钥/公钥/CSR。
 ///
-/// 逐行识别 `-----BEGIN ...-----` 边界，而不是搜索 `PRIVATE KEY` 子串：
-/// base64 正文里即便出现类似字样也不会误判。任何非 `CERTIFICATE` 的
-/// begin 边界都立即失败，防止把 `cert + key` 混合文件当成 CA 复制/读取。
+/// 这里用严格状态机，而不是「扫描 BEGIN 行」：
+/// - 证书块外只允许空行 / 纯空白行；
+/// - 每个块必须以精确的 `-----BEGIN CERTIFICATE-----` 开始、以精确的
+///   `-----END CERTIFICATE-----` 结束，块内只允许 base64 字符
+///   （`A-Za-z0-9+/=`）；
+/// - 任何块外非空内容（裸 base64/JSON/注释/垃圾）、任何非 `CERTIFICATE`
+///   区块、嵌套块、缺失 END 边界都拒绝。
+///
+/// 这样 `load_certs` 宽松的「跳过无关行」行为就不能被利用：调用方拿到的
+/// 文本若通过本函数，就不可能在证书块外夹带私钥或账户 JSON。
 ///
 /// 错误只包含行号与区块类型，不回显证书/私钥内容。
 pub fn ensure_certificate_only_pem(text: &str) -> Result<()> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+
+    let mut in_certificate = false;
     for (index, raw) in text.lines().enumerate() {
-        // PEM 允许 CRLF；先去掉行尾 \r，边界本身仍要求逐字节精确。
         let line = raw.trim_end_matches('\r');
-        let Some(pos) = line.find("-----BEGIN ") else {
-            continue;
-        };
-        let boundary = &line[pos..];
-        if pos != 0 || boundary != "-----BEGIN CERTIFICATE-----" {
-            let label = boundary
-                .strip_prefix("-----BEGIN ")
-                .unwrap_or(boundary)
-                .trim_end_matches('-')
-                .trim();
-            if label == "CERTIFICATE" {
+        let line_no = index + 1;
+
+        if !in_certificate {
+            // 块外：空行/纯空白行可以出现，其余一律拒绝。
+            if line.trim().is_empty() {
+                continue;
+            }
+            if line == BEGIN {
+                in_certificate = true;
+                continue;
+            }
+            if line == END {
                 return Err(anyhow!(
-                    "PEM 第 {} 行的 CERTIFICATE 边界前后有多余字符，拒绝解析",
-                    index + 1
+                    "PEM 第 {line_no} 行出现没有对应 BEGIN 的 END CERTIFICATE，拒绝解析"
+                ));
+            }
+            if line.starts_with("-----BEGIN ") || line.starts_with("-----END ") {
+                let label = pem_block_label(line);
+                return Err(anyhow!(
+                    "PEM 第 {line_no} 行包含非 CERTIFICATE 区块（{}）；只允许 CERTIFICATE，拒绝私钥/公钥/CSR",
+                    if label.is_empty() { "未知区块" } else { label }
+                ));
+            }
+            if line.contains("-----BEGIN ") || line.contains("-----END ") {
+                return Err(anyhow!(
+                    "PEM 第 {line_no} 行的 CERTIFICATE 边界前后有多余字符，拒绝解析"
                 ));
             }
             return Err(anyhow!(
-                "PEM 第 {} 行包含非 CERTIFICATE 区块（{}）；只允许 CERTIFICATE，拒绝私钥/公钥/CSR",
-                index + 1,
+                "PEM 第 {line_no} 行在 CERTIFICATE 块之外包含非空白内容；\
+                 只允许空行与 CERTIFICATE 区块，拒绝裸 base64/JSON/注释/垃圾文本；\
+                 不是合法 PEM 证书"
+            ));
+        }
+
+        // 块内：只允许 base64 正文档与精确的 END 边界。
+        if line == END {
+            in_certificate = false;
+            continue;
+        }
+        if line == BEGIN {
+            return Err(anyhow!(
+                "PEM 第 {line_no} 行证书块嵌套（上一个 CERTIFICATE 缺少 END 边界），拒绝解析"
+            ));
+        }
+        if line.starts_with("-----BEGIN ") || line.starts_with("-----END ") {
+            let label = pem_block_label(line);
+            return Err(anyhow!(
+                "PEM 第 {line_no} 行在 CERTIFICATE 区块内出现非 CERTIFICATE 区块（{}）；\
+                 只允许 CERTIFICATE，拒绝私钥/公钥/CSR",
                 if label.is_empty() {
                     "未知区块"
                 } else {
@@ -1263,8 +1386,34 @@ pub fn ensure_certificate_only_pem(text: &str) -> Result<()> {
                 }
             ));
         }
+        if line.is_empty() || line.chars().all(char::is_whitespace) {
+            return Err(anyhow!(
+                "PEM 第 {line_no} 行在 CERTIFICATE 区块内出现空行/空白行，拒绝解析"
+            ));
+        }
+        if !line
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '='))
+        {
+            return Err(anyhow!(
+                "PEM 第 {line_no} 行不是合法的 base64 证书正文（只允许 A-Za-z0-9+/=）"
+            ));
+        }
+    }
+
+    if in_certificate {
+        return Err(anyhow!("PEM 中的 CERTIFICATE 块缺少 END 边界"));
     }
     Ok(())
+}
+
+/// 从 PEM 边界行里取出区块类型，仅用于错误信息（不回显正文）。
+fn pem_block_label(line: &str) -> &str {
+    line.strip_prefix("-----BEGIN ")
+        .or_else(|| line.strip_prefix("-----END "))
+        .unwrap_or(line)
+        .trim_end_matches('-')
+        .trim()
 }
 
 /// 从 PEM 证书链中提取最后一张 `CERTIFICATE`，按 PEM 原样返回。
@@ -1454,9 +1603,9 @@ pub fn admin_server_config(
 /// 管理 API 的 TLS 服务端配置（公开 CA / ACME 证书）：server-auth，不要求客户端证书。
 ///
 /// 与 [`admin_server_config`] 的区别：不要求证书由本地 `ca.crt` 签发，改用
-/// [`validate_public_server_cert`] 做 SAN / 有效期 / EKU / 非 CA 校验，因此
-/// ACME（含 IP identifier、回环 IP SAN）签发的证书可以直接用于管理端口。
-/// CA 链由客户端在握手阶段按系统根 / 自定义根验证。
+/// [`validate_acme_chain`] 校验 SAN / 有效期 / EKU / 非 CA + 叶子到 CA 的链，
+/// 因此 ACME（含 IP identifier、回环 IP SAN）签发的证书可以直接用于管理端口。
+/// 链尾的信任锚仍由客户端在握手阶段按系统根 / 自定义根验证。
 pub fn admin_server_config_public(
     data_dir: &Path,
     expected_sans: &[String],
@@ -1479,8 +1628,9 @@ pub fn admin_server_config_public(
             key_path.display()
         ));
     }
-    validate_public_server_cert(&cert_pem, expected_sans, crate::util::now_ms())
-        .context("管理 API TLS 证书校验失败（SAN / 有效期 / EKU），请重新执行 tls issue")?;
+    validate_acme_chain(&cert_pem, expected_sans, crate::util::now_ms()).context(
+        "管理 API TLS 证书链校验失败（SAN / 有效期 / EKU / CA 链），请重新执行 tls issue",
+    )?;
 
     let certs = load_certs(&cert_pem)?;
     let key = load_key(&key_pem)?;
@@ -2272,6 +2422,70 @@ mod tests {
         // 证书边界前后有多余字符（可能躲过宽松解析器）同样拒绝。
         let padded = format!("junk{cert_pem}");
         assert!(ensure_certificate_only_pem(&padded).is_err());
+    }
+
+    /// C4：块外只允许空白；裸 base64/JSON/注释/垃圾必须拒绝，多证书 bundle 通过。
+    #[test]
+    fn c4_ensure_certificate_only_pem_rejects_text_outside_blocks() {
+        let key1 = KeyPair::generate().unwrap();
+        let cert1 = ca_params(DEFAULT_CA_DAYS)
+            .unwrap()
+            .self_signed(&key1)
+            .unwrap()
+            .pem();
+        let key2 = KeyPair::generate().unwrap();
+        let cert2 = ca_params(DEFAULT_CA_DAYS)
+            .unwrap()
+            .self_signed(&key2)
+            .unwrap()
+            .pem();
+
+        // 合法：单证书、CRLF、多证书 bundle、块间空行。
+        ensure_certificate_only_pem(&cert1).expect("单证书必须通过");
+        ensure_certificate_only_pem(&cert1.replace('\n', "\r\n")).expect("CRLF 必须通过");
+        let bundle = format!("{cert1}\n\n{cert2}");
+        ensure_certificate_only_pem(&bundle).expect("多证书 bundle 必须通过");
+
+        // 块后裸 base64（私钥正文）与块前/块后 JSON 都必须拒绝。
+        let bare_base64 = cert1
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<String>();
+        for text in [
+            format!("{cert1}{bare_base64}\n"),
+            format!("{bare_base64}\n{cert1}"),
+            format!("{{\"key_pkcs8\":\"AAAA\"}}\n{cert1}"),
+            format!("{cert1}{{\"key_pkcs8\":\"AAAA\"}}\n"),
+            format!("# 这是证书\n{cert1}"),
+            format!("{cert1}trailing garbage\n"),
+            format!("{cert1}-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"),
+            format!("{cert1}{}", key1.serialize_pem()),
+        ] {
+            let err =
+                ensure_certificate_only_pem(&text).expect_err("证书块外出现非空白内容必须拒绝");
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("块之外")
+                    || text.contains("非 CERTIFICATE")
+                    || text.contains("边界前后"),
+                "错误应说明块外内容: {text}"
+            );
+        }
+
+        // 块内非 base64、空行、缺 END、嵌套、块内夹带其他 PEM 都必须拒绝。
+        for text in [
+            "-----BEGIN CERTIFICATE-----\nAAAA\nnot base64!\n-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\nAAAA\n\nBBBB\n-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\nAAAA\n",
+            "-----BEGIN CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----BEGIN PRIVATE KEY-----\nBBBB\n-----END PRIVATE KEY-----\n-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END PRIVATE KEY-----\n",
+        ] {
+            ensure_certificate_only_pem(text).expect_err("非法块结构必须拒绝");
+        }
+
+        // 缩进的 BEGIN 不在行首，按块外非空内容拒绝。
+        ensure_certificate_only_pem(&format!(" {cert1}")).expect_err("缩进边界必须拒绝");
     }
 
     /// C4：从 ACME 证书链提取最后一张 CA，并判断 BasicConstraints.ca。
@@ -3430,6 +3644,74 @@ mod tests {
         (now - TimeDuration::hours(1), now + TimeDuration::days(30))
     }
 
+    /// 测试用 CA：自签、BasicConstraints.ca=true。
+    fn test_ca(cn: &str) -> (Certificate, KeyPair, String) {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, cn.to_string());
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let pem = cert.pem();
+        (cert, key, pem)
+    }
+
+    /// 测试用下级 CA：由 `issuer` 真实签名，`is_ca` 控制 BasicConstraints。
+    fn test_signed_ca(
+        cn: &str,
+        issuer: &Certificate,
+        issuer_key: &KeyPair,
+        is_ca: IsCa,
+    ) -> (Certificate, KeyPair, String) {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = is_ca;
+        params
+            .distinguished_name
+            .push(DnType::CommonName, cn.to_string());
+        let key = KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, issuer, issuer_key).unwrap();
+        let pem = cert.pem();
+        (cert, key, pem)
+    }
+
+    /// 测试用 ACME 叶子：生成 CSR 后由 `ca` 签名。
+    fn test_acme_leaf(
+        ca: &Certificate,
+        ca_key: &KeyPair,
+        sans: &[&str],
+        eku: Option<ExtendedKeyUsagePurpose>,
+        is_ca: IsCa,
+    ) -> (String, String) {
+        let mut params = CertificateParams::new(
+            sans.iter()
+                .map(|san| (*san).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let subject_alt_names = params.subject_alt_names.clone();
+        params.distinguished_name = DistinguishedName::new();
+        let eku_list: Vec<_> = eku.into_iter().collect();
+        params.is_ca = is_ca.clone();
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = eku_list.clone();
+        let key = KeyPair::generate().unwrap();
+        let csr = params.serialize_request(&key).unwrap();
+        let mut csr = CertificateSigningRequestParams::from_pem(&csr.pem().unwrap()).unwrap();
+        // 显式带上 SAN / EKU，避免依赖 rcgen 在 CSR 中是否保留这些参数。
+        csr.params.subject_alt_names = subject_alt_names;
+        csr.params.is_ca = is_ca;
+        csr.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        csr.params.extended_key_usages = eku_list;
+        let cert = csr.signed_by(ca, ca_key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
     /// C3：公开证书校验不要求 CN=rustboard-hub，只看 SAN / 有效期 / EKU / 非 CA。
     #[test]
     fn c3_validate_public_cert_accepts_acme_style_leaf_without_cn() {
@@ -3539,6 +3821,161 @@ mod tests {
         let err = validate_public_server_cert(&ca, &sans, crate::util::now_ms())
             .expect_err("CA 证书不能作为服务端叶子证书");
         assert!(format!("{err:#}").contains("CA 证书"), "错误信息: {err:#}");
+    }
+
+    /// 安全：ACME 链校验必须要求至少叶子 + CA，单证书/自签叶子一律拒绝。
+    #[test]
+    fn c4_validate_acme_chain_rejects_self_signed_and_missing_chain() {
+        let (not_before, not_after) = ok_window();
+        let sans = ["board.example.com".to_string()];
+
+        // 旧实现只做形状校验：自签叶子可以通过 validate_public_server_cert。
+        let self_signed = public_leaf(
+            &["board.example.com"],
+            not_before,
+            not_after,
+            Some(ExtendedKeyUsagePurpose::ServerAuth),
+            IsCa::NoCa,
+        );
+        validate_public_server_cert(&self_signed, &sans, crate::util::now_ms())
+            .expect("形状校验仍应接受自签叶子（只校验 SAN/有效期/EKU）");
+        let err = validate_acme_chain(&self_signed, &sans, crate::util::now_ms())
+            .expect_err("单证书自签叶子不能作为 ACME 证书");
+        assert!(format!("{err:#}").contains("至少需要"), "错误信息: {err:#}");
+
+        // 真叶子但缺 CA：同样拒绝（链缺失）。
+        let (ca, ca_key, _ca_pem) = test_ca("Test ACME Root");
+        let (leaf, _leaf_key) = test_acme_leaf(
+            &ca,
+            &ca_key,
+            &["board.example.com"],
+            Some(ExtendedKeyUsagePurpose::ServerAuth),
+            IsCa::NoCa,
+        );
+        let err = validate_acme_chain(&leaf, &sans, crate::util::now_ms())
+            .expect_err("缺 CA 的叶子不能作为 ACME 证书");
+        assert!(format!("{err:#}").contains("至少需要"), "错误信息: {err:#}");
+    }
+
+    /// 安全：叶子 + CA（含 intermediate）逐级验签通过；链尾可以是 intermediate。
+    #[test]
+    fn c4_validate_acme_chain_accepts_leaf_ca_and_intermediate() {
+        let sans = ["board.example.com".to_string(), "127.0.0.1".to_string()];
+        let (root, root_key, root_pem) = test_ca("Test ACME Root");
+        let (leaf, _key) = test_acme_leaf(
+            &root,
+            &root_key,
+            &["board.example.com", "127.0.0.1"],
+            Some(ExtendedKeyUsagePurpose::ServerAuth),
+            IsCa::NoCa,
+        );
+        validate_acme_chain(&format!("{leaf}{root_pem}"), &sans, crate::util::now_ms())
+            .expect("叶子 + 根必须通过");
+
+        // 三级链：叶子 -> intermediate -> root。链尾不做信任锚校验。
+        let (inter, inter_key, inter_pem) = test_signed_ca(
+            "Test ACME Intermediate",
+            &root,
+            &root_key,
+            IsCa::Ca(BasicConstraints::Unconstrained),
+        );
+        let (leaf2, _key2) = test_acme_leaf(
+            &inter,
+            &inter_key,
+            &["board.example.com", "127.0.0.1"],
+            Some(ExtendedKeyUsagePurpose::ServerAuth),
+            IsCa::NoCa,
+        );
+        validate_acme_chain(
+            &format!("{leaf2}{inter_pem}{root_pem}"),
+            &sans,
+            crate::util::now_ms(),
+        )
+        .expect("叶子 + intermediate + root 必须通过");
+    }
+
+    /// 安全：issuer 匹配但签名不符、中间证书非 CA 都必须拒绝。
+    #[test]
+    fn c4_validate_acme_chain_rejects_bad_signature_and_non_ca() {
+        let sans = ["board.example.com".to_string()];
+
+        // 两个 CA 使用相同 subject：leaf 的 issuer 能匹配，但签名验不过。
+        let (ca_a, ca_a_key, _ca_a_pem) = test_ca("Same Subject CA");
+        let (_ca_b, _ca_b_key, ca_b_pem) = test_ca("Same Subject CA");
+        let (leaf, _key) = test_acme_leaf(
+            &ca_a,
+            &ca_a_key,
+            &["board.example.com"],
+            Some(ExtendedKeyUsagePurpose::ServerAuth),
+            IsCa::NoCa,
+        );
+        let err = validate_acme_chain(&format!("{leaf}{ca_b_pem}"), &sans, crate::util::now_ms())
+            .expect_err("签名不符的链必须拒绝");
+        assert!(
+            format!("{err:#}").contains("签名校验失败"),
+            "错误信息: {err:#}"
+        );
+
+        // 非 CA 的“中间证书”即使签名正确也不能作为链的一部分。
+        let (root, root_key, root_pem) = test_ca("Test ACME Root");
+        let (fake_inter, fake_inter_key, fake_inter_pem) =
+            test_signed_ca("Not A CA Intermediate", &root, &root_key, IsCa::NoCa);
+        let (leaf2, _key2) = test_acme_leaf(
+            &fake_inter,
+            &fake_inter_key,
+            &["board.example.com"],
+            Some(ExtendedKeyUsagePurpose::ServerAuth),
+            IsCa::NoCa,
+        );
+        let err = validate_acme_chain(
+            &format!("{leaf2}{fake_inter_pem}{root_pem}"),
+            &sans,
+            crate::util::now_ms(),
+        )
+        .expect_err("中间证书非 CA 必须拒绝");
+        assert!(format!("{err:#}").contains("不是 CA"), "错误信息: {err:#}");
+
+        // 链尾（这里是非 CA 的 intermediate）同样必须满足 BasicConstraints.ca=true。
+        let err = validate_acme_chain(
+            &format!("{leaf2}{fake_inter_pem}"),
+            &sans,
+            crate::util::now_ms(),
+        )
+        .expect_err("链尾不是 CA 必须拒绝");
+        assert!(format!("{err:#}").contains("不是 CA"), "错误信息: {err:#}");
+    }
+
+    /// 安全：链校验前先拒绝块外内容，防止 cert+key 混合 PEM 绕过。
+    #[test]
+    fn c4_validate_acme_chain_rejects_pem_with_extra_content() {
+        let sans = ["board.example.com".to_string()];
+        let (root, root_key, root_pem) = test_ca("Test ACME Root");
+        let (leaf, leaf_key) = test_acme_leaf(
+            &root,
+            &root_key,
+            &["board.example.com"],
+            Some(ExtendedKeyUsagePurpose::ServerAuth),
+            IsCa::NoCa,
+        );
+        let chain = format!("{leaf}{root_pem}");
+        validate_acme_chain(&chain, &sans, crate::util::now_ms()).unwrap();
+
+        let err = validate_acme_chain(&format!("{chain}{leaf_key}"), &sans, crate::util::now_ms())
+            .expect_err("cert+key 混合 PEM 必须拒绝");
+        assert!(
+            format!("{err:#}").contains("只允许 CERTIFICATE"),
+            "错误信息: {err:#}"
+        );
+        let err = validate_acme_chain(
+            &format!("{chain}{{\"key\":\"AAAA\"}}\n"),
+            &sans,
+            crate::util::now_ms(),
+        )
+        .expect_err("块后 JSON 必须拒绝");
+        assert!(
+            format!("{err:#}").contains("块之外") || format!("{err:#}").contains("只允许"),
+            "错误信息: {err:#}"
+        );
     }
 
     /// C3 拆分：ensure_client_ca 只创建 ca.crt/ca.key，不碰 server 材料；

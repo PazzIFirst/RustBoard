@@ -8562,9 +8562,12 @@ mod tests {
             "获取锁失败时绝不能写证书"
         );
         drop(lock);
-        assert!(!tls::cert_dir(&dir)
-            .join(cert_rotation::CERT_LOCK_FILE)
-            .exists());
+        assert!(
+            tls::cert_dir(&dir)
+                .join(cert_rotation::CERT_LOCK_FILE)
+                .exists(),
+            "flock 锁文件是持久的，Drop 不应删除它"
+        );
 
         rotate_cert(Some(cfg_path), true, Some(30)).expect("释放锁后必须能正常轮换");
         let after = std::fs::read_to_string(&cert_path).unwrap();
@@ -8574,10 +8577,10 @@ mod tests {
             "正常轮换必须换证书"
         );
         assert!(
-            !tls::cert_dir(&dir)
+            tls::cert_dir(&dir)
                 .join(cert_rotation::CERT_LOCK_FILE)
                 .exists(),
-            "rotate 结束后必须删除锁文件"
+            "rotate 结束后锁文件仍保留（flock 已释放）"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

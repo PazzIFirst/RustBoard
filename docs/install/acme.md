@@ -208,6 +208,12 @@ ACME 端口 / 防火墙 / 云环境诊断（只读；安装器不会自动修改
 - `tls.staging_check = true`（默认）且 `--acme-directory` 为 Let's Encrypt
   production 默认值时，安装器会先向 staging 申请一次临时证书，再走 production；
   staging 失败会按回退策略处理，避免直接消耗 production 的失败额度。
+- staging 使用真实数据目录下的独立私有临时子目录
+  `<data_dir>/.acme-staging-<uuid>`（0700），结束后递归删除。staging 的客户端 CA、
+  ACME account / state 与临时证书全部落在该子目录，**不会**写入 live
+  `certs/server.crt`、`certs/acme/account.json` 或 `certs/acme/state.toml`；因此
+  staging 的 `account.json` 不会绑定 production directory，也不会污染生产材料。
+  staging 失败立即进入回退/中止路径，不会继续跑 production 的 3 轮重试。
 - `acme-ip` 默认跳过自动 staging（shortlived profile 在 staging 的支持依
   Let's Encrypt 策略），直接以 production 结果为准；需要手工验证时显式给
   staging directory。
@@ -245,10 +251,16 @@ sudo rustboard-hub install --force --tls acme-domain \
   不会因为一次 ACME 失败而失联。
 - `tls.fallback_to_self_signed = false`：安装中止，配置 / unit / 二进制由安装
   事务回滚；不会留下 ACME 模式的配置。
-- 全新安装失败时，数据目录由事务回滚删除；已有安装失败时，安装前的
-  `server.crt` / `server.key` 会被恢复。
-- ACME 账户 / 订单状态可能保留在数据目录中，便于修复后重试；配置本身一定是
-  self-signed 或 ACME 中的一种，不会“半份 ACME 配置”。
+- 事务边界：`InstallTxn` 只负责配置、unit、二进制与安装状态；`<data_dir>/certs`
+  下的 CA、ACME 账户/状态与服务端证书由安装器的独立 guard 处理。
+  - **全新安装**（安装前 `data_dir` 不存在）失败时，清理本次创建的
+    `<data_dir>/certs`（CA / account / state / 服务端证书），且仅当 `data_dir`
+    已为空时才删除它；不会递归删除 `data_dir`，避免误删期间写入的其它文件。
+  - **已有安装**失败时，恢复安装前的 `server.crt` / `server.key`；已有数据目录
+    里的 ACME account / state 可能保留，便于修复后重试，不会回滚整个数据目录。
+- 已有数据目录缺少 `ca.crt` / `ca.key` 时，安装器拒绝静默重建客户端 CA
+  （会导致所有已纳管 agent 失联）；请从备份恢复或显式迁移。只有 `data_dir`
+  完全不存在时才允许自动创建。
 
 回退后打印的重试命令形如：
 
@@ -311,10 +323,16 @@ sudo rustboard-hub tls issue --config /etc/rustboard/hub.toml
 - hub 的 agent 接入端口（默认随机五位数）与管理端口是独立监听，不要为了 ACME
   把它们暴露到公网；管理 API 默认只绑回环；
 - `--admin-tls required` 时，同机 panel 使用
-  `https://<证书 SAN 覆盖的主机名>:<管理端口>`；自签 / 私有 ACME 会附
-  `--hub-ca <hub data_dir>/certs/ca.crt`，公共 ACME 使用系统根。若 panel 版本
-  尚不支持 `--hub-ca`，安装会以未知参数失败；用 `--panel no` 跳过同机面板，
-  升级 panel 后按 [panel-tls.md](panel-tls.md)
+  `https://<证书 SAN 覆盖的主机名>:<管理端口>`；`--hub-ca` 按 hub 的证书来源选择：
+  - **self-signed**：`<hub data_dir>/certs/ca.crt`；
+  - **私有 ACME**：`<hub data_dir>/certs/agent-ca.pem`。它由安装器从
+    `certs/server.crt` 的**链尾 CA** 提取（0644），与 `hub agent add` 使用的
+    信任锚一致；`tls.acme_ca_file` 只是 ACME WFE 的 HTTPS 根，**不能**当作 hub
+    服务端证书的 CA；
+  - **公共 ACME**：使用系统根，不传 `--hub-ca`。
+
+  若 panel 版本尚不支持 `--hub-ca`，安装会以未知参数失败；用 `--panel no` 跳过
+  同机面板，升级 panel 后按 [panel-tls.md](panel-tls.md)
   手工配置，不会静默降级成不校验证书。
 - 面板直连 HTTPS（`--tls-cert/--tls-key/--public-origin`）与 ACME 是两件独立
   的事：ACME 签的是 hub 的 `server.crt`，面板仍需自己的证书；详见
@@ -342,8 +360,10 @@ sudo rustboard-hub tls issue --config /etc/rustboard/hub.toml
 - ACME 账户 key、证书私钥、key authorization 不会出现在安装器输出中；
   `tls issue` 的输出也会过滤私钥块与 keyAuth 再打印。
 - 安装器不会执行任何防火墙 / 安全组修改命令，只打印建议。
-- 不要把 `--acme-ca` 指向可被普通用户替换的路径；该文件会被 hub 读取用于校验
-  ACME 服务端。
+- 不要把 `--acme-ca` 指向可被普通用户替换的路径；该文件只用于校验 ACME WFE
+  （Pebble / 私有 ACME）的 HTTPS 连接，不是 hub 服务端证书的信任锚。私有 ACME
+  下 agent / 同机 panel 的信任锚是安装器从 `server.crt` 链尾提取的
+  `certs/agent-ca.pem`；不要手工把 `tls.acme_ca_file` 当成 hub CA 传给 panel。
 - ACME 域名证书是公开信任的，任何能解析到该域名的人都能看到 hub 的 TLS 身份；
   管理 API 仍需要 Bearer token。
 - 生产环境建议保留 `fallback_to_self_signed = true` 作为兜底，但回退后必须用

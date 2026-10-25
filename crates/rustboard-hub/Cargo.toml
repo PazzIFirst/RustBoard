@@ -21,6 +21,8 @@ http-body = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 hmac = { workspace = true }
+# rotate-cert / ACME 安装锁使用内核 flock(2)；workspace 已固定 libc 0.2。
+libc = { workspace = true }
 # M5 Phase C C4：ACME 客户端。显式关闭默认 aws-lc-rs，改用纯 Rust `ring`
 # + hyper-rustls；不引入 cmake/openssl。版本锁死以复现 C0 spike 的结论。
 instant-acme = { version = "=0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }

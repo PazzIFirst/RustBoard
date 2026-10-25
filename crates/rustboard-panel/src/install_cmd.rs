@@ -108,6 +108,9 @@ pub struct InstallArgs {
     /// 面板 HTTPS 私钥 PEM（0600 普通文件，不支持符号链接）。
     #[arg(long, value_name = "PATH")]
     tls_key: Option<PathBuf>,
+    /// 显式降级为 HTTP：仅用于 `--force` 时清理旧直连 TLS 材料，不能与证书参数同用。
+    #[arg(long, conflicts_with_all = ["tls_cert", "tls_key"])]
+    http: bool,
     /// hub 管理 API 的私有 CA（PEM，可含多张证书）；只允许与 https hub 一起使用。
     #[arg(long, value_name = "PATH")]
     hub_ca: Option<PathBuf>,
@@ -217,6 +220,116 @@ struct HubCaPlan {
     bytes: Vec<u8>,
 }
 
+/// 显式 `--http` 降级时需要事务删除的旧面板 TLS 材料。
+///
+/// 只包含安装器自己写入的 `cert.pem` / `key.pem`（以及不再被配置引用的
+/// `hub-ca.pem`）；未知文件一律保留，`remove_dir` 只会在目录为空时成功。
+#[derive(Debug)]
+struct TlsDowngrade {
+    files: Vec<PathBuf>,
+    dir: PathBuf,
+    remove_dir: bool,
+}
+
+/// 旧配置是否有成对且非空的直连 TLS 字段。
+fn configured_panel_tls(base: Option<&PanelConfig>) -> bool {
+    base.is_some_and(|cfg| !cfg.tls_cert.trim().is_empty() && !cfg.tls_key.trim().is_empty())
+}
+
+/// 列出 `panel-tls` 下由本安装器管理的已知文件；目录/文件是符号链接时拒绝。
+fn existing_tls_material(tls_dir: &Path) -> Result<Vec<PathBuf>> {
+    match fs::symlink_metadata(tls_dir) {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取面板 TLS 目录 {} 失败", tls_dir.display()))
+        }
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "面板 TLS 目录 {} 是符号链接，拒绝读取/删除其内容",
+            tls_dir.display()
+        ),
+        Ok(meta) if !meta.is_dir() => {
+            bail!("面板 TLS 路径 {} 不是目录", tls_dir.display())
+        }
+        Ok(_) => {}
+    }
+
+    let mut found = Vec::new();
+    for name in [
+        PANEL_TLS_CERT_FILE,
+        PANEL_TLS_KEY_FILE,
+        PANEL_TLS_HUB_CA_FILE,
+    ] {
+        let path = tls_dir.join(name);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("读取面板 TLS 文件 {} 失败", path.display()))
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                bail!("面板 TLS 文件 {} 是符号链接，拒绝事务删除", path.display())
+            }
+            Ok(meta) if meta.is_file() => found.push(path),
+            Ok(_) => bail!("面板 TLS 路径 {} 不是普通文件", path.display()),
+        }
+    }
+    Ok(found)
+}
+
+/// 防止 `--force` 在旧配置不可用时把 HTTPS 面板静默降级为 HTTP。
+///
+/// - 旧配置（或显式参数）有成对 TLS 字段：正常复用，不是降级；
+/// - 没有成对 TLS 字段但 `panel-tls` 里仍有安装器材料：必须由用户显式选择
+///   `--tls-cert/--tls-key`（继续 HTTPS）或 `--http`（明确降级并清理旧材料）；
+/// - `--http`：把已知文件登记给事务删除，避免私钥残留；若旧配置仍引用
+///   `hub-ca.pem`（HTTPS hub 的公共信任锚），保留该文件与目录。
+fn resolve_tls_downgrade(
+    args: &InstallArgs,
+    base: Option<&PanelConfig>,
+    tls_dir: &Path,
+    keep_hub_ca: bool,
+) -> Result<Option<TlsDowngrade>> {
+    let explicit_tls = args.tls_cert.is_some() && args.tls_key.is_some();
+    if args.http {
+        if !args.force {
+            return Ok(None);
+        }
+        let mut files = existing_tls_material(tls_dir)?;
+        if keep_hub_ca {
+            files.retain(|path| {
+                path.file_name() != Some(std::ffi::OsStr::new(PANEL_TLS_HUB_CA_FILE))
+            });
+        }
+        return Ok(Some(TlsDowngrade {
+            files,
+            dir: tls_dir.to_path_buf(),
+            // hub-ca 仍被配置引用时不能删目录（否则配置文件指向不存在的 CA）。
+            remove_dir: !keep_hub_ca,
+        }));
+    }
+    if !args.force || explicit_tls || configured_panel_tls(base) {
+        return Ok(None);
+    }
+    let leftovers = existing_tls_material(tls_dir)?;
+    // hub-ca.pem 是公共信任锚，不属于“HTTPS 面板被降级”的判据；只有残留的
+    // 服务端证书/私钥（尤其私钥）才必须 fail-closed。
+    let server_tls_left = leftovers.iter().any(|path| {
+        matches!(
+            path.file_name().and_then(std::ffi::OsStr::to_str),
+            Some(PANEL_TLS_CERT_FILE | PANEL_TLS_KEY_FILE)
+        )
+    });
+    if !server_tls_left {
+        return Ok(None);
+    }
+    bail!(concat!(
+        "--force 检测到旧面板 TLS 材料，但旧配置不可用或没有成对的 tls_cert/tls_key；",
+        "拒绝静默把 HTTPS 面板降级为 HTTP。请显式提供 --tls-cert/--tls-key 继续 HTTPS，",
+        "或传 --http 显式降级（会用事务删除旧 panel-tls 材料）"
+    ))
+}
+
 /// 解析面板直连 TLS 参数（含 `--force` 复用旧配置）。
 ///
 /// 任何不完整 / 不配套 / 权限不合规 / SAN 不覆盖的情况都在写盘前返回错误。
@@ -227,6 +340,13 @@ fn resolve_panel_tls(
     tls_dir: &Path,
     dry_run: bool,
 ) -> Result<Option<PanelTlsPlan>> {
+    // 显式 --http：忽略旧配置里的 TLS 字段，由 downgrade 流程事务删除旧材料。
+    if args.http {
+        if args.tls_cert.is_some() || args.tls_key.is_some() {
+            bail!("--http 与 --tls-cert / --tls-key 互斥，不能同时显式降级和启用 HTTPS");
+        }
+        return Ok(None);
+    }
     let (material, copy_files) = match (&args.tls_cert, &args.tls_key) {
         (Some(cert), Some(key)) => (
             crate::validate_panel_tls_files(cert, key, crate::TlsFilePolicy::Source)
@@ -258,6 +378,12 @@ fn resolve_panel_tls(
         }
         _ => bail!("--tls-cert 与 --tls-key 必须成对提供：都为空使用 HTTP，都非空才启用面板 HTTPS"),
     };
+    // C7：证书链只允许 CERTIFICATE 区块。`tls::load_certs` 会跳过私钥块，
+    // 如果用户把 cert+key 合并成一个 PEM 传给 --tls-cert，安装器会把面板私钥
+    // 原样复制到 0644 的 cert.pem。必须在写盘前直接拒绝。
+    tls::ensure_certificate_only_pem(&material.cert_pem).context(
+        "tls_cert 只允许 CERTIFICATE 区块（发现私钥/公钥/CSR 等非证书内容）；请把证书链与私钥拆成两个文件",
+    )?;
 
     let explicit_origin = args
         .public_origin
@@ -352,6 +478,14 @@ fn read_hub_ca_pem(path: &Path) -> Result<Vec<u8>> {
     let bytes = fs::read(path).with_context(|| format!("读取 --hub-ca {} 失败", path.display()))?;
     let text = std::str::from_utf8(&bytes)
         .with_context(|| format!("--hub-ca {} 不是 UTF-8 PEM 文本", path.display()))?;
+    // 同 cert：`load_certs` 会跳过私钥块，必须拒绝 cert+key 合并 PEM，避免把
+    // 私钥内容按公开 CA（0644）复制进 panel-tls。
+    tls::ensure_certificate_only_pem(text).with_context(|| {
+        format!(
+            "--hub-ca {} 只允许 CERTIFICATE 区块（发现私钥/公钥/CSR 等非证书内容）",
+            path.display()
+        )
+    })?;
     tls::load_certs(text)
         .with_context(|| format!("--hub-ca {} 不是有效的 PEM 证书", path.display()))?;
     Ok(bytes)
@@ -374,6 +508,14 @@ fn resolve_cookie_secure(
         }
         return CookieSecure::Always;
     }
+    // 显式 --http 降级：旧配置的 always 是直连 TLS 强制写入的，不能沿用到 HTTP，
+    // 否则登录 Cookie 带 Secure 而浏览器不会回传。
+    if args.http {
+        return args
+            .cookie_secure
+            .map(CookieSecure::from)
+            .unwrap_or_default();
+    }
     args.cookie_secure
         .map(CookieSecure::from)
         .or_else(|| base.map(|cfg| cfg.cookie_secure))
@@ -381,17 +523,25 @@ fn resolve_cookie_secure(
 }
 
 /// 非直连 TLS 时的 public_origin：显式参数优先，其次保留旧配置。
+///
+/// 显式 `--http` 降级时不再沿用旧配置里由直连 TLS 推导出的 `https://` origin；
+/// 继续服务 HTTP 直连会让登录 Origin 校验必然失败。反代场景请显式传
+/// `--public-origin https://...`。
 fn resolve_http_public_origin(args: &InstallArgs, base: Option<&PanelConfig>) -> String {
-    args.public_origin
+    if let Some(origin) = args
+        .public_origin
         .as_deref()
         .map(str::trim)
         .filter(|origin| !origin.is_empty())
+    {
+        return origin.to_string();
+    }
+    if args.http {
+        return String::new();
+    }
+    base.map(|cfg| cfg.public_origin.trim())
+        .filter(|origin| !origin.is_empty())
         .map(str::to_string)
-        .or_else(|| {
-            base.map(|cfg| cfg.public_origin.trim())
-                .filter(|origin| !origin.is_empty())
-                .map(str::to_string)
-        })
         .unwrap_or_default()
 }
 
@@ -486,30 +636,23 @@ pub fn install(args: InstallArgs) -> Result<()> {
         None
     };
 
-    // hub 地址 / token：hub.toml 已在入口处加载。
+    // hub 地址 / token：hub.toml 已在入口处加载；--force 优先保留旧面板配置。
     let hub_url = resolve_hub_url(
         args.hub_url.as_deref(),
+        base_config.as_ref(),
         hub_config.as_ref(),
         &hub_config_path,
     )?;
     // C7：hub 管理端要求 TLS 时，面板配置必须是 https；显式 --hub-url http
     // 也要拒绝，不能写出明文对接 required hub 的错误配置。
     ensure_hub_admin_tls_supported(hub_config.as_ref(), &hub_url)?;
-    let token = match args.hub_token_file.as_deref() {
-        Some(path) => read_secret_file(path, "hub token")?,
-        None => match hub_config
-            .as_ref()
-            .map(|hub| hub.admin_token.trim())
-            .filter(|token| !token.is_empty())
-        {
-            Some(token) => token.to_string(),
-            None => bail!(
-                "缺少 hub 管理 token：请使用 --hub-token-file 提供 0600 文件，\
-                 或先安装 hub 使 {} 含非空 admin_token",
-                hub_config_path.display()
-            ),
-        },
-    };
+    let token = resolve_hub_token(
+        args.hub_token_file.as_deref(),
+        base_config.as_ref(),
+        hub_config.as_ref(),
+        &hub_url,
+        &hub_config_path,
+    )?;
 
     let listen = resolve_listen(args.listen.as_deref(), base_config.as_ref())?;
     let static_dir = resolve_static_dir(args.static_dir.as_deref(), base_config.as_ref())?;
@@ -528,6 +671,14 @@ pub fn install(args: InstallArgs) -> Result<()> {
     let cookie_secure = resolve_cookie_secure(&args, base_config.as_ref(), panel_tls.is_some());
     let (hub_ca_plan, hub_ca_config) =
         resolve_hub_ca(&args, base_config.as_ref(), &hub_url, &tls_dir)?;
+    // B：--force + 旧配置不可用时，绝不能因为没传 TLS 参数就把 HTTPS 面板
+    // 静默降级为 HTTP；旧 panel-tls 私钥必须由显式 --http 走事务清理。
+    let tls_downgrade = resolve_tls_downgrade(
+        &args,
+        base_config.as_ref(),
+        &tls_dir,
+        hub_ca_config.is_some(),
+    )?;
 
     let password = plan_password(args.password_file.as_deref(), base_config.as_ref())?;
 
@@ -576,10 +727,18 @@ pub fn install(args: InstallArgs) -> Result<()> {
     };
     cfg.public_origin = public_origin;
     cfg.cookie_secure = cookie_secure;
-    if let Some(plan) = &panel_tls {
-        // 配置里永远写安装后的绝对路径，不写用户源文件路径。
-        cfg.tls_cert = path_string(&plan.cert_path, "tls_cert")?;
-        cfg.tls_key = path_string(&plan.key_path, "tls_key")?;
+    match &panel_tls {
+        Some(plan) => {
+            // 配置里永远写安装后的绝对路径，不写用户源文件路径。
+            cfg.tls_cert = path_string(&plan.cert_path, "tls_cert")?;
+            cfg.tls_key = path_string(&plan.key_path, "tls_key")?;
+        }
+        None => {
+            // 显式 --http 降级：必须清掉旧配置里的 TLS 路径，否则运行时仍会
+            // 尝试加载已删除的证书/私钥。
+            cfg.tls_cert.clear();
+            cfg.tls_key.clear();
+        }
     }
     // 无条件赋最终值：hub 切回 http 时 resolve_hub_ca 会清空旧 CA，不能沿用 base。
     cfg.hub_ca = hub_ca_config.unwrap_or_default();
@@ -612,6 +771,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
             tls_dir: &tls_dir,
             tls: panel_tls.as_ref(),
             hub_ca: hub_ca_plan.as_ref(),
+            downgrade: tls_downgrade.as_ref(),
         };
         let outcome = apply.run();
         (outcome, apply.reload_done, apply.activation_attempted)
@@ -740,10 +900,21 @@ struct ApplyInstall<'a> {
     tls: Option<&'a PanelTlsPlan>,
     /// 需要写入的 hub 私有 CA。
     hub_ca: Option<&'a HubCaPlan>,
+    /// 显式 `--http` 降级：事务删除旧 `panel-tls` 材料。
+    downgrade: Option<&'a TlsDowngrade>,
 }
 
 impl ApplyInstall<'_> {
     fn run(&mut self) -> Result<()> {
+        // 显式 --http 降级：先用事务删除旧 cert/key（hub-ca 若仍被配置引用则保留），
+        // 失败时回滚会恢复文件；成功 commit 后再尝试删除空目录。
+        if let Some(downgrade) = self.downgrade {
+            for path in &downgrade.files {
+                self.txn
+                    .remove(path)
+                    .with_context(|| format!("事务删除旧面板 TLS 文件 {} 失败", path.display()))?;
+            }
+        }
         // 先建 TLS 目录（0700）：后面写证书/私钥时父目录一定存在且不可被替换。
         if self.tls.is_some() || self.hub_ca.is_some() {
             self.txn.create_dir(self.tls_dir, 0o700)?;
@@ -819,7 +990,26 @@ impl ApplyInstall<'_> {
             RoleState::new(self.paths, env!("CARGO_PKG_VERSION"), self.txn.backup_dir()),
         );
         self.state.save(&self.paths.state)?;
-        self.txn.commit()
+        self.txn.commit()?;
+        if let Some(downgrade) = self.downgrade {
+            if downgrade.remove_dir {
+                match fs::remove_dir(&downgrade.dir) {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+                        ) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "警告: 删除旧 panel TLS 目录 {} 失败: {error}",
+                            downgrade.dir.display()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1007,6 +1197,12 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
     };
 
     if args.dry_run {
+        if let Some(tls) = purge_targets
+            .as_ref()
+            .and_then(|targets| targets.tls.as_ref())
+        {
+            println!("  面板 TLS 材料: {}（--purge 将删除）", tls.display());
+        }
         print_uninstall_plan(
             &paths,
             &unit_path,
@@ -1020,12 +1216,20 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
 
     // preflight 全部通过后才提示；取消时未做任何修改。
     if let Some(targets) = &purge_targets {
-        if !args.yes && (targets.config.is_some() || targets.data.is_some()) {
-            let question = format!(
+        if !args.yes
+            && (targets.config.is_some() || targets.data.is_some() || targets.tls.is_some())
+        {
+            let mut question = format!(
                 "确认删除面板配置 {} 与数据目录 {}？该操作不可恢复",
                 config_path.display(),
                 data_path.display()
             );
+            if let Some(tls) = &targets.tls {
+                question.push_str(&format!(
+                    "；同时删除面板 TLS 材料（含私钥）{}",
+                    tls.display()
+                ));
+            }
             let prompt = Prompt::new(false);
             if !prompt.confirm(&question, false)? {
                 println!("已取消卸载（未做任何修改）");
@@ -1066,6 +1270,10 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
     // 定位到同一组路径；state 中 roles 为空时删除整个 state 文件。
     let mut purged_config = false;
     let mut purged_data = false;
+    let mut purged_tls = false;
+    let tls_purge_path = purge_targets
+        .as_ref()
+        .and_then(|targets| targets.tls.clone());
     if let Some(targets) = purge_targets {
         if let Some(config) = targets.config {
             check_existing_regular_file(&config, "panel 配置")?;
@@ -1078,6 +1286,13 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
             fs::remove_dir_all(&data)
                 .with_context(|| format!("删除面板数据目录 {} 失败", data.display()))?;
             purged_data = true;
+        }
+        if let Some(tls) = targets.tls {
+            // preflight 后、删除前再复核一次：目录不能被换成符号链接。
+            check_removable_directory(&tls, "面板 TLS 目录")?;
+            fs::remove_dir_all(&tls)
+                .with_context(|| format!("删除面板 TLS 目录 {} 失败", tls.display()))?;
+            purged_tls = true;
         }
     }
 
@@ -1096,6 +1311,11 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
         purged_config,
         purged_data,
     );
+    if purged_tls {
+        if let Some(tls) = tls_purge_path {
+            println!("  已删除面板 TLS 材料（含私钥）: {}", tls.display());
+        }
+    }
     Ok(())
 }
 
@@ -1641,13 +1861,25 @@ fn read_toml_readonly<T: serde::de::DeserializeOwned>(path: &Path, label: &str) 
 }
 
 /// 解析 hub 管理 API 地址。
+///
+/// `--force` 时以旧配置为先：未显式给 `--hub-url` 必须保留 `base.hub_url`，
+/// 不能回退到同 prefix hub.toml 推导出的本地地址（可能把旧 hub token 发到
+/// 本机任意用户可绑定的端口）。
 fn resolve_hub_url(
     explicit: Option<&str>,
+    base: Option<&PanelConfig>,
     hub: Option<&HubConfig>,
     hub_path: &Path,
 ) -> Result<String> {
     if let Some(raw) = explicit {
         return crate::normalize_hub_url(raw).context("--hub-url 非法");
+    }
+    if let Some(base) = base {
+        let configured = base.hub_url.trim();
+        if !configured.is_empty() {
+            return crate::normalize_hub_url(configured)
+                .context("已有面板配置的 hub_url 非法；请用 --hub-url 显式指定");
+        }
     }
     if let Some(hub) = hub {
         if let Some(port) = port_of(&hub.admin_listen) {
@@ -1667,6 +1899,58 @@ fn resolve_hub_url(
         );
     }
     Ok(format!("http://127.0.0.1:{DEFAULT_ADMIN_PORT}"))
+}
+
+/// 解析最终 hub token。
+///
+/// 顺序：显式 `--hub-token-file` > 旧配置 token（仅当地址未变）> 同 prefix
+/// hub.toml 的 admin_token（仅全新安装）。旧配置 token 一旦发现 `hub_url`
+/// 变化就拒绝复用，避免把凭据发到新地址。
+fn resolve_hub_token(
+    token_file: Option<&Path>,
+    base: Option<&PanelConfig>,
+    hub: Option<&HubConfig>,
+    hub_url: &str,
+    hub_path: &Path,
+) -> Result<String> {
+    if let Some(path) = token_file {
+        return read_secret_file(path, "hub token");
+    }
+    if let Some(base) = base {
+        let base_token = base.token.trim();
+        let base_url = base.hub_url.trim();
+        if !base_token.is_empty() {
+            let unchanged = !base_url.is_empty()
+                && crate::normalize_hub_url(base_url)
+                    .map(|url| url == hub_url)
+                    .unwrap_or(false);
+            if !unchanged {
+                bail!(concat!(
+                    "--force 检测到 hub_url 已变更，但未提供 --hub-token-file：",
+                    "拒绝复用旧 hub token（避免把凭据发到新地址）。",
+                    "请显式提供 --hub-token-file，或保留原 --hub-url"
+                ));
+            }
+            return Ok(base_token.to_string());
+        }
+        // 旧配置存在却没有 token：不猜测同 prefix hub.toml 的 token 会不会被
+        // 发到旧地址，要求用户显式提供。
+        bail!(concat!(
+            "已有面板配置没有可复用的 hub token；--force 需要显式提供 ",
+            "--hub-token-file，避免把 hub 管理 token 发到非预期地址"
+        ));
+    }
+    match hub
+        .map(|hub| hub.admin_token.trim())
+        .filter(|token| !token.is_empty())
+    {
+        Some(token) => Ok(token.to_string()),
+        None => bail!(
+            "缺少 hub 管理 token：请使用 --hub-token-file 提供 0600 文件，\
+             或先安装 hub 使 {} 含非空 admin_token",
+            hub_path.display()
+        ),
+    }
 }
 
 /// 解析静态资源目录。
@@ -2078,6 +2362,50 @@ fn remove_regular_file(path: &Path, label: &str) -> Result<bool> {
 struct PurgeTargets {
     config: Option<PathBuf>,
     data: Option<PathBuf>,
+    /// `<prefix>/etc/rustboard/panel-tls`（存在时）；内含面板私钥。
+    tls: Option<PathBuf>,
+}
+
+/// `--purge` 的 panel TLS 目录目标：`<prefix>/etc/rustboard/panel-tls`。
+///
+/// 拒绝符号链接（目录本身与任何被替换的父目录），并要求 canonical path 正好是
+/// prefix 下的固定相对路径；避免伪造 prefix 结构把删除引向别处。
+fn prepare_panel_tls_purge_target(paths: &Paths) -> Result<Option<PathBuf>> {
+    let dir = paths.prefix.join(PANEL_TLS_DIR_RELATIVE);
+    let meta = match fs::symlink_metadata(&dir) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取面板 TLS 目录 {} 元数据失败", dir.display()))
+        }
+    };
+    if meta.file_type().is_symlink() {
+        bail!(
+            "面板 TLS 目录 {} 是符号链接，拒绝 --purge 删除",
+            dir.display()
+        );
+    }
+    if !meta.is_dir() {
+        bail!(
+            "面板 TLS 路径 {} 不是目录，拒绝 --purge 删除",
+            dir.display()
+        );
+    }
+    let prefix = fs::canonicalize(&paths.prefix)
+        .with_context(|| format!("解析安装前缀 {} 失败，拒绝 --purge", paths.prefix.display()))?;
+    let canonical = fs::canonicalize(&dir)
+        .with_context(|| format!("解析面板 TLS 目录 {} 失败", dir.display()))?;
+    let expected = prefix.join(PANEL_TLS_DIR_RELATIVE);
+    if canonical != expected {
+        bail!(
+            "面板 TLS 目录 {} 的真实路径是 {}（预期 {}）；父目录可能被替换为符号链接，拒绝 --purge",
+            dir.display(),
+            canonical.display(),
+            expected.display()
+        );
+    }
+    Ok(Some(canonical))
 }
 
 /// 只读校验 `--purge` 目标：受管路径 allowlist、符号链接拒绝、类型正确、
@@ -2115,7 +2443,8 @@ fn prepare_purge_targets(
             bail!("拒绝 --purge 删除安装状态文件本身: {}", config.display());
         }
     }
-    Ok(PurgeTargets { config, data })
+    let tls = prepare_panel_tls_purge_target(paths)?;
+    Ok(PurgeTargets { config, data, tls })
 }
 
 /// 校验单个 purge 目标并返回 canonical path；不存在返回 `None`。
@@ -2451,6 +2780,32 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    /// 测试用默认安装参数；调用方按需覆盖字段。
+    fn test_install_args() -> InstallArgs {
+        InstallArgs {
+            yes: true,
+            offline: false,
+            dry_run: false,
+            force: false,
+            prefix: None,
+            config: None,
+            unit_dir: None,
+            hub_url: None,
+            hub_token_file: None,
+            password_file: None,
+            listen: None,
+            static_dir: None,
+            tls_cert: None,
+            tls_key: None,
+            http: false,
+            hub_ca: None,
+            public_origin: None,
+            cookie_secure: None,
+            systemd: false,
+            no_systemd: true,
+        }
+    }
+
     #[test]
     fn hub_token_file_missing_is_rejected() {
         let dir = TempDir::new("token-missing");
@@ -2584,6 +2939,146 @@ mod tests {
         };
         let listen = resolve_listen(None, Some(&broken)).unwrap();
         assert!(listen.starts_with("127.0.0.1:"), "{listen}");
+    }
+
+    #[test]
+    fn force_preserves_base_hub_url_and_token() {
+        let base = PanelConfig {
+            hub_url: "https://remote.example:8444".to_string(),
+            token: "base-token".to_string(),
+            ..PanelConfig::default()
+        };
+        let hub_path = Path::new("/nonexistent/hub.toml");
+        assert_eq!(
+            resolve_hub_url(None, Some(&base), None, hub_path).unwrap(),
+            "https://remote.example:8444",
+            "--force 未显式 --hub-url 必须保留旧地址，不能回退到默认端口"
+        );
+        assert_eq!(
+            resolve_hub_token(
+                None,
+                Some(&base),
+                None,
+                "https://remote.example:8444",
+                hub_path
+            )
+            .unwrap(),
+            "base-token"
+        );
+
+        // 地址改变且没有显式 token 文件：拒绝复用旧 token。
+        let error = resolve_hub_token(None, Some(&base), None, "http://127.0.0.1:8444", hub_path)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--hub-token-file"),
+            "{error:#}"
+        );
+
+        // 显式 token 文件优先，允许切换地址。
+        let dir = TempDir::new("force-token");
+        let token_path = dir.join("token");
+        write_with_mode(&token_path, b"explicit-token\n", 0o600);
+        assert_eq!(
+            resolve_hub_token(
+                Some(&token_path),
+                Some(&base),
+                None,
+                "http://127.0.0.1:8444",
+                hub_path
+            )
+            .unwrap(),
+            "explicit-token"
+        );
+
+        // 旧配置没有 token：不猜测 hub.toml 的 token 会发到哪个地址。
+        let empty = PanelConfig {
+            token: String::new(),
+            ..base
+        };
+        assert!(resolve_hub_token(
+            None,
+            Some(&empty),
+            None,
+            "https://remote.example:8444",
+            hub_path
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn force_never_silently_downgrades_https_panel() {
+        let dir = TempDir::new("tls-downgrade");
+        let paths = resolve_paths(Some(dir.path.as_path()), None, None).unwrap();
+        let tls_dir = paths.prefix.join(PANEL_TLS_DIR_RELATIVE);
+        fs::create_dir_all(&tls_dir).unwrap();
+        for name in [
+            PANEL_TLS_CERT_FILE,
+            PANEL_TLS_KEY_FILE,
+            PANEL_TLS_HUB_CA_FILE,
+        ] {
+            fs::write(tls_dir.join(name), b"stale").unwrap();
+        }
+
+        let mut args = test_install_args();
+        args.force = true;
+        // 旧配置不可解析/缺失 + 残留 TLS 材料 + 未显式 TLS/--http：fail-closed。
+        let error = resolve_tls_downgrade(&args, None, &tls_dir, false).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("--http"), "{message}");
+        assert!(message.contains("--tls-cert"), "{message}");
+        assert!(tls_dir.join(PANEL_TLS_KEY_FILE).exists(), "拒绝时不得删除");
+
+        // 显式 --http：登记 cert/key/hub-ca 给事务删除，并尝试删除空目录。
+        args.http = true;
+        let downgrade = resolve_tls_downgrade(&args, None, &tls_dir, false)
+            .unwrap()
+            .expect("显式 --http 必须允许降级");
+        assert_eq!(downgrade.files.len(), 3);
+        assert!(downgrade.remove_dir);
+
+        // 旧配置仍引用 hub-ca.pem（https hub）：保留公共 CA 与目录。
+        let downgrade = resolve_tls_downgrade(&args, None, &tls_dir, true)
+            .unwrap()
+            .expect("显式 --http 必须允许降级");
+        assert_eq!(downgrade.files.len(), 2);
+        assert!(!downgrade.remove_dir);
+
+        // 旧配置有成对 tls 字段：正常复用，不是降级。
+        let base = PanelConfig {
+            tls_cert: "/srv/cert.pem".to_string(),
+            tls_key: "/srv/key.pem".to_string(),
+            ..PanelConfig::default()
+        };
+        let mut force = test_install_args();
+        force.force = true;
+        assert!(resolve_tls_downgrade(&force, Some(&base), &tls_dir, false)
+            .unwrap()
+            .is_none());
+
+        // 没有 --force 不触碰旧材料（幂等分支/正常安装语义不变）。
+        let mut http_only = test_install_args();
+        http_only.http = true;
+        assert!(resolve_tls_downgrade(&http_only, None, &tls_dir, false)
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tls_downgrade_rejects_symlinked_material() {
+        let dir = TempDir::new("tls-downgrade-link");
+        let paths = resolve_paths(Some(dir.path.as_path()), None, None).unwrap();
+        let tls_dir = paths.prefix.join(PANEL_TLS_DIR_RELATIVE);
+        fs::create_dir_all(&tls_dir).unwrap();
+        let target = dir.join("outside-key.pem");
+        fs::write(&target, b"secret").unwrap();
+        std::os::unix::fs::symlink(&target, tls_dir.join(PANEL_TLS_KEY_FILE)).unwrap();
+
+        let mut args = test_install_args();
+        args.force = true;
+        args.http = true;
+        let error = resolve_tls_downgrade(&args, None, &tls_dir, false).unwrap_err();
+        assert!(format!("{error:#}").contains("符号链接"), "{error:#}");
     }
 
     #[test]
@@ -3187,6 +3682,7 @@ mod tests {
             static_dir: None,
             tls_cert: None,
             tls_key: None,
+            http: false,
             hub_ca: None,
             public_origin: None,
             cookie_secure: None,
@@ -3241,6 +3737,7 @@ mod tests {
             static_dir: None,
             tls_cert: None,
             tls_key: None,
+            http: false,
             hub_ca: Some(ca_path),
             public_origin: None,
             cookie_secure: None,
@@ -3410,6 +3907,7 @@ mod tests {
             static_dir: None,
             tls_cert: None,
             tls_key: None,
+            http: false,
             hub_ca: None,
             public_origin: None,
             cookie_secure: Some(CookieSecureArg::Never),

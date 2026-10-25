@@ -2833,6 +2833,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "instant-acme",
+ "libc",
  "object_store",
  "rcgen 0.13.2",
  "reqwest 0.12.28",

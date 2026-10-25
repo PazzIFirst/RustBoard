@@ -193,6 +193,25 @@ impl Fixture {
         write_mode(&key, pki.key_pem.as_bytes(), 0o600);
         (cert, key)
     }
+
+    /// 与 [`Fixture::install_cmd`] 相同，但不传 `--hub-token-file`（测试 --force 复用）。
+    fn install_cmd_without_token(&self, port: u16, hub_url: &str) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rustboard-panel"));
+        cmd.arg("install")
+            .arg("--prefix")
+            .arg(&self.prefix)
+            .arg("--no-systemd")
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("--hub-url")
+            .arg(hub_url)
+            .arg("--password-file")
+            .arg(&self.password_file)
+            .arg("--static-dir")
+            .arg(&self.site);
+        cmd.env("RUSTBOARD_INSTALL_LOCK_HELD", "1");
+        cmd
+    }
 }
 
 impl Drop for Fixture {
@@ -894,4 +913,309 @@ fn force_without_tls_args_reuses_existing_installed_files() {
     let cfg = PanelConfig::load(&fixture.config()).expect("配置可解析");
     assert_eq!(cfg.cookie_secure, CookieSecure::Always);
     assert_eq!(cfg.public_origin, "https://panel.test");
+}
+
+#[test]
+fn merged_cert_or_hub_ca_pem_is_rejected_before_write() {
+    let _guard = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("merged-pem");
+    let port = pick_port();
+    let pki = TestPki::new(&[dns("panel.test"), ip_san("127.0.0.1")]);
+    let (_, source_key) = fixture.write_source_pair(&pki);
+
+    // cert+key 合并 PEM 传给 --tls-cert：load_certs 会跳过私钥块，若不拦截会把
+    // 面板私钥以 0644 复制到 panel-tls/cert.pem。
+    let merged_cert = fixture.root.join("merged-cert.pem");
+    write_mode(
+        &merged_cert,
+        format!("{}{}", pki.fullchain_pem, pki.key_pem).as_bytes(),
+        0o644,
+    );
+    let error = run_failed(
+        fixture
+            .install_cmd(port, "http://127.0.0.1:1")
+            .arg("--tls-cert")
+            .arg(&merged_cert)
+            .arg("--tls-key")
+            .arg(&source_key),
+        "cert+key 合并 PEM",
+    );
+    assert!(
+        error.contains("CERTIFICATE") || error.contains("私钥"),
+        "{error}"
+    );
+    assert!(!fixture.config().exists(), "失败安装不得写配置");
+    assert!(!fixture.tls_dir().exists(), "失败安装不得创建 panel-tls");
+
+    // hub-ca+key 合并 PEM：同样必须在写盘前拒绝。
+    let merged_hub_ca = fixture.root.join("merged-hub-ca.pem");
+    write_mode(
+        &merged_hub_ca,
+        format!("{}{}", pki.ca_pem, pki.key_pem).as_bytes(),
+        0o644,
+    );
+    let error = run_failed(
+        fixture
+            .install_cmd(port, "https://hub.example:8444")
+            .arg("--hub-ca")
+            .arg(&merged_hub_ca),
+        "hub-ca+key 合并 PEM",
+    );
+    assert!(
+        error.contains("CERTIFICATE") || error.contains("私钥"),
+        "{error}"
+    );
+    assert!(!fixture.config().exists());
+    assert!(!fixture.tls_dir().exists());
+}
+
+#[test]
+fn force_refuses_silent_https_downgrade_and_explicit_http_cleans_up() {
+    let _guard = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("downgrade");
+    let port = pick_port();
+    run_checked(
+        &mut fixture.install_cmd(port, "http://127.0.0.1:1"),
+        "首次 HTTP 安装",
+    );
+
+    // 旧配置损坏 + 残留 panel-tls 材料：--force 未传 TLS 参数时不得静默降级。
+    fs::create_dir_all(fixture.tls_dir()).unwrap();
+    fs::set_permissions(fixture.tls_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+    write_mode(&fixture.tls_cert(), b"stale-cert", 0o644);
+    write_mode(&fixture.tls_key(), b"stale-private-key", 0o600);
+    write_mode(&fixture.hub_ca(), b"stale-ca", 0o644);
+    let corrupt = b"this is not = [valid toml";
+    write_mode(&fixture.config(), corrupt, 0o600);
+
+    let error = run_failed(
+        fixture
+            .install_cmd(port, "http://127.0.0.1:1")
+            .arg("--force"),
+        "--force 无 TLS 参数且旧配置损坏",
+    );
+    assert!(
+        error.contains("拒绝") && (error.contains("--http") || error.contains("--tls-cert")),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read(fixture.config()).unwrap(),
+        corrupt,
+        "fail-closed 不得改写旧配置"
+    );
+    assert_eq!(
+        fs::read(fixture.tls_key()).unwrap(),
+        b"stale-private-key",
+        "fail-closed 不得删除私钥"
+    );
+
+    // 显式 --http：允许降级，并用事务删除 cert/key/hub-ca，随后删除空目录。
+    run_checked(
+        fixture
+            .install_cmd(port, "http://127.0.0.1:1")
+            .arg("--force")
+            .arg("--http"),
+        "--force --http 显式降级",
+    );
+    let cfg = PanelConfig::load(&fixture.config()).expect("降级后的配置必须可解析");
+    assert!(cfg.tls_cert.is_empty() && cfg.tls_key.is_empty(), "{cfg:?}");
+    assert!(!fixture.tls_key().exists(), "显式降级必须删除旧面板私钥");
+    assert!(
+        !fixture.tls_dir().exists(),
+        "已知 TLS 材料删完后应删除空 panel-tls 目录"
+    );
+}
+
+/// 构造不带 `--hub-url` / `--hub-token-file` 的 --force 安装命令。
+fn force_install_cmd(fixture: &Fixture, port: u16) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rustboard-panel"));
+    cmd.arg("install")
+        .arg("--prefix")
+        .arg(&fixture.prefix)
+        .arg("--no-systemd")
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--password-file")
+        .arg(&fixture.password_file)
+        .arg("--static-dir")
+        .arg(&fixture.site)
+        .arg("--force");
+    cmd.env("RUSTBOARD_INSTALL_LOCK_HELD", "1");
+    cmd
+}
+
+#[test]
+fn force_preserves_hub_url_and_token_from_base_config() {
+    let _guard = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("force-hub");
+    let port = pick_port();
+    let pki = TestPki::new(&[dns("panel.test")]);
+    let ca_source = fixture.root.join("hub-ca-source.pem");
+    write_mode(&ca_source, pki.ca_pem.as_bytes(), 0o644);
+    run_checked(
+        fixture
+            .install_cmd(port, "https://remote.example:8444")
+            .arg("--hub-ca")
+            .arg(&ca_source),
+        "首次 HTTPS 远程 hub 安装",
+    );
+    let before = PanelConfig::load(&fixture.config()).expect("读取首次安装配置");
+    assert_eq!(before.hub_url, "https://remote.example:8444");
+    assert_eq!(before.token, HUB_TOKEN);
+    assert_eq!(before.hub_ca, fixture.hub_ca().to_string_lossy());
+
+    // 未显式 --hub-url / --hub-token-file：必须保留旧地址与 token。
+    run_checked(
+        &mut force_install_cmd(&fixture, port),
+        "--force 保留旧 hub_url/token",
+    );
+    let after = PanelConfig::load(&fixture.config()).expect("读取 --force 配置");
+    assert_eq!(after.hub_url, "https://remote.example:8444");
+    assert_eq!(after.token, HUB_TOKEN);
+    assert_eq!(after.hub_ca, fixture.hub_ca().to_string_lossy());
+
+    // 显式改到不同地址但没有 token 文件：拒绝，避免旧 token 被发到新地址。
+    let before_bytes = fs::read(fixture.config()).unwrap();
+    let error = run_failed(
+        fixture
+            .install_cmd_without_token(port, "http://127.0.0.1:18444")
+            .arg("--force"),
+        "--force 改 hub_url 且无 token 文件",
+    );
+    assert!(error.contains("--hub-token-file"), "{error}");
+    assert_eq!(
+        fs::read(fixture.config()).unwrap(),
+        before_bytes,
+        "拒绝时不得改写配置"
+    );
+
+    // 显式 token 文件：允许切换地址。
+    let token_file = fixture.root.join("new-hub-token");
+    write_private(&token_file, "new-hub-token-value");
+    run_checked(
+        fixture
+            .install_cmd_without_token(port, "http://127.0.0.1:18444")
+            .arg("--force")
+            .arg("--hub-token-file")
+            .arg(&token_file),
+        "--force 切换地址且显式提供 token",
+    );
+    let switched = PanelConfig::load(&fixture.config()).expect("读取切换后的配置");
+    assert_eq!(switched.hub_url, "http://127.0.0.1:18444");
+    assert_eq!(switched.token, "new-hub-token-value");
+}
+
+fn uninstall_cmd(fixture: &Fixture, purge: bool) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rustboard-panel"));
+    cmd.arg("uninstall")
+        .arg("--prefix")
+        .arg(&fixture.prefix)
+        .arg("--yes");
+    if purge {
+        cmd.arg("--purge");
+    }
+    cmd.env("RUSTBOARD_INSTALL_LOCK_HELD", "1");
+    cmd
+}
+
+#[test]
+fn uninstall_purge_removes_panel_tls_private_key() {
+    let _guard = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("purge-tls");
+    let port = pick_port();
+    let pki = TestPki::new(&[dns("panel.test"), ip_san("127.0.0.1")]);
+    let (source_cert, source_key) = fixture.write_source_pair(&pki);
+    run_checked(
+        fixture
+            .install_cmd(port, "http://127.0.0.1:1")
+            .arg("--tls-cert")
+            .arg(&source_cert)
+            .arg("--tls-key")
+            .arg(&source_key),
+        "安装面板（TLS，准备 purge）",
+    );
+    assert!(fixture.tls_key().exists());
+
+    run_checked(&mut uninstall_cmd(&fixture, true), "uninstall --purge");
+    assert!(!fixture.config().exists(), "--purge 应删除配置");
+    assert!(
+        !fixture.prefix.join("var/lib/rustboard/panel").exists(),
+        "--purge 应删除数据目录"
+    );
+    assert!(
+        !fixture.tls_dir().exists(),
+        "--purge 应删除 panel-tls 目录（含私钥）"
+    );
+    assert!(!fixture.tls_key().exists(), "私钥不得残留");
+}
+
+#[test]
+fn uninstall_without_purge_keeps_panel_tls_private_key() {
+    let _guard = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("keep-tls");
+    let port = pick_port();
+    let pki = TestPki::new(&[dns("panel.test"), ip_san("127.0.0.1")]);
+    let (source_cert, source_key) = fixture.write_source_pair(&pki);
+    run_checked(
+        fixture
+            .install_cmd(port, "http://127.0.0.1:1")
+            .arg("--tls-cert")
+            .arg(&source_cert)
+            .arg("--tls-key")
+            .arg(&source_key),
+        "安装面板（TLS，准备非 purge）",
+    );
+
+    run_checked(&mut uninstall_cmd(&fixture, false), "uninstall（保留）");
+    assert!(fixture.config().exists(), "非 --purge 必须保留配置");
+    assert!(fixture.tls_key().exists(), "非 --purge 必须保留私钥");
+    assert_eq!(mode_of(&fixture.tls_key()), 0o600);
+}
+
+#[test]
+fn force_explicit_http_downgrades_valid_tls_config_and_removes_key() {
+    let _guard = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("downgrade-valid");
+    let port = pick_port();
+    let pki = TestPki::new(&[dns("panel.test"), ip_san("127.0.0.1")]);
+    let (source_cert, source_key) = fixture.write_source_pair(&pki);
+    run_checked(
+        fixture
+            .install_cmd(port, "http://127.0.0.1:1")
+            .arg("--tls-cert")
+            .arg(&source_cert)
+            .arg("--tls-key")
+            .arg(&source_key),
+        "首次 TLS 安装（准备显式降级）",
+    );
+    let before = PanelConfig::load(&fixture.config()).expect("读取 TLS 配置");
+    assert!(!before.tls_cert.is_empty() && !before.tls_key.is_empty());
+    assert_eq!(before.cookie_secure, CookieSecure::Always);
+    assert_eq!(before.public_origin, "https://panel.test");
+
+    run_checked(
+        fixture
+            .install_cmd(port, "http://127.0.0.1:1")
+            .arg("--force")
+            .arg("--http"),
+        "--force --http 显式降级有效 TLS 配置",
+    );
+    let after = PanelConfig::load(&fixture.config()).expect("读取降级后的配置");
+    assert!(
+        after.tls_cert.is_empty() && after.tls_key.is_empty(),
+        "{after:?}"
+    );
+    assert_eq!(
+        after.cookie_secure,
+        CookieSecure::Auto,
+        "HTTP 不得沿用 always"
+    );
+    assert!(
+        after.public_origin.is_empty(),
+        "显式降级不得沿用直连 TLS 推导的 https origin"
+    );
+    assert_eq!(after.hub_url, "http://127.0.0.1:1");
+    assert_eq!(after.token, HUB_TOKEN);
+    assert!(!fixture.tls_dir().exists(), "旧 panel-tls 目录应删除");
+    assert!(!fixture.tls_key().exists(), "旧私钥不得残留");
 }

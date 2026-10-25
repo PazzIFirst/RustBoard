@@ -33,7 +33,6 @@
 //! 「最小 1」，实现采用更严格的安全下限——秒级检查在证书未到期时只是无意义的
 //! 磁盘读取，还会放大错误配置（有效期 ≤ 续签阈值）造成的重写频率。
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -52,10 +51,8 @@ pub type TlsConfigSender = watch::Sender<Arc<ServerConfig>>;
 pub const CERT_FILE_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// 热加载失败告警的最小间隔，避免坏证书每 10s 刷一条日志。
 const CERT_LOAD_WARN_INTERVAL: Duration = Duration::from_secs(60);
-/// rotate-cert 锁文件的名称（位于证书目录）。
+/// rotate-cert 锁文件的名称（位于证书目录）。锁文件是**持久**的，不随 Drop 删除。
 pub const CERT_LOCK_FILE: &str = ".rotate.lock";
-/// 锁文件超过该时长视为陈旧（持锁进程可能已崩溃）。
-const STALE_LOCK_AGE: Duration = Duration::from_secs(10 * 60);
 
 /// 监听器当前实际使用的服务端证书摘要（只含公开信息）。
 ///
@@ -322,11 +319,11 @@ pub fn reload_server_config_if_changed(
     if !tls::cert_matches_key(&cert_pem, &key_pem).context("校验证书与私钥配套失败")? {
         bail!("服务端证书与私钥不配套，拒绝热加载");
     }
-    // 2) 按证书来源选择校验：self-signed 校验本地 CA 链；ACME 只做公开校验
-    //    （SAN / 有效期 / EKU / 非 CA），链由客户端在握手时按公共根验证。
+    // 2) 按证书来源选择校验：self-signed 校验本地 CA 链；ACME 校验叶子形状
+    //    与「叶子 -> CA」签名链（链尾信任锚由握手客户端验证）。
     if cfg.tls.mode.is_acme() {
-        tls::validate_public_server_cert(&cert_pem, &cfg.effective_server_names(), now_ms())
-            .context("热加载 ACME 证书校验失败（SAN / 有效期 / EKU）")?;
+        tls::validate_acme_chain(&cert_pem, &cfg.effective_server_names(), now_ms())
+            .context("热加载 ACME 证书链校验失败（SAN / 有效期 / EKU / CA 链）")?;
     } else {
         let ca_path = dir.join(tls::CA_CERT_FILE);
         let ca_pem = std::fs::read_to_string(&ca_path)
@@ -360,56 +357,58 @@ pub fn reload_server_config_if_changed(
     Ok(true)
 }
 
-/// rotate-cert 的进程间互斥锁：`<证书目录>/.rotate.lock`，`create_new` + 0600。
+/// rotate-cert 的进程间互斥锁：`<证书目录>/.rotate.lock`，基于 `flock(2)`。
 ///
-/// RAII：正常返回、出错返回、panic 展开时都会在 `Drop` 里删除锁文件。
-/// 持锁进程被 kill -9 时会留下锁文件，超过 [`STALE_LOCK_AGE`] 视为陈旧并自动清理。
+/// 旧实现用 `create_new` + 陈旧时间清理，存在 TOCTOU 竞态：两个进程可能同时
+/// 判定锁陈旧、都删除再重建，最终同时持锁。现在改为内核 advisory lock：
+/// - 打开/创建锁文件（0600，`O_NOFOLLOW`），`flock(LOCK_EX | LOCK_NB)`；
+/// - 持锁期间把 `File` 保存在结构体里，`Drop` 时 `flock(LOCK_UN)` 后关闭；
+/// - **不删除锁文件**：持锁进程被 `kill -9` 时内核会自动释放 flock，持久文件
+///   没有残留风险，也避免了「删除别人刚创建的锁文件」的竞态。
 #[derive(Debug)]
 pub struct CertLock {
+    file: std::fs::File,
     path: PathBuf,
 }
 
 impl CertLock {
-    /// 在证书目录获取锁；已有未过期的锁时返回错误。
+    /// 在证书目录获取锁；另一个进程持锁时立即返回错误。
     pub fn acquire(cert_dir: &Path) -> Result<Self> {
         fsutil::ensure_dir(cert_dir, 0o700)
             .with_context(|| format!("创建证书目录失败: {}", cert_dir.display()))?;
         let path = cert_dir.join(CERT_LOCK_FILE);
-        match create_lock_file(&path) {
-            Ok(()) => Ok(Self { path }),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                if is_stale_lock(&path) {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "检测到超过 10 分钟的陈旧 rotate-cert 锁，清理后重试"
-                    );
-                    match std::fs::remove_file(&path) {
-                        Ok(()) => {}
-                        Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(remove_err) => {
-                            return Err(remove_err)
-                                .with_context(|| format!("清理陈旧锁文件失败: {}", path.display()))
-                        }
-                    }
-                    create_lock_file(&path).with_context(|| {
-                        format!(
-                            "另一个 rotate-cert 正在运行（锁文件 {}）；请等待其结束",
-                            path.display()
-                        )
-                    })?;
-                    Ok(Self { path })
-                } else {
-                    bail!(
-                        "另一个 rotate-cert 正在运行（锁文件 {}）；\
-                         若确认没有进程在运行，可等待 10 分钟后陈旧锁自动恢复，或手动删除该文件",
-                        path.display()
-                    )
-                }
-            }
-            Err(err) => {
-                Err(err).with_context(|| format!("创建 rotate-cert 锁文件失败: {}", path.display()))
-            }
+
+        let file = open_lock_file(&path)
+            .with_context(|| format!("打开 rotate-cert 锁文件失败: {}", path.display()))?;
+        // 已存在的锁文件可能来自旧版本（0644）：基于已打开的 fd 收紧到 0600。
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("收紧 rotate-cert 锁文件权限失败: {}", path.display()))?;
         }
+
+        use std::os::unix::io::AsRawFd;
+        // SAFETY：`file` 在本作用域内始终存活，fd 有效；flock 只读取该 fd 的
+        // 打开文件描述，不涉及内存访问或悬垂指针。
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            let would_block = err
+                .raw_os_error()
+                .map(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+                .unwrap_or(false);
+            if would_block {
+                bail!(
+                    "另一个 rotate-cert 正在运行（锁文件 {}）；请等待其结束。\
+                     该锁由内核在进程退出时自动释放，无需删除锁文件",
+                    path.display()
+                );
+            }
+            return Err(err)
+                .with_context(|| format!("获取 rotate-cert 文件锁失败: {}", path.display()));
+        }
+
+        Ok(Self { file, path })
     }
 
     #[cfg(test)]
@@ -420,46 +419,35 @@ impl CertLock {
 
 impl Drop for CertLock {
     fn drop(&mut self) {
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => tracing::warn!(
+        use std::os::unix::io::AsRawFd;
+        // SAFETY：`self.file` 在 Drop 期间仍然存活，fd 有效；释放 advisory lock
+        // 只影响该打开文件描述。显式 LOCK_UN 后再由 File 关闭，避免依赖析构顺序。
+        let rc = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        if rc != 0 {
+            tracing::warn!(
                 path = %self.path.display(),
-                error = %err,
-                "删除 rotate-cert 锁文件失败，请手工清理"
-            ),
+                error = %std::io::Error::last_os_error(),
+                "释放 rotate-cert 文件锁失败；关闭文件描述符时内核仍会释放锁"
+            );
         }
+        // 不删除锁文件：下一次 acquire 复用同一个 inode，flock 自动生效。
     }
 }
 
-/// `create_new` 创建锁文件并写入 pid / 时间；已存在时返回 `AlreadyExists`。
-fn create_lock_file(path: &Path) -> std::io::Result<()> {
-    use std::fs::OpenOptions;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // 从创建的第一刻起就是 0600（不受 umask 影响）。
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    writeln!(file, "pid={} time_ms={}", std::process::id(), now_ms())?;
-    Ok(())
-}
+/// 打开（不存在则创建）锁文件：新建时 0600，拒绝符号链接。
+///
+/// 已存在文件的权限由 [`CertLock::acquire`] 在持有 fd 的情况下收紧，避免
+/// 「先 lstat 再 chmod」被替换路径的竞态。
+fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
 
-/// 锁文件是否已超过陈旧阈值（mtime 在未来或读不到时按不陈旧处理）。
-fn is_stale_lock(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    modified
-        .elapsed()
-        .map(|age| age >= STALE_LOCK_AGE)
-        .unwrap_or(false)
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
 }
 
 /// 是否现在需要续签；返回 `Some(新证书有效期天数)` 表示需要续签。
@@ -1002,9 +990,9 @@ fn load_acme_tls_config(cfg: &HubConfig) -> Result<Arc<ServerConfig>> {
              `rustboard-hub tls issue --config <hub.toml>` 重新获取证书"
         );
     }
-    tls::validate_public_server_cert(&material.cert_pem, &expected_sans, now_ms()).context(
-        "ACME 服务端证书校验失败；请执行 `rustboard-hub tls issue --config <hub.toml>` \
-         重新获取证书（旧证书保持不动）",
+    tls::validate_acme_chain(&material.cert_pem, &expected_sans, now_ms()).context(
+        "ACME 服务端证书链校验失败（至少需要叶子 + CA，且逐级验签通过）；\
+         请执行 `rustboard-hub tls issue --config <hub.toml>` 重新获取证书（旧证书保持不动）",
     )?;
     tls::server_config(&cfg.data_dir)
         .context("构建 ACME TLS 配置失败（检查 ca.crt/ca.key 与证书文件权限）")
@@ -2470,7 +2458,7 @@ mod tests {
         assert!(!rx.has_changed().unwrap(), "失败时不得推送新配置");
         assert!(lock.path().exists(), "失败方不得删除他人的锁");
 
-        // 释放锁后可正常续签，且锁文件随 RAII 删除。
+        // 释放锁后可正常续签；锁文件是持久的，不随 Drop 删除。
         drop(lock);
         let renewed = check_and_renew(&cfg, &tx, true, Some(30))
             .unwrap()
@@ -2482,25 +2470,53 @@ mod tests {
             1,
             "成功续签必须成对备份旧材料"
         );
-        assert!(!cert_dir.join(CERT_LOCK_FILE).exists());
+        assert!(
+            cert_dir.join(CERT_LOCK_FILE).exists(),
+            "持久锁文件不应被删除"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// KI-11：锁文件 0600、内容含 pid；第二个 acquire 失败，Drop 后释放。
+    /// KI-11：两个线程同时 acquire 只能一个成功；Drop 后另一个成功。
+    /// 锁文件持久保留（flock 自动释放），不再测试「删除锁文件」。
     #[test]
     fn v021_cert_lock_blocks_concurrent_rotate_and_releases_on_drop() {
         let dir = temp_dir("cert-lock");
         fsutil::ensure_dir(&dir, 0o700).unwrap();
         let cert_dir = tls::cert_dir(&dir);
-        let lock = CertLock::acquire(&cert_dir).expect("首次获取锁必须成功");
-        let lock_path = lock.path().to_path_buf();
-        assert_eq!(lock_path.file_name().unwrap(), CERT_LOCK_FILE);
-        assert!(lock_path.exists());
-        let content = std::fs::read_to_string(&lock_path).unwrap();
-        assert!(
-            content.contains(&format!("pid={}", std::process::id())),
-            "锁文件必须记录 pid: {content}"
-        );
+
+        // 两个线程从同一 barrier 同时抢锁；成功者持有到第二个 barrier 才释放。
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let finish = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let cert_dir = cert_dir.clone();
+            let start = start.clone();
+            let finish = finish.clone();
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                match CertLock::acquire(&cert_dir) {
+                    Ok(lock) => {
+                        finish.wait();
+                        drop(lock);
+                        true
+                    }
+                    Err(_) => {
+                        finish.wait();
+                        false
+                    }
+                }
+            }));
+        }
+        let successes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|acquired| *acquired)
+            .count();
+        assert_eq!(successes, 1, "两个线程同时 acquire 只能有一个成功");
+
+        let lock_path = cert_dir.join(CERT_LOCK_FILE);
+        assert!(lock_path.exists(), "持久锁文件必须存在");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2508,55 +2524,49 @@ mod tests {
             assert_eq!(mode, 0o600, "锁文件必须是 0600");
         }
 
-        let err = CertLock::acquire(&cert_dir).expect_err("并发第二个必须失败");
+        // 释放后可以再次获取；锁文件仍在，但不再持有内核锁。
+        let again = CertLock::acquire(&cert_dir).expect("释放后必须能重新获取");
+        assert_eq!(again.path(), lock_path);
+        let err = CertLock::acquire(&cert_dir).expect_err("持锁期间第二个必须失败");
         assert!(
             format!("{err:#}").contains("另一个 rotate-cert 正在运行"),
             "错误信息: {err:#}"
         );
-        assert!(lock_path.exists(), "失败方不得删除他人的锁");
-
-        drop(lock);
-        assert!(!lock_path.exists(), "RAII 必须删除锁文件");
-        // 释放后可以再次获取。
-        let again = CertLock::acquire(&cert_dir).expect("释放后必须能重新获取");
         drop(again);
-        assert!(!lock_path.exists());
+        CertLock::acquire(&cert_dir).expect("Drop 后必须能重新获取");
+        assert!(lock_path.exists(), "锁文件必须持久保留，不能依赖 Drop 删除");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// KI-11：超过 10 分钟的陈旧锁可自动恢复；未超时的锁不被误删。
+    /// 陈旧锁文件（旧 mtime、没有 flock 持有者）不能阻塞：flock 只看内核锁状态。
     #[test]
-    fn v021_cert_lock_recovers_stale_lock() {
+    fn v021_cert_lock_ignores_stale_lock_file() {
         use std::time::{Duration, SystemTime};
 
         let dir = temp_dir("cert-lock-stale");
         fsutil::ensure_dir(&dir, 0o700).unwrap();
         let cert_dir = tls::cert_dir(&dir);
-        let lock = CertLock::acquire(&cert_dir).unwrap();
-        let lock_path = lock.path().to_path_buf();
-
-        // 模拟持锁进程被 kill -9：只留下锁文件（用 forget 跳过 Drop）。
-        std::mem::forget(lock);
-        assert!(lock_path.exists());
-
-        // 刚创建的锁未超时：仍必须拒绝。
-        let err = CertLock::acquire(&cert_dir).expect_err("新鲜锁不得被清理");
-        assert!(format!("{err:#}").contains("另一个 rotate-cert 正在运行"));
-
-        // 把 mtime 改成 11 分钟前：下一次 acquire 必须清理并成功。
-        let old = SystemTime::now() - Duration::from_secs(11 * 60);
-        let file = std::fs::OpenOptions::new()
+        fsutil::ensure_dir(&cert_dir, 0o700).unwrap();
+        let lock_path = cert_dir.join(CERT_LOCK_FILE);
+        std::fs::write(&lock_path, b"pid=999999 time_ms=0\n").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
+        std::fs::OpenOptions::new()
             .write(true)
             .open(&lock_path)
+            .unwrap()
+            .set_modified(old)
             .unwrap();
-        file.set_modified(old).unwrap();
-        drop(file);
 
-        let recovered = CertLock::acquire(&cert_dir).expect("陈旧锁必须可恢复");
-        assert!(lock_path.exists(), "恢复后应持有一把新锁");
-        drop(recovered);
-        assert!(!lock_path.exists());
-
+        let lock = CertLock::acquire(&cert_dir).expect("没有 flock 持有者的旧锁文件不影响获取");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "旧锁文件权限必须被收紧到 0600");
+        }
+        drop(lock);
+        assert!(lock_path.exists(), "释放后锁文件仍保留");
+        CertLock::acquire(&cert_dir).expect("释放后必须能再次获取");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2572,20 +2582,42 @@ mod tests {
         cfg
     }
 
-    /// 生成 ACME 风格的公开证书（无 CN、SAN 指定、serverAuth、非 CA）。
+    /// 生成 ACME 风格的公开证书链（叶子 + CA）：叶子由测试 CA 真实签名，
+    /// 与 Pebble/公共 ACME 的返回形状一致（不是 self-signed 叶子）。
     fn public_pair(domain: &str) -> (String, String) {
         use rcgen::{
-            CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-            KeyUsagePurpose,
+            BasicConstraints, CertificateParams, CertificateSigningRequestParams,
+            DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
         };
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "Test ACME CA");
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_pem = ca_cert.pem();
+
         let mut params = CertificateParams::new(vec![domain.to_string()]).unwrap();
+        let subject_alt_names = params.subject_alt_names.clone();
         params.distinguished_name = DistinguishedName::new();
         params.is_ca = IsCa::NoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let key = KeyPair::generate().unwrap();
-        let cert = params.self_signed(&key).unwrap();
-        (cert.pem(), key.serialize_pem())
+        let csr = params.serialize_request(&key).unwrap();
+        let mut csr = CertificateSigningRequestParams::from_pem(&csr.pem().unwrap()).unwrap();
+        csr.params.subject_alt_names = subject_alt_names;
+        csr.params.is_ca = IsCa::NoCa;
+        csr.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let cert = csr.signed_by(&ca_cert, &ca_key).unwrap();
+        (format!("{}{}", cert.pem(), ca_pem), key.serialize_pem())
     }
 
     #[test]

@@ -2057,7 +2057,8 @@ mod tests {
         let bad = dir.join("bad.pem");
         write_mode(&bad, b"not a certificate", 0o644);
         let err = read_server_ca(&bad).unwrap_err().to_string();
-        assert!(err.contains("不是合法 PEM 证书"), "{err}");
+        // 严格状态机在 load_certs 之前就拒绝块外文本；错误只保留最外层 context。
+        assert!(err.contains("不是仅含 CERTIFICATE 的 PEM"), "{err}");
         assert!(
             !err.contains("not a certificate"),
             "错误不能回显内容: {err}"

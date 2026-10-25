@@ -7,6 +7,18 @@
 //! 订单总超时 180s；错误按 rate limit / validation / network 分类，信息只含
 //! 公开的域名、状态与 ACME 返回的 problem detail，绝不打印 token、key
 //! authorization、账户 key 或证书私钥。
+//!
+//! # 真实 Pebble 集成测试（默认跳过）
+//!
+//! 文件末尾三个 `pebble_*` 测试依赖本机 Pebble（host network，`14000` 目录、
+//! HTTP `5002`、TLS-ALPN `5001`）与 `/tmp/pebble-test/certs/pebble.minica.pem`。
+//! 默认 `cargo test` 因 `#[ignore]` 不会运行；显式运行时**必须**设置
+//! `RUSTBOARD_PEBBLE=1`，缺少环境会 panic（而不是 0 退出伪装成功）：
+//!
+//! ```text
+//! RUSTBOARD_PEBBLE=1 cargo test -p rustboard-hub --locked -- \
+//!     --ignored pebble --test-threads=1
+//! ```
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -588,15 +600,39 @@ mod tests {
         dir
     }
 
+    /// Pebble 集成测试的硬性前置检查。
+    ///
+    /// `#[ignore]` 只保证默认 `cargo test` 跳过；当维护者显式 `--ignored`
+    /// 请求这些测试时，缺少环境必须失败，不能静默 return 造成假绿。
+    fn pebble_root() -> &'static str {
+        const ROOT: &str = "/tmp/pebble-test/certs/pebble.minica.pem";
+        if std::env::var("RUSTBOARD_PEBBLE").ok().as_deref() != Some("1") {
+            panic!(
+                "Pebble 集成测试必须显式设置 RUSTBOARD_PEBBLE=1；\
+                 运行方式：RUSTBOARD_PEBBLE=1 cargo test -p rustboard-hub --locked -- \
+                 --ignored pebble --test-threads=1"
+            );
+        }
+        if !Path::new(ROOT).exists() {
+            panic!(
+                "已设置 RUSTBOARD_PEBBLE=1，但缺少 Pebble 根证书 {ROOT}；\
+                 请先启动 Pebble（host network）：\
+                 docker run -d --name rb-pebble --network host \
+                 -e PEBBLE_VA_NOSLEEP=1 -e PEBBLE_WFE_NONCEREJECT=0 \
+                 ghcr.io/letsencrypt/pebble@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199 && \
+                 mkdir -p /tmp/pebble-test/certs && \
+                 docker cp rb-pebble:/test/certs/pebble.minica.pem \
+                 /tmp/pebble-test/certs/pebble.minica.pem"
+            );
+        }
+        ROOT
+    }
+
     /// IP identifier + `shortlived` profile 的 Pebble 集成（C-G3 的本地验证）。
     #[tokio::test]
-    #[ignore = "需要本机 Pebble（host network 14000/5002）与 /tmp/pebble-test/certs/pebble.minica.pem"]
+    #[ignore = "需要 RUSTBOARD_PEBBLE=1 + 本机 Pebble（host network 14000/5002）与 /tmp/pebble-test/certs/pebble.minica.pem"]
     async fn pebble_ip_shortlived_issues_real_certificate() {
-        let root = "/tmp/pebble-test/certs/pebble.minica.pem";
-        if !Path::new(root).exists() {
-            eprintln!("跳过：缺少 {root}（Pebble 未启动）");
-            return;
-        }
+        let _root = pebble_root();
         std::env::set_var("RUSTBOARD_ACME_HTTP_PORT", "5002");
         let dir = temp_dir("pebble-ip");
         let mut tls_cfg = acme_tls(&["127.0.0.1"]);
@@ -604,12 +640,12 @@ mod tests {
         let issued = obtain_certificate(&dir, &tls_cfg)
             .await
             .expect("Pebble IP shortlived 必须签发成功");
-        tls::validate_public_server_cert(
+        tls::validate_acme_chain(
             &issued.cert_pem,
             &tls_cfg.domains,
             rustboard_common::util::now_ms(),
         )
-        .unwrap();
+        .expect("Pebble 必须返回真实叶子 + CA 链，且逐级验签通过");
         let names = tls::public_cert_names(&issued.cert_pem).unwrap();
         assert!(
             names.iter().any(|name| name == "IP:127.0.0.1"),
@@ -625,13 +661,9 @@ mod tests {
     /// 不进入默认门禁；手动运行：
     /// `RUSTBOARD_PEBBLE=1 cargo test -p rustboard-hub --locked -- --ignored pebble --test-threads=1`
     #[tokio::test]
-    #[ignore = "需要本机 Pebble（host network 14000/5002）与 /tmp/pebble-test/certs/pebble.minica.pem"]
+    #[ignore = "需要 RUSTBOARD_PEBBLE=1 + 本机 Pebble（host network 14000/5002）与 /tmp/pebble-test/certs/pebble.minica.pem"]
     async fn pebble_http01_issues_real_certificate() {
-        let root = "/tmp/pebble-test/certs/pebble.minica.pem";
-        if !Path::new(root).exists() {
-            eprintln!("跳过：缺少 {root}（Pebble 未启动）");
-            return;
-        }
+        let _root = pebble_root();
         std::env::set_var("RUSTBOARD_ACME_HTTP_PORT", "5002");
         let dir = temp_dir("pebble-http01");
         let tls_cfg = acme_tls(&["localhost"]);
@@ -640,12 +672,12 @@ mod tests {
             .expect("Pebble HTTP-01 必须签发成功");
         assert!(issued.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(!issued.key_pem.is_empty());
-        tls::validate_public_server_cert(
+        tls::validate_acme_chain(
             &issued.cert_pem,
             &tls_cfg.domains,
             rustboard_common::util::now_ms(),
         )
-        .unwrap();
+        .expect("Pebble 必须返回真实叶子 + CA 链，且逐级验签通过");
         assert!(
             tls::not_after_unix(&issued.cert_pem).unwrap()
                 > rustboard_common::util::now_ms() / 1000
@@ -656,13 +688,9 @@ mod tests {
 
     /// TLS-ALPN-01 的 Pebble 集成（Pebble tlsPort=5001）。
     #[tokio::test]
-    #[ignore = "需要本机 Pebble（host network 14000/5001）与 /tmp/pebble-test/certs/pebble.minica.pem"]
+    #[ignore = "需要 RUSTBOARD_PEBBLE=1 + 本机 Pebble（host network 14000/5001）与 /tmp/pebble-test/certs/pebble.minica.pem"]
     async fn pebble_tls_alpn01_issues_real_certificate() {
-        let root = "/tmp/pebble-test/certs/pebble.minica.pem";
-        if !Path::new(root).exists() {
-            eprintln!("跳过：缺少 {root}（Pebble 未启动）");
-            return;
-        }
+        let _root = pebble_root();
         std::env::set_var("RUSTBOARD_ACME_TLS_PORT", "5001");
         let dir = temp_dir("pebble-tlsalpn");
         let mut tls_cfg = acme_tls(&["localhost"]);
@@ -670,12 +698,12 @@ mod tests {
         let issued = obtain_certificate(&dir, &tls_cfg)
             .await
             .expect("Pebble TLS-ALPN-01 必须签发成功");
-        tls::validate_public_server_cert(
+        tls::validate_acme_chain(
             &issued.cert_pem,
             &tls_cfg.domains,
             rustboard_common::util::now_ms(),
         )
-        .unwrap();
+        .expect("Pebble 必须返回真实叶子 + CA 链，且逐级验签通过");
         std::env::remove_var("RUSTBOARD_ACME_TLS_PORT");
         let _ = std::fs::remove_dir_all(&dir);
     }
