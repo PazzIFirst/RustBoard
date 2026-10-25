@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use rustboard_common::config::{AcmeChallenge, HubConfig, ServerTlsMode, TlsConfig};
 use rustboard_install::detect_system;
@@ -30,6 +31,30 @@ fn skip_if_not_root() -> bool {
         return true;
     }
     false
+}
+
+/// 真实安装用例的进程内串行锁。
+///
+/// `rustboard-hub install` 会在子进程里抢固定全局 flock
+/// `/run/rustboard-install.lock`，且拿不到就立即失败；`cargo test` 默认并行跑
+/// 同一测试二进制里的用例时，多个真实安装用例的子进程会互相撞锁并报
+/// “另一个安装/卸载/升级进程正在运行”。这里把整个测试体（含多次 install）
+/// 串行化，生产代码的锁语义保持不变。
+///
+/// 只在测试体最外层取一次锁，**不要**放进 [`install_output`]：同一用例内可能
+/// 连续安装多次（如 ACME 失败后重试 self-signed），`std::sync::Mutex` 不可重入，
+/// 在辅助函数里重复加锁会自锁。
+static INSTALL_SERIAL: Mutex<()> = Mutex::new(());
+
+/// 获取真实安装用例的串行 guard。
+///
+/// 用例 panic 会让 mutex 中毒；这把锁只保证“同一时刻只有一个安装子进程”，
+/// 不保护共享数据，因此直接取回内部值继续，避免一个用例失败连坐其余用例。
+/// guard 随测试体作用域结束（含非 root 提前 return 与 panic unwind）自动释放。
+fn serialize_real_install() -> MutexGuard<'static, ()> {
+    INSTALL_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 static NEXT_PREFIX: AtomicU64 = AtomicU64::new(0);
@@ -124,6 +149,8 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 
 #[test]
 fn offline_with_existing_acme_config_fails_and_keeps_config_byte_identical() {
+    // 整段测试体持锁：install 会抢 /run 全局锁。
+    let _install_guard = serialize_real_install();
     if skip_if_not_root() {
         return;
     }
@@ -151,6 +178,9 @@ fn offline_with_existing_acme_config_fails_and_keeps_config_byte_identical() {
 
 #[test]
 fn new_acme_failure_cleans_data_dir_and_allows_self_signed_retry() {
+    // 整段测试体持锁：本用例会连续 install 两次（失败 + self-signed 重试），
+    // guard 只在这里取一次，避免 install_output 内重复加锁自锁。
+    let _install_guard = serialize_real_install();
     if skip_if_not_root() {
         return;
     }
@@ -206,6 +236,8 @@ fn new_acme_failure_cleans_data_dir_and_allows_self_signed_retry() {
 
 #[test]
 fn existing_data_dir_missing_ca_is_refused_without_creating_one() {
+    // 整段测试体持锁：install 会抢 /run 全局锁。
+    let _install_guard = serialize_real_install();
     if skip_if_not_root() {
         return;
     }
