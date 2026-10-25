@@ -269,7 +269,9 @@
 --all-targets` 通过、`cargo audit` 0 高危、actionlint 通过；`v100-offline.sh`
 **122 PASS / 0 FAIL / 0 SKIP（STRICT=1）**；`v100-docker.sh` amd64
 **123 PASS / 0 FAIL / 1 SKIP**（可选 arm64/QEMU 按设计 SKIP）；`v100-acme.sh`
-Pebble **3/3**（HTTP-01、TLS-ALPN-01、IP shortlived）真实签发；panel
+Pebble **3/3**（HTTP-01、TLS-ALPN-01、IP shortlived）真实签发；另手工跑通
+`hub install --tls acme-domain`（Pebble TLS-ALPN）→ `--force --tls self-signed`
+切换，确认 ACME 证书被既有 CA 重签、`openssl verify` 通过；panel
 `phase_c_panel_tls` **14/14**；web 80/80 + build。独立渗透报告
 [2026-10-25-m5-phase-c-pentest.md](security/2026-10-25-m5-phase-c-pentest.md)：
 **高危 0 / 中危 0 / 低危 3**（L-01 account.json 旧权限仅 issue 时收紧、L-02

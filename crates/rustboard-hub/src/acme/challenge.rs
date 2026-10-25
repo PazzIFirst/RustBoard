@@ -418,6 +418,15 @@ struct AcmeAlpnResolver {
 
 impl ResolvesServerCert for AcmeAlpnResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        // 只有明确协商 acme-tls/1 的 ClientHello 才下发挑战证书；无 ALPN
+        // 的普通 TLS 客户端应在证书阶段之前失败，避免泄露挑战证书。
+        let alpn_ok = hello
+            .alpn()
+            .map(|mut protocols| protocols.any(|proto| proto == ACME_TLS_ALPN))
+            .unwrap_or(false);
+        if !alpn_ok {
+            return None;
+        }
         if let Some(name) = hello.server_name() {
             if let Some(cert) = self.certs.get(&name.to_ascii_lowercase()) {
                 return Some(cert.clone());
@@ -809,6 +818,34 @@ mod tests {
         let name = ServerName::try_from("board.example.com".to_string()).unwrap();
         let result = connector.connect(name, tcp).await;
         assert!(result.is_err(), "非 acme-tls/1 的 ALPN 不能完成握手");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tls_alpn01_rejects_missing_alpn_before_certificate() {
+        let server = start_tls_alpn01_on(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            vec![TlsAlpn01Entry {
+                domain: "board.example.com".into(),
+                key_authorization_digest: vec![1u8; 32],
+            }],
+            false,
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addr();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAny(provider)))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let name = ServerName::try_from("board.example.com".to_string()).unwrap();
+        let result = connector.connect(name, tcp).await;
+        assert!(result.is_err(), "无 ALPN 的客户端不得拿到挑战证书");
         server.shutdown().await;
     }
 
