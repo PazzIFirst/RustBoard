@@ -21,29 +21,33 @@
 //! - systemd 按 unit 名字操作：`--systemd` 只接受系统 unit 目录；安装写 unit 后
 //!   用 `FragmentPath` 确认 systemd 实际解析的就是本安装的 unit，卸载只对确认
 //!   归属的 unit 执行 stop / disable，unit 文件不存在时绝不 stop；
-//! - 同 prefix 的 `hub.toml` 为 `admin_tls=required` 时，Phase A 面板安装直接
-//!   拒绝（即使显式 `--hub-url http://...`），不写出明文对接 required hub 的配置；
+//! - 同 prefix 的 `hub.toml` 为 `admin_tls=required` 时，面板必须用
+//!   `--hub-url https://<SAN 覆盖的主机名>`（私有 CA 再加 `--hub-ca`）对接；
+//!   显式或推导出的 hub 地址仍是 http 时在写盘前拒绝；
 //! - uninstall 先完成全部只读 preflight（含 state 记录的 config / data 路径），
 //!   再提示、停服、删除；只有 unit 位于系统 unit 目录时才调用 systemctl，prefix
 //!   内 unit 只删文件。
 
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use rustboard_common::config::{AdminTlsMode, CookieSecure, HubConfig, PanelConfig};
-use rustboard_common::fsutil;
+use rustboard_common::tls;
 use rustboard_common::util::port_of;
-use rustboard_common::DEFAULT_ADMIN_PORT;
+use rustboard_common::{fsutil, DEFAULT_ADMIN_PORT};
 use rustboard_install::{
     detect_system, is_systemd_unit_dir, pick_free_port, read_private_file, render_unit,
     require_systemd, shell_arg, unit_is_ours, validate_install_prefix, validate_managed_path,
     wait_http_ok, InstallLock, InstallState, InstallTxn, ManagedPathKind, PathOverrides, Paths,
     Prompt, Role, RoleState, ServiceManager,
 };
+use rustls::pki_types::ServerName;
 
 /// token / 密码文件读取上限（方案要求 token ≤ 4 KiB）。
 const SECRET_FILE_MAX_BYTES: usize = 4096;
@@ -55,9 +59,9 @@ const HUB_CONFIG_RELATIVE: &str = "etc/rustboard/hub.toml";
 const PRODUCTION_CONFIG: &str = "/etc/rustboard/panel.toml";
 /// 生产默认数据目录。
 const PRODUCTION_DATA: &str = "/var/lib/rustboard/panel";
-/// R-S5：Phase A 面板只支持明文 hub 管理 API；required 时必须在写盘 / 启动前拒绝。
-const ADMIN_TLS_REQUIRED_UNSUPPORTED: &str =
-    "Phase A 面板安装不支持 admin_tls=required；请等待 Phase C 或显式使用反代/HTTPS 部署";
+/// hub 配置了 `admin_tls=required` 时，面板必须用 https 地址对接。
+const ADMIN_TLS_REQUIRED_NEEDS_HTTPS: &str =
+    "hub.toml 配置了 admin_tls=required：面板必须通过 https:// 连接 hub；     请传 --hub-url https://<证书 SAN 覆盖的主机名>，自签/私有 CA 还需 --hub-ca <ca.pem>";
 
 /// `rustboard-panel install` 参数。
 #[derive(Debug, Args)]
@@ -98,12 +102,45 @@ pub struct InstallArgs {
     /// 前端静态资源目录；显式指定时必须包含 `index.html`。
     #[arg(long)]
     static_dir: Option<PathBuf>,
+    /// 面板 HTTPS 证书 PEM（必须与 `--tls-key` 成对）。
+    #[arg(long, value_name = "PATH")]
+    tls_cert: Option<PathBuf>,
+    /// 面板 HTTPS 私钥 PEM（0600 普通文件，不支持符号链接）。
+    #[arg(long, value_name = "PATH")]
+    tls_key: Option<PathBuf>,
+    /// hub 管理 API 的私有 CA（PEM，可含多张证书）；只允许与 https hub 一起使用。
+    #[arg(long, value_name = "PATH")]
+    hub_ca: Option<PathBuf>,
+    /// 面板对外访问源，例如 `https://panel.example.com`；直连 TLS 未给时按证书 SAN 推导。
+    #[arg(long, value_name = "URL")]
+    public_origin: Option<String>,
+    /// 会话 Cookie Secure 策略；直连 TLS 时强制 always。
+    #[arg(long, value_enum, value_name = "auto|always|never")]
+    cookie_secure: Option<CookieSecureArg>,
     /// 强制由 systemd 管理（需要 systemd 可用）。
     #[arg(long, conflicts_with = "no_systemd")]
     systemd: bool,
     /// 不写 unit、不调用 systemctl。
     #[arg(long, conflicts_with = "systemd")]
     no_systemd: bool,
+}
+
+/// `--cookie-secure` 的 CLI 取值，与 `PanelConfig` 的 serde 名称保持一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CookieSecureArg {
+    Auto,
+    Always,
+    Never,
+}
+
+impl From<CookieSecureArg> for CookieSecure {
+    fn from(value: CookieSecureArg) -> Self {
+        match value {
+            CookieSecureArg::Auto => CookieSecure::Auto,
+            CookieSecureArg::Always => CookieSecure::Always,
+            CookieSecureArg::Never => CookieSecure::Never,
+        }
+    }
 }
 
 /// `rustboard-panel uninstall` 参数。
@@ -152,6 +189,219 @@ impl ServiceMode {
     }
 }
 
+/// 面板 TLS 文件目录（相对 prefix），与方案 D6 的安装布局一致。
+const PANEL_TLS_DIR_RELATIVE: &str = "etc/rustboard/panel-tls";
+/// 安装后的证书文件名。
+const PANEL_TLS_CERT_FILE: &str = "cert.pem";
+/// 安装后的私钥文件名。
+const PANEL_TLS_KEY_FILE: &str = "key.pem";
+/// 安装后的 hub 私有 CA 文件名。
+const PANEL_TLS_HUB_CA_FILE: &str = "hub-ca.pem";
+
+/// 本次安装解析出的面板直连 TLS 计划。
+///
+/// `PanelTlsFiles` 内含私钥，故意不派生 `Debug`；本结构也不打印 PEM。
+struct PanelTlsPlan {
+    material: crate::PanelTlsFiles,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    /// `--tls-cert/--tls-key` 显式给出时为 true；`--force` 复用旧配置时为 false，
+    /// 不重写已有文件（但仍会校验文件本身）。
+    copy_files: bool,
+    public_origin: String,
+}
+
+/// 本次安装要写入的 hub 私有 CA。
+struct HubCaPlan {
+    dest: PathBuf,
+    bytes: Vec<u8>,
+}
+
+/// 解析面板直连 TLS 参数（含 `--force` 复用旧配置）。
+///
+/// 任何不完整 / 不配套 / 权限不合规 / SAN 不覆盖的情况都在写盘前返回错误。
+fn resolve_panel_tls(
+    args: &InstallArgs,
+    base: Option<&PanelConfig>,
+    listen: &str,
+    tls_dir: &Path,
+    dry_run: bool,
+) -> Result<Option<PanelTlsPlan>> {
+    let (material, copy_files) = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => (
+            crate::validate_panel_tls_files(cert, key, crate::TlsFilePolicy::Source)
+                .context("校验 --tls-cert/--tls-key 失败")?,
+            true,
+        ),
+        (None, None) => {
+            let Some(base) = base else {
+                return Ok(None);
+            };
+            let cert = base.tls_cert.trim();
+            let key = base.tls_key.trim();
+            if cert.is_empty() && key.is_empty() {
+                return Ok(None);
+            }
+            if cert.is_empty() || key.is_empty() {
+                bail!("已有面板配置的 tls_cert/tls_key 未成对，拒绝安装");
+            }
+            let policy = if dry_run {
+                crate::TlsFilePolicy::ReadOnly
+            } else {
+                crate::TlsFilePolicy::Runtime
+            };
+            (
+                crate::validate_panel_tls_files(Path::new(cert), Path::new(key), policy)
+                    .context("校验已有面板 TLS 配置失败")?,
+                false,
+            )
+        }
+        _ => bail!("--tls-cert 与 --tls-key 必须成对提供：都为空使用 HTTP，都非空才启用面板 HTTPS"),
+    };
+
+    let explicit_origin = args
+        .public_origin
+        .as_deref()
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty());
+    let base_origin = base
+        .map(|cfg| cfg.public_origin.trim())
+        .filter(|origin| !origin.is_empty());
+    let public_origin = match explicit_origin.or(base_origin) {
+        Some(origin) => origin.to_string(),
+        // 直连 TLS 没有 public_origin 时按证书第一个非通配 SAN 推导，
+        // 避免 Origin 校验退回 Host 比较导致部署歧义。
+        None => crate::derived_https_origin(&material)?,
+    };
+    if !public_origin.starts_with("https://") {
+        bail!(
+            "直连 TLS 时 public_origin 必须是 https://<host>（当前 {public_origin:?}）；\
+             反代部署才使用 http:// 或 auto"
+        );
+    }
+    crate::validate_panel_tls_names(&material, listen, &public_origin)
+        .context("面板 TLS 证书 SAN 校验失败")?;
+
+    Ok(Some(PanelTlsPlan {
+        material,
+        cert_path: tls_dir.join(PANEL_TLS_CERT_FILE),
+        key_path: tls_dir.join(PANEL_TLS_KEY_FILE),
+        copy_files,
+        public_origin,
+    }))
+}
+
+/// 解析 `--hub-ca`：只允许与 https hub 搭配；复制到 prefix 内固定路径。
+///
+/// 返回 `(需要写入的计划, 配置里的 hub_ca 路径)`。未显式给 `--hub-ca` 时保留
+/// `--force` 旧配置里的 hub_ca，避免升级时丢掉私有 CA 设置。
+fn resolve_hub_ca(
+    args: &InstallArgs,
+    base: Option<&PanelConfig>,
+    hub_url: &str,
+    tls_dir: &Path,
+) -> Result<(Option<HubCaPlan>, Option<String>)> {
+    let Some(source) = args.hub_ca.as_deref() else {
+        let existing = base
+            .map(|cfg| cfg.hub_ca.trim())
+            .filter(|ca| !ca.is_empty())
+            .map(str::to_string);
+        let Some(existing) = existing else {
+            return Ok((None, None));
+        };
+        // 旧配置可能来自 admin_tls=required；hub 切回 off 后 --force 会重新生成
+        // http hub_url。保留 hub_ca 会让 ProxyClient 在启动时拒绝 http+CA 的矛盾
+        // 配置，因此在没有显式 --hub-ca 时清掉并告警。
+        if !hub_url.starts_with("https://") {
+            eprintln!(
+                "警告: 旧配置的 hub_ca 只适用于 https hub；当前 hub_url={hub_url}，                 已从新配置移除 hub_ca（如需保留请改用 https）"
+            );
+            return Ok((None, None));
+        }
+        return Ok((None, Some(existing)));
+    };
+    if !hub_url.starts_with("https://") {
+        bail!(
+            "--hub-ca 只能与 https:// 的 hub 地址一起使用（当前 {hub_url}）；\
+             明文 http 配置 CA 不会加密，请先把 hub_url 改成 https://"
+        );
+    }
+    let bytes = read_hub_ca_pem(source)?;
+    let dest = tls_dir.join(PANEL_TLS_HUB_CA_FILE);
+    let config_path = path_string(&dest, "hub_ca")?;
+    Ok((Some(HubCaPlan { dest, bytes }), Some(config_path)))
+}
+
+/// 读取并校验 hub 私有 CA（PEM，至少一张证书）。
+fn read_hub_ca_pem(path: &Path) -> Result<Vec<u8>> {
+    let meta = fs::symlink_metadata(path)
+        .with_context(|| format!("读取 --hub-ca {} 失败", path.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!("--hub-ca {} 是符号链接，拒绝使用", path.display());
+    }
+    if !meta.is_file() {
+        bail!("--hub-ca {} 不是普通文件", path.display());
+    }
+    if meta.len() > crate::MAX_TLS_FILE_BYTES {
+        bail!(
+            "--hub-ca 超过 1 MiB 上限（{} 字节）: {}",
+            meta.len(),
+            path.display()
+        );
+    }
+    let bytes = fs::read(path).with_context(|| format!("读取 --hub-ca {} 失败", path.display()))?;
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("--hub-ca {} 不是 UTF-8 PEM 文本", path.display()))?;
+    tls::load_certs(text)
+        .with_context(|| format!("--hub-ca {} 不是有效的 PEM 证书", path.display()))?;
+    Ok(bytes)
+}
+
+/// 解析最终 Cookie Secure 策略：直连 TLS 强制 always；HTTP 保留旧配置/参数。
+fn resolve_cookie_secure(
+    args: &InstallArgs,
+    base: Option<&PanelConfig>,
+    tls_enabled: bool,
+) -> CookieSecure {
+    if tls_enabled {
+        if let Some(arg) = args.cookie_secure {
+            if CookieSecure::from(arg) != CookieSecure::Always {
+                eprintln!(
+                    "警告: 直连 TLS 强制 cookie_secure=always，忽略 --cookie-secure {}",
+                    cookie_secure_name(arg.into())
+                );
+            }
+        }
+        return CookieSecure::Always;
+    }
+    args.cookie_secure
+        .map(CookieSecure::from)
+        .or_else(|| base.map(|cfg| cfg.cookie_secure))
+        .unwrap_or_default()
+}
+
+/// 非直连 TLS 时的 public_origin：显式参数优先，其次保留旧配置。
+fn resolve_http_public_origin(args: &InstallArgs, base: Option<&PanelConfig>) -> String {
+    args.public_origin
+        .as_deref()
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            base.map(|cfg| cfg.public_origin.trim())
+                .filter(|origin| !origin.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// 路径转 UTF-8 字符串（写入 TOML config 用）。
+fn path_string(path: &Path, label: &str) -> Result<String> {
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("{label} 路径不是有效 UTF-8: {}", path.display()))
+}
+
 /// 密码来源计划。
 #[derive(Debug)]
 enum PasswordPlan {
@@ -178,6 +428,11 @@ pub fn install(args: InstallArgs) -> Result<()> {
     // 安装流程不需要交互确认；--yes 保留用于统一安装器契约。
     let _ = args.yes;
 
+    // C7：cert/key 必须成对；在任何写盘 / 加锁之前给出明确错误。
+    if args.tls_cert.is_some() != args.tls_key.is_some() {
+        bail!("--tls-cert 与 --tls-key 必须成对提供：都为空使用 HTTP，都非空才启用面板 HTTPS");
+    }
+
     // 非 dry-run 全程持有**全局**安装锁，且在读取 install-state 之前获取：并发
     // 安装 / 卸载（包括不同角色）会互相覆盖 config、unit 与 state。hub 调起的
     // panel 子进程继承父进程的锁，必须跳过，否则同一把 flock 会自锁失败。
@@ -187,11 +442,11 @@ pub fn install(args: InstallArgs) -> Result<()> {
     let unit_dir = unit_directory(&paths.unit)?;
     let service = ServiceManager::new(unit_dir, mode.manages(), args.dry_run);
 
-    // R-S5：无论 hub_url / token 是否显式给出，只要同 prefix 的 hub.toml 存在就
-    // 读取检查 admin_tls。dry-run 用只读解析，正常安装沿用会收紧权限的安全加载。
+    // 无论 hub_url / token 是否显式给出，只要同 prefix 的 hub.toml 存在就读取；
+    // admin_tls 的检查放在 hub_url 解析之后（required 必须是 https）。
+    // dry-run 用只读解析，正常安装沿用会收紧权限的安全加载。
     let hub_config_path = paths.prefix.join(HUB_CONFIG_RELATIVE);
     let hub_config = load_hub_config_if_exists(&hub_config_path, args.dry_run)?;
-    ensure_hub_admin_tls_supported(hub_config.as_ref())?;
 
     // 幂等：已有记录且文件齐全、服务 active 时直接返回；--force 才重写。
     let recorded = state.role(Role::Panel).cloned();
@@ -231,12 +486,15 @@ pub fn install(args: InstallArgs) -> Result<()> {
         None
     };
 
-    // hub 地址 / token：hub.toml 已在入口处加载（R-S5 需要无条件检查 admin_tls）。
+    // hub 地址 / token：hub.toml 已在入口处加载。
     let hub_url = resolve_hub_url(
         args.hub_url.as_deref(),
         hub_config.as_ref(),
         &hub_config_path,
     )?;
+    // C7：hub 管理端要求 TLS 时，面板配置必须是 https；显式 --hub-url http
+    // 也要拒绝，不能写出明文对接 required hub 的错误配置。
+    ensure_hub_admin_tls_supported(hub_config.as_ref(), &hub_url)?;
     let token = match args.hub_token_file.as_deref() {
         Some(path) => read_secret_file(path, "hub token")?,
         None => match hub_config
@@ -259,6 +517,18 @@ pub fn install(args: InstallArgs) -> Result<()> {
         warn_missing_static_dir();
     }
 
+    // C7：在写盘 / 启动前完成 TLS 源文件、配套、有效期、SAN、hub_ca 与策略校验。
+    let tls_dir = paths.prefix.join(PANEL_TLS_DIR_RELATIVE);
+    let panel_tls =
+        resolve_panel_tls(&args, base_config.as_ref(), &listen, &tls_dir, args.dry_run)?;
+    let public_origin = match &panel_tls {
+        Some(plan) => plan.public_origin.clone(),
+        None => resolve_http_public_origin(&args, base_config.as_ref()),
+    };
+    let cookie_secure = resolve_cookie_secure(&args, base_config.as_ref(), panel_tls.is_some());
+    let (hub_ca_plan, hub_ca_config) =
+        resolve_hub_ca(&args, base_config.as_ref(), &hub_url, &tls_dir)?;
+
     let password = plan_password(args.password_file.as_deref(), base_config.as_ref())?;
 
     if args.dry_run {
@@ -270,6 +540,9 @@ pub fn install(args: InstallArgs) -> Result<()> {
             static_dir.as_deref(),
             &password,
             args.offline,
+            panel_tls.as_ref(),
+            cookie_secure,
+            &public_origin,
         );
         return Ok(());
     }
@@ -301,6 +574,15 @@ pub fn install(args: InstallArgs) -> Result<()> {
             .to_string(),
         None => String::new(),
     };
+    cfg.public_origin = public_origin;
+    cfg.cookie_secure = cookie_secure;
+    if let Some(plan) = &panel_tls {
+        // 配置里永远写安装后的绝对路径，不写用户源文件路径。
+        cfg.tls_cert = path_string(&plan.cert_path, "tls_cert")?;
+        cfg.tls_key = path_string(&plan.key_path, "tls_key")?;
+    }
+    // 无条件赋最终值：hub 切回 http 时 resolve_hub_ca 会清空旧 CA，不能沿用 base。
+    cfg.hub_ca = hub_ca_config.unwrap_or_default();
     cfg.validate().context("面板配置校验失败")?;
     let config_bytes = render_panel_config(&cfg);
     // unit 文本在事务开始前渲染：渲染失败（路径含 systemd 特殊字符等）必须在任何
@@ -327,6 +609,9 @@ pub fn install(args: InstallArgs) -> Result<()> {
             reload_done: false,
             activation_attempted: false,
             state: &mut state,
+            tls_dir: &tls_dir,
+            tls: panel_tls.as_ref(),
+            hub_ca: hub_ca_plan.as_ref(),
         };
         let outcome = apply.run();
         (outcome, apply.reload_done, apply.activation_attempted)
@@ -449,10 +734,20 @@ struct ApplyInstall<'a> {
     /// 本次是否尝试过 enable / restart（只有此时回滚才允许 stop/disable）。
     activation_attempted: bool,
     state: &'a mut InstallState,
+    /// `<prefix>/etc/rustboard/panel-tls`；有 TLS 或 hub CA 时才创建。
+    tls_dir: &'a Path,
+    /// 面板直连 TLS 计划；`None` 表示 HTTP。
+    tls: Option<&'a PanelTlsPlan>,
+    /// 需要写入的 hub 私有 CA。
+    hub_ca: Option<&'a HubCaPlan>,
 }
 
 impl ApplyInstall<'_> {
     fn run(&mut self) -> Result<()> {
+        // 先建 TLS 目录（0700）：后面写证书/私钥时父目录一定存在且不可被替换。
+        if self.tls.is_some() || self.hub_ca.is_some() {
+            self.txn.create_dir(self.tls_dir, 0o700)?;
+        }
         self.txn.create_owned_dir(&self.paths.data_dir, 0o700)?;
         self.txn
             .write(&self.paths.config, self.config_bytes.as_bytes(), 0o600)?;
@@ -460,6 +755,20 @@ impl ApplyInstall<'_> {
             self.txn.write(&self.paths.unit, unit.as_bytes(), 0o644)?;
         }
         install_binary(self.txn, &self.paths.binary)?;
+
+        // 证书/私钥/CA 在 config 与 binary 之后写入：任一步失败都会由事务回滚
+        // 恢复旧文件，不会留下「配置指向新证书、磁盘还是旧证书」的半完成状态。
+        if let Some(tls) = self.tls {
+            if tls.copy_files {
+                self.txn
+                    .write(&tls.cert_path, tls.material.cert_pem.as_bytes(), 0o644)?;
+                self.txn
+                    .write(&tls.key_path, tls.material.key_pem.as_bytes(), 0o600)?;
+            }
+        }
+        if let Some(hub_ca) = self.hub_ca {
+            self.txn.write(&hub_ca.dest, &hub_ca.bytes, 0o644)?;
+        }
 
         if self.mode.manages() {
             let unit_name = Role::Panel.unit_name();
@@ -484,8 +793,25 @@ impl ApplyInstall<'_> {
                 .ensure_fragment_is(unit_name, &self.paths.unit)?;
             let port = port_of(&self.cfg.listen)
                 .ok_or_else(|| anyhow!("面板 listen 缺少可解析端口: {}", self.cfg.listen))?;
-            wait_http_ok(&format!("http://127.0.0.1:{port}/healthz"), HEALTH_TIMEOUT)
-                .context("面板服务启动后 /healthz 未在时限内返回 200")?;
+            match self.tls {
+                Some(tls) => {
+                    // TLS 健康检查必须走 https + 正确 SNI，并校验证书链；不能
+                    // 用「TCP 能连上」代替。
+                    let server_name =
+                        crate::preferred_tls_server_name(&tls.material, &self.cfg.public_origin)?;
+                    wait_panel_https_health(
+                        port,
+                        &server_name,
+                        &tls.material.cert_pem,
+                        HEALTH_TIMEOUT,
+                    )
+                    .context("面板 HTTPS 服务启动后 /healthz 未在时限内返回 200")?;
+                }
+                None => {
+                    wait_http_ok(&format!("http://127.0.0.1:{port}/healthz"), HEALTH_TIMEOUT)
+                        .context("面板服务启动后 /healthz 未在时限内返回 200")?;
+                }
+            }
         }
 
         self.state.upsert(
@@ -495,6 +821,92 @@ impl ApplyInstall<'_> {
         self.state.save(&self.paths.state)?;
         self.txn.commit()
     }
+}
+
+/// 等待面板 HTTPS `/healthz` 返回 200；信任系统根或用户证书里的 CA。
+///
+/// 每次尝试用独立 TCP 连接；连接/握手失败只记录最近一次错误，直到总超时。
+fn wait_panel_https_health(
+    port: u16,
+    server_name: &str,
+    cert_pem: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let configs = https_health_trust_configs(cert_pem)?;
+    let deadline = Instant::now() + timeout;
+    let mut last_error = String::from("尚未建立连接");
+    loop {
+        for config in &configs {
+            match https_health_once(port, server_name, config) {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = format!("{error:#}"),
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("等待 https://127.0.0.1:{port}/healthz（SNI={server_name}）超时: {last_error}");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// HTTPS 健康检查的信任库：系统根（公共 ACME 证书）或用户证书 PEM 里的 CA。
+fn https_health_trust_configs(cert_pem: &str) -> Result<Vec<Arc<rustls::ClientConfig>>> {
+    let mut configs = Vec::new();
+    // 私有 CA / 自签场景优先用用户证书里的 CA：避免先拿系统根做一次注定失败的
+    // 握手（会消耗一次服务端连接，也会让日志多一条无关的证书错误）。
+    if let Ok(config) = tls::client_config_custom_ca(cert_pem, None, None) {
+        configs.push(config);
+    }
+    if let Ok(config) = tls::client_config_system_roots(None, None) {
+        configs.push(config);
+    }
+    if configs.is_empty() {
+        bail!("无法构建 HTTPS 健康检查信任库：系统根与证书中的 CA 都不可用");
+    }
+    Ok(configs)
+}
+
+/// 单次 HTTPS `/healthz`：TCP → TLS（不跳过证书/主机名校验）→ HTTP/1.1 GET。
+fn https_health_once(
+    port: u16,
+    server_name: &str,
+    config: &Arc<rustls::ClientConfig>,
+) -> Result<()> {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let tcp = TcpStream::connect_timeout(&address, Duration::from_secs(2))
+        .with_context(|| format!("连接 127.0.0.1:{port} 失败"))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(5)))
+        .context("设置 HTTPS 健康检查读超时失败")?;
+    tcp.set_write_timeout(Some(Duration::from_secs(5)))
+        .context("设置 HTTPS 健康检查写超时失败")?;
+
+    let name = ServerName::try_from(server_name.to_string())
+        .map_err(|_| anyhow!("HTTPS 健康检查 SNI 非法: {server_name:?}"))?;
+    let connection = rustls::ClientConnection::new(config.clone(), name)
+        .context("创建 HTTPS 健康检查 TLS 连接失败")?;
+    let mut stream = rustls::StreamOwned::new(connection, tcp);
+
+    let host_header = if server_name.contains(':') && !server_name.starts_with('[') {
+        format!("[{server_name}]")
+    } else {
+        server_name.to_string()
+    };
+    write!(
+        stream,
+        "GET /healthz HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n"
+    )
+    .context("发送 HTTPS 健康检查请求失败")?;
+    stream.flush().context("刷新 HTTPS 健康检查请求失败")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status = String::new();
+    reader
+        .read_line(&mut status)
+        .context("读取 HTTPS 健康检查响应失败")?;
+    if status.split_whitespace().nth(1) != Some("200") {
+        bail!("HTTPS /healthz 返回非 200: {}", status.trim());
+    }
+    Ok(())
 }
 
 /// 执行卸载。
@@ -943,15 +1355,17 @@ fn acquire_install_lock(
     Ok(Some(lock))
 }
 
-/// R-S5：同 prefix 的 hub 配置为 `admin_tls=required` 时拒绝面板安装。
+/// C7：同 prefix 的 hub 配置为 `admin_tls=required` 时，panel 必须用 https 对接。
 ///
-/// Phase A 面板只通过明文 `http://` 对接 hub 管理 API；required hub 会监听 HTTPS，
-/// 继续安装既无法通过健康检查，也会写出一个 http 对接 required hub 的错误配置。
-/// 必须在写盘 / 启动之前拒绝，且不因显式 `--hub-url http://...` 而放行。
-fn ensure_hub_admin_tls_supported(hub: Option<&HubConfig>) -> Result<()> {
+/// 面板已支持 `https://` + `hub_ca`（自签/私有 CA）与系统根（公共 ACME）。
+/// 但若最终 hub 地址仍是 http（未传 `--hub-url`，或显式传了 http），继续安装
+/// 只会写出一个连不上 required hub 的配置；必须在写盘 / 启动前拒绝。
+fn ensure_hub_admin_tls_supported(hub: Option<&HubConfig>, hub_url: &str) -> Result<()> {
     match hub {
-        Some(hub) if hub.admin_tls == AdminTlsMode::Required => {
-            bail!("{ADMIN_TLS_REQUIRED_UNSUPPORTED}")
+        Some(hub)
+            if hub.admin_tls == AdminTlsMode::Required && !hub_url.starts_with("https://") =>
+        {
+            bail!("{ADMIN_TLS_REQUIRED_NEEDS_HTTPS}")
         }
         _ => Ok(()),
     }
@@ -1410,7 +1824,7 @@ fn render_panel_config(cfg: &PanelConfig) -> String {
         cookie_secure_name(*cookie_secure),
     );
     push_toml_string(&mut out, "public_origin", public_origin);
-    // C2 先加字段；C7 才让 panel install 接收 --tls-cert/--tls-key。
+    // C7：直连 TLS 的证书/私钥绝对路径（HTTP 模式为空字符串）。
     push_toml_string(&mut out, "tls_cert", tls_cert);
     push_toml_string(&mut out, "tls_key", tls_key);
     out
@@ -1604,6 +2018,20 @@ fn ensure_installed_files(paths: &Paths, mode: ServiceMode) -> Result<()> {
     if mode.writes_unit() && !path_exists(&paths.unit) {
         missing.push(paths.unit.display().to_string());
     }
+    // 幂等捷径也要确认 config 里引用的 TLS/CA 文件还在，否则会误报「已安装」
+    // 而实际服务启动即失败。解析失败留给后续启动阶段报错。
+    if let Ok(cfg) = read_toml_readonly::<PanelConfig>(&paths.config, "面板配置") {
+        for (label, value) in [
+            ("tls_cert", cfg.tls_cert.as_str()),
+            ("tls_key", cfg.tls_key.as_str()),
+            ("hub_ca", cfg.hub_ca.as_str()),
+        ] {
+            let value = value.trim();
+            if !value.is_empty() && !path_exists(Path::new(value)) {
+                missing.push(format!("{label}={value}"));
+            }
+        }
+    }
     if !missing.is_empty() {
         bail!(
             "安装记录存在但以下文件缺失: {}；请使用 --force 重新安装（或先 uninstall）",
@@ -1754,6 +2182,7 @@ fn validate_purge_containment(
 }
 
 /// 打印 dry-run 安装计划；不输出 token / 密码。
+#[allow(clippy::too_many_arguments)]
 fn print_install_plan(
     paths: &Paths,
     mode: ServiceMode,
@@ -1762,6 +2191,9 @@ fn print_install_plan(
     static_dir: Option<&Path>,
     password: &PasswordPlan,
     offline: bool,
+    tls: Option<&PanelTlsPlan>,
+    cookie_secure: CookieSecure,
+    public_origin: &str,
 ) {
     println!("面板安装计划（--dry-run：不写文件、不调用 systemctl）:");
     println!("  配置: {}", paths.config.display());
@@ -1773,7 +2205,23 @@ fn print_install_plan(
     }
     println!("  二进制: {}", paths.binary.display());
     println!("  监听: {listen}");
+    println!(
+        "  传输: {}",
+        if tls.is_some() {
+            "HTTPS（直连 TLS 1.3 + ALPN http/1.1）"
+        } else {
+            "HTTP"
+        }
+    );
+    if let Some(tls) = tls {
+        println!("  TLS 证书: {}（0644）", tls.cert_path.display());
+        println!("  TLS 私钥: {}（0600）", tls.key_path.display());
+    }
     println!("  hub API: {hub_url}");
+    if !public_origin.is_empty() {
+        println!("  public_origin: {public_origin}");
+    }
+    println!("  Cookie Secure: {}", cookie_secure_name(cookie_secure));
     println!("  静态目录: {}", static_dir_label(static_dir));
     println!("  密码: {}", password_plan_label(password));
     println!("  hub token: 从受保护的 0600 来源读取（不显示）");
@@ -1800,7 +2248,26 @@ fn print_install_summary(
     }
     println!("  二进制: {}（0755）", paths.binary.display());
     println!("  监听: {}", cfg.listen);
+    println!(
+        "  传输: {}",
+        if cfg.tls_cert.trim().is_empty() {
+            "HTTP"
+        } else {
+            "HTTPS（直连 TLS 1.3 + ALPN http/1.1）"
+        }
+    );
+    if !cfg.tls_cert.trim().is_empty() {
+        println!("  TLS 证书: {}（0644）", cfg.tls_cert);
+        println!("  TLS 私钥: {}（0600）", cfg.tls_key);
+    }
     println!("  hub API: {}", cfg.hub_url);
+    if !cfg.hub_ca.trim().is_empty() {
+        println!("  hub CA: {}", cfg.hub_ca);
+    }
+    if !cfg.public_origin.trim().is_empty() {
+        println!("  public_origin: {}", cfg.public_origin);
+    }
+    println!("  Cookie Secure: {}", cookie_secure_name(cfg.cookie_secure));
     println!(
         "  静态目录: {}",
         static_dir_label(if cfg.static_dir.trim().is_empty() {
@@ -2662,27 +3129,32 @@ mod tests {
     }
 
     #[test]
-    fn admin_tls_required_is_rejected() {
+    fn admin_tls_required_requires_https_hub() {
         let required = HubConfig {
             admin_tls: AdminTlsMode::Required,
             ..HubConfig::default()
         };
-        let error = ensure_hub_admin_tls_supported(Some(&required)).unwrap_err();
+        let error =
+            ensure_hub_admin_tls_supported(Some(&required), "http://127.0.0.1:1234").unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("admin_tls=required"), "{message}");
-        assert!(message.contains("Phase A"), "{message}");
+        assert!(message.contains("https"), "{message}");
+        // C7：面板支持 https + hub_ca 后，required 不再一律拒绝。
+        assert!(
+            ensure_hub_admin_tls_supported(Some(&required), "https://hub.example:8444").is_ok()
+        );
 
         let off = HubConfig {
             admin_tls: AdminTlsMode::Off,
             ..HubConfig::default()
         };
-        assert!(ensure_hub_admin_tls_supported(Some(&off)).is_ok());
-        assert!(ensure_hub_admin_tls_supported(None).is_ok());
+        assert!(ensure_hub_admin_tls_supported(Some(&off), "http://127.0.0.1:8444").is_ok());
+        assert!(ensure_hub_admin_tls_supported(None, "http://127.0.0.1:8444").is_ok());
     }
 
     #[cfg(unix)]
     #[test]
-    fn required_hub_admin_tls_rejects_dry_run_without_writing() {
+    fn required_hub_admin_tls_dry_run_requires_https_without_writing() {
         if detect_system().euid != 0 {
             eprintln!("跳过 root-only panel required 测试（euid != 0）");
             return;
@@ -2713,13 +3185,18 @@ mod tests {
             password_file: None,
             listen: None,
             static_dir: None,
+            tls_cert: None,
+            tls_key: None,
+            hub_ca: None,
+            public_origin: None,
+            cookie_secure: None,
             systemd: false,
             no_systemd: false,
         })
         .unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("admin_tls=required"), "{message}");
-        assert!(message.contains("Phase A"), "{message}");
+        assert!(message.contains("https"), "{message}");
 
         // 零写入：目录树、hub.toml 权限、panel 受管路径都不变。
         assert_eq!(tree_snapshot(&prefix), before);
@@ -2732,6 +3209,46 @@ mod tests {
         ] {
             assert!(!path_exists(path), "{} 不应存在", path.display());
         }
+
+        // C7：显式 https hub + 有效的 --hub-ca 时，required 允许 dry-run。
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Panel Test Hub CA");
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_path = dir.join("hub-ca.pem");
+        fs::write(&ca_path, ca_cert.pem()).unwrap();
+        let before_with_ca = tree_snapshot(&prefix);
+
+        install(InstallArgs {
+            yes: true,
+            offline: false,
+            dry_run: true,
+            force: false,
+            prefix: Some(prefix.clone()),
+            config: None,
+            unit_dir: None,
+            hub_url: Some("https://hub.example:8444".to_string()),
+            hub_token_file: None,
+            password_file: None,
+            listen: None,
+            static_dir: None,
+            tls_cert: None,
+            tls_key: None,
+            hub_ca: Some(ca_path),
+            public_origin: None,
+            cookie_secure: None,
+            systemd: false,
+            no_systemd: false,
+        })
+        .expect("required hub + https + --hub-ca 的 dry-run 必须通过");
+        assert_eq!(tree_snapshot(&prefix), before_with_ca, "dry-run 必须零写入");
     }
 
     #[test]
@@ -2771,5 +3288,143 @@ mod tests {
             validate_recorded_config_and_data(&paths, &paths.data_dir, &paths.data_dir).is_err()
         );
         assert!(validate_recorded_config_and_data(&paths, &paths.config, &paths.config).is_err());
+    }
+
+    /// C7：安装器 HTTPS 健康检查必须走真实 TLS，验证 CA + SNI，且错误 SNI 失败。
+    #[test]
+    fn https_health_check_uses_ca_and_checks_sni() {
+        use std::io::Read as _;
+
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "RustBoard Panel Health CA");
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        ca_params.key_identifier_method = rcgen::KeyIdMethod::Sha256;
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "rustboard-panel health");
+        params.subject_alt_names = vec![rcgen::SanType::DnsName(
+            rcgen::Ia5String::try_from("panel.test".to_string()).unwrap(),
+        )];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf = params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+        let cert_pem = format!("{}{}", leaf.pem(), ca_cert.pem());
+        let key_pem = leaf_key.serialize_pem();
+
+        // 健康检查可能先尝试多个信任库；测试服务端必须能承受多次握手尝试，
+        // 直到某一次成功返回 200 才退出（错误 SNI 用例用 stop 标记退出）。
+        use std::sync::atomic::AtomicBool;
+
+        let spawn_server = || {
+            let config = tls::server_config_from_paths(&cert_pem, &key_pem).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_thread = stop.clone();
+            let handle = std::thread::spawn(move || loop {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((tcp, _)) => {
+                        let Ok(connection) = rustls::ServerConnection::new(config.clone()) else {
+                            continue;
+                        };
+                        let mut stream = rustls::StreamOwned::new(connection, tcp);
+                        let mut buffer = [0u8; 2048];
+                        match stream.read(&mut buffer) {
+                            Ok(read) if read > 0 => {
+                                let _ = stream.write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\
+                                      Connection: close\r\n\r\nok",
+                                );
+                                let _ = stream.flush();
+                                return;
+                            }
+                            _ => continue,
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            });
+            (port, stop, handle)
+        };
+
+        let (port, _stop, handle) = spawn_server();
+        wait_panel_https_health(port, "panel.test", &cert_pem, Duration::from_secs(5))
+            .expect("正确 SNI + 私有 CA 的 HTTPS 健康检查必须通过");
+        handle.join().unwrap();
+
+        // 证书只有 panel.test，使用错误 SNI 时必须失败（不得跳过验证）。
+        let (port, stop, handle) = spawn_server();
+        let error =
+            wait_panel_https_health(port, "evil.example", &cert_pem, Duration::from_millis(500))
+                .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("SNI=evil.example"), "{text}");
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn tls_cookie_policy_is_always_for_direct_tls() {
+        assert_eq!(
+            CookieSecure::from(CookieSecureArg::Auto),
+            CookieSecure::Auto
+        );
+        assert_eq!(
+            CookieSecure::from(CookieSecureArg::Always),
+            CookieSecure::Always
+        );
+        assert_eq!(
+            CookieSecure::from(CookieSecureArg::Never),
+            CookieSecure::Never
+        );
+        let args = InstallArgs {
+            yes: true,
+            offline: false,
+            dry_run: false,
+            force: false,
+            prefix: None,
+            config: None,
+            unit_dir: None,
+            hub_url: None,
+            hub_token_file: None,
+            password_file: None,
+            listen: None,
+            static_dir: None,
+            tls_cert: None,
+            tls_key: None,
+            hub_ca: None,
+            public_origin: None,
+            cookie_secure: Some(CookieSecureArg::Never),
+            systemd: false,
+            no_systemd: false,
+        };
+        assert_eq!(
+            resolve_cookie_secure(&args, None, true),
+            CookieSecure::Always,
+            "直连 TLS 必须强制 always"
+        );
+        assert_eq!(
+            resolve_cookie_secure(&args, None, false),
+            CookieSecure::Never,
+            "HTTP 模式保留显式策略"
+        );
     }
 }

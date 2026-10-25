@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path as AxumPath, RawQuery, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -33,11 +33,12 @@ use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
-use rustboard_common::config::{HubConfig, PanelConfig};
+use rustboard_common::config::{CookieSecure, HubConfig, PanelConfig};
 use rustboard_common::util::{now_ms, pick_free_port, port_of};
 use rustboard_common::{
-    DEFAULT_ADMIN_PORT, DEFAULT_HUB_CONFIG, DEFAULT_PANEL_CONFIG, DEFAULT_PANEL_PORT,
+    fsutil, tls, DEFAULT_ADMIN_PORT, DEFAULT_HUB_CONFIG, DEFAULT_PANEL_CONFIG, DEFAULT_PANEL_PORT,
 };
+use rustls::pki_types::ServerName;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -54,9 +55,9 @@ const MAX_ALERT_EVENT_LIMIT: i64 = 100;
 const MAX_ARCHIVE_OBJECT_LIMIT: i64 = 100;
 /// 同时进行的 Argon2 校验上限，避免 64 MiB × N 的内存 DoS。
 const MAX_CONCURRENT_ARGON2: usize = 2;
-/// 面板 HTTP 全局并发连接上限；超出后 accept 到的 TCP 立即关闭。
+/// 面板 HTTP/HTTPS 全局并发连接上限；超出后 accept 到的 TCP 立即关闭。
 const ADMIN_MAX_CONNECTIONS: usize = 256;
-/// 面板 HTTP 单来源 IP 并发连接上限；只绑回环时同样生效。
+/// 面板 HTTP/HTTPS 单来源 IP 并发连接上限；只绑回环时同样生效。
 const ADMIN_MAX_CONNECTIONS_PER_IP: usize = 32;
 /// HTTP/1 请求头读取超时，抵挡 slowloris 一类慢速攻击。
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -66,6 +67,10 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// 「header 完整 + Content-Length 很大 + 不发 body」的客户端，会一直挂住并占满
 /// 每 IP 连接槽位（反代后所有用户共享一个代理 IP）。10s 是正常请求的宽裕上限。
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// TLS 握手超时：与 header 超时同属 KI-17 的连接占用约束，避免慢握手绕过限流。
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 面板 TLS 证书 / 私钥文件大小上限（方案 D6：≤1 MiB）。
+pub(crate) const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
 /// 单 IP 连接表容量：超过后清理空项并拒绝新来源，防止无限增长。
 const MAX_IP_CONNECTION_ENTRIES: usize = 4096;
 /// 自动生成的密码长度。
@@ -114,7 +119,7 @@ const MAX_CONTROL_LINES: u64 = 2_000;
 const MAX_AUDIT_LIMIT: i64 = 200;
 /// 审计 capability 过滤值的最大字节数。
 const MAX_AUDIT_CAPABILITY_LEN: usize = 32;
-/// 面板是明文 HTTP，CSP 只允许同源资源；uPlot 运行时写入的 style 属性靠
+/// 面板默认明文 HTTP（C7 可直连 HTTPS），CSP 只允许同源资源；uPlot 运行时写入的 style 属性靠
 /// `style-src 'unsafe-inline'` 放行，但禁止任何内联/外部脚本注入。
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; \
      style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; \
@@ -1730,6 +1735,326 @@ where
     }
 }
 
+/// 面板 TLS 文件读取策略。
+///
+/// - [`Runtime`](Self::Runtime)：`panel run` 启动时读取，发现 key/cert 权限过宽会
+///   收紧（key → 0600、cert → 0644），符号链接一律拒绝；
+/// - [`Source`](Self::Source)：`panel install --tls-cert/--tls-key` 的源文件只读校验，
+///   不修改用户文件；key 过宽直接拒绝并提示 chmod；
+/// - [`ReadOnly`](Self::ReadOnly)：`--dry-run` 读取已有安装，只做内容/类型校验，
+///   不做任何 chmod，保证 dry-run 零写入。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TlsFilePolicy {
+    Runtime,
+    Source,
+    ReadOnly,
+}
+
+/// 已校验的面板 TLS 材料。
+///
+/// **故意不实现 `Debug` / `Display`**：结构体内含私钥 PEM，任何调试打印都可能
+/// 把私钥写进日志。日志只记录路径、SAN 与有效期等公开信息。
+pub(crate) struct PanelTlsFiles {
+    pub cert_pem: String,
+    pub key_pem: String,
+    pub dns_names: Vec<String>,
+    pub ip_names: Vec<IpAddr>,
+}
+
+/// 校验面板 TLS 证书 / 私钥文件，返回已解析的 PEM。
+///
+/// 覆盖方案 D6 的文件层约束：普通文件、非符号链接、≤1 MiB、key 仅属主可读、
+/// 证书与私钥配套、证书在有效期内、至少有一个 SAN。错误信息只包含路径、权限
+/// 与公开证书信息，绝不回显私钥内容。
+pub(crate) fn validate_panel_tls_files(
+    cert_path: &Path,
+    key_path: &Path,
+    policy: TlsFilePolicy,
+) -> Result<PanelTlsFiles> {
+    let cert_pem = read_tls_pem(cert_path, "tls_cert", 0o644, policy)?;
+    let key_pem = read_tls_pem(key_path, "tls_key", 0o600, policy)?;
+
+    let matched = tls::cert_matches_key(&cert_pem, &key_pem)
+        .context("校验证书与私钥是否配套失败（证书或私钥 PEM 无法解析）")?;
+    if !matched {
+        bail!("tls_cert 与 tls_key 不匹配：证书公钥与私钥不是一对");
+    }
+
+    let summary = tls::cert_summary(&cert_pem).context("解析 tls_cert 失败")?;
+    let now = now_ms();
+    let not_before_ms = summary.not_before.saturating_mul(1_000);
+    let not_after_ms = summary.not_after.saturating_mul(1_000);
+    if now >= not_after_ms {
+        bail!(
+            "tls_cert 已过期（notAfter={}，当前时间已超过有效期）",
+            tls::format_unix_utc(summary.not_after)
+        );
+    }
+    // 允许 60s 时钟偏差，与 hub 的现存证书校验保持一致。
+    if now.saturating_add(60_000) < not_before_ms {
+        bail!(
+            "tls_cert 尚未生效（notBefore={}）",
+            tls::format_unix_utc(summary.not_before)
+        );
+    }
+
+    let (dns_names, ip_names) = cert_identities(&cert_pem)?;
+    Ok(PanelTlsFiles {
+        cert_pem,
+        key_pem,
+        dns_names,
+        ip_names,
+    })
+}
+
+/// 校验证书 SAN 覆盖监听 IP（非通配绑定）与 `public_origin` 主机名。
+pub(crate) fn validate_panel_tls_names(
+    files: &PanelTlsFiles,
+    listen: &str,
+    public_origin: &str,
+) -> Result<()> {
+    let certs = tls::load_certs(&files.cert_pem).context("解析 tls_cert 失败")?;
+    let parsed = rustls::server::ParsedCertificate::try_from(&certs[0])
+        .map_err(|err| anyhow!("tls_cert 不是可用的服务端证书: {err}"))?;
+
+    // 监听地址是具体 IP 时必须覆盖它；0.0.0.0 / :: 是通配绑定，不能作为访问名。
+    if let Some(host) = listen_host(listen) {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if !ip.is_unspecified() {
+                let name = ServerName::from(ip);
+                rustls::client::verify_server_name(&parsed, &name)
+                    .map_err(|_| anyhow!("tls_cert 的 SAN 未覆盖监听地址 IP {ip}"))?;
+            }
+        }
+    }
+
+    let origin = public_origin.trim();
+    if !origin.is_empty() {
+        let host = origin_host(origin)
+            .ok_or_else(|| anyhow!("public_origin 无法解析出主机名: {origin:?}"))?;
+        let name = ServerName::try_from(host)
+            .map_err(|_| anyhow!("public_origin 主机名非法: {host:?}"))?;
+        rustls::client::verify_server_name(&parsed, &name).map_err(|_| {
+            anyhow!(
+                "tls_cert 的 SAN 未覆盖 public_origin 主机 {host:?}\
+                 （证书 DNS SAN: {:?}，IP SAN: {:?}）",
+                files.dns_names,
+                files.ip_names
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// 按证书 SAN 推导默认的 `public_origin`（直连 TLS 未显式指定时使用）。
+pub(crate) fn derived_https_origin(files: &PanelTlsFiles) -> Result<String> {
+    if let Some(dns) = files.dns_names.iter().find(|name| !name.contains('*')) {
+        return Ok(format!("https://{dns}"));
+    }
+    if let Some(ip) = files.ip_names.first() {
+        return Ok(match ip {
+            IpAddr::V6(_) => format!("https://[{ip}]"),
+            IpAddr::V4(_) => format!("https://{ip}"),
+        });
+    }
+    bail!(
+        "tls_cert 没有可用于推导 public_origin 的非通配 SAN；请显式传 --public-origin https://<host>"
+    )
+}
+
+/// 安装器 HTTPS 健康检查使用的 SNI：优先 `public_origin` 主机名，其次证书 SAN。
+pub(crate) fn preferred_tls_server_name(
+    files: &PanelTlsFiles,
+    public_origin: &str,
+) -> Result<String> {
+    if let Some(host) = origin_host(public_origin.trim()) {
+        return Ok(host.to_string());
+    }
+    if let Some(dns) = files.dns_names.iter().find(|name| !name.contains('*')) {
+        return Ok(dns.clone());
+    }
+    if let Some(ip) = files.ip_names.first() {
+        return Ok(ip.to_string());
+    }
+    bail!("无法确定 HTTPS 健康检查的 SNI：public_origin 为空且证书没有可用 SAN")
+}
+
+/// 从 `scheme://host[:port]` 里取 host；只用于已经过 `PanelConfig::validate`
+/// 的 `public_origin` 与安装器自己生成的值。
+pub(crate) fn origin_host(origin: &str) -> Option<&str> {
+    let rest = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    listen_host(authority)
+}
+
+/// 读取并校验一个 TLS PEM 文件（普通文件、非符号链接、≤1 MiB、权限合规）。
+fn read_tls_pem(
+    path: &Path,
+    label: &str,
+    target_mode: u32,
+    policy: TlsFilePolicy,
+) -> Result<String> {
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("读取 {label} {} 失败", path.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!(
+            "{label} {} 是符号链接，拒绝使用；请改为指向真实文件的路径",
+            path.display()
+        );
+    }
+    if !meta.is_file() {
+        bail!("{label} {} 不是普通文件", path.display());
+    }
+    if meta.len() > MAX_TLS_FILE_BYTES {
+        bail!(
+            "{label} 超过 1 MiB 上限（{} 字节）: {}",
+            meta.len(),
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    check_tls_file_mode(path, label, target_mode, policy)?;
+    #[cfg(not(unix))]
+    {
+        let _ = (target_mode, policy);
+    }
+
+    let bytes =
+        std::fs::read(path).with_context(|| format!("读取 {label} {} 失败", path.display()))?;
+    String::from_utf8(bytes)
+        .with_context(|| format!("{label} {} 不是 UTF-8 编码的 PEM 文本", path.display()))
+}
+
+/// 检查 / 收紧 TLS 文件权限；符号链接已在调用前拒绝。
+#[cfg(unix)]
+fn check_tls_file_mode(
+    path: &Path,
+    label: &str,
+    target_mode: u32,
+    policy: TlsFilePolicy,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if policy == TlsFilePolicy::ReadOnly {
+        return Ok(());
+    }
+    if policy == TlsFilePolicy::Runtime {
+        fsutil::harden(path, target_mode)
+            .with_context(|| format!("收紧 {label} {} 权限失败", path.display()))?;
+    }
+    let mode = std::fs::symlink_metadata(path)
+        .with_context(|| format!("读取 {label} {} 权限失败", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+
+    if target_mode == 0o600 {
+        // 私钥：只允许属主读（0600；也接受 0400 这类更严格的只读权限）。
+        if mode & 0o077 != 0 || mode & 0o400 == 0 {
+            bail!(
+                "{label} {} 权限必须是 0600（当前 {mode:04o}）；请执行 chmod 600 后重试",
+                path.display()
+            );
+        }
+    } else {
+        // 证书是公开信息，但不能允许组/其他用户写入（防篡改）。
+        if mode & 0o022 != 0 || mode & 0o400 == 0 {
+            bail!(
+                "{label} {} 权限过宽（当前 {mode:04o}）；证书不能允许组或其他用户写入，请执行 chmod 644",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 提取证书里的 DNS / IP SAN，并强制至少存在一个 SAN。
+fn cert_identities(cert_pem: &str) -> Result<(Vec<String>, Vec<IpAddr>)> {
+    let certs = tls::load_certs(cert_pem).context("解析 tls_cert 失败")?;
+    let (_, cert) = x509_parser::parse_x509_certificate(certs[0].as_ref())
+        .map_err(|err| anyhow!("解析 tls_cert 失败: {err:?}"))?;
+
+    let mut dns_names = Vec::new();
+    let mut ip_names = Vec::new();
+    for extension in cert.extensions() {
+        let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
+            extension.parsed_extension()
+        else {
+            continue;
+        };
+        for name in &san.general_names {
+            match name {
+                x509_parser::extensions::GeneralName::DNSName(name) => {
+                    dns_names.push((*name).to_string());
+                }
+                x509_parser::extensions::GeneralName::IPAddress(raw) => {
+                    if let Some(ip) = ip_from_san(raw) {
+                        ip_names.push(ip);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if dns_names.is_empty() && ip_names.is_empty() {
+        bail!("tls_cert 没有任何 SAN（必须至少包含一个 DNS 或 IP SAN）");
+    }
+    Ok((dns_names, ip_names))
+}
+
+/// 把 X.509 SAN 里的 4/16 字节原始地址转换为 `IpAddr`。
+fn ip_from_san(raw: &[u8]) -> Option<IpAddr> {
+    match raw.len() {
+        4 => Some(IpAddr::V4(std::net::Ipv4Addr::new(
+            raw[0], raw[1], raw[2], raw[3],
+        ))),
+        16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(raw);
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
+}
+
+/// 面板直连 TLS 的服务端配置；HTTP 模式返回 `None`。
+struct PanelTlsRuntime {
+    config: Arc<rustls::ServerConfig>,
+}
+
+/// 按 `PanelConfig` 的 `tls_cert` / `tls_key` 加载运行时 TLS。
+///
+/// 缺字段 → `Ok(None)`，HTTP 行为完全不变；只设一个、文件校验/配套/有效期/SAN
+/// 任一失败 → 返回错误，启动失败。
+fn load_panel_tls(cfg: &PanelConfig) -> Result<Option<PanelTlsRuntime>> {
+    let cert = cfg.tls_cert.trim();
+    let key = cfg.tls_key.trim();
+    if cert.is_empty() && key.is_empty() {
+        return Ok(None);
+    }
+    if cert.is_empty() || key.is_empty() {
+        bail!("tls_cert 与 tls_key 必须成对配置：都为空使用 HTTP，都非空才启用面板 HTTPS");
+    }
+
+    let cert_path = Path::new(cert);
+    let key_path = Path::new(key);
+    if !cert_path.is_absolute() || !key_path.is_absolute() {
+        bail!("tls_cert 与 tls_key 必须是绝对路径（当前 {cert:?} / {key:?}）");
+    }
+
+    let files = validate_panel_tls_files(cert_path, key_path, TlsFilePolicy::Runtime)
+        .context("面板 TLS 证书/私钥校验失败")?;
+    validate_panel_tls_names(&files, &cfg.listen, &cfg.public_origin)
+        .context("面板 TLS 证书 SAN 校验失败")?;
+    let config = tls::server_config_from_paths(&files.cert_pem, &files.key_pem)
+        .context("构建面板 HTTPS 服务端配置失败（TLS 1.3 + ALPN http/1.1）")?;
+    // files 在这里释放：私钥只保留在 rustls ServerConfig 内部。
+    Ok(Some(PanelTlsRuntime { config }))
+}
+
 /// 面板 HTTP 的 accept 循环（KI-17）。
 ///
 /// 不用 `axum::serve`：它没有 header 读超时，也拿不到连接数。这里手工 accept，
@@ -1737,12 +2062,31 @@ where
 /// header 的慢连接最多占用 [`HEADER_READ_TIMEOUT`]，慢 body 最多占用
 /// [`BODY_READ_TIMEOUT`]，洪水下 `/healthz` 仍可用。
 async fn serve_panel_listener(app: Router, listener: TcpListener) -> Result<()> {
+    serve_panel_connections(app, listener, None).await
+}
+
+/// 面板直连 HTTPS 的 accept 循环；TLS 握手也受连接槽位与超时约束。
+async fn serve_panel_tls_listener(
+    app: Router,
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> Result<()> {
+    serve_panel_connections(app, listener, Some(acceptor)).await
+}
+
+/// HTTP / HTTPS 共用的 accept 循环：限流、超时与 `ConnectInfo` 注入完全一致。
+async fn serve_panel_connections(
+    app: Router,
+    listener: TcpListener,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) -> Result<()> {
     let local = listener.local_addr().context("读取面板监听地址失败")?;
     // 与 Argon2 的 `state.argon2_slots` 完全独立，不能混用许可。
     let permits = Arc::new(Semaphore::new(ADMIN_MAX_CONNECTIONS.max(1)));
     let limits = Arc::new(ConnectionLimiter::new(ADMIN_MAX_CONNECTIONS_PER_IP));
     tracing::info!(
         listen = %local,
+        tls = tls.is_some(),
         max_connections = ADMIN_MAX_CONNECTIONS,
         max_connections_per_ip = ADMIN_MAX_CONNECTIONS_PER_IP,
         "面板连接限制已启用"
@@ -1794,36 +2138,61 @@ async fn serve_panel_listener(app: Router, listener: TcpListener) -> Result<()> 
         }
 
         let app = app.clone();
+        let acceptor = tls.clone();
         tokio::spawn(async move {
             // 许可跟随连接生命周期；连接关闭（含超时）后自动归还。
             let _permit = permit;
             let _connection = connection;
 
-            // 登录限速 / 可信反代取 IP 依赖 ConnectInfo<SocketAddr>，逐请求注入。
-            // KI-17：请求体套一次性总 deadline，慢 body 最多占 10s，不随 frame 重置。
-            let service = tower::service_fn(move |req: hyper::Request<Incoming>| {
-                let (mut parts, incoming) = req.into_parts();
-                parts.extensions.insert(ConnectInfo(peer));
-                let body = Body::new(DeadlineBody::new(incoming, BODY_READ_TIMEOUT));
-                let req = hyper::Request::from_parts(parts, body);
-                let app = app.clone();
-                async move { app.oneshot(req).await }
-            });
-
-            // 不用 hyper-util 的 auto builder：它的 HTTP 版本嗅探阶段没有超时。
-            // http1 Builder 只对「读 header」计时；body 由 DeadlineBody 的 10s 总
-            // deadline 单独约束，不会因为 header 超时被提前杀掉。
-            if let Err(err) = hyper::server::conn::http1::Builder::new()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(HEADER_READ_TIMEOUT)
-                .serve_connection(TokioIo::new(tcp), TowerToHyperService::new(service))
-                .with_upgrades()
-                .await
-            {
-                // 只记录来源与错误，不记录请求头。
-                tracing::debug!(%peer, error = %err, "面板连接结束");
+            match acceptor {
+                Some(acceptor) => {
+                    // 慢 TLS 握手同样不能无限占用连接槽位：先做握手超时，再进入
+                    // 与 HTTP 完全相同的 header/body 超时处理。
+                    match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+                        Ok(Ok(stream)) => serve_panel_http(app, peer, stream).await,
+                        Ok(Err(err)) => {
+                            // 只记录来源与错误，不记录证书内容。
+                            tracing::debug!(%peer, error = %err, "面板 TLS 握手失败");
+                        }
+                        Err(_) => {
+                            tracing::warn!(%peer, "面板 TLS 握手超时，关闭连接");
+                        }
+                    }
+                }
+                None => serve_panel_http(app, peer, tcp).await,
             }
         });
+    }
+}
+
+/// 在一条（已建立的 HTTP 或 TLS）连接上跑 hyper HTTP/1 服务。
+async fn serve_panel_http<S>(app: Router, peer: SocketAddr, stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    // 登录限速 / 可信反代取 IP 依赖 ConnectInfo<SocketAddr>，逐请求注入。
+    // KI-17：请求体套一次性总 deadline，慢 body 最多占 10s，不随 frame 重置。
+    let service = tower::service_fn(move |req: hyper::Request<Incoming>| {
+        let (mut parts, incoming) = req.into_parts();
+        parts.extensions.insert(ConnectInfo(peer));
+        let body = Body::new(DeadlineBody::new(incoming, BODY_READ_TIMEOUT));
+        let req = hyper::Request::from_parts(parts, body);
+        let app = app.clone();
+        async move { app.oneshot(req).await }
+    });
+
+    // 不用 hyper-util 的 auto builder：它的 HTTP 版本嗅探阶段没有超时。
+    // http1 Builder 只对「读 header」计时；body 由 DeadlineBody 的 10s 总
+    // deadline 单独约束，不会因为 header 超时被提前杀掉。
+    if let Err(err) = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service))
+        .with_upgrades()
+        .await
+    {
+        // 只记录来源与错误，不记录请求头。
+        tracing::debug!(%peer, error = %err, "面板连接结束");
     }
 }
 
@@ -1867,6 +2236,31 @@ fn run(config: Option<PathBuf>, listen: Option<String>, hub: Option<String>) -> 
             "未找到前端构建产物，页面请求将返回 503；请构建 web/ 或用 static_dir 指定目录"
         );
     }
+
+    // C7：直连 TLS 在启动前完成文件、配套、有效期与 SAN 校验，任何失败都拒绝启动。
+    let tls = load_panel_tls(&cfg).context("面板 TLS 配置无效")?;
+    if tls.is_some() {
+        let origin = cfg.public_origin.trim();
+        if origin.is_empty() {
+            tracing::warn!(
+                "面板已启用 HTTPS，但 public_origin 为空；Origin 校验将退回 Host 同源比较，\
+                 建议显式设置 https://<host>"
+            );
+        } else if !origin.starts_with("https://") {
+            bail!("直连 TLS 时 public_origin 必须是 https://（当前 {origin:?}）");
+        }
+        // 直连 HTTPS 时 Auto 依赖可信反代 + X-Forwarded-Proto，永远不会给浏览器
+        // 加 Secure；这里强制 always，避免会话 Cookie 在 HTTPS 下可被明文回放。
+        if cfg.cookie_secure != CookieSecure::Always {
+            tracing::warn!(
+                from = ?cfg.cookie_secure,
+                "面板直连 HTTPS，强制 cookie_secure=always（忽略配置里的其它策略）"
+            );
+            cfg.cookie_secure = CookieSecure::Always;
+        }
+    }
+    let tls_acceptor = tls.map(|tls| tokio_rustls::TlsAcceptor::from(tls.config));
+
     let state = Arc::new(AppState::new(cfg, static_files, Some(path.clone()))?);
     let listen = state.cfg.listen.clone();
     let hub = state.cfg.hub_url.clone();
@@ -1882,16 +2276,30 @@ fn run(config: Option<PathBuf>, listen: Option<String>, hub: Option<String>) -> 
         let listener = TcpListener::bind(&listen)
             .await
             .with_context(|| format!("监听 {listen} 失败"))?;
-        if !loopback {
-            tracing::warn!(
-                listen = %listen,
-                "面板是明文 HTTP，请使用 VPN/反代；当前监听地址不是回环地址，\
-                 不要直接暴露到公网或不可信网络"
-            );
+        match tls_acceptor {
+            Some(acceptor) => {
+                // 只记录 scheme；不打印证书/私钥路径，更不打印 key 内容。
+                tracing::info!(
+                    listen = %listen,
+                    hub = %hub,
+                    scheme = "https",
+                    "面板已启动（HTTPS，TLS 1.3 + ALPN http/1.1）"
+                );
+                serve_panel_tls_listener(app, listener, acceptor).await
+            }
+            None => {
+                if !loopback {
+                    tracing::warn!(
+                        listen = %listen,
+                        "面板是明文 HTTP，请使用 VPN/反代；当前监听地址不是回环地址，\
+                         不要直接暴露到公网或不可信网络"
+                    );
+                }
+                tracing::info!(listen = %listen, hub = %hub, scheme = "http", "面板已启动");
+                // KI-17：手工 accept，带 header 读超时与全局 / 每 IP 连接上限。
+                serve_panel_listener(app, listener).await
+            }
         }
-        tracing::info!(listen = %listen, hub = %hub, "面板已启动");
-        // KI-17：手工 accept，带 header 读超时与全局 / 每 IP 连接上限。
-        serve_panel_listener(app, listener).await
     })
 }
 
@@ -2057,24 +2465,40 @@ fn ports(config: Option<PathBuf>) -> Result<()> {
     };
     let port = port_of(&cfg.listen).unwrap_or(DEFAULT_PANEL_PORT);
     let loopback = listen_is_loopback(&cfg.listen);
+    // C7：配置了 tls_cert/tls_key 时，ports 也应显示 https 而不是 http。
+    let scheme = if !cfg.tls_cert.trim().is_empty() && !cfg.tls_key.trim().is_empty() {
+        "https"
+    } else {
+        "http"
+    };
     println!("配置文件: {}", path.display());
     println!("面板端口: {port}");
     println!("  监听: {}", cfg.listen);
+    println!(
+        "  传输: {}",
+        if scheme == "https" {
+            "HTTPS（TLS 1.3 + ALPN http/1.1）"
+        } else {
+            "HTTP"
+        }
+    );
     if loopback {
         match listen_host(&cfg.listen) {
             Some(host) if host.parse::<std::net::Ipv6Addr>().is_ok() => {
-                println!("  浏览器: http://[{host}]:{port}");
+                println!("  浏览器: {scheme}://[{host}]:{port}");
             }
-            Some(host) => println!("  浏览器: http://{host}:{port}"),
-            None => println!("  浏览器: http://127.0.0.1:{port}"),
+            Some(host) => println!("  浏览器: {scheme}://{host}:{port}"),
+            None => println!("  浏览器: {scheme}://127.0.0.1:{port}"),
         }
         println!("  提示: 面板只监听回环地址，请通过本机浏览器或 SSH 端口转发访问");
     } else {
-        println!("  浏览器: http://<本机IP>:{port}（监听非回环地址）");
-        println!(
-            "  警告: 面板是明文 HTTP，请使用 VPN/反代（HTTPS）对外提供，\
-             不要直接暴露到公网或不可信网络"
-        );
+        println!("  浏览器: {scheme}://<本机IP>:{port}（监听非回环地址）");
+        if scheme == "http" {
+            println!(
+                "  警告: 面板是明文 HTTP，请使用 VPN/反代（HTTPS）对外提供，\
+                 不要直接暴露到公网或不可信网络"
+            );
+        }
     }
     println!("hub API: {}", cfg.hub_url);
     println!(
@@ -5179,5 +5603,267 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    // ---------- C7：面板直连 TLS 文件 / SAN 校验 ----------
+
+    struct TlsTempDir {
+        path: PathBuf,
+    }
+
+    impl TlsTempDir {
+        fn new(tag: &str) -> Self {
+            let unique = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "rustboard-panel-tls-{tag}-{}-{unique}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for TlsTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn test_ca() -> (rcgen::Certificate, rcgen::KeyPair) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "RustBoard Panel Test CA");
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        params.key_identifier_method = rcgen::KeyIdMethod::Sha256;
+        let cert = params.self_signed(&key).unwrap();
+        (cert, key)
+    }
+
+    /// 生成 leaf；`sans` 形如 `dns:panel.example.com` / `ip:127.0.0.1`。
+    fn test_leaf(
+        ca_cert: &rcgen::Certificate,
+        ca_key: &rcgen::KeyPair,
+        sans: &[&str],
+        expired: bool,
+    ) -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "rustboard-panel test");
+        params.subject_alt_names = sans
+            .iter()
+            .map(|san| {
+                if let Some(ip) = san.strip_prefix("ip:") {
+                    rcgen::SanType::IpAddress(ip.parse().unwrap())
+                } else {
+                    let dns = san.strip_prefix("dns:").unwrap_or(san);
+                    rcgen::SanType::DnsName(rcgen::Ia5String::try_from(dns.to_string()).unwrap())
+                }
+            })
+            .collect();
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
+        ];
+        if expired {
+            params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2020, 2, 1);
+        }
+        let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    fn write_tls_pair(dir: &TlsTempDir, cert_pem: &str, key_pem: &str) -> (PathBuf, PathBuf) {
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, cert_pem).unwrap();
+        std::fs::write(&key, key_pem).unwrap();
+        set_mode(&cert, 0o644);
+        set_mode(&key, 0o600);
+        (cert, key)
+    }
+
+    #[test]
+    fn panel_tls_http_mode_and_pair_rules() {
+        assert!(
+            load_panel_tls(&PanelConfig::default()).unwrap().is_none(),
+            "缺 tls 字段必须保持 HTTP"
+        );
+
+        let dir = TlsTempDir::new("pair");
+        let (ca_cert, ca_key) = test_ca();
+        let (cert_pem, key_pem) = test_leaf(&ca_cert, &ca_key, &["dns:panel.example.com"], false);
+        let (cert, _) = write_tls_pair(&dir, &cert_pem, &key_pem);
+
+        let mut cfg = PanelConfig {
+            tls_cert: cert.to_string_lossy().into_owned(),
+            ..PanelConfig::default()
+        };
+        let error = load_panel_tls(&cfg).err().expect("必须拒绝");
+        assert!(format!("{error:#}").contains("成对"), "{error:#}");
+
+        cfg.tls_key = "relative-key.pem".to_string();
+        let error = load_panel_tls(&cfg).err().expect("必须拒绝");
+        assert!(format!("{error:#}").contains("绝对路径"), "{error:#}");
+    }
+
+    #[test]
+    fn panel_tls_runtime_hardens_key_but_source_rejects_loose_key() {
+        let dir = TlsTempDir::new("mode");
+        let (ca_cert, ca_key) = test_ca();
+        let (cert_pem, key_pem) = test_leaf(&ca_cert, &ca_key, &["dns:panel.example.com"], false);
+        let (cert, key) = write_tls_pair(&dir, &cert_pem, &key_pem);
+        set_mode(&key, 0o644);
+
+        let error = validate_panel_tls_files(&cert, &key, TlsFilePolicy::Source)
+            .err()
+            .expect("必须拒绝");
+        assert!(format!("{error:#}").contains("0600"), "{error:#}");
+        assert_eq!(mode_of(&key), 0o644, "Source 校验不得修改用户源文件");
+
+        validate_panel_tls_files(&cert, &key, TlsFilePolicy::Runtime)
+            .expect("运行时读取应把 0644 key 收紧到 0600");
+        assert_eq!(mode_of(&key), 0o600);
+        assert_eq!(mode_of(&cert), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn panel_tls_rejects_symlink_key() {
+        let dir = TlsTempDir::new("symlink");
+        let (ca_cert, ca_key) = test_ca();
+        let (cert_pem, key_pem) = test_leaf(&ca_cert, &ca_key, &["dns:panel.example.com"], false);
+        let (cert, key) = write_tls_pair(&dir, &cert_pem, &key_pem);
+        let link = dir.join("key-link.pem");
+        std::os::unix::fs::symlink(&key, &link).unwrap();
+
+        let error = validate_panel_tls_files(&cert, &link, TlsFilePolicy::Source)
+            .err()
+            .expect("必须拒绝");
+        assert!(format!("{error:#}").contains("符号链接"), "{error:#}");
+    }
+
+    #[test]
+    fn panel_tls_rejects_mismatched_and_expired_certificates() {
+        let dir = TlsTempDir::new("bad-mat");
+        let (ca_cert, ca_key) = test_ca();
+        let (cert1, _key1) = test_leaf(&ca_cert, &ca_key, &["dns:panel.example.com"], false);
+        let (_cert2, key2) = test_leaf(&ca_cert, &ca_key, &["dns:panel.example.com"], false);
+        let (cert, key) = write_tls_pair(&dir, &cert1, &key2);
+        let error = validate_panel_tls_files(&cert, &key, TlsFilePolicy::Source)
+            .err()
+            .expect("必须拒绝");
+        assert!(format!("{error:#}").contains("不匹配"), "{error:#}");
+
+        let dir = TlsTempDir::new("expired");
+        let (cert_pem, key_pem) = test_leaf(&ca_cert, &ca_key, &["dns:panel.example.com"], true);
+        let (cert, key) = write_tls_pair(&dir, &cert_pem, &key_pem);
+        let error = validate_panel_tls_files(&cert, &key, TlsFilePolicy::Source)
+            .err()
+            .expect("必须拒绝");
+        assert!(format!("{error:#}").contains("已过期"), "{error:#}");
+    }
+
+    #[test]
+    fn panel_tls_requires_san_and_checks_listen_ip_and_origin() {
+        let dir = TlsTempDir::new("san");
+        let (ca_cert, ca_key) = test_ca();
+        let (cert_pem, key_pem) = test_leaf(
+            &ca_cert,
+            &ca_key,
+            &["dns:panel.example.com", "ip:127.0.0.1"],
+            false,
+        );
+        let (cert, key) = write_tls_pair(&dir, &cert_pem, &key_pem);
+        let files = validate_panel_tls_files(&cert, &key, TlsFilePolicy::Source).expect("合法证书");
+
+        validate_panel_tls_names(&files, "127.0.0.1:8443", "https://panel.example.com")
+            .expect("监听 IP 与 public_origin 都被覆盖");
+
+        let error = validate_panel_tls_names(&files, "127.0.0.2:8443", "https://panel.example.com")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("127.0.0.2"), "{error:#}");
+
+        let error =
+            validate_panel_tls_names(&files, "0.0.0.0:8443", "https://evil.example").unwrap_err();
+        assert!(format!("{error:#}").contains("SAN"), "{error:#}");
+
+        // 0.0.0.0 是通配绑定，不作为访问名校验。
+        validate_panel_tls_names(&files, "0.0.0.0:8443", "https://panel.example.com")
+            .expect("通配监听地址不应要求 IP SAN");
+
+        assert_eq!(
+            derived_https_origin(&files).unwrap(),
+            "https://panel.example.com"
+        );
+
+        let dir = TlsTempDir::new("no-san");
+        let (cert_pem, key_pem) = test_leaf(&ca_cert, &ca_key, &[], false);
+        let (cert, key) = write_tls_pair(&dir, &cert_pem, &key_pem);
+        let error = validate_panel_tls_files(&cert, &key, TlsFilePolicy::Source)
+            .err()
+            .expect("必须拒绝");
+        assert!(format!("{error:#}").contains("没有任何 SAN"), "{error:#}");
+    }
+
+    #[test]
+    fn panel_tls_load_builds_tls13_http1_config() {
+        let dir = TlsTempDir::new("load");
+        let (ca_cert, ca_key) = test_ca();
+        let (cert_pem, key_pem) = test_leaf(
+            &ca_cert,
+            &ca_key,
+            &["dns:panel.example.com", "ip:127.0.0.1"],
+            false,
+        );
+        let (cert, key) = write_tls_pair(&dir, &cert_pem, &key_pem);
+        let cfg = PanelConfig {
+            listen: "127.0.0.1:8443".to_string(),
+            public_origin: "https://panel.example.com".to_string(),
+            tls_cert: cert.to_string_lossy().into_owned(),
+            tls_key: key.to_string_lossy().into_owned(),
+            ..PanelConfig::default()
+        };
+        let runtime = load_panel_tls(&cfg).expect("合法 TLS 配置").expect("HTTPS");
+        assert_eq!(runtime.config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn panel_tls_origin_host_parsing() {
+        assert_eq!(
+            origin_host("https://panel.example.com"),
+            Some("panel.example.com")
+        );
+        assert_eq!(
+            origin_host("https://panel.example.com:8443"),
+            Some("panel.example.com")
+        );
+        assert_eq!(origin_host("https://[::1]:8443"), Some("::1"));
+        assert_eq!(origin_host("ftp://panel.example.com"), None);
+        assert_eq!(origin_host("https://"), None);
     }
 }

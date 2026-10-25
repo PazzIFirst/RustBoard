@@ -26,17 +26,23 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
+# C7：面板直连 HTTPS 需要 rustls 服务端/客户端类型与 tokio-rustls accept。
+rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# C7：校验证书 SAN / 有效期（workspace 已有依赖，common 也在用，无新增供应链）。
+x509-parser = { workspace = true }
 # 仅安装器使用：dry-run 时只读解析 hub.toml / panel.toml（不能用 load_toml，
 # 它会 chmod 收紧权限，破坏 dry-run 零写入）。
 toml = { workspace = true }
 tokio = { workspace = true }
+# C7：面板直连 HTTPS 的 accept 层；同时供 proxy 测试里的 mock TLS hub 使用。
+tokio-rustls = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 include_dir = { workspace = true, optional = true }
 
 [dev-dependencies]
-# 真实 TLS mock hub：只在测试构建启用，不进入发布二进制。
-tokio-rustls = { workspace = true }
+# C7：测试里生成私有 CA / 服务端证书，验证真实 TLS 握手与安装器。
+rcgen = { workspace = true }
