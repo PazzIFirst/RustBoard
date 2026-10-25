@@ -50,7 +50,7 @@ use rustboard_core::storage::postgres::PostgresStorage;
 use rustboard_core::storage::sqlite::DEFAULT_READ_POOL_SIZE;
 use rustboard_core::storage::StorageHandle;
 use rustboard_core::storage::{
-    AgentSeriesRow, IngestOutcome, QueryTooLarge, SampleTier, AUDIT_RETENTION_MS,
+    AgentSeriesRow, IngestOutcome, QueryTooLarge, RejectReason, SampleTier, AUDIT_RETENTION_MS,
 };
 use tokio::net::TcpListener;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
@@ -5572,12 +5572,40 @@ async fn handle_message(
                             )
                             .await?;
                         }
-                        Ok(IngestOutcome::Rejected(reason)) => {
-                            // 吊销检查与写入在同一个事务里，命中即整批回滚：绝不 ACK。
-                            tracing::warn!(agent = %agent_id, ?reason, "批次被拒绝，关闭会话");
-                            reject_and_close(socket, codes::REVOKED, "该 agent 已被吊销").await;
-                            return Ok(MessageAction::Close);
-                        }
+                        Ok(IngestOutcome::Rejected(reason)) => match reason {
+                            RejectReason::Invalid => {
+                                // NUL / NaN / Inf 等坏数据整批丢弃：ACK 让 agent 前进，
+                                // 不关闭会话；否则一条坏批次会让该 agent 永久重连失败。
+                                tracing::warn!(
+                                    agent = %agent_id,
+                                    epoch = batch.epoch,
+                                    seq = batch.seq,
+                                    ?reason,
+                                    "批次数据非法，已丢弃"
+                                );
+                                send_frame(
+                                    socket,
+                                    &Frame::Ack {
+                                        epoch: batch.epoch,
+                                        seq: batch.seq,
+                                    },
+                                )
+                                .await?;
+                            }
+                            // Revoked（以及未来新增的拒绝原因）保持吊销语义：
+                            // 吊销检查与写入在同一个事务里，命中即整批回滚，绝不 ACK。
+                            _ => {
+                                tracing::warn!(
+                                    agent = %agent_id,
+                                    epoch = batch.epoch,
+                                    seq = batch.seq,
+                                    ?reason,
+                                    "批次被拒绝，关闭会话"
+                                );
+                                reject_and_close(socket, codes::REVOKED, "该 agent 已被吊销").await;
+                                return Ok(MessageAction::Close);
+                            }
+                        },
                         Err(err) => {
                             tracing::error!(agent = %agent_id, error = %err, "入库失败，关闭会话");
                             reject_and_close(socket, codes::INTERNAL, "入库失败").await;
