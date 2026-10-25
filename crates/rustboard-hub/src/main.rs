@@ -31,7 +31,7 @@ use hyper::body::Incoming;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use rustboard_common::config::{AdminTlsMode, HubConfig};
+use rustboard_common::config::{AdminTlsMode, HubConfig, ServerTlsMode};
 use rustboard_common::control::ControlError;
 use rustboard_common::fsutil;
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
@@ -1066,16 +1066,83 @@ fn shell_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// KI-20：渲染可直接粘贴执行的 agent 安装命令。
+/// hub 的服务端证书来源 → `hub agent add` 应给 agent 的信任模型。
+///
+/// ACME hub 绝不输出指纹：公共 ACME 用系统根；私有/自定义 ACME
+/// （`tls.acme_ca_file` 非空）用该 CA 文件（安装器会复制到 agent data_dir）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HubAgentTrust<'a> {
+    Fingerprint,
+    SystemRoots,
+    CustomCa(&'a str),
+}
+
+fn hub_agent_trust(cfg: &HubConfig) -> HubAgentTrust<'_> {
+    match cfg.tls.mode {
+        ServerTlsMode::SelfSigned => HubAgentTrust::Fingerprint,
+        ServerTlsMode::AcmeDomain | ServerTlsMode::AcmeIp => {
+            let ca = cfg.tls.acme_ca_file.trim();
+            if ca.is_empty() {
+                HubAgentTrust::SystemRoots
+            } else {
+                HubAgentTrust::CustomCa(ca)
+            }
+        }
+    }
+}
+
+/// ACME hub 对 v0.4 指纹 agent 的升级提示（会打印在 `agent add` 输出里）。
+const ACME_AGENT_UPGRADE_NOTICE: &str =
+    "v0.4 指纹 agent 不兼容 ACME hub，请升级 rustboard-agent 到 v1.0+";
+
+/// 渲染 agent 安装命令时使用的信任来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentInstallTrust<'a> {
+    Fingerprint(&'a str),
+    SystemRoots,
+    CustomCa(&'a str),
+}
+
+/// 渲染可直接粘贴执行的 agent 安装命令。
+///
+/// URL、token、指纹/CA 路径、name 全部经 [`shell_arg`] 引用；fingerprint 模式的
+/// 正常值输出与 v0.4 逐字节一致。
+fn render_agent_install_command(
+    url: &str,
+    token: &str,
+    name: &str,
+    trust: AgentInstallTrust<'_>,
+) -> String {
+    let mut command = format!(
+        "rustboard-agent init --hub {} \\\n    --token {}",
+        shell_arg(url),
+        shell_arg(token)
+    );
+    match trust {
+        AgentInstallTrust::Fingerprint(fingerprint) => {
+            command.push_str(&format!(" --fingerprint {}", shell_arg(fingerprint)));
+        }
+        AgentInstallTrust::SystemRoots => command.push_str(" --tls-mode system-roots"),
+        AgentInstallTrust::CustomCa(ca) => {
+            command.push_str(&format!(
+                " --tls-mode custom-ca --server-ca {}",
+                shell_arg(ca)
+            ));
+        }
+    }
+    command.push_str(&format!(" --name {}", shell_arg(name)));
+    command
+}
+
+/// KI-20：渲染指纹模式的 agent 安装命令（v0.4 输出保持不变）。
 ///
 /// URL、token、指纹、name 全部经 [`shell_arg`] 引用；正常值不改变输出。
 fn render_install_command(url: &str, token: &str, fingerprint: &str, name: &str) -> String {
-    format!(
-        "rustboard-agent init --hub {} \\\n    --token {} --fingerprint {} --name {}",
-        shell_arg(url),
-        shell_arg(token),
-        shell_arg(fingerprint),
-        shell_arg(name)
+    render_agent_install_command(
+        url,
+        token,
+        name,
+        AgentInstallTrust::Fingerprint(fingerprint),
     )
 }
 
@@ -1102,16 +1169,56 @@ fn agent_add(config: Option<PathBuf>, name: String, ttl_minutes: u32) -> Result<
     let expires = now + (ttl_minutes as i64) * 60_000;
     db.create_enroll_token(&tls::sha256_hex(&token), &name, now, expires)?;
 
-    let cert_pem =
-        std::fs::read_to_string(tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE))
-            .context("找不到服务端证书，先执行 rustboard-hub init")?;
-    let fingerprint = tls::fingerprint_of_pem(&cert_pem)?;
+    let trust = hub_agent_trust(&cfg);
+    // ACME 模式不读取/输出服务端证书指纹：旧指纹 agent 在 ACME hub 上必然失败，
+    // 必须引导升级而不是给一条无法使用的命令。self-signed 保持旧行为（读证书、
+    // 计算指纹），证书缺失时仍然报“先 init”。
+    let command = match trust {
+        HubAgentTrust::Fingerprint => {
+            let cert_pem =
+                std::fs::read_to_string(tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE))
+                    .context("找不到服务端证书，先执行 rustboard-hub init")?;
+            let fingerprint = tls::fingerprint_of_pem(&cert_pem)?;
+            render_install_command(&hub_agent_ws_url(&cfg), &token, &fingerprint, &name)
+        }
+        HubAgentTrust::SystemRoots => render_agent_install_command(
+            &hub_agent_ws_url(&cfg),
+            &token,
+            &name,
+            AgentInstallTrust::SystemRoots,
+        ),
+        HubAgentTrust::CustomCa(ca) => render_agent_install_command(
+            &hub_agent_ws_url(&cfg),
+            &token,
+            &name,
+            AgentInstallTrust::CustomCa(ca),
+        ),
+    };
 
+    println!("一次性 token（{ttl_minutes} 分钟内有效，仅可使用一次）:");
+    println!("  {token}");
+    if trust != HubAgentTrust::Fingerprint {
+        println!("\n提示: {ACME_AGENT_UPGRADE_NOTICE}");
+        if let HubAgentTrust::CustomCa(ca) = trust {
+            println!("  自定义 ACME CA: {ca}（需确保目标机可读取该文件）");
+        }
+    }
+    println!("\n在目标服务器上执行:");
+    println!("  {command}");
+    Ok(())
+}
+
+/// `hub agent add` 展示给 agent 的 WebSocket 入口。
+///
+/// self-signed 用 `server_names`（旧行为）；ACME 用 `tls.domains`。优先
+/// `advertise_host`，其次第一个非回环 IP，再退回第一个名字。
+fn hub_agent_ws_url(cfg: &HubConfig) -> String {
+    let names = cfg.effective_server_names();
     let host = cfg
         .advertise_host
         .clone()
         .or_else(|| {
-            cfg.server_names
+            names
                 .iter()
                 .find(|h| {
                     h.parse::<std::net::IpAddr>()
@@ -1120,23 +1227,10 @@ fn agent_add(config: Option<PathBuf>, name: String, ttl_minutes: u32) -> Result<
                 })
                 .cloned()
         })
-        .or_else(|| cfg.server_names.first().cloned())
+        .or_else(|| names.first().cloned())
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let port = cfg.agent_listen.rsplit(':').next().unwrap_or("8443");
-
-    println!("一次性 token（{ttl_minutes} 分钟内有效，仅可使用一次）:");
-    println!("  {token}");
-    println!("\n在目标服务器上执行:");
-    println!(
-        "  {}",
-        render_install_command(
-            &format!("wss://{host}:{port}/agent/ws"),
-            &token,
-            &fingerprint,
-            &name
-        )
-    );
-    Ok(())
+    format!("wss://{host}:{port}/agent/ws")
 }
 
 fn agent_revoke(config: Option<PathBuf>, id: String) -> Result<()> {
@@ -12403,6 +12497,124 @@ mod tests {
                 "危险字符必须整体单引号包裹: {unsafe_value:?}"
             );
         }
+    }
+
+    /// C2：`hub agent add` 的输出必须跟随 hub 的 TLS 模式；ACME hub 绝不输出指纹。
+    #[test]
+    fn c2_agent_install_command_follows_hub_tls_mode() {
+        use rustboard_common::config::TlsConfig;
+
+        // self-signed：保持旧行为，信任来源是指纹。
+        let self_signed = HubConfig::default();
+        assert_eq!(
+            hub_agent_trust(&self_signed),
+            HubAgentTrust::Fingerprint,
+            "旧配置/自签 hub 必须继续输出 --fingerprint"
+        );
+
+        // 公共 ACME：系统根，主机名来自 tls.domains。
+        let public_acme = HubConfig {
+            server_names: Vec::new(),
+            tls: TlsConfig {
+                mode: ServerTlsMode::AcmeDomain,
+                acme_email: "admin@example.com".to_string(),
+                domains: vec!["board.example.com".to_string()],
+                ..TlsConfig::default()
+            },
+            ..HubConfig::default()
+        };
+        assert_eq!(hub_agent_trust(&public_acme), HubAgentTrust::SystemRoots);
+        assert_eq!(
+            hub_agent_ws_url(&public_acme),
+            "wss://board.example.com:8443/agent/ws",
+            "ACME 模式主机名必须来自 tls.domains"
+        );
+
+        // 私有 ACME：custom-ca + acme_ca_file。
+        let mut private_tls = public_acme.tls.clone();
+        private_tls.acme_ca_file = "/etc/rustboard/pebble-ca.pem".to_string();
+        let private_acme = HubConfig {
+            tls: private_tls,
+            ..public_acme.clone()
+        };
+        assert_eq!(
+            hub_agent_trust(&private_acme),
+            HubAgentTrust::CustomCa("/etc/rustboard/pebble-ca.pem")
+        );
+
+        // acme-ip 的主机名是 IP 字符串。
+        let ip_acme = HubConfig {
+            server_names: Vec::new(),
+            tls: TlsConfig {
+                mode: ServerTlsMode::AcmeIp,
+                acme_email: "admin@example.com".to_string(),
+                domains: vec!["203.0.113.10".to_string()],
+                ..TlsConfig::default()
+            },
+            ..HubConfig::default()
+        };
+        assert_eq!(hub_agent_trust(&ip_acme), HubAgentTrust::SystemRoots);
+        assert_eq!(
+            hub_agent_ws_url(&ip_acme),
+            "wss://203.0.113.10:8443/agent/ws"
+        );
+
+        // 命令渲染：fingerprint 逐字节不变；ACME 只出现 --tls-mode，不出现指纹。
+        let token = "0123456789abcdef".repeat(4);
+        let fingerprint = "fedcba9876543210".repeat(4);
+        let url = "wss://board.example.com:8443/agent/ws";
+        let fingerprint_command = render_install_command(url, &token, &fingerprint, "web-01");
+        assert_eq!(
+            fingerprint_command,
+            format!(
+                "rustboard-agent init --hub {url} \\\n    \
+                 --token {token} --fingerprint {fingerprint} --name web-01"
+            ),
+            "self-signed 输出必须与 v0.4 完全一致"
+        );
+
+        let system_roots =
+            render_agent_install_command(url, &token, "web-01", AgentInstallTrust::SystemRoots);
+        assert_eq!(
+            system_roots,
+            format!(
+                "rustboard-agent init --hub {url} \\\n    \
+                 --token {token} --tls-mode system-roots --name web-01"
+            )
+        );
+        assert!(
+            !system_roots.contains("fingerprint"),
+            "ACME 命令不得出现指纹: {system_roots}"
+        );
+
+        let custom_ca = render_agent_install_command(
+            url,
+            &token,
+            "web-01",
+            AgentInstallTrust::CustomCa("/etc/rustboard/pebble-ca.pem"),
+        );
+        assert!(
+            custom_ca.contains("--tls-mode custom-ca --server-ca /etc/rustboard/pebble-ca.pem"),
+            "{custom_ca}"
+        );
+        assert!(!custom_ca.contains("fingerprint"), "{custom_ca}");
+
+        // CA 路径含空格时仍要安全引用，不能拆成新的 shell 词。
+        let quoted = render_agent_install_command(
+            url,
+            &token,
+            "web-01",
+            AgentInstallTrust::CustomCa("/etc/rust board/ca.pem"),
+        );
+        assert!(
+            quoted.contains("--server-ca '/etc/rust board/ca.pem'"),
+            "{quoted}"
+        );
+
+        assert!(
+            ACME_AGENT_UPGRADE_NOTICE.contains("v0.4 指纹 agent 不兼容 ACME hub，请升级"),
+            "升级提示必须点明 v0.4 agent 不兼容"
+        );
     }
 
     /// KI-20：正常 name 的安装命令逐字节不变；危险 name 只出现在安全引号里。

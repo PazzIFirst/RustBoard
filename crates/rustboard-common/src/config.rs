@@ -7,6 +7,367 @@ use std::path::{Path, PathBuf};
 
 use crate::{control, Error, Result};
 
+/// hub 服务端密码套件/证书来源模式。
+///
+/// - `self-signed`：v0.4 行为，本地 CA 自签服务端证书 + agent 指纹钉扎；
+/// - `acme-domain`：ACME 域名证书（DNS identifier）；
+/// - `acme-ip`：ACME IP 证书（IPv4 identifier，通常用短期 profile）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServerTlsMode {
+    /// 自签证书（默认，保持旧配置行为）。
+    #[default]
+    SelfSigned,
+    /// ACME 域名证书。
+    AcmeDomain,
+    /// ACME IPv4 证书。
+    AcmeIp,
+}
+
+impl ServerTlsMode {
+    /// 稳定的字符串名（日志/CLI 展示用，与 serde 名称一致）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SelfSigned => "self-signed",
+            Self::AcmeDomain => "acme-domain",
+            Self::AcmeIp => "acme-ip",
+        }
+    }
+
+    /// 是否由 ACME 管理服务端证书。
+    pub fn is_acme(self) -> bool {
+        !matches!(self, Self::SelfSigned)
+    }
+}
+
+/// ACME 挑战类型。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AcmeChallenge {
+    /// HTTP-01（默认）：临时监听 80 端口提供 key authorization。
+    #[default]
+    #[serde(rename = "http-01")]
+    Http01,
+    /// TLS-ALPN-01：临时监听 443 端口，仅接受 `acme-tls/1`。
+    #[serde(rename = "tls-alpn-01")]
+    TlsAlpn01,
+}
+
+impl AcmeChallenge {
+    /// 稳定的字符串名（与 serde 名称一致，可用于日志/诊断输出）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http01 => "http-01",
+            Self::TlsAlpn01 => "tls-alpn-01",
+        }
+    }
+}
+
+/// agent 的服务端信任模型。
+///
+/// 旧配置缺 `tls_mode` 时默认 `fingerprint`，行为与 v0.4 完全一致。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentTlsMode {
+    /// 指纹钉扎（默认）：bootstrap 与已纳管都依赖 `server_fingerprint`。
+    #[default]
+    Fingerprint,
+    /// 系统根证书 + URL 主机名校验（公共 ACME 证书）。
+    SystemRoots,
+    /// 指定 CA（`server_ca`）+ URL 主机名校验（私有 ACME / 自签 CA）。
+    CustomCa,
+}
+
+impl AgentTlsMode {
+    /// 稳定的字符串名（与 serde/CLI 名称一致）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fingerprint => "fingerprint",
+            Self::SystemRoots => "system-roots",
+            Self::CustomCa => "custom-ca",
+        }
+    }
+}
+
+/// Let's Encrypt v2 production ACME 目录（默认值）。
+pub const DEFAULT_ACME_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
+
+/// hub 服务端证书来源与 ACME 参数。对应 `hub.toml` 的 `[tls]`。
+///
+/// 全部字段有默认值：旧配置完全没有 `[tls]` 时等价于 `mode = "self-signed"`，
+/// 不要求任何 ACME 字段，行为与 v0.4 一致。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// 服务端证书来源。
+    pub mode: ServerTlsMode,
+    /// ACME 账户联系邮箱；ACME 模式必填。
+    pub acme_email: String,
+    /// ACME directory URL；ACME 模式必须是 `https://` 且无 userinfo/fragment。
+    pub acme_directory: String,
+    /// ACME 挑战类型。
+    pub challenge: AcmeChallenge,
+    /// 证书标识：`acme-domain` 为 1–20 个 DNS 名，`acme-ip` 为恰好一个 IPv4。
+    pub domains: Vec<String>,
+    /// ACME profile；`acme-ip` 留空时运行时默认 `shortlived`，`acme-domain` 留空不设置。
+    pub acme_profile: String,
+    /// 私有/Pebble ACME 的根 CA（PEM 绝对路径）；留空使用系统根。
+    pub acme_ca_file: String,
+    /// 安装时先跑一次 staging 挑战（失败按 `fallback_to_self_signed` 处理）。
+    pub staging_check: bool,
+    /// ACME 获取证书失败时是否回退 self-signed 继续安装。
+    pub fallback_to_self_signed: bool,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            mode: ServerTlsMode::SelfSigned,
+            acme_email: String::new(),
+            acme_directory: DEFAULT_ACME_DIRECTORY.to_string(),
+            challenge: AcmeChallenge::Http01,
+            domains: Vec::new(),
+            acme_profile: String::new(),
+            acme_ca_file: String::new(),
+            staging_check: true,
+            fallback_to_self_signed: true,
+        }
+    }
+}
+
+impl TlsConfig {
+    /// 配置级校验；不读文件、不访问网络。
+    ///
+    /// `self-signed` 模式不要求/不校验任何 ACME 字段（旧配置即使带着无关的
+    /// ACME 字段也不影响启动）。ACME 模式的错误信息统一以 `tls.` 开头，
+    /// 便于运维定位，且只包含公开配置值（邮箱、域名、路径），不涉及私钥。
+    pub fn validate(&self) -> Result<()> {
+        match self.mode {
+            ServerTlsMode::SelfSigned => Ok(()),
+            ServerTlsMode::AcmeDomain => {
+                self.validate_acme_common()?;
+                if !(1..=MAX_ACME_DOMAINS).contains(&self.domains.len()) {
+                    return Err(Error::InvalidConfig(format!(
+                        "tls.domains 在 acme-domain 模式下必须包含 1–{MAX_ACME_DOMAINS} 个域名，\
+                         实际 {} 个",
+                        self.domains.len()
+                    )));
+                }
+                for domain in &self.domains {
+                    validate_acme_dns_name(domain)?;
+                }
+                Ok(())
+            }
+            ServerTlsMode::AcmeIp => {
+                self.validate_acme_common()?;
+                if self.domains.len() != 1 {
+                    return Err(Error::InvalidConfig(format!(
+                        "tls.domains 在 acme-ip 模式下必须恰好包含一个 IPv4 地址，实际 {} 个",
+                        self.domains.len()
+                    )));
+                }
+                validate_acme_ipv4(&self.domains[0])
+            }
+        }
+    }
+
+    /// 两种 ACME 模式共用的字段校验。
+    fn validate_acme_common(&self) -> Result<()> {
+        validate_acme_email(&self.acme_email)?;
+        validate_acme_directory(&self.acme_directory)?;
+        if !self.acme_profile.trim().is_empty() {
+            validate_acme_profile(&self.acme_profile)?;
+        }
+        if !self.acme_ca_file.trim().is_empty() {
+            validate_absolute_config_path("tls.acme_ca_file", &self.acme_ca_file)?;
+        }
+        Ok(())
+    }
+}
+
+/// `acme-domain` 最多允许的域名数量。
+const MAX_ACME_DOMAINS: usize = 20;
+
+/// ACME 邮箱的基本格式校验：非空、恰好一个 `@`、无空白/控制字符。
+fn validate_acme_email(email: &str) -> Result<()> {
+    if email.is_empty() {
+        return Err(Error::InvalidConfig(
+            "tls.acme_email 在 ACME 模式下不能为空".into(),
+        ));
+    }
+    if email
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(Error::InvalidConfig(
+            "tls.acme_email 不能包含空白或控制字符".into(),
+        ));
+    }
+    let mut parts = email.split('@');
+    let local = parts.next().unwrap_or_default();
+    let domain = parts.next().unwrap_or_default();
+    if local.is_empty() || domain.is_empty() || parts.next().is_some() {
+        return Err(Error::InvalidConfig(
+            "tls.acme_email 必须是 `name@example.com` 形式（恰好一个 @，两侧非空）".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// ACME directory 必须是 https、带主机名、无 userinfo/fragment。
+fn validate_acme_directory(directory: &str) -> Result<()> {
+    if directory.is_empty() {
+        return Err(Error::InvalidConfig("tls.acme_directory 不能为空".into()));
+    }
+    if directory
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(Error::InvalidConfig(
+            "tls.acme_directory 不能包含空白或控制字符".into(),
+        ));
+    }
+    let Some(rest) = directory.strip_prefix("https://") else {
+        return Err(Error::InvalidConfig(
+            "tls.acme_directory 必须以 https:// 开头".into(),
+        ));
+    };
+    // authority 截止到 path/query/fragment；userinfo 只可能出现在 authority 里。
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return Err(Error::InvalidConfig("tls.acme_directory 缺少主机名".into()));
+    }
+    if authority.contains('@') {
+        return Err(Error::InvalidConfig(
+            "tls.acme_directory 不能包含 userinfo（@）".into(),
+        ));
+    }
+    if directory.contains('#') {
+        return Err(Error::InvalidConfig(
+            "tls.acme_directory 不能包含 fragment（#）".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// ACME profile 名：非空时只接受短小的 ASCII 标识符。
+fn validate_acme_profile(profile: &str) -> Result<()> {
+    if profile.len() > 64 {
+        return Err(Error::InvalidConfig(
+            "tls.acme_profile 长度不能超过 64 字节".into(),
+        ));
+    }
+    if !profile
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(Error::InvalidConfig(
+            "tls.acme_profile 只能包含字母、数字、'-'、'_'".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `acme-domain` 的单个标识：必须是合法 DNS 名，禁止通配符与 IP。
+fn validate_acme_dns_name(raw: &str) -> Result<()> {
+    if raw.is_empty() {
+        return Err(Error::InvalidConfig(
+            "tls.domains 含空条目，无法申请 ACME 域名证书".into(),
+        ));
+    }
+    if raw.trim() != raw {
+        return Err(Error::InvalidConfig(format!(
+            "tls.domains 条目 {raw:?} 不能包含首尾空白"
+        )));
+    }
+    if raw.contains('*') {
+        return Err(Error::InvalidConfig(format!(
+            "tls.domains 条目 {raw:?} 含通配符 `*`；v1 不支持通配符证书"
+        )));
+    }
+    if raw.parse::<IpAddr>().is_ok() {
+        return Err(Error::InvalidConfig(format!(
+            "tls.domains 条目 {raw:?} 是 IP；acme-domain 模式只接受 DNS 域名（IP 请用 acme-ip）"
+        )));
+    }
+    if raw.len() > 253 {
+        return Err(Error::InvalidConfig(format!(
+            "tls.domains 条目 {raw:?} 长度超过 253 字节"
+        )));
+    }
+    if raw.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(Error::InvalidConfig(format!(
+            "tls.domains 条目 {raw:?} 含空白或控制字符"
+        )));
+    }
+    if raw.starts_with('.') || raw.ends_with('.') || raw.contains("..") {
+        return Err(Error::InvalidConfig(format!(
+            "tls.domains 条目 {raw:?} 的 DNS 标签为空（首尾点或连续点）"
+        )));
+    }
+    for label in raw.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(Error::InvalidConfig(format!(
+                "tls.domains 条目 {raw:?} 的单个标签长度为 0 或超过 63 字节"
+            )));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(Error::InvalidConfig(format!(
+                "tls.domains 条目 {raw:?} 的标签不能以 '-' 开头或结尾"
+            )));
+        }
+        if !label
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        {
+            return Err(Error::InvalidConfig(format!(
+                "tls.domains 条目 {raw:?} 的标签只能包含字母、数字、'-'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `acme-ip` 的唯一标识：必须是 IPv4（明确拒绝 IPv6/空/域名）。
+fn validate_acme_ipv4(raw: &str) -> Result<()> {
+    if raw.trim() != raw {
+        return Err(Error::InvalidConfig(format!(
+            "tls.domains 条目 {raw:?} 不能包含首尾空白"
+        )));
+    }
+    match raw.parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) => Ok(()),
+        Ok(IpAddr::V6(_)) => Err(Error::InvalidConfig(format!(
+            "tls.domains 条目 {raw:?} 是 IPv6；acme-ip 模式只支持 IPv4"
+        ))),
+        Err(_) => Err(Error::InvalidConfig(format!(
+            "tls.domains 条目 {raw:?} 不是合法 IPv4 地址"
+        ))),
+    }
+}
+
+/// 配置中的文件路径：绝对路径、无控制字符、无首尾空白。
+///
+/// 只做配置层校验；文件是否存在、权限、符号链接由运行时（安装器/加载器）校验。
+fn validate_absolute_config_path(field: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::InvalidConfig(format!("{field} 不能为空")));
+    }
+    if value.trim() != value {
+        return Err(Error::InvalidConfig(format!("{field} 不能包含首尾空白")));
+    }
+    if value.chars().any(|ch| ch.is_control()) {
+        return Err(Error::InvalidConfig(format!(
+            "{field} 不能包含控制字符（如 NUL/换行）"
+        )));
+    }
+    if !Path::new(value).is_absolute() {
+        return Err(Error::InvalidConfig(format!(
+            "{field} 必须是绝对路径，实际 {value:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// agent 端配置。对应 `/etc/rustboard/agent.toml`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -15,8 +376,16 @@ pub struct AgentConfig {
     pub hub_url: String,
     /// 纳管时由 `rustboard-hub agent add` 生成的一次性 token。
     pub token: String,
-    /// hub 服务端证书的 SHA-256 指纹（hex）。自签模式下必须与安装命令一致。
+    /// hub 服务端证书的 SHA-256 指纹（hex）。`fingerprint` 模式下必须与安装命令一致。
     pub server_fingerprint: String,
+    /// 服务端信任模型；旧配置缺该字段时为 `fingerprint`。
+    #[serde(default)]
+    pub tls_mode: AgentTlsMode,
+    /// `custom-ca` 模式下服务端 CA 证书（PEM）的绝对路径。
+    ///
+    /// 安装器会把 `--server-ca` 复制到 `<data_dir>/server-ca.pem` 并写入该路径。
+    #[serde(default)]
+    pub server_ca: String,
     /// 展示名，留空则用 hostname。
     pub name: String,
     pub data_dir: PathBuf,
@@ -62,6 +431,8 @@ impl Default for AgentConfig {
             hub_url: format!("ws://127.0.0.1:{}/agent/ws", crate::DEFAULT_AGENT_PORT),
             token: String::new(),
             server_fingerprint: String::new(),
+            tls_mode: AgentTlsMode::Fingerprint,
+            server_ca: String::new(),
             name: String::new(),
             data_dir: PathBuf::from("/var/lib/rustboard/agent"),
             sample_interval_ms: 5_000,
@@ -104,10 +475,32 @@ impl AgentConfig {
         if self.sample_interval_ms < 1_000 {
             return Err(Error::InvalidConfig("采样间隔不能小于 1000ms".into()));
         }
-        if self.hub_url.starts_with("wss://") && self.server_fingerprint.trim().is_empty() {
-            return Err(Error::InvalidConfig(
-                "wss:// 连接必须配置 server_fingerprint（安装命令里会给出）".into(),
-            ));
+        if self.hub_url.starts_with("wss://") {
+            match self.tls_mode {
+                // 旧行为：wss + fingerprint 必须有指纹。
+                AgentTlsMode::Fingerprint => {
+                    if self.server_fingerprint.trim().is_empty() {
+                        return Err(Error::InvalidConfig(
+                            "wss:// 连接必须配置 server_fingerprint（安装命令里会给出）".into(),
+                        ));
+                    }
+                }
+                // 系统根由 rustls-native-certs 在运行时加载，配置层不要求任何字段。
+                AgentTlsMode::SystemRoots => {}
+                // custom-ca 必须显式给出服务端 CA，绝不静默回退到指纹。
+                AgentTlsMode::CustomCa => {
+                    if self.server_ca.trim().is_empty() {
+                        return Err(Error::InvalidConfig(
+                            "wss:// + custom-ca 必须配置 server_ca（CA 证书的绝对路径）".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        // server_ca 只要非空就必须是绝对路径，与 mode 无关：避免运行到一半才
+        // 发现路径拼错。空串表示未配置。
+        if !self.server_ca.trim().is_empty() {
+            validate_absolute_config_path("server_ca", &self.server_ca)?;
         }
         // 续签阈值至少 1 天：0 会让「剩余寿命 ≤ 阈值」在刚签发后就成立。
         if self.cert_renew_before_days < 1 {
@@ -1192,6 +1585,11 @@ pub struct HubConfig {
     /// M4 冷归档配置；旧配置缺 `[archive]` 时使用默认值（归档关闭）。
     #[serde(default)]
     pub archive: ArchiveConfig,
+    /// M5 Phase C：服务端证书来源与 ACME 参数。
+    ///
+    /// 旧配置没有 `[tls]` 时为 `mode = "self-signed"`，不需要新增任何字段。
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 /// agent 接入层默认的最大并发连接数。
@@ -1258,6 +1656,7 @@ impl Default for HubConfig {
             control: HubControlConfig::default(),
             alerts: HubAlertsConfig::default(),
             archive: ArchiveConfig::default(),
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -1269,6 +1668,17 @@ impl HubConfig {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         crate::error::save_toml(path, self)
+    }
+
+    /// 当前模式实际用于证书 SAN / 对外主机的名字列表。
+    ///
+    /// - `self-signed`：沿用 `server_names`（v0.4 行为）；
+    /// - ACME：使用 `tls.domains`（域名列表，或 `acme-ip` 的单个 IP 字符串）。
+    pub fn effective_server_names(&self) -> Vec<String> {
+        match self.tls.mode {
+            ServerTlsMode::SelfSigned => self.server_names.clone(),
+            ServerTlsMode::AcmeDomain | ServerTlsMode::AcmeIp => self.tls.domains.clone(),
+        }
     }
 
     /// 业务校验：`run` / `init` 入口都会调用。
@@ -1349,10 +1759,23 @@ impl HubConfig {
                 self.admin_auth_failure_limit_per_min
             )));
         }
-        // server_names 是服务端证书的 SAN 唯一来源：为空或含非法条目时，
-        // 启动/init 必须尽早失败（签发层还会再校验一次，这里给出配置级错误）。
-        crate::tls::parse_server_sans(&self.server_names)
-            .map_err(|err| Error::InvalidConfig(format!("server_names 非法: {err}")))?;
+        // 服务端证书来源必须在启动/init 前自洽：ACME 模式的 email/directory/
+        // domains/profile 非法时，不能等到签发阶段才失败。self-signed 不要求
+        // 任何 ACME 字段，保持旧配置行为。
+        self.tls.validate()?;
+        // SAN 的唯一起点随模式变化：self-signed 用 server_names（旧行为，空仍
+        // 报错）；ACME 用 tls.domains（已在 `TlsConfig::validate` 中校验，这里
+        // 再做一次证书编码层的兜底）。
+        match self.tls.mode {
+            ServerTlsMode::SelfSigned => {
+                crate::tls::parse_server_sans(&self.server_names)
+                    .map_err(|err| Error::InvalidConfig(format!("server_names 非法: {err}")))?;
+            }
+            ServerTlsMode::AcmeDomain | ServerTlsMode::AcmeIp => {
+                crate::tls::parse_server_sans(&self.tls.domains)
+                    .map_err(|err| Error::InvalidConfig(format!("tls.domains 非法: {err}")))?;
+            }
+        }
         self.validate_retention()?;
         self.validate_maintenance_interval()?;
         self.control.validate()?;
@@ -1468,6 +1891,15 @@ pub struct PanelConfig {
     /// 面板的对外访问源（例如 `https://panel.example.com`），用于 Origin 校验。
     #[serde(default)]
     pub public_origin: String,
+    /// 面板 HTTPS 证书（PEM）绝对路径；与 `tls_key` 必须同时配置。
+    ///
+    /// 本阶段只落地配置字段与成对校验；私钥权限、符号链接与证书/私钥配对
+    /// 由 C7 的运行时加载器校验。
+    #[serde(default)]
+    pub tls_cert: String,
+    /// 面板 HTTPS 私钥（PEM）绝对路径；与 `tls_cert` 必须同时配置。
+    #[serde(default)]
+    pub tls_key: String,
 }
 
 /// 面板会话 Cookie 的 `Secure` 策略。
@@ -1496,6 +1928,8 @@ impl Default for PanelConfig {
             trusted_proxies: Vec::new(),
             cookie_secure: CookieSecure::Auto,
             public_origin: String::new(),
+            tls_cert: String::new(),
+            tls_key: String::new(),
         }
     }
 }
@@ -1534,7 +1968,29 @@ impl PanelConfig {
         if !origin.is_empty() {
             validate_public_origin(origin)?;
         }
+        self.validate_tls_pair()?;
         Ok(())
+    }
+
+    /// `tls_cert` / `tls_key` 必须同时为空（HTTP）或同时非空（HTTPS）。
+    ///
+    /// 本阶段只做配置层校验：路径必须绝对、无控制字符/首尾空白；文件是否
+    /// 存在、私钥 0600、非符号链接、证书与私钥是否配对留到 C7 运行时。
+    fn validate_tls_pair(&self) -> Result<()> {
+        match (
+            self.tls_cert.trim().is_empty(),
+            self.tls_key.trim().is_empty(),
+        ) {
+            (true, true) => Ok(()),
+            (false, false) => {
+                validate_absolute_config_path("tls_cert", &self.tls_cert)?;
+                validate_absolute_config_path("tls_key", &self.tls_key)?;
+                Ok(())
+            }
+            _ => Err(Error::InvalidConfig(
+                "tls_cert 与 tls_key 必须成对配置：都为空使用 HTTP，都非空才启用面板 HTTPS".into(),
+            )),
+        }
     }
 }
 

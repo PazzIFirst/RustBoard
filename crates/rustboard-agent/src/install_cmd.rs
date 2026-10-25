@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
-use rustboard_common::config::AgentConfig;
+use rustboard_common::config::{AgentConfig, AgentTlsMode};
 use rustboard_common::tls;
 use rustboard_common::util::hostname;
 use rustboard_common::VERSION;
@@ -46,6 +46,38 @@ const AGENT_CERT: &str = "agent.crt";
 const AGENT_KEY: &str = "agent.key";
 const AGENT_SECRET: &str = "agent.secret";
 const AGENT_ID: &str = "agent_id";
+
+/// `custom-ca` 模式复制到 data_dir 的服务端 CA 文件名。
+const SERVER_CA_FILE: &str = "server-ca.pem";
+
+/// `--server-ca` 源文件大小上限（PEM 证书包）。
+const SERVER_CA_MAX_BYTES: usize = 1024 * 1024;
+
+/// `--tls-mode` 的 CLI 值。
+///
+/// 不复用 `rustboard_common::config::AgentTlsMode` 的 `ValueEnum` derive：
+/// common crate 不依赖 clap，保持配置层与 CLI 解析解耦；映射集中在
+/// [`From`] 中，新增模式时编译器会强制同步。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum AgentTlsModeArg {
+    /// 指纹钉扎（默认，保持 v0.4 行为）。
+    #[default]
+    Fingerprint,
+    /// 系统根证书 + 主机名校验（公共 ACME）。
+    SystemRoots,
+    /// 指定 CA + 主机名校验（私有 ACME / 自签）。
+    CustomCa,
+}
+
+impl From<AgentTlsModeArg> for AgentTlsMode {
+    fn from(value: AgentTlsModeArg) -> Self {
+        match value {
+            AgentTlsModeArg::Fingerprint => AgentTlsMode::Fingerprint,
+            AgentTlsModeArg::SystemRoots => AgentTlsMode::SystemRoots,
+            AgentTlsModeArg::CustomCa => AgentTlsMode::CustomCa,
+        }
+    }
+}
 
 /// token 文件大小上限；与计划里的 4 KiB 一致。
 const TOKEN_MAX_BYTES: usize = 4096;
@@ -99,9 +131,17 @@ pub struct InstallArgs {
     #[arg(long)]
     pub token_file: Option<PathBuf>,
     /// hub 服务端证书 SHA-256 指纹；支持 64 位 hex 或 `sha256:...`。
+    ///
+    /// `fingerprint` 模式新装必填；`custom-ca` 模式可选；`system-roots` 模式不需要。
     #[arg(long)]
     pub fingerprint: Option<String>,
-    /// Phase C 才支持 CA 信任；本阶段显式拒绝，不静默忽略。
+    /// 服务端信任模型；默认 `fingerprint`（旧 CLI 不传时行为不变）。
+    #[arg(long, value_enum)]
+    pub tls_mode: Option<AgentTlsModeArg>,
+    /// 服务端 CA 证书（PEM）；`custom-ca` 模式新装必填。
+    ///
+    /// 必须是 0600/0644 的普通文件、非符号链接、≤1 MiB；安装器会校验其中至少
+    /// 一张证书并复制到 `<data_dir>/server-ca.pem`（0644）。
     #[arg(long)]
     pub server_ca: Option<PathBuf>,
     /// 展示名，默认取本机 hostname。
@@ -154,12 +194,13 @@ enum InstallMode {
 
 /// 执行 `rustboard-agent install`。
 pub fn install(args: InstallArgs) -> Result<()> {
-    // Phase A 只做自签指纹钉扎；CA 信任/ACME 属于 Phase C，必须明确报错。
-    if let Some(path) = &args.server_ca {
-        bail!(
-            "--server-ca {} 属于 Phase C（CA 信任/ACME），Phase A 只支持 --fingerprint 指纹钉扎",
-            path.display()
-        );
+    // `--server-ca` 只对 custom-ca 有意义；显式选了别的模式时立刻拒绝，
+    // 避免把一个安全相关的参数静默忽略。--force 未传 --tls-mode 时模式来自
+    // 旧配置，留到合并后再判断。
+    if args.server_ca.is_some()
+        && matches!(args.tls_mode, Some(mode) if mode != AgentTlsModeArg::CustomCa)
+    {
+        bail!("--server-ca 只能与 --tls-mode custom-ca 一起使用");
     }
 
     let system = detect_system();
@@ -312,18 +353,22 @@ pub fn install(args: InstallArgs) -> Result<()> {
         return Ok(());
     }
 
+    let requested_tls_mode = args.tls_mode.map(AgentTlsMode::from);
     let mut cfg = match old_config {
         Some(cfg) if mode == InstallMode::ForceReuse => cfg,
         _ => AgentConfig::default(),
     };
     if mode == InstallMode::ForceReuse {
-        // --force 只应用显式 flags；未给的字段（尤其是 token）保持旧值，
-        // 避免把已完成 enrollment 的 agent 重写成空 token。
+        // --force 只应用显式 flags；未给的字段（尤其是 token / tls_mode）保持
+        // 旧值，避免把已完成 enrollment 的 agent 重写成空 token 或错误的信任模式。
         if let Some(hub) = args.hub.as_deref() {
             cfg.hub_url = hub.to_string();
         }
         if let Some(name) = args.name.as_deref() {
             cfg.name = name.to_string();
+        }
+        if let Some(tls_mode) = requested_tls_mode {
+            cfg.tls_mode = tls_mode;
         }
         if let Some(fingerprint) = args.fingerprint.as_deref() {
             cfg.server_fingerprint = normalize_fingerprint(fingerprint)?;
@@ -332,7 +377,17 @@ pub fn install(args: InstallArgs) -> Result<()> {
             cfg.token = read_token(token_file)?;
         }
         cfg.data_dir = paths.data_dir.clone();
+        // 模式可能来自旧配置；显式 --server-ca 与最终模式不符时必须拒绝，
+        // 不能静默忽略用户传入的 CA 文件。
+        if args.server_ca.is_some() && cfg.tls_mode != AgentTlsMode::CustomCa {
+            bail!(
+                "--server-ca 只能与 --tls-mode custom-ca 一起使用（当前配置模式为 {}）",
+                cfg.tls_mode.as_str()
+            );
+        }
     } else {
+        // 参数检查顺序与旧版一致：先 hub、再 token-file，最后指纹/CA 组合；
+        // 旧 CLI（不传 --tls-mode）的错误信息因此保持不变。
         let hub = args
             .hub
             .as_deref()
@@ -340,19 +395,40 @@ pub fn install(args: InstallArgs) -> Result<()> {
         let token_file = args.token_file.as_deref().ok_or_else(|| {
             anyhow!("新装必须指定 --token-file（token 只接受 0600 文件，禁止通过 argv 传递）")
         })?;
-        let fingerprint = args
-            .fingerprint
-            .as_deref()
-            .ok_or_else(|| anyhow!("新装必须指定 --fingerprint（hub 服务端证书 SHA-256 指纹）"))?;
+        let tls_mode = requested_tls_mode.unwrap_or_default();
+        validate_fresh_tls_args(
+            tls_mode,
+            args.fingerprint.as_deref(),
+            args.server_ca.as_deref(),
+        )?;
         cfg.hub_url = hub.to_string();
         cfg.token = read_token(token_file)?;
-        cfg.server_fingerprint = normalize_fingerprint(fingerprint)?;
+        cfg.tls_mode = tls_mode;
+        cfg.server_fingerprint = match args.fingerprint.as_deref() {
+            Some(fingerprint) => normalize_fingerprint(fingerprint)?,
+            None => String::new(),
+        };
         cfg.name = args.name.clone().unwrap_or_else(hostname);
         cfg.data_dir = paths.data_dir.clone();
     }
+
+    // `--server-ca` 在任何写盘之前读取、校验并复制到 data_dir/server-ca.pem；
+    // 配置里只写复制后的绝对路径，避免服务运行后源文件被移走/替换。
+    let server_ca_bytes = if let Some(source) = args.server_ca.as_deref() {
+        let bytes = read_server_ca(source)?;
+        let dest = paths.data_dir.join(SERVER_CA_FILE);
+        let dest_text = dest
+            .to_str()
+            .ok_or_else(|| anyhow!("data_dir 不是有效 UTF-8，无法写入 server_ca 配置"))?;
+        cfg.server_ca = dest_text.to_string();
+        Some(bytes)
+    } else {
+        None
+    };
+
     // KI-21：必须在写任何文件之前完成校验；失败时磁盘上不能留下半个安装。
     cfg.validate()
-        .context("agent 配置校验失败（检查 --hub / --data-dir / --fingerprint）")?;
+        .context("agent 配置校验失败（检查 --hub / --data-dir / --fingerprint / --server-ca）")?;
     validate_fingerprint(&cfg)?;
 
     // M1/L5：任何落盘（含 dry-run 计划）之前统一校验 config/data/unit/binary
@@ -384,6 +460,9 @@ pub fn install(args: InstallArgs) -> Result<()> {
         let mut txn = InstallTxn::begin(&paths, true)?;
         txn.create_owned_dir(&paths.data_dir, 0o700)?;
         txn.write(&paths.config, config_bytes.as_bytes(), 0o600)?;
+        if let Some(bytes) = &server_ca_bytes {
+            txn.write(&paths.data_dir.join(SERVER_CA_FILE), bytes, 0o644)?;
+        }
         // M3：落盘前再复核一次 unit 归属，缩小“preflight 通过后 unit 被替换”
         // 的时间窗口；外来 unit 仍然拒绝覆盖。
         if write_unit {
@@ -416,6 +495,11 @@ pub fn install(args: InstallArgs) -> Result<()> {
         // 失败回滚会连同 enrollment 产生的证书一起删除（create_owned_dir）。
         txn.create_owned_dir(&paths.data_dir, 0o700)?;
         txn.write(&paths.config, config_bytes.as_bytes(), 0o600)?;
+        if let Some(bytes) = &server_ca_bytes {
+            // 与配置同事务写入；失败时 rollback 恢复旧文件/删除新建目录，
+            // 不会留下半个 server-ca.pem。
+            txn.write(&paths.data_dir.join(SERVER_CA_FILE), bytes, 0o644)?;
+        }
         // M3：落盘前再复核一次 unit 归属，缩小“preflight 通过后 unit 被替换”
         // 的时间窗口；外来 unit 仍然拒绝覆盖。
         if write_unit {
@@ -1168,6 +1252,107 @@ fn read_token(path: &Path) -> Result<String> {
     Ok(token.to_string())
 }
 
+/// 新装时校验 `--tls-mode` 与 `--fingerprint` / `--server-ca` 的组合。
+///
+/// 抽成纯函数便于单测；`--force` 复用旧配置时模式可能来自旧配置，因此不能
+/// 直接复用这个函数（见 `install` 内的合并后校验）。
+fn validate_fresh_tls_args(
+    mode: AgentTlsMode,
+    fingerprint: Option<&str>,
+    server_ca: Option<&Path>,
+) -> Result<()> {
+    match mode {
+        AgentTlsMode::Fingerprint => {
+            if fingerprint.is_none() {
+                bail!("新装必须指定 --fingerprint（hub 服务端证书 SHA-256 指纹）");
+            }
+            if server_ca.is_some() {
+                bail!("fingerprint 模式不使用 --server-ca；私有 CA 请改用 --tls-mode custom-ca");
+            }
+        }
+        AgentTlsMode::SystemRoots => {
+            if server_ca.is_some() {
+                bail!("system-roots 模式不使用 --server-ca；公共 ACME 证书由系统根校验");
+            }
+        }
+        AgentTlsMode::CustomCa => {
+            if server_ca.is_none() {
+                bail!("custom-ca 模式新装必须指定 --server-ca（服务端 CA 证书的 PEM 路径）");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 读取并校验 `--server-ca`：
+///
+/// - 0600/0644 的普通文件、非符号链接、≤1 MiB（防止误把目录/私钥/大文件读进内存）；
+/// - UTF-8 PEM，至少一张可解析证书（可包含多张，作为多根 bundle 复制）。
+///
+/// 错误信息只包含路径与原因，不打印证书内容。返回原始字节供事务原样复制。
+fn read_server_ca(path: &Path) -> Result<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("读取 --server-ca {} 失败", path.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!("--server-ca {} 是符号链接，拒绝读取", path.display());
+    }
+    if !meta.is_file() {
+        bail!("--server-ca {} 不是普通文件，拒绝读取", path.display());
+    }
+    if meta.len() > SERVER_CA_MAX_BYTES as u64 {
+        bail!(
+            "--server-ca {} 超过 {} 字节上限，拒绝读取",
+            path.display(),
+            SERVER_CA_MAX_BYTES
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o600 && mode != 0o644 {
+            bail!(
+                "--server-ca {} 权限必须是 0600 或 0644，实际 {mode:04o}",
+                path.display()
+            );
+        }
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("打开 --server-ca {} 失败", path.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("读取 --server-ca {} 元数据失败", path.display()))?;
+    if !opened.is_file() {
+        bail!("--server-ca {} 不是普通文件，拒绝读取", path.display());
+    }
+
+    let mut bytes = Vec::new();
+    file.take(SERVER_CA_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("读取 --server-ca {} 失败", path.display()))?;
+    if bytes.len() > SERVER_CA_MAX_BYTES {
+        bail!(
+            "--server-ca {} 超过 {} 字节上限，拒绝读取",
+            path.display(),
+            SERVER_CA_MAX_BYTES
+        );
+    }
+    let pem = std::str::from_utf8(&bytes)
+        .map_err(|_| anyhow!("--server-ca {} 不是有效 UTF-8 PEM", path.display()))?;
+    tls::load_certs(pem)
+        .with_context(|| format!("--server-ca {} 不是合法 PEM 证书", path.display()))?;
+    Ok(bytes)
+}
+
 /// 校验并归一化指纹为 64 位小写 hex。
 fn normalize_fingerprint(raw: &str) -> Result<String> {
     let digest = tls::parse_fingerprint(raw)
@@ -1179,9 +1364,12 @@ fn normalize_fingerprint(raw: &str) -> Result<String> {
     Ok(normalized)
 }
 
-/// `wss://` 连接必须有可解析的指纹；`ws://` 允许留空（与 AgentConfig 语义一致）。
+/// 指纹模式（旧行为）下 `wss://` 必须能解析出指纹；其他模式下指纹可选，
+/// 但一旦提供也必须合法（避免把拼错的旧指纹静默带进新配置）。
 fn validate_fingerprint(cfg: &AgentConfig) -> Result<()> {
-    if cfg.hub_url.starts_with("wss://") {
+    if cfg.hub_url.starts_with("wss://")
+        && (cfg.tls_mode == AgentTlsMode::Fingerprint || !cfg.server_fingerprint.trim().is_empty())
+    {
         tls::parse_fingerprint(&cfg.server_fingerprint)
             .map_err(|err| anyhow!("server_fingerprint 不是合法 SHA-256 指纹: {err}"))?;
     }
@@ -1690,6 +1878,7 @@ mod tests {
             hub: Some("wss://127.0.0.1:8443/agent/ws".to_string()),
             token_file: None,
             fingerprint: None,
+            tls_mode: None,
             server_ca: None,
             name: None,
             systemd: false,
@@ -1697,20 +1886,275 @@ mod tests {
         }
     }
 
-    /// 安全：`--server-ca` 必须明确报 Phase C，且在任何写盘之前失败。
+    /// 生成一张真实的自签 CA（只用于安装器参数/文件校验测试）。
+    fn sample_ca_pem(dir: &Path) -> String {
+        let hub_dir = dir.join("sample-hub");
+        tls::ensure_hub_material(
+            &hub_dir,
+            &["localhost".to_string()],
+            tls::CertPolicy::default(),
+        )
+        .expect("生成测试 CA 失败");
+        std::fs::read_to_string(tls::cert_dir(&hub_dir).join(tls::CA_CERT_FILE)).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn write_mode(path: &Path, bytes: &[u8], mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// C2：新装的 `--tls-mode` / `--fingerprint` / `--server-ca` 组合校验
+    /// （纯函数，不读写磁盘），旧 CLI 不传 --tls-mode 时仍是 fingerprint。
     #[test]
-    fn server_ca_is_rejected_as_phase_c_without_writes() {
-        let _serial = serialize_install_tests();
-        let dir = temp_dir("server-ca");
-        let mut args = base_install_args(dir.clone());
-        args.server_ca = Some(PathBuf::from("/tmp/ca.pem"));
-        let err = install(args).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("Phase C"),
-            "错误必须点名 Phase C: {err:#}"
+    fn c2_validate_fresh_tls_args_combinations() {
+        let fingerprint = "ab".repeat(32);
+        let ca = Path::new("/etc/rustboard/server-ca.pem");
+
+        validate_fresh_tls_args(AgentTlsMode::Fingerprint, Some(&fingerprint), None)
+            .expect("fingerprint + 指纹必须合法");
+        validate_fresh_tls_args(AgentTlsMode::SystemRoots, None, None)
+            .expect("system-roots 不需要指纹/CA");
+        validate_fresh_tls_args(AgentTlsMode::SystemRoots, Some(&fingerprint), None)
+            .expect("system-roots 携带旧指纹也应允许");
+        validate_fresh_tls_args(AgentTlsMode::CustomCa, None, Some(ca))
+            .expect("custom-ca + CA 必须合法");
+        validate_fresh_tls_args(AgentTlsMode::CustomCa, Some(&fingerprint), Some(ca))
+            .expect("custom-ca 允许可选指纹");
+
+        for (mode, fingerprint, server_ca, needle) in [
+            (AgentTlsMode::Fingerprint, None, None, "--fingerprint"),
+            (
+                AgentTlsMode::Fingerprint,
+                Some(fingerprint.as_str()),
+                Some(ca),
+                "--server-ca",
+            ),
+            (AgentTlsMode::SystemRoots, None, Some(ca), "--server-ca"),
+            (AgentTlsMode::CustomCa, None, None, "--server-ca"),
+        ] {
+            let err = validate_fresh_tls_args(mode, fingerprint, server_ca)
+                .expect_err("非法组合必须被拒绝")
+                .to_string();
+            assert!(err.contains(needle), "错误必须包含 {needle}: {err}");
+        }
+
+        // clap ValueEnum：名称是 kebab-case；不传 --tls-mode 时保持 None（旧 CLI）。
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: InstallArgs,
+        }
+        use clap::Parser as _;
+
+        let cli = Cli::try_parse_from(["test", "--tls-mode", "system-roots"]).unwrap();
+        assert_eq!(cli.args.tls_mode, Some(AgentTlsModeArg::SystemRoots));
+        assert_eq!(cli.args.server_ca, None);
+
+        let cli = Cli::try_parse_from([
+            "test",
+            "--tls-mode",
+            "custom-ca",
+            "--server-ca",
+            "/etc/rustboard/server-ca.pem",
+        ])
+        .unwrap();
+        assert_eq!(cli.args.tls_mode, Some(AgentTlsModeArg::CustomCa));
+        assert_eq!(
+            cli.args.server_ca.as_deref(),
+            Some(Path::new("/etc/rustboard/server-ca.pem"))
         );
-        assert!(!dir.join("etc").exists(), "失败前不能写配置");
-        assert!(!dir.join("var").exists(), "失败前不能建数据目录");
+
+        assert!(
+            Cli::try_parse_from(["test", "--tls-mode", "bogus"]).is_err(),
+            "未知 --tls-mode 必须解析失败"
+        );
+        assert_eq!(
+            Cli::try_parse_from(["test"]).unwrap().args.tls_mode,
+            None,
+            "旧 CLI 不传 --tls-mode 时不能有隐式值"
+        );
+    }
+
+    /// C2：`--server-ca` 只接受 0600/0644 普通文件、非符号链接、≤1 MiB，
+    /// 且 PEM 至少有一张可解析证书；错误不打印证书内容。
+    #[cfg(unix)]
+    #[test]
+    fn c2_read_server_ca_validates_mode_size_and_pem() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("server-ca-read");
+        let ca_pem = sample_ca_pem(&dir);
+        let good = dir.join("ca.pem");
+        write_mode(&good, ca_pem.as_bytes(), 0o600);
+        assert_eq!(read_server_ca(&good).unwrap(), ca_pem.as_bytes());
+
+        write_mode(&good, ca_pem.as_bytes(), 0o644);
+        assert_eq!(read_server_ca(&good).unwrap(), ca_pem.as_bytes());
+
+        // 多张证书的 bundle 合法。
+        let bundle = format!("{ca_pem}{ca_pem}");
+        let bundle_path = dir.join("bundle.pem");
+        write_mode(&bundle_path, bundle.as_bytes(), 0o644);
+        assert_eq!(read_server_ca(&bundle_path).unwrap(), bundle.as_bytes());
+
+        // 0640/0664 等非 0600/0644 权限拒绝。
+        for mode in [0o640, 0o664] {
+            std::fs::set_permissions(&good, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = read_server_ca(&good).unwrap_err().to_string();
+            assert!(
+                err.contains("0600") && err.contains("0644"),
+                "权限错误必须说明允许值: {err}"
+            );
+        }
+
+        // 符号链接、目录、超限、空文件、非法 PEM 全部拒绝。
+        let link = dir.join("ca-link.pem");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        assert!(
+            read_server_ca(&link)
+                .unwrap_err()
+                .to_string()
+                .contains("符号链接"),
+            "符号链接必须拒绝"
+        );
+        assert!(
+            read_server_ca(&dir)
+                .unwrap_err()
+                .to_string()
+                .contains("普通文件"),
+            "目录必须拒绝"
+        );
+
+        let big = dir.join("big.pem");
+        write_mode(&big, &vec![b'A'; SERVER_CA_MAX_BYTES + 1], 0o644);
+        assert!(
+            read_server_ca(&big)
+                .unwrap_err()
+                .to_string()
+                .contains("上限"),
+            "超限文件必须拒绝"
+        );
+        let empty = dir.join("empty.pem");
+        write_mode(&empty, b"", 0o644);
+        assert!(
+            read_server_ca(&empty)
+                .unwrap_err()
+                .to_string()
+                .contains("PEM"),
+            "空文件必须拒绝"
+        );
+        let bad = dir.join("bad.pem");
+        write_mode(&bad, b"not a certificate", 0o644);
+        let err = read_server_ca(&bad).unwrap_err().to_string();
+        assert!(err.contains("不是合法 PEM 证书"), "{err}");
+        assert!(
+            !err.contains("not a certificate"),
+            "错误不能回显内容: {err}"
+        );
+        // 非 UTF-8 同样拒绝，且不回显内容。
+        let binary = dir.join("binary.pem");
+        write_mode(&binary, &[0xff, 0xfe, 0x00], 0o644);
+        assert!(read_server_ca(&binary)
+            .unwrap_err()
+            .to_string()
+            .contains("UTF-8"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C2：custom-ca 新装把服务端 CA 复制到 data_dir/server-ca.pem（0644），
+    /// 配置写复制后的绝对路径；旧 CLI（不传 --tls-mode）仍写 fingerprint。
+    #[cfg(unix)]
+    #[test]
+    fn c2_custom_ca_install_copies_pem_and_writes_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _serial = serialize_install_tests();
+        if !running_as_root() {
+            eprintln!("跳过 c2_custom_ca_install_copies_pem_and_writes_mode：prefix 校验需要 root");
+            return;
+        }
+        let dir = temp_dir("custom-ca-install");
+        let token_file = dir.join("enroll-token");
+        write_private(&token_file, b"0123456789abcdef");
+        let ca_pem = sample_ca_pem(&dir);
+        let ca_source = dir.join("source-ca.pem");
+        write_mode(&ca_source, ca_pem.as_bytes(), 0o644);
+
+        let paths = Paths::for_role(Role::Agent, &dir, PathOverrides::default()).unwrap();
+        let mut args = base_install_args(dir.clone());
+        args.dry_run = false;
+        args.token_file = Some(token_file);
+        args.tls_mode = Some(AgentTlsModeArg::CustomCa);
+        args.server_ca = Some(ca_source);
+        install(args).expect("custom-ca 安装必须成功");
+
+        let cfg = AgentConfig::load(&paths.config).unwrap();
+        assert_eq!(cfg.tls_mode, AgentTlsMode::CustomCa);
+        let expected = paths.data_dir.join(SERVER_CA_FILE);
+        assert_eq!(cfg.server_ca, expected.to_string_lossy());
+        assert_eq!(std::fs::read(&expected).unwrap(), ca_pem.as_bytes());
+        assert_eq!(
+            std::fs::metadata(&expected).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "复制后的 CA 必须是 0644"
+        );
+
+        // 旧 CLI 不传 --tls-mode：仍是 fingerprint，不产生 server-ca.pem。
+        let dir2 = temp_dir("legacy-install");
+        let token2 = dir2.join("enroll-token");
+        write_private(&token2, b"fedcba9876543210");
+        let paths2 = Paths::for_role(Role::Agent, &dir2, PathOverrides::default()).unwrap();
+        let mut args = base_install_args(dir2.clone());
+        args.dry_run = false;
+        args.token_file = Some(token2);
+        args.fingerprint = Some("ab".repeat(32));
+        install(args).expect("旧 CLI 安装必须成功");
+        let cfg = AgentConfig::load(&paths2.config).unwrap();
+        assert_eq!(cfg.tls_mode, AgentTlsMode::Fingerprint);
+        assert!(cfg.server_ca.is_empty());
+        assert!(!paths2.data_dir.join(SERVER_CA_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// C2：事务中途失败不得留下半个 server-ca.pem 或配置。
+    #[cfg(unix)]
+    #[test]
+    fn c2_custom_ca_install_failure_rolls_back_pem() {
+        let _serial = serialize_install_tests();
+        if !running_as_root() {
+            eprintln!("跳过 c2_custom_ca_install_failure_rolls_back_pem：prefix 校验需要 root");
+            return;
+        }
+        let dir = temp_dir("custom-ca-rollback");
+        let token_file = dir.join("enroll-token");
+        write_private(&token_file, b"0123456789abcdef");
+        let ca_pem = sample_ca_pem(&dir);
+        let ca_source = dir.join("source-ca.pem");
+        write_mode(&ca_source, ca_pem.as_bytes(), 0o644);
+
+        let paths = Paths::for_role(Role::Agent, &dir, PathOverrides::default()).unwrap();
+        // 在二进制目标位置放一个目录，让事务在写完 config/server-ca 后的
+        // copy_file 阶段失败，验证回滚不留下半个 CA。
+        std::fs::create_dir_all(&paths.binary).unwrap();
+
+        let mut args = base_install_args(dir.clone());
+        args.dry_run = false;
+        args.token_file = Some(token_file);
+        args.tls_mode = Some(AgentTlsModeArg::CustomCa);
+        args.server_ca = Some(ca_source);
+        let err = install(args).expect_err("写入二进制失败时必须回滚");
+        assert!(format!("{err:#}").contains("安装失败"), "{err:#}");
+
+        assert!(
+            !paths.data_dir.join(SERVER_CA_FILE).exists(),
+            "失败后不得留下半个 server-ca.pem"
+        );
+        assert!(!paths.config.exists(), "失败后不得留下配置");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

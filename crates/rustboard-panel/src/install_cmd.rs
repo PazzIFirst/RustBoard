@@ -1384,6 +1384,8 @@ fn render_panel_config(cfg: &PanelConfig) -> String {
         trusted_proxies,
         cookie_secure,
         public_origin,
+        tls_cert,
+        tls_key,
     } = cfg;
 
     let mut out = String::new();
@@ -1408,6 +1410,9 @@ fn render_panel_config(cfg: &PanelConfig) -> String {
         cookie_secure_name(*cookie_secure),
     );
     push_toml_string(&mut out, "public_origin", public_origin);
+    // C2 先加字段；C7 才让 panel install 接收 --tls-cert/--tls-key。
+    push_toml_string(&mut out, "tls_cert", tls_cert);
+    push_toml_string(&mut out, "tls_key", tls_key);
     out
 }
 
@@ -2145,6 +2150,8 @@ mod tests {
             trusted_proxies: vec!["10.0.0.0/8".to_string(), "127.0.0.1".to_string()],
             cookie_secure: CookieSecure::Always,
             public_origin: "https://panel.example.com".to_string(),
+            tls_cert: String::new(),
+            tls_key: String::new(),
         };
         fs::write(&path, render_panel_config(&cfg)).unwrap();
         let loaded = PanelConfig::load(&path).expect("渲染结果必须是合法 PanelConfig");

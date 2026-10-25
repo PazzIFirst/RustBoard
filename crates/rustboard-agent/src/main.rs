@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use rustboard_common::config::AgentConfig;
+use rustboard_common::config::{AgentConfig, AgentTlsMode};
 use rustboard_common::control::{codes as control_codes, ControlError, ControlResponse};
 use rustboard_common::fsutil;
 use rustboard_common::model::{Sample, SampleBatch};
@@ -239,6 +239,12 @@ enum Cmd {
         /// hub 服务端证书的 SHA-256 指纹，由 `rustboard-hub init` 输出。
         #[arg(long)]
         fingerprint: Option<String>,
+        /// 服务端信任模型；默认 fingerprint（与 `install` 一致）。
+        #[arg(long, value_enum)]
+        tls_mode: Option<install_cmd::AgentTlsModeArg>,
+        /// `custom-ca` 模式的服务端 CA 证书（PEM 绝对路径）。
+        #[arg(long)]
+        server_ca: Option<PathBuf>,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
@@ -279,12 +285,24 @@ fn main() -> Result<()> {
             hub,
             token,
             fingerprint,
+            tls_mode,
+            server_ca,
             name,
             data_dir,
             force,
         } => {
             let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_CONFIG));
-            init_agent(&path, hub, token, fingerprint, name, data_dir, force)
+            init_agent(
+                &path,
+                hub,
+                token,
+                fingerprint,
+                name,
+                data_dir,
+                force,
+                tls_mode,
+                server_ca,
+            )
         }
         Cmd::Run { config } => {
             let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_CONFIG));
@@ -310,6 +328,7 @@ fn main() -> Result<()> {
 /// 否则 `agent init --data-dir /etc` 会留下一个启动时才失败的配置；更糟的是
 /// 后续 `run` 会按旧版本行为尝试把共享目录 chmod 成 0700。校验失败时磁盘上
 /// 不能出现半个配置文件。
+#[allow(clippy::too_many_arguments)]
 fn init_agent(
     path: &Path,
     hub: Option<String>,
@@ -318,6 +337,8 @@ fn init_agent(
     name: Option<String>,
     data_dir: Option<PathBuf>,
     force: bool,
+    tls_mode: Option<install_cmd::AgentTlsModeArg>,
+    server_ca: Option<PathBuf>,
 ) -> Result<()> {
     if path.exists() && !force {
         bail!("{} 已存在，使用 --force 覆盖", path.display());
@@ -331,6 +352,15 @@ fn init_agent(
     }
     if let Some(f) = fingerprint {
         cfg.server_fingerprint = f;
+    }
+    if let Some(mode) = tls_mode {
+        cfg.tls_mode = mode.into();
+    }
+    if let Some(ca) = server_ca {
+        cfg.server_ca = ca
+            .to_str()
+            .ok_or_else(|| anyhow!("--server-ca 不是有效 UTF-8 路径: {}", ca.display()))?
+            .to_string();
     }
     if let Some(n) = name {
         cfg.name = n;
@@ -621,49 +651,122 @@ fn is_enrolled(cfg: &AgentConfig) -> bool {
         && cfg.data_dir.join(AGENT_SECRET).exists()
 }
 
-async fn connect(cfg: &AgentConfig, with_client_cert: bool) -> Result<WsStream> {
-    let connector = if cfg.hub_url.starts_with("wss://") {
-        let config = if with_client_cert {
-            // M3：老的 agent.key 可能是 0644，读取前先收紧到 0600。
-            let key_path = cfg.data_dir.join(AGENT_KEY);
-            fsutil::harden(&key_path, 0o600)
-                .with_context(|| format!("收紧私钥权限失败: {}", key_path.display()))?;
-            let cert_pem = std::fs::read_to_string(cfg.data_dir.join(AGENT_CERT))
-                .context("读取客户端证书失败，可能需要重新纳管")?;
-            let key_pem = std::fs::read_to_string(&key_path)
-                .context("读取客户端私钥失败，可能需要重新纳管")?;
+/// 读取已纳管 agent 的客户端证书与私钥。
+///
+/// 旧的 agent.key 可能是 0644，读取前先收紧到 0600（M3 行为）；错误信息只包含
+/// 路径，不打印私钥内容。
+fn load_client_identity(cfg: &AgentConfig) -> Result<(String, String)> {
+    let key_path = cfg.data_dir.join(AGENT_KEY);
+    fsutil::harden(&key_path, 0o600)
+        .with_context(|| format!("收紧私钥权限失败: {}", key_path.display()))?;
+    let cert_pem = std::fs::read_to_string(cfg.data_dir.join(AGENT_CERT))
+        .context("读取客户端证书失败，可能需要重新纳管")?;
+    let key_pem =
+        std::fs::read_to_string(&key_path).context("读取客户端私钥失败，可能需要重新纳管")?;
+    Ok((cert_pem, key_pem))
+}
 
-            // A4：已纳管连接改用「CA 信任 + 主机名校验」，服务端证书轮换后无需重新纳管。
-            //
-            // 降级策略：只有「读不到 ca.crt」才回退指纹钉扎（兼容 v0.1 安装）；
-            // ca.crt 存在但内容非法时 client_config_ca 会返回错误并向上抛，
-            // 不允许静默降级到钉扎——那会把一个明确的配置错误变成安全隐患。
-            let ca_path = cfg.data_dir.join(AGENT_CA);
-            match std::fs::read_to_string(&ca_path) {
-                Ok(ca_pem) => tls::client_config_ca(&ca_pem, &cert_pem, &key_pem)?,
-                Err(err) => {
-                    // 兼容没有 ca.crt 的 v0.1 安装：退回指纹钉扎，但必须告警，
-                    // 因为一旦 hub 轮换服务端证书，这条连接就会失效。
-                    tracing::warn!(
-                        path = %ca_path.display(),
-                        error = %err,
-                        "读取 CA 证书失败，回退服务端证书指纹钉扎（hub 轮换证书后将无法连接）"
-                    );
-                    tls::client_config_pinned(
-                        &cfg.server_fingerprint,
-                        Some(&cert_pem),
-                        Some(&key_pem),
-                    )?
+/// 读取 `custom-ca` 模式的服务端 CA PEM。
+///
+/// 空路径、相对路径、读不到或没有至少一张证书都直接报错；**绝不回退**到指纹
+/// 钉扎或系统根，避免把配置错误静默变成另一种（可能不受信任的）信任模型。
+fn load_server_ca(cfg: &AgentConfig) -> Result<String> {
+    let raw = cfg.server_ca.trim();
+    if raw.is_empty() {
+        bail!("custom-ca 模式必须配置 server_ca（服务端 CA 证书的 PEM 绝对路径）");
+    }
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        bail!("server_ca 必须是绝对路径: {}", path.display());
+    }
+    let pem = std::fs::read_to_string(path)
+        .with_context(|| format!("读取 server_ca 失败: {}", path.display()))?;
+    tls::load_certs(&pem)
+        .with_context(|| format!("server_ca 不是合法 PEM 证书: {}", path.display()))?;
+    Ok(pem)
+}
+
+/// 按 `tls_mode` 为 `wss://` 构建 TLS connector；`ws://` 不需要 TLS，返回 None。
+///
+/// - `fingerprint`：保持 v0.4 行为。bootstrap 用指纹；已纳管优先
+///   `agent_data/ca.crt` + `client_config_ca`（A4 兼容），ca.crt 读取失败才回退
+///   指纹并告警。
+/// - `system-roots`：系统根 + URL 主机名校验；bootstrap 不带客户端证书，
+///   已纳管带 agent.crt/key。**不读取** `agent_data/ca.crt` 作为服务端根。
+/// - `custom-ca`：`server_ca` 指定 CA + 主机名校验；bootstrap 不带客户端证书，
+///   已纳管带 agent.crt/key。CA 为空/不可读/非法直接报错。
+///
+/// `agent_data/ca.crt` 在续签路径中仍只用于校验客户端证书的签发者，不参与这里
+/// 对服务端信任根的选择。
+fn tls_connector(
+    cfg: &AgentConfig,
+    with_client_cert: bool,
+) -> Result<Option<tokio_tungstenite::Connector>> {
+    if !cfg.hub_url.starts_with("wss://") {
+        return Ok(None);
+    }
+    tracing::debug!(
+        mode = cfg.tls_mode.as_str(),
+        with_client_cert,
+        "构建 TLS 客户端配置"
+    );
+
+    let config = match cfg.tls_mode {
+        AgentTlsMode::Fingerprint => {
+            if with_client_cert {
+                let (cert_pem, key_pem) = load_client_identity(cfg)?;
+                // A4：已纳管连接改用「CA 信任 + 主机名校验」，服务端证书轮换后
+                // 无需重新纳管。
+                //
+                // 降级策略：只有「读不到 ca.crt」才回退指纹钉扎（兼容 v0.1 安装）；
+                // ca.crt 存在但内容非法时 client_config_ca 会返回错误并向上抛，
+                // 不允许静默降级到钉扎——那会把一个明确的配置错误变成安全隐患。
+                let ca_path = cfg.data_dir.join(AGENT_CA);
+                match std::fs::read_to_string(&ca_path) {
+                    Ok(ca_pem) => tls::client_config_ca(&ca_pem, &cert_pem, &key_pem)?,
+                    Err(err) => {
+                        // 兼容没有 ca.crt 的 v0.1 安装：退回指纹钉扎，但必须告警，
+                        // 因为一旦 hub 轮换服务端证书，这条连接就会失效。
+                        tracing::warn!(
+                            path = %ca_path.display(),
+                            error = %err,
+                            "读取 CA 证书失败，回退服务端证书指纹钉扎（hub 轮换证书后将无法连接）"
+                        );
+                        tls::client_config_pinned(
+                            &cfg.server_fingerprint,
+                            Some(&cert_pem),
+                            Some(&key_pem),
+                        )?
+                    }
                 }
+            } else {
+                // bootstrap：还没有客户端证书，只能用安装命令带外分发的指纹。
+                tls::client_config_pinned(&cfg.server_fingerprint, None, None)?
             }
-        } else {
-            // bootstrap：还没有客户端证书，只能用安装命令带外分发的指纹。
-            tls::client_config_pinned(&cfg.server_fingerprint, None, None)?
-        };
-        Some(tokio_tungstenite::Connector::Rustls(config))
-    } else {
-        None
+        }
+        AgentTlsMode::SystemRoots => {
+            if with_client_cert {
+                let (cert_pem, key_pem) = load_client_identity(cfg)?;
+                tls::client_config_system_roots(Some(&cert_pem), Some(&key_pem))?
+            } else {
+                tls::client_config_bootstrap_system_roots()?
+            }
+        }
+        AgentTlsMode::CustomCa => {
+            let ca_pem = load_server_ca(cfg)?;
+            if with_client_cert {
+                let (cert_pem, key_pem) = load_client_identity(cfg)?;
+                tls::client_config_custom_ca(&ca_pem, Some(&cert_pem), Some(&key_pem))?
+            } else {
+                tls::client_config_bootstrap_custom_ca(&ca_pem)?
+            }
+        }
     };
+    Ok(Some(tokio_tungstenite::Connector::Rustls(config)))
+}
+
+async fn connect(cfg: &AgentConfig, with_client_cert: bool) -> Result<WsStream> {
+    let connector = tls_connector(cfg, with_client_cert)?;
 
     let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
         cfg.hub_url.as_str(),
@@ -1568,6 +1671,8 @@ mod tests {
             None,
             Some(PathBuf::from("/etc")),
             false,
+            None,
+            None,
         )
         .unwrap_err();
         let chain = format!("{err:#}");
@@ -1595,12 +1700,61 @@ mod tests {
             None,
             Some(data_dir.clone()),
             false,
+            None,
+            None,
         )
         .unwrap();
 
         assert!(path.exists(), "合法配置必须落盘");
         let cfg = AgentConfig::load(&path).unwrap();
         assert_eq!(cfg.data_dir, data_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C2：`agent init` 也接受 hub `agent add` 在 ACME 模式下输出的
+    /// `--tls-mode` / `--server-ca`，且旧 CLI（不传）仍是 fingerprint。
+    #[cfg(unix)]
+    #[test]
+    fn c2_agent_init_accepts_tls_mode_and_server_ca() {
+        let dir = temp_dir("init-tls");
+        let data_dir = dir.join("data");
+        let path = dir.join("agent.toml");
+        init_agent(
+            &path,
+            Some("wss://hub.example.com:8443/agent/ws".to_string()),
+            Some("enroll-token".to_string()),
+            None,
+            Some("web-01".to_string()),
+            Some(data_dir),
+            false,
+            Some(install_cmd::AgentTlsModeArg::CustomCa),
+            Some(PathBuf::from("/etc/rustboard/server-ca.pem")),
+        )
+        .unwrap();
+        let cfg = AgentConfig::load(&path).unwrap();
+        assert_eq!(cfg.tls_mode, AgentTlsMode::CustomCa);
+        assert_eq!(cfg.server_ca, "/etc/rustboard/server-ca.pem");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 旧 CLI：不传 --tls-mode/--server-ca 仍是 fingerprint + 空 CA。
+        let dir = temp_dir("init-legacy-tls");
+        let data_dir = dir.join("data");
+        let path = dir.join("agent.toml");
+        init_agent(
+            &path,
+            Some("ws://127.0.0.1:1/agent/ws".to_string()),
+            None,
+            None,
+            None,
+            Some(data_dir),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let cfg = AgentConfig::load(&path).unwrap();
+        assert_eq!(cfg.tls_mode, AgentTlsMode::Fingerprint);
+        assert!(cfg.server_ca.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2407,6 +2561,103 @@ mod tests {
             IncomingFrame::Bad { control_id: None } => {}
             _ => panic!("坏帧应被分类为 Bad 且不携带 control id"),
         }
+    }
+
+    /// C2：`tls_connector` 按 `tls_mode` 选择信任源；custom-ca 的 CA 缺失/非法
+    /// 必须直接报错，绝不回退到指纹。
+    #[test]
+    fn c2_tls_connector_selects_trust_source_by_mode() {
+        let dir = temp_dir("tls-connector-mode");
+        let mut cfg = enrolled_config(&dir, 90);
+        cfg.hub_url = "wss://localhost:8443/agent/ws".to_string();
+        let hub_dir = dir.join("hub");
+        let ca_path = dir.join(AGENT_CA);
+        let ca_pem = std::fs::read_to_string(&ca_path).unwrap();
+        let server_pem =
+            std::fs::read_to_string(tls::cert_dir(&hub_dir).join(tls::SERVER_CERT_FILE)).unwrap();
+        let fingerprint = tls::fingerprint_of_pem(&server_pem).unwrap();
+
+        // fingerprint：bootstrap 与已纳管都必须能构建（已纳管优先 ca.crt）。
+        cfg.tls_mode = AgentTlsMode::Fingerprint;
+        cfg.server_fingerprint = fingerprint.clone();
+        cfg.server_ca.clear();
+        assert!(
+            tls_connector(&cfg, false).unwrap().is_some(),
+            "fingerprint bootstrap 必须构建 connector"
+        );
+        assert!(
+            tls_connector(&cfg, true).unwrap().is_some(),
+            "fingerprint 已纳管（ca.crt）必须构建 connector"
+        );
+
+        // system-roots：bootstrap 与已纳管都不读取 ca.crt 作为服务端根。
+        cfg.tls_mode = AgentTlsMode::SystemRoots;
+        cfg.server_fingerprint.clear();
+        assert!(
+            tls_connector(&cfg, false).unwrap().is_some(),
+            "system-roots bootstrap 必须构建 connector"
+        );
+        std::fs::remove_file(&ca_path).unwrap();
+        assert!(
+            tls_connector(&cfg, true).unwrap().is_some(),
+            "system-roots 已纳管不得依赖 ca.crt"
+        );
+        rustboard_common::fsutil::atomic_write(&ca_path, ca_pem.as_bytes(), 0o644).unwrap();
+
+        // custom-ca：bootstrap 与已纳管都用 server_ca 指定的 CA。
+        cfg.tls_mode = AgentTlsMode::CustomCa;
+        cfg.server_ca = ca_path.to_string_lossy().into_owned();
+        assert!(
+            tls_connector(&cfg, false).unwrap().is_some(),
+            "custom-ca bootstrap 必须构建 connector"
+        );
+        assert!(
+            tls_connector(&cfg, true).unwrap().is_some(),
+            "custom-ca 已纳管必须构建 connector"
+        );
+
+        // server_ca 为空 / 相对路径 / 不可读 / 非法 PEM：直接报错，不回退指纹。
+        for (case, server_ca, needle) in [
+            ("空", String::new(), "server_ca"),
+            ("相对路径", "relative-ca.pem".to_string(), "绝对路径"),
+            (
+                "不存在",
+                dir.join("missing-ca.pem").to_string_lossy().into_owned(),
+                "server_ca",
+            ),
+        ] {
+            cfg.server_ca = server_ca;
+            let err = tls_connector(&cfg, true)
+                .err()
+                .expect("非法 server_ca 必须失败")
+                .to_string();
+            assert!(
+                err.contains(needle),
+                "{case} 的错误必须包含 {needle}: {err}"
+            );
+        }
+
+        let bad_ca = dir.join("bad-ca.pem");
+        std::fs::write(&bad_ca, b"not a certificate").unwrap();
+        cfg.server_ca = bad_ca.to_string_lossy().into_owned();
+        let err = tls_connector(&cfg, false)
+            .err()
+            .expect("非法 PEM 必须失败")
+            .to_string();
+        assert!(err.contains("server_ca"), "错误信息: {err}");
+        assert!(
+            err.contains("不是合法 PEM 证书"),
+            "错误应说明 PEM 非法: {err}"
+        );
+
+        // ws:// 明文不构建 TLS connector。
+        cfg.hub_url = "ws://127.0.0.1:1/agent/ws".to_string();
+        assert!(
+            tls_connector(&cfg, false).unwrap().is_none(),
+            "ws:// 不应构建 TLS connector"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

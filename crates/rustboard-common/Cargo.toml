@@ -19,6 +19,10 @@ rand = { workspace = true }
 base64 = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
+# M5 Phase C C2：agent `system-roots` 信任模型需要读取操作系统 CA 包。
+# 0.8.3 已在 Cargo.lock 中（reqwest/hyper-rustls 的传递依赖），直接声明为
+# common 的依赖不会引入新 crate；`openssl-probe` 只探测证书路径，不链接 OpenSSL。
+rustls-native-certs = "0.8"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 x509-parser = { workspace = true, features = ["verify"] }

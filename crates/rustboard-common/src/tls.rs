@@ -1226,6 +1226,124 @@ pub fn client_config_ca(
     Ok(Arc::new(config))
 }
 
+/// 从 PEM 构建信任根集合：可包含多张证书，但至少要有一张能解析。
+fn root_store_from_pem(ca_pem: &str) -> Result<rustls::RootCertStore> {
+    if ca_pem.trim().is_empty() {
+        return Err(anyhow!("CA 证书 PEM 为空"));
+    }
+    let certs = load_certs(ca_pem).context("解析 CA 证书 PEM 失败")?;
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, ignored) = roots.add_parsable_certificates(certs);
+    if added == 0 {
+        return Err(anyhow!(
+            "CA 证书中没有可用的信任根（{ignored} 张证书无法解析）"
+        ));
+    }
+    Ok(roots)
+}
+
+/// 用给定信任根与可选客户端证书构建 TLS 1.3 客户端配置。
+///
+/// 客户端证书与私钥必须成对出现：只给其中一个会直接报错，不能静默退化成
+/// 单向 TLS（否则 mTLS 端会在握手阶段以难懂的错误拒绝连接）。
+fn client_config_with_roots(
+    roots: rustls::RootCertStore,
+    client_cert_pem: Option<&str>,
+    client_key_pem: Option<&str>,
+) -> Result<Arc<rustls::ClientConfig>> {
+    let identity = match (client_cert_pem, client_key_pem) {
+        (None, None) => None,
+        (Some(cert), Some(key)) => Some((load_certs(cert)?, load_key(key)?)),
+        _ => return Err(anyhow!("客户端证书与私钥必须成对提供")),
+    };
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_root_certificates(roots);
+    let mut config = match identity {
+        Some((certs, key)) => builder.with_client_auth_cert(certs, key)?,
+        None => builder.with_no_client_auth(),
+    };
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
+/// 用**操作系统根证书**做链校验 + URL 主机名校验，可选携带客户端证书。
+///
+/// 用于 `tls_mode = "system-roots"`（公共 ACME 证书）。根证书由
+/// `rustls-native-certs` 读取（尊重 `SSL_CERT_FILE` / `SSL_CERT_DIR`）；
+/// 读取不到任何可用证书时明确报错，绝不静默退化为「不校验」。
+pub fn client_config_system_roots(
+    client_cert_pem: Option<&str>,
+    client_key_pem: Option<&str>,
+) -> Result<Arc<rustls::ClientConfig>> {
+    let native = rustls_native_certs::load_native_certs();
+    let error_count = native.errors.len();
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, _ignored) = roots.add_parsable_certificates(native.certs);
+    if added == 0 {
+        return Err(anyhow!(
+            "无法加载系统根证书（0 张可用证书，{error_count} 个读取错误）；\
+             请安装 CA 证书包（如 ca-certificates）或改用 custom-ca"
+        ));
+    }
+    client_config_with_roots(roots, client_cert_pem, client_key_pem)
+}
+
+/// bootstrap 专用：系统根 + 无客户端证书（尚未纳管）。
+pub fn client_config_bootstrap_system_roots() -> Result<Arc<rustls::ClientConfig>> {
+    client_config_system_roots(None, None)
+}
+
+/// 用显式传入的 CA 证书（可多张）做链校验 + 主机名校验，可选客户端证书。
+///
+/// 用于 `tls_mode = "custom-ca"`：私有 ACME / 自签 hub。CA 必须至少有一张
+/// 可解析证书；客户端证书与私钥必须成对提供。
+pub fn client_config_custom_ca(
+    server_ca_pem: &str,
+    client_cert_pem: Option<&str>,
+    client_key_pem: Option<&str>,
+) -> Result<Arc<rustls::ClientConfig>> {
+    let roots = root_store_from_pem(server_ca_pem).context("server_ca 证书无效")?;
+    client_config_with_roots(roots, client_cert_pem, client_key_pem)
+}
+
+/// bootstrap 专用：指定 CA + 无客户端证书（尚未纳管）。
+pub fn client_config_bootstrap_custom_ca(server_ca_pem: &str) -> Result<Arc<rustls::ClientConfig>> {
+    client_config_custom_ca(server_ca_pem, None, None)
+}
+
+/// 从 PEM 内容构建**不要求客户端证书**的服务端 TLS 配置。
+///
+/// 用于面板直连 HTTPS（C7）与未来 ACME 证书加载：TLS 1.3、ALPN `http/1.1`。
+/// 只做 server-auth；需要 mTLS 的 agent 入口仍用 [`server_config`]。
+/// 函数名沿用计划中的 `server_config_from_paths`，但参数是已读取的 PEM 内容，
+/// 以便调用方自行决定路径权限/符号链接策略。
+pub fn server_config_from_paths(
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<Arc<rustls::ServerConfig>> {
+    if cert_pem.trim().is_empty() {
+        return Err(anyhow!("服务端证书 PEM 为空"));
+    }
+    if key_pem.trim().is_empty() {
+        return Err(anyhow!("服务端私钥 PEM 为空"));
+    }
+    if !cert_matches_key(cert_pem, key_pem)? {
+        return Err(anyhow!("服务端证书与私钥不匹配"));
+    }
+    let certs = load_certs(cert_pem)?;
+    let key = load_key(key_pem)?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
 /// 只比对服务端证书的 SHA-256 指纹。
 ///
 /// 自签模式下没有公共信任链可用，指纹随安装命令带外分发，等价于 SSH 的 known_hosts。
@@ -1670,6 +1788,127 @@ mod tests {
             handshake(foreign_config, server_config, "localhost").is_err(),
             "无关 CA 必须握手失败"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C2：`client_config_system_roots` 必须能在不访问网络的情况下构建，并保留
+    /// 客户端证书成对约束；系统 CA 包缺失时才报错，不能静默忽略。
+    #[test]
+    fn c2_client_config_system_roots_builds_without_network() {
+        let config =
+            client_config_system_roots(None, None).expect("系统根证书应能在常规 Linux 环境构建");
+        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+
+        // 只给证书或只给私钥：必须显式报错，而不是退化成单向 TLS。
+        let err = client_config_system_roots(Some("-----BEGIN CERTIFICATE-----"), None)
+            .expect_err("客户端证书/私钥必须成对");
+        assert!(format!("{err:#}").contains("成对"), "{err:#}");
+    }
+
+    /// C2：自定义 CA（多证书 bundle）+ 客户端证书做真实双向握手。
+    #[test]
+    fn c2_custom_ca_bundle_completes_real_handshake_with_client_cert() {
+        let dir = temp_dir("custom-ca-bundle");
+        ensure_hub_material(&dir, &["localhost".to_string()], CertPolicy::default()).unwrap();
+        let ca_pem = read_cert(&dir, CA_CERT_FILE);
+        let ca_key_pem = read_cert(&dir, CA_KEY_FILE);
+        let server_pem = read_cert(&dir, SERVER_CERT_FILE);
+        let server_key_pem = read_cert(&dir, SERVER_KEY_FILE);
+
+        // 第二个无关 CA 混在 bundle 里：多根必须被接受，且不能影响正常链校验。
+        let extra_key = KeyPair::generate().unwrap();
+        let extra_pem = ca_params(DEFAULT_CA_DAYS)
+            .unwrap()
+            .self_signed(&extra_key)
+            .unwrap()
+            .pem();
+        let bundle = format!("{ca_pem}{extra_pem}");
+
+        let (csr_pem, key_pem) = make_csr().unwrap();
+        let client_pem = sign_client_csr(&ca_key_pem, &csr_pem, "agent-c2", 90).unwrap();
+        let client_config =
+            client_config_custom_ca(&bundle, Some(&client_pem), Some(&key_pem)).unwrap();
+        assert_eq!(client_config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+
+        let mtls_server = server_config(&dir).unwrap();
+        let (client, server) = handshake(client_config, mtls_server, "localhost")
+            .expect("自定义 CA + 客户端证书必须握手成功");
+        assert_eq!(
+            client.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_3)
+        );
+        assert_eq!(
+            server.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_3)
+        );
+        assert!(
+            server.peer_certificates().is_some(),
+            "服务端必须看到客户端证书"
+        );
+        assert!(
+            client.peer_certificates().is_some(),
+            "客户端必须看到服务端证书"
+        );
+
+        // 无关 CA 必须被拒：bundle 里只有正确的第一张能验证这张服务端证书。
+        let foreign_config =
+            client_config_custom_ca(&extra_pem, Some(&client_pem), Some(&key_pem)).unwrap();
+        assert!(
+            handshake(foreign_config, server_config(&dir).unwrap(), "localhost").is_err(),
+            "无关 CA 必须握手失败"
+        );
+
+        // 错误主机名同样必须失败（custom-ca 不是「只信任 CA」）。
+        let wrong_name =
+            client_config_custom_ca(&bundle, Some(&client_pem), Some(&key_pem)).unwrap();
+        assert!(
+            handshake(wrong_name, server_config(&dir).unwrap(), "wrong.example").is_err(),
+            "错误主机名必须握手失败"
+        );
+
+        // bootstrap：无客户端证书也能完成 server-auth 握手（服务端不要求客户端证书）。
+        let bootstrap = client_config_bootstrap_custom_ca(&bundle).unwrap();
+        let public_server = server_config_from_paths(&server_pem, &server_key_pem).unwrap();
+        assert_eq!(public_server.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        let (client, server) = handshake(bootstrap, public_server, "localhost")
+            .expect("bootstrap custom-ca 必须握手成功");
+        assert_eq!(
+            client.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_3)
+        );
+        assert!(
+            server.peer_certificates().is_none(),
+            "bootstrap 不应携带客户端证书"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C2：非法/空 CA PEM 与不配套的 server cert/key 必须在构建阶段报错。
+    #[test]
+    fn c2_tls_config_helpers_reject_invalid_material() {
+        for bad in [
+            "",
+            "not a pem",
+            "-----BEGIN CERTIFICATE-----\n\0\n-----END CERTIFICATE-----",
+        ] {
+            let err = client_config_custom_ca(bad, None, None)
+                .expect_err("非法 CA PEM 必须被拒绝")
+                .to_string();
+            assert!(err.contains("server_ca"), "错误应点名 server_ca: {err}");
+        }
+
+        let dir = temp_dir("server-config-paths");
+        ensure_hub_material(&dir, &["localhost".to_string()], CertPolicy::default()).unwrap();
+        let cert_pem = read_cert(&dir, SERVER_CERT_FILE);
+        let (_csr, wrong_key) = make_csr().unwrap();
+        let err = server_config_from_paths(&cert_pem, &wrong_key)
+            .expect_err("不配套的 server cert/key 必须被拒绝")
+            .to_string();
+        assert!(err.contains("不匹配"), "错误应说明不匹配: {err}");
+        assert!(server_config_from_paths("", &wrong_key).is_err());
+        assert!(server_config_from_paths(&cert_pem, "").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
