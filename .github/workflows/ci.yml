@@ -56,6 +56,71 @@ jobs:
       - name: 单元与集成测试
         run: cargo test --workspace --locked
 
+  postgres:
+    name: postgres / Phase D 实库测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: rustboard
+          POSTGRES_PASSWORD: rustboard
+          POSTGRES_DB: rustboard
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rustboard -d rustboard"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # 实库测试每个用例 CREATE/DROP DATABASE（库名带 pid/nanos/seq），
+      # 官方 postgres 镜像的 POSTGRES_USER 即 superuser，满足 CREATEDB。
+      RUSTBOARD_TEST_PG: postgres://rustboard:rustboard@localhost:5432/rustboard?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: 安装工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: 缓存 cargo 与 target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: 等待 PostgreSQL 就绪
+        run: |
+          for i in $(seq 1 30); do
+            if timeout 1 bash -c ': > /dev/tcp/127.0.0.1/5432' 2>/dev/null; then
+              echo "PostgreSQL 已就绪（第 ${i} 次探测）"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL 在 30 秒内未就绪" >&2
+          exit 1
+
+      - name: Phase D 实库测试（schema / core / parity / migrate）
+        run: >-
+          cargo test -p rustboard-core
+          --test postgres_schema
+          --test postgres_core
+          --test postgres_parity
+          --test postgres_migrate
+          --locked
+
   e2e:
     name: e2e 安全回归
     runs-on: ubuntu-latest
