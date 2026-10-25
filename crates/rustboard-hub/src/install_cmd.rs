@@ -516,6 +516,119 @@ fn ensure_db_args_match_backend(args: &InstallArgs, cfg: &HubConfig) -> Result<(
     )
 }
 
+/// 判断旧 SQLite 是否已有业务数据时探测的表（任一非空即拒绝切换）。
+///
+/// 不遍历全部 21 张表：`samples` 是主数据，`agents` / `api_tokens` 覆盖已纳管
+/// 与现有凭据；真正的全表校验由随后的 `rustboard-hub migrate` 负责。
+const SQLITE_DATA_PROBE_TABLES: [&str; 3] = ["samples", "api_tokens", "agents"];
+
+/// 只读判断 SQLite 是否已有业务数据；返回第一张非空表。
+///
+/// - 文件不存在：视为空（全新安装 / 尚未创建）；
+/// - 只有 schema、没有行，或 0 字节文件：视为空；
+/// - 符号链接 / 非普通文件 / 打开或读取失败：fail-closed 返回错误，不能在
+///   无法确认时允许切换（避免掩盖数据）；
+/// - 缺表按空处理，兼容旧 schema / 尚未迁移的库。
+fn sqlite_business_data_table(path: &Path) -> Result<Option<&'static str>> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("检查 SQLite 数据库 {} 失败", path.display()))
+        }
+    };
+    if meta.file_type().is_symlink() {
+        bail!(
+            "SQLite 数据库 {} 是符号链接，无法确认是否为空；拒绝直接切换到 PostgreSQL",
+            path.display()
+        );
+    }
+    if !meta.is_file() {
+        bail!(
+            "SQLite 数据库 {} 不是普通文件，无法确认是否为空；拒绝直接切换到 PostgreSQL",
+            path.display()
+        );
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| {
+                format!(
+                    "以只读方式打开 SQLite 数据库 {} 失败（请先停止 hub 后重试）",
+                    path.display()
+                )
+            })?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .context("设置 SQLite busy_timeout 失败")?;
+    for table in SQLITE_DATA_PROBE_TABLES {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .with_context(|| {
+                format!(
+                    "读取 SQLite schema 失败（请先停止 hub 后重试）: {}",
+                    path.display()
+                )
+            })?;
+        if exists == 0 {
+            continue;
+        }
+        let non_empty: i64 = conn
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM \"{table}\" LIMIT 1)"),
+                [],
+                |row| row.get(0),
+            )
+            .with_context(|| {
+                format!(
+                    "读取 SQLite 表 {table} 失败（{}；请先停止 hub 后重试）",
+                    path.display()
+                )
+            })?;
+        if non_empty != 0 {
+            return Ok(Some(table));
+        }
+    }
+    Ok(None)
+}
+
+/// 拒绝用 `install --db postgres://` 静默丢弃有数据的 SQLite。
+///
+/// `install` 只改写 `hub.toml` 的 database，不搬数据；若旧 SQLite 仍有业务
+/// 数据，直接切换会让 hub 启动后连到空 PostgreSQL，表现为“数据消失”。只在
+/// 显式 `--db postgres://` 且旧配置是 SQLite 时检查；空库 / 文件不存在允许。
+fn ensure_sqlite_empty_before_postgres_switch(
+    args: &InstallArgs,
+    cfg: &HubConfig,
+    config_path: &Path,
+) -> Result<()> {
+    if !matches!(check_db_mode(args.db.as_deref())?, DbMode::Postgres(_)) {
+        return Ok(());
+    }
+    let DatabaseKind::Sqlite(path) = cfg.database_kind().context("解析 database 配置失败")?
+    else {
+        return Ok(());
+    };
+    let Some(table) = sqlite_business_data_table(&path)? else {
+        return Ok(());
+    };
+    let target = redact_database_url(args.db.as_deref().unwrap_or_default());
+    bail!(
+        "检测到现有 SQLite 数据库仍有业务数据，拒绝直接切换到 PostgreSQL：\n  \
+         SQLite: {}\n  表 {table} 非空（至少 1 行）\n\
+         `install --db postgres://…` 只用于全新安装或空 SQLite：它只改写 hub.toml，\
+         不会迁移数据；直接切换会让 hub 启动后连接空 PostgreSQL，看起来像数据丢失。\n\
+         请先停止 hub，再用同一 DSN 执行离线迁移（迁移前会备份 SQLite 与 hub.toml）：\n  \
+         rustboard-hub migrate --to '<本次 --db 的 DSN>' --config {}\n\
+         目标（脱敏）: {target}\n\
+         迁移与校验成功后 migrate 会原子改写 database；不要手工改配置绕过。",
+        path.display(),
+        config_path.display()
+    )
+}
+
 /// 真实 PostgreSQL 探测：建池（含首次 `SELECT 1`）→ `apply_schema` → `ping`。
 ///
 /// 顺序固定：
@@ -935,6 +1048,10 @@ fn prepare_config(
 ) -> Result<(HubConfig, bool)> {
     if config_present {
         let mut cfg = load_hub_config_checked(&paths.config)?;
+        // install 只改 database、不搬数据：已有 SQLite 有业务数据时必须走
+        // migrate，否则 hub 启动后会连到空 PostgreSQL（看起来像数据丢失）。
+        // 检查发生在 apply_explicit_flags 改写 database 之前，失败不写配置。
+        ensure_sqlite_empty_before_postgres_switch(args, &cfg, &paths.config)?;
         apply_explicit_flags(&mut cfg, args, retention)?;
         ensure_acme_args_match_mode(&cfg, args)?;
         cfg.validate()
@@ -4409,6 +4526,196 @@ mod tests {
         // 失败不得把内存里的改动写回。
         updated.admin_token.clear();
         assert_eq!(fs::read(&paths.config).unwrap(), before);
+    }
+
+    /// 判断“是否已有业务数据”的只读探测：缺文件 / 空 schema / 0 字节视为空，
+    /// samples / api_tokens / agents 任一非空即命中。
+    #[test]
+    fn sqlite_business_data_probe_detects_rows_and_allows_empty() {
+        let dir = TempDir::new("sqlite-data-probe");
+        let missing = dir.path().join("missing.db");
+        assert_eq!(sqlite_business_data_table(&missing).unwrap(), None);
+
+        let empty = dir.path().join("empty.db");
+        let conn = rusqlite::Connection::open(&empty).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE samples (agent_id TEXT NOT NULL, ts INTEGER NOT NULL);
+             CREATE TABLE api_tokens (id INTEGER PRIMARY KEY);
+             CREATE TABLE agents (id TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(sqlite_business_data_table(&empty).unwrap(), None);
+
+        // 0 字节文件是合法的空 SQLite，不得误判为损坏。
+        let zero = dir.path().join("zero.db");
+        fs::write(&zero, b"").unwrap();
+        assert_eq!(sqlite_business_data_table(&zero).unwrap(), None);
+
+        for table in SQLITE_DATA_PROBE_TABLES {
+            let path = dir.path().join(format!("{table}.db"));
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE {table} (id INTEGER);\
+                 INSERT INTO {table} (id) VALUES (1);"
+            ))
+            .unwrap();
+            drop(conn);
+            assert_eq!(
+                sqlite_business_data_table(&path).unwrap(),
+                Some(table),
+                "{table} 有 1 行时必须命中"
+            );
+        }
+
+        // 生产库是 WAL 模式；干净停机后通常没有 -wal/-shm。只读探测不能因此
+        // 误报错误（否则空库切 PG 会被无故拦住）。
+        let wal_path = dir.path().join("wal.db");
+        {
+            let conn = rusqlite::Connection::open(&wal_path).unwrap();
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode.to_ascii_lowercase(), "wal");
+            conn.execute_batch("CREATE TABLE samples (id INTEGER);")
+                .unwrap();
+        }
+        // 模拟 last connection 关闭后的干净状态：-wal/-shm 已被删除。
+        for suffix in ["-wal", "-shm"] {
+            let _ = fs::remove_file(format!("{}{suffix}", wal_path.display()));
+        }
+        assert_eq!(sqlite_business_data_table(&wal_path).unwrap(), None);
+        {
+            let conn = rusqlite::Connection::open(&wal_path).unwrap();
+            conn.execute("INSERT INTO samples (id) VALUES (1)", [])
+                .unwrap();
+        }
+        assert_eq!(
+            sqlite_business_data_table(&wal_path).unwrap(),
+            Some("samples")
+        );
+    }
+
+    /// `install --db postgres://` 不得静默丢弃有数据的 SQLite：
+    /// 写盘前拒绝、提示 migrate，配置字节不变，且错误不泄露 DSN 密码。
+    ///
+    /// 逐表覆盖 samples / api_tokens / agents；`--db sqlite` 与未给 `--db`
+    /// 都必须保持允许（不切换后端，不需要迁移）。
+    #[test]
+    fn install_db_postgres_refuses_nonempty_sqlite_without_rewriting_config() {
+        let secret = "switch-secret-91ac";
+        for table in SQLITE_DATA_PROBE_TABLES {
+            let dir = TempDir::new(&format!("pg-switch-nonempty-{table}"));
+            let paths = Paths::for_role(Role::Hub, dir.path(), PathOverrides::default()).unwrap();
+            fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+            fs::create_dir_all(&paths.data_dir).unwrap();
+            let db_path = paths.data_dir.join("rustboard.db");
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE {table} (id INTEGER);\
+                 INSERT INTO {table} (id) VALUES (1);"
+            ))
+            .unwrap();
+            drop(conn);
+
+            let cfg = HubConfig {
+                data_dir: paths.data_dir.clone(),
+                database: sqlite_database(&paths.data_dir),
+                admin_token: "keep-me".to_string(),
+                ..HubConfig::default()
+            };
+            fs::write(&paths.config, toml::to_string_pretty(&cfg).unwrap()).unwrap();
+            let before = fs::read(&paths.config).unwrap();
+
+            // `--db sqlite` 不切换后端，不需要迁移，必须保持允许。
+            let mut sqlite_args = test_install_args();
+            sqlite_args.prefix = Some(dir.path().to_path_buf());
+            sqlite_args.db = Some("sqlite".to_string());
+            prepare_config(&sqlite_args, &paths, Retention::default(), true)
+                .expect("--db sqlite 不应被 SQLite 有数据拦截");
+
+            // 未给 --db：沿用已有 SQLite，同样必须允许（--force 重装语义）。
+            let mut no_db_args = test_install_args();
+            no_db_args.prefix = Some(dir.path().to_path_buf());
+            no_db_args.db = None;
+            prepare_config(&no_db_args, &paths, Retention::default(), true)
+                .expect("未给 --db 不应被 SQLite 有数据拦截");
+
+            let mut args = test_install_args();
+            args.prefix = Some(dir.path().to_path_buf());
+            args.db = Some(format!(
+                "postgres://rustboard:{secret}@127.0.0.1:1/rustboard?sslmode=disable"
+            ));
+            let err = prepare_config(&args, &paths, Retention::default(), true).unwrap_err();
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("rustboard-hub migrate --to"),
+                "{table}: 错误必须指向离线迁移命令: {rendered}"
+            );
+            assert!(rendered.contains("停止 hub"), "{table}: {rendered}");
+            assert!(
+                rendered.contains(&paths.config.display().to_string()),
+                "{table}: 错误必须给出 --config 路径: {rendered}"
+            );
+            assert!(
+                rendered.contains(table),
+                "{table}: 错误应点名非空表: {rendered}"
+            );
+            assert!(
+                !rendered.contains(secret),
+                "{table}: 错误泄露密码: {rendered}"
+            );
+            assert!(
+                rendered.contains("postgres://rustboard:***@"),
+                "{table}: {rendered}"
+            );
+            // 失败发生在 apply_explicit_flags / InstallTxn 之前：配置字节不变。
+            assert_eq!(fs::read(&paths.config).unwrap(), before, "{table}");
+        }
+    }
+
+    /// 空 schema、0 字节、文件不存在都允许 `--db postgres://`（全新/空库场景）。
+    #[test]
+    fn install_db_postgres_allows_empty_or_missing_sqlite() {
+        let check_case = |tag: &str, prepare: &dyn Fn(&Path)| {
+            let dir = TempDir::new(tag);
+            let paths = Paths::for_role(Role::Hub, dir.path(), PathOverrides::default()).unwrap();
+            fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+            prepare(&paths.data_dir);
+            let cfg = HubConfig {
+                data_dir: paths.data_dir.clone(),
+                database: sqlite_database(&paths.data_dir),
+                ..HubConfig::default()
+            };
+            fs::write(&paths.config, toml::to_string_pretty(&cfg).unwrap()).unwrap();
+
+            let mut args = test_install_args();
+            args.prefix = Some(dir.path().to_path_buf());
+            args.db =
+                Some("postgres://rustboard@127.0.0.1:5432/rustboard?sslmode=disable".to_string());
+            let (updated, _need_certs) =
+                prepare_config(&args, &paths, Retention::default(), true).unwrap();
+            match updated.database_kind().unwrap() {
+                DatabaseKind::Postgres(_) => {}
+                other => panic!("{tag}: 空 SQLite 应允许切换到 PG，实际 {other:?}"),
+            }
+        };
+
+        check_case("pg-switch-empty-schema", &|data_dir| {
+            fs::create_dir_all(data_dir).unwrap();
+            let conn = rusqlite::Connection::open(data_dir.join("rustboard.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE samples (agent_id TEXT NOT NULL, ts INTEGER NOT NULL);
+                 CREATE TABLE api_tokens (id INTEGER PRIMARY KEY);
+                 CREATE TABLE agents (id TEXT PRIMARY KEY);",
+            )
+            .unwrap();
+        });
+        check_case("pg-switch-zero-byte", &|data_dir| {
+            fs::create_dir_all(data_dir).unwrap();
+            fs::write(data_dir.join("rustboard.db"), b"").unwrap();
+        });
+        check_case("pg-switch-missing-file", &|_data_dir| {});
     }
 
     /// 有本地 PG 时验证真实探测链路（open → apply_schema → ping）；无 env 明确 SKIP。
