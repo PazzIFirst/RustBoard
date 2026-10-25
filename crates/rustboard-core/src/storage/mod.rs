@@ -6,7 +6,7 @@
 //! `dyn Storage` 使用。
 //!
 //! [`StorageHandle`] 是 Phase D 引入的多后端边界：内部是 `Arc<dyn Storage>`，
-//! 当前只构造 SQLite；D2/D3 增加 PG schema 与实现后在这里扩展。
+//! 可构造 SQLite 或 PostgreSQL；调用点只依赖 [`Deref`] 后的 trait 方法。
 
 pub mod postgres;
 pub mod sqlite;
@@ -18,6 +18,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 
+use self::postgres::PostgresStorage;
 use self::sqlite::{AlertSeriesSnapshot, ArchiveRawRow, SqliteStorage};
 use crate::alerts::{AlertEvent, AlertRule, AlertSilence, AlertState};
 use crate::archive::{ArchiveObject, ArchiveStatus};
@@ -670,8 +671,8 @@ pub trait Storage: Send + Sync {
 /// 存储句柄：Phase D 的多后端边界。
 ///
 /// 内部是 `Arc<dyn Storage>`，`Clone` 只增加引用计数，不复制底层连接。
-/// 当前只能构造 SQLite；PostgreSQL 在 D3 实现 `Storage` 后从同一入口接入，
-/// hub 侧届时只需换构造函数，调用点仍通过 [`Deref`] 直接使用 trait 方法。
+/// SQLite 与 PostgreSQL 都能从这里构造；调用点通过 [`Deref`] 直接使用
+/// trait 方法，不需要知道具体后端。
 #[derive(Clone)]
 pub struct StorageHandle {
     inner: Arc<dyn Storage>,
@@ -703,6 +704,17 @@ impl StorageHandle {
     /// 打开内存 SQLite（共享缓存），供测试与只读 CLI 使用。
     pub fn sqlite_memory() -> Result<Self> {
         Ok(Self::from_sqlite(SqliteStorage::open_in_memory()?))
+    }
+
+    /// 用已打开的 PostgreSQL 存储构造句柄（Phase D3）。
+    ///
+    /// 只做 `Arc<dyn Storage>` 装箱，不建立连接、不跑 schema 迁移；连接与
+    /// 迁移由调用方在 blocking 线程通过 [`PostgresStorage::open`] /
+    /// [`PostgresStorage::apply_schema`] 完成。
+    pub fn postgres(storage: PostgresStorage) -> Self {
+        Self {
+            inner: Arc::new(storage),
+        }
     }
 
     /// 以 `&dyn Storage` 借用底层存储。
