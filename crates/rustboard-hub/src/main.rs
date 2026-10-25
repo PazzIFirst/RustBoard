@@ -1511,6 +1511,60 @@ fn rotate_cert(config: Option<PathBuf>, force: bool, days: Option<u32>) -> Resul
     Ok(())
 }
 
+/// L-01：`tls status` 的 ACME 私有文件只读自检。
+///
+/// 只打印 `WARN` 与修复建议，**绝不**调用 `harden` / `chmod`，也不跟随符号链接；
+/// 真正的权限收紧只发生在 `hub run` 启动期（`acme::store::harden_acme_material`）。
+fn warn_acme_material_permissions(data_dir: &FsPath) -> Result<()> {
+    for (label, path) in [
+        (
+            "ACME 账户文件（含私钥）",
+            acme::store::account_path(data_dir),
+        ),
+        ("ACME 状态文件", acme::store::state_path(data_dir)),
+    ] {
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("检查 {label} 权限失败: {}", path.display()))
+            }
+        };
+        if meta.file_type().is_symlink() {
+            println!(
+                "WARN: {label} 是符号链接（{}）；tls status 不会跟随或修改链接目标，\
+                 hub 启动会直接拒绝。请删除链接并恢复真实文件。",
+                path.display()
+            );
+            continue;
+        }
+        if !meta.file_type().is_file() {
+            println!(
+                "WARN: {label} 不是普通文件（{}）；hub 启动会直接拒绝。\
+                 请移除后恢复真实文件。",
+                path.display()
+            );
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                println!(
+                    "WARN: {label} 权限为 {mode:04o}（含 group/other 位）：{}；\
+                     修复：`chmod 600 {}`，或重启 hub（启动期会只收紧到 0600）。\
+                     tls status 只读，不会自动修改文件。",
+                    path.display(),
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `rustboard-hub tls status`：只读展示证书来源、公开状态与当前证书信息。
 fn tls_status(config: Option<PathBuf>) -> Result<()> {
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
@@ -1534,6 +1588,8 @@ fn tls_status(config: Option<PathBuf>) -> Result<()> {
             ca_file
         }
     );
+    // L-01：只读检查 ACME 私有文件权限；发现 0644 / 符号链接只告警，不写盘。
+    warn_acme_material_permissions(&cfg.data_dir)?;
 
     let material = acme::store::read_server_material(&cfg.data_dir)
         .context("读取服务端证书材料失败（状态只读，不写盘）")?;
@@ -1748,6 +1804,11 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
     // 旧版本遗留的 0755 数据目录也会在这里被修正。
     fsutil::ensure_private_dir(&cfg.data_dir, 0o700)
         .with_context(|| format!("创建或收紧数据目录失败: {}", cfg.data_dir.display()))?;
+    // L-01：启动期把既有 ACME account.json / state.toml 只收紧到 0600。必须发生在
+    // 任何 TLS/ACME 读取之前，且与 tls.mode 无关（切回 self-signed 后旧文件仍在）；
+    // 符号链接、非普通文件或 chmod 失败都直接阻止启动，不能静默带着过宽权限运行。
+    acme::store::harden_acme_material(&cfg.data_dir)
+        .context("启动前收紧 ACME 账户/状态文件权限失败")?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1953,9 +2014,10 @@ fn admin_listen_is_non_loopback(addr: &str) -> Result<bool> {
 /// 启动前校验管理 API 的传输安全；任何失败都发生在监听之前。
 ///
 /// - `off` 只允许回环：非回环直接拒绝（v0.3.3 有意的安全收紧）。
-/// - `required`：绑定 IP 在 `server_names` 里（比较前 trim），或管理端可通过
-///   `server_names` 里的 DNS 名访问；两者都不满足时提示先更新 server_names 再
-///   rotate-cert。`0.0.0.0` / `::` 通配绑定跳过精确检查。
+/// - `required`：绑定 IP 在 `server_names` / `tls.domains` 里（比较前 trim），或管理端
+///   可通过 DNS 名访问；两者都不满足时拒绝启动。`0.0.0.0` / `::` 通配绑定跳过精确检查。
+/// - 回环绑定要求**精确 IP SAN**，不放宽（fail-closed）；错误信息给出三种可用部署方式，
+///   并明确警告不要把回环 IP 加进公共 ACME 域名证书（公共 CA 不会签发回环 IP SAN）。
 fn validate_admin_tls(cfg: &HubConfig) -> Result<()> {
     let sock: SocketAddr = cfg
         .admin_listen
@@ -2001,6 +2063,31 @@ fn validate_admin_tls(cfg: &HubConfig) -> Result<()> {
             let dns_covered =
                 !ip.is_loopback() && names.iter().any(|name| name.parse::<IpAddr>().is_err());
             if !covered && !dns_covered {
+                if ip.is_loopback() {
+                    bail!(
+                        "admin_tls=\"required\" 且管理 API 只绑定回环地址 {ip}，但证书名字\
+                         （ACME tls.domains / self-signed server_names）中没有该回环 IP 的 SAN，\
+                         本机无法通过 HTTPS 访问管理 API。这是刻意的 fail-closed：管理端按 IP \
+                         直连时证书必须精确覆盖该 IP，不会为了启动而放宽校验。请任选一种部署方式：\n\
+                         1) 管理口绑定对外地址，用防火墙 / 云安全组限制来源：\n\
+                            admin_listen = \"0.0.0.0:8444\"\n\
+                            admin_tls = \"required\"\n\
+                            证书需覆盖管理端实际访问的 DNS 名（self-signed 用 server_names，\
+                            ACME 用 tls.domains）；改完执行 `rustboard-hub tls issue`（ACME）或 \
+                            `rustboard-hub rotate-cert --force`（self-signed）。\n\
+                         2) 同机 panel 走回环明文 HTTP，TLS 交给反向代理：\n\
+                            admin_tls = \"off\"\n\
+                            admin_listen = \"127.0.0.1:8444\"\n\
+                            面板访问 http://127.0.0.1:8444，由 nginx/Caddy 等反向代理终止 TLS；\
+                            仍必须保留 Bearer token，且不要把 8444 直接暴露到公网。\n\
+                         3) 改用包含 {ip} SAN 的 self-signed 证书（仅 self-signed）：\n\
+                            把 {ip} 加入 server_names（保留现有主机名），然后执行 \
+                            `rustboard-hub rotate-cert --force`。\n\
+                         警告：不要把回环 IP 加入公共 ACME 域名证书（tls.domains）；\
+                         Let's Encrypt 等公共 CA 不会为 127.0.0.1 / ::1 等回环地址签发 SAN。\
+                         ACME 模式请使用方式 1 或 2。"
+                    );
+                }
                 bail!(
                     "admin_tls=\"required\" 且管理 API 绑定 {ip}，但证书名字（server_names / \
                      ACME tls.domains）中既没有该 IP SAN、也没有可用于远端访问的 DNS SAN；\

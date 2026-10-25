@@ -41,6 +41,57 @@ pub fn account_path(data_dir: &Path) -> PathBuf {
     acme_dir(data_dir).join(ACCOUNT_FILE)
 }
 
+/// 启动期收紧 ACME 私有文件权限（L-01）：`account.json` 与 `state.toml` 只允许 0600。
+///
+/// 语义：
+/// - 只处理**已经存在**的文件；目录或文件不存在时正常返回（首次启动 / 尚未启用 ACME）；
+/// - 先用 [`std::fs::symlink_metadata`] 检查**目标本身**：符号链接直接报错，
+///   绝不跟随读取，也绝不 chmod 链接目标；
+/// - 普通文件交给 [`fsutil::harden`] 只收紧到 0600：已是 0600 时不调用 chmod，
+///   比 0600 更严格（例如 0400）也保持原样，不放宽；
+/// - 目录 / FIFO / 设备等非普通文件同样报错，避免把非文件当成 ACME 材料；
+/// - `chmod` 失败（只读文件系统、EACCES、非属主等）必须返回错误，由调用方阻止启动。
+///
+/// 由 `hub run` 在数据目录 `ensure_private_dir(0700)` 之后、任何 TLS/ACME 读取之前
+/// 调用，且与 `tls.mode` 无关（切换回 self-signed 后旧 ACME 文件仍可能留在盘上）。
+pub fn harden_acme_material(data_dir: &Path) -> Result<()> {
+    for path in [account_path(data_dir), state_path(data_dir)] {
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("检查 ACME 私有文件失败: {}", path.display()))
+            }
+        };
+        if meta.file_type().is_symlink() {
+            bail!(
+                "ACME 私有文件是符号链接: {}；拒绝跟随，也拒绝修改链接目标。请删除该链接并\
+                 恢复真实的 ACME 账户/状态文件；账户文件丢失时可执行 \
+                 `rustboard-hub tls issue` 重新创建账户后再启动 hub。",
+                path.display()
+            );
+        }
+        if !meta.file_type().is_file() {
+            bail!(
+                "ACME 私有路径不是普通文件: {}（可能是目录、FIFO 或设备）；拒绝收紧权限。\
+                 请移除它并恢复真实的 ACME 账户/状态文件，或执行 `rustboard-hub tls issue` \
+                 重新创建账户后再启动 hub。",
+                path.display()
+            );
+        }
+        fsutil::harden(&path, 0o600).with_context(|| {
+            format!(
+                "收紧 ACME 私有文件权限失败: {}；hub 启动需要当前用户能修改该文件。\
+                 请先手工执行 `chmod 600 {}`（确认文件属于运行 hub 的用户），再重启 hub",
+                path.display(),
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// 落盘的 ACME 公开状态；**不含任何 secret**。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -128,8 +179,23 @@ pub fn write_state(data_dir: &Path, state: &AcmeState) -> Result<()> {
 }
 
 /// 读取账户 credentials JSON；不存在返回 `None`，损坏时备份并报错。
+///
+/// 读取前先对目标本身做 [`std::fs::symlink_metadata`]：账户文件含私钥，是符号链接
+/// 时必须直接拒绝，不能先跟随读取；随后的 [`fsutil::harden`] 同样不会 chmod 链接目标。
 pub fn read_account(data_dir: &Path) -> Result<Option<String>> {
     let path = account_path(data_dir);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "ACME 账户文件是符号链接: {}；拒绝跟随读取（账户文件含私钥）。请删除该链接并\
+             恢复真实文件，或执行 `rustboard-hub tls issue` 重新创建账户。",
+            path.display()
+        ),
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("检查 ACME 账户失败: {}", path.display()))
+        }
+    }
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),

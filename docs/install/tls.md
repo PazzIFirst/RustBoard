@@ -169,6 +169,61 @@ sudo rustboard-hub tls renew  --config /etc/rustboard/hub.toml
 - 调试务必先用 staging，避免消耗 production 速率限制；见
   [acme.md §11](acme.md#11-lets-encrypt-速率限制)。
 
+### 4.5 ACME 域名证书 + 回环管理口（fail-closed）
+
+`admin_tls = "required"` 且 `admin_listen` 绑定回环 IP（例如
+`127.0.0.1:8444`）时，`validate_admin_tls` 要求证书 SAN **精确包含该回环 IP**。
+ACME 域名证书只有 DNS SAN，因此这个组合会在监听前被拒绝。这是**有意的
+fail-closed**（不是 bug）：管理端按 IP 直连时必须校验证书覆盖该 IP，hub 不会
+为了启动而放宽校验。错误信息会给出以下三种方式，任选其一：
+
+1. 管理口绑定对外地址，用防火墙 / 云安全组限制来源：
+
+   ```toml
+   # /etc/rustboard/hub.toml（根表键）
+   admin_tls = "required"
+   admin_listen = "0.0.0.0:8444"
+   ```
+
+   ```bash
+   # tls.domains 必须覆盖管理端实际访问的 DNS 名
+   sudo rustboard-hub tls issue --config /etc/rustboard/hub.toml
+   # 占位网段，替换为受信管理来源
+   sudo ufw allow from 203.0.113.0/24 to any port 8444 proto tcp
+   ```
+
+   云安全组只放行管理来源，不要对公网开放 8444。
+
+2. 同机 panel 走回环明文 HTTP，TLS 由反向代理终止：
+
+   ```toml
+   # /etc/rustboard/hub.toml（根表键）
+   admin_tls = "off"
+   admin_listen = "127.0.0.1:8444"
+   ```
+
+   面板连 `http://127.0.0.1:8444`，外部访问由 nginx / Caddy 等反代终止 TLS；
+   Bearer token 仍然必需，不要把 8444 直接暴露到公网。
+
+3. 改用包含回环 IP SAN 的 self-signed 证书（仅 self-signed）：
+
+   ```toml
+   # /etc/rustboard/hub.toml
+   # server_names 是根表键，必须写在 [tls] 段之前
+   server_names = ["127.0.0.1", "::1", "hub.example.com"]
+
+   [tls]
+   mode = "self-signed"
+   ```
+
+   ```bash
+   sudo rustboard-hub rotate-cert --force --config /etc/rustboard/hub.toml
+   ```
+
+> **不要**把回环 IP 加入公共 ACME 域名证书：`tls.domains` 只接受 DNS 名，
+> Let's Encrypt 等公共 CA 也不会为 `127.0.0.1` / `::1` 签发 SAN。ACME 模式请用
+> 方式 1 或 2；方式 3 仅适用于 self-signed。
+
 ## 5. 续期、退避与热加载
 
 - 续期阈值：剩余寿命 ≤ `min(lifetime/3, 48h)`。因此 90 天证书在剩余约 48 小时

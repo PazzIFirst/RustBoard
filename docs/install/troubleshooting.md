@@ -18,6 +18,7 @@
 | `tls_key` / `tls_cert` 权限或符号链接被拒 | §8 |
 | 容器里 ACME 端口不通、entrypoint 跳过安装、healthcheck 红 | §9 |
 | `admin_tls=required` 后面板/健康检查失败 | §10 |
+| 启动报“管理 API 只绑定回环地址...没有该回环 IP 的 SAN” | §10.1 |
 | 想确认当前证书来源与到期 | `rustboard-hub tls status --config ...` |
 
 ## 2. 80/443 被占用
@@ -166,7 +167,8 @@ openssl s_client -connect board.example.com:8443 \
 
 - 证书 SAN 没有包含实际访问名（例如只签了 `board.example.com`，agent 用 IP 连）；
 - 用 IP 访问 ACME 域名证书（ACME 域名证书通常没有 IP SAN；IP 场景用 `acme-ip`）；
-- 管理口/面板用了 `127.0.0.1`，但证书没有回环 SAN；
+- 管理口/面板用了 `127.0.0.1`，但证书没有回环 SAN（ACME 域名证书不会包含，
+  见 §10.1）；
 - `server_names` 改了但没重签：self-signed 先 `rotate-cert --force`，ACME 先
   `tls issue`；
 - 中间链缺失：`server.crt` 必须 leaf 第一、后面跟中间 CA；
@@ -192,6 +194,13 @@ ACME 的账户/状态在 `certs/acme/`，恢复时与 `server.crt/key` 一起备
 
 - hub 数据/证书目录 `0700`；`hub.toml`、`panel.toml`、私钥、ACME 账户 `0600`；
   证书 `0644`。启动会收紧过宽权限，但共享目录/符号链接会直接拒绝。
+- **L-01 ACME 私有文件**：`certs/acme/account.json`（含账户私钥）与
+  `certs/acme/state.toml` 必须是 `0600`。`hub run` 启动时会在数据目录 `0700`
+  收紧之后、任何 TLS/ACME 读取之前，把已存在的这两个文件**只收紧**到 `0600`
+  （已是 0600 或更严格时不 chmod，绝不放宽）。若其中任一是符号链接、不是普通
+  文件，或 chmod 失败（只读文件系统、EACCES、属主不对），hub **拒绝启动**，
+  不会静默带着过宽权限继续。`tls status` 只读：发现 group/other 位或符号链接
+  只打印 `WARN` 和修复建议，绝不调用 chmod、不修改链接目标。
 - 安装器 root prefix 只允许 `/etc/rustboard`、`/var/lib/rustboard` 与
   `/usr/local/bin/rustboard-*`；测试 prefix 必须是 root 拥有、非 sticky、group/
   other 不可写（不要用 `/tmp`）。
@@ -199,6 +208,27 @@ ACME 的账户/状态在 `certs/acme/`，恢复时与 `server.crt/key` 一起备
   ConfigMap 常是符号链接，必要时复制成真实文件。
 - Docker 证书持久化在 `hub_data` / `panel_data`；`docker compose down -v` 会删除
   volume 与证书/账户，**不要**用它做“重置证书”的常规手段。
+
+```bash
+# 查看 ACME 私有文件权限（应是 600）
+sudo stat -c '%a %U:%G %n' /var/lib/rustboard/hub/certs/acme/account.json \
+  /var/lib/rustboard/hub/certs/acme/state.toml 2>/dev/null
+
+# 手工收紧；也可以重启 hub，由启动期自检自动收紧普通文件
+sudo chmod 600 /var/lib/rustboard/hub/certs/acme/account.json \
+  /var/lib/rustboard/hub/certs/acme/state.toml
+sudo systemctl restart rustboard-hub
+
+# 如果是符号链接：先确认指向，再删除链接并恢复真实文件；不要用 chmod -L
+ls -l /var/lib/rustboard/hub/certs/acme/
+```
+
+`tls status` 的告警形如（路径与 mode 按实际显示）：
+
+```text
+WARN: ACME 账户文件（含私钥） 权限为 0644（含 group/other 位）：...；修复：`chmod 600 ...`，或重启 hub（启动期会只收紧到 0600）。tls status 只读，不会自动修改文件。
+WARN: ACME 账户文件（含私钥） 是符号链接（...）；tls status 不会跟随或修改链接目标，hub 启动会直接拒绝。
+```
 
 ```bash
 sudo stat -c '%a %U:%G %n' /var/lib/rustboard/hub/certs/* \
@@ -239,6 +269,67 @@ sudo stat -c '%a %U:%G %n' /var/lib/rustboard/hub/certs/* \
 - 远程面板不要靠“把 8444 改成 0.0.0.0 + admin_tls=off”绕过；默认仍应
   VPN/SSH/反代，非回环必须 HTTPS。
 
+### 10.1 ACME 域名证书 + 回环管理口启动失败
+
+现象：`admin_tls = "required"` 且 `admin_listen` 绑定回环 IP（如
+`127.0.0.1:8444`），hub 启动失败，错误以
+`admin_tls="required" 且管理 API 只绑定回环地址 ...` 开头。
+
+原因：管理端按 IP 直连时证书 SAN 必须**精确包含该回环 IP**，而 ACME 域名证书
+只有 DNS SAN。这是**刻意的 fail-closed**，不是证书没装好；不要用 `-k`、跳过
+校验或改写二进制来绕过。任选一种部署方式：
+
+1. 管理口绑定对外地址，用防火墙 / 云安全组限制来源：
+
+   ```toml
+   # /etc/rustboard/hub.toml（根表键）
+   admin_tls = "required"
+   admin_listen = "0.0.0.0:8444"
+   ```
+
+   ```bash
+   # tls.domains 需覆盖管理端实际访问的 DNS 名
+   sudo rustboard-hub tls issue --config /etc/rustboard/hub.toml
+   # 占位网段，替换为受信管理来源
+   sudo ufw allow from 203.0.113.0/24 to any port 8444 proto tcp
+   ```
+
+   云安全组同样只放行管理来源，不要对公网开放 8444。
+
+2. 同机 panel 走回环明文 HTTP，TLS 交给反向代理：
+
+   ```toml
+   # /etc/rustboard/hub.toml（根表键）
+   admin_tls = "off"
+   admin_listen = "127.0.0.1:8444"
+   ```
+
+   ```bash
+   curl -fsS http://127.0.0.1:8444/healthz
+   ```
+
+   面板连 `http://127.0.0.1:8444`，由 nginx / Caddy 等反代对外提供 HTTPS 并
+   终止 TLS；Bearer token 仍然必需，不要把 8444 直接暴露到公网。
+
+3. 改用包含回环 IP SAN 的 self-signed 证书（仅 self-signed）：
+
+   ```toml
+   # /etc/rustboard/hub.toml
+   # server_names 是根表键，必须写在 [tls] 段之前
+   server_names = ["127.0.0.1", "::1", "hub.example.com"]
+
+   [tls]
+   mode = "self-signed"
+   ```
+
+   ```bash
+   sudo rustboard-hub rotate-cert --force --config /etc/rustboard/hub.toml
+   ```
+
+> **不要**把 `127.0.0.1` / `::1` 加进公共 ACME 域名证书的 `tls.domains`：
+> Let's Encrypt 等公共 CA 不会为回环 IP 签发 SAN；`acme-ip` 也只接受公网 IPv4，
+> 不能用来签回环地址。ACME 模式请用方式 1 或 2。
+
 ## 11. 常见错误信息对照
 
 | 信息（摘要） | 位置 | 处理 |
@@ -257,6 +348,7 @@ sudo stat -c '%a %U:%G %n' /var/lib/rustboard/hub/certs/* \
 | `tls_cert 与 tls_key 不匹配` | panel install/run | 换配套文件 |
 | `... 是符号链接，拒绝使用` | panel/hub | 改用真实文件 |
 | `admin_tls=required 需要...` | hub 启动/安装 | SAN 覆盖管理端访问名；见 §10 |
+| `... 只绑定回环地址 ... 没有该回环 IP 的 SAN` | hub 启动 | 按 §10.1 三选一；不要给公共 ACME 证书加回环 IP |
 
 ## 12. 收集证据（脱敏）
 

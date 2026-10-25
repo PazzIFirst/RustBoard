@@ -156,7 +156,68 @@ sudo ./install.sh hub --yes \
 证书里的域名做 SNI / 主机名校验。若管理口绑定指定 IP，则该 IP 或可访问的 DNS
 名必须出现在证书 SAN 中；否则安装器会在写盘前提示先补 `--domain` / `--san`。
 
-### 4.6 私有 / Pebble ACME（测试环境）
+### 4.6 ACME 域名证书 + 回环管理口（fail-closed，刻意保留）
+
+`admin_tls = "required"` 且 `admin_listen` 绑定回环 IP（例如
+`127.0.0.1:8444`）时，hub 要求证书 SAN **精确包含该回环 IP**。ACME 域名证书
+只有 DNS SAN，这个组合会在监听前被拒绝，错误信息类似：
+
+```text
+admin_tls="required" 且管理 API 只绑定回环地址 127.0.0.1，但证书名字
+（ACME tls.domains / self-signed server_names）中没有该回环 IP 的 SAN...
+```
+
+这是**有意的 fail-closed**，不是配置没生效：管理端按 IP 直连时必须校验证书
+覆盖该 IP，hub 不会为了启动而放宽校验。请任选一种部署方式：
+
+1. 管理口绑定对外地址，用防火墙 / 云安全组限制来源：
+
+   ```toml
+   # /etc/rustboard/hub.toml（根表键）
+   admin_tls = "required"
+   admin_listen = "0.0.0.0:8444"
+   ```
+
+   ```bash
+   # ACME 证书的 tls.domains 需覆盖管理端实际访问的 DNS 名
+   sudo rustboard-hub tls issue --config /etc/rustboard/hub.toml
+   # 示例：只放行受信管理网段（203.0.113.0/24 为文档占位网段，按实际替换）
+   sudo ufw allow from 203.0.113.0/24 to any port 8444 proto tcp
+   ```
+
+   云安全组同样只放行管理来源，不要用 `0.0.0.0/0` 开放 8444。
+
+2. 同机 panel 走回环明文 HTTP，TLS 交给反向代理：
+
+   ```toml
+   # /etc/rustboard/hub.toml（根表键）
+   admin_tls = "off"
+   admin_listen = "127.0.0.1:8444"
+   ```
+
+   面板访问 `http://127.0.0.1:8444`，由 nginx / Caddy 等反代对外提供 HTTPS 并
+   终止 TLS。管理 API 的 Bearer token 仍然必需，不要把 8444 直接暴露到公网。
+
+3. 改用包含回环 IP SAN 的 self-signed 证书（仅 self-signed）：
+
+   ```toml
+   # /etc/rustboard/hub.toml
+   # server_names 属于根表，必须写在 [tls] 段之前
+   server_names = ["127.0.0.1", "::1", "hub.example.com"]
+
+   [tls]
+   mode = "self-signed"
+   ```
+
+   ```bash
+   sudo rustboard-hub rotate-cert --force --config /etc/rustboard/hub.toml
+   ```
+
+> **不要**把 `127.0.0.1` / `::1` 加进公共 ACME 域名证书的 `tls.domains`：
+> Let's Encrypt 等公共 CA 不会为回环 IP 签发 SAN，`tls issue` 只会失败并消耗
+> 验证失败额度。ACME 模式请使用方式 1 或 2。
+
+### 4.7 私有 / Pebble ACME（测试环境）
 
 ```bash
 sudo ./install.sh hub --yes \
