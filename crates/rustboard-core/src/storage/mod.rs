@@ -8,6 +8,7 @@
 //! [`StorageHandle`] 是 Phase D 引入的多后端边界：内部是 `Arc<dyn Storage>`，
 //! 当前只构造 SQLite；D2/D3 增加 PG schema 与实现后在这里扩展。
 
+pub mod postgres;
 pub mod sqlite;
 
 use std::ops::Deref;

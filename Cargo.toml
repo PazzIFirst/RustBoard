@@ -34,6 +34,11 @@ libc = "0.2"
 # M4-C2：object_store 的 `aws` feature 会强制 aws-lc-rs（cmake），
 # 因此按 spike 结论拆为 aws-base + reqwest + ring（纯 rustls/ring）。
 object_store = { version = "0.14.2", default-features = false, features = ["aws-base", "reqwest", "ring"] }
+# M5 Phase D：PostgreSQL 后端（D0 spike 实测组合）。
+# `postgres` 同步 API 保持 Storage trait 同步；TLS 由 tokio-postgres-rustls 提供，
+# 只启用 ring，避免 openssl / aws-lc / cmake。D3 用 r2d2 承载连接池。
+postgres = "0.19.14"
+r2d2 = "0.8.10"
 rand = "0.8"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
 # v0.3.3：Panel 支持 https://hub。选 native roots + ring provider：
@@ -41,6 +46,8 @@ rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem
 # - 用系统信任库；Panel 配置 `hub_ca` 时只信任该私有 CA（见 panel/src/proxy.rs）。
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+# 私有 CA 场景用 rustls-pki-types 解析 PEM，不引入 unmaintained 的 rustls-pemfile。
+rustls-native-certs = "0.8"
 rmp-serde = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -49,6 +56,7 @@ sha2 = "0.10"
 thiserror = "2"
 time = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal", "io-util"] }
+tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
