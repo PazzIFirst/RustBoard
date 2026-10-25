@@ -1425,6 +1425,8 @@ fn prepare_private_acme_agent_ca(cfg: &HubConfig) -> Result<Option<PathBuf>> {
     let chain_path = dir.join(tls::SERVER_CERT_FILE);
     let chain = fs::read_to_string(&chain_path)
         .with_context(|| format!("读取私有 ACME 服务端证书链失败: {}", chain_path.display()))?;
+    // store/启动/热加载路径已经用 validate_acme_chain 校验过；这里只提取链尾，
+    // 兼容旧版安装留下的合法链，避免 `hub agent add` 依赖完整订单状态。
     let anchor = tls::last_certificate_pem(&chain)
         .with_context(|| format!("提取私有 ACME 证书链尾 CA 失败: {}", chain_path.display()))?;
     if !tls::certificate_is_ca(&anchor).context("校验私有 ACME 链尾证书失败")? {
@@ -1669,10 +1671,17 @@ impl AcmeStagingDir {
         if self.removed {
             return Ok(());
         }
-        self.removed = true;
         match fs::remove_dir_all(&self.path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Ok(()) => {
+                self.removed = true;
+                Ok(())
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                self.removed = true;
+                Ok(())
+            }
+            // 删除失败时保持 removed=false，Drop 还会再试一次；绝不能把
+            // 「未清理」误标成已清理（会留下 staging CA/account 私钥）。
             Err(err) => Err(err).with_context(|| {
                 format!("删除 ACME staging 临时目录 {} 失败", self.path.display())
             }),
@@ -2144,7 +2153,30 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
         );
     }
 
-    let (mut cfg, need_certs) = prepare_config(&args, &paths, retention, config_present)?;
+    // D：显式 `--tls self-signed` 从既有 ACME 切回自签时，旧 server.crt 仍是
+    // ACME 证书；prepare_config 看到文件齐全会给 need_certs=false，后续
+    // run_install 只 harden 不重签，写出的配置与证书不一致。这里读取旧模式，
+    // 强制用既有客户端 CA 重签（CA 缺失则 fail-closed）。
+    let previous_tls_mode = if config_present {
+        HubConfig::load(&paths.config)
+            .ok()
+            .map(|previous| previous.tls.mode)
+    } else {
+        None
+    };
+    let (mut cfg, mut need_certs) = prepare_config(&args, &paths, retention, config_present)?;
+    let switching_acme_to_self = previous_tls_mode.is_some_and(|mode| mode.is_acme())
+        && cfg.tls.mode == ServerTlsMode::SelfSigned;
+    if switching_acme_to_self {
+        // 只有确实存在 ACME 数据目录时才要求既有 CA。ACME 新装失败后 txn 已
+        // 回滚 data_dir，但配置文件可能恢复成 ACME 模式；此时重试 self-signed
+        // 属于全新安装，应允许创建新 CA。
+        if paths.data_dir.exists() {
+            tls::load_validated_ca(&paths.data_dir)
+                .context("从 ACME 切回 self-signed 需要既有客户端 CA；CA 缺失或损坏，拒绝继续")?;
+        }
+        need_certs = true;
+    }
     // B：--offline 的 CLI 参数检查只覆盖本次显式 ACME；已有配置可能本来就是
     // ACME。必须在任何诊断 / 事务 / 联网之前拒绝，且不得改写配置。
     ensure_offline_not_acme(&args, &cfg)?;
@@ -2163,7 +2195,10 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
         ensure_existing_acme_ca_complete(&paths.data_dir, data_dir_existed_before)?;
     }
     // L7：需要补证书但数据目录已存在（可能有旧 CA / agent 指纹）时拒绝重建。
-    ensure_cert_rebuild_allowed(&paths.data_dir, need_certs)?;
+    // 显式 ACME→self-signed 是安全的「复用既有 CA 重签 server」，不是重建 CA。
+    if !switching_acme_to_self {
+        ensure_cert_rebuild_allowed(&paths.data_dir, need_certs)?;
+    }
     if !need_certs && (args.advertise.is_some() || !args.sans.is_empty()) {
         println!(
             "提示：沿用已有服务端证书；新增 SAN 需再执行 `rustboard-hub rotate-cert` 才会生效。"
@@ -2199,13 +2234,34 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
 
     // 只有新装、或旧面板状态丢失、或本次重新生成了 admin_token 时才重跑面板：
     // 已有配置的 --force 会保留 token，不需要动面板。
-    let install_panel =
-        panel_yes && (state.role(Role::Panel).is_none() || existing.is_none() || !config_present);
+    let install_panel = panel_yes
+        && (state.role(Role::Panel).is_none()
+            || existing.is_none()
+            || !config_present
+            // 私有 ACME 的 panel 需要 hub_ca=agent-ca.pem；升级/强制安装时重跑
+            // panel 安装器，把旧 acme_ca_file 迁移到新的链尾信任锚。
+            || (args.force
+                && cfg.tls.mode.is_acme()
+                && !cfg.tls.acme_ca_file.trim().is_empty()));
 
     let mut txn = InstallTxn::begin(&paths, false)?;
+    // 全新 ACME 安装的 data_dir 必须由事务拥有：后续 run_install 启动 hub 会
+    // 写 rustboard.db，guard 只删 certs 时 data_dir 非空，失败重试会被
+    // “已有 data_dir 缺 CA”/“证书不完整”卡死。提前登记 OwnedDir，txn.rollback
+    // 才能递归清理。
+    if cfg.tls.mode.is_acme() && !data_dir_existed_before {
+        txn.create_owned_dir(&paths.data_dir, 0o700)?;
+    }
     // ACME 先写配置并调用 `tls issue`：成功后继续原事务；失败回退 self-signed
     // 后继续，确保最终落盘的配置与证书来源一致。
     let mut acme_guard: Option<AcmeCertGuard> = None;
+    // 端口预检回退在 issue 之前把 cfg 改成 self-signed；此时仍要保护原 ACME
+    // 服务端证书，后续任何安装失败都必须能恢复回来。
+    if force_self_signed && !cfg.tls.mode.is_acme() && data_dir_existed_before {
+        let mut guard = AcmeCertGuard::capture(&paths.data_dir, data_dir_existed_before);
+        guard.arm();
+        acme_guard = Some(guard);
+    }
     if cfg.tls.mode.is_acme() {
         match issue_acme_with_fallback(
             &mut cfg,
@@ -2217,6 +2273,12 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
             Ok(AcmeOutcome::Issued { guard }) => acme_guard = Some(guard),
             Ok(AcmeOutcome::FellBack) => {
                 force_self_signed = true;
+                // issue 已在回退时恢复旧证书；重新捕获并保持 armed 到 commit，
+                // 防止后续 run_install/健康检查/面板失败留下 self-signed 证书 +
+                // 旧 ACME 配置。
+                let mut guard = AcmeCertGuard::capture(&paths.data_dir, data_dir_existed_before);
+                guard.arm();
+                acme_guard = Some(guard);
             }
             Err(err) => {
                 // 尚未触碰服务 / unit；回滚配置与本次创建的文件。

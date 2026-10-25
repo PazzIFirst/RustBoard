@@ -859,6 +859,15 @@ fi
 if is_acme_tls_mode "$TLS_MODE"; then
     # 显式 ACME 时绝不追加 --offline（用户也可能把参数写在数组里）。
     log "证书模式: $TLS_MODE（需要访问 ACME 目录，不追加 --offline）"
+elif has_arg --force; then
+    # 已有配置可能是 ACME，脚本看不到 hub.toml 的 tls.mode；--force 时不要
+    # 自动注入 --offline，由 hub install 读取既有配置后决定（既有 ACME 会
+    # 拒绝 offline，自签也不会因此联网）。显式 --offline 仍保留。
+    if has_arg --offline; then
+        log "显式 --offline 保留；由 hub install 校验既有配置是否 ACME"
+    else
+        log "--force 已有安装：不自动追加 --offline（由 hub install 读取既有 tls.mode）"
+    fi
 else
     if ! has_arg --offline; then
         ARGS+=(--offline)
