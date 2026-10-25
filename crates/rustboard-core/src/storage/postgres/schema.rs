@@ -379,15 +379,14 @@ CREATE TABLE IF NOT EXISTS archive_state (
 );
 "#;
 
-/// 解析 DSN 并建立一条**仅供 schema 初始化使用**的连接。
+/// 解析 DSN、叠加环境变量密码，返回 schema 初始化用的连接配置。
 ///
-/// D2 不做 TLS、不做连接池：只接受显式 `sslmode=disable`（本地/受信内网），
-/// 其他模式直接拒绝，避免误以为这里已经具备生产 TLS 语义。D3 的
-/// `PostgresStorage` 会用 `tokio-postgres-rustls` + `r2d2` 单独建连。
-///
-/// 错误信息不回显 DSN（可能含密码）。
-pub fn connect_for_schema(dsn: &str) -> Result<postgres::Client> {
-    let config: postgres::Config = dsn
+/// 密码优先级与 [`PostgresStorage::open`](super::PostgresStorage::open) 一致：
+/// `RUSTBOARD_DATABASE_PASSWORD` 非空时覆盖 DSN query/authority 里的密码；
+/// 未设置或空串则沿用 DSN 内密码。非 UTF-8 的 env 直接报错（fail-closed），
+/// 错误信息只含变量名，不回显密码或 DSN。
+fn schema_config(dsn: &str) -> Result<postgres::Config> {
+    let mut config: postgres::Config = dsn
         .parse()
         .context("PostgreSQL DSN 解析失败（D2 schema 连接只支持 sslmode=disable）")?;
     if config.get_ssl_mode() != SslMode::Disable {
@@ -395,7 +394,22 @@ pub fn connect_for_schema(dsn: &str) -> Result<postgres::Client> {
             "schema 初始化连接只支持 sslmode=disable；生产 TLS/pool 由 D3 的 PostgresStorage 负责"
         );
     }
-    config
+    if let Some(password) = super::database_password_from_env()? {
+        config.password(password);
+    }
+    Ok(config)
+}
+
+/// 解析 DSN 并建立一条**仅供 schema 初始化使用**的连接。
+///
+/// D2 不做 TLS、不做连接池：只接受显式 `sslmode=disable`（本地/受信内网），
+/// 其他模式直接拒绝，避免误以为这里已经具备生产 TLS 语义。D3 的
+/// `PostgresStorage` 会用 `tokio-postgres-rustls` + `r2d2` 单独建连。
+///
+/// env `RUSTBOARD_DATABASE_PASSWORD` 非空时覆盖 DSN 内密码，与
+/// `PostgresStorage` 保持一致；错误信息不回显 DSN 或密码。
+pub fn connect_for_schema(dsn: &str) -> Result<postgres::Client> {
+    schema_config(dsn)?
         .connect(NoTls)
         .context("连接 PostgreSQL 失败（D2 schema 连接只支持 sslmode=disable）")
 }
@@ -531,6 +545,9 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, MutexGuard};
+
     use super::*;
 
     /// 表/索引清单必须与 SQLite v7 基线一一对应，防止后续改 DDL 时漏项。
@@ -614,6 +631,108 @@ mod tests {
             POSTGRES_SCHEMA_DDL.matches("BIGSERIAL PRIMARY KEY").count(),
             9,
             "9 张表应有 BIGSERIAL 主键（5 张 SQLite AUTOINCREMENT + 4 张新增 id）"
+        );
+    }
+
+    // ---- env 密码覆盖 ----------------------------------------------------
+    //
+    // 串行化所有会改动进程环境变量的测试，并在 guard drop 时还原原值。
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct PasswordEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl PasswordEnvGuard {
+        fn set(value: Option<&OsStr>) -> Self {
+            let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os(super::super::PASSWORD_ENV);
+            match value {
+                Some(value) => std::env::set_var(super::super::PASSWORD_ENV, value),
+                None => std::env::remove_var(super::super::PASSWORD_ENV),
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for PasswordEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(super::super::PASSWORD_ENV, value),
+                None => std::env::remove_var(super::super::PASSWORD_ENV),
+            }
+        }
+    }
+
+    /// env 覆盖优先级必须与 `PostgresStorage` 一致：非空 env > DSN 内密码。
+    #[test]
+    fn schema_config_env_password_matches_postgres_storage_priority() {
+        const DSN_WITH_PW: &str =
+            "postgres://rustboard:url-secret@127.0.0.1:1/rustboard?sslmode=disable";
+        const DSN_WITHOUT_PW: &str = "postgres://rustboard@127.0.0.1:1/rustboard?sslmode=disable";
+
+        {
+            let _env = PasswordEnvGuard::set(None);
+            assert_eq!(
+                schema_config(DSN_WITH_PW).unwrap().get_password(),
+                Some(b"url-secret".as_slice()),
+                "无 env 时应保留 DSN 内密码"
+            );
+            assert_eq!(
+                schema_config(DSN_WITHOUT_PW).unwrap().get_password(),
+                None,
+                "无 env 且 DSN 无密码时应保持无密码"
+            );
+        }
+
+        {
+            let _env = PasswordEnvGuard::set(Some(OsStr::new("")));
+            assert_eq!(
+                schema_config(DSN_WITH_PW).unwrap().get_password(),
+                Some(b"url-secret".as_slice()),
+                "空 env 视为未设置，不得覆盖 DSN 密码"
+            );
+        }
+
+        {
+            let _env = PasswordEnvGuard::set(Some(OsStr::new("env-secret")));
+            assert_eq!(
+                schema_config(DSN_WITH_PW).unwrap().get_password(),
+                Some(b"env-secret".as_slice()),
+                "非空 env 必须覆盖 DSN 内密码"
+            );
+            assert_eq!(
+                schema_config(DSN_WITHOUT_PW).unwrap().get_password(),
+                Some(b"env-secret".as_slice()),
+                "DSN 无密码时 env 密码必须生效"
+            );
+        }
+    }
+
+    /// 非 UTF-8 env 必须 fail-closed，且错误信息不能带出密码内容。
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_env_password_is_rejected_without_leaking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let _env = PasswordEnvGuard::set(Some(OsStr::from_bytes(b"topsecret\xff")));
+        let err = schema_config("postgres://rustboard@127.0.0.1:1/rustboard?sslmode=disable")
+            .expect_err("非 UTF-8 env 必须返回错误");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(super::super::PASSWORD_ENV),
+            "错误应指出环境变量名：{message}"
+        );
+        assert!(
+            !message.contains("topsecret"),
+            "错误信息泄露密码：{message}"
         );
     }
 }
