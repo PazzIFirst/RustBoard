@@ -31,7 +31,7 @@ use hyper::body::Incoming;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use rustboard_common::config::{AdminTlsMode, HubConfig, ServerTlsMode};
+use rustboard_common::config::{AdminTlsMode, DatabaseKind, HubConfig, ServerTlsMode};
 use rustboard_common::control::ControlError;
 use rustboard_common::fsutil;
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
@@ -45,6 +45,8 @@ use rustboard_core::alerts::builtin_rules;
 use rustboard_core::archive::{sha256_hex, ArchiveObject, ArchiveStatus, ColdStore};
 use rustboard_core::collect::default_collectors;
 use rustboard_core::downsample;
+use rustboard_core::storage::postgres::PostgresStorage;
+#[cfg(test)]
 use rustboard_core::storage::sqlite::DEFAULT_READ_POOL_SIZE;
 use rustboard_core::storage::StorageHandle;
 use rustboard_core::storage::{
@@ -516,8 +518,7 @@ fn main() -> Result<()> {
         Cmd::Run { config } => {
             let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
             let cfg = load_config(&path)?;
-            let db_path = cfg.sqlite_path()?;
-            run(cfg, db_path)
+            run(cfg)
         }
         Cmd::RotateCert {
             config,
@@ -716,11 +717,11 @@ fn validate_token_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// 打开配置文件指向的 SQLite（CLI 与运行中的 hub 通过 WAL 并发）。
+/// 打开配置文件指向的存储（SQLite 或 PostgreSQL；CLI 与运行中的 hub 并发访问）。
 fn open_token_storage(config: Option<PathBuf>) -> Result<StorageHandle> {
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
     let cfg = load_config(&path)?;
-    StorageHandle::sqlite(&cfg.sqlite_path()?, DEFAULT_READ_POOL_SIZE)
+    open_cli_storage_for_config(&cfg).context("打开 token 存储失败")
 }
 
 /// 把 `--scope` 解析成枚举，非法值给出可读错误。
@@ -795,7 +796,7 @@ fn maintenance_command(action: MaintenanceAction) -> Result<()> {
     Ok(())
 }
 
-/// 打开配置指向的 SQLite，供维护 CLI 使用。
+/// 打开配置指向的存储，供维护 CLI 使用。
 ///
 /// 只要求配置本身合法（retention 倒挂/越界必须在这里拒绝，否则删除边界不可信），
 /// **不要求 admin_token / 证书材料**：排障与 e2e 可在 hub 未运行时独立执行。
@@ -804,9 +805,7 @@ fn open_maintenance_storage(config: Option<PathBuf>) -> Result<(StorageHandle, H
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
     let cfg = load_config(&path)?;
     cfg.validate().context("维护任务配置校验失败")?;
-    let db_path = cfg.sqlite_path()?;
-    let storage = StorageHandle::sqlite(&db_path, DEFAULT_READ_POOL_SIZE)
-        .with_context(|| format!("打开维护数据库失败: {}", db_path.display()))?;
+    let storage = open_cli_storage_for_config(&cfg).context("打开维护数据库失败")?;
     Ok((storage, cfg))
 }
 
@@ -1353,7 +1352,7 @@ fn agent_add(config: Option<PathBuf>, name: String, ttl_minutes: u32) -> Result<
         }
     };
 
-    let db = StorageHandle::sqlite(&cfg.sqlite_path()?, DEFAULT_READ_POOL_SIZE)?;
+    let db = open_cli_storage_for_config(&cfg).context("打开 agent 存储失败")?;
     let now = now_ms();
     let expires = now + (ttl_minutes as i64) * 60_000;
     db.create_enroll_token(&tls::sha256_hex(&token), &name, now, expires)?;
@@ -1417,7 +1416,7 @@ fn hub_agent_ws_url(cfg: &HubConfig) -> Result<String> {
 fn agent_revoke(config: Option<PathBuf>, id: String) -> Result<()> {
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
     let cfg = load_config(&path)?;
-    let db = StorageHandle::sqlite(&cfg.sqlite_path()?, DEFAULT_READ_POOL_SIZE)?;
+    let db = open_cli_storage_for_config(&cfg).context("打开 agent 存储失败")?;
     db.revoke_agent(&id, now_ms())?;
     println!("已吊销 agent: {id}");
     Ok(())
@@ -1806,6 +1805,77 @@ fn open_storage(
     }
 }
 
+/// 按 `HubConfig::database` 打开对应后端（Phase D4）。
+///
+/// # 运行时不变量
+///
+/// PostgreSQL 的同步驱动会在内部创建 current-thread runtime 并 `block_on`；
+/// 在 tokio runtime 内调用会直接 panic（spike §4.1）。因此本函数**只能在
+/// runtime 外调用**：`run` 在 `runtime.block_on` 之前调用，CLI 命令本身就在
+/// runtime 外调用。async 任务内的存储访问必须走 [`storage_blocking`]。
+///
+/// PostgreSQL 路径会在返回前完成幂等 schema 迁移；SQLite 路径与旧行为一致，
+/// 仍走 [`open_storage`]（数据库位于 `data_dir` 时收紧目录权限）。
+/// 所有错误上下文只包含 `DatabaseKind::redacted()`，不出现 DSN 密码。
+fn open_storage_for_config(cfg: &HubConfig) -> Result<StorageHandle> {
+    open_storage_for_config_with(cfg, true)
+}
+
+/// CLI 版存储入口：PostgreSQL 与 hub 启动一致，SQLite 保持旧 CLI 行为。
+///
+/// 旧 CLI（token / agent / maintenance）直接 `StorageHandle::sqlite`，不会声明
+/// `data_dir` 为私有目录。容器里 hub 以运行用户 10001 持有 `data_dir`，而
+/// `docker exec` 的 CLI 是 root；若这里调用 [`open_storage`] 收紧目录权限，
+/// 会因「目录属于其他用户」直接失败。因此 CLI 路径只打开数据库文件。
+fn open_cli_storage_for_config(cfg: &HubConfig) -> Result<StorageHandle> {
+    open_storage_for_config_with(cfg, false)
+}
+
+fn open_storage_for_config_with(
+    cfg: &HubConfig,
+    harden_sqlite_data_dir: bool,
+) -> Result<StorageHandle> {
+    let kind = cfg.database_kind().context("解析 database 配置失败")?;
+    match &kind {
+        DatabaseKind::Sqlite(path) => {
+            if harden_sqlite_data_dir {
+                open_storage(path, &cfg.data_dir, cfg.read_pool_size)
+            } else {
+                StorageHandle::sqlite(path, cfg.read_pool_size)
+                    .with_context(|| format!("打开 SQLite 数据库失败: {}", path.display()))
+            }
+        }
+        DatabaseKind::Postgres(_) => {
+            let database = kind.redacted();
+            // `open_from_config` 内部会建立连接池并做一次 SELECT 1；apply_schema
+            // 复用池内连接。两者都必须在 blocking 上下文执行。
+            let pg = PostgresStorage::open_from_config(cfg)
+                .with_context(|| format!("打开 PostgreSQL 存储失败（database={database}）"))?;
+            pg.apply_schema()
+                .with_context(|| format!("初始化 PostgreSQL schema 失败（database={database}）"))?;
+            Ok(StorageHandle::postgres(pg))
+        }
+    }
+}
+
+/// 在 blocking 线程上执行一次同步存储调用。
+///
+/// async 路径（会话握手、心跳、清理、启动初始化）不得直接调用
+/// [`StorageHandle`]：PostgreSQL 的 connect/query/drop 在 tokio worker 上会
+/// panic（`Cannot start a runtime from within a runtime`，spike §4）。闭包内
+/// 完成“取连接 → 查询/事务 → 归还连接”，不把任何连接 guard 返回到 async 侧。
+/// SQLite 也统一走这里，换来的是边界一致、不需要按后端分叉调用点。
+async fn storage_blocking<T, F>(storage: Arc<StorageHandle>, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&StorageHandle) -> Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || f(&storage)).await {
+        Ok(result) => result,
+        Err(err) => Err(anyhow::Error::new(err).context("执行存储后台任务失败")),
+    }
+}
+
 /// 启动时收紧已存在的证书目录（KI-21）。
 ///
 /// 只处理已经存在的目录：证书缺失是另一类需要暴露的启动错误，不能用一个新建的
@@ -1819,7 +1889,7 @@ fn harden_existing_cert_dir(data_dir: &FsPath) -> Result<()> {
     Ok(())
 }
 
-fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
+fn run(cfg: HubConfig) -> Result<()> {
     // 启动前先做配置自洽性校验，避免把明显错误的有效期/检查周期带到运行期。
     cfg.validate().context("hub 配置校验失败")?;
     // common 侧暂不校验采样间隔；hub 启动前本地兜住，避免 Welcome 下发非法值。
@@ -1839,18 +1909,30 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
     acme::store::harden_acme_material(&cfg.data_dir)
         .context("启动前收紧 ACME 账户/状态文件权限失败")?;
 
+    // Phase D4：存储必须在 tokio runtime 之前打开。PostgreSQL 的同步连接池
+    // 不能在 async 块内创建（spike §4.1/§4.4），schema 迁移同样在 blocking
+    // 上下文完成；SQLite 提前打开行为不变。
+    let database = cfg
+        .database_kind()
+        .context("解析 database 配置失败")?
+        .redacted();
+    let storage = Arc::new(open_storage_for_config(&cfg)?);
+    tracing::info!(database = %database, read_pool_size = cfg.read_pool_size, "存储已就绪");
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
-    runtime.block_on(async move {
-        // KI-02：写连接 1 条 + 只读连接池，长查询不再阻塞写入与心跳。
-        let storage = Arc::new(open_storage(&db_path, &cfg.data_dir, cfg.read_pool_size)?);
-        tracing::info!(db = %db_path.display(), read_pool_size = cfg.read_pool_size, "存储已就绪");
+    // 保留一份 runtime 外的句柄：即使 async 侧先结束，PG 连接池的最后一个
+    // Arc 也在 runtime 之外释放（D3 的 Drop 另有独立线程兜底）。
+    let storage_for_run = storage.clone();
+    let result: Result<()> = runtime.block_on(async move {
+        let storage = storage_for_run;
 
         // L5：监听前清掉上次异常退出遗留的 online，避免面板长期显示假在线。
-        let reset = storage
-            .reset_online_status()
+        // 所有存储调用都在 spawn_blocking 内，PG 才不会在 worker 上 panic。
+        let reset = storage_blocking(storage.clone(), |storage| storage.reset_online_status())
+            .await
             .context("启动时重置在线状态失败")?;
         if reset > 0 {
             tracing::info!(count = reset, "启动时已将残留的 online 状态重置为 offline");
@@ -1858,7 +1940,11 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
 
         // M3：审计保留 180 天，启动时先清一次过期记录（运行期每 1000 条再清）。
         let audit_cutoff = now_ms().saturating_sub(AUDIT_RETENTION_MS);
-        match storage.prune_audit(audit_cutoff) {
+        match storage_blocking(storage.clone(), move |storage| {
+            storage.prune_audit(audit_cutoff)
+        })
+        .await
+        {
             Ok(0) => {}
             Ok(removed) => tracing::info!(removed, "启动时已清理过期审计记录"),
             Err(err) => tracing::warn!(error = %err, "启动时清理过期审计记录失败"),
@@ -1870,16 +1956,16 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         // 其它规则占用时显式失败（不再静默跳过）。初始阈值来自 `[alerts]` 配置：
         // 离线用 `offline_after_secs`（秒），证书用 `cert_warn_hours`（小时）。
         let seed_now = now_ms();
-        let seeded = storage
-            .seed_builtin_alert_rules(
-                &builtin_rules(
-                    seed_now,
-                    cfg.alerts.offline_after_secs,
-                    cfg.alerts.cert_warn_hours,
-                ),
+        let offline_after_secs = cfg.alerts.offline_after_secs;
+        let cert_warn_hours = cfg.alerts.cert_warn_hours;
+        let seeded = storage_blocking(storage.clone(), move |storage| {
+            storage.seed_builtin_alert_rules(
+                &builtin_rules(seed_now, offline_after_secs, cert_warn_hours),
                 seed_now,
             )
-            .context("写入内置告警规则失败")?;
+        })
+        .await
+        .context("写入内置告警规则失败")?;
         if seeded > 0 {
             tracing::info!(seeded, "已写入内置告警规则（初始 disabled）");
         }
@@ -2027,7 +2113,12 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
             serve(admin_app, admin_addr, admin_tls)
         )?;
         Ok(())
-    })
+    });
+    // PG 连接池的最后一个引用必须在 runtime 外释放（spike §4.3）；D3 的
+    // `PostgresStorage::Drop` 还会把池移交给独立线程，这里是双保险。
+    drop(runtime);
+    drop(storage);
+    result
 }
 
 /// 管理监听是否绑在非回环地址；解析失败与 bind 一样视为启动错误。
@@ -4717,9 +4808,11 @@ async fn handle_enroll(mut socket: WebSocket, state: AppState, req: EnrollReques
     };
 
     let now = now_ms();
-    let Some(token_name) = state
-        .storage
-        .consume_enroll_token(&tls::sha256_hex(&req.token), now)?
+    let token_hash = tls::sha256_hex(&req.token);
+    let Some(token_name) = storage_blocking(state.storage.clone(), move |storage| {
+        storage.consume_enroll_token(&token_hash, now)
+    })
+    .await?
     else {
         send_frame(
             &mut socket,
@@ -4737,10 +4830,8 @@ async fn handle_enroll(mut socket: WebSocket, state: AppState, req: EnrollReques
         .context("签发客户端证书失败")?;
 
     let secret = new_secret();
-    state
-        .storage
-        .set_agent_secret(&agent_id, &tls::sha256_hex(&secret), now)?;
-    state.storage.upsert_agent(&AgentRecord {
+    let secret_hash = tls::sha256_hex(&secret);
+    let record = AgentRecord {
         agent_id: agent_id.clone(),
         name: if token_name.is_empty() {
             req.hostname.clone()
@@ -4755,7 +4846,13 @@ async fn handle_enroll(mut socket: WebSocket, state: AppState, req: EnrollReques
         status: "pending".to_string(),
         last_seen_at: now,
         created_at: now,
-    })?;
+    };
+    let agent_id_for_db = agent_id.clone();
+    storage_blocking(state.storage.clone(), move |storage| {
+        storage.set_agent_secret(&agent_id_for_db, &secret_hash, now)?;
+        storage.upsert_agent(&record)
+    })
+    .await?;
 
     tracing::info!(agent = %agent_id, host = %req.hostname, "agent 已纳管");
     send_frame(
@@ -4791,21 +4888,33 @@ async fn handle_session(mut socket: WebSocket, state: AppState, hello: AgentHell
         );
     }
 
-    if state.storage.is_revoked(&agent_id)? {
+    let revoked = storage_blocking(state.storage.clone(), {
+        let agent = agent_id.clone();
+        move |storage| storage.is_revoked(&agent)
+    })
+    .await?;
+    if revoked {
         send_frame(&mut socket, &problem(codes::REVOKED, "该 agent 已被吊销")).await?;
         bail!("已吊销的 agent 尝试连接: {agent_id}");
     }
 
-    if !state
-        .storage
-        .verify_agent_secret(&agent_id, &tls::sha256_hex(&hello.secret))?
-    {
+    let secret_hash = tls::sha256_hex(&hello.secret);
+    let secret_ok = storage_blocking(state.storage.clone(), {
+        let agent = agent_id.clone();
+        move |storage| storage.verify_agent_secret(&agent, &secret_hash)
+    })
+    .await?;
+    if !secret_ok {
         send_frame(&mut socket, &problem(codes::BAD_TOKEN, "agent secret 无效")).await?;
         bail!("agent secret 校验失败: {agent_id}");
     }
 
     let now = now_ms();
-    let existing = state.storage.get_agent(&agent_id)?;
+    let existing = storage_blocking(state.storage.clone(), {
+        let agent = agent_id.clone();
+        move |storage| storage.get_agent(&agent)
+    })
+    .await?;
     let name = if !hello.name.trim().is_empty() {
         hello.name.clone()
     } else if let Some(prev) = existing.as_ref() {
@@ -4832,210 +4941,275 @@ async fn handle_session(mut socket: WebSocket, state: AppState, hello: AgentHell
     };
 
     // 从这里开始，所有退出路径（正常关闭 / recv 错误 / send 错误 / 心跳超时 /
-    // 入库错误 / 任务失败）都由 `_cleanup` 的 Drop 统一执行状态清理。
+    // 入库错误 / 任务失败）都由 `cleanup` 统一执行状态清理。
     // `register` 对同一 agent 会等旧连接的清理回调（写 offline/revoked）结束才插入
     // 新连接，因此下面的 `upsert_agent(online)` 一定晚于旧 offline 落库。
-    let handle = state.sessions.register(&agent_id);
-    let _cleanup = SessionCleanup::new(
+    // 注册在 blocking 线程执行：旧连接清理可能正持有 slot 锁做 PG 写入，不能
+    // 让 tokio worker 卡在这把锁上。
+    let handle = {
+        let sessions = state.sessions.clone();
+        let agent = agent_id.clone();
+        tokio::task::spawn_blocking(move || sessions.register(&agent))
+            .await
+            .context("注册 agent 会话失败")?
+    };
+    let mut cleanup = SessionCleanup::new(
         state.storage.clone(),
         state.sessions.clone(),
         agent_id.clone(),
         handle.conn_id,
     );
-    // M3：控制命令的 pending 表属于本会话。声明顺序保证会话结束时先 Drop
-    // `ControlSession`（给所有等待者回 agent_offline），再注销注册表。
-    // #18：每条 pending 带上本地 deadline；会话每秒清理一次，避免管理 API 超时后
-    // 残留项永久占用 max_pending 名额。
-    let mut control = ControlSession::new(
-        state.cfg.control.max_pending_per_session,
-        Duration::from_millis(state.cfg.control.request_timeout_ms.max(1)),
-    );
-    let mut control_rx = handle.control_rx;
-    let mut watch_control = true;
-    // 首轮 tick 立即触发（此时 pending 必为空），随后每秒一次；错过的 tick 直接跳过，
-    // 不让慢连接积压出连续清理。
-    let mut control_expire = tokio::time::interval(Duration::from_secs(1));
-    control_expire.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    state.storage.upsert_agent(&record)?;
-    // M3 + KI-24：能力先登记到本条连接；只有它仍是该 agent 的最新连接时才写库。
-    // 未知能力在入库前就被忽略，数据库里只会有本版本认识的四个字符串。
-    // 旧连接晚到的 Hello 只更新自己的记录，返回 false 且不覆盖新连接的能力。
-    let capabilities = control::sanitize_agent_capabilities(&hello.capabilities);
-    let persisted = state.sessions.set_capabilities(
-        &agent_id,
-        handle.conn_id,
-        capabilities,
-        |capabilities| {
-            state
-                .storage
-                .upsert_agent_control(&agent_id, capabilities, now)?;
-            if !capabilities.is_empty() {
-                tracing::info!(
-                    agent = %agent_id,
-                    capabilities = capabilities.len(),
-                    "agent 控制能力已登记"
-                );
-            }
-            Ok(())
-        },
-    )?;
-    if !persisted {
-        tracing::debug!(
-            agent = %agent_id,
-            conn_id = handle.conn_id,
-            "旧连接晚到的 Hello 能力仅登记到会话，不写库"
+    // 会话主体放进 async 块：无论从哪条路径退出（含 `?`），都能在块结束后
+    // 先 await 异步清理，再返回结果；Drop 只是任务被取消时的兜底。
+    let outcome: Result<()> = async move {
+        // M3：控制命令的 pending 表属于本会话。声明顺序保证会话结束时先 Drop
+        // `ControlSession`（给所有等待者回 agent_offline），再注销注册表。
+        // #18：每条 pending 带上本地 deadline；会话每秒清理一次，避免管理 API 超时后
+        // 残留项永久占用 max_pending 名额。
+        let mut control = ControlSession::new(
+            state.cfg.control.max_pending_per_session,
+            Duration::from_millis(state.cfg.control.request_timeout_ms.max(1)),
         );
-    }
-    // upsert_agent 会把状态写回 online；若吊销恰好发生在握手期间，立即恢复 revoked。
-    if state.storage.is_revoked(&agent_id)? {
-        state.storage.set_status(&agent_id, "revoked", now_ms())?;
-        send_frame(&mut socket, &problem(codes::REVOKED, "该 agent 已被吊销")).await?;
-        bail!("握手期间 agent 被吊销: {agent_id}");
-    }
-    tracing::info!(agent = %agent_id, host = %hello.hostname, "agent 已连接");
+        let mut control_rx = handle.control_rx;
+        let mut watch_control = true;
+        // 首轮 tick 立即触发（此时 pending 必为空），随后每秒一次；错过的 tick 直接跳过，
+        // 不让慢连接积压出连续清理。
+        let mut control_expire = tokio::time::interval(Duration::from_secs(1));
+        control_expire.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let welcome = Frame::Welcome(Welcome {
-        agent_id: agent_id.clone(),
-        server_version: VERSION.to_string(),
-        protocol: PROTOCOL_VERSION,
-        sample_interval_ms: sample_interval_for(&state, &agent_id),
-        server_time: now,
-    });
-    send_frame(&mut socket, &welcome).await?;
-
-    let mut shutdown = handle.shutdown;
-    let mut watch_shutdown = true;
-    // 每个会话最多成功续签一次，状态跟随会话生命周期。
-    let mut renew = RenewState::default();
-    // 绝对空闲 deadline：每秒的控制清理 tick 不会重置它，只有入站帧才续期。
-    let mut idle = SessionIdle::new(SESSION_IDLE_TIMEOUT);
-
-    loop {
-        // 45s 内收不到任何帧就认为连接已死；agent 每 15s 发一次 Ping。
-        // 空闲超时是独立 select 分支：即使 recv / 控制队列 / 清理 tick 持续就绪，
-        // biased 也会在 deadline 时优先关闭连接，不会被其它分支饿死。
-        let recv = socket.recv();
-        let idle_sleep = tokio::time::sleep_until(idle.deadline());
-        tokio::pin!(idle_sleep);
-        let event = tokio::select! {
-            biased;
-            changed = shutdown.changed(), if watch_shutdown => {
-                // 关闭原因由 SessionRegistry 写入（吊销 / 配置变更）。
-                match changed {
-                    Ok(()) => SessionEvent::Shutdown(*shutdown.borrow_and_update()),
-                    Err(_) => SessionEvent::WatchClosed,
-                }
-            }
-            _ = &mut idle_sleep => SessionEvent::IdleTimeout,
-            // 清理优先于新控制命令：持续就绪的控制队列不能把 pending 超时清理
-            // 推迟到方案承诺的 ≤2s 之外。shutdown 仍保持最高优先级。
-            _ = control_expire.tick() => SessionEvent::ControlExpired,
-            command = control_rx.recv(), if watch_control => match command {
-                Some(command) => SessionEvent::Control(command),
-                None => SessionEvent::ControlClosed,
-            },
-            received = recv => match received {
-                None => SessionEvent::Closed,
-                Some(Err(err)) => SessionEvent::RecvError(err.to_string()),
-                Some(Ok(message)) => SessionEvent::Message(message),
-            },
-        };
-
-        match event {
-            SessionEvent::Shutdown(ShutdownReason::Revoke) => {
-                tracing::info!(agent = %agent_id, "收到吊销通知，关闭会话");
-                reject_and_close(&mut socket, codes::REVOKED, "该 agent 已被吊销").await;
-                break;
-            }
-            SessionEvent::Shutdown(ShutdownReason::Reconfigure) => {
-                // 配置变更不是吊销：发 Close(1000) 正常关闭，agent 会立即重连并
-                // 在 Welcome 里拿到新采样间隔。绝不发 revoked Problem。
-                tracing::info!(agent = %agent_id, "收到配置变更通知，正常关闭会话以便重连");
-                let close = Message::Close(Some(CloseFrame {
-                    code: close_code::NORMAL,
-                    reason: "reconfigure".into(),
-                }));
-                if let Err(err) = send_with_timeout(&mut socket, close).await {
-                    tracing::debug!(agent = %agent_id, error = %err, "发送 Close 帧失败");
-                }
-                break;
-            }
-            SessionEvent::WatchClosed => {
-                // 正常流程不会走到这里：注册表在会话循环期间一直持有发送端。
-                tracing::debug!(agent = %agent_id, "会话取消信号已关闭，停止监听吊销");
-                watch_shutdown = false;
-            }
-            SessionEvent::IdleTimeout => {
-                tracing::warn!(
-                    agent = %agent_id,
-                    timeout_secs = SESSION_IDLE_TIMEOUT.as_secs(),
-                    "会话心跳超时，主动关闭"
-                );
-                break;
-            }
-            SessionEvent::Closed => break,
-            SessionEvent::RecvError(err) => {
-                tracing::warn!(agent = %agent_id, error = %err, "接收失败，关闭会话");
-                break;
-            }
-            SessionEvent::Control(command) => {
-                // #17：dispatch 前再查一次吊销。命中/查询失败都只回错误，
-                // 绝不把 ControlCommand 投递给 agent；随后 continue 等 watcher 关闭。
-                if let Err(error) = control_revocation_gate(&state, &agent_id).await {
-                    let _ = command.reply.send(Err(error));
-                    continue;
-                }
-                // 分配会话内 id 并发送 ControlRequest；容量超限时 dispatch 已回错误。
-                control.dispatch(&mut socket, command).await?;
-            }
-            SessionEvent::ControlClosed => {
-                tracing::debug!(agent = %agent_id, "控制命令通道已关闭，停止接收控制请求");
-                watch_control = false;
-            }
-            SessionEvent::ControlExpired => {
-                // 只遍历内存 pending 并回 oneshot，不做 I/O，不阻塞采集 / ACK。
-                let expired = control.expire(Instant::now());
-                if expired > 0 {
-                    tracing::debug!(agent = %agent_id, expired, "清理超时的控制请求");
-                }
-            }
-            SessionEvent::Message(message) => {
-                match handle_message(
-                    &mut socket,
-                    &state,
-                    &agent_id,
-                    &mut renew,
-                    &mut control,
-                    message,
-                )
-                .await?
-                {
-                    MessageAction::Continue => {
-                        // 只有完整处理完一帧才续期：慢批次入库 / 证书签发等
-                        // 处理耗时不能被计入下一个空闲窗口，否则处理完立即被误杀。
-                        // 控制命令 / 清理 tick / shutdown 都不算心跳，不续期。
-                        idle.on_frame();
+        storage_blocking(state.storage.clone(), move |storage| {
+            storage.upsert_agent(&record)
+        })
+        .await?;
+        // M3 + KI-24：能力先登记到本条连接；只有它仍是该 agent 的最新连接时才写库。
+        // 未知能力在入库前就被忽略，数据库里只会有本版本认识的四个字符串。
+        // 旧连接晚到的 Hello 只更新自己的记录，返回 false 且不覆盖新连接的能力。
+        let capabilities = control::sanitize_agent_capabilities(&hello.capabilities);
+        let persisted = {
+            let sessions = state.sessions.clone();
+            let storage = state.storage.clone();
+            let agent = agent_id.clone();
+            let conn_id = handle.conn_id;
+            tokio::task::spawn_blocking(move || {
+                sessions.set_capabilities(&agent, conn_id, capabilities, |capabilities| {
+                    storage.upsert_agent_control(&agent, capabilities, now)?;
+                    if !capabilities.is_empty() {
+                        tracing::info!(
+                            agent = %agent,
+                            capabilities = capabilities.len(),
+                            "agent 控制能力已登记"
+                        );
                     }
-                    MessageAction::Close => break,
+                    Ok(())
+                })
+            })
+            .await
+            .context("登记 agent 控制能力失败")??
+        };
+        if !persisted {
+            tracing::debug!(
+                agent = %agent_id,
+                conn_id = handle.conn_id,
+                "旧连接晚到的 Hello 能力仅登记到会话，不写库"
+            );
+        }
+        // upsert_agent 会把状态写回 online；若吊销恰好发生在握手期间，立即恢复 revoked。
+        let revoked = storage_blocking(state.storage.clone(), {
+            let agent = agent_id.clone();
+            move |storage| {
+                let revoked = storage.is_revoked(&agent)?;
+                if revoked {
+                    storage.set_status(&agent, "revoked", now_ms())?;
+                }
+                Ok(revoked)
+            }
+        })
+        .await?;
+        if revoked {
+            send_frame(&mut socket, &problem(codes::REVOKED, "该 agent 已被吊销")).await?;
+            bail!("握手期间 agent 被吊销: {agent_id}");
+        }
+        tracing::info!(agent = %agent_id, host = %hello.hostname, "agent 已连接");
+
+        let welcome = Frame::Welcome(Welcome {
+            agent_id: agent_id.clone(),
+            server_version: VERSION.to_string(),
+            protocol: PROTOCOL_VERSION,
+            sample_interval_ms: sample_interval_for_session(&state, &agent_id).await,
+            server_time: now,
+        });
+        send_frame(&mut socket, &welcome).await?;
+
+        let mut shutdown = handle.shutdown;
+        let mut watch_shutdown = true;
+        // 每个会话最多成功续签一次，状态跟随会话生命周期。
+        let mut renew = RenewState::default();
+        // 绝对空闲 deadline：每秒的控制清理 tick 不会重置它，只有入站帧才续期。
+        let mut idle = SessionIdle::new(SESSION_IDLE_TIMEOUT);
+
+        loop {
+            // 45s 内收不到任何帧就认为连接已死；agent 每 15s 发一次 Ping。
+            // 空闲超时是独立 select 分支：即使 recv / 控制队列 / 清理 tick 持续就绪，
+            // biased 也会在 deadline 时优先关闭连接，不会被其它分支饿死。
+            let recv = socket.recv();
+            let idle_sleep = tokio::time::sleep_until(idle.deadline());
+            tokio::pin!(idle_sleep);
+            let event = tokio::select! {
+                biased;
+                changed = shutdown.changed(), if watch_shutdown => {
+                    // 关闭原因由 SessionRegistry 写入（吊销 / 配置变更）。
+                    match changed {
+                        Ok(()) => SessionEvent::Shutdown(*shutdown.borrow_and_update()),
+                        Err(_) => SessionEvent::WatchClosed,
+                    }
+                }
+                _ = &mut idle_sleep => SessionEvent::IdleTimeout,
+                // 清理优先于新控制命令：持续就绪的控制队列不能把 pending 超时清理
+                // 推迟到方案承诺的 ≤2s 之外。shutdown 仍保持最高优先级。
+                _ = control_expire.tick() => SessionEvent::ControlExpired,
+                command = control_rx.recv(), if watch_control => match command {
+                    Some(command) => SessionEvent::Control(command),
+                    None => SessionEvent::ControlClosed,
+                },
+                received = recv => match received {
+                    None => SessionEvent::Closed,
+                    Some(Err(err)) => SessionEvent::RecvError(err.to_string()),
+                    Some(Ok(message)) => SessionEvent::Message(message),
+                },
+            };
+
+            match event {
+                SessionEvent::Shutdown(ShutdownReason::Revoke) => {
+                    tracing::info!(agent = %agent_id, "收到吊销通知，关闭会话");
+                    reject_and_close(&mut socket, codes::REVOKED, "该 agent 已被吊销").await;
+                    break;
+                }
+                SessionEvent::Shutdown(ShutdownReason::Reconfigure) => {
+                    // 配置变更不是吊销：发 Close(1000) 正常关闭，agent 会立即重连并
+                    // 在 Welcome 里拿到新采样间隔。绝不发 revoked Problem。
+                    tracing::info!(agent = %agent_id, "收到配置变更通知，正常关闭会话以便重连");
+                    let close = Message::Close(Some(CloseFrame {
+                        code: close_code::NORMAL,
+                        reason: "reconfigure".into(),
+                    }));
+                    if let Err(err) = send_with_timeout(&mut socket, close).await {
+                        tracing::debug!(agent = %agent_id, error = %err, "发送 Close 帧失败");
+                    }
+                    break;
+                }
+                SessionEvent::WatchClosed => {
+                    // 正常流程不会走到这里：注册表在会话循环期间一直持有发送端。
+                    tracing::debug!(agent = %agent_id, "会话取消信号已关闭，停止监听吊销");
+                    watch_shutdown = false;
+                }
+                SessionEvent::IdleTimeout => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        timeout_secs = SESSION_IDLE_TIMEOUT.as_secs(),
+                        "会话心跳超时，主动关闭"
+                    );
+                    break;
+                }
+                SessionEvent::Closed => break,
+                SessionEvent::RecvError(err) => {
+                    tracing::warn!(agent = %agent_id, error = %err, "接收失败，关闭会话");
+                    break;
+                }
+                SessionEvent::Control(command) => {
+                    // #17：dispatch 前再查一次吊销。命中/查询失败都只回错误，
+                    // 绝不把 ControlCommand 投递给 agent；随后 continue 等 watcher 关闭。
+                    if let Err(error) = control_revocation_gate(&state, &agent_id).await {
+                        let _ = command.reply.send(Err(error));
+                        continue;
+                    }
+                    // 分配会话内 id 并发送 ControlRequest；容量超限时 dispatch 已回错误。
+                    control.dispatch(&mut socket, command).await?;
+                }
+                SessionEvent::ControlClosed => {
+                    tracing::debug!(agent = %agent_id, "控制命令通道已关闭，停止接收控制请求");
+                    watch_control = false;
+                }
+                SessionEvent::ControlExpired => {
+                    // 只遍历内存 pending 并回 oneshot，不做 I/O，不阻塞采集 / ACK。
+                    let expired = control.expire(Instant::now());
+                    if expired > 0 {
+                        tracing::debug!(agent = %agent_id, expired, "清理超时的控制请求");
+                    }
+                }
+                SessionEvent::Message(message) => {
+                    match handle_message(
+                        &mut socket,
+                        &state,
+                        &agent_id,
+                        &mut renew,
+                        &mut control,
+                        message,
+                    )
+                    .await?
+                    {
+                        MessageAction::Continue => {
+                            // 只有完整处理完一帧才续期：慢批次入库 / 证书签发等
+                            // 处理耗时不能被计入下一个空闲窗口，否则处理完立即被误杀。
+                            // 控制命令 / 清理 tick / shutdown 都不算心跳，不续期。
+                            idle.on_frame();
+                        }
+                        MessageAction::Close => break,
+                    }
                 }
             }
         }
-    }
 
-    tracing::info!(agent = %agent_id, "agent 会话结束");
-    Ok(())
+        tracing::info!(agent = %agent_id, "agent 会话结束");
+        Ok(())
+    }
+    .await;
+    cleanup.finish_async().await;
+    outcome
 }
 
 /// Welcome 下发的有效采样间隔：agent 显式配置优先，读失败/越界值回退配置默认值。
 ///
 /// 兜底值也 clamp 到合法范围：即使配置层校验被绕过，Welcome 也绝不发非法值。
+/// 这是同步入口，只供单测 / 非 async 上下文使用；async 会话必须走
+/// [`sample_interval_for_session`]。
+#[cfg(test)]
 fn sample_interval_for(state: &AppState, agent_id: &str) -> u64 {
     let fallback = state
         .cfg
         .sample_interval_ms
         .clamp(MIN_SAMPLE_INTERVAL_MS, MAX_SAMPLE_INTERVAL_MS);
-    match state.storage.get_sample_interval(agent_id) {
+    sample_interval_from_storage(&state.storage, agent_id, fallback)
+}
+
+/// async 会话入口：把 `get_sample_interval` 放到 blocking 线程，避免 PG panic。
+async fn sample_interval_for_session(state: &AppState, agent_id: &str) -> u64 {
+    let fallback = state
+        .cfg
+        .sample_interval_ms
+        .clamp(MIN_SAMPLE_INTERVAL_MS, MAX_SAMPLE_INTERVAL_MS);
+    let storage = state.storage.clone();
+    let agent = agent_id.to_string();
+    match storage_blocking(storage, move |storage| {
+        Ok(sample_interval_from_storage(storage, &agent, fallback))
+    })
+    .await
+    {
+        Ok(ms) => ms,
+        Err(err) => {
+            tracing::warn!(
+                agent = %agent_id,
+                error = %err,
+                "读取采样间隔任务失败，回退配置默认值"
+            );
+            fallback
+        }
+    }
+}
+
+/// 采样间隔读取的共用主体；调用方保证处于 blocking 上下文。
+fn sample_interval_from_storage(storage: &StorageHandle, agent_id: &str, fallback: u64) -> u64 {
+    match storage.get_sample_interval(agent_id) {
         Ok(Some(ms)) if (MIN_SAMPLE_INTERVAL_MS..=MAX_SAMPLE_INTERVAL_MS).contains(&ms) => ms,
         Ok(Some(ms)) => {
             tracing::warn!(
@@ -5359,7 +5533,7 @@ async fn handle_message(
                             .await?;
                     match result {
                         Ok(IngestOutcome::Inserted { inserted }) => {
-                            mark_seen(state, agent_id);
+                            mark_seen(state, agent_id).await;
                             tracing::debug!(
                                 agent = %agent_id,
                                 epoch = batch.epoch,
@@ -5377,7 +5551,7 @@ async fn handle_message(
                             .await?;
                         }
                         Ok(IngestOutcome::Duplicate) => {
-                            mark_seen(state, agent_id);
+                            mark_seen(state, agent_id).await;
                             tracing::debug!(
                                 agent = %agent_id,
                                 epoch = batch.epoch,
@@ -5407,11 +5581,11 @@ async fn handle_message(
                     }
                 }
                 Frame::Ping { ts } => {
-                    mark_seen(state, agent_id);
+                    mark_seen(state, agent_id).await;
                     send_frame(socket, &Frame::Pong { ts }).await?;
                 }
                 Frame::Pong { .. } => {
-                    mark_seen(state, agent_id);
+                    mark_seen(state, agent_id).await;
                 }
                 Frame::ControlResponse(response) => {
                     // 只按 id 匹配本会话已登记的请求；未知 id 丢弃并计数。
@@ -5428,7 +5602,7 @@ async fn handle_message(
                     let reply =
                         handle_renewal(&state.renewal, renew, agent_id, &csr_pem, now_ms()).await;
                     if matches!(reply, Frame::CertRenewed { .. }) {
-                        mark_seen(state, agent_id);
+                        mark_seen(state, agent_id).await;
                     }
                     send_frame(socket, &reply).await?;
                 }
@@ -5439,11 +5613,11 @@ async fn handle_message(
             }
         }
         Message::Ping(payload) => {
-            mark_seen(state, agent_id);
+            mark_seen(state, agent_id).await;
             send_with_timeout(socket, Message::Pong(payload)).await?;
         }
         Message::Pong(_) => {
-            mark_seen(state, agent_id);
+            mark_seen(state, agent_id).await;
         }
         Message::Close(_) => return Ok(MessageAction::Close),
         Message::Text(_) => {}
@@ -5455,9 +5629,13 @@ async fn handle_message(
 ///
 /// 只有能走到这里的会话才是注册表里的活跃连接（会话结束后的清理不会再处理帧），
 /// 所以任意活跃连接刷新状态都是正确的；状态是否置 offline 由注册表决定。
-fn mark_seen(state: &AppState, agent_id: &str) {
-    if let Err(err) = state.storage.mark_seen(agent_id, now_ms()) {
-        tracing::warn!(agent = %agent_id, error = %err, "刷新 last_seen_at 失败");
+/// 同步存储调用必须在 blocking 线程执行（PG 在 tokio worker 上会 panic）。
+async fn mark_seen(state: &AppState, agent_id: &str) {
+    let storage = state.storage.clone();
+    let agent = agent_id.to_string();
+    match storage_blocking(storage, move |storage| storage.mark_seen(&agent, now_ms())).await {
+        Ok(()) => {}
+        Err(err) => tracing::warn!(agent = %agent_id, error = %err, "刷新 last_seen_at 失败"),
     }
 }
 
@@ -5493,110 +5671,176 @@ impl SessionCleanup {
 
     /// 注销本连接；最后一条连接写状态，最新连接断开时回退控制能力。
     ///
-    /// 关键点：`unregister_with_fallback` 在 per-agent slot 锁内执行两个回调，而同一
-    /// agent 的新连接 `register` 也要拿这把锁。因此「查吊销 + 写 offline/revoked」
-    /// 以及「回退能力写库」都与「新连接注册」严格串行：回调先完成，新连接才插入，
-    /// 调用方随后写 online。旧 offline / 旧能力不可能落在新连接之后，也不需要再
-    /// 调用 `has_active` 二次检查（slot 已空且锁仍未释放，新连接插不进来）。
-    ///
-    /// 两个回调都只做单行数据库写入；失败处理与日志全部移到 slot 锁外。
+    /// 这是非 async 上下文（单测 / 普通线程）的同步入口；async 会话路径必须
+    /// 用 [`Self::finish_async`]，不能让同步 PG 调用落在 tokio worker 上。
+    #[cfg(test)]
     fn finish(&mut self) {
         if self.finished {
             return;
         }
         self.finished = true;
-
-        let agent_id = self.agent_id.clone();
-        let storage = self.storage.clone();
-        let fallback_agent_id = self.agent_id.clone();
-        let fallback_storage = self.storage.clone();
-        // 回调内只记录结果，避免在临界区里打日志。
-        let mut revoked_error: Option<anyhow::Error> = None;
-        let mut written: Option<(&'static str, anyhow::Result<()>)> = None;
-        // 能力回退写库的结果：剩余连接能力条数 + best-effort 写入结果。
-        let mut fallback: Option<(usize, anyhow::Result<()>)> = None;
-        let outcome = self.sessions.unregister_with_fallback(
-            &self.agent_id,
+        finish_session_cleanup(
+            self.storage.clone(),
+            self.sessions.clone(),
+            self.agent_id.clone(),
             self.conn_id,
-            || {
-                // revoked 优先级最高：先查吊销，命中写 revoked，否则才写 offline。
-                let revoked = match storage.is_revoked(&agent_id) {
-                    Ok(revoked) => revoked,
-                    Err(err) => {
-                        revoked_error = Some(err);
-                        false
-                    }
-                };
-                let status = if revoked { "revoked" } else { "offline" };
-                written = Some((status, storage.set_status(&agent_id, status, now_ms())));
-            },
-            |capabilities| {
-                // KI-24：最新连接断开且仍有剩余连接，best-effort 回退能力。
-                // 失败只记录，不影响连接清理与采集。
-                let result = fallback_storage.upsert_agent_control(
-                    &fallback_agent_id,
-                    capabilities,
-                    now_ms(),
-                );
-                fallback = Some((capabilities.len(), result));
-            },
         );
+    }
 
-        if matches!(
-            outcome,
-            UnregisterOutcome::NotRegistered | UnregisterOutcome::Removed
-        ) {
-            tracing::debug!(
-                agent = %self.agent_id,
-                conn_id = self.conn_id,
-                "旧会话结束，不修改在线状态与控制能力"
-            );
+    /// async 会话退出路径：把整段清理（含 slot 锁内的数据库写入）移入
+    /// `spawn_blocking`，闭包返回前连接已归还。
+    ///
+    /// 不能只把单个查询包起来：`unregister_with_fallback` 的回调必须在 slot
+    /// 锁内完成“查吊销 → 写 offline/revoked”，整段一起挪走才能保持
+    /// 「旧 offline 一定早于新 online」的语义（见 `finish` 的说明）。
+    async fn finish_async(&mut self) {
+        if self.finished {
             return;
         }
-        if let Some(err) = revoked_error {
-            tracing::warn!(agent = %self.agent_id, error = %err, "清理时查询吊销状态失败");
+        self.finished = true;
+        let storage = self.storage.clone();
+        let sessions = self.sessions.clone();
+        let agent_id = self.agent_id.clone();
+        let conn_id = self.conn_id;
+        match tokio::task::spawn_blocking(move || {
+            finish_session_cleanup(storage, sessions, agent_id, conn_id);
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(err) => tracing::warn!(
+                agent = %self.agent_id,
+                conn_id = self.conn_id,
+                error = %err,
+                "会话清理后台任务失败"
+            ),
         }
-        if let Some((status, result)) = written {
-            match result {
-                Ok(()) => {
-                    tracing::info!(agent = %self.agent_id, status = status, "agent 状态已更新");
-                }
-                Err(err) if status == "revoked" => {
-                    tracing::warn!(agent = %self.agent_id, error = %err, "恢复 revoked 状态失败");
-                }
+    }
+}
+
+/// 会话清理主体：注销连接，并在 per-agent slot 锁内完成状态/能力写库。
+///
+/// 关键点：`unregister_with_fallback` 在 slot 锁内执行两个回调，而同一 agent 的
+/// 新连接 `register` 也要拿这把锁。因此「查吊销 + 写 offline/revoked」以及
+/// 「回退能力写库」都与「新连接注册」严格串行：回调先完成，新连接才插入，
+/// 调用方随后写 online。旧 offline / 旧能力不可能落在新连接之后，也不需要再
+/// 调用 `has_active` 二次检查（slot 已空且锁仍未释放，新连接插不进来）。
+///
+/// 两个回调都只做单行数据库写入；失败处理与日志全部移到 slot 锁外。
+fn finish_session_cleanup(
+    storage: Arc<StorageHandle>,
+    sessions: Arc<SessionRegistry>,
+    agent_id: String,
+    conn_id: u64,
+) {
+    let revoked_agent_id = agent_id.clone();
+    let fallback_agent_id = agent_id.clone();
+    let fallback_storage = storage.clone();
+    // 回调内只记录结果，避免在临界区里打日志。
+    let mut revoked_error: Option<anyhow::Error> = None;
+    let mut written: Option<(&'static str, anyhow::Result<()>)> = None;
+    // 能力回退写库的结果：剩余连接能力条数 + best-effort 写入结果。
+    let mut fallback: Option<(usize, anyhow::Result<()>)> = None;
+    let outcome = sessions.unregister_with_fallback(
+        &agent_id,
+        conn_id,
+        || {
+            // revoked 优先级最高：先查吊销，命中写 revoked，否则才写 offline。
+            let revoked = match storage.is_revoked(&revoked_agent_id) {
+                Ok(revoked) => revoked,
                 Err(err) => {
-                    tracing::warn!(agent = %self.agent_id, error = %err, "更新 agent 状态失败");
+                    revoked_error = Some(err);
+                    false
                 }
+            };
+            let status = if revoked { "revoked" } else { "offline" };
+            written = Some((
+                status,
+                storage.set_status(&revoked_agent_id, status, now_ms()),
+            ));
+        },
+        |capabilities| {
+            // KI-24：最新连接断开且仍有剩余连接，best-effort 回退能力。
+            // 失败只记录，不影响连接清理与采集。
+            let result =
+                fallback_storage.upsert_agent_control(&fallback_agent_id, capabilities, now_ms());
+            fallback = Some((capabilities.len(), result));
+        },
+    );
+
+    if matches!(
+        outcome,
+        UnregisterOutcome::NotRegistered | UnregisterOutcome::Removed
+    ) {
+        tracing::debug!(
+            agent = %agent_id,
+            conn_id,
+            "旧会话结束，不修改在线状态与控制能力"
+        );
+        return;
+    }
+    if let Some(err) = revoked_error {
+        tracing::warn!(agent = %agent_id, error = %err, "清理时查询吊销状态失败");
+    }
+    if let Some((status, result)) = written {
+        match result {
+            Ok(()) => {
+                tracing::info!(agent = %agent_id, status = status, "agent 状态已更新");
+            }
+            Err(err) if status == "revoked" => {
+                tracing::warn!(agent = %agent_id, error = %err, "恢复 revoked 状态失败");
+            }
+            Err(err) => {
+                tracing::warn!(agent = %agent_id, error = %err, "更新 agent 状态失败");
             }
         }
-        match fallback {
-            Some((capabilities, result)) => match result {
-                Ok(()) => tracing::info!(
-                    agent = %self.agent_id,
-                    capabilities,
-                    "控制能力已回退到剩余连接"
-                ),
-                Err(err) => tracing::warn!(
-                    agent = %self.agent_id,
-                    error = %err,
-                    "回退控制能力失败，保留原值"
-                ),
-            },
-            None if matches!(outcome, UnregisterOutcome::LatestRemovedWithoutFallback) => {
-                // 剩余连接都还没登记能力：保留数据库里的历史能力，绝不写空。
-                tracing::debug!(
-                    agent = %self.agent_id,
-                    "剩余连接未登记控制能力，保留历史能力"
-                );
-            }
-            None => {}
+    }
+    match fallback {
+        Some((capabilities, result)) => match result {
+            Ok(()) => tracing::info!(
+                agent = %agent_id,
+                capabilities,
+                "控制能力已回退到剩余连接"
+            ),
+            Err(err) => tracing::warn!(
+                agent = %agent_id,
+                error = %err,
+                "回退控制能力失败，保留原值"
+            ),
+        },
+        None if matches!(outcome, UnregisterOutcome::LatestRemovedWithoutFallback) => {
+            // 剩余连接都还没登记能力：保留数据库里的历史能力，绝不写空。
+            tracing::debug!(
+                agent = %agent_id,
+                "剩余连接未登记控制能力，保留历史能力"
+            );
         }
+        None => {}
     }
 }
 
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
-        self.finish();
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let storage = self.storage.clone();
+        let sessions = self.sessions.clone();
+        let agent_id = self.agent_id.clone();
+        let conn_id = self.conn_id;
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // 正常会话路径已 await finish_async；这里只在任务被取消 / panic 时
+            // 兜底。tokio worker 上不能直接跑同步 PG，也不能阻塞等待，因此
+            // 交给 blocking 线程异步完成；进程退出前由下次启动的
+            // reset_online_status 兜住残留状态。
+            std::mem::drop(tokio::task::spawn_blocking(move || {
+                finish_session_cleanup(storage, sessions, agent_id, conn_id);
+            }));
+        } else {
+            // 单测 / 普通线程：保持旧同步语义。
+            finish_session_cleanup(storage, sessions, agent_id, conn_id);
+        }
     }
 }
 
@@ -5810,8 +6054,12 @@ fn spawn_self_monitor(storage: Arc<StorageHandle>, cfg: HubConfig) {
             last_seen_at: now_ms(),
             created_at: now_ms(),
         };
-        if let Err(err) = storage.upsert_agent(&record) {
-            tracing::error!(error = %err, "注册本机 agent 失败");
+        let storage_for_register = storage.clone();
+        match tokio::task::spawn_blocking(move || storage_for_register.upsert_agent(&record)).await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::error!(error = %err, "注册本机 agent 失败"),
+            Err(err) => tracing::error!(error = %err, "注册本机 agent 任务失败"),
         }
         tracing::info!("本机采集已启用（agent_id = {HUB_SELF_AGENT_ID}）");
 
@@ -9776,6 +10024,65 @@ mod tests {
             "数据库文件仍必须是 0600"
         );
         let _ = std::fs::remove_dir_all(&db_parent);
+    }
+
+    /// D4b 回归：`open_storage_for_config` 对 SQLite 配置仍走原有行为
+    /// （数据库在 data_dir 内时收紧目录，且可直接读写）。
+    #[test]
+    fn d4b_open_storage_for_config_supports_sqlite() {
+        let dir = temp_dir("d4b-open-storage-sqlite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("hub.db");
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            database: format!("sqlite://{}", db.display()),
+            ..HubConfig::default()
+        };
+
+        let storage = open_storage_for_config(&cfg).expect("SQLite 配置必须能打开");
+        storage
+            .upsert_agent(&test_agent("a1"))
+            .expect("写入 agent 失败");
+        assert_eq!(
+            storage
+                .get_agent("a1")
+                .expect("读取 agent 失败")
+                .expect("agent 必须存在")
+                .agent_id,
+            "a1"
+        );
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D4b 安全回归：PG 打开失败的错误上下文不能回显 DSN 密码。
+    ///
+    /// 127.0.0.1:1 在生产环境不会监听；这里只验证错误构造，不依赖真实 PG。
+    #[test]
+    fn d4b_open_storage_for_config_pg_error_redacts_password() {
+        let dir = temp_dir("d4b-open-storage-pg-redact");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            database: "postgres://rustboard:supersecret@127.0.0.1:1/rustboard?sslmode=disable"
+                .to_string(),
+            db_connect_timeout_ms: 200,
+            ..HubConfig::default()
+        };
+
+        let err = open_storage_for_config(&cfg)
+            .err()
+            .expect("不可达的 PostgreSQL 必须报错");
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("supersecret"),
+            "错误信息不得包含 DSN 密码: {text}"
+        );
+        assert!(
+            text.contains("PostgreSQL"),
+            "错误信息应说明是 PostgreSQL 后端: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ------------------------------------------------------------------

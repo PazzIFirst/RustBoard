@@ -58,6 +58,46 @@ const MAX_SHARD_ROWS: usize = 50_000;
 /// 单次 SQL 扫描行数；worker 分批读取，避免一次把整天 raw 读进内存。
 const SCAN_BATCH_ROWS: usize = 10_000;
 
+/// 归档存储调用的来源：`Arc` 直接复用，`&StorageHandle` 克隆底层句柄。
+///
+/// 目的只是让 async 函数能拿到 `'static` 的存储句柄交给 `spawn_blocking`，
+/// 同时保持既有测试 / CLI 传 `&StorageHandle` 的调用方式不变。
+pub(crate) trait StorageSource {
+    fn into_storage_handle(self) -> Arc<StorageHandle>;
+}
+
+impl StorageSource for Arc<StorageHandle> {
+    fn into_storage_handle(self) -> Arc<StorageHandle> {
+        self
+    }
+}
+
+impl StorageSource for &Arc<StorageHandle> {
+    fn into_storage_handle(self) -> Arc<StorageHandle> {
+        self.clone()
+    }
+}
+
+impl StorageSource for &StorageHandle {
+    fn into_storage_handle(self) -> Arc<StorageHandle> {
+        Arc::new(self.clone())
+    }
+}
+
+/// 在 blocking 线程执行同步存储调用（PG 同步驱动在 tokio worker 上会 panic）。
+///
+/// 闭包内完成取连接 / 查询 / 事务；不把任何连接 guard 带回 async 侧。
+async fn storage_blocking<T, F>(storage: Arc<StorageHandle>, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&StorageHandle) -> Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || f(&storage)).await {
+        Ok(result) => result,
+        Err(err) => Err(anyhow::Error::new(err).context("执行归档存储后台任务失败")),
+    }
+}
+
 /// `archive_state.last_error` 允许透传的固定中文文案（历史版本可能直接存过
 /// `ArchiveError::Display`）。未知内容一律掩码为 `archive_error`。
 const SAFE_LAST_ERROR_TEXTS: [&str; 7] = [
@@ -293,11 +333,17 @@ pub(crate) fn spawn_archive_worker(storage: Arc<StorageHandle>, cfg: HubConfig) 
 
     tokio::spawn(async move {
         let startup_now = now_ms();
-        match should_catch_up(&storage, &cfg, startup_now) {
+        let check_storage = storage.clone();
+        let check_cfg = cfg.clone();
+        match storage_blocking(check_storage, move |storage| {
+            should_catch_up(storage, &check_cfg, startup_now)
+        })
+        .await
+        {
             Ok(true) => {
                 tracing::info!("归档 worker：今天已过计划时间且水位落后，立即补跑");
                 if let Err(err) =
-                    run_archive_once(&storage, &cfg, store.as_ref(), startup_now).await
+                    run_archive_once(storage.clone(), &cfg, store.as_ref(), startup_now).await
                 {
                     tracing::warn!(error = %err, "归档补跑失败，保留水位等待下一轮重试");
                 }
@@ -316,7 +362,9 @@ pub(crate) fn spawn_archive_worker(storage: Arc<StorageHandle>, cfg: HubConfig) 
                 "归档 worker：等待下一次计划时间"
             );
             tokio::time::sleep(delay).await;
-            if let Err(err) = run_archive_once(&storage, &cfg, store.as_ref(), now_ms()).await {
+            if let Err(err) =
+                run_archive_once(storage.clone(), &cfg, store.as_ref(), now_ms()).await
+            {
                 tracing::warn!(error = %err, "归档任务失败，保留水位等待下一轮重试");
             }
         }
@@ -354,8 +402,11 @@ fn next_run_delay(now: i64, schedule_hour_utc: u8) -> Duration {
 /// 无论成功失败都会写 `last_run`；失败时只把固定码 `archive_run_failed`
 /// 写入 `last_error`（成功清空），不存后端错误原文。
 /// 返回的 [`ArchiveRunReport`] 只用于日志 / CLI，不包含 secret。
+///
+/// 所有存储访问在 [`storage_blocking`] 内执行；PG 的同步驱动不能直接跑在
+/// tokio worker 上。
 pub(crate) async fn run_archive_once(
-    storage: &StorageHandle,
+    storage: impl StorageSource,
     cfg: &HubConfig,
     store: &dyn ColdStore,
     now: i64,
@@ -365,15 +416,16 @@ pub(crate) async fn run_archive_once(
 
 /// 带可调分片 / 扫描行数的实现；测试用小分片覆盖多分片路径。
 async fn run_archive_once_with_limits(
-    storage: &StorageHandle,
+    storage: impl StorageSource,
     cfg: &HubConfig,
     store: &dyn ColdStore,
     now: i64,
     max_shard_rows: usize,
     scan_batch_rows: usize,
 ) -> Result<ArchiveRunReport> {
+    let storage = storage.into_storage_handle();
     let result = run_archive_cycle(
-        storage,
+        storage.clone(),
         cfg,
         store,
         now,
@@ -381,28 +433,41 @@ async fn run_archive_once_with_limits(
         scan_batch_rows.max(1),
     )
     .await;
-    record_run_state(storage, now, &result);
+    record_run_state(storage, now, &result).await;
     result
 }
 
 /// 访问数据库失败时只 WARN，不覆盖调用方真正关心的归档错误。
-fn record_run_state(storage: &StorageHandle, now: i64, result: &Result<ArchiveRunReport>) {
+async fn record_run_state(
+    storage: Arc<StorageHandle>,
+    now: i64,
+    result: &Result<ArchiveRunReport>,
+) {
     // 只写固定码：后端错误即使意外带出 URL / 凭据，也不会进入状态表。
     let last_error = match result {
         Ok(_) => String::new(),
         Err(_) => LAST_ERROR_RUN_FAILED.to_string(),
     };
-    if let Err(err) = storage.set_archive_state(STATE_LAST_RUN, &now.to_string(), now) {
+    let run_storage = storage.clone();
+    if let Err(err) = storage_blocking(run_storage, move |storage| {
+        storage.set_archive_state(STATE_LAST_RUN, &now.to_string(), now)
+    })
+    .await
+    {
         tracing::warn!(error = %err, "写入归档任务 last_run 失败");
     }
-    if let Err(err) = storage.set_archive_state(STATE_LAST_ERROR, &last_error, now) {
+    if let Err(err) = storage_blocking(storage, move |storage| {
+        storage.set_archive_state(STATE_LAST_ERROR, &last_error, now)
+    })
+    .await
+    {
         tracing::warn!(error = %err, "写入归档任务 last_error 失败");
     }
 }
 
 /// 一轮归档的主体：按 UTC 天推进，逐日切分片并上传。
 async fn run_archive_cycle(
-    storage: &StorageHandle,
+    storage: Arc<StorageHandle>,
     cfg: &HubConfig,
     store: &dyn ColdStore,
     now: i64,
@@ -413,7 +478,11 @@ async fn run_archive_cycle(
         bail!("归档未启用（archive.enabled = false）");
     }
 
-    let watermark = read_archive_i64(storage, STATE_LAST_ARCHIVED_TS)?;
+    let watermark_storage = storage.clone();
+    let watermark = storage_blocking(watermark_storage, |storage| {
+        read_archive_i64(storage, STATE_LAST_ARCHIVED_TS)
+    })
+    .await?;
     let mut report = ArchiveRunReport {
         enabled: true,
         watermark,
@@ -427,7 +496,11 @@ async fn run_archive_cycle(
         Some(value) if value % DAY_MS == 0 => value,
         // 非整天值（旧版本 / 人工修库）从下一天开始，避免把半天重复归档。
         Some(value) => day_start(value) + DAY_MS,
-        None => match storage.raw_stats()?.oldest_ts {
+        None => match storage_blocking(storage.clone(), |storage| {
+            Ok(storage.raw_stats()?.oldest_ts)
+        })
+        .await?
+        {
             Some(oldest) => day_start(oldest),
             // 没有任何 raw：本轮无事可做，也不凭空写水位。
             None => return Ok(report),
@@ -444,12 +517,16 @@ async fn run_archive_cycle(
         loop {
             while shard_rows.len() < max_shard_rows {
                 let remaining = max_shard_rows - shard_rows.len();
-                let batch = storage.scan_archive_rows(
-                    cursor,
-                    day_end,
-                    after_rowid,
-                    scan_batch_rows.min(remaining),
-                )?;
+                let scan_storage = storage.clone();
+                let batch = storage_blocking(scan_storage, move |storage| {
+                    storage.scan_archive_rows(
+                        cursor,
+                        day_end,
+                        after_rowid,
+                        scan_batch_rows.min(remaining),
+                    )
+                })
+                .await?;
                 if batch.is_empty() {
                     break;
                 }
@@ -459,8 +536,16 @@ async fn run_archive_cycle(
             if shard_rows.is_empty() {
                 break;
             }
-            let outcome =
-                upload_shard(storage, cfg, store, day, &mut next_shard, &shard_rows, now).await?;
+            let outcome = upload_shard(
+                storage.clone(),
+                cfg,
+                store,
+                day,
+                &mut next_shard,
+                &shard_rows,
+                now,
+            )
+            .await?;
             report.objects += outcome.uploaded;
             report.skipped_objects += outcome.skipped;
             report.rows += outcome.rows;
@@ -469,7 +554,12 @@ async fn run_archive_cycle(
         }
 
         // 整天所有分片成功后才推进水位；中途失败会直接返回，水位保持旧值。
-        storage.set_archive_state(STATE_LAST_ARCHIVED_TS, &day_end.to_string(), now)?;
+        let watermark_value = day_end.to_string();
+        let watermark_storage = storage.clone();
+        storage_blocking(watermark_storage, move |storage| {
+            storage.set_archive_state(STATE_LAST_ARCHIVED_TS, &watermark_value, now)
+        })
+        .await?;
         report.days += 1;
         report.watermark = Some(day_end);
         cursor = day_end;
@@ -492,7 +582,7 @@ struct ShardOutcome {
 /// 用显式 `VecDeque` 代替递归，避免 async 递归的 boxed future 与额外分配；
 /// 拆分保持行顺序，分片编号连续。
 async fn upload_shard(
-    storage: &StorageHandle,
+    storage: Arc<StorageHandle>,
     cfg: &HubConfig,
     store: &dyn ColdStore,
     day: ArchiveDay,
@@ -529,7 +619,12 @@ async fn upload_shard(
         );
         let manifest_bytes = manifest_json(&manifest)?.into_bytes();
 
-        let existing = storage.find_archive_object_by_key(&keys.object_key)?;
+        let find_storage = storage.clone();
+        let object_key = keys.object_key.clone();
+        let existing = storage_blocking(find_storage, move |storage| {
+            storage.find_archive_object_by_key(&object_key)
+        })
+        .await?;
         let id = match existing {
             Some(object) => match object.status {
                 ArchiveStatus::Uploaded | ArchiveStatus::LocalDeleted => {
@@ -538,13 +633,18 @@ async fn upload_shard(
                     continue;
                 }
                 ArchiveStatus::Failed => {
-                    storage.update_archive_object_status(
-                        object.id,
-                        ArchiveStatus::Pending,
-                        "",
-                        None,
-                        None,
-                    )?;
+                    let update_storage = storage.clone();
+                    let object_id = object.id;
+                    storage_blocking(update_storage, move |storage| {
+                        storage.update_archive_object_status(
+                            object_id,
+                            ArchiveStatus::Pending,
+                            "",
+                            None,
+                            None,
+                        )
+                    })
+                    .await?;
                     object.id
                 }
                 ArchiveStatus::Pending => object.id,
@@ -566,7 +666,12 @@ async fn upload_shard(
                     uploaded_at: None,
                     deleted_at: None,
                 };
-                match storage.insert_archive_object(&object) {
+                let insert_storage = storage.clone();
+                let insert_result = storage_blocking(insert_storage, move |storage| {
+                    storage.insert_archive_object(&object)
+                })
+                .await;
+                match insert_result {
                     Ok(id) => id,
                     Err(err)
                         if matches!(
@@ -575,8 +680,12 @@ async fn upload_shard(
                         ) =>
                     {
                         // 并发 / 上一轮中断造成插入冲突：重新读一次，已上传则跳过。
-                        let Some(existing) =
-                            storage.find_archive_object_by_key(&keys.object_key)?
+                        let find_storage = storage.clone();
+                        let object_key = keys.object_key.clone();
+                        let Some(existing) = storage_blocking(find_storage, move |storage| {
+                            storage.find_archive_object_by_key(&object_key)
+                        })
+                        .await?
                         else {
                             return Err(err);
                         };
@@ -587,13 +696,18 @@ async fn upload_shard(
                                 continue;
                             }
                             ArchiveStatus::Failed => {
-                                storage.update_archive_object_status(
-                                    existing.id,
-                                    ArchiveStatus::Pending,
-                                    "",
-                                    None,
-                                    None,
-                                )?;
+                                let update_storage = storage.clone();
+                                let existing_id = existing.id;
+                                storage_blocking(update_storage, move |storage| {
+                                    storage.update_archive_object_status(
+                                        existing_id,
+                                        ArchiveStatus::Pending,
+                                        "",
+                                        None,
+                                        None,
+                                    )
+                                })
+                                .await?;
                                 existing.id
                             }
                             ArchiveStatus::Pending => existing.id,
@@ -607,18 +721,28 @@ async fn upload_shard(
         if let Err(err) =
             upload_object_and_manifest(store, &keys, &output.data, &manifest_bytes).await
         {
-            if let Err(db_err) = storage.update_archive_object_status(
-                id,
-                ArchiveStatus::Failed,
-                archive_error_code(err),
-                None,
-                None,
-            ) {
+            let update_storage = storage.clone();
+            let error_code = archive_error_code(err);
+            if let Err(db_err) = storage_blocking(update_storage, move |storage| {
+                storage.update_archive_object_status(
+                    id,
+                    ArchiveStatus::Failed,
+                    error_code,
+                    None,
+                    None,
+                )
+            })
+            .await
+            {
                 tracing::warn!(error = %db_err, "标记归档对象失败状态时数据库错误");
             }
             return Err(err.into());
         }
-        storage.update_archive_object_status(id, ArchiveStatus::Uploaded, "", Some(now), None)?;
+        let update_storage = storage.clone();
+        storage_blocking(update_storage, move |storage| {
+            storage.update_archive_object_status(id, ArchiveStatus::Uploaded, "", Some(now), None)
+        })
+        .await?;
         outcome.uploaded += 1;
         outcome.rows += output.rows;
         outcome.bytes += output.bytes;
