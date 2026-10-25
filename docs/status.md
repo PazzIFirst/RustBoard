@@ -374,7 +374,7 @@ hub，需升级。
 | D-G6 | `migrate` 失败不切换/不破坏 SQLite，成功可回切 | ✅ | `postgres_migrate` 6；失败不改配置、不删 SQLite，成功后配置原子切换 |
 | D-G7 | 备份/恢复后点数、范围、告警状态、token 数一致 | ✅ | `phase_d_backup` 14；manifest SHA256、PG dump/restore、SQLite VACUUM INTO、旧 WAL/恶意路径/并发 migrate |
 | D-G8 | 安装器 `--db` 探测、配置、脱敏，不自动建库/角色 | ✅ | 安装器 PG 探测先于写盘；失败不改 hub.toml/unit/二进制 |
-| D-G9 | Docker 可接 PG；默认 compose 仍 SQLite | ✅ | `docker/compose.postgres.example.yml`、`RUSTBOARD_DATABASE*`；默认 compose 未变 |
+| D-G9 | Docker 可接 PG；默认 compose 仍 SQLite | ✅ 配置层；镜像 e2e 待补 | `docker/compose.postgres.example.yml`（pin PG16）、`RUSTBOARD_DATABASE*`、entrypoint 6 组合 harness、默认 compose 未变；**未重建镜像做容器内 PG e2e**，Phase E/发布前补 |
 | D-G10 | 全量 fmt/clippy/test/audit、独立评审/渗透、checkpoint | ✅ | 全 workspace **1380 passed / 0 failed / 5 ignored**；fmt/clippy/audit 通过；初评/修复/两名独立复审与本地渗透见 [Phase D 评审渗透](security/2026-10-26-m5-phase-d-review-pentest.md)；checkpoint 已打 |
 
 #### Phase D 测试证据（2026-10-26，全 workspace 已复跑）
