@@ -188,6 +188,7 @@
       高危/严重项修复后由新评审/渗透复验（报告见
       `docs/security/2026-10-24-m5-phase-a-install-pentest.md`）
 - [ ] Phase B：musl x86_64/arm64、离线包、Docker/多架构、release workflow
+      （计划：[Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)）
 - [ ] Phase C/D/E：ACME/面板 TLS、PostgreSQL/备份迁移、压力/长稳/v1.0.0
 
 > Phase A 的 e2e 只覆盖 x86_64 本机 systemd；arm64、离线 netns、Docker 镜像与
@@ -411,6 +412,7 @@ v0.4.1 已完成并发布；v0.4.2 修复 CI ANSI 测试助手，并把 vendored
 安装器内核与自签三步安装（e2e 121/121）；下一步按计划进入 Phase B：musl
 x86_64/arm64、离线包、多架构 Docker 与 tag 触发的 release workflow，随后并行
 Phase C（ACME/面板 TLS）与 Phase D（PostgreSQL/备份迁移）。计划见
-[M5 计划](plans/2026-10-24-m5-install-delivery.md) 与
-[Phase A 设计](plans/2026-10-24-m5-phase-a-installer.md)。控制面/告警/归档均按
+[M5 计划](plans/2026-10-24-m5-install-delivery.md)、
+[Phase A 设计](plans/2026-10-24-m5-phase-a-installer.md) 与
+[Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)。控制面/告警/归档均按
 “默认关闭或最小暴露 + 审计/固定错误码”交付。
