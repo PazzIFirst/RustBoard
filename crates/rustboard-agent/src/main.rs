@@ -7,6 +7,7 @@ mod control;
 mod install_cmd;
 
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -33,6 +34,9 @@ const AGENT_KEY: &str = "agent.key";
 const AGENT_SECRET: &str = "agent.secret";
 const AGENT_CA: &str = "ca.crt";
 const AGENT_ID: &str = "agent_id";
+
+/// 运行时 `server_ca` 文件大小上限（PEM 证书 bundle）。
+const SERVER_CA_MAX_BYTES: u64 = 1024 * 1024;
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -670,6 +674,8 @@ fn load_client_identity(cfg: &AgentConfig) -> Result<(String, String)> {
 ///
 /// 空路径、相对路径、读不到或没有至少一张证书都直接报错；**绝不回退**到指纹
 /// 钉扎或系统根，避免把配置错误静默变成另一种（可能不受信任的）信任模型。
+/// 文件本身按安全边界检查：拒绝符号链接/非普通文件、>1 MiB 与 0600/0644
+/// 之外的权限；PEM 只允许 CERTIFICATE 区块，防止把 cert+key 当 CA 读入。
 fn load_server_ca(cfg: &AgentConfig) -> Result<String> {
     let raw = cfg.server_ca.trim();
     if raw.is_empty() {
@@ -679,8 +685,75 @@ fn load_server_ca(cfg: &AgentConfig) -> Result<String> {
     if !path.is_absolute() {
         bail!("server_ca 必须是绝对路径: {}", path.display());
     }
-    let pem = std::fs::read_to_string(path)
+
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("读取 server_ca 元数据失败: {}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!("server_ca 是符号链接，拒绝读取: {}", path.display());
+    }
+    if !meta.is_file() {
+        bail!("server_ca 不是普通文件，拒绝读取: {}", path.display());
+    }
+    if meta.len() > SERVER_CA_MAX_BYTES {
+        bail!(
+            "server_ca 超过 {} 字节上限，拒绝读取: {}",
+            SERVER_CA_MAX_BYTES,
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o600 && mode != 0o644 {
+            bail!(
+                "server_ca 权限必须是 0600 或 0644，实际 {mode:04o}: {}",
+                path.display()
+            );
+        }
+    }
+
+    // symlink_metadata 与 open 之间存在竞态；O_NOFOLLOW + 打开后复核元数据
+    // 把“检查后被换成符号链接”的窗口降到最小。
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("打开 server_ca 失败: {}", path.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("读取 server_ca 元数据失败: {}", path.display()))?;
+    if !opened.is_file() {
+        bail!("server_ca 不是普通文件，拒绝读取: {}", path.display());
+    }
+    if opened.len() > SERVER_CA_MAX_BYTES {
+        bail!(
+            "server_ca 超过 {} 字节上限，拒绝读取: {}",
+            SERVER_CA_MAX_BYTES,
+            path.display()
+        );
+    }
+
+    let mut bytes = Vec::new();
+    file.take(SERVER_CA_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("读取 server_ca 失败: {}", path.display()))?;
+    if bytes.len() as u64 > SERVER_CA_MAX_BYTES {
+        bail!(
+            "server_ca 超过 {} 字节上限，拒绝读取: {}",
+            SERVER_CA_MAX_BYTES,
+            path.display()
+        );
+    }
+    let pem = String::from_utf8(bytes)
+        .map_err(|_| anyhow!("server_ca 不是有效 UTF-8 PEM: {}", path.display()))?;
+    tls::ensure_certificate_only_pem(&pem)
+        .with_context(|| format!("server_ca 不是仅含 CERTIFICATE 的 PEM: {}", path.display()))?;
     tls::load_certs(&pem)
         .with_context(|| format!("server_ca 不是合法 PEM 证书: {}", path.display()))?;
     Ok(pem)
@@ -689,8 +762,8 @@ fn load_server_ca(cfg: &AgentConfig) -> Result<String> {
 /// 按 `tls_mode` 为 `wss://` 构建 TLS connector；`ws://` 不需要 TLS，返回 None。
 ///
 /// - `fingerprint`：保持 v0.4 行为。bootstrap 用指纹；已纳管优先
-///   `agent_data/ca.crt` + `client_config_ca`（A4 兼容），ca.crt 读取失败才回退
-///   指纹并告警。
+///   `agent_data/ca.crt` + `client_config_ca`（A4 兼容），ca.crt 不存在才回退
+///   指纹并告警；其他读取错误与非法内容都向上抛。
 /// - `system-roots`：系统根 + URL 主机名校验；bootstrap 不带客户端证书，
 ///   已纳管带 agent.crt/key。**不读取** `agent_data/ca.crt` 作为服务端根。
 /// - `custom-ca`：`server_ca` 指定 CA + 主机名校验；bootstrap 不带客户端证书，
@@ -724,7 +797,10 @@ fn tls_connector(
                 let ca_path = cfg.data_dir.join(AGENT_CA);
                 match std::fs::read_to_string(&ca_path) {
                     Ok(ca_pem) => tls::client_config_ca(&ca_pem, &cert_pem, &key_pem)?,
-                    Err(err) => {
+                    // 只有「文件不存在」才回退指纹（兼容 v0.1 安装）。权限不足、
+                    // 路径是目录、I/O 错误等一律上抛：把读失败静默降级成钉扎会
+                    // 掩盖真实的配置/部署问题。
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                         // 兼容没有 ca.crt 的 v0.1 安装：退回指纹钉扎，但必须告警，
                         // 因为一旦 hub 轮换服务端证书，这条连接就会失效。
                         tracing::warn!(
@@ -737,6 +813,10 @@ fn tls_connector(
                             Some(&cert_pem),
                             Some(&key_pem),
                         )?
+                    }
+                    Err(err) => {
+                        return Err(err)
+                            .with_context(|| format!("读取 CA 证书失败: {}", ca_path.display()))
                     }
                 }
             } else {
@@ -1736,6 +1816,28 @@ mod tests {
         assert_eq!(cfg.server_ca, "/etc/rustboard/server-ca.pem");
         let _ = std::fs::remove_dir_all(&dir);
 
+        // C4：--server-ca 与非 custom-ca 组合必须在写配置前拒绝（不能静默忽略）。
+        let dir = temp_dir("init-ca-wrong-mode");
+        let path = dir.join("agent.toml");
+        let err = init_agent(
+            &path,
+            Some("wss://hub.example.com:8443/agent/ws".to_string()),
+            Some("enroll-token".to_string()),
+            Some("ab".repeat(32)),
+            None,
+            Some(dir.join("data")),
+            false,
+            None,
+            Some(PathBuf::from("/etc/rustboard/server-ca.pem")),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("server_ca"),
+            "错误必须点明 server_ca: {err:#}"
+        );
+        assert!(!path.exists(), "校验失败不得写配置");
+        let _ = std::fs::remove_dir_all(&dir);
+
         // 旧 CLI：不传 --tls-mode/--server-ca 仍是 fingerprint + 空 CA。
         let dir = temp_dir("init-legacy-tls");
         let data_dir = dir.join("data");
@@ -2650,12 +2752,145 @@ mod tests {
             "错误应说明 PEM 非法: {err}"
         );
 
-        // ws:// 明文不构建 TLS connector。
+        // ws:// 明文：custom-ca 组合必须先被 `AgentConfig::validate()` 拒绝
+        // （否则 tls_connector 返回 None，CA 与主机名校验会被静默忽略）。
         cfg.hub_url = "ws://127.0.0.1:1/agent/ws".to_string();
+        let err = cfg
+            .validate()
+            .expect_err("ws:// + custom-ca 必须配置校验失败")
+            .to_string();
+        assert!(
+            err.contains("ws://") && err.contains("custom-ca"),
+            "错误信息: {err}"
+        );
+
+        // 旧配置 ws:// + fingerprint 仍然合法，且不构建 TLS connector。
+        cfg.tls_mode = AgentTlsMode::Fingerprint;
+        cfg.server_ca.clear();
+        cfg.server_fingerprint.clear();
+        cfg.validate().expect("ws:// + fingerprint 旧配置必须通过");
         assert!(
             tls_connector(&cfg, false).unwrap().is_none(),
             "ws:// 不应构建 TLS connector"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C4：fingerprint 模式的 ca.crt 回退只允许 NotFound；其他读取错误必须
+    /// 带路径上抛，不能静默降级成指纹钉扎。
+    #[test]
+    fn c4_fingerprint_ca_fallback_only_on_not_found() {
+        let dir = temp_dir("fingerprint-ca-fallback");
+        let mut cfg = enrolled_config(&dir, 90);
+        cfg.hub_url = "wss://localhost:8443/agent/ws".to_string();
+        cfg.tls_mode = AgentTlsMode::Fingerprint;
+        let server_pem =
+            std::fs::read_to_string(tls::cert_dir(&dir.join("hub")).join(tls::SERVER_CERT_FILE))
+                .unwrap();
+        cfg.server_fingerprint = tls::fingerprint_of_pem(&server_pem).unwrap();
+        cfg.server_ca.clear();
+
+        // NotFound：兼容没有 ca.crt 的 v0.1 安装，回退指纹钉扎。
+        std::fs::remove_file(dir.join(AGENT_CA)).unwrap();
+        assert!(
+            tls_connector(&cfg, true).unwrap().is_some(),
+            "ca.crt 不存在时必须回退指纹钉扎"
+        );
+
+        // 其他错误（用目录触发 EISDIR）：必须上抛并带路径。
+        std::fs::create_dir(dir.join(AGENT_CA)).unwrap();
+        let err = tls_connector(&cfg, true)
+            .err()
+            .expect("ca.crt 读取错误不得回退")
+            .to_string();
+        assert!(
+            err.contains(&dir.join(AGENT_CA).display().to_string()),
+            "错误必须包含路径: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C4：运行时 `server_ca` 只接受安全的普通文件，且 PEM 只能含 CERTIFICATE。
+    #[cfg(unix)]
+    #[test]
+    fn c4_load_server_ca_checks_file_and_rejects_mixed_pem() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("load-server-ca");
+        let hub_dir = dir.join("hub");
+        tls::ensure_hub_material(
+            &hub_dir,
+            &["localhost".to_string()],
+            tls::CertPolicy::default(),
+        )
+        .unwrap();
+        let ca_pem =
+            std::fs::read_to_string(tls::cert_dir(&hub_dir).join(tls::CA_CERT_FILE)).unwrap();
+        let ca_path = dir.join("server-ca.pem");
+        fsutil::atomic_write(&ca_path, ca_pem.as_bytes(), 0o644).unwrap();
+
+        let mut cfg = AgentConfig {
+            data_dir: dir.clone(),
+            server_ca: ca_path.to_string_lossy().into_owned(),
+            ..AgentConfig::default()
+        };
+        assert_eq!(load_server_ca(&cfg).unwrap(), ca_pem);
+
+        // cert+key 混合：不能让私钥随 CA 一起被读入。
+        let (_csr, key_pem) = tls::make_csr().unwrap();
+        let mixed = dir.join("mixed.pem");
+        fsutil::atomic_write(&mixed, format!("{ca_pem}{key_pem}").as_bytes(), 0o644).unwrap();
+        cfg.server_ca = mixed.to_string_lossy().into_owned();
+        let err = format!("{:#}", load_server_ca(&cfg).unwrap_err());
+        assert!(
+            err.contains("非 CERTIFICATE") && err.contains("PRIVATE KEY"),
+            "混合 PEM 必须拒绝: {err}"
+        );
+
+        // 0600 允许；0640 拒绝。
+        std::fs::set_permissions(&ca_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        cfg.server_ca = ca_path.to_string_lossy().into_owned();
+        assert!(load_server_ca(&cfg).is_ok());
+        std::fs::set_permissions(&ca_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let err = load_server_ca(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("0600") && err.contains("0644"),
+            "权限错误必须说明允许值: {err}"
+        );
+
+        // 符号链接 / 目录 / 超限 / 相对路径 / 不存在：全部拒绝。
+        std::fs::set_permissions(&ca_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.join("ca-link.pem");
+        std::os::unix::fs::symlink(&ca_path, &link).unwrap();
+        cfg.server_ca = link.to_string_lossy().into_owned();
+        assert!(load_server_ca(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("符号链接"));
+        cfg.server_ca = dir.to_string_lossy().into_owned();
+        assert!(load_server_ca(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("普通文件"));
+        let big = dir.join("big.pem");
+        fsutil::atomic_write(&big, &vec![b'A'; SERVER_CA_MAX_BYTES as usize + 1], 0o644).unwrap();
+        cfg.server_ca = big.to_string_lossy().into_owned();
+        assert!(load_server_ca(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("上限"));
+        cfg.server_ca = "relative.pem".to_string();
+        assert!(load_server_ca(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("绝对路径"));
+        cfg.server_ca = dir.join("missing.pem").to_string_lossy().into_owned();
+        assert!(load_server_ca(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("server_ca"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

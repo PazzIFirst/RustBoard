@@ -519,7 +519,20 @@ fn c2_agent_tls_modes_validation() {
         .to_string();
     assert!(err.contains("绝对路径"), "错误信息: {err}");
 
-    // 非空 server_ca 在任何模式下都必须是绝对路径。
+    // 非空 server_ca 只在 custom-ca 模式允许；其他模式必须显式拒绝，
+    // 不能等到运行期才被静默忽略。
+    for mode in [AgentTlsMode::Fingerprint, AgentTlsMode::SystemRoots] {
+        let fingerprint = if mode == AgentTlsMode::Fingerprint {
+            valid_fingerprint()
+        } else {
+            String::new()
+        };
+        let err = agent_with(mode, wss, &fingerprint, "/etc/rustboard/server-ca.pem")
+            .validate()
+            .expect_err("非 custom-ca 模式携带 server_ca 必须拒绝")
+            .to_string();
+        assert!(err.contains("server_ca"), "错误信息: {err}");
+    }
     let err = agent_with(
         AgentTlsMode::Fingerprint,
         wss,
@@ -527,17 +540,30 @@ fn c2_agent_tls_modes_validation() {
         "ca.pem",
     )
     .validate()
-    .expect_err("fingerprint 模式下非空 server_ca 也要校验路径")
+    .expect_err("fingerprint 模式下非空 server_ca 也要拒绝")
     .to_string();
     assert!(err.contains("server_ca"), "错误信息: {err}");
 
-    // ws:// 明文：不强制指纹，也不强制 server_ca（保持旧行为）。
+    // ws:// 明文：只允许 fingerprint（旧行为）；system-roots / custom-ca
+    // 的 CA 与主机名校验会被忽略，必须拒绝。
     agent_with(AgentTlsMode::Fingerprint, ws, "", "")
         .validate()
         .expect("ws:// + fingerprint 允许空指纹");
-    agent_with(AgentTlsMode::CustomCa, ws, "", "")
-        .validate()
-        .expect("ws:// 不启用 TLS，不强制 server_ca");
+    for mode in [AgentTlsMode::SystemRoots, AgentTlsMode::CustomCa] {
+        let err = agent_with(mode, ws, "", "")
+            .validate()
+            .expect_err("ws:// + 非 fingerprint 必须拒绝")
+            .to_string();
+        assert!(
+            err.contains("ws://") && err.contains("fingerprint"),
+            "错误信息必须点明 ws:// 只允许 fingerprint: {err}"
+        );
+        assert!(
+            err.contains(mode.as_str()),
+            "错误信息必须点明实际模式 {}: {err}",
+            mode.as_str()
+        );
+    }
 
     // serde：kebab-case 名称可解析；未知值必须失败。
     let cfg: AgentConfig = toml::from_str(
@@ -547,6 +573,11 @@ fn c2_agent_tls_modes_validation() {
     .unwrap();
     assert_eq!(cfg.tls_mode, AgentTlsMode::SystemRoots);
     assert_eq!(cfg.server_ca, "/etc/rustboard/server-ca.pem");
+    let err = cfg
+        .validate()
+        .expect_err("system-roots 携带 server_ca 必须在校验时拒绝")
+        .to_string();
+    assert!(err.contains("server_ca"), "错误信息: {err}");
     let err = toml::from_str::<AgentConfig>("tls_mode = \"ca\"\n").expect_err("未知模式必须失败");
     assert!(err.to_string().contains("tls_mode"), "错误信息: {err}");
 }

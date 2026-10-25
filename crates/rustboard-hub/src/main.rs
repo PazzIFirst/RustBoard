@@ -1126,23 +1126,24 @@ fn shell_arg(value: &str) -> String {
 /// hub 的服务端证书来源 → `hub agent add` 应给 agent 的信任模型。
 ///
 /// ACME hub 绝不输出指纹：公共 ACME 用系统根；私有/自定义 ACME
-/// （`tls.acme_ca_file` 非空）用该 CA 文件（安装器会复制到 agent data_dir）。
+/// （`tls.acme_ca_file` 非空）由 `agent add` 从 `server.crt` 链尾提取 CA，
+/// 写成 `<data_dir>/certs/agent-ca.pem` 作为 agent 信任锚。**不能**把
+/// `acme_ca_file`（ACME WFE 的 HTTPS 根）当成 agent 验证 hub 的 CA。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HubAgentTrust<'a> {
+enum HubAgentTrust {
     Fingerprint,
     SystemRoots,
-    CustomCa(&'a str),
+    CustomCa,
 }
 
-fn hub_agent_trust(cfg: &HubConfig) -> HubAgentTrust<'_> {
+fn hub_agent_trust(cfg: &HubConfig) -> HubAgentTrust {
     match cfg.tls.mode {
         ServerTlsMode::SelfSigned => HubAgentTrust::Fingerprint,
         ServerTlsMode::AcmeDomain | ServerTlsMode::AcmeIp => {
-            let ca = cfg.tls.acme_ca_file.trim();
-            if ca.is_empty() {
+            if cfg.tls.acme_ca_file.trim().is_empty() {
                 HubAgentTrust::SystemRoots
             } else {
-                HubAgentTrust::CustomCa(ca)
+                HubAgentTrust::CustomCa
             }
         }
     }
@@ -1214,50 +1215,98 @@ fn validate_agent_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// 私有 ACME：从已签发的 `server.crt` 链尾提取 CA，写成 agent 信任锚。
+///
+/// `tls.acme_ca_file` 是 ACME 服务端（WFE）的 HTTPS 根，与 ACME 签发的证书链
+/// 不一定相同，绝不能直接给 agent 当服务端 CA。这里使用 `server.crt` 的最后
+/// 一张 CERTIFICATE（通常是中间 CA / 根 CA），要求 BasicConstraints.ca=true。
+///
+/// 证书未签发、链尾不是 CA 或写盘失败都返回错误，调用方必须在创建 enrollment
+/// token 之前失败。
+fn prepare_private_acme_agent_ca(cfg: &HubConfig, config_path: &FsPath) -> Result<PathBuf> {
+    let cert_path = tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE);
+    let chain_pem = std::fs::read_to_string(&cert_path).with_context(|| {
+        format!(
+            "私有 ACME 需要已签发的服务端证书 {}；先执行 `rustboard-hub tls issue --config {}`",
+            cert_path.display(),
+            config_path.display()
+        )
+    })?;
+    let anchor_pem = tls::last_certificate_pem(&chain_pem)
+        .with_context(|| format!("从 {} 提取链尾 CA 失败", cert_path.display()))?;
+    if !tls::certificate_is_ca(&anchor_pem)
+        .with_context(|| format!("判断 {} 链尾是否为 CA 失败", cert_path.display()))?
+    {
+        bail!(
+            "{} 的证书链尾不是 CA，无法作为 agent 信任锚；请确认 ACME 返回完整证书链",
+            cert_path.display()
+        );
+    }
+
+    let agent_ca_path = tls::cert_dir(&cfg.data_dir).join("agent-ca.pem");
+    fsutil::atomic_write(&agent_ca_path, anchor_pem.as_bytes(), 0o644)
+        .with_context(|| format!("写入 agent CA 失败: {}", agent_ca_path.display()))?;
+    Ok(agent_ca_path)
+}
+
 fn agent_add(config: Option<PathBuf>, name: String, ttl_minutes: u32) -> Result<()> {
     // KI-20：先校验 name，再打开数据库 / 创建 token。
     validate_agent_name(&name)?;
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
     let cfg = load_config(&path)?;
-    let db = SqliteStorage::open(&cfg.sqlite_path()?)?;
-
-    let token = new_secret();
-    let now = now_ms();
-    let expires = now + (ttl_minutes as i64) * 60_000;
-    db.create_enroll_token(&tls::sha256_hex(&token), &name, now, expires)?;
+    // 配置必须在创建 token / 写 agent CA 之前自洽；ACME 无 domains 等错误
+    // 不能留下一个已入库但无法使用的 enrollment token。
+    cfg.validate()
+        .context("hub 配置校验失败（检查 tls / server_names 等）")?;
 
     let trust = hub_agent_trust(&cfg);
-    // ACME 模式不读取/输出服务端证书指纹：旧指纹 agent 在 ACME hub 上必然失败，
-    // 必须引导升级而不是给一条无法使用的命令。self-signed 保持旧行为（读证书、
-    // 计算指纹），证书缺失时仍然报“先 init”。
+    let url = hub_agent_ws_url(&cfg)?;
+    let token = new_secret();
+    // 所有可能失败的准备（读证书、提取/写 agent CA、渲染 URL）都必须在
+    // `create_enroll_token` 之前完成；否则失败会留下无法使用的 token。
+    let mut agent_ca_path = None;
     let command = match trust {
         HubAgentTrust::Fingerprint => {
             let cert_pem =
                 std::fs::read_to_string(tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE))
                     .context("找不到服务端证书，先执行 rustboard-hub init")?;
             let fingerprint = tls::fingerprint_of_pem(&cert_pem)?;
-            render_install_command(&hub_agent_ws_url(&cfg), &token, &fingerprint, &name)
+            render_install_command(&url, &token, &fingerprint, &name)
         }
-        HubAgentTrust::SystemRoots => render_agent_install_command(
-            &hub_agent_ws_url(&cfg),
-            &token,
-            &name,
-            AgentInstallTrust::SystemRoots,
-        ),
-        HubAgentTrust::CustomCa(ca) => render_agent_install_command(
-            &hub_agent_ws_url(&cfg),
-            &token,
-            &name,
-            AgentInstallTrust::CustomCa(ca),
-        ),
+        HubAgentTrust::SystemRoots => {
+            render_agent_install_command(&url, &token, &name, AgentInstallTrust::SystemRoots)
+        }
+        HubAgentTrust::CustomCa => {
+            let ca_path = prepare_private_acme_agent_ca(&cfg, &path)?;
+            let ca_text = ca_path.to_str().ok_or_else(|| {
+                anyhow::anyhow!("agent CA 路径不是有效 UTF-8: {}", ca_path.display())
+            })?;
+            let command = render_agent_install_command(
+                &url,
+                &token,
+                &name,
+                AgentInstallTrust::CustomCa(ca_text),
+            );
+            agent_ca_path = Some(ca_path);
+            command
+        }
     };
+
+    let db = SqliteStorage::open(&cfg.sqlite_path()?)?;
+    let now = now_ms();
+    let expires = now + (ttl_minutes as i64) * 60_000;
+    db.create_enroll_token(&tls::sha256_hex(&token), &name, now, expires)?;
 
     println!("一次性 token（{ttl_minutes} 分钟内有效，仅可使用一次）:");
     println!("  {token}");
     if trust != HubAgentTrust::Fingerprint {
         println!("\n提示: {ACME_AGENT_UPGRADE_NOTICE}");
-        if let HubAgentTrust::CustomCa(ca) = trust {
-            println!("  自定义 ACME CA: {ca}（需确保目标机可读取该文件）");
+        if let Some(ca) = &agent_ca_path {
+            println!("  已生成 agent 信任锚: {}", ca.display());
+            println!(
+                "  请将该文件复制到目标机，或在该路径可读后再执行；\
+                 不要把 tls.acme_ca_file（ACME WFE 根）当作 agent CA。"
+            );
         }
     }
     println!("\n在目标服务器上执行:");
@@ -1269,8 +1318,22 @@ fn agent_add(config: Option<PathBuf>, name: String, ttl_minutes: u32) -> Result<
 ///
 /// self-signed 用 `server_names`（旧行为）；ACME 用 `tls.domains`。优先
 /// `advertise_host`，其次第一个非回环 IP，再退回第一个名字。
-fn hub_agent_ws_url(cfg: &HubConfig) -> String {
+///
+/// ACME 模式下证书 SAN 来自 `tls.domains`：若显式 `advertise_host` 不在其中，
+/// 生成的 URL 必然握手失败（主机名校验不通过），必须在创建 token 前拒绝。
+fn hub_agent_ws_url(cfg: &HubConfig) -> Result<String> {
     let names = cfg.effective_server_names();
+    if cfg.tls.mode.is_acme() {
+        if let Some(host) = cfg.advertise_host.as_deref() {
+            if !names.iter().any(|name| name.eq_ignore_ascii_case(host)) {
+                bail!(
+                    "advertise_host={host:?} 不在 ACME 证书名列表 tls.domains {:?} 中；\
+                     生成的 wss:// 地址会因主机名校验失败，请修改 advertise_host 或 tls.domains",
+                    names
+                );
+            }
+        }
+    }
     let host = cfg
         .advertise_host
         .clone()
@@ -1287,7 +1350,7 @@ fn hub_agent_ws_url(cfg: &HubConfig) -> String {
         .or_else(|| names.first().cloned())
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let port = cfg.agent_listen.rsplit(':').next().unwrap_or("8443");
-    format!("wss://{host}:{port}/agent/ws")
+    Ok(format!("wss://{host}:{port}/agent/ws"))
 }
 
 fn agent_revoke(config: Option<PathBuf>, id: String) -> Result<()> {
@@ -12782,22 +12845,36 @@ mod tests {
         };
         assert_eq!(hub_agent_trust(&public_acme), HubAgentTrust::SystemRoots);
         assert_eq!(
-            hub_agent_ws_url(&public_acme),
+            hub_agent_ws_url(&public_acme).unwrap(),
             "wss://board.example.com:8443/agent/ws",
             "ACME 模式主机名必须来自 tls.domains"
         );
 
-        // 私有 ACME：custom-ca + acme_ca_file。
+        // ACME 模式显式 advertise_host 必须被证书名覆盖，否则生成的 URL
+        // 必然在主机名校验阶段失败；空值仍按 effective names 选择。
+        let mut bad_advertise = public_acme.clone();
+        bad_advertise.advertise_host = Some("other.example.com".to_string());
+        let err = hub_agent_ws_url(&bad_advertise).unwrap_err().to_string();
+        assert!(
+            err.contains("advertise_host") && err.contains("tls.domains"),
+            "错误信息: {err}"
+        );
+        bad_advertise.advertise_host = Some("BOARD.EXAMPLE.COM".to_string());
+        assert_eq!(
+            hub_agent_ws_url(&bad_advertise).unwrap(),
+            "wss://BOARD.EXAMPLE.COM:8443/agent/ws",
+            "DNS 名匹配应大小写不敏感"
+        );
+
+        // 私有 ACME：custom-ca（信任锚在 agent add 时从 server.crt 链尾生成，
+        // 绝不再把 acme_ca_file 当作 agent CA）。
         let mut private_tls = public_acme.tls.clone();
         private_tls.acme_ca_file = "/etc/rustboard/pebble-ca.pem".to_string();
         let private_acme = HubConfig {
             tls: private_tls,
             ..public_acme.clone()
         };
-        assert_eq!(
-            hub_agent_trust(&private_acme),
-            HubAgentTrust::CustomCa("/etc/rustboard/pebble-ca.pem")
-        );
+        assert_eq!(hub_agent_trust(&private_acme), HubAgentTrust::CustomCa);
 
         // acme-ip 的主机名是 IP 字符串。
         let ip_acme = HubConfig {
@@ -12812,7 +12889,7 @@ mod tests {
         };
         assert_eq!(hub_agent_trust(&ip_acme), HubAgentTrust::SystemRoots);
         assert_eq!(
-            hub_agent_ws_url(&ip_acme),
+            hub_agent_ws_url(&ip_acme).unwrap(),
             "wss://203.0.113.10:8443/agent/ws"
         );
 
@@ -12872,6 +12949,81 @@ mod tests {
             ACME_AGENT_UPGRADE_NOTICE.contains("v0.4 指纹 agent 不兼容 ACME hub，请升级"),
             "升级提示必须点明 v0.4 agent 不兼容"
         );
+    }
+
+    /// C4：私有 ACME 的 agent CA 必须来自 `server.crt` 链尾，而不是
+    /// `tls.acme_ca_file`（后者只是 ACME WFE 的 HTTPS 根）。
+    #[cfg(unix)]
+    #[test]
+    fn c4_private_acme_agent_ca_uses_certificate_chain_tail() {
+        use rustboard_common::config::TlsConfig;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("private-acme-agent-ca");
+        let data_dir = dir.join("hub");
+        let cert_dir = tls::cert_dir(&data_dir);
+        fsutil::ensure_dir(&cert_dir, 0o700).unwrap();
+
+        // 构造真实链：叶子（clientAuth 不影响提取）+ 自签 CA。
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Test ACME Root");
+        let ca_pem = ca_params.self_signed(&ca_key).unwrap().pem();
+        let (csr, _leaf_key) = tls::make_csr().unwrap();
+        let leaf_pem = tls::sign_client_csr(&ca_key.serialize_pem(), &csr, "hub-leaf", 90).unwrap();
+        let cert_path = cert_dir.join(tls::SERVER_CERT_FILE);
+        fsutil::atomic_write(&cert_path, format!("{leaf_pem}{ca_pem}").as_bytes(), 0o600).unwrap();
+
+        let cfg = HubConfig {
+            data_dir: data_dir.clone(),
+            tls: TlsConfig {
+                mode: ServerTlsMode::AcmeDomain,
+                acme_email: "admin@example.com".to_string(),
+                domains: vec!["board.example.com".to_string()],
+                acme_ca_file: "/etc/rustboard/pebble-wfe-ca.pem".to_string(),
+                ..TlsConfig::default()
+            },
+            ..HubConfig::default()
+        };
+        let out = prepare_private_acme_agent_ca(&cfg, FsPath::new("/tmp/hub.toml")).unwrap();
+        assert_eq!(out, cert_dir.join("agent-ca.pem"));
+        let written = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(
+            tls::fingerprint_of_pem(&written).unwrap(),
+            tls::fingerprint_of_pem(&ca_pem).unwrap(),
+            "agent CA 必须是链尾 CA，不是 ACME WFE 的 acme_ca_file"
+        );
+        assert!(tls::certificate_is_ca(&written).unwrap());
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "agent CA 必须是 0644"
+        );
+
+        // 链尾是叶子：拒绝，且不能留下一个错误的 agent-ca.pem。
+        std::fs::remove_file(&out).unwrap();
+        fsutil::atomic_write(&cert_path, leaf_pem.as_bytes(), 0o600).unwrap();
+        let err = prepare_private_acme_agent_ca(&cfg, FsPath::new("/tmp/hub.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("链尾不是 CA"),
+            "错误必须说明链尾不是 CA: {err}"
+        );
+        assert!(!out.exists(), "失败时不得留下 agent-ca.pem");
+
+        // 证书尚未签发：提示先执行 tls issue。
+        std::fs::remove_file(&cert_path).unwrap();
+        let err = prepare_private_acme_agent_ca(&cfg, FsPath::new("/tmp/hub.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tls issue"), "错误信息: {err}");
+        assert!(!out.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// KI-20：正常 name 的安装命令逐字节不变；危险 name 只出现在安全引号里。

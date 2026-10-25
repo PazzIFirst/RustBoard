@@ -496,10 +496,25 @@ impl AgentConfig {
                     }
                 }
             }
+        } else if self.tls_mode != AgentTlsMode::Fingerprint {
+            // 明文 ws:// 不构建 TLS connector：system-roots / custom-ca 的 CA
+            // 与主机名校验会被完全忽略，必须拒绝，避免「配置了 CA 却明文传输」。
+            return Err(Error::InvalidConfig(format!(
+                "hub_url 为明文 ws:// 时只能使用 tls_mode=fingerprint；\
+                 {} 必须使用 wss://（否则 CA/主机名校验会被忽略）",
+                self.tls_mode.as_str()
+            )));
         }
-        // server_ca 只要非空就必须是绝对路径，与 mode 无关：避免运行到一半才
-        // 发现路径拼错。空串表示未配置。
+        // server_ca 只在 custom-ca 下有语义：其他模式携带非空 CA 会在运行时被
+        // 静默忽略，必须在配置层拒绝（install/init 复用同一校验）。
         if !self.server_ca.trim().is_empty() {
+            if self.tls_mode != AgentTlsMode::CustomCa {
+                return Err(Error::InvalidConfig(format!(
+                    "server_ca 只在 tls_mode=custom-ca 时允许（当前 {}）；\
+                     请清空 server_ca 或改用 custom-ca",
+                    self.tls_mode.as_str()
+                )));
+            }
             validate_absolute_config_path("server_ca", &self.server_ca)?;
         }
         // 续签阈值至少 1 天：0 会让「剩余寿命 ≤ 阈值」在刚签发后就成立。

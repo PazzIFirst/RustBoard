@@ -342,6 +342,14 @@ jobs:
           name: web-dist
           path: web/dist
 
+      # v100-offline 的来源校验会直接读取 dist/<arch>/bin；artifact 不保留权限，
+      # 统一恢复目标二进制可执行位，避免把 0644 误判成构建问题。
+      - name: 恢复构建产物可执行位（artifact 不保留权限）
+        run: |
+          set -euo pipefail
+          find dist -type f -path '*/bin/rustboard-*' -exec chmod 0755 {} +
+          find dist -type f -path '*/bin/rustboard-*' -print
+
       - name: 安装 e2e 依赖（缺什么装什么）
         run: |
           set -euo pipefail
@@ -410,6 +418,14 @@ jobs:
           name: web-dist
           path: web/dist
 
+      # v100-docker 要求 dist/$DOCKER_ARCH/bin 三个二进制可执行；artifact 不保留
+      # 权限，下载后统一恢复，避免 S.1 把 0644 误判成交付错误。
+      - name: 恢复构建产物可执行位（artifact 不保留权限）
+        run: |
+          set -euo pipefail
+          find dist -type f -path '*/bin/rustboard-*' -exec chmod 0755 {} +
+          find dist -type f -path '*/bin/rustboard-*' -print
+
       # docker/buildx 由 hosted runner 预装；compose 插件缺失时脚本回退 PyYAML。
       - name: 安装 e2e 依赖（缺什么装什么）
         run: |
@@ -467,6 +483,14 @@ jobs:
         with:
           name: web-dist
           path: web/dist
+
+      # v100-arm64 与随后的 Docker e2e 都要求 dist/arm64/bin 可执行；artifact
+      # 不保留权限，下载后统一恢复目标二进制。
+      - name: 恢复构建产物可执行位（artifact 不保留权限）
+        run: |
+          set -euo pipefail
+          find dist -type f -path '*/bin/rustboard-*' -exec chmod 0755 {} +
+          find dist -type f -path '*/bin/rustboard-*' -print
 
       # v100-arm64 需要 root（/opt 临时 prefix）与 file/curl/ss；Docker 部分需要
       # compose 插件或 PyYAML 回退。docker/buildx 由 arm64 hosted runner 预装。

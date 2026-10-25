@@ -1348,6 +1348,15 @@ fn read_server_ca(path: &Path) -> Result<Vec<u8>> {
     }
     let pem = std::str::from_utf8(&bytes)
         .map_err(|_| anyhow!("--server-ca {} 不是有效 UTF-8 PEM", path.display()))?;
+    // 先按 PEM 边界拒绝私钥/公钥/CSR 混入，再解析证书。`load_certs` 只读取
+    // CERTIFICATE 段，若只做它会把同一文件里的私钥原样复制到 0644 的
+    // data_dir/server-ca.pem。
+    tls::ensure_certificate_only_pem(pem).with_context(|| {
+        format!(
+            "--server-ca {} 不是仅含 CERTIFICATE 的 PEM（拒绝复制私钥/公钥/CSR）",
+            path.display()
+        )
+    })?;
     tls::load_certs(pem)
         .with_context(|| format!("--server-ca {} 不是合法 PEM 证书", path.display()))?;
     Ok(bytes)
@@ -2053,6 +2062,20 @@ mod tests {
             !err.contains("not a certificate"),
             "错误不能回显内容: {err}"
         );
+        // C4：cert+key 混合 PEM 必须拒绝，不能只校验 CERTIFICATE 段后把私钥
+        // 原样复制到 0644 的 server-ca.pem。
+        let (_csr, key_pem) = tls::make_csr().unwrap();
+        let mixed = dir.join("cert-key.pem");
+        write_mode(&mixed, format!("{ca_pem}{key_pem}").as_bytes(), 0o644);
+        let err = format!("{:#}", read_server_ca(&mixed).unwrap_err());
+        assert!(
+            err.contains("非 CERTIFICATE") && err.contains("PRIVATE KEY"),
+            "混合 PEM 必须点名私钥区块: {err}"
+        );
+        assert!(
+            !err.contains("-----BEGIN CERTIFICATE-----\n"),
+            "错误只能包含路径与区块类型，不能回显 PEM 内容: {err}"
+        );
         // 非 UTF-8 同样拒绝，且不回显内容。
         let binary = dir.join("binary.pem");
         write_mode(&binary, &[0xff, 0xfe, 0x00], 0o644);
@@ -2061,6 +2084,44 @@ mod tests {
             .to_string()
             .contains("UTF-8"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C4：`--server-ca` 指向 cert+key 混合文件时，安装必须在任何落盘前失败，
+    /// 不能把私钥写进 0644 的 server-ca.pem。
+    #[cfg(unix)]
+    #[test]
+    fn c4_custom_ca_install_rejects_mixed_key_before_writing() {
+        let _serial = serialize_install_tests();
+        if !running_as_root() {
+            eprintln!(
+                "跳过 c4_custom_ca_install_rejects_mixed_key_before_writing：prefix 校验需要 root"
+            );
+            return;
+        }
+        let dir = temp_dir("mixed-ca-install");
+        let token_file = dir.join("enroll-token");
+        write_private(&token_file, b"0123456789abcdef");
+        let ca_pem = sample_ca_pem(&dir);
+        let (_csr, key_pem) = tls::make_csr().unwrap();
+        let mixed = dir.join("mixed-ca.pem");
+        write_mode(&mixed, format!("{ca_pem}{key_pem}").as_bytes(), 0o644);
+
+        let paths = Paths::for_role(Role::Agent, &dir, PathOverrides::default()).unwrap();
+        let mut args = base_install_args(dir.clone());
+        args.token_file = Some(token_file);
+        args.tls_mode = Some(AgentTlsModeArg::CustomCa);
+        args.server_ca = Some(mixed);
+        let err = install(args).expect_err("cert+key 混合 PEM 必须拒绝");
+        assert!(
+            format!("{err:#}").contains("非 CERTIFICATE"),
+            "错误必须说明证书文件混入其他区块: {err:#}"
+        );
+        assert!(
+            !paths.data_dir.join(SERVER_CA_FILE).exists(),
+            "失败时不得创建 server-ca.pem"
+        );
+        assert!(!paths.config.exists(), "失败时不得写 agent 配置");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
