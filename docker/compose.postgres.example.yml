@@ -1,0 +1,90 @@
+# RustBoard Docker Compose PostgreSQL 叠加示例（M5 Phase D）。
+#
+# **不是默认部署**：默认 compose 仍是 SQLite（hub_data volume 内的
+# /data/var/lib/rustboard/hub/rustboard.db）。本文件必须和默认文件叠加使用：
+#
+#   # 1) 准备密码文件（0600，内容只有密码，末尾换行可有可无）：
+#   install -d -m 0700 docker/secrets
+#   openssl rand -base64 32 > docker/secrets/postgres_password
+#   chmod 0600 docker/secrets/postgres_password
+#
+#   # 2) 全新 volume 首次启动
+#   RUSTBOARD_VERSION=v1.0.0 \
+#   docker compose -f docker/compose.example.yml \
+#     -f docker/compose.postgres.example.yml up -d
+#
+# 这个叠加文件做四件事：
+# 1. 增加一个**不发布端口**的 PostgreSQL 16/17 服务（只在 compose 内网可达）；
+# 2. 给 hub 注入 RUSTBOARD_DATABASE 与 RUSTBOARD_DATABASE_PASSWORD_FILE；
+# 3. 用 pg_isready 健康检查把 hub 的启动排到数据库就绪之后；
+# 4. 增加持久化 volume postgres_data。
+#
+# 重要：
+# - hub 安装器**不会**自动建库/建角色；本示例由 postgres 镜像首次初始化时用
+#   POSTGRES_DB/POSTGRES_USER 创建（运算符显式声明）。非容器部署请按
+#   docs/install/postgres.md 手工 CREATE ROLE / DATABASE。
+# - RUSTBOARD_DATABASE 只在 hub **首次初始化**（/data/etc/rustboard/hub.toml
+#   不存在）时生效；已有 volume 不会被改写。SQLite→PG 切换/迁移必须先备份，
+#   见 docker/README.md §14 与 docs/install/postgres.md。
+# - 示例用 `sslmode=disable`，因为 stock postgres 镜像默认不启用 TLS；这条链路
+#   只适合本机 / 受信内网。生产必须给 PostgreSQL 配证书，并把 DSN 改成
+#   `?sslmode=verify-full`，同时用 RUSTBOARD_DATABASE_SSLROOTCERT 挂载私有 CA。
+#   不要用 sslmode=require / prefer：前者不保证主机名校验，后者会静默降级明文。
+# - 密码不写进本文件：postgres 侧用 POSTGRES_PASSWORD_FILE + Docker secret，
+#   hub 侧用 RUSTBOARD_DATABASE_PASSWORD_FILE（entrypoint 读取后导出为
+#   RUSTBOARD_DATABASE_PASSWORD）。`RUSTBOARD_PG_PASSWORD_FILE` 可指向仓库外
+#   的 0600 文件。
+# - 不要给 postgres 添加 `ports:`；5432 只应在 compose 默认网络内可达。
+#
+# 本文件不定义 name：Compose 项目名沿用默认文件，避免叠加后成为两个项目。
+
+services:
+  postgres:
+    # 16、17 都支持；需要固定小版本时改成 postgres:17.2-alpine 之类的 tag。
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: rustboard
+      POSTGRES_USER: rustboard
+      # 不在 environment 里写明文密码；由 Docker secret 挂载后初始化。
+      POSTGRES_PASSWORD_FILE: /run/secrets/rustboard_pg_password
+    secrets:
+      - rustboard_pg_password
+    volumes:
+      # 包含全部 RustBoard 数据；备份/恢复见 docs/install/postgres.md。
+      - postgres_data:/var/lib/postgresql/data
+    # intentionally no ports: 5432 不发布到宿主，也不对公网可达。
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rustboard -d rustboard"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+
+  hub:
+    depends_on:
+      postgres:
+        condition: service_healthy
+    secrets:
+      - rustboard_pg_password
+    environment:
+      # 无密码 DSN；密码由 RUSTBOARD_DATABASE_PASSWORD(_FILE) 提供。
+      # 示例用 sslmode=disable（stock 镜像无 TLS），生产改成 verify-full。
+      RUSTBOARD_DATABASE: "postgres://rustboard@postgres:5432/rustboard?sslmode=disable"
+      # entrypoint 读取该文件后导出 RUSTBOARD_DATABASE_PASSWORD，绝不打印。
+      RUSTBOARD_DATABASE_PASSWORD_FILE: "/run/secrets/rustboard_pg_password"
+      # 生产 TLS：给 PostgreSQL 配置证书后启用下面两行（并改 sslmode=verify-full）。
+      # RUSTBOARD_DATABASE_SSLROOTCERT: "/run/rustboard/postgres-ca.pem"
+    # volumes:
+    #   # 私有 CA PEM，只读挂载；路径必须是普通文件，否则 entrypoint 在安装前退出。
+    #   - ./secrets/postgres-ca.pem:/run/rustboard/postgres-ca.pem:ro
+
+secrets:
+  # 文件内容就是数据库密码；不要提交到仓库，建议 0600 并放在仓库外。
+  rustboard_pg_password:
+    file: ${RUSTBOARD_PG_PASSWORD_FILE:-./secrets/postgres_password}
+
+volumes:
+  postgres_data:

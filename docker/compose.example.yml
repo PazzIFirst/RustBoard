@@ -17,6 +17,12 @@
 #     -f docker/compose.acme.example.yml up -d
 # 本文件默认不发布 80/443，避免不需要 ACME 的部署多开端口。
 #
+# 数据库默认 SQLite（hub_data volume 内），本文件**不**包含 PostgreSQL service。
+# 需要显式 opt-in PostgreSQL 时叠加专用文件（不是默认行为）：
+#   docker compose -f docker/compose.example.yml \
+#     -f docker/compose.postgres.example.yml up -d
+# 首次初始化后 RUSTBOARD_DATABASE 不再生效；切换/迁移见 docker/README.md §14。
+#
 # 注意：hub 与 panel 共享 network namespace。panel 必须通过 127.0.0.1:8444
 # 访问 hub 管理 API；默认管理口仍是回环明文。`RUSTBOARD_ADMIN_TLS=required`
 # 可启用管理端 HTTPS，但必须同时覆盖 healthcheck（见 docker/README.md §8）。

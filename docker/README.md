@@ -4,7 +4,8 @@
 `packaging/build-release.sh` 产出的 musl 静态二进制和 `web/dist` 前端产物；基础镜像、
 端口、降权和 healthcheck 都在 `docker/Dockerfile` 中固定。Phase C 增加 ACME
 （80/443 元数据、`RUSTBOARD_TLS_MODE`/`RUSTBOARD_ACME_*`）、面板直连 HTTPS
-与管理端 TLS 的容器侧说明。
+与管理端 TLS 的容器侧说明；Phase D 增加 PostgreSQL（显式 opt-in）的容器侧说明，
+默认仍是 SQLite。
 
 > 安全基线：hub 管理 API **默认**仍只绑 `127.0.0.1:8444`；Phase C 支持
 > `RUSTBOARD_ADMIN_TLS=required` 的 HTTPS，但默认示例不启用。panel 默认与 hub
@@ -471,6 +472,10 @@ org.opencontainers.image.licenses=MIT
 | 改了 `RUSTBOARD_TLS_MODE` 不生效 | 已有 `/data/etc/rustboard/hub.toml`，entrypoint 跳过 install；见 §13.4 |
 | `--user 10001` 下 ACME 续期报绑定失败 | 非 root 无 `NET_BIND_SERVICE`；ACME 用默认 root entrypoint |
 | `RUSTBOARD_ACME_*` 缺失/非法 | entrypoint 在 install 前退出；按提示补变量，不要加 `--offline` |
+| hub 首启日志报连接 PostgreSQL 失败 | 数据库未就绪/密码文件缺失/DSN 错；compose 已用 healthcheck 排序，检查 `RUSTBOARD_PG_PASSWORD_FILE` 与 `RUSTBOARD_DATABASE`；见 §14 |
+| `RUSTBOARD_DATABASE_PASSWORD_FILE` 不是普通文件 | secret 未挂载或路径写错；Compose secret 必须存在于宿主且可读，路径是容器内绝对路径 |
+| 改了 `RUSTBOARD_DATABASE` 但仍是 SQLite | 已有 `hub.toml`，entrypoint 只在首次初始化应用该变量；按 §14.2 迁移，不要删 volume |
+| `--offline` 与 PostgreSQL 互斥 | PG 安装需要联网探测；去掉 `--offline`，或继续用 SQLite |
 | `COPY dist/... not found` | 未先运行构建脚本，或 `--platform` 对应架构的 `dist/<arch>/bin` 不存在 |
 | 镜像内找不到 web | `web/dist` 未构建，或 `.dockerignore` 误排除了 `web/dist` |
 
@@ -560,7 +565,96 @@ docker compose -f docker/compose.example.yml \
 > Docker ACME 的端到端验证需要公网 80/443 或 Pebble 端口映射；C8 只做
 > compose/脚本静态检查，不伪造签发成功。真实 LE staging 留 C9 手工门禁。
 
-## 14. 相关文档
+## 14. PostgreSQL（Phase D，显式 opt-in）
+
+默认 compose **不包含 PostgreSQL**，hub 仍使用 `hub_data` volume 内的 SQLite。
+PostgreSQL 只通过专用叠加文件启用，且**不是默认行为**：
+
+```bash
+install -d -m 0700 docker/secrets
+openssl rand -base64 32 > docker/secrets/postgres_password
+chmod 0600 docker/secrets/postgres_password
+
+RUSTBOARD_VERSION=v1.0.0 \
+docker compose -f docker/compose.example.yml \
+  -f docker/compose.postgres.example.yml up -d
+```
+
+叠加文件增加 `postgres:17-alpine`（16 也可）、`postgres_data` volume，并给 hub
+注入数据库环境变量。**5432 不发布**，只在 compose 默认网络内可达。完整的
+安装/权限/备份说明见 [PostgreSQL 安装文档](../docs/install/postgres.md)。
+
+### 14.1 数据库环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `RUSTBOARD_DATABASE` | 空（SQLite） | `postgres://` / `postgresql://` DSN；**只在首次初始化**（hub.toml 不存在）时映射为 `--db`；已有 volume 不会改写配置 |
+| `RUSTBOARD_DATABASE_SSLROOTCERT` | 空 | 容器内绝对路径的 PEM 根 CA，映射 `--db-sslrootcert`；必须与 `RUSTBOARD_DATABASE` 同时设置 |
+| `RUSTBOARD_DATABASE_PASSWORD` | 空 | 数据库密码；优先级高于 DSN 内密码；由 install / run 继承 |
+| `RUSTBOARD_DATABASE_PASSWORD_FILE` | 空 | entrypoint 读取该文件并导出为 `RUSTBOARD_DATABASE_PASSWORD`；适合 Docker secret；不能与直接设置密码同时使用 |
+
+- entrypoint **不打印** DSN 或密码，日志只说“PostgreSQL（连接串与密码不打印）”；
+  若 DSN 的 URL 里带密码会额外警告（它会出现在进程参数/容器元数据中），建议
+  使用无密码 DSN + `RUSTBOARD_DATABASE_PASSWORD(_FILE)`。
+- 设置 `RUSTBOARD_DATABASE` 后，entrypoint **不会**再追加 `--offline`（PG 探测
+  需要联网）；SQLite 默认路径的 `--offline` 行为不变。
+- 安装器只做 schema（幂等，advisory lock）与 `ping`，**不会**建库/建角色。
+  示例中的库/角色由 postgres 镜像首次初始化时按 `POSTGRES_DB`/`POSTGRES_USER`
+  创建；非容器部署要手工 `CREATE ROLE` / `CREATE DATABASE`。
+- 示例用 `sslmode=disable`（stock 镜像无 TLS），只适合本机/受信内网。生产请给
+  PostgreSQL 配证书，把 DSN 改成 `?sslmode=verify-full`，并用
+  `RUSTBOARD_DATABASE_SSLROOTCERT` 只读挂载私有 CA。不要用 `require`/`prefer`。
+
+### 14.2 已有 volume / 迁移
+
+`RUSTBOARD_DATABASE` 只在 hub 首次初始化时生效。已有 `/data/etc/rustboard/hub.toml`
+的 volume 改环境变量**不会**切换数据库；entrypoint 会跳过 install 并打印提示。
+
+切换/迁移固定顺序（详见 [postgres.md](../docs/install/postgres.md)）：
+
+1. **停 hub**（`docker compose ... stop hub panel`）并备份：`hub_data` +
+   PostgreSQL 逻辑备份；
+2. 用 D5 的 `rustboard-hub backup --out ...`（交付后）或手工 `pg_dump
+   --format=custom`；
+3. 用 `rustboard-hub migrate --to postgres://...`（D5 交付后）或按文档导入；
+4. 改 `hub.toml` 的 `database`（和 `db_sslrootcert`）后 `up -d`；
+5. 验证 `/healthz`、agent、面板与告警；保留 SQLite 与备份，观察后再清理。
+
+回滚：把 `database` 改回 SQLite 路径并重启；SQLite 文件全程不动。
+**迁移前必须停 hub**，不要在运行中直接复制 PG 数据目录。
+
+### 14.3 非 root 与备份工具
+
+- `docker run --user 10001:10001` / Compose `user:` 只在**已初始化** volume 上
+  支持：entrypoint 跳过 install，因此 `RUSTBOARD_DATABASE` 不会生效（不会改写
+  `hub.toml`）；配置必须已经是 PostgreSQL。数据库密码环境变量仍会传给 hub run。
+- hub 镜像基于 `debian:bookworm-slim`，**不含** `pg_dump`/`pg_restore`。备份请在
+  宿主执行，或临时用 `postgres:16` 容器；不要为了备份给 hub 镜像加包。
+- `pg_dump` 的一致性快照适合日常备份；迁移/切换场景仍要求先停 hub。
+  `postgres_data` 是 PG 自己管理的目录，运行中直接复制不保证一致。
+- 备份文件含 agent secret 与 token 哈希，按 secret 管理（0600/0700）。
+
+### 14.4 验证
+
+```bash
+# 1) 数据库已就绪（不打印密码）
+docker compose -f docker/compose.example.yml \
+  -f docker/compose.postgres.example.yml exec postgres \
+  pg_isready -U rustboard -d rustboard
+
+# 2) hub 初始化日志应包含“数据库: PostgreSQL（连接串与密码不打印）”
+docker compose -f docker/compose.example.yml \
+  -f docker/compose.postgres.example.yml logs hub | grep -E '数据库|apply_schema|安装完成'
+
+# 3) schema 表存在（21 张业务表 + schema_migrations）
+docker compose -f docker/compose.example.yml \
+  -f docker/compose.postgres.example.yml exec postgres \
+  psql -U rustboard -d rustboard -c '\dt'
+```
+
+排障时不要 `cat` 完整 `hub.toml`、不要 `docker inspect` 全量环境变量。
+
+## 15. 相关文档
 
 - [M5 Phase B 交付计划](../docs/plans/2026-10-25-m5-phase-b-delivery.md)
 - [M5 Phase A 安装器计划](../docs/plans/2026-10-24-m5-phase-a-installer.md)

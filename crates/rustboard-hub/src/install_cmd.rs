@@ -21,10 +21,14 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
-use rustboard_common::config::{AcmeChallenge, AdminTlsMode, HubConfig, ServerTlsMode, TlsConfig};
+use rustboard_common::config::{
+    redact_database_url, AcmeChallenge, AdminTlsMode, DatabaseKind, HubConfig, ServerTlsMode,
+    TlsConfig,
+};
 use rustboard_common::fsutil;
 use rustboard_common::tls;
 use rustboard_common::util::{hostname, port_of};
+use rustboard_core::storage::postgres::PostgresStorage;
 use rustboard_install::{
     detect_system, is_systemd_unit_dir, pick_free_port, render_unit, require_root, shell_arg,
     unit_is_ours, validate_install_prefix, validate_managed_path, wait_http_ok,
@@ -141,9 +145,13 @@ pub(crate) struct InstallArgs {
     /// 保留期，例如 `raw=7d,1m=90d,1h=2y`。
     #[arg(long)]
     pub(crate) retention: Option<String>,
-    /// 数据库后端；Phase A 只支持 `sqlite`。
+    /// 数据库后端：`sqlite`（默认，`<data-dir>/rustboard.db`）或
+    /// `postgres://…` / `postgresql://…`（不会自动建库/建角色）。
     #[arg(long)]
     pub(crate) db: Option<String>,
+    /// PostgreSQL 根 CA（PEM 绝对路径）；仅 `--db postgres://…` 时可用。
+    #[arg(long, value_name = "PEM")]
+    pub(crate) db_sslrootcert: Option<PathBuf>,
     /// 服务端证书来源：`self-signed`（默认）/ `acme-domain` / `acme-ip`。
     #[arg(long, value_parser = ["self-signed", "acme-domain", "acme-ip"])]
     pub(crate) tls: Option<String>,
@@ -377,15 +385,205 @@ fn validate_tls_args(args: &InstallArgs) -> Result<ServerTlsMode> {
     Ok(mode)
 }
 
-/// `--db` 只允许 SQLite；PostgreSQL 明确指向 Phase D。
-fn check_db_mode(value: Option<&str>) -> Result<()> {
-    match value {
-        None | Some("sqlite") => Ok(()),
-        Some(other) if other.starts_with("postgres://") || other.starts_with("postgresql://") => {
-            bail!("PostgreSQL 后端在 Phase D 实现，当前 --db 只支持 sqlite（实际 {other:?}）")
-        }
-        Some(other) => bail!("--db 只支持 sqlite（Phase A），无法识别 {other:?}"),
+/// `--db` 的解析结果。
+///
+/// `Postgres` 保存**原始** DSN（可能带密码），因此不 `derive(Debug)`：任何展示
+/// 都必须走 [`DbMode::redacted`] / [`redact_database_url`]。
+#[derive(Clone, PartialEq, Eq)]
+enum DbMode {
+    /// 默认 SQLite：数据库文件固定为 `<data-dir>/rustboard.db`。
+    Sqlite,
+    /// PostgreSQL 连接串。
+    Postgres(String),
+}
+
+impl DbMode {
+    fn is_postgres(&self) -> bool {
+        matches!(self, Self::Postgres(_))
     }
+
+    /// 适合终端 / 日志展示的脱敏形式。
+    fn redacted(&self) -> String {
+        match self {
+            Self::Sqlite => "sqlite".to_string(),
+            Self::Postgres(url) => redact_database_url(url),
+        }
+    }
+}
+
+impl std::fmt::Debug for DbMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sqlite => f.write_str("Sqlite"),
+            Self::Postgres(_) => write!(f, "Postgres({})", self.redacted()),
+        }
+    }
+}
+
+/// `--offline` 与 PostgreSQL 互斥的固定文案（安装器 / 已有配置两处共用）。
+const OFFLINE_PG_CONFLICT: &str = concat!(
+    "--offline 与 PostgreSQL 互斥：安装器需要连接数据库执行 apply_schema 与 ping，",
+    "离线模式不会发起任何网络请求。请去掉 --offline，或改用默认 SQLite"
+);
+
+/// 解析并**结构校验** `--db`；不联网、不写盘。
+///
+/// - `None` / `sqlite`：保持默认 SQLite（文件在 `data_dir`）；
+/// - `postgres://` / `postgresql://`：复用 `HubConfig::database_kind` 的 D1 结构
+///   校验（scheme / authority / host / database path）；
+/// - 其他值：明确失败，不静默回退 SQLite。
+///
+/// 非法 PostgreSQL URL 的错误只展示脱敏后的 URL，绝不回显 userinfo / 密码。
+fn check_db_mode(value: Option<&str>) -> Result<DbMode> {
+    match value {
+        None | Some("sqlite") => Ok(DbMode::Sqlite),
+        Some(url) if url.starts_with("postgres://") || url.starts_with("postgresql://") => {
+            // 只借用配置层的结构校验，不连接数据库。
+            let probe = HubConfig {
+                database: url.to_string(),
+                ..HubConfig::default()
+            };
+            match probe.database_kind() {
+                Ok(DatabaseKind::Postgres(_)) => Ok(DbMode::Postgres(url.to_string())),
+                _ => bail!(
+                    "--db 的 PostgreSQL 连接串结构非法（应形如 \
+                     postgres://user@host:5432/db?sslmode=verify-full）：{}",
+                    redact_database_url(url)
+                ),
+            }
+        }
+        Some(other) if other.starts_with("sqlite://") => bail!(
+            "--db 只接受 sqlite 或 postgres:// / postgresql://；SQLite 文件固定为 \
+             <data-dir>/rustboard.db，自定义路径请在安装后编辑 hub.toml 的 database"
+        ),
+        Some(_) => {
+            bail!("--db 只接受 sqlite 或 postgres:// / postgresql:// 连接串；其他数据库后端不支持")
+        }
+    }
+}
+
+/// `--db-sslrootcert` 的写盘前校验：绝对路径、普通文件、非符号链接。
+///
+/// 只 stat，不读取 PEM 内容；真正的 PEM 解析由 `PostgresStorage` 在探测时完成。
+fn validate_db_sslrootcert_arg(path: Option<&Path>) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if !path.is_absolute() {
+        bail!("--db-sslrootcert 必须是绝对路径: {}", path.display());
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "--db-sslrootcert 指向符号链接 {}：为防路径替换，请填写真实 PEM 文件路径",
+            path.display()
+        ),
+        Ok(meta) if meta.is_file() => Ok(()),
+        Ok(_) => bail!("--db-sslrootcert 不是普通文件: {}", path.display()),
+        Err(err) if err.kind() == ErrorKind::NotFound => bail!(
+            "--db-sslrootcert 文件不存在: {}（私有 CA 需要 PEM 根证书；公共 CA 可省略该参数）",
+            path.display()
+        ),
+        Err(err) => {
+            Err(err).with_context(|| format!("检查 --db-sslrootcert {} 失败", path.display()))
+        }
+    }
+}
+
+/// `--offline` 下不得写入未验证的 PostgreSQL URL。
+///
+/// `--db postgres://…` 在 CLI 阶段就会拒绝；这里再按**最终配置**判定一次，
+/// 覆盖「已有 hub.toml 是 PG + packaging/install.sh 自动注入 --offline」的场景。
+fn ensure_offline_not_postgres(offline: bool, cfg: &HubConfig) -> Result<()> {
+    if !offline {
+        return Ok(());
+    }
+    if matches!(cfg.database_kind()?, DatabaseKind::Postgres(_)) {
+        bail!(OFFLINE_PG_CONFLICT);
+    }
+    Ok(())
+}
+
+/// `--db-sslrootcert` 只对 PostgreSQL 有意义；SQLite 下静默忽略会误导用户。
+fn ensure_db_args_match_backend(args: &InstallArgs, cfg: &HubConfig) -> Result<()> {
+    if args.db_sslrootcert.is_none() {
+        return Ok(());
+    }
+    if matches!(cfg.database_kind()?, DatabaseKind::Postgres(_)) {
+        return Ok(());
+    }
+    bail!(
+        "--db-sslrootcert 只适用于 PostgreSQL；当前 database 为 SQLite（SQLite 不需要 TLS 根证书）"
+    )
+}
+
+/// 真实 PostgreSQL 探测：建池（含首次 `SELECT 1`）→ `apply_schema` → `ping`。
+///
+/// 顺序固定：
+/// 1. [`PostgresStorage::open_from_config`] 解析 DSN、建立连接池；构造器自身会
+///    做一次 `SELECT 1` 探活（D3 行为），连接不可达/认证失败在这里失败；
+/// 2. [`PostgresStorage::apply_schema`] 幂等应用 schema v7，事务级 advisory lock
+///    串行化多实例并发迁移；
+/// 3. [`PostgresStorage::ping`] 确认 schema 应用后连接仍可用。
+///
+/// **不自动建库 / 建角色**：`apply_schema` 只在该数据库内执行 `CREATE TABLE`
+/// 等 DDL，需要角色对 database/schema 有建表权限。
+///
+/// # 必须在 tokio runtime 外调用
+///
+/// `postgres` 是同步驱动，内部会创建 current-thread runtime；安装器走 `main`
+/// 的同步 CLI 分支，满足该前提（不要从 async 任务里调用）。
+///
+/// 错误上下文只使用脱敏 DSN（底层 `PostgresStorage` 统一处理），本函数不拼接
+/// 原始 URL。
+fn probe_postgres_database(cfg: &HubConfig) -> Result<()> {
+    let storage = PostgresStorage::open_from_config(cfg).context(
+        "连接 PostgreSQL 失败（连接串已脱敏；请检查 host/端口/用户/密码/sslmode/根证书）",
+    )?;
+    storage.apply_schema().context(
+        "PostgreSQL schema 初始化失败：需要在该数据库建表（owner 或等价权限）；\
+         安装器不会自动建库/建角色",
+    )?;
+    storage
+        .ping()
+        .context("PostgreSQL schema 应用后的 SELECT 1 探活失败")?;
+    Ok(())
+}
+
+/// 写配置 / unit / 二进制之前的数据库校验与探测。
+///
+/// 调用点固定在 `InstallTxn::begin` **之前**：失败时已有 `hub.toml`、unit 与
+/// 二进制一律不改写。顺序：offline 互斥 → `--db-sslrootcert` 后端匹配 →
+/// PostgreSQL `apply_schema` → `ping`。
+fn check_database_before_write(args: &InstallArgs, cfg: &HubConfig) -> Result<()> {
+    ensure_offline_not_postgres(args.offline, cfg)?;
+    ensure_db_args_match_backend(args, cfg)?;
+    match cfg.database_kind().context("解析 database 配置失败")? {
+        DatabaseKind::Postgres(_) => probe_postgres_database(cfg),
+        DatabaseKind::Sqlite(_) => Ok(()),
+    }
+}
+
+/// 应用 `--db` / `--db-sslrootcert`。
+///
+/// - `--db sqlite`：database 跟随 `cfg.data_dir`，并清掉不再适用的根证书字段；
+/// - `--db postgres://…`：写入原始 DSN；显式 `--db-sslrootcert` 同步写入；
+/// - 未给 `--db`：保持现有 database（新装配置已由 `new_hub_config` 写成 SQLite）。
+fn apply_db_flags(cfg: &mut HubConfig, args: &InstallArgs) -> Result<()> {
+    match check_db_mode(args.db.as_deref())? {
+        DbMode::Sqlite => {
+            if args.db.is_some() {
+                cfg.database = sqlite_database(&cfg.data_dir);
+                if args.db_sslrootcert.is_none() {
+                    cfg.db_sslrootcert = None;
+                }
+            }
+        }
+        DbMode::Postgres(url) => cfg.database = url,
+    }
+    if let Some(path) = &args.db_sslrootcert {
+        cfg.db_sslrootcert = Some(path.clone());
+    }
+    Ok(())
 }
 
 /// 解析 `--panel yes|no`。
@@ -678,6 +876,7 @@ fn new_hub_config(args: &InstallArgs, paths: &Paths, retention: Retention) -> Re
         admin_token: crate::new_secret(),
         ..HubConfig::default()
     };
+    apply_db_flags(&mut cfg, args)?;
     apply_tls_flags(&mut cfg, args)?;
     apply_retention(&mut cfg, retention);
     Ok(cfg)
@@ -709,13 +908,16 @@ fn apply_explicit_flags(
     if let Some(name) = &args.name {
         cfg.name = name.clone();
     }
-    // data_dir 是显式 flag 时，数据库跟随数据目录；--db 显式给出时也只支持 sqlite。
+    // data_dir 是显式 flag 时，SQLite 路径跟随数据目录（旧行为）。但 PostgreSQL
+    // 的 DSN 与本地 data_dir 无关：已有 PG 配置改 data_dir 时不能静默切回
+    // SQLite（那会看起来像换库/丢数据）；显式 --db 由 apply_db_flags 覆盖。
     if let Some(data_dir) = &args.data_dir {
         cfg.data_dir = data_dir.clone();
-        cfg.database = sqlite_database(data_dir);
-    } else if args.db.is_some() {
-        cfg.database = sqlite_database(&cfg.data_dir);
+        if args.db.is_none() && matches!(cfg.database_kind()?, DatabaseKind::Sqlite(_)) {
+            cfg.database = sqlite_database(data_dir);
+        }
     }
+    apply_db_flags(cfg, args)?;
     apply_tls_flags(cfg, args)?;
     apply_retention(cfg, retention);
     Ok(())
@@ -2041,7 +2243,18 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
     // 离线/ACME 互斥与 ACME 必填参数必须在读状态、写盘、访问网络之前失败。
     let requested_tls = validate_tls_args(&args)?;
     let prefix = args.prefix.clone().unwrap_or_else(|| PathBuf::from("/"));
-    check_db_mode(args.db.as_deref())?;
+    // --db / --db-sslrootcert 的结构与文件校验同样在读状态、写盘之前完成；
+    // 真实 PostgreSQL 探测要等读到最终配置、并确认 offline 互斥之后再执行。
+    let db_mode = check_db_mode(args.db.as_deref())?;
+    validate_db_sslrootcert_arg(args.db_sslrootcert.as_deref())?;
+    if args.offline && db_mode.is_postgres() {
+        bail!(OFFLINE_PG_CONFLICT);
+    }
+    if args.db.is_some() && !db_mode.is_postgres() && args.db_sslrootcert.is_some() {
+        bail!(
+            "--db-sslrootcert 只适用于 PostgreSQL；--db sqlite 不需要 TLS 根证书（请去掉该参数）"
+        );
+    }
     let retention = match args.retention.as_deref() {
         Some(value) => parse_retention(value)?,
         None => Retention::default(),
@@ -2094,7 +2307,15 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
             Some(value) => parse_panel(value)?,
             None => args.yes,
         };
-        print_install_plan(&args, &paths, manage, write_unit, panel_yes, requested_tls);
+        print_install_plan(
+            &args,
+            &paths,
+            manage,
+            write_unit,
+            panel_yes,
+            requested_tls,
+            &db_mode,
+        );
         return Ok(());
     }
 
@@ -2243,12 +2464,19 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
     // B：--offline 的 CLI 参数检查只覆盖本次显式 ACME；已有配置可能本来就是
     // ACME。必须在任何诊断 / 事务 / 联网之前拒绝，且不得改写配置。
     ensure_offline_not_acme(&args, &cfg)?;
+    // 同理，已有配置可能已经是 PostgreSQL；--offline 必须在任何探测前拒绝。
+    ensure_offline_not_postgres(args.offline, &cfg)?;
+    ensure_db_args_match_backend(&args, &cfg)?;
     // 已有配置的 data_dir 是权威值：升级/重装不跟随 flag 默认值漂移。
     paths.data_dir = cfg.data_dir.clone();
     // 配置来自 state/磁盘：admin_tls=required 在 Phase C 用 HTTPS 健康检查支持，
     // 但必须在写盘前确认能推导出 SNI / CA，不能等到启动后误判并回滚。
     ensure_admin_tls_supported(&cfg)?;
     validate_install_paths(&paths)?;
+    // PostgreSQL 探测必须在 InstallTxn 之前：apply_schema 会写 PG（幂等），
+    // 失败时已有 hub.toml / unit / 二进制一律不改写。探测顺序见
+    // [`probe_postgres_database`]。SQLite 不联网、不探测，行为保持不变。
+    check_database_before_write(&args, &cfg)?;
     // ACME 材料（CA / 账户 / 状态 / 证书）不在 InstallTxn 的备份模型里：在诊断与
     // 任何回退路径之前记录 data_dir 是否已存在。只有全新安装才允许自动建 CA。
     let data_dir_existed_before = !path_is_missing(&paths.data_dir, "数据目录")?;
@@ -2826,26 +3054,38 @@ impl Drop for TempTokenFile {
     }
 }
 
-/// 打印安装计划（dry-run）。
-fn print_install_plan(
+/// 渲染安装计划（dry-run）。
+///
+/// 独立成纯函数（只返回字符串、不打印）便于测试断言「计划输出不含 DSN 密码」。
+/// PostgreSQL 只展示 [`redact_database_url`] 的结果，且明确写出将执行的动作与
+/// “不联网”。
+fn render_install_plan(
     args: &InstallArgs,
     paths: &Paths,
     manage: bool,
     write_unit: bool,
     panel_yes: bool,
     requested_tls: ServerTlsMode,
-) {
-    println!("RustBoard Hub 安装计划（--dry-run：不写文件、不调用 systemctl、不联网）");
-    println!("  安装前缀: {}", paths.prefix.display());
-    println!("  配置: {}", paths.config.display());
-    println!("  数据目录: {}", paths.data_dir.display());
-    println!("  二进制: {}", paths.binary.display());
+    db_mode: &DbMode,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "RustBoard Hub 安装计划（--dry-run：不写文件、不调用 systemctl、不联网）"
+    );
+    let _ = writeln!(out, "  安装前缀: {}", paths.prefix.display());
+    let _ = writeln!(out, "  配置: {}", paths.config.display());
+    let _ = writeln!(out, "  数据目录: {}", paths.data_dir.display());
+    let _ = writeln!(out, "  二进制: {}", paths.binary.display());
     if write_unit {
-        println!("  unit: {}", paths.unit.display());
+        let _ = writeln!(out, "  unit: {}", paths.unit.display());
     } else {
-        println!("  unit: 不写入（--no-systemd）");
+        let _ = writeln!(out, "  unit: 不写入（--no-systemd）");
     }
-    println!(
+    let _ = writeln!(
+        out,
         "  systemd: {}",
         if manage {
             "daemon-reload → enable --now → 等待 /healthz"
@@ -2855,7 +3095,37 @@ fn print_install_plan(
             "不写 unit、不调用 systemctl"
         }
     );
-    println!(
+    match db_mode {
+        DbMode::Postgres(url) => {
+            // 连接串可能来自 `--db`，也可能含密码：只输出脱敏形式。
+            let _ = writeln!(out, "  数据库: PostgreSQL {}", redact_database_url(url));
+            let _ = writeln!(
+                out,
+                "  PostgreSQL 动作: 连接 → apply_schema（advisory lock，幂等）→ ping；\
+                 不自动建库/建角色；--dry-run 不执行"
+            );
+            if let Some(cert) = args.db_sslrootcert.as_deref() {
+                let _ = writeln!(out, "  PostgreSQL 根 CA: {}", cert.display());
+            }
+        }
+        DbMode::Sqlite if args.db.is_some() => {
+            let _ = writeln!(
+                out,
+                "  数据库: sqlite://{}/rustboard.db",
+                paths.data_dir.display()
+            );
+        }
+        DbMode::Sqlite => {
+            let _ = writeln!(
+                out,
+                "  数据库: 未给 --db：全新安装使用 SQLite（{}/rustboard.db）；\
+                 已有配置沿用其 database",
+                paths.data_dir.display()
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
         "  TLS: {}（管理 API: {}）",
         requested_tls.as_str(),
         match args.tls_options.admin_tls.as_deref() {
@@ -2864,23 +3134,67 @@ fn print_install_plan(
         }
     );
     if requested_tls.is_acme() {
-        println!(
+        let _ = writeln!(
+            out,
             "  ACME: 写 unit 前先做 80/443/防火墙/云只读诊断，再调用 `tls issue` \
              （staging / production 由 C4 CLI 负责）；最多 {ACME_MAX_ATTEMPTS} 轮，\
              失败按 tls.fallback_to_self_signed 回退"
         );
-        println!("  ACME 需要：--acme-email / --domain；不会自动修改防火墙或安全组");
+        let _ = writeln!(
+            out,
+            "  ACME 需要：--acme-email / --domain；不会自动修改防火墙或安全组"
+        );
     }
     if panel_yes {
-        println!("  同机面板: 将调用同目录的 {}", Role::Panel.binary_name());
+        let _ = writeln!(
+            out,
+            "  同机面板: 将调用同目录的 {}",
+            Role::Panel.binary_name()
+        );
         if let Some(dir) = &args.panel_static_dir {
-            println!("  面板静态目录: {}", dir.display());
+            let _ = writeln!(out, "  面板静态目录: {}", dir.display());
         }
     } else {
-        println!("  同机面板: 跳过（--panel no）");
+        let _ = writeln!(out, "  同机面板: 跳过（--panel no）");
     }
     if args.force {
-        println!("  --force: 覆盖已有配置 / unit 并重启（保留 admin_token、data_dir、证书）");
+        let _ = writeln!(
+            out,
+            "  --force: 覆盖已有配置 / unit 并重启（保留 admin_token、data_dir、证书）"
+        );
+    }
+    out
+}
+
+/// 打印安装计划（dry-run）。
+fn print_install_plan(
+    args: &InstallArgs,
+    paths: &Paths,
+    manage: bool,
+    write_unit: bool,
+    panel_yes: bool,
+    requested_tls: ServerTlsMode,
+    db_mode: &DbMode,
+) {
+    print!(
+        "{}",
+        render_install_plan(
+            args,
+            paths,
+            manage,
+            write_unit,
+            panel_yes,
+            requested_tls,
+            db_mode
+        )
+    );
+}
+
+/// 配置里 database 的脱敏展示；非法配置也不回显原值。
+fn redacted_database(cfg: &HubConfig) -> String {
+    match cfg.database_kind() {
+        Ok(kind) => kind.redacted(),
+        Err(_) => "<database 配置非法>".to_string(),
     }
 }
 
@@ -2890,6 +3204,7 @@ fn print_install_success(plan: &InstallPlan<'_>) {
     println!("RustBoard Hub 安装完成。");
     println!("  配置: {}", plan.paths.config.display());
     println!("  数据目录: {}", plan.paths.data_dir.display());
+    println!("  数据库: {}", redacted_database(plan.cfg));
     println!("  agent 接入: {}", plan.cfg.agent_listen);
     println!("  管理 API: {}", plan.health.display_url());
     println!("  服务端证书来源: {}", plan.cfg.tls.mode.as_str());
@@ -3920,7 +4235,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_c_tls_modes_parse_and_phase_d_db_is_rejected() {
+    fn phase_c_tls_modes_parse_and_db_modes_are_validated() {
         assert_eq!(parse_tls_mode(None).unwrap(), ServerTlsMode::SelfSigned);
         assert_eq!(
             parse_tls_mode(Some("self-signed")).unwrap(),
@@ -3937,13 +4252,190 @@ mod tests {
         let err = parse_tls_mode(Some("bogus")).unwrap_err().to_string();
         assert!(err.contains("--tls"), "{err}");
 
-        assert!(check_db_mode(None).is_ok());
-        assert!(check_db_mode(Some("sqlite")).is_ok());
-        for url in ["postgres://localhost/rustboard", "postgresql://db/rb"] {
-            let err = check_db_mode(Some(url)).unwrap_err().to_string();
-            assert!(err.contains("Phase D"), "{url}: {err}");
+        assert_eq!(check_db_mode(None).unwrap(), DbMode::Sqlite);
+        assert_eq!(check_db_mode(Some("sqlite")).unwrap(), DbMode::Sqlite);
+        for url in [
+            "postgres://localhost/rustboard",
+            "postgresql://db/rb",
+            "postgres://rustboard@127.0.0.1:5432/rustboard?sslmode=verify-full",
+        ] {
+            match check_db_mode(Some(url)).unwrap() {
+                DbMode::Postgres(parsed) => assert_eq!(parsed, url),
+                other => panic!("{url} 应解析为 PostgreSQL，实际 {other:?}"),
+            }
         }
-        assert!(check_db_mode(Some("mysql")).is_err());
+        // 其他后端 / 自定义 SQLite 路径明确拒绝，不静默回退。
+        for unsupported in ["mysql", "mysql://db/rb", "sqlite:///tmp/rb.db", ""] {
+            let err = check_db_mode(Some(unsupported)).unwrap_err().to_string();
+            assert!(err.contains("--db"), "{unsupported:?}: {err}");
+        }
+        // 非法 PG URL：失败且错误不含密码。
+        let secret = "db-topsecret-4f8a";
+        let bad = format!("postgres://rustboard:{secret}@/rustboard");
+        let err = check_db_mode(Some(&bad)).unwrap_err().to_string();
+        assert!(!err.contains(secret), "错误泄露密码: {err}");
+        assert!(err.contains("postgres://rustboard:***@"), "{err}");
+    }
+
+    /// `--db-sslrootcert` 只接受绝对路径的真实普通文件。
+    #[test]
+    fn db_sslrootcert_requires_absolute_regular_file() {
+        assert!(validate_db_sslrootcert_arg(None).is_ok());
+        let err = validate_db_sslrootcert_arg(Some(Path::new("relative/ca.pem"))).unwrap_err();
+        assert!(err.to_string().contains("绝对路径"), "{err}");
+
+        let dir = TempDir::new("db-sslrootcert");
+        let missing = dir.path().join("missing-ca.pem");
+        let err = validate_db_sslrootcert_arg(Some(&missing))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不存在"), "{err}");
+
+        let err = validate_db_sslrootcert_arg(Some(dir.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不是普通文件"), "{err}");
+
+        let ca = dir.path().join("pg-ca.pem");
+        fs::write(&ca, "-----BEGIN CERTIFICATE-----\n").unwrap();
+        assert!(validate_db_sslrootcert_arg(Some(&ca)).is_ok());
+    }
+
+    /// dry-run 只打印脱敏后的 DSN 与将执行的动作，不出现密码。
+    #[test]
+    fn db_dry_run_plan_redacts_password_and_never_connects() {
+        let secret = "db-plan-secret-9a1c";
+        let mut args = test_install_args();
+        args.db = Some(format!(
+            "postgres://rustboard:{secret}@db.example.com:5432/rustboard?sslmode=verify-full"
+        ));
+        let db_mode = check_db_mode(args.db.as_deref()).unwrap();
+        let paths = Paths::for_role(
+            Role::Hub,
+            Path::new("/opt/rustboard-dryrun"),
+            PathOverrides::default(),
+        )
+        .unwrap();
+        let plan = render_install_plan(
+            &args,
+            &paths,
+            false,
+            false,
+            false,
+            ServerTlsMode::SelfSigned,
+            &db_mode,
+        );
+        assert!(!plan.contains(secret), "dry-run 计划泄露密码: {plan}");
+        assert!(
+            plan.contains("postgres://rustboard:***@db.example.com"),
+            "{plan}"
+        );
+        assert!(plan.contains("apply_schema"), "{plan}");
+        assert!(plan.contains("ping"), "{plan}");
+        assert!(plan.contains("不自动建库/建角色"), "{plan}");
+        assert!(plan.contains("不联网"), "{plan}");
+        // 计划本身不读配置、不联网：dry-run 的 probe 永远不会被调用。
+    }
+
+    /// `--offline` 与 PostgreSQL 互斥：CLI 与已有配置两条路径都要拒绝。
+    #[test]
+    fn offline_with_postgres_is_rejected() {
+        let mut args = test_install_args();
+        args.offline = true;
+        args.db = Some("postgres://rustboard@127.0.0.1:5432/rustboard?sslmode=disable".into());
+        // dry-run 也拒绝：不得在 offline 下打印/写入未验证的 PG 计划之外的路径。
+        args.prefix = Some(std::env::temp_dir().join("rb-offline-pg"));
+        args.dry_run = true;
+        let err = install(args).unwrap_err().to_string();
+        assert!(err.contains("--offline"), "{err}");
+        assert!(err.contains("PostgreSQL"), "{err}");
+
+        // 已有配置为 PG + packaging/install.sh 注入 --offline：按最终配置拒绝。
+        let cfg = HubConfig {
+            database: "postgres://rustboard@127.0.0.1:5432/rustboard".into(),
+            ..HubConfig::default()
+        };
+        let err = ensure_offline_not_postgres(true, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--offline"), "{err}");
+        assert!(err.contains("PostgreSQL"), "{err}");
+        let sqlite = HubConfig::default();
+        ensure_offline_not_postgres(true, &sqlite).expect("SQLite 离线安装保持允许");
+    }
+
+    /// PostgreSQL 探测失败（不可达）时：已有配置的字节不被改写，错误不含密码。
+    ///
+    /// 探测点固定在 `InstallTxn::begin` 之前；本测试复现同一顺序：
+    /// 读配置并应用 `--db` → 写盘前探测 → 失败返回。配置文件内容必须逐字节不变。
+    #[test]
+    fn failed_postgres_probe_does_not_rewrite_existing_config() {
+        let dir = TempDir::new("pg-probe-keeps-config");
+        let paths = Paths::for_role(Role::Hub, dir.path(), PathOverrides::default()).unwrap();
+        fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+        let cfg = HubConfig {
+            data_dir: paths.data_dir.clone(),
+            database: sqlite_database(&paths.data_dir),
+            admin_token: "existing-admin-token".to_string(),
+            ..HubConfig::default()
+        };
+        let config_text = toml::to_string_pretty(&cfg).unwrap();
+        fs::write(&paths.config, config_text.as_bytes()).unwrap();
+        let before = fs::read(&paths.config).unwrap();
+
+        let secret = "probe-secret-7c2e";
+        // 端口 1 在本机不会提供服务；sslmode=disable 避免 TLS 根证书干扰。
+        let unreachable =
+            format!("postgres://rustboard:{secret}@127.0.0.1:1/rustboard?sslmode=disable");
+        let mut args = test_install_args();
+        args.prefix = Some(dir.path().to_path_buf());
+        args.db = Some(unreachable.clone());
+        args.db_sslrootcert = None;
+
+        // 与 install 非 dry-run 路径一致：先读已有配置并应用显式 flags（不写盘）。
+        let (mut updated, _need_certs) =
+            prepare_config(&args, &paths, Retention::default(), true).unwrap();
+        assert_eq!(updated.database, unreachable);
+        // 写盘前探测失败。
+        let err = check_database_before_write(&args, &updated).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(!rendered.contains(secret), "探测错误泄露密码: {rendered}");
+        assert!(
+            rendered.to_ascii_lowercase().contains("postgres") || rendered.contains("连接"),
+            "{rendered}"
+        );
+        // 配置字节不变（探测失败发生在任何事务/写盘之前）。
+        assert_eq!(fs::read(&paths.config).unwrap(), before);
+        // 失败不得把内存里的改动写回。
+        updated.admin_token.clear();
+        assert_eq!(fs::read(&paths.config).unwrap(), before);
+    }
+
+    /// 有本地 PG 时验证真实探测链路（open → apply_schema → ping）；无 env 明确 SKIP。
+    #[test]
+    fn postgres_probe_applies_schema_when_test_pg_available() {
+        let Ok(dsn) = std::env::var("RUSTBOARD_TEST_PG") else {
+            eprintln!(
+                "SKIP postgres_probe_applies_schema_when_test_pg_available: \
+                 未设置 RUSTBOARD_TEST_PG（需要一个可建表的测试 PostgreSQL）"
+            );
+            return;
+        };
+        if dsn.trim().is_empty() {
+            eprintln!(
+                "SKIP postgres_probe_applies_schema_when_test_pg_available: \
+                 RUSTBOARD_TEST_PG 为空"
+            );
+            return;
+        }
+        let cfg = HubConfig {
+            database: dsn.trim().to_string(),
+            db_pool_size: 2,
+            db_connect_timeout_ms: 5_000,
+            ..HubConfig::default()
+        };
+        // 集成测试的库通常是 sslmode=disable 的本地容器；不覆盖用户给的 sslmode。
+        probe_postgres_database(&cfg).expect("真实 PostgreSQL 探测（apply_schema → ping）失败");
     }
 
     #[test]
@@ -4358,6 +4850,7 @@ mod tests {
             name: None,
             retention: None,
             db: None,
+            db_sslrootcert: None,
             tls: None,
             tls_options: Box::default(),
             panel: None,

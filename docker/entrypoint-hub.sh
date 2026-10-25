@@ -10,6 +10,11 @@
 # - TLS 模式由 RUSTBOARD_TLS_MODE 控制（默认 self-signed，安装阶段追加 --offline）；
 #   ACME 模式读取 RUSTBOARD_ACME_* 并在首次安装时映射为 CLI 参数，绝不追加
 #   --offline；缺失/非法参数在写盘前失败；
+# - 数据库默认 SQLite。RUSTBOARD_DATABASE（postgres:// / postgresql://）只在
+#   首次安装时映射为 `--db`，已有配置不改写；该模式需要联网探测，安装阶段不
+#   追加 --offline。RUSTBOARD_DATABASE_SSLROOTCERT 映射 `--db-sslrootcert`；
+#   RUSTBOARD_DATABASE_PASSWORD_FILE 读取后导出为 RUSTBOARD_DATABASE_PASSWORD；
+#   连接串与密码绝不打印；
 # - 已初始化的 volume 支持 `docker run --user 10001:10001`，此时只校验配置可读，
 #   不执行 install / chown；非 root 启动不保留绑定低端口的能力，不建议用于 ACME；
 # - 失败时以非零码退出，不启动服务，也不删除已有 /data 数据。
@@ -30,6 +35,11 @@ readonly SETPRIV=/usr/bin/setpriv
 readonly TLS_MODE="${RUSTBOARD_TLS_MODE:-self-signed}"
 # 管理 API：off（默认，仅回环 HTTP）/ required（HTTPS）。
 readonly ADMIN_TLS_MODE="${RUSTBOARD_ADMIN_TLS:-}"
+
+# PostgreSQL（可选）：只在首次安装时通过 RUSTBOARD_DATABASE 映射为 --db。
+# 已有配置以 hub.toml 为准，环境变量不会改写它。原始 DSN 可能含密码，绝不打印。
+DATABASE_URL=""
+DATABASE_SSLROOTCERT=""
 
 # ACME 安装参数；只在首次安装且 TLS_MODE 为 acme-* 时填充。
 ACME_EMAIL=""
@@ -65,6 +75,70 @@ validate_tls_mode_env() {
     ""|off|required) ;;
     *) die "RUSTBOARD_ADMIN_TLS 只接受 off / required" ;;
   esac
+}
+
+# 校验数据库环境变量。RUSTBOARD_DATABASE 的值可能含密码，绝不打印。
+# - 只接受 postgres:// / postgresql://（SQLite 是默认，不需要环境变量）；
+# - RUSTBOARD_DATABASE_SSLROOTCERT 仅与 RUSTBOARD_DATABASE 同时使用，必须是
+#   容器内绝对路径的普通文件；
+# - RUSTBOARD_DATABASE_PASSWORD_FILE 读取后导出为 RUSTBOARD_DATABASE_PASSWORD
+#   （hub 只认环境变量），便于使用 Docker secret；与直接设置密码互斥。
+#   文件末尾的换行会被命令替换去掉。
+validate_database_env() {
+  local raw cert pw_file pw authority userinfo
+
+  raw="$(trim "${RUSTBOARD_DATABASE:-}")"
+  if [ -n "$raw" ]; then
+    case "$raw" in
+      postgres://*|postgresql://*) ;;
+      *) die "RUSTBOARD_DATABASE 只接受 postgres:// 或 postgresql:// 连接串（值不打印）" ;;
+    esac
+    case "$raw" in
+      *[[:space:][:cntrl:]]*) die "RUSTBOARD_DATABASE 含空白或控制字符（值不打印）" ;;
+    esac
+    case "$raw" in
+      *"#"*) die "RUSTBOARD_DATABASE 不能包含 fragment（#）" ;;
+    esac
+    # URL 内密码会进入 argv / 容器元数据；只提醒，不回显值。
+    authority="${raw#*://}"
+    authority="${authority%%[/?#]*}"
+    if [[ "$authority" == *@* ]]; then
+      userinfo="${authority%@*}"
+      if [[ "$userinfo" == *:* ]]; then
+        log "警告: RUSTBOARD_DATABASE 的 URL 含密码，可能出现在进程参数与容器元数据中；\
+建议改用无密码 DSN + RUSTBOARD_DATABASE_PASSWORD(_FILE)"
+      fi
+    fi
+  fi
+
+  cert="$(trim "${RUSTBOARD_DATABASE_SSLROOTCERT:-}")"
+  if [ -n "$cert" ]; then
+    [ -n "$raw" ] || die "RUSTBOARD_DATABASE_SSLROOTCERT 只能与 RUSTBOARD_DATABASE 一起使用"
+    case "$cert" in
+      /*) ;;
+      *) die "RUSTBOARD_DATABASE_SSLROOTCERT 必须是容器内绝对路径" ;;
+    esac
+    [ -f "$cert" ] || die "RUSTBOARD_DATABASE_SSLROOTCERT 不是普通文件（请只读挂载 PEM）"
+    [ -r "$cert" ] || die "RUSTBOARD_DATABASE_SSLROOTCERT 不可读"
+  fi
+  DATABASE_URL="$raw"
+  DATABASE_SSLROOTCERT="$cert"
+
+  pw_file="$(trim "${RUSTBOARD_DATABASE_PASSWORD_FILE:-}")"
+  if [ -n "$pw_file" ]; then
+    [ -z "${RUSTBOARD_DATABASE_PASSWORD:-}" ] \
+      || die "RUSTBOARD_DATABASE_PASSWORD 与 RUSTBOARD_DATABASE_PASSWORD_FILE 不能同时设置"
+    case "$pw_file" in
+      /*) ;;
+      *) die "RUSTBOARD_DATABASE_PASSWORD_FILE 必须是容器内绝对路径" ;;
+    esac
+    [ -f "$pw_file" ] || die "RUSTBOARD_DATABASE_PASSWORD_FILE 不是普通文件"
+    [ -r "$pw_file" ] || die "RUSTBOARD_DATABASE_PASSWORD_FILE 不可读"
+    pw="$(cat -- "$pw_file")" || die "读取 RUSTBOARD_DATABASE_PASSWORD_FILE 失败"
+    [ -n "$pw" ] || die "RUSTBOARD_DATABASE_PASSWORD_FILE 为空"
+    export RUSTBOARD_DATABASE_PASSWORD="$pw"
+    unset pw
+  fi
 }
 
 has_acme_env() {
@@ -374,10 +448,15 @@ share_admin_token_if_requested() {
 
 # 环境变量取值在任何 install / exec 之前校验：非法值不能带进运行阶段。
 validate_tls_mode_env
+validate_database_env
 
 # 非 root：只允许已初始化 volume，直接运行，避免尝试 chown / install。
 if [ "$(id -u)" -ne 0 ]; then
   validate_config_readable
+  if [ -n "$DATABASE_URL" ]; then
+    log "提示: 已初始化 volume，RUSTBOARD_DATABASE 只在首次初始化时生效；\
+数据库连接以 hub.toml 为准（改 DSN 请备份后编辑配置，SQLite→PG 迁移见 docs/install/postgres.md）"
+  fi
   if [ -n "${RUSTBOARD_ADMIN_TOKEN_SHARE:-}" ] \
     && [ ! -r "${RUSTBOARD_ADMIN_TOKEN_SHARE}" ]; then
     die "非 root 启动不会生成共享 admin token；请先用 root 启动一次，\
@@ -419,10 +498,28 @@ if [ ! -e "$CONFIG_FILE" ]; then
     --panel no
   )
 
+  # 可选 PostgreSQL：只在首次安装时传给安装器。安装器会 apply_schema + ping，
+  # 不自动建库/建角色；DSN 与密码不打印。实例/角色必须先由 DBA 建好。
+  if [ -n "$DATABASE_URL" ]; then
+    install_args+=(--db "$DATABASE_URL")
+    if [ -n "$DATABASE_SSLROOTCERT" ]; then
+      install_args+=(--db-sslrootcert "$DATABASE_SSLROOTCERT")
+    fi
+    log "数据库: PostgreSQL（连接串与密码不打印；安装阶段执行 apply_schema → ping，不建库/建角色）"
+  else
+    log "数据库: SQLite（默认；设置 RUSTBOARD_DATABASE 可改用 PostgreSQL）"
+  fi
+
   if [ "$TLS_MODE" = "self-signed" ]; then
-    # 默认行为与 Phase B 一致：自签 + 安装阶段 --offline。
-    install_args+=(--offline --tls self-signed)
-    log "TLS 模式: self-signed（安装阶段 --offline）"
+    if [ -n "$DATABASE_URL" ]; then
+      # PostgreSQL 探测需要联网，不能追加 --offline（安装器会明确拒绝）。
+      install_args+=(--tls self-signed)
+      log "TLS 模式: self-signed（PostgreSQL 探测需要网络，安装阶段不使用 --offline）"
+    else
+      # 默认行为与 Phase B 一致：自签 + 安装阶段 --offline。
+      install_args+=(--offline --tls self-signed)
+      log "TLS 模式: self-signed（安装阶段 --offline）"
+    fi
   else
     # ACME 必须访问 ACME 目录并完成 80/443 挑战，绝不能追加 --offline。
     log "TLS 模式: $TLS_MODE（不使用 --offline；安装阶段需要访问 ACME 目录并绑定 80/443）"
@@ -456,6 +553,10 @@ else
   if [ "$TLS_MODE" != "self-signed" ] || [ -n "$ADMIN_TLS_MODE" ]; then
     log "提示: RUSTBOARD_TLS_MODE / RUSTBOARD_ADMIN_TLS 只在首次初始化时生效；\
 当前配置保持不变。模式或管理端 TLS 变更请备份后执行 rustboard-hub install --force"
+  fi
+  if [ -n "$DATABASE_URL" ]; then
+    log "提示: RUSTBOARD_DATABASE 只在首次初始化时生效；当前配置保持不变。\
+切换/迁移数据库请先备份，再编辑 /data/etc/rustboard/hub.toml 的 database（SQLite→PG 见 docs/install/postgres.md）"
   fi
 fi
 
