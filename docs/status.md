@@ -265,7 +265,7 @@
       attestation、pre-release 不 latest）；RC 通过后才进入 Phase D/E
 
 **Phase C 已验证（本地，2026-10-25）**：`cargo fmt/clippy/check`、workspace
-**1220 passed / 0 failed / 4 ignored**、MSRV 1.89 `cargo check --workspace
+**1221 passed / 0 failed / 4 ignored**、MSRV 1.89 `cargo check --workspace
 --all-targets` 通过、`cargo audit` 0 高危、actionlint 通过；`v100-offline.sh`
 **122 PASS / 0 FAIL / 0 SKIP（STRICT=1）**；`v100-docker.sh` amd64
 **123 PASS / 0 FAIL / 1 SKIP**（可选 arm64/QEMU 按设计 SKIP）；`v100-acme.sh`
@@ -274,9 +274,9 @@ Pebble **3/3**（HTTP-01、TLS-ALPN-01、IP shortlived）真实签发；另手�
 切换，确认 ACME 证书被既有 CA 重签、`openssl verify` 通过；panel
 `phase_c_panel_tls` **14/14**；web 80/80 + build。独立渗透报告
 [2026-10-25-m5-phase-c-pentest.md](security/2026-10-25-m5-phase-c-pentest.md)：
-**高危 0 / 中危 0 / 低危 3**（L-01 account.json 旧权限仅 issue 时收紧、L-02
-TLS-ALPN 无 ALPN 客户端仍见挑战证书、L-03 域名证书+回环 admin required 被
-fail-closed 拒绝）。O.hub/O.union 已同步 80/443 元数据，C.3/H.13/H.14 仍断言
+**高危 0 / 中危 0 / 低危 3**；L-02（TLS-ALPN 无 ALPN 客户端仍见挑战证书）
+已修复并补单测，L-01（account.json 旧权限仅 issue 时收紧）与 L-03（域名证书+
+回环 admin required 被 fail-closed 拒绝）保留为低危/文档约束。O.hub/O.union 已同步 80/443 元数据，C.3/H.13/H.14 仍断言
 默认 compose 不发布 80/443、8444 不发布。
 
 **仍未完成 / RC 阻断**：本地 arm64 最终包未重建（QEMU 构建超时，hosted
