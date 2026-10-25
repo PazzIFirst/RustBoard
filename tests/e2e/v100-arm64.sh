@@ -25,9 +25,9 @@
 #      包内 web（不修改产品），并把“直接执行 install.sh”记 SKIP；
 #   5) 全程 --no-systemd，不碰真实 unit/生产路径；生产路径用递归内容 hash/
 #      权限/属主/符号链接快照比对；失败日志先 redact；
-#   6) 清理所有进程与 /opt/rustboard-v100-arm64.* 临时目录。
+#   6) 清理所有进程与 $HOME/rustboard-v100-arm64.* 临时目录。
 #
-# 约束：只写 /opt/rustboard-v100-arm64.*；trap 清理前校验路径（仅
+# 约束：只写 $HOME/rustboard-v100-arm64.*；trap 清理前校验路径（仅
 #       /opt/rustboard-v100-*、非符号链接、readlink -f 等于自身）；
 #       不打印 token/密码/私钥；SKIP 不计入 PASS。
 #
@@ -111,7 +111,7 @@ hub /healthz；不只检查“编译成功”。package install.sh 按本机 una
 环境变量:
   PACKAGE=<tar.gz>  显式指定 aarch64 离线包；指定时复用并校验来源一致性
   SKIP_BUILD=1      只用现有 dist 包（复用前同样校验来源一致性）
-  KEEP_E2E_TMP=1    保留 /opt/rustboard-v100-arm64.* 与日志
+  KEEP_E2E_TMP=1    保留 $HOME/rustboard-v100-arm64.* 与日志
   QEMU=<binary>     显式指定 qemu-aarch64 或 qemu-aarch64-static
   STRICT=1          SKIP 也按失败处理（CI 严格模式；x86 主机默认会因 SKIP 失败）
   ALLOW_UNVERIFIED=1 仅当 dist/<arch>/bin 或 web/dist 缺源时显式放行：
@@ -295,10 +295,10 @@ web_tree_digest() {
 is_safe_tmp_root() {
   local path=${TMP_ROOT:-} real
   [[ -n "$path" ]] || return 1
-  [[ "$path" == /opt/rustboard-v100-arm64.* ]] || return 1
-  [[ "$path" != *..* && "$path" != "/" && "$path" != "/opt" ]] || return 1
+  [[ "$path" == $HOME/rustboard-v100-arm64.* ]] || return 1
+  [[ "$path" != *..* && "$path" != "/" && "$path" != "$HOME" ]] || return 1
   [[ -d "$path" && ! -L "$path" ]] || return 1
-  [[ "${path%/*}" == "/opt" ]] || return 1
+  [[ "${path%/*}" == "$HOME" ]] || return 1
   real=$(readlink -f -- "$path" 2>/dev/null || true)
   [[ -n "$real" && "$real" == "$path" ]] || return 1
   return 0
@@ -306,8 +306,8 @@ is_safe_tmp_root() {
 
 ensure_tmp_root() {
   [[ -n "$TMP_ROOT" ]] && return 0
-  TMP_ROOT=$(mktemp -d /opt/rustboard-v100-arm64.XXXXXX 2>/dev/null) \
-    || die "无法在 /opt 下创建临时目录（需要 root 与可写 /opt）"
+  TMP_ROOT=$(mktemp -d "$HOME/rustboard-v100-arm64.XXXXXX" 2>/dev/null) \
+    || die "无法在 $HOME 下创建临时目录（需要 root 与可写 HOME）"
   is_safe_tmp_root || die "临时目录未通过安全校验: $TMP_ROOT"
   LOG_DIR="$TMP_ROOT/logs"
   mkdir -p -- "$LOG_DIR" || die "无法创建日志目录: $LOG_DIR"
@@ -374,7 +374,7 @@ require_cmd() {
 }
 
 preflight() {
-  (( EUID == 0 )) || die "需要 root（在 /opt 下创建临时 prefix 并启动 arm64 测试实例）"
+  (( EUID == 0 )) || die "需要 root（在 $HOME 下创建临时 prefix 并启动 arm64 测试实例）"
   [[ "$(uname -s)" == "Linux" ]] || die "仅支持 Linux"
 
   local cmd

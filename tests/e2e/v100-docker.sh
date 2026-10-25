@@ -1448,10 +1448,17 @@ stop_remove() {
 user_checks() {
   local config="$HUB_DATA/etc/rustboard/hub.toml"
 
+  # 先从容器的 /data 视图确认初始化完成；某些 CI Docker 环境下宿主
+  # bind-mount 源路径不保证立即可见，直接查宿主路径会产生假阴性。
+  if ! docker exec "$HUB_CT" test -f /data/etc/rustboard/hub.toml; then
+    fail "U.1" "已初始化 volume 缺少 /data/etc/rustboard/hub.toml，无法验证 --user 10001:10001"
+    stop_remove "$HUB_CT"
+    return
+  fi
   stop_remove "$HUB_CT"
   if [[ ! -f "$config" ]]; then
-    fail "U.1" "已初始化 volume 缺少 $config，无法验证 --user 10001:10001"
-    return
+    # 容器视图已确认，宿主视图缺失只作为诊断信息；真正启动 --user 用例仍会验证。
+    info "U.1 宿主路径 $config 不可见（容器 /data 已确认初始化，继续）"
   fi
 
   if ! docker run -d --name "$USER_CT" --label "rustboard.e2e=1" \

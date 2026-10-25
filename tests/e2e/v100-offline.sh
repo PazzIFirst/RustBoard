@@ -40,8 +40,8 @@
 #      STRICT=1 时任何 SKIP 非零退出。
 #
 # 约束：
-#   - 只写 /opt/rustboard-v100-offline.* 临时目录；trap 清理前校验路径
-#     （仅 /opt/rustboard-v100-*、非符号链接、readlink -f 等于自身）；
+#   - 只写 $HOME/rustboard-v100-offline.* 临时目录；trap 清理前校验路径
+#     （仅 $HOME/rustboard-v100-*、非符号链接、readlink -f 等于自身）；
 #   - 不碰 /etc/rustboard、/var/lib/rustboard、/usr/local/bin、
 #     /usr/share/rustboard、真实 systemd unit；安装只用 prefix + --no-systemd；
 #   - 不打印 token/密码/私钥；失败日志先 redact；
@@ -140,7 +140,7 @@ M5 Phase B 离线包 e2e：在 unshare -n 中安装并启动 hub/panel/agent，
 环境变量:
   PACKAGE=<tar.gz>  显式指定离线包；指定时复用并校验来源一致性
   SKIP_BUILD=1      只用现有 dist 包（复用前同样校验来源一致性）
-  KEEP_E2E_TMP=1    失败/成功后都保留 /opt/rustboard-v100-offline.* 与日志
+  KEEP_E2E_TMP=1    失败/成功后都保留 $HOME/rustboard-v100-offline.* 与日志
   STRICT=1          SKIP 也按失败处理（CI 严格模式）；默认 SKIP 不计 PASS 但不失败
   ALLOW_UNVERIFIED=1 仅当 dist/<arch>/bin 或 web/dist 缺源时显式放行：
                     打印 WARN、不计 PASS；hash 不一致仍 FATAL；默认 fail-closed
@@ -349,10 +349,10 @@ check_hash_unchanged() {
 is_safe_tmp_root() {
   local path=${TMP_ROOT:-} real
   [[ -n "$path" ]] || return 1
-  [[ "$path" == /opt/rustboard-v100-offline.* ]] || return 1
-  [[ "$path" != *..* && "$path" != "/" && "$path" != "/opt" ]] || return 1
+  [[ "$path" == $HOME/rustboard-v100-offline.* ]] || return 1
+  [[ "$path" != *..* && "$path" != "/" && "$path" != "$HOME" ]] || return 1
   [[ -d "$path" && ! -L "$path" ]] || return 1
-  [[ "${path%/*}" == "/opt" ]] || return 1
+  [[ "${path%/*}" == "$HOME" ]] || return 1
   real=$(readlink -f -- "$path" 2>/dev/null || true)
   [[ -n "$real" && "$real" == "$path" ]] || return 1
   return 0
@@ -360,8 +360,8 @@ is_safe_tmp_root() {
 
 ensure_tmp_root() {
   [[ -n "$TMP_ROOT" ]] && return 0
-  TMP_ROOT=$(mktemp -d /opt/rustboard-v100-offline.XXXXXX 2>/dev/null) \
-    || die "无法在 /opt 下创建临时目录（需要 root 与可写 /opt）"
+  TMP_ROOT=$(mktemp -d "$HOME/rustboard-v100-offline.XXXXXX" 2>/dev/null) \
+    || die "无法在 $HOME 下创建临时目录（需要 root 与可写 HOME）"
   is_safe_tmp_root || die "临时目录未通过安全校验: $TMP_ROOT"
   LOG_DIR="$TMP_ROOT/logs"
   mkdir -p -- "$LOG_DIR" || die "无法创建日志目录: $LOG_DIR"
@@ -464,7 +464,7 @@ require_cmd() {
 }
 
 preflight() {
-  (( EUID == 0 )) || die "需要 root（unshare -n、/opt prefix、strace 安装 e2e）"
+  (( EUID == 0 )) || die "需要 root（unshare -n、$HOME prefix、strace 安装 e2e）"
   [[ "$(uname -s)" == "Linux" ]] || die "仅支持 Linux（unshare -n / strace）"
 
   local cmd
