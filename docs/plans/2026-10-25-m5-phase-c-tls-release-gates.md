@@ -113,6 +113,9 @@ instant-acme = { version = "0.8.5", default-features = false, features = ["ring"
 - C0 先编译 spike；若 `ring` 组合在 MSRV 1.89 下不可用，才评估
   `rustls-acme 0.15.4`（必须同样使用 ring，不得引入 aws-lc）。
 - ACME HTTPS 默认系统根；`tls.acme_ca_file` 可为 Pebble/私有 ACME 指定 PEM 根。
+- **C0 已验收**（2026-10-25）：MSRV 1.89 编译通过、无 aws-lc；Pebble DNS/IP、`shortlived`、
+  TLS-ALPN-01 均跑通。`Account::builder_with_root` 只读取单张 PEM，多根私有 CA 需
+  自建 `HttpClient`。详见 [C0 spike 结论](2026-10-25-m5-phase-c-spike.md)。
 
 ### D2. 服务端证书与客户端 CA 拆分
 
@@ -215,6 +218,8 @@ server_fingerprint = ""   # fingerprint 时必填；向下兼容
   请求上限 8 KiB、超时 5s；不记录 token/keyAuth。
 - TLS-ALPN-01：临时绑定 `0.0.0.0:443`，仅 ALPN `acme-tls/1`；按 SNI 返回
   含 `id-pe-acmeIdentifier` critical 扩展的自签证书；不提供普通 HTTP。
+  **C0 限制**：rustls `with_single_cert` 会因 critical 扩展拒绝该证书，必须用
+  `CertifiedKey::new` + 自定义 `ResolvesServerCert`，并自行校验 key 配对；见 spike §6。
 - 证书：
   ```rust
   let mut params = CertificateParams::new(vec![domain])?;
@@ -239,7 +244,8 @@ server_fingerprint = ""   # fingerprint 时必填；向下兼容
 
 ### D9. 80/443 诊断与回退
 
-安装器在写配置前执行：
+安装器在写配置前执行（C0 已确认本机 80 被 nginx 占用，诊断必须 fail-closed；
+ACME e2e 用 Pebble 5001/5002 仅作测试，不替代生产 80/443 检查）：
 
 1. **本地 bind**：TcpListener 试绑 80/443；失败用 `ss -ltnp` 找 PID（无 ss 则报通用占用）。
 2. **防火墙**：识别 `ufw status` / `firewall-cmd --state` / `nft list ruleset` /
