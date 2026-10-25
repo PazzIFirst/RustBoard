@@ -27,6 +27,9 @@ libc = { workspace = true }
 # + hyper-rustls；不引入 cmake/openssl。版本锁死以复现 C0 spike 的结论。
 instant-acme = { version = "=0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
 reqwest = { workspace = true }
+# D5b：备份/恢复直接使用 SQLite 的 `VACUUM INTO`（workspace 已有依赖，
+# 与 rustboard-core 共用同一版本；不引入新的第三方 crate）。
+rusqlite = { workspace = true }
 # object_store 0.14 的 HTTP 传输使用 reqwest 0.13；显式启用 rustls（ring provider），
 # 避免 object_store 的 `aws` feature 拉入 aws-lc-rs。此别名不直接在代码中使用，
 # 只用于给 object_store 的传递依赖打开 TLS feature（provider 在 archive_s3.rs 安装）。

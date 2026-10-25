@@ -65,10 +65,12 @@ mod archive_s3;
 mod archive_sftp;
 mod archive_webdav;
 mod auth;
+mod backup_cmd;
 mod cert_rotation;
 mod channels;
 mod control;
 mod install_cmd;
+mod migrate_cmd;
 mod notify;
 mod notify_worker;
 mod session;
@@ -313,6 +315,12 @@ enum Cmd {
     Upgrade(install_cmd::UpgradeArgs),
     /// M5：卸载 hub（默认保留配置与数据，--purge 才删除）。
     Uninstall(install_cmd::UninstallArgs),
+    /// M5：把当前 SQLite 源库离线迁移到 PostgreSQL，成功后切换配置。
+    Migrate(migrate_cmd::MigrateArgs),
+    /// M5：备份当前数据库、hub.toml 与证书。
+    Backup(backup_cmd::BackupArgs),
+    /// M5：从备份恢复数据库、hub.toml 与证书。
+    Restore(backup_cmd::RestoreArgs),
 }
 
 /// `maintenance` 子命令（M4-A2）。
@@ -546,6 +554,9 @@ fn main() -> Result<()> {
         Cmd::Install(args) => install_cmd::install(args),
         Cmd::Upgrade(args) => install_cmd::upgrade(args),
         Cmd::Uninstall(args) => install_cmd::uninstall(args),
+        Cmd::Migrate(args) => migrate_cmd::migrate(args),
+        Cmd::Backup(args) => backup_cmd::backup(args),
+        Cmd::Restore(args) => backup_cmd::restore(args),
     }
 }
 
