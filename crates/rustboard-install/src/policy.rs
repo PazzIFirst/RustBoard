@@ -171,7 +171,10 @@ fn check_prefix_dir(meta: &std::fs::Metadata, path: &Path) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
         let mode = meta.mode();
         let euid = crate::system::effective_uid();
-        if meta.uid() != euid {
+        // 允许 root 拥有的祖先目录（常见 `/home`、`/opt` 0755）：root 本来
+        // 就可以替换这些路径，普通用户安装在其下不会因此获得额外权限。其他
+        // 非当前 euid 的属主仍拒绝，避免在他人可控目录中落安装文件。
+        if meta.uid() != euid && meta.uid() != 0 {
             bail!(
                 "安装前缀组件 {} 属主 uid={}（当前 euid={euid}），拒绝使用他人拥有的路径",
                 path.display(),
