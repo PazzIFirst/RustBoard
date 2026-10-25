@@ -37,6 +37,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: 安装 Rust stable（rustfmt / clippy）
@@ -269,6 +270,7 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: 下载前端产物
@@ -324,6 +326,7 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: 下载 x86_64 离线包
@@ -376,6 +379,148 @@ jobs:
           test -f "$e2e_script"
           sudo env PACKAGE="$package" SKIP_BUILD=1 STRICT=1 bash "$e2e_script"
 
+  # 发布前的 Docker 交付门禁：ubuntu-latest 上本地 buildx --load amd64 三镜像并
+  # 原生跑全部运行时用例；只建本地 tag，不登录、不推送 GHCR。arm64 由
+  # delivery-arm64 在原生 arm64 runner 覆盖，所以这里显式 SKIP_ARM64=1，
+  # 避免在同一 amd64 门禁里再用 QEMU 重复验证 arm64。
+  delivery-docker:
+    name: Docker 交付 e2e（amd64）
+    permissions:
+      contents: read
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: 下载 amd64 离线包
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-amd64
+          path: dist
+
+      # v100-docker 的来源校验需要仓库内 web/dist（fail-closed）；与 build job 一致。
+      - name: 下载前端产物
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      # docker/buildx 由 hosted runner 预装；compose 插件缺失时脚本回退 PyYAML。
+      - name: 安装 e2e 依赖（缺什么装什么）
+        run: |
+          set -euo pipefail
+          missing=()
+          for cmd in python3 curl git tar sha256sum timeout; do
+            if ! command -v "$cmd" > /dev/null 2>&1; then
+              case "$cmd" in
+                sha256sum | timeout) missing+=(coreutils) ;;
+                *) missing+=("$cmd") ;;
+              esac
+            fi
+          done
+          if ! docker compose version > /dev/null 2>&1 \
+            && ! python3 -c 'import yaml' > /dev/null 2>&1; then
+            missing+=(python3-yaml)
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "${missing[@]}"
+          fi
+          docker version
+          docker buildx version
+
+      - name: 运行 Docker 交付 e2e（amd64）
+        run: |
+          set -euo pipefail
+          test -f tests/e2e/v100-docker.sh
+          SKIP_ARM64=1 DOCKER_ARCH=amd64 bash tests/e2e/v100-docker.sh
+
+  # 发布前的原生 arm64 交付门禁：先在 arm64 runner 上安装/启动 aarch64 离线包，
+  # 再原生构建并运行三镜像 Docker e2e；不使用 QEMU，也不推送 GHCR。
+  delivery-arm64:
+    name: arm64 交付 e2e（原生）
+    permissions:
+      contents: read
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: 下载 arm64 离线包
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-arm64
+          path: dist
+
+      - name: 下载前端产物
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      # v100-arm64 需要 root（/opt 临时 prefix）与 file/curl/ss；Docker 部分需要
+      # compose 插件或 PyYAML 回退。docker/buildx 由 arm64 hosted runner 预装。
+      - name: 安装 e2e 依赖（缺什么装什么）
+        run: |
+          set -euo pipefail
+          missing=()
+          for cmd in python3 file curl tar sha256sum timeout; do
+            if ! command -v "$cmd" > /dev/null 2>&1; then
+              case "$cmd" in
+                sha256sum | timeout) missing+=(coreutils) ;;
+                *) missing+=("$cmd") ;;
+              esac
+            fi
+          done
+          if ! command -v ss > /dev/null 2>&1; then
+            missing+=(iproute2)
+          fi
+          if ! docker compose version > /dev/null 2>&1 \
+            && ! python3 -c 'import yaml' > /dev/null 2>&1; then
+            missing+=(python3-yaml)
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "${missing[@]}"
+          fi
+          docker version
+          docker buildx version
+
+      - name: 运行 arm64 离线包 e2e（原生）
+        run: |
+          set -euo pipefail
+          package=""
+          for candidate in dist/serverdashboard-v*-aarch64.tar.gz; do
+            if [ -f "$candidate" ]; then
+              package="$candidate"
+              break
+            fi
+          done
+          if [ -z "$package" ]; then
+            echo "::error::找不到 aarch64 离线包"
+            exit 1
+          fi
+          package="$(readlink -f "$package")"
+          e2e_script="$PWD/tests/e2e/v100-arm64.sh"
+          test -f "$e2e_script"
+          sudo env PACKAGE="$package" SKIP_BUILD=1 STRICT=1 bash "$e2e_script"
+
+      - name: 运行 Docker 交付 e2e（arm64 原生）
+        run: |
+          set -euo pipefail
+          test -f tests/e2e/v100-docker.sh
+          DOCKER_ARCH=arm64 SKIP_ARM64=1 bash tests/e2e/v100-docker.sh
+
   # 3. 每个架构分别构建并推送三个镜像的临时 tag：<tag>-<arch>。
   images:
     name: 镜像 ${{ matrix.role }} / ${{ matrix.arch }}
@@ -413,6 +558,7 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: 下载对应架构 dist
@@ -569,12 +715,18 @@ jobs:
       - verify
       - manifest
       - delivery-e2e
+      - delivery-docker
+      - delivery-arm64
+    # 正式 tag/sha/latest 提升与 Release 发布前的最后人工闸门：
+    # GitHub 仓库需在 Settings -> Environments -> release 配置 required reviewers。
+    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: 检出代码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       # imagetools 用于 staging -> 正式 tag 的提升；固定安装 buildx 避免依赖 runner 状态。

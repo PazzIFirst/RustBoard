@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# RustBoard M5 Phase B（v1.0.0）Docker 交付物独立 e2e。
+# RustBoard M5 Phase B/C（v1.0.0）Docker 交付物独立 e2e。
 #
 # 依据（只读设计文档与 Docker/Compose 接口，不参考 entrypoint 实现细节）：
 #   - docs/plans/2026-10-25-m5-phase-b-delivery.md §3.4、§3.6、§6、§9
@@ -10,9 +10,9 @@
 #   - tests/e2e/v100-install.sh 的 PASS/FAIL、redact、trap 清理约定
 #
 # 覆盖：
-#   1) 前置：docker/buildx/curl/python3/git；dist/amd64/bin 与 web/dist 缺失即 FATAL，
-#      明确提示先运行 packaging/build-release.sh --arch amd64；
-#   2) 三镜像 buildx --load 构建（amd64）与架构断言；
+#   1) 前置：docker/buildx/curl/python3/git；dist/$DOCKER_ARCH/bin 与 web/dist 缺失即
+#      FATAL，明确提示先运行 packaging/build-release.sh --arch "$DOCKER_ARCH"；
+#   2) 三镜像 buildx --load 构建（linux/$DOCKER_ARCH）与架构断言；
 #   3) 镜像隔离：无 /etc/rustboard/<role>.toml、无 /var/lib/rustboard、无 .key/.pem、
 #      无运行期 admin token；默认端口仅 hub 8443 / panel 8080，8444 不 EXPOSE；
 #   4) hub：healthcheck、管理口 8444 /healthz、配置 0600、--no-systemd 无 unit、
@@ -27,21 +27,33 @@
 #      control 默认关闭、agent 配置 0600/10001 可读；
 #   9) compose：docker compose config 语法、8444 不在 ports、panel network_mode、
 #      agent profile 且默认不启动、agent 非 privileged/无 docker.sock；
-#  10) arm64：QEMU/binfmt 与 dist/arm64 产物均可用时构建并运行 hub；否则 SKIP，
-#      多架构 manifest 明确标注未在本地验证（由 release workflow 负责）。
+#  10) arm64 附加检查（仅 DOCKER_ARCH=amd64 且 SKIP_ARM64!=1）：QEMU/binfmt 与
+#      dist/arm64 产物均可用时构建并运行 hub；否则 SKIP。DOCKER_ARCH=arm64 时主用例
+#      主用例本身即按 arm64 执行全部断言，不再重复该附加检查；多架构 manifest 仍明确标注
+#      未在本地验证（由 release workflow 负责）。
 #
 # 约束：
-#   - 只创建 rustboard-test/*:local 本地镜像、临时容器/网络/volume 与 mktemp 目录；
-#     不 push、不碰宿主 /etc /var/lib /usr/local 与生产路径；
+#   - 只创建 rustboard-test/*:local-$DOCKER_ARCH 本地镜像、临时容器/网络/volume 与
+#     mktemp 目录；不 push、不碰宿主 /etc /var/lib /usr/local 与生产路径；
 #   - 不打印 token / 密码 / 私钥；失败现场 tail 全部经过 redact；
 #   - 所有容器/网络/volume/临时目录在 trap 中清理；失败非零退出；
 #   - 不修改 Dockerfile / entrypoint / compose / packaging 实现。
 #
 # 依赖：bash 4.4+、docker 24+、docker buildx、docker compose（缺失时回退
 #       python3 + PyYAML）、curl、python3、git、timeout、sha256sum、tar。
-# 用法：bash tests/e2e/v100-docker.sh
-# 调试：KEEP_E2E_TMP=1 bash tests/e2e/v100-docker.sh
-#       HEALTH_TIMEOUT=300 可放宽 healthcheck 等待；EMPTY_TIMEOUT=60 可放宽空卷失败等待。
+# 用法：DOCKER_ARCH=amd64 bash tests/e2e/v100-docker.sh
+#       DOCKER_ARCH=arm64 SKIP_ARM64=1 bash tests/e2e/v100-docker.sh   # arm64 原生主机
+#       bash tests/e2e/v100-docker.sh --help
+# 环境：
+#   DOCKER_ARCH=amd64|arm64  运行架构（默认 amd64）。平台 linux/$DOCKER_ARCH、源
+#                            dist/$DOCKER_ARCH/bin、包名 x86_64/aarch64、
+#                            SHA256SUMS.<pkgarch>；非法值直接 FATAL；
+#   SKIP_ARM64=1             跳过可选的 arm64/QEMU 附加检查（避免同一门禁重复；
+#                            DOCKER_ARCH=arm64 时也会自动跳过）；
+#   HEALTH_TIMEOUT=180       healthcheck 等待秒数；
+#   EMPTY_TIMEOUT=30         空 volume/agent 空 env 失败等待秒数；
+#   KEEP_E2E_TMP=1           保留临时目录与日志。
+# 调试：HEALTH_TIMEOUT=300 / EMPTY_TIMEOUT=60 可放宽等待；KEEP_E2E_TMP=1 保留现场。
 #
 # cleanup 及其辅助函数由 trap 间接调用；ShellCheck 看不到这条路径，SC2317 为误报。
 # shellcheck disable=SC2317,SC2016
@@ -60,6 +72,28 @@ HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-180}
 EMPTY_TIMEOUT=${EMPTY_TIMEOUT:-30}
 KEEP_E2E_TMP=${KEEP_E2E_TMP:-0}
 
+# 架构参数：平台、dist 源目录、包架构后缀与镜像 tag 全部由 DOCKER_ARCH 派生。
+# 非法值必须在任何 preflight/构建之前 FATAL，避免误用错架构产物。
+DOCKER_ARCH=${DOCKER_ARCH:-amd64}
+SKIP_ARM64=${SKIP_ARM64:-0}
+case "$DOCKER_ARCH" in
+  amd64) PKG_ARCH=x86_64 ;;
+  arm64) PKG_ARCH=aarch64 ;;
+  *)
+    printf 'FATAL: DOCKER_ARCH 只允许 amd64 或 arm64，实际为 [%s]\n' "$DOCKER_ARCH" >&2
+    exit 1
+    ;;
+esac
+case "$SKIP_ARM64" in
+  0 | 1) ;;
+  *)
+    printf 'FATAL: SKIP_ARM64 只允许 0 或 1，实际为 [%s]\n' "$SKIP_ARM64" >&2
+    exit 1
+    ;;
+esac
+ARCH_PLATFORM="linux/${DOCKER_ARCH}"
+IMAGE_TAG="local-${DOCKER_ARCH}"
+
 PASSES=0
 FAILS=0
 SKIPS=0
@@ -73,10 +107,12 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 NET_NAME="rb-e2e-${RUN_ID}-net"
 HUB_RUN_VOLUME="rb-e2e-${RUN_ID}-run"
 
-HUB_IMAGE="rustboard-test/hub:local"
-PANEL_IMAGE="rustboard-test/panel:local"
-AGENT_IMAGE="rustboard-test/agent:local"
-ARM64_HUB_IMAGE="rustboard-test/hub:local-arm64"
+HUB_IMAGE="rustboard-test/hub:${IMAGE_TAG}"
+PANEL_IMAGE="rustboard-test/panel:${IMAGE_TAG}"
+AGENT_IMAGE="rustboard-test/agent:${IMAGE_TAG}"
+# 只在 DOCKER_ARCH=amd64 的可选 QEMU 附加检查中使用；tag 同时带主架构与目标架构，
+# 与 HUB_IMAGE 始终不同，避免覆盖主镜像。
+ARM64_HUB_IMAGE="rustboard-test/hub:local-${DOCKER_ARCH}-qemu-arm64"
 
 HUB_CT="rb-e2e-${RUN_ID}-hub"
 PANEL_CT="rb-e2e-${RUN_ID}-panel"
@@ -132,6 +168,43 @@ info() {
 die() {
   printf 'FATAL: %s\n' "$*" >&2
   exit 1
+}
+
+# 角色 -> 本地镜像 tag（带架构后缀，amd64/arm64 互不覆盖）。
+image_for_role() {
+  case "$1" in
+    hub) printf '%s' "$HUB_IMAGE" ;;
+    panel) printf '%s' "$PANEL_IMAGE" ;;
+    agent) printf '%s' "$AGENT_IMAGE" ;;
+    *) return 1 ;;
+  esac
+}
+
+usage() {
+  cat <<'EOF'
+用法: [DOCKER_ARCH=amd64|arm64] [SKIP_ARM64=1] bash tests/e2e/v100-docker.sh [--help]
+
+M5 Docker 交付 e2e：按 DOCKER_ARCH 构建并运行 hub/panel/agent 三镜像
+（在对应架构主机上为原生执行），
+覆盖镜像隔离、默认端口、非 root 主进程、健康检查、重启幂等、--user、panel
+共享 netns、agent 空环境 fail-fast、真实 enrollment 与 compose 结构。
+x86_64 主机可在 QEMU 可用且 dist/arm64 存在时附加验证 arm64 hub。
+
+环境变量:
+  DOCKER_ARCH=amd64|arm64  运行架构，默认 amd64。平台 linux/$DOCKER_ARCH、
+                           源 dist/$DOCKER_ARCH/bin、包名 x86_64/aarch64、
+                           校验 dist/SHA256SUMS.<pkgarch>；非法值直接 FATAL
+  SKIP_ARM64=1             跳过可选 arm64/QEMU 附加检查；DOCKER_ARCH=arm64 时
+                           主用例即按 linux/arm64 执行，该附加检查也自动跳过
+  HEALTH_TIMEOUT=180       healthcheck 等待秒数
+  EMPTY_TIMEOUT=30         空 volume/agent 空 env 失败退出等待秒数
+  KEEP_E2E_TMP=1           保留临时目录与日志
+
+用法示例:
+  bash tests/e2e/v100-docker.sh
+  DOCKER_ARCH=amd64 SKIP_ARM64=1 bash tests/e2e/v100-docker.sh
+  DOCKER_ARCH=arm64 SKIP_ARM64=1 bash tests/e2e/v100-docker.sh   # arm64 原生主机
+EOF
 }
 
 # 日志/容器输出永不原样打印：先遮掉 token、密码、Bearer、私钥与 64hex。
@@ -236,11 +309,18 @@ print_summary() {
   SUMMARY_PRINTED=1
   printf '===== v100-docker e2e: PASS=%s FAIL=%s SKIP=%s =====\n' \
     "$PASSES" "$FAILS" "$SKIPS"
-  printf 'INFO: 多架构 manifest（linux/amd64 + linux/arm64 合并、latest 标签、GHCR digest）未在本地验证；由 release workflow 的 buildx/imagetools 负责。\n'
+  printf 'INFO: 本次 DOCKER_ARCH=%s（%s），包架构 %s；多架构 manifest（linux/amd64 + linux/arm64 合并、latest 标签、GHCR digest）未在本地验证，由 release workflow 的 buildx/imagetools 负责。\n' \
+    "$DOCKER_ARCH" "$ARCH_PLATFORM" "$PKG_ARCH"
   if (( ARM64_VERIFIED )); then
     printf 'INFO: arm64 单架构镜像已在本机 QEMU 下构建并运行；合并 manifest 仍需 release workflow 验证。\n'
   elif (( ARM64_SKIPPED )); then
-    printf 'INFO: 本机未执行 arm64 镜像验证（SKIP 原因见上），不视为通过。\n'
+    if [[ "$DOCKER_ARCH" == "arm64" ]]; then
+      printf 'INFO: 可选 arm64/QEMU 附加检查已跳过：本门禁按 linux/arm64 执行，主用例已覆盖 arm64（arm64 主机上为原生）。\n'
+    elif [[ "$SKIP_ARM64" == "1" ]]; then
+      printf 'INFO: 可选 arm64/QEMU 附加检查已跳过（SKIP_ARM64=1）；arm64 原生门禁由 delivery-arm64 覆盖。\n'
+    else
+      printf 'INFO: 本机未执行 arm64 镜像附加验证（SKIP 原因见上），不视为通过。\n'
+    fi
   fi
 }
 
@@ -445,7 +525,7 @@ need_cmd() {
 }
 
 source_fail() {
-  die "来源校验失败: $*；请先运行 packaging/build-release.sh --arch amd64"
+  die "来源校验失败（DOCKER_ARCH=$DOCKER_ARCH，包架构 $PKG_ARCH）: $*；请先运行 packaging/build-release.sh --arch $DOCKER_ARCH"
 }
 
 hash_file() {
@@ -481,25 +561,26 @@ out.write_text("\n".join(entries) + "\n", encoding="utf-8")
 PY
 }
 
-# 构建前来源校验：
-#   1) dist/amd64/bin 三个二进制存在、可执行，且 sha256 与包内/包内 SHA256SUMS 一致；
-#   2) dist 外层 SHA256SUMS.x86_64 覆盖 tarball，包名与 Cargo.toml VERSION 一致；
-#   3) dist/serverdashboard-v*-x86_64.tar.gz 解包后的 VERSION/SHA256SUMS 全通过；
+# 构建前来源校验（全部按 DOCKER_ARCH 派生，避免拿错架构产物构建镜像）：
+#   1) dist/$DOCKER_ARCH/bin 三个二进制存在、可执行，且 sha256 与包内/外层校验和一致；
+#   2) dist 外层 SHA256SUMS.$PKG_ARCH 覆盖 tarball，包名与 Cargo.toml VERSION 一致；
+#   3) dist/serverdashboard-v*-$PKG_ARCH.tar.gz 解包后的 VERSION/SHA256SUMS 全通过；
 #   4) web/dist 文件集合的递归 sha256 与包内 share/rustboard/web 一致。
 verify_sources() {
   local role pkg pkg_name pkg_root extract sums expected_hash actual_hash
   local dist_bin pkg_bin dist_hash pkg_hash pkg_version web_count
-  local expected_pkg_name="serverdashboard-v${VERSION}-x86_64"
+  local expected_pkg_name="serverdashboard-v${VERSION}-${PKG_ARCH}"
+  local bin_dir="dist/${DOCKER_ARCH}/bin"
   local -a pkgs=()
 
-  info "校验发布来源（dist/web/Cargo.toml VERSION=$VERSION）..."
+  info "校验发布来源（DOCKER_ARCH=$DOCKER_ARCH，bin=$bin_dir，包架构=$PKG_ARCH，VERSION=$VERSION）..."
 
   [[ -d dist ]] || source_fail "dist 目录不存在"
-  [[ -f dist/SHA256SUMS.x86_64 && ! -L dist/SHA256SUMS.x86_64 ]] \
-    || source_fail "dist/SHA256SUMS.x86_64 不存在或不是普通文件"
+  [[ -f "dist/SHA256SUMS.${PKG_ARCH}" && ! -L "dist/SHA256SUMS.${PKG_ARCH}" ]] \
+    || source_fail "dist/SHA256SUMS.${PKG_ARCH} 不存在或不是普通文件"
 
   for role in hub panel agent; do
-    dist_bin="dist/amd64/bin/rustboard-$role"
+    dist_bin="$bin_dir/rustboard-$role"
     [[ -f "$dist_bin" && ! -L "$dist_bin" && -x "$dist_bin" ]] \
       || source_fail "$dist_bin 不存在、不是普通文件或不可执行"
   done
@@ -507,18 +588,18 @@ verify_sources() {
   [[ -s web/dist/index.html && ! -L web/dist/index.html ]] \
     || source_fail "web/dist/index.html 不存在、为空或不是普通文件"
 
-  mapfile -t pkgs < <(find dist -maxdepth 1 -type f -name 'serverdashboard-v*-x86_64.tar.gz' -print 2>/dev/null | sort)
+  mapfile -t pkgs < <(find dist -maxdepth 1 -type f -name "serverdashboard-v*-${PKG_ARCH}.tar.gz" -print 2>/dev/null | sort)
   if (( ${#pkgs[@]} == 0 )); then
-    source_fail "缺少 dist/serverdashboard-v*-x86_64.tar.gz"
+    source_fail "缺少 dist/serverdashboard-v*-${PKG_ARCH}.tar.gz"
   elif (( ${#pkgs[@]} > 1 )); then
-    source_fail "dist 下存在多个 x86_64 离线包，无法确定来源: ${pkgs[*]}"
+    source_fail "dist 下存在多个 ${PKG_ARCH} 离线包，无法确定来源: ${pkgs[*]}"
   fi
   pkg=${pkgs[0]}
   pkg_name=$(basename -- "$pkg")
   [[ "$pkg_name" == "$expected_pkg_name.tar.gz" ]] \
     || source_fail "包名 $pkg_name 与 Cargo.toml VERSION=$VERSION 不一致（期望 $expected_pkg_name.tar.gz）"
 
-  sums="dist/SHA256SUMS.x86_64"
+  sums="dist/SHA256SUMS.${PKG_ARCH}"
   expected_hash=$(awk -v f="$pkg_name" '{ name=$2; sub(/^\*/, "", name); if (name == f) { print $1; exit } }' "$sums")
   if [[ ! "$expected_hash" =~ ^[0-9a-fA-F]{64}$ ]]; then
     source_fail "$sums 未列出 $pkg_name 的 sha256"
@@ -526,10 +607,10 @@ verify_sources() {
   actual_hash=$(hash_file "$pkg")
   [[ "$actual_hash" == "$expected_hash" ]] \
     || source_fail "$pkg_name sha256 与 $sums 不一致（actual=$actual_hash expected=$expected_hash）"
-  if ! ( cd dist && sha256sum -c --strict SHA256SUMS.x86_64 >"$LOG_DIR/source-outer-sums.log" 2>&1 ); then
+  if ! ( cd dist && sha256sum -c --strict "SHA256SUMS.${PKG_ARCH}" >"$LOG_DIR/source-outer-sums.log" 2>&1 ); then
     source_fail "$sums sha256sum -c --strict 失败（详见 source-outer-sums.log）"
   fi
-  pass "S.1" "dist/amd64/bin 三二进制存在、可执行，且 tarball sha256 与 SHA256SUMS.x86_64 一致"
+  pass "S.1" "$bin_dir 三二进制存在、可执行，且 tarball sha256 与 SHA256SUMS.${PKG_ARCH} 一致"
 
   extract="$TMP_ROOT/source-check"
   rm -rf -- "$extract"
@@ -558,10 +639,10 @@ verify_sources() {
   if ! ( cd "$pkg_root" && sha256sum -c --strict SHA256SUMS >"$LOG_DIR/source-package-sums.log" 2>&1 ); then
     source_fail "包内 SHA256SUMS 校验失败（详见 source-package-sums.log）"
   fi
-  pass "S.2" "包内 VERSION=$VERSION 且 SHA256SUMS 全量校验通过"
+  pass "S.2" "包内 VERSION=$VERSION 且 SHA256SUMS 全量校验通过（$PKG_ARCH）"
 
   for role in hub panel agent; do
-    dist_bin="dist/amd64/bin/rustboard-$role"
+    dist_bin="$bin_dir/rustboard-$role"
     pkg_bin="$pkg_root/bin/rustboard-$role"
     [[ -f "$pkg_bin" && ! -L "$pkg_bin" && -x "$pkg_bin" ]] \
       || source_fail "包内 $pkg_bin 不存在、不是普通文件或不可执行"
@@ -571,12 +652,12 @@ verify_sources() {
       source_fail "无法计算 $role 二进制 sha256"
     fi
     [[ "$dist_hash" == "$pkg_hash" ]] \
-      || source_fail "dist/amd64/bin/rustboard-$role 与包内同名二进制 sha256 不一致"
+      || source_fail "$dist_bin 与包内同名二进制 sha256 不一致"
     if ! grep -qE "^${pkg_hash}[[:space:]]+bin/rustboard-${role}$" "$pkg_root/SHA256SUMS"; then
       source_fail "包内 SHA256SUMS 未列出 bin/rustboard-$role 的当前 hash"
     fi
   done
-  pass "S.3" "dist/amd64/bin 三二进制 sha256 与包内同名二进制及包内 SHA256SUMS 一致"
+  pass "S.3" "$bin_dir 三二进制 sha256 与包内同名二进制及包内 SHA256SUMS 一致"
 
   [[ -d "$pkg_root/share/rustboard/web" && ! -L "$pkg_root/share/rustboard/web" ]] \
     || source_fail "包内 share/rustboard/web 不存在或不是普通目录"
@@ -612,6 +693,7 @@ preflight() {
   docker buildx inspect >/dev/null 2>&1 || die "docker buildx 没有可用 builder"
   driver=$(docker buildx inspect 2>/dev/null | awk -F': *' '/^Driver:/ { print $2; exit }' || true)
   info "buildx driver=${driver:-unknown}；当前 UID=$(id -u)（root 可选）"
+  info "DOCKER_ARCH=$DOCKER_ARCH platform=$ARCH_PLATFORM pkgarch=$PKG_ARCH image_tag=$IMAGE_TAG SKIP_ARM64=$SKIP_ARM64"
 
   [[ -f docker/Dockerfile ]] || die "缺少 docker/Dockerfile（Docker 交付接口未就绪）"
   [[ -f docker/compose.example.yml ]] || die "缺少 docker/compose.example.yml（Compose 交付接口未就绪）"
@@ -647,13 +729,19 @@ preflight() {
     info "docker compose 插件不可用，compose 用例回退为 python3 + PyYAML 结构解析"
   fi
 
-  if [[ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]] \
+  if [[ "$DOCKER_ARCH" == "arm64" ]]; then
+    HAVE_QEMU_AARCH64=0
+    info "DOCKER_ARCH=arm64：主用例按 linux/arm64 构建/运行（arm64 主机上为原生），跳过可选 arm64/QEMU 附加检查"
+  elif [[ "$SKIP_ARM64" == "1" ]]; then
+    HAVE_QEMU_AARCH64=0
+    info "SKIP_ARM64=1：跳过可选 arm64/QEMU 附加检查（arm64 原生门禁由 delivery-arm64 覆盖）"
+  elif [[ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]] \
     && grep -q '^enabled' /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null; then
     HAVE_QEMU_AARCH64=1
-    info "检测到 qemu-aarch64 binfmt（dist/arm64 产物存在时执行 arm64 镜像用例）"
+    info "检测到 qemu-aarch64 binfmt（dist/arm64 产物存在时执行 arm64 镜像附加用例）"
   else
     HAVE_QEMU_AARCH64=0
-    info "未检测到 qemu-aarch64 binfmt（arm64 镜像用例将 SKIP）"
+    info "未检测到 qemu-aarch64 binfmt（可选 arm64 镜像附加用例将 SKIP）"
   fi
 
   HUB_DATA="$TMP_ROOT/hub-data"
@@ -930,22 +1018,26 @@ compose_checks() {
 # ---------------------------------------------------------------------------
 
 build_image() {
-  local role=$1 log="$LOG_DIR/build-$1.log"
-  if docker buildx build --load --platform linux/amd64 --progress=plain \
+  local role=$1 log="$LOG_DIR/build-$1.log" image
+  image=$(image_for_role "$role") || {
+    fail "B.$2" "未知角色: $role"
+    return 1
+  }
+  if docker buildx build --load --platform "$ARCH_PLATFORM" --progress=plain \
     -f docker/Dockerfile --target "$role" \
     --build-arg "VERSION=$VERSION" \
     --build-arg "REVISION=$REVISION" \
-    -t "rustboard-test/$role:local" . >"$log" 2>&1; then
-    pass "B.$2" "构建 rustboard-test/$role:local（linux/amd64，VERSION=$VERSION）"
+    -t "$image" . >"$log" 2>&1; then
+    pass "B.$2" "构建 $image（$ARCH_PLATFORM，VERSION=$VERSION）"
     return 0
   fi
-  fail "B.$2" "构建 rustboard-test/$role:local 失败（日志尾部见下）"
+  fail "B.$2" "构建 $image 失败（$ARCH_PLATFORM，日志尾部见下）"
   dump_file "$log" 100
   return 1
 }
 
 build_images() {
-  local role idx=0 failed=0 platform
+  local role idx=0 failed=0 platform image
   for role in hub panel agent; do
     idx=$((idx + 1))
     if ! build_image "$role" "$idx"; then
@@ -954,11 +1046,12 @@ build_images() {
   done
 
   for role in hub panel agent; do
-    if ! docker image inspect "rustboard-test/$role:local" >/dev/null 2>&1; then
+    image=$(image_for_role "$role") || continue
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
       continue
     fi
-    platform=$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "rustboard-test/$role:local" 2>/dev/null || true)
-    check_eq "B.4-$role" "镜像 $role 架构为 linux/amd64" "linux/amd64" "$platform"
+    platform=$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$image" 2>/dev/null || true)
+    check_eq "B.4-$role" "镜像 $role 架构为 $ARCH_PLATFORM" "$ARCH_PLATFORM" "$platform"
   done
 
   if (( failed )); then
@@ -979,7 +1072,7 @@ image_label() {
 label_checks() {
   local role image
   for role in hub panel agent; do
-    image="rustboard-test/$role:local"
+    image=$(image_for_role "$role") || continue
     check_eq "L.$role.source" "镜像 $role label org.opencontainers.image.source" \
       "https://github.com/pazzifirst/rustboard" \
       "$(image_label "$image" org.opencontainers.image.source)"
@@ -1208,7 +1301,7 @@ port_targets_csv() {
 port_checks() {
   local role image mappings targets union=""
   for role in hub panel agent; do
-    image="rustboard-test/$role:local"
+    image=$(image_for_role "$role") || continue
     if ! start_port_probe "$role" "$image"; then
       fail "O.$role" "无法启动 $role 端口探测容器"
       continue
@@ -1838,13 +1931,23 @@ agent_checks() {
 
 arm64_checks() {
   local log="$LOG_DIR/arm64-build.log" out="" arch=""
+  if [[ "$DOCKER_ARCH" == "arm64" ]]; then
+    skip "M.1" "可选 arm64/QEMU 附加检查已跳过：DOCKER_ARCH=arm64，主用例已按 linux/arm64 执行"
+    ARM64_SKIPPED=1
+    return
+  fi
+  if [[ "$SKIP_ARM64" == "1" ]]; then
+    skip "M.1" "可选 arm64/QEMU 附加检查已跳过：SKIP_ARM64=1（arm64 原生门禁由 delivery-arm64 覆盖）"
+    ARM64_SKIPPED=1
+    return
+  fi
   if (( HAVE_QEMU_AARCH64 == 0 )); then
-    skip "M.1" "arm64 镜像构建：本机未注册 qemu-aarch64 binfmt"
+    skip "M.1" "arm64 镜像附加检查：本机未注册 qemu-aarch64 binfmt"
     ARM64_SKIPPED=1
     return
   fi
   if [[ ! -x "dist/arm64/bin/rustboard-hub" ]]; then
-    skip "M.1" "arm64 镜像构建：QEMU 可用但缺少 dist/arm64/bin/rustboard-hub（先运行 packaging/build-release.sh --arch arm64 后重跑）"
+    skip "M.1" "arm64 镜像附加检查：QEMU 可用但缺少 dist/arm64/bin/rustboard-hub（先运行 packaging/build-release.sh --arch arm64 后重跑）"
     ARM64_SKIPPED=1
     return
   fi
@@ -1854,9 +1957,9 @@ arm64_checks() {
     --build-arg "VERSION=$VERSION" \
     --build-arg "REVISION=$REVISION" \
     -t "$ARM64_HUB_IMAGE" . >"$log" 2>&1; then
-    pass "M.1" "构建 $ARM64_HUB_IMAGE（linux/arm64，QEMU）"
+    pass "M.1" "构建 $ARM64_HUB_IMAGE（linux/arm64，QEMU 附加）"
   else
-    fail "M.1" "arm64 hub 镜像构建失败（QEMU/binfmt 可用）"
+    fail "M.1" "arm64 hub 镜像附加构建失败（QEMU/binfmt 可用）"
     dump_file "$log" 100
     ARM64_SKIPPED=1
     return
@@ -1884,6 +1987,30 @@ arm64_checks() {
 # 主流程
 # ---------------------------------------------------------------------------
 
+parse_args() {
+  case $# in
+    0) ;;
+    1)
+      case "$1" in
+        -h | --help)
+          usage
+          exit 0
+          ;;
+        *)
+          printf '未知参数: %s\n' "$1" >&2
+          usage >&2
+          exit 2
+          ;;
+      esac
+      ;;
+    *)
+      printf '未知参数: %s\n' "$*" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
 main() {
   preflight
   setup_resources
@@ -1908,6 +2035,9 @@ main() {
   agent_checks
   arm64_checks
 }
+
+# --help 在处理参数时直接退出，不注册 cleanup trap（无需清理任何资源）。
+parse_args "$@"
 
 trap cleanup EXIT
 trap 'exit 130' INT TERM
