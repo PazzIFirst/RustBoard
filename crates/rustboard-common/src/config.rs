@@ -1522,8 +1522,291 @@ fn validate_archive_host_key_fingerprint(fingerprint: &str) -> Result<()> {
     Ok(())
 }
 
+/// 数据库后端类型，由 `HubConfig::database` 解析得到。
+///
+/// `Postgres` 保存的是**原始** DSN（可能带密码），因此不能 `derive(Debug)`：
+/// 自定义 `Debug` 只输出脱敏后的 URL，避免日志、panic 与错误信息回显密码。
+#[derive(Clone, PartialEq, Eq)]
+pub enum DatabaseKind {
+    /// SQLite 数据库文件路径。
+    Sqlite(PathBuf),
+    /// PostgreSQL 连接串（保留原始内容；展示前必须走 [`Self::redacted`]）。
+    Postgres(String),
+}
+
+impl DatabaseKind {
+    /// 适合日志/错误展示的脱敏形式。
+    ///
+    /// SQLite 输出 `sqlite://<path>`；PostgreSQL 输出密码已替换为 `***` 的 URL。
+    pub fn redacted(&self) -> String {
+        match self {
+            Self::Sqlite(path) => format!("sqlite://{}", path.display()),
+            Self::Postgres(url) => redact_database_url(url),
+        }
+    }
+}
+
+impl fmt::Debug for DatabaseKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sqlite(path) => f.debug_tuple("Sqlite").field(path).finish(),
+            Self::Postgres(url) => f
+                .debug_tuple("Postgres")
+                .field(&redact_database_url(url))
+                .finish(),
+        }
+    }
+}
+
+/// 数据库地址支持形式（错误信息复用，避免各处文案漂移）。
+const DATABASE_FORMS_HINT: &str =
+    "只支持 sqlite://<path>、postgres://...、postgresql://... 或本地 SQLite 文件路径";
+
+/// 脱敏 PostgreSQL URL 中的密码，供日志与错误信息使用。
+///
+/// 覆盖两类位置：
+/// - authority 的 `user:password@host`（含百分号编码的密码、空密码）；
+/// - query 参数 `password=` / `sslpassword=`（`passfile` 是文件路径，保持原样）。
+///
+/// 固定使用 `***` 作为替换标记，因此对已脱敏输入再次调用不会重复加星号。
+/// 无密码时原样返回，不会误伤 `user@host`、`host:5432`、IPv6 字面量或路径。
+/// 只处理 `postgres://` / `postgresql://`，其它输入原样返回。
+pub fn redact_database_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    if !matches!(scheme, "postgres" | "postgresql") {
+        return url.to_string();
+    }
+    // authority 在第一个 `/` 或 `?` 前结束。这里**不**把 `#` 当作边界：
+    // 非法 URL 可能把 `#` 写进密码（例如 `user:pa#ss@host`），按 URL 语法
+    // 截断会在错误信息里残留密码片段；先按 userinfo 脱敏，`#` 留在 host
+    // 片段里也无害（PostgreSQL 校验随后会因 fragment 拒绝）。
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let redacted_authority = redact_url_authority(authority);
+    // 空 authority 的畸形 URL（例如 `postgres:///user:pass@host/db`）没有可解析的
+    // userinfo，密码可能落在 path 里；用同样的保守裁剪避免错误信息泄露。
+    if authority.is_empty() {
+        if let (Some(colon), Some(at)) = (rest.find(':'), rest.rfind('@')) {
+            if colon < at {
+                return format!(
+                    "{scheme}://{}:***{}",
+                    &rest[..colon],
+                    redact_url_query(&rest[at..])
+                );
+            }
+        }
+    }
+    // `user:password` 里出现裸 `/` 或 `?` 时，按 URL 语法 authority 会提前结束，
+    // 常规脱敏只能覆盖密码的前半段。若 authority 没有 `@` 且冒号后不是纯数字
+    // 端口，就按「漏写 @host / 密码含裸分隔符」的畸形输入处理：
+    // 用第一个 `:` 到最后一个 `@` 之间的内容整体替换；完全没有 `@` 时丢弃
+    // `:` 之后的全部内容。这样错误信息不会残留密码片段。
+    let malformed_userinfo = !authority.contains('@')
+        && !authority.starts_with('[')
+        && authority.split_once(':').is_some_and(|(_, suffix)| {
+            !suffix.is_empty() && !suffix.bytes().all(|b| b.is_ascii_digit())
+        });
+    if malformed_userinfo {
+        if let (Some(colon), Some(at)) = (rest.find(':'), rest.rfind('@')) {
+            if colon < at {
+                return format!(
+                    "{scheme}://{}:***{}",
+                    &rest[..colon],
+                    redact_url_query(&rest[at..])
+                );
+            }
+        }
+        return format!("{scheme}://{redacted_authority}");
+    }
+    format!("{scheme}://{redacted_authority}{}", redact_url_query(tail))
+}
+
+/// 脱敏 authority 中的 userinfo 密码；无密码时保持原样。
+fn redact_url_authority(authority: &str) -> String {
+    // 用最后一个 `@` 切分：密码里的裸 `@`（非法但可能出现）也会被一起替换。
+    if let Some((userinfo, host)) = authority.rsplit_once('@') {
+        let Some((user, password)) = userinfo.split_once(':') else {
+            // `user@host`：没有密码字段，原样返回。
+            return authority.to_string();
+        };
+        if password == "***" {
+            return authority.to_string();
+        }
+        return format!("{user}:***@{host}");
+    }
+
+    // 没有 `@` 的 `user:password` 是非法 URL（例如漏写 `@host`），但错误信息
+    // 仍可能带出密码，做一次保守脱敏。`host:5432` 的端口是纯数字，不会误伤；
+    // IPv6 字面量以 `[` 开头，直接跳过。
+    if authority.starts_with('[') {
+        return authority.to_string();
+    }
+    if let Some((user, password)) = authority.split_once(':') {
+        if !password.is_empty()
+            && password != "***"
+            && !password.bytes().all(|b| b.is_ascii_digit())
+        {
+            return format!("{user}:***");
+        }
+    }
+    authority.to_string()
+}
+
+/// 脱敏 query 中的 `password` / `sslpassword` 参数，保留其它参数与 fragment。
+fn redact_url_query(tail: &str) -> String {
+    let Some(query_start) = tail.find('?') else {
+        return tail.to_string();
+    };
+    let (prefix, query_and_fragment) = tail.split_at(query_start + 1);
+    let (query, fragment) = match query_and_fragment.split_once('#') {
+        Some((query, fragment)) => (query, Some(fragment)),
+        None => (query_and_fragment, None),
+    };
+    let mut redacted = String::with_capacity(query_and_fragment.len());
+    for (index, pair) in query.split('&').enumerate() {
+        if index > 0 {
+            redacted.push('&');
+        }
+        match pair.split_once('=') {
+            Some((key, value)) if is_secret_query_key(key) && value != "***" => {
+                redacted.push_str(key);
+                redacted.push_str("=***");
+            }
+            _ => redacted.push_str(pair),
+        }
+    }
+    if let Some(fragment) = fragment {
+        redacted.push('#');
+        redacted.push_str(fragment);
+    }
+    format!("{prefix}{redacted}")
+}
+
+/// query 中按密码处理的参数名（大小写不敏感）。
+fn is_secret_query_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("password") || key.eq_ignore_ascii_case("sslpassword")
+}
+
+/// PostgreSQL DSN 的结构校验错误：展示脱敏 URL，绝不回显密码。
+fn invalid_postgres_dsn(url: &str, reason: &str) -> Error {
+    Error::InvalidConfig(format!(
+        "database 不是合法的 PostgreSQL 连接串（{reason}）：{}",
+        redact_database_url(url)
+    ))
+}
+
+/// 不支持的 `xxx://` scheme 错误：只展示保守过滤后的 scheme，不展示完整 DSN。
+fn unsupported_database_scheme(scheme: &str) -> Error {
+    let safe_scheme = !scheme.is_empty()
+        && scheme.len() <= 32
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+    let detail = if safe_scheme {
+        format!("database 使用了不支持的 scheme `{scheme}`")
+    } else {
+        "database 使用了不支持的地址格式".to_string()
+    };
+    Error::InvalidConfig(format!("{detail}：{DATABASE_FORMS_HINT}"))
+}
+
+/// 只做 PostgreSQL URL 的结构校验，不建立任何连接。
+///
+/// 要求 scheme 正确、authority/host 非空、数据库 path 非空；禁止空白、控制字符
+/// 与 fragment。userinfo、query、IPv6（`[::1]:5432`）与 percent encoding 均允许。
+fn validate_postgres_database_url(url: &str) -> Result<()> {
+    let rest = url
+        .strip_prefix("postgres://")
+        .or_else(|| url.strip_prefix("postgresql://"))
+        .ok_or_else(|| invalid_postgres_dsn(url, "scheme 必须是 postgres:// 或 postgresql://"))?;
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(invalid_postgres_dsn(url, "不能包含空白或控制字符"));
+    }
+    if url.contains('#') {
+        return Err(invalid_postgres_dsn(url, "不能包含 fragment（#）"));
+    }
+
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() {
+        return Err(invalid_postgres_dsn(url, "authority 不能为空"));
+    }
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    if host_port.is_empty() {
+        return Err(invalid_postgres_dsn(url, "host 不能为空"));
+    }
+    validate_postgres_host_port(host_port, url)?;
+
+    let after_authority = &rest[authority_end..];
+    let Some(path_and_query) = after_authority.strip_prefix('/') else {
+        return Err(invalid_postgres_dsn(
+            url,
+            "缺少数据库路径（形如 postgres://host/dbname）",
+        ));
+    };
+    let database_path = path_and_query
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(path_and_query);
+    if database_path.is_empty() {
+        return Err(invalid_postgres_dsn(url, "database path 不能为空"));
+    }
+    Ok(())
+}
+
+/// 校验 host[:port]；IPv6 必须写成 `[addr]` 或 `[addr]:port`。
+fn validate_postgres_host_port(host_port: &str, url: &str) -> Result<()> {
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let Some((host, suffix)) = rest.split_once(']') else {
+            return Err(invalid_postgres_dsn(url, "IPv6 host 缺少右方括号 ]"));
+        };
+        if host.is_empty() {
+            return Err(invalid_postgres_dsn(url, "host 不能为空"));
+        }
+        if suffix.is_empty() {
+            return Ok(());
+        }
+        let Some(port) = suffix.strip_prefix(':') else {
+            return Err(invalid_postgres_dsn(url, "IPv6 host 的 ] 之后只能是 :port"));
+        };
+        return validate_postgres_port(port, url);
+    }
+
+    if host_port.matches(':').count() > 1 {
+        return Err(invalid_postgres_dsn(
+            url,
+            "IPv6 host 必须用 [] 包裹，例如 [::1]:5432",
+        ));
+    }
+    let (host, port) = match host_port.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (host_port, None),
+    };
+    if host.is_empty() {
+        return Err(invalid_postgres_dsn(url, "host 不能为空"));
+    }
+    if let Some(port) = port {
+        validate_postgres_port(port, url)?;
+    }
+    Ok(())
+}
+
+/// 端口必须是 1–65535 的十进制数字（结构校验，不做 DNS/连接）。
+fn validate_postgres_port(port: &str, url: &str) -> Result<()> {
+    let valid = port.parse::<u16>().is_ok_and(|value| value != 0);
+    if !valid {
+        return Err(invalid_postgres_dsn(url, "端口必须是 1–65535 的数字"));
+    }
+    Ok(())
+}
+
 /// hub 端配置。对应 `/etc/rustboard/hub.toml`。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HubConfig {
     /// agent 接入监听地址。
@@ -1536,6 +1819,26 @@ pub struct HubConfig {
     pub data_dir: PathBuf,
     /// SQLite 用路径，PostgreSQL 用 `postgres://...`。
     pub database: String,
+    /// 数据库连接池大小（1–64，默认 8）。
+    ///
+    /// SQLite 用作读连接池上限；PostgreSQL 用作连接池上限。写连接始终只有 1 条。
+    #[serde(default = "default_db_pool_size")]
+    pub db_pool_size: usize,
+    /// 建立数据库连接 / 探活超时（毫秒，100–60000，默认 5000）。
+    #[serde(default = "default_db_connect_timeout_ms")]
+    pub db_connect_timeout_ms: u64,
+    /// PostgreSQL `statement_timeout`（毫秒，100–600000，默认 30000）。
+    ///
+    /// SQLite 不使用该值；保留字段是为了两种后端共用同一份配置结构。
+    #[serde(default = "default_db_statement_timeout_ms")]
+    pub db_statement_timeout_ms: u64,
+    /// PostgreSQL 自定义根 CA（PEM）路径；`None` 使用系统根证书。
+    ///
+    /// 语义类似 libpq 的 `sslrootcert`：配置后**替换**系统根，而不是叠加。
+    /// 当前只做路径校验（非空、已存在且为普通文件），不读取内容也不联网；
+    /// 实际读取文件由 D3 的 PostgreSQL 连接初始化负责。
+    #[serde(default)]
+    pub db_sslrootcert: Option<PathBuf>,
     /// 是否把 hub 所在主机也当作一台 agent 采集。
     pub self_monitor: bool,
     /// hub 自身的展示名。
@@ -1617,6 +1920,59 @@ pub struct HubConfig {
     pub tls: TlsConfig,
 }
 
+/// D1：手写 `Debug`，避免日志/panic 回显 `database` DSN 密码与 `admin_token`。
+impl fmt::Debug for HubConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // database 只展示脱敏形式；非法/不支持的后端不输出原值，防止任意 secret 泄露。
+        let database = self.redacted_database_for_debug();
+        f.debug_struct("HubConfig")
+            .field("agent_listen", &self.agent_listen)
+            .field("admin_listen", &self.admin_listen)
+            .field("admin_tls", &self.admin_tls)
+            .field("data_dir", &self.data_dir)
+            .field("database", &database)
+            .field("db_pool_size", &self.db_pool_size)
+            .field("db_connect_timeout_ms", &self.db_connect_timeout_ms)
+            .field("db_statement_timeout_ms", &self.db_statement_timeout_ms)
+            .field("db_sslrootcert", &self.db_sslrootcert)
+            .field("self_monitor", &self.self_monitor)
+            .field("name", &self.name)
+            .field("server_names", &self.server_names)
+            .field("advertise_host", &self.advertise_host)
+            .field("sample_interval_ms", &self.sample_interval_ms)
+            .field("max_connections", &self.max_connections)
+            .field("max_connections_per_ip", &self.max_connections_per_ip)
+            .field("read_pool_size", &self.read_pool_size)
+            .field("admin_rate_limit_per_min", &self.admin_rate_limit_per_min)
+            .field(
+                "admin_write_rate_limit_per_min",
+                &self.admin_write_rate_limit_per_min,
+            )
+            .field(
+                "admin_auth_failure_limit_per_min",
+                &self.admin_auth_failure_limit_per_min,
+            )
+            .field("per_core", &self.per_core)
+            .field("excluded_interfaces", &self.excluded_interfaces)
+            .field("retention_raw_days", &self.retention_raw_days)
+            .field("retention_1m_days", &self.retention_1m_days)
+            .field("retention_1h_days", &self.retention_1h_days)
+            .field("maintenance_interval_secs", &self.maintenance_interval_secs)
+            // 空 token 也输出固定标记，不暴露长度或是否已配置。
+            .field("admin_token", &"***")
+            .field("ca_validity_days", &self.ca_validity_days)
+            .field("server_cert_validity_days", &self.server_cert_validity_days)
+            .field("client_cert_validity_days", &self.client_cert_validity_days)
+            .field("renew_before_days", &self.renew_before_days)
+            .field("cert_check_interval_secs", &self.cert_check_interval_secs)
+            .field("control", &self.control)
+            .field("alerts", &self.alerts)
+            .field("archive", &self.archive)
+            .field("tls", &self.tls)
+            .finish()
+    }
+}
+
 /// agent 接入层默认的最大并发连接数。
 fn default_max_connections() -> usize {
     1024
@@ -1630,6 +1986,21 @@ fn default_max_connections_per_ip() -> usize {
 /// SQLite 只读连接池默认大小。
 fn default_read_pool_size() -> usize {
     4
+}
+
+/// 数据库连接池默认大小（SQLite 读池 / PostgreSQL 池共用配置项）。
+fn default_db_pool_size() -> usize {
+    DEFAULT_DB_POOL_SIZE
+}
+
+/// 数据库连接/探活默认超时（毫秒）。
+fn default_db_connect_timeout_ms() -> u64 {
+    DEFAULT_DB_CONNECT_TIMEOUT_MS
+}
+
+/// PostgreSQL `statement_timeout` 默认值（毫秒）。
+fn default_db_statement_timeout_ms() -> u64 {
+    DEFAULT_DB_STATEMENT_TIMEOUT_MS
 }
 
 /// 管理 API 默认每 IP 每分钟请求上限。
@@ -1655,6 +2026,10 @@ impl Default for HubConfig {
             admin_tls: AdminTlsMode::Off,
             data_dir: PathBuf::from("/var/lib/rustboard/hub"),
             database: "sqlite:///var/lib/rustboard/hub/rustboard.db".to_string(),
+            db_pool_size: default_db_pool_size(),
+            db_connect_timeout_ms: default_db_connect_timeout_ms(),
+            db_statement_timeout_ms: default_db_statement_timeout_ms(),
+            db_sslrootcert: None,
             self_monitor: true,
             name: String::new(),
             server_names: vec!["localhost".to_string(), "127.0.0.1".to_string()],
@@ -1713,6 +2088,10 @@ impl HubConfig {
     /// 只读取元数据，不修改权限；不读写证书文件。`admin_token` 属于 M2 的鉴权
     /// 范围，本阶段不校验（为空仍允许启动，保持 v0.1 行为）。
     pub fn validate(&self) -> Result<()> {
+        // D1：数据库地址与连接参数必须最先校验。非法 DSN / 越界参数要在任何
+        // 目录检查、CA 生成或写盘之前失败，避免启动到一半才发现配置不可用。
+        self.database_kind()?;
+        self.validate_database_options()?;
         // KI-21：先拒绝 /tmp、/etc、/ 这类 data_dir，避免后续 ensure_private_dir
         // 把共享目录 chmod 成 0700（init 也会走这里，不会先留下半个 CA）。
         crate::fsutil::validate_private_dir_path(&self.data_dir)
@@ -1810,6 +2189,88 @@ impl HubConfig {
         Ok(())
     }
 
+    /// D1：数据库连接池与超时参数校验。
+    ///
+    /// 三个字段都有保守上限：连接数是文件句柄，超时过短会制造伪故障，
+    /// 过长则让启动/查询在故障时长时间挂起。错误必须点名字段和实际值。
+    fn validate_database_options(&self) -> Result<()> {
+        if !(MIN_DB_POOL_SIZE..=MAX_DB_POOL_SIZE).contains(&self.db_pool_size) {
+            return Err(Error::InvalidConfig(format!(
+                "db_pool_size 必须在 {MIN_DB_POOL_SIZE}–{MAX_DB_POOL_SIZE} 之间，\
+                 实际 {}；请按数据库承载能力调整",
+                self.db_pool_size
+            )));
+        }
+        if !(MIN_DB_CONNECT_TIMEOUT_MS..=MAX_DB_CONNECT_TIMEOUT_MS)
+            .contains(&self.db_connect_timeout_ms)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "db_connect_timeout_ms 必须在 {MIN_DB_CONNECT_TIMEOUT_MS}–\
+                 {MAX_DB_CONNECT_TIMEOUT_MS} 毫秒之间，实际 {}；\
+                 过短会制造伪故障，过长会让启动在故障时长时间挂起",
+                self.db_connect_timeout_ms
+            )));
+        }
+        if !(MIN_DB_STATEMENT_TIMEOUT_MS..=MAX_DB_STATEMENT_TIMEOUT_MS)
+            .contains(&self.db_statement_timeout_ms)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "db_statement_timeout_ms 必须在 {MIN_DB_STATEMENT_TIMEOUT_MS}–\
+                 {MAX_DB_STATEMENT_TIMEOUT_MS} 毫秒之间，实际 {}；\
+                 该值会作为 PostgreSQL statement_timeout 下发",
+                self.db_statement_timeout_ms
+            )));
+        }
+        self.validate_db_sslrootcert()?;
+        Ok(())
+    }
+
+    /// D1：`db_sslrootcert` 路径校验（只 stat，不读取文件、不联网）。
+    ///
+    /// 配置后该 PEM 会替换系统根证书（语义同 libpq `sslrootcert`）；D3 才实际
+    /// 读取。这里用 `symlink_metadata` 检查路径本身：符号链接、目录、非普通文件
+    /// 都拒绝，错误只展示路径。
+    fn validate_db_sslrootcert(&self) -> Result<()> {
+        let Some(path) = self.db_sslrootcert.as_deref() else {
+            return Ok(());
+        };
+        if path.as_os_str().is_empty() {
+            return Err(Error::InvalidConfig(
+                "db_sslrootcert 路径为空：请填写 PEM 根 CA 文件路径，\
+                 或删除该字段使用系统根证书"
+                    .into(),
+            ));
+        }
+        let display = path.display();
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => Err(Error::InvalidConfig(format!(
+                "db_sslrootcert 指向符号链接 {display}：为防路径替换，请填写真实文件路径"
+            ))),
+            Ok(meta) if meta.is_dir() => Err(Error::InvalidConfig(format!(
+                "db_sslrootcert 指向目录 {display}：需要 PEM 编码的根 CA 文件，不能是目录"
+            ))),
+            Ok(meta) if meta.is_file() => Ok(()),
+            Ok(_) => Err(Error::InvalidConfig(format!(
+                "db_sslrootcert 不是普通文件 {display}：需要 PEM 编码的根 CA 文件"
+            ))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Err(Error::InvalidConfig(format!(
+                    "db_sslrootcert 文件不存在 {display}：请检查路径，\
+                     或删除该字段使用系统根证书"
+                )))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                Err(Error::InvalidConfig(format!(
+                    "db_sslrootcert 无法访问 {display}（权限不足）：\
+                     请确认 hub 运行用户可 stat 该路径，或修正文件权限"
+                )))
+            }
+            Err(err) => Err(Error::InvalidConfig(format!(
+                "db_sslrootcert 无法检查 {display}：{err}；请确认路径可访问"
+            ))),
+        }
+    }
+
     /// M4：三层保留期与降采样/保留期任务的配置校验。
     ///
     /// 1. 每层天数必须在硬上限内（0 表示该层永不自动删除）；
@@ -1875,11 +2336,75 @@ impl HubConfig {
         Ok(())
     }
 
+    /// Debug 专用：只返回脱敏后的 database 值。
+    ///
+    /// 合法地址走 [`DatabaseKind::redacted`]；非法但仍是 PostgreSQL scheme 的
+    /// 地址交给 `redact_database_url`；其它非法/不支持的 scheme 不输出原值，
+    /// 避免把任意 secret 带进日志。
+    fn redacted_database_for_debug(&self) -> String {
+        match self.database_kind() {
+            Ok(kind) => kind.redacted(),
+            Err(_)
+                if self.database.starts_with("postgres://")
+                    || self.database.starts_with("postgresql://") =>
+            {
+                redact_database_url(&self.database)
+            }
+            Err(_) => "<invalid database config>".to_string(),
+        }
+    }
+
+    /// 解析 `database` 配置为后端类型；只做结构校验，不连接数据库。
+    ///
+    /// - `sqlite://<path>`（含旧的 `sqlite:///var/...` 绝对路径形式）；
+    /// - 裸路径（相对/绝对均可）；
+    /// - `postgres://...` / `postgresql://...`，只校验 scheme、authority、host
+    ///   与 database path 等结构，不探测网络。
+    ///
+    /// 非法 PostgreSQL URL 的错误信息只包含脱敏后的 URL，绝不回显密码。
+    pub fn database_kind(&self) -> Result<DatabaseKind> {
+        let raw = self.database.as_str();
+        if raw.trim().is_empty() {
+            return Err(Error::InvalidConfig(format!(
+                "database 不能为空：{DATABASE_FORMS_HINT}"
+            )));
+        }
+        // 先保留旧语义：`sqlite:///var/...` strip 掉前缀后是 `/var/...`。
+        if let Some(path) = raw.strip_prefix("sqlite://") {
+            if path.is_empty() {
+                return Err(Error::InvalidConfig(
+                    "database 的 sqlite:// 之后缺少数据库路径：应写成 \
+                     sqlite:///var/lib/rustboard/hub/rustboard.db（绝对路径）或 \
+                     sqlite://relative/path.db（相对路径）"
+                        .into(),
+                ));
+            }
+            return Ok(DatabaseKind::Sqlite(PathBuf::from(path)));
+        }
+        if raw.starts_with("postgres://") || raw.starts_with("postgresql://") {
+            validate_postgres_database_url(raw)?;
+            return Ok(DatabaseKind::Postgres(raw.to_string()));
+        }
+        if let Some((scheme, _)) = raw.split_once("://") {
+            return Err(unsupported_database_scheme(scheme));
+        }
+        Ok(DatabaseKind::Sqlite(PathBuf::from(raw)))
+    }
+
+    /// 取 SQLite 数据库文件路径。
+    ///
+    /// 这是 SQLite 专用入口：PostgreSQL 配置必须走 [`Self::database_kind`] /
+    /// StorageHandle，绝不能把 PG DSN 当作本地文件路径。错误信息不包含 URL。
     pub fn sqlite_path(&self) -> Result<PathBuf> {
-        self.database
-            .strip_prefix("sqlite://")
-            .map(PathBuf::from)
-            .ok_or_else(|| Error::InvalidConfig("v1 暂只支持 sqlite:// 形式的数据库地址".into()))
+        match self.database_kind()? {
+            DatabaseKind::Sqlite(path) => Ok(path),
+            DatabaseKind::Postgres(_) => Err(Error::InvalidConfig(
+                "当前操作只适用于 SQLite：database 配置为 PostgreSQL；\
+                 PostgreSQL 请使用 database_kind() 走 storage backend，\
+                 sqlite_path() 不能用于 PG 连接串"
+                    .into(),
+            )),
+        }
     }
 }
 
@@ -2086,6 +2611,17 @@ const MAX_CONNECTIONS_PER_IP: usize = 256;
 /// SQLite 只读连接池允许范围。
 const MIN_READ_POOL_SIZE: usize = 1;
 const MAX_READ_POOL_SIZE: usize = 16;
+
+/// D1：数据库连接池与超时参数的范围/默认值（旧配置缺省时使用默认值）。
+const MIN_DB_POOL_SIZE: usize = 1;
+const MAX_DB_POOL_SIZE: usize = 64;
+const DEFAULT_DB_POOL_SIZE: usize = 8;
+const MIN_DB_CONNECT_TIMEOUT_MS: u64 = 100;
+const MAX_DB_CONNECT_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_DB_CONNECT_TIMEOUT_MS: u64 = 5_000;
+const MIN_DB_STATEMENT_TIMEOUT_MS: u64 = 100;
+const MAX_DB_STATEMENT_TIMEOUT_MS: u64 = 600_000;
+const DEFAULT_DB_STATEMENT_TIMEOUT_MS: u64 = 30_000;
 
 /// 管理 API 每分钟请求上限的硬上限（0 表示关闭限速）。
 const MAX_ADMIN_RATE_LIMIT_PER_MIN: u32 = 6_000;
@@ -3721,5 +4257,528 @@ name = ""
         assert!(!sftp_debug.contains("/etc/rustboard/private-ed25519"));
         let webdav_debug = format!("{:?}", hub.archive.webdav.as_ref().unwrap());
         assert!(!webdav_debug.contains("webdav-password-plaintext"));
+    }
+
+    /// D1：构造只替换 database 的最小配置，其它字段沿用默认值。
+    fn hub_with_database(database: &str) -> HubConfig {
+        HubConfig {
+            database: database.to_string(),
+            ..HubConfig::default()
+        }
+    }
+
+    /// D1：新字段缺省值必须与方案一致，旧配置不写也能启动。
+    #[test]
+    fn d1_database_fields_defaults_and_toml() {
+        let hub: HubConfig = toml::from_str("").unwrap();
+        assert_eq!(hub.db_pool_size, 8);
+        assert_eq!(hub.db_connect_timeout_ms, 5_000);
+        assert_eq!(hub.db_statement_timeout_ms, 30_000);
+        assert!(hub.db_sslrootcert.is_none());
+        assert_eq!(HubConfig::default().db_pool_size, 8);
+        assert_eq!(HubConfig::default().db_connect_timeout_ms, 5_000);
+        assert_eq!(HubConfig::default().db_statement_timeout_ms, 30_000);
+        assert!(HubConfig::default().db_sslrootcert.is_none());
+        hub.validate().expect("旧配置缺省必须合法");
+
+        let hub: HubConfig = toml::from_str(
+            "db_pool_size = 16\ndb_connect_timeout_ms = 1500\n\
+             db_statement_timeout_ms = 45000\n",
+        )
+        .unwrap();
+        assert_eq!(hub.db_pool_size, 16);
+        assert_eq!(hub.db_connect_timeout_ms, 1_500);
+        assert_eq!(hub.db_statement_timeout_ms, 45_000);
+        hub.validate().expect("显式配置必须被读取并通过校验");
+    }
+
+    /// D1：`db_sslrootcert` 缺省 None、旧配置可加载；Some 时只 stat 校验，
+    /// 错误只展示路径，不回显 DSN/密码。
+    #[test]
+    fn d1_db_sslrootcert_default_serde_and_validation() {
+        // 旧配置完全没有该字段：必须能加载、默认 None 且整体校验通过。
+        let old: HubConfig =
+            toml::from_str("database = \"sqlite:///var/lib/rustboard/hub/rustboard.db\"\n")
+                .unwrap();
+        assert!(old.db_sslrootcert.is_none());
+        old.validate().expect("旧配置无 db_sslrootcert 必须合法");
+
+        let dir =
+            std::env::temp_dir().join(format!("rustboard-d1-sslrootcert-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = dir.join("root-ca.pem");
+        std::fs::write(
+            &ca,
+            b"-----BEGIN CERTIFICATE-----\nplaceholder\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+
+        // 显式配置：serde 必须读到，存在的普通文件必须通过（不读取内容）。
+        let text = format!(
+            "database = \"postgres://rb_user:secr3t@db.example.com/rustboard\"\n\
+             db_sslrootcert = \"{}\"\n",
+            ca.display()
+        );
+        let hub: HubConfig = toml::from_str(&text).unwrap();
+        assert_eq!(hub.db_sslrootcert.as_deref(), Some(ca.as_path()));
+        hub.validate().expect("存在的普通文件路径必须通过校验");
+
+        // 目录、缺失文件、空路径都必须拒绝；错误点名字段且不泄露 DSN 密码。
+        for (path, needle) in [
+            (dir.clone(), "目录"),
+            (dir.join("missing-ca.pem"), "不存在"),
+            (PathBuf::new(), "路径为空"),
+        ] {
+            let mut hub = hub_with_database("postgres://rb_user:secr3t@db.example.com/rustboard");
+            hub.db_sslrootcert = Some(path);
+            let err = hub
+                .validate()
+                .expect_err("非法 db_sslrootcert 必须被拒绝")
+                .to_string();
+            assert!(err.contains("db_sslrootcert"), "错误必须点名字段: {err}");
+            assert!(err.contains(needle), "错误应说明 {needle}: {err}");
+            assert!(!err.contains("secr3t"), "错误不得回显 DSN 密码: {err}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D1：`db_sslrootcert` 必须拒绝符号链接（包括断链），只显示链接路径。
+    #[cfg(unix)]
+    #[test]
+    fn d1_db_sslrootcert_rejects_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustboard-d1-sslrootcert-link-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real-ca.pem");
+        std::fs::write(&target, b"placeholder").unwrap();
+
+        let link = dir.join("link-ca.pem");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut hub = hub_with_database("postgres://rb_user:secr3t@db.example.com/rustboard");
+        hub.db_sslrootcert = Some(link.clone());
+        let err = hub.validate().expect_err("符号链接必须拒绝").to_string();
+        assert!(err.contains("db_sslrootcert"), "错误必须点名字段: {err}");
+        assert!(err.contains("符号链接"), "错误应说明符号链接: {err}");
+        assert!(
+            err.contains(&link.display().to_string()),
+            "错误应显示链接路径: {err}"
+        );
+        assert!(!err.contains("secr3t"), "错误不得回显 DSN 密码: {err}");
+
+        // 断链同样在 symlink_metadata 阶段被识别，不跟随到目标。
+        let broken = dir.join("broken-link.pem");
+        std::os::unix::fs::symlink(dir.join("missing-target.pem"), &broken).unwrap();
+        hub.db_sslrootcert = Some(broken);
+        let err = hub
+            .validate()
+            .expect_err("断链符号链接必须拒绝")
+            .to_string();
+        assert!(err.contains("符号链接"), "错误应说明符号链接: {err}");
+        assert!(
+            !err.contains("missing-target.pem"),
+            "错误不得跟随/回显目标路径: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D1：连接池/超时字段的边界值与越界错误（点名字段 + 实际值）。
+    #[test]
+    fn d1_database_fields_bounds_and_errors() {
+        for text in [
+            "db_pool_size = 1\n",
+            "db_pool_size = 64\n",
+            "db_connect_timeout_ms = 100\n",
+            "db_connect_timeout_ms = 60000\n",
+            "db_statement_timeout_ms = 100\n",
+            "db_statement_timeout_ms = 600000\n",
+        ] {
+            let hub: HubConfig = toml::from_str(text).unwrap();
+            hub.validate().unwrap_or_else(|err| {
+                panic!("边界值必须合法: text={text:?}, err={err}");
+            });
+        }
+
+        for (text, field, actual) in [
+            ("db_pool_size = 0\n", "db_pool_size", "0"),
+            ("db_pool_size = 65\n", "db_pool_size", "65"),
+            (
+                "db_connect_timeout_ms = 99\n",
+                "db_connect_timeout_ms",
+                "99",
+            ),
+            (
+                "db_connect_timeout_ms = 60001\n",
+                "db_connect_timeout_ms",
+                "60001",
+            ),
+            (
+                "db_statement_timeout_ms = 99\n",
+                "db_statement_timeout_ms",
+                "99",
+            ),
+            (
+                "db_statement_timeout_ms = 600001\n",
+                "db_statement_timeout_ms",
+                "600001",
+            ),
+        ] {
+            let hub: HubConfig = toml::from_str(text).unwrap();
+            let err = hub.validate().expect_err("越界值必须被拒绝").to_string();
+            assert!(err.contains(field), "错误必须点名 {field}: {err}");
+            assert!(
+                err.contains(&format!("实际 {actual}")),
+                "错误必须包含实际值 {actual}: {err}"
+            );
+        }
+    }
+
+    /// D1：SQLite 的 `sqlite://` 前缀与裸路径（含相对路径）解析。
+    #[test]
+    fn d1_database_kind_accepts_sqlite_forms() {
+        for (raw, expected) in [
+            (
+                "sqlite:///var/lib/rustboard/hub/rustboard.db",
+                "/var/lib/rustboard/hub/rustboard.db",
+            ),
+            ("sqlite://relative/path.db", "relative/path.db"),
+            (
+                "/var/lib/rustboard/hub/rustboard.db",
+                "/var/lib/rustboard/hub/rustboard.db",
+            ),
+            ("data/rustboard.db", "data/rustboard.db"),
+        ] {
+            let hub = hub_with_database(raw);
+            match hub.database_kind().unwrap() {
+                DatabaseKind::Sqlite(path) => {
+                    assert_eq!(path, PathBuf::from(expected), "raw={raw}")
+                }
+                other => panic!("raw={raw} 应解析为 SQLite，实际 {other:?}"),
+            }
+            assert_eq!(hub.sqlite_path().unwrap(), PathBuf::from(expected));
+        }
+    }
+
+    /// D1：PostgreSQL 结构合法形式全部接受，且原 URL 完整保留（不在解析阶段改写）。
+    #[test]
+    fn d1_database_kind_accepts_postgres_structural_forms() {
+        for raw in [
+            "postgres://rustboard@127.0.0.1/rustboard?sslmode=verify-full",
+            "postgresql://rustboard@127.0.0.1/rustboard",
+            "postgres://user:p%40ss@[::1]:5432/rustboard",
+            "postgres://user:secret@db.example.com:5432/rustboard?connect_timeout=5",
+            "postgres://user@db.example.com/rustboard",
+        ] {
+            let hub = hub_with_database(raw);
+            match hub.database_kind().unwrap() {
+                DatabaseKind::Postgres(url) => assert_eq!(url, raw),
+                other => panic!("raw={raw} 应解析为 PostgreSQL，实际 {other:?}"),
+            }
+            // 只做结构校验，不连接数据库；合法 PG 配置必须能通过整体校验。
+            hub.validate()
+                .unwrap_or_else(|err| panic!("合法 PG 配置应通过校验: raw={raw}, err={err}"));
+        }
+    }
+
+    /// D1：非法 DSN / 空地址 / 不支持的 scheme 必须拒绝，错误信息不得回显密码。
+    #[test]
+    fn d1_database_kind_rejects_invalid_without_leaking_password() {
+        let secret = "sup3r-secret";
+        for raw in [
+            "",
+            "sqlite://",
+            "postgres://",
+            "postgres://rb_user:sup3r-secret@/rustboard",
+            "postgres://rb_user:sup3r-secret@localhost",
+            "postgres://localhost/",
+            "postgres://rb_user:sup3r-secret@localhost/rustboard#fragment",
+            "postgres://rb_user:sup3r-secret#tail@localhost/rustboard",
+            "postgres:///rb_user:sup3r-secret@localhost/rustboard",
+            "postgres://rb_user:sup3r-secret@local host/rustboard",
+            "postgres://rb_user:sup3r-secret@localhost/rustboard\u{1}",
+            "postgres://rb_user:sup3r-secret@localhost:notaport/rustboard",
+            "postgres://rb_user:sup3r-secret@::1/rustboard",
+            "postgres://rb_user:sup3r-secret@[::1/rustboard",
+            "postgres://rb_user:sup3r-secret/rustboard",
+            "mysql://rb_user:sup3r-secret@localhost/rustboard",
+        ] {
+            let hub = hub_with_database(raw);
+            let err = match hub.database_kind() {
+                Ok(kind) => panic!("原始地址 {raw:?} 必须被拒绝，实际 {kind:?}"),
+                Err(err) => err.to_string(),
+            };
+            assert!(err.contains("database"), "错误应点名字段 database: {err}");
+            assert!(
+                !err.contains(secret),
+                "错误信息不得回显密码: raw={raw:?}, err={err}"
+            );
+        }
+
+        let err = hub_with_database("mysql://rb_user:sup3r-secret@localhost/rustboard")
+            .database_kind()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("不支持"),
+            "不支持的 scheme 必须明确报错: {err}"
+        );
+        assert!(err.contains("mysql"), "错误应点名 scheme: {err}");
+
+        // 密码里含裸 `/` / `?` 的畸形 URL：错误信息连密码片段也不能残留。
+        for raw in [
+            "postgres://rb_user:sup3r/secret@localhost/rustboard",
+            "postgres://rb_user:sup3r?secret@localhost/rustboard",
+        ] {
+            let err = hub_with_database(raw)
+                .database_kind()
+                .unwrap_err()
+                .to_string();
+            for part in ["sup3r", "secret"] {
+                assert!(
+                    !err.contains(part),
+                    "错误信息不得残留密码片段 {part}: raw={raw:?}, err={err}"
+                );
+            }
+        }
+    }
+
+    /// D1：DSN 脱敏覆盖普通密码、空密码、编码密码、query password 与无密码场景。
+    #[test]
+    fn d1_redact_database_url_covers_passwords() {
+        for (input, expected) in [
+            (
+                "postgres://rb_user:secr3t@db.example.com/rustboard",
+                "postgres://rb_user:***@db.example.com/rustboard",
+            ),
+            (
+                "postgresql://rb_user:secr3t@db.example.com/rustboard",
+                "postgresql://rb_user:***@db.example.com/rustboard",
+            ),
+            (
+                "postgres://rb_user:p%40ss@db.example.com/rustboard",
+                "postgres://rb_user:***@db.example.com/rustboard",
+            ),
+            // 非法 URL 把 `#` 写进密码时，错误路径也必须先脱敏再展示。
+            (
+                "postgres://rb_user:sec#ret@db.example.com/rustboard",
+                "postgres://rb_user:***@db.example.com/rustboard",
+            ),
+            // 密码里的裸 `/` / `?` 会让 authority 提前结束，脱敏仍不得残留片段。
+            (
+                "postgres://rb_user:secr3t/part@db.example.com/rustboard",
+                "postgres://rb_user:***@db.example.com/rustboard",
+            ),
+            (
+                "postgres://rb_user:secr3t?part@db.example.com/rustboard",
+                "postgres://rb_user:***@db.example.com/rustboard",
+            ),
+            (
+                "postgres://rb_user:@db.example.com/rustboard",
+                "postgres://rb_user:***@db.example.com/rustboard",
+            ),
+            (
+                "postgres://rb_user:secr3t@[::1]:5432/rustboard?sslmode=verify-full",
+                "postgres://rb_user:***@[::1]:5432/rustboard?sslmode=verify-full",
+            ),
+            (
+                "postgres://rb_user:secr3t@db.example.com/rustboard?password=qu3ry&sslmode=require",
+                "postgres://rb_user:***@db.example.com/rustboard?password=***&sslmode=require",
+            ),
+            (
+                "postgres://db.example.com/rustboard?password=qu3ry",
+                "postgres://db.example.com/rustboard?password=***",
+            ),
+            (
+                "postgres://db.example.com/rustboard?Password=qu3ry",
+                "postgres://db.example.com/rustboard?Password=***",
+            ),
+            (
+                "postgres://db.example.com/rustboard?sslpassword=qu3ry",
+                "postgres://db.example.com/rustboard?sslpassword=***",
+            ),
+            // 无密码：不能误伤 user@host 或 host:port。
+            (
+                "postgres://rb_user@db.example.com/rustboard",
+                "postgres://rb_user@db.example.com/rustboard",
+            ),
+            (
+                "postgres://db.example.com:5432/rustboard",
+                "postgres://db.example.com:5432/rustboard",
+            ),
+            // passfile 是路径不是密码，保持原样。
+            (
+                "postgres://db.example.com/rustboard?passfile=/etc/rustboard/pgpass",
+                "postgres://db.example.com/rustboard?passfile=/etc/rustboard/pgpass",
+            ),
+            // 已脱敏输入不重复处理。
+            (
+                "postgres://rb_user:***@db.example.com/rustboard",
+                "postgres://rb_user:***@db.example.com/rustboard",
+            ),
+            (
+                "postgres://db.example.com/rustboard?password=***&sslmode=require",
+                "postgres://db.example.com/rustboard?password=***&sslmode=require",
+            ),
+            // 非 PostgreSQL 输入原样返回。
+            (
+                "sqlite:///var/lib/rustboard/hub/rustboard.db",
+                "sqlite:///var/lib/rustboard/hub/rustboard.db",
+            ),
+        ] {
+            assert_eq!(redact_database_url(input), expected, "input={input}");
+        }
+    }
+
+    /// D1：脱敏必须幂等，且输出中不残留密码。
+    #[test]
+    fn d1_redact_database_url_is_idempotent_and_leak_free() {
+        for input in [
+            "postgres://rb_user:secr3t@db.example.com/rustboard",
+            "postgres://rb_user:sec#ret@db.example.com/rustboard",
+            "postgres://rb_user:p%40ss@db.example.com/rustboard?password=qu3ry",
+            "postgres://rb_user:@db.example.com/rustboard",
+            "postgres://rb_user@db.example.com/rustboard",
+            "postgres://db.example.com/rustboard?password=***",
+        ] {
+            let once = redact_database_url(input);
+            let twice = redact_database_url(&once);
+            assert_eq!(once, twice, "脱敏必须幂等: input={input}");
+            for secret in ["secr3t", "p%40ss", "qu3ry"] {
+                assert!(
+                    !once.contains(secret),
+                    "脱敏输出不得包含 {secret}: input={input}, out={once}"
+                );
+            }
+        }
+    }
+
+    /// D1：DatabaseKind 的 Debug / redacted 不得泄露 PostgreSQL 密码。
+    #[test]
+    fn d1_database_kind_debug_and_redacted_do_not_leak() {
+        let hub = hub_with_database("postgres://rb_user:secr3t@db.example.com/rustboard");
+        let kind = hub.database_kind().unwrap();
+        let debug = format!("{kind:?}");
+        assert!(debug.contains("Postgres"), "Debug 应显示后端类型: {debug}");
+        assert!(debug.contains("***"), "Debug 应显示脱敏标记: {debug}");
+        assert!(!debug.contains("secr3t"), "Debug 不得包含密码: {debug}");
+        assert_eq!(
+            kind.redacted(),
+            "postgres://rb_user:***@db.example.com/rustboard"
+        );
+    }
+
+    /// D1：HubConfig Debug 必须同时隐藏 DSN 密码与 admin_token，保留其余字段。
+    #[test]
+    fn d1_hub_config_debug_redacts_database_and_admin_token() {
+        let mut hub = hub_with_database(
+            "postgres://rb_user:sup3r-dsn-secret@db.example.com/rustboard?\
+             password=sup3r-query-secret",
+        );
+        hub.admin_token = "admin-token-plaintext".to_string();
+        hub.name = "hub-debug-visible-name".to_string();
+
+        let debug = format!("{hub:?}");
+        for secret in [
+            "sup3r-dsn-secret",
+            "sup3r-query-secret",
+            "admin-token-plaintext",
+        ] {
+            assert!(
+                !debug.contains(secret),
+                "HubConfig Debug 不得包含 {secret}: {debug}"
+            );
+        }
+        assert!(
+            debug.contains("postgres://rb_user:***@db.example.com/rustboard?password=***"),
+            "Debug 应保留脱敏 URL: {debug}"
+        );
+        assert!(
+            debug.contains("hub-debug-visible-name"),
+            "非敏感字段应正常显示: {debug}"
+        );
+        assert!(
+            debug.contains("admin_token: \"***\""),
+            "admin_token 必须固定输出 ***: {debug}"
+        );
+        assert!(
+            debug.contains("db_pool_size: 8"),
+            "非敏感字段应正常显示: {debug}"
+        );
+
+        // 空 token 也输出固定标记，不暴露长度或是否已配置。
+        let mut empty = HubConfig::default();
+        empty.admin_token.clear();
+        let debug = format!("{empty:?}");
+        assert!(
+            debug.contains("admin_token: \"***\""),
+            "空 token 也应显示 ***: {debug}"
+        );
+        assert!(
+            !debug.contains("admin_token: \"\""),
+            "不得暴露空 token: {debug}"
+        );
+
+        // 非法/不支持的 database 不输出原值，防止任意 secret 泄露。
+        let invalid = hub_with_database("mysql://rb_user:sql-secret@localhost/rustboard");
+        let debug = format!("{invalid:?}");
+        assert!(!debug.contains("sql-secret"), "非法 DSN 不得泄露: {debug}");
+        assert!(
+            debug.contains("<invalid database config>"),
+            "非法 DSN 应显示占位: {debug}"
+        );
+
+        // 空 authority 的畸形 PG URL 也不得在 Debug 中留下密码。
+        let invalid_pg = hub_with_database("postgres:///rb_user:sql-secret@localhost/rustboard");
+        let debug = format!("{invalid_pg:?}");
+        assert!(
+            !debug.contains("sql-secret"),
+            "畸形 PG URL 不得泄露密码: {debug}"
+        );
+    }
+
+    /// D1：validate 必须先校验 DSN 与新字段，不能被 data_dir 检查抢先。
+    #[test]
+    fn d1_validate_checks_database_before_data_dir() {
+        let hub = HubConfig {
+            data_dir: PathBuf::from("/tmp"),
+            database: "postgres://rb_user:secr3t@/rustboard".to_string(),
+            ..HubConfig::default()
+        };
+        let err = hub.validate().expect_err("非法 DSN 必须失败").to_string();
+        assert!(err.contains("PostgreSQL"), "应先报 DSN 错误: {err}");
+        assert!(!err.contains("data_dir"), "不应先执行 data_dir 校验: {err}");
+        assert!(!err.contains("secr3t"), "错误不得回显密码: {err}");
+
+        let hub = HubConfig {
+            data_dir: PathBuf::from("/tmp"),
+            db_pool_size: 0,
+            ..HubConfig::default()
+        };
+        let err = hub
+            .validate()
+            .expect_err("越界 db_pool_size 必须失败")
+            .to_string();
+        assert!(err.contains("db_pool_size"), "应先报字段错误: {err}");
+        assert!(!err.contains("data_dir"), "不应先执行 data_dir 校验: {err}");
+    }
+
+    /// D1：PostgreSQL 配置的 sqlite_path 必须给出明确错误，且不泄露 URL。
+    #[test]
+    fn d1_sqlite_path_rejects_postgres_without_leaking_url() {
+        let hub = hub_with_database("postgres://rb_user:secr3t@db.example.com/rustboard");
+        let err = hub.sqlite_path().expect_err("PG 配置不能取 SQLite 路径");
+        let err = err.to_string();
+        assert!(
+            err.contains("只适用于 SQLite"),
+            "错误应说明仅适用于 SQLite: {err}"
+        );
+        assert!(err.contains("database_kind()"), "错误应指向正确入口: {err}");
+        assert!(!err.contains("secr3t"), "错误不得回显密码: {err}");
+        assert!(!err.contains("db.example.com"), "错误不得回显 URL: {err}");
     }
 }
