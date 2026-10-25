@@ -1140,7 +1140,7 @@ fn hub_agent_trust(cfg: &HubConfig) -> HubAgentTrust {
     match cfg.tls.mode {
         ServerTlsMode::SelfSigned => HubAgentTrust::Fingerprint,
         ServerTlsMode::AcmeDomain | ServerTlsMode::AcmeIp => {
-            if cfg.tls.acme_ca_file.trim().is_empty() {
+            if cfg.tls.agent_ca_file.trim().is_empty() && cfg.tls.acme_ca_file.trim().is_empty() {
                 HubAgentTrust::SystemRoots
             } else {
                 HubAgentTrust::CustomCa
@@ -1224,6 +1224,32 @@ fn validate_agent_name(name: &str) -> Result<()> {
 /// 证书未签发、链尾不是 CA 或写盘失败都返回错误，调用方必须在创建 enrollment
 /// token 之前失败。
 fn prepare_private_acme_agent_ca(cfg: &HubConfig, config_path: &FsPath) -> Result<PathBuf> {
+    let agent_ca_path = tls::cert_dir(&cfg.data_dir).join("agent-ca.pem");
+
+    // 显式稳定根优先，避免链尾 intermediate 轮换导致已分发 agent 失联。
+    let explicit = cfg.tls.agent_ca_file.trim();
+    if !explicit.is_empty() {
+        let source = std::path::Path::new(explicit);
+        let text = std::fs::read_to_string(source)
+            .with_context(|| format!("读取 tls.agent_ca_file 失败: {}", source.display()))?;
+        tls::ensure_certificate_only_pem(&text).with_context(|| {
+            format!(
+                "tls.agent_ca_file 只允许 CERTIFICATE 区块: {}",
+                source.display()
+            )
+        })?;
+        let anchor = tls::last_certificate_pem(&text)?;
+        if !tls::certificate_is_ca(&anchor)? {
+            bail!(
+                "tls.agent_ca_file {} 不是 CA 证书（BasicConstraints.ca=true）",
+                source.display()
+            );
+        }
+        fsutil::atomic_write(&agent_ca_path, anchor.as_bytes(), 0o644)
+            .with_context(|| format!("写入显式 agent CA 失败: {}", agent_ca_path.display()))?;
+        return Ok(agent_ca_path);
+    }
+
     let cert_path = tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE);
     let chain_pem = std::fs::read_to_string(&cert_path).with_context(|| {
         format!(
@@ -1243,7 +1269,6 @@ fn prepare_private_acme_agent_ca(cfg: &HubConfig, config_path: &FsPath) -> Resul
         );
     }
 
-    let agent_ca_path = tls::cert_dir(&cfg.data_dir).join("agent-ca.pem");
     fsutil::atomic_write(&agent_ca_path, anchor_pem.as_bytes(), 0o644)
         .with_context(|| format!("写入 agent CA 失败: {}", agent_ca_path.display()))?;
     Ok(agent_ca_path)

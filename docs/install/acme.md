@@ -91,7 +91,8 @@ firewall-cmd --reload
 | `--acme-challenge http-01\|tls-alpn-01` | 挑战类型；默认 `http-01` |
 | `--domain DNS\|IPv4` | 证书标识，可重复；`acme-domain` 1–20 个，`acme-ip` 恰好 1 个 |
 | `--acme-profile PROFILE` | 例如 `shortlived`；留空按 ACME 客户端默认 |
-| `--acme-ca PEM` | 私有 / Pebble ACME 的根 CA 绝对路径；留空用系统根 |
+| `--acme-ca PEM` | 私有 / Pebble ACME 的 WFE HTTPS 根绝对路径；留空用系统根 |
+| `--agent-ca PEM` | 私有 ACME 签发链的稳定信任锚（CA）；留空从 `server.crt` 链尾派生 |
 | `--admin-tls off\|required` | 管理 API 明文（仅回环，默认）或 HTTPS |
 | `--offline` | 不发起任何外部网络探测；**与 ACME 互斥** |
 
@@ -325,7 +326,8 @@ sudo rustboard-hub tls issue --config /etc/rustboard/hub.toml
 - `--admin-tls required` 时，同机 panel 使用
   `https://<证书 SAN 覆盖的主机名>:<管理端口>`；`--hub-ca` 按 hub 的证书来源选择：
   - **self-signed**：`<hub data_dir>/certs/ca.crt`；
-  - **私有 ACME**：`<hub data_dir>/certs/agent-ca.pem`。它由安装器从
+  - **私有 ACME**：`<hub data_dir>/certs/agent-ca.pem`。若设置了
+    `tls.agent_ca_file`/`--agent-ca`，优先使用该稳定根；否则由安装器从
     `certs/server.crt` 的**链尾 CA** 提取（0644），与 `hub agent add` 使用的
     信任锚一致；`tls.acme_ca_file` 只是 ACME WFE 的 HTTPS 根，**不能**当作 hub
     服务端证书的 CA；

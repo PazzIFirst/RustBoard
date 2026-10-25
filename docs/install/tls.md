@@ -88,7 +88,8 @@ acme_directory = "https://acme-v02.api.letsencrypt.org/directory"
 challenge = "http-01"           # http-01 | tls-alpn-01
 domains = ["board.example.com"] # acme-domain: 1–20 个 DNS；acme-ip: 恰好 1 个 IPv4
 acme_profile = ""               # 例如 shortlived；acme-ip 留空时默认 shortlived
-acme_ca_file = ""               # 仅私有/Pebble ACME；PEM 绝对路径
+acme_ca_file = ""               # 仅私有/Pebble ACME 的 WFE HTTPS 根；PEM 绝对路径
+agent_ca_file = ""              # 私有 ACME 签发链的稳定信任锚；留空从链尾派生
 staging_check = true            # 安装时先跑一次 staging（acme-ip 默认跳过）
 fallback_to_self_signed = true  # ACME 失败时回退自签继续安装
 ```
@@ -100,6 +101,9 @@ fallback_to_self_signed = true  # ACME 失败时回退自签继续安装
 - `acme-domain` 的域名不能是 IP、不能含通配符 `*`、不能有首尾点/空标签；
   `acme-ip` 只接受公网 IPv4，恰好一个。
 - `acme_profile` 只允许字母、数字、`-`、`_`，最长 64 字节。
+- `agent_ca_file`（可选）必须是绝对路径、普通文件，用于私有 ACME 的稳定
+  信任锚；链尾会轮换（intermediate）时必须显式设置，否则 agent/panel 可能在
+  轮换后失联。安装器会把它复制为 `certs/agent-ca.pem`。
 - `acme_ca_file` 必须是绝对路径、普通文件；只用于私有/Pebble ACME。公共
   Let's Encrypt 使用系统根，不要设置它。
 

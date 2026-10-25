@@ -112,6 +112,12 @@ pub struct TlsConfig {
     pub acme_profile: String,
     /// 私有/Pebble ACME 的根 CA（PEM 绝对路径）；留空使用系统根。
     pub acme_ca_file: String,
+    /// 私有 ACME 签发链的稳定信任锚（PEM 绝对路径，可选）。
+    ///
+    /// `acme_ca_file` 是 ACME WFE 的 HTTPS 根，**不是**服务端证书链的 CA；
+    /// 若私有 ACME 的链尾会轮换（中间 CA），应把稳定根写在这里。留空时
+    /// 安装器从 `server.crt` 链尾派生 `agent-ca.pem`。
+    pub agent_ca_file: String,
     /// 安装时先跑一次 staging 挑战（失败按 `fallback_to_self_signed` 处理）。
     pub staging_check: bool,
     /// ACME 获取证书失败时是否回退 self-signed 继续安装。
@@ -128,6 +134,7 @@ impl Default for TlsConfig {
             domains: Vec::new(),
             acme_profile: String::new(),
             acme_ca_file: String::new(),
+            agent_ca_file: String::new(),
             staging_check: true,
             fallback_to_self_signed: true,
         }
@@ -179,6 +186,9 @@ impl TlsConfig {
         }
         if !self.acme_ca_file.trim().is_empty() {
             validate_absolute_config_path("tls.acme_ca_file", &self.acme_ca_file)?;
+        }
+        if !self.agent_ca_file.trim().is_empty() {
+            validate_absolute_config_path("tls.agent_ca_file", &self.agent_ca_file)?;
         }
         Ok(())
     }

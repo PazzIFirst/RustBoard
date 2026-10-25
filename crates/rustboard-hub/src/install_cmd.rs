@@ -88,6 +88,9 @@ pub(crate) struct TlsCliArgs {
     /// 私有 / Pebble ACME 的根 CA PEM（绝对路径）；留空使用系统根。
     #[arg(long, value_name = "PEM")]
     pub(crate) acme_ca: Option<PathBuf>,
+    /// 私有 ACME 签发链的稳定信任锚（PEM 绝对路径）；留空从证书链尾派生。
+    #[arg(long, value_name = "PEM")]
+    pub(crate) agent_ca: Option<PathBuf>,
     /// 管理 API 传输模式：`off`（默认，仅回环明文）/ `required`（HTTPS）。
     #[arg(long, value_parser = ["off", "required"])]
     pub(crate) admin_tls: Option<String>,
@@ -278,6 +281,7 @@ fn has_acme_args(args: &InstallArgs) -> bool {
         || !args.tls_options.domains.is_empty()
         || args.tls_options.acme_profile.is_some()
         || args.tls_options.acme_ca.is_some()
+        || args.tls_options.agent_ca.is_some()
 }
 
 /// 写盘 / 网络之前的 TLS 参数互斥与必填校验。
@@ -345,6 +349,28 @@ fn validate_tls_args(args: &InstallArgs) -> Result<ServerTlsMode> {
                 .with_context(|| format!("读取 --acme-ca {} 失败", path.display()))?;
             if !meta.is_file() {
                 bail!("--acme-ca 不是普通文件: {}", path.display());
+            }
+        }
+        if let Some(path) = &args.tls_options.agent_ca {
+            if !path.is_absolute() {
+                bail!("--agent-ca 必须是绝对路径: {}", path.display());
+            }
+            let meta = fs::metadata(path)
+                .with_context(|| format!("读取 --agent-ca {} 失败", path.display()))?;
+            if !meta.is_file() {
+                bail!("--agent-ca 不是普通文件: {}", path.display());
+            }
+            let text = fs::read_to_string(path)
+                .with_context(|| format!("读取 --agent-ca {} 失败", path.display()))?;
+            tls::ensure_certificate_only_pem(&text).with_context(|| {
+                format!("--agent-ca {} 只允许 CERTIFICATE 区块", path.display())
+            })?;
+            let anchor = tls::last_certificate_pem(&text)?;
+            if !tls::certificate_is_ca(&anchor)? {
+                bail!(
+                    "--agent-ca {} 必须是 CA 证书（BasicConstraints.ca=true）",
+                    path.display()
+                );
             }
         }
     }
@@ -459,6 +485,12 @@ fn apply_tls_flags(cfg: &mut HubConfig, args: &InstallArgs) -> Result<()> {
             .to_str()
             .ok_or_else(|| anyhow!("--acme-ca 不是有效 UTF-8: {}", path.display()))?;
         cfg.tls.acme_ca_file = path.to_string();
+    }
+    if let Some(path) = &args.tls_options.agent_ca {
+        let path = path
+            .to_str()
+            .ok_or_else(|| anyhow!("--agent-ca 不是有效 UTF-8: {}", path.display()))?;
+        cfg.tls.agent_ca_file = path.to_string();
     }
     if !args.tls_options.domains.is_empty() {
         let mut domains = Vec::with_capacity(args.tls_options.domains.len());
@@ -1418,10 +1450,41 @@ fn verify_acme_server_material(data_dir: &Path) -> Result<String> {
 /// 与 hub 服务端证书链无关；把它传给同机 panel 的 `--hub-ca` 会让 panel 校验证书
 /// 失败。公共 ACME（`acme_ca_file` 为空）与 self-signed 返回 `None`。
 fn prepare_private_acme_agent_ca(cfg: &HubConfig) -> Result<Option<PathBuf>> {
-    if !cfg.tls.mode.is_acme() || cfg.tls.acme_ca_file.trim().is_empty() {
+    if !cfg.tls.mode.is_acme() {
         return Ok(None);
     }
     let dir = tls::cert_dir(&cfg.data_dir);
+
+    // 显式稳定根优先：私有 ACME 的链尾可能是会轮换的 intermediate，用户可把
+    // 长期根固定到 tls.agent_ca_file。安装器复制到 certs/agent-ca.pem，供
+    // agent add / health / panel 统一使用。
+    let explicit = cfg.tls.agent_ca_file.trim();
+    if !explicit.is_empty() {
+        let source = Path::new(explicit);
+        let text = fs::read_to_string(source)
+            .with_context(|| format!("读取 tls.agent_ca_file 失败: {}", source.display()))?;
+        tls::ensure_certificate_only_pem(&text).with_context(|| {
+            format!(
+                "tls.agent_ca_file 只允许 CERTIFICATE 区块: {}",
+                source.display()
+            )
+        })?;
+        let anchor = tls::last_certificate_pem(&text)?;
+        if !tls::certificate_is_ca(&anchor)? {
+            bail!(
+                "tls.agent_ca_file {} 不是 CA 证书（BasicConstraints.ca=true）",
+                source.display()
+            );
+        }
+        let dest = dir.join(ACME_AGENT_CA_FILE);
+        fsutil::atomic_write(&dest, anchor.as_bytes(), 0o644)
+            .with_context(|| format!("写入显式 agent CA 失败: {}", dest.display()))?;
+        return Ok(Some(dest));
+    }
+
+    if cfg.tls.acme_ca_file.trim().is_empty() {
+        return Ok(None);
+    }
     let chain_path = dir.join(tls::SERVER_CERT_FILE);
     let chain = fs::read_to_string(&chain_path)
         .with_context(|| format!("读取私有 ACME 服务端证书链失败: {}", chain_path.display()))?;
@@ -4708,6 +4771,27 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o644);
         }
+
+        // 显式稳定根优先于链尾，避免 intermediate 轮换导致已分发 agent 失联。
+        let stable_key = KeyPair::generate().unwrap();
+        let mut stable_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        stable_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        stable_params
+            .distinguished_name
+            .push(DnType::CommonName, "Stable ACME Root");
+        let stable_pem = stable_params.self_signed(&stable_key).unwrap().pem();
+        let stable_path = dir.path().join("stable-agent-ca.pem");
+        fs::write(&stable_path, &stable_pem).unwrap();
+        cfg.tls.agent_ca_file = stable_path.to_string_lossy().to_string();
+        let explicit = prepare_private_acme_agent_ca(&cfg)
+            .unwrap()
+            .expect("显式 agent CA 必须生成");
+        assert_eq!(
+            tls::fingerprint_of_pem(&fs::read_to_string(&explicit).unwrap()).unwrap(),
+            tls::fingerprint_of_pem(&stable_pem).unwrap(),
+            "必须优先使用 tls.agent_ca_file 而不是链尾"
+        );
+        cfg.tls.agent_ca_file.clear();
 
         // 公共 ACME / self-signed 不生成 agent CA。
         cfg.tls.acme_ca_file.clear();
