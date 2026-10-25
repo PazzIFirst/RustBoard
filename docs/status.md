@@ -271,7 +271,8 @@
 **123 PASS / 0 FAIL / 1 SKIP**（可选 arm64/QEMU 按设计 SKIP）；`v100-acme.sh`
 Pebble **3/3**（HTTP-01、TLS-ALPN-01、IP shortlived）真实签发；另手工跑通
 `hub install --tls acme-domain`（Pebble TLS-ALPN）→ `--force --tls self-signed`
-切换，确认 ACME 证书被既有 CA 重签、`openssl verify` 通过；panel
+切换，确认 ACME 证书被既有 CA 重签、`openssl verify` 通过；该流程已固化为
+[v100-acme-upgrade.sh](tests/e2e/v100-acme-upgrade.sh) 并实跑通过；panel
 `phase_c_panel_tls` **14/14**；web 80/80 + build。独立渗透报告
 [2026-10-25-m5-phase-c-pentest.md](security/2026-10-25-m5-phase-c-pentest.md)：
 **高危 0 / 中危 0 / 低危 3**；L-02（TLS-ALPN 无 ALPN 客户端仍见挑战证书）
