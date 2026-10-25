@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.1] - 2026-10-26
+
 ### Added
 
 - Phase C ACME 服务端证书：hub `[tls]` 新增 `self-signed` / `acme-domain` /

@@ -2754,7 +2754,7 @@ dependencies = [
 
 [[package]]
 name = "rustboard-agent"
-version = "0.4.2"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2777,7 +2777,7 @@ dependencies = [
 
 [[package]]
 name = "rustboard-common"
-version = "0.4.2"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2801,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "rustboard-core"
-version = "0.4.2"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2819,7 +2819,7 @@ dependencies = [
 
 [[package]]
 name = "rustboard-hub"
-version = "0.4.2"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2861,7 +2861,7 @@ dependencies = [
 
 [[package]]
 name = "rustboard-install"
-version = "0.4.2"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "rustboard-panel"
-version = "0.4.2"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
