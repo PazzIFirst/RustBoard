@@ -21,6 +21,13 @@
 | v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
 | M5 安装与交付 | 🟡 进行中（Phase C 主体已实现，待 RC） | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126（arm64 QEMU + 来源校验）；Phase C C0–C8 已实现 ACME/agent TLS/面板 TLS/管理端 TLS/Docker 与文档，尚未完成 C9 全量 e2e、独立评审/渗透与 `v1.0.0-rc.1`；正式 v1.0.0 待 Phase E |
 
+## 构建产物清理（2026-10-25 Phase C 收尾）
+
+- 触发：根分区 86%（23 GiB 可用）。
+- 清理：`target/debug/incremental`、`target/v040-t1`、Docker builder cache
+  （`docker builder prune -af`）；保留 `target/baseline-bin`（v0.4.0 冻结基线）。
+- 结果：62%（59 GiB 可用）；未删除源码、测试、文档、`vendor/`、`tests/pentest/`。
+
 ## M1 明细
 
 已完成：
