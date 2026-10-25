@@ -112,13 +112,14 @@ jobs:
           echo "PostgreSQL 在 30 秒内未就绪" >&2
           exit 1
 
-      - name: Phase D 实库测试（schema / core / parity / migrate）
+      - name: Phase D 实库测试（schema / core / parity / migrate / load）
         run: >-
           cargo test -p rustboard-core
           --test postgres_schema
           --test postgres_core
           --test postgres_parity
           --test postgres_migrate
+          --test postgres_load
           --locked
 
   e2e:
