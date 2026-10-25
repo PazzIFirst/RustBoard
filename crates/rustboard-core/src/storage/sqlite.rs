@@ -1872,6 +1872,375 @@ impl Storage for SqliteStorage {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    // ---- Phase D D1a：`Storage` trait 剩余方法的 UFCS 转发 ----
+    //
+    // 上面已有 29 个方法直接实现；这里把 `impl SqliteStorage` 其余 68 个固有
+    // 方法转发进 trait，使 `dyn Storage` 覆盖完整存储 API。**必须走
+    // `SqliteStorage::method(self, ...)`**：写成 `self.method(...)` 会命中
+    // trait 方法自身，造成无限递归或歧义。
+    //
+    // Rust 不允许同一 trait 对同一类型拆成多个 `impl` 块（E0119），所以这些
+    // 转发方法与上面的实现共处一个 impl 块，但方法体互不重复。
+
+    fn seed_builtin_alert_rules(&self, rules: &[AlertRule], now: i64) -> Result<usize> {
+        SqliteStorage::seed_builtin_alert_rules(self, rules, now)
+    }
+
+    fn get_alert_rule(&self, id: &str) -> Result<Option<AlertRule>> {
+        SqliteStorage::get_alert_rule(self, id)
+    }
+
+    fn list_alert_rules(&self) -> Result<Vec<AlertRule>> {
+        SqliteStorage::list_alert_rules(self)
+    }
+
+    fn alert_rule_count(&self) -> Result<usize> {
+        SqliteStorage::alert_rule_count(self)
+    }
+
+    fn create_alert_rule(&self, rule: &AlertRule) -> Result<()> {
+        SqliteStorage::create_alert_rule(self, rule)
+    }
+
+    fn update_alert_rule(&self, rule: &AlertRule) -> Result<()> {
+        SqliteStorage::update_alert_rule(self, rule)
+    }
+
+    fn update_alert_rule_and_clear_states(&self, rule: &AlertRule) -> Result<()> {
+        SqliteStorage::update_alert_rule_and_clear_states(self, rule)
+    }
+
+    fn delete_alert_rule(&self, id: &str) -> Result<()> {
+        SqliteStorage::delete_alert_rule(self, id)
+    }
+
+    fn delete_alert_rule_and_clear_states(&self, id: &str) -> Result<()> {
+        SqliteStorage::delete_alert_rule_and_clear_states(self, id)
+    }
+
+    fn list_alert_states(&self) -> Result<Vec<AlertState>> {
+        SqliteStorage::list_alert_states(self)
+    }
+
+    fn get_alert_state(
+        &self,
+        rule_id: &str,
+        agent_id: &str,
+        series_key: &str,
+    ) -> Result<Option<AlertState>> {
+        SqliteStorage::get_alert_state(self, rule_id, agent_id, series_key)
+    }
+
+    fn upsert_alert_state(&self, state: &AlertState) -> Result<()> {
+        SqliteStorage::upsert_alert_state(self, state)
+    }
+
+    fn delete_alert_state(&self, rule_id: &str, agent_id: &str, series_key: &str) -> Result<usize> {
+        SqliteStorage::delete_alert_state(self, rule_id, agent_id, series_key)
+    }
+
+    fn prune_alert_states(&self, resolved_before: i64) -> Result<usize> {
+        SqliteStorage::prune_alert_states(self, resolved_before)
+    }
+
+    fn prune_stale_alert_states(&self, stale_before: i64, max_rows: usize) -> Result<usize> {
+        SqliteStorage::prune_stale_alert_states(self, stale_before, max_rows)
+    }
+
+    fn insert_alert_event(&self, event: &AlertEvent) -> Result<i64> {
+        SqliteStorage::insert_alert_event(self, event)
+    }
+
+    fn list_alert_events(&self, limit: usize, before_id: Option<i64>) -> Result<Vec<AlertEvent>> {
+        SqliteStorage::list_alert_events(self, limit, before_id)
+    }
+
+    fn prune_alert_events(&self, before_ts: i64, max_rows: usize) -> Result<usize> {
+        SqliteStorage::prune_alert_events(self, before_ts, max_rows)
+    }
+
+    fn create_alert_silence(&self, silence: &AlertSilence) -> Result<i64> {
+        SqliteStorage::create_alert_silence(self, silence)
+    }
+
+    fn list_active_silences(&self, now: i64) -> Result<Vec<AlertSilence>> {
+        SqliteStorage::list_active_silences(self, now)
+    }
+
+    fn delete_alert_silence(&self, id: i64) -> Result<bool> {
+        SqliteStorage::delete_alert_silence(self, id)
+    }
+
+    fn prune_alert_silences(&self, before_ts: i64) -> Result<usize> {
+        SqliteStorage::prune_alert_silences(self, before_ts)
+    }
+
+    fn list_enabled_alert_rules(&self) -> Result<Vec<AlertRule>> {
+        SqliteStorage::list_enabled_alert_rules(self)
+    }
+
+    fn list_alert_states_for_rule(&self, rule_id: &str, limit: usize) -> Result<Vec<AlertState>> {
+        SqliteStorage::list_alert_states_for_rule(self, rule_id, limit)
+    }
+
+    fn prune_alert_states_for_rule(&self, rule_id: &str, keep: usize) -> Result<usize> {
+        SqliteStorage::prune_alert_states_for_rule(self, rule_id, keep)
+    }
+
+    fn latest_alert_series(
+        &self,
+        metric: &str,
+        since: i64,
+        agent: Option<&str>,
+        limit: usize,
+    ) -> Result<AlertSeriesSnapshot> {
+        SqliteStorage::latest_alert_series(self, metric, since, agent, limit)
+    }
+
+    fn apply_alert_transitions(&self, events: &[AlertEvent], states: &[AlertState]) -> Result<()> {
+        SqliteStorage::apply_alert_transitions(self, events, states)
+    }
+
+    fn apply_alert_evaluation(
+        &self,
+        rule_id: &str,
+        events: &[AlertEvent],
+        states: &[AlertState],
+        keep_states: usize,
+    ) -> Result<usize> {
+        SqliteStorage::apply_alert_evaluation(self, rule_id, events, states, keep_states)
+    }
+
+    fn max_alert_event_id(&self) -> Result<i64> {
+        SqliteStorage::max_alert_event_id(self)
+    }
+
+    fn list_pending_notification_events_after(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<AlertEvent>> {
+        SqliteStorage::list_pending_notification_events_after(self, after_id, limit)
+    }
+
+    fn mark_notification_processed(&self, id: i64, notify_error: &str) -> Result<bool> {
+        SqliteStorage::mark_notification_processed(self, id, notify_error)
+    }
+
+    fn list_pending_notification_events(&self, limit: usize) -> Result<Vec<AlertEvent>> {
+        SqliteStorage::list_pending_notification_events(self, limit)
+    }
+
+    fn mark_notification_result(
+        &self,
+        id: i64,
+        notified: bool,
+        notify_error: &str,
+    ) -> Result<bool> {
+        SqliteStorage::mark_notification_result(self, id, notified, notify_error)
+    }
+
+    fn update_alert_state_notified(
+        &self,
+        rule_id: &str,
+        agent_id: &str,
+        series_key: &str,
+        last_notified_at: i64,
+    ) -> Result<bool> {
+        SqliteStorage::update_alert_state_notified(
+            self,
+            rule_id,
+            agent_id,
+            series_key,
+            last_notified_at,
+        )
+    }
+
+    fn list_notification_channels(&self) -> Result<Vec<NotificationChannel>> {
+        SqliteStorage::list_notification_channels(self)
+    }
+
+    fn get_notification_channel(&self, id: &str) -> Result<Option<NotificationChannel>> {
+        SqliteStorage::get_notification_channel(self, id)
+    }
+
+    fn notification_channel_count(&self) -> Result<usize> {
+        SqliteStorage::notification_channel_count(self)
+    }
+
+    fn create_notification_channel(&self, channel: &NotificationChannel) -> Result<()> {
+        SqliteStorage::create_notification_channel(self, channel)
+    }
+
+    fn update_notification_channel(&self, channel: &NotificationChannel) -> Result<()> {
+        SqliteStorage::update_notification_channel(self, channel)
+    }
+
+    fn delete_notification_channel(&self, id: &str) -> Result<()> {
+        SqliteStorage::delete_notification_channel(self, id)
+    }
+
+    fn create_api_token(
+        &self,
+        name: &str,
+        token_hash: &str,
+        scope: &str,
+        created_at: i64,
+    ) -> Result<ApiTokenRecord> {
+        SqliteStorage::create_api_token(self, name, token_hash, scope, created_at)
+    }
+
+    fn list_api_tokens(&self) -> Result<Vec<ApiTokenRecord>> {
+        SqliteStorage::list_api_tokens(self)
+    }
+
+    fn rotate_api_token(&self, name: &str, token_hash: &str, now: i64) -> Result<ApiTokenRecord> {
+        SqliteStorage::rotate_api_token(self, name, token_hash, now)
+    }
+
+    fn revoke_api_token(&self, name: &str, now: i64) -> Result<()> {
+        SqliteStorage::revoke_api_token(self, name, now)
+    }
+
+    fn authenticate_api_token(&self, token_hash: &str, now: i64) -> Result<Option<ApiTokenRecord>> {
+        SqliteStorage::authenticate_api_token(self, token_hash, now)
+    }
+
+    fn downsample_1m_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult> {
+        SqliteStorage::downsample_1m_range(self, from_ts, to_ts)
+    }
+
+    fn downsample_1h_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult> {
+        SqliteStorage::downsample_1h_range(self, from_ts, to_ts)
+    }
+
+    fn raw_stats(&self) -> Result<TierStats> {
+        SqliteStorage::raw_stats(self)
+    }
+
+    fn samples_1m_stats(&self) -> Result<TierStats> {
+        SqliteStorage::samples_1m_stats(self)
+    }
+
+    fn samples_1h_stats(&self) -> Result<TierStats> {
+        SqliteStorage::samples_1h_stats(self)
+    }
+
+    fn raw_ts_at_offset(&self, from_ts: i64, to_ts: i64, offset: usize) -> Result<Option<i64>> {
+        SqliteStorage::raw_ts_at_offset(self, from_ts, to_ts, offset)
+    }
+
+    fn samples_1m_ts_at_offset(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        offset: usize,
+    ) -> Result<Option<i64>> {
+        SqliteStorage::samples_1m_ts_at_offset(self, from_ts, to_ts, offset)
+    }
+
+    fn raw_new_rows(&self, after_rowid: Option<i64>) -> Result<(Option<i64>, Option<i64>)> {
+        SqliteStorage::raw_new_rows(self, after_rowid)
+    }
+
+    fn samples_1m_oldest_ts(&self) -> Result<Option<i64>> {
+        SqliteStorage::samples_1m_oldest_ts(self)
+    }
+
+    fn prune_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
+        SqliteStorage::prune_samples_before(self, cutoff)
+    }
+
+    fn prune_samples_1m_before(&self, cutoff: i64) -> Result<PruneResult> {
+        SqliteStorage::prune_samples_1m_before(self, cutoff)
+    }
+
+    fn prune_samples_1h_before(&self, cutoff: i64) -> Result<PruneResult> {
+        SqliteStorage::prune_samples_1h_before(self, cutoff)
+    }
+
+    fn claim_raw_rowid_if_unchanged(
+        &self,
+        expected_rowid: Option<i64>,
+        expected_generation: i64,
+        new_max: i64,
+    ) -> Result<bool> {
+        SqliteStorage::claim_raw_rowid_if_unchanged(
+            self,
+            expected_rowid,
+            expected_generation,
+            new_max,
+        )
+    }
+
+    fn insert_archive_object(&self, object: &ArchiveObject) -> Result<i64> {
+        SqliteStorage::insert_archive_object(self, object)
+    }
+
+    fn get_archive_object(&self, id: i64) -> Result<Option<ArchiveObject>> {
+        SqliteStorage::get_archive_object(self, id)
+    }
+
+    fn find_archive_object_by_key(&self, object_key: &str) -> Result<Option<ArchiveObject>> {
+        SqliteStorage::find_archive_object_by_key(self, object_key)
+    }
+
+    fn list_archive_objects(
+        &self,
+        limit: usize,
+        before_id: Option<i64>,
+    ) -> Result<Vec<ArchiveObject>> {
+        SqliteStorage::list_archive_objects(self, limit, before_id)
+    }
+
+    fn update_archive_object_status(
+        &self,
+        id: i64,
+        status: ArchiveStatus,
+        error: &str,
+        uploaded_at: Option<i64>,
+        deleted_at: Option<i64>,
+    ) -> Result<()> {
+        SqliteStorage::update_archive_object_status(
+            self,
+            id,
+            status,
+            error,
+            uploaded_at,
+            deleted_at,
+        )
+    }
+
+    fn get_archive_state(&self, key: &str) -> Result<Option<String>> {
+        SqliteStorage::get_archive_state(self, key)
+    }
+
+    fn set_archive_state(&self, key: &str, value: &str, updated_at: i64) -> Result<()> {
+        SqliteStorage::set_archive_state(self, key, value, updated_at)
+    }
+
+    fn list_archive_objects_in_range(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+    ) -> Result<Vec<ArchiveObject>> {
+        SqliteStorage::list_archive_objects_in_range(self, from_ts, to_ts)
+    }
+
+    fn scan_archive_rows(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        after_rowid: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ArchiveRawRow>> {
+        SqliteStorage::scan_archive_rows(self, from_ts, to_ts, after_rowid, limit)
+    }
+
+    fn count_archive_objects(&self) -> Result<i64> {
+        SqliteStorage::count_archive_objects(self)
+    }
 }
 
 // ---------------------------------------------------------------------------

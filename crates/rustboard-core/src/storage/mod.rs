@@ -1,9 +1,26 @@
-//! 存储抽象。v1 先实现 SQLite，PostgreSQL 走同一套 SQL 子集。
+//! 存储抽象。
+//!
+//! [`Storage`] 是同步 trait：当前只有 SQLite 实现，PostgreSQL 在 Phase D（D3）
+//! 接入。PG 的网络阻塞不在这层 await，而是由上层用 `block_in_place` / 专用
+//! 线程池包装（调用点由 D3 基准确定），因此 trait 保持同步、可直接作为
+//! `dyn Storage` 使用。
+//!
+//! [`StorageHandle`] 是 Phase D 引入的多后端边界：内部是 `Arc<dyn Storage>`，
+//! 当前只构造 SQLite；D2/D3 增加 PG schema 与实现后在这里扩展。
 
 pub mod sqlite;
 
+use std::ops::Deref;
+use std::path::Path;
+use std::sync::Arc;
+
 use anyhow::Result;
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
+
+use self::sqlite::{AlertSeriesSnapshot, ArchiveRawRow, SqliteStorage};
+use crate::alerts::{AlertEvent, AlertRule, AlertSilence, AlertState};
+use crate::archive::{ArchiveObject, ArchiveStatus};
+use crate::channels::NotificationChannel;
 
 /// 审计记录保留时长：180 天（毫秒）。启动时与每 1000 条写入后按此清理。
 pub const AUDIT_RETENTION_MS: i64 = 180 * 24 * 60 * 60 * 1000;
@@ -229,6 +246,11 @@ pub struct AgentSeriesRow {
     pub value: f64,
 }
 
+/// 同步存储接口：SQLite 实现见 [`sqlite::SqliteStorage`]。
+///
+/// 所有方法都是同步阻塞调用。PostgreSQL 的网络阻塞不在这层 await，而是由
+/// 上层用 `block_in_place` / 专用线程池包装（D3 基准后确定范围），因此这里
+/// 不加 `async`，保持 `dyn Storage` 可用。
 pub trait Storage: Send + Sync {
     /// 插入或更新 agent 元信息。
     fn upsert_agent(&self, agent: &AgentRecord) -> Result<()>;
@@ -364,4 +386,372 @@ pub trait Storage: Send + Sync {
 
     /// 列出全部维护水位，按 key 升序。
     fn list_maintenance_state(&self) -> Result<Vec<MaintenanceStateEntry>>;
+
+    // ---- M4-B1 告警规则（schema v7 `alert_rules`） ----
+
+    /// 写入内置规则种子；按 id 已存在则跳过，重复调用幂等，返回新增条数。
+    fn seed_builtin_alert_rules(&self, rules: &[AlertRule], now: i64) -> Result<usize>;
+
+    /// 按 id 读取规则；不存在返回 `None`。
+    fn get_alert_rule(&self, id: &str) -> Result<Option<AlertRule>>;
+
+    /// 列出全部规则：内置在前，同组按名称升序。
+    fn list_alert_rules(&self) -> Result<Vec<AlertRule>>;
+
+    /// 规则总数（含内置规则）。
+    fn alert_rule_count(&self) -> Result<usize>;
+
+    /// 新建规则；达到上限或名称重复返回领域错误。
+    fn create_alert_rule(&self, rule: &AlertRule) -> Result<()>;
+
+    /// 更新规则的可写字段；不清理 `alert_states`。
+    fn update_alert_rule(&self, rule: &AlertRule) -> Result<()>;
+
+    /// 与 `update_alert_rule` 相同，并在同一事务内清空该规则的状态。
+    fn update_alert_rule_and_clear_states(&self, rule: &AlertRule) -> Result<()>;
+
+    /// 删除自定义规则；内置规则拒绝删除。
+    fn delete_alert_rule(&self, id: &str) -> Result<()>;
+
+    /// 与 `delete_alert_rule` 相同，并在同一事务内清空该规则的状态。
+    fn delete_alert_rule_and_clear_states(&self, id: &str) -> Result<()>;
+
+    // ---- M4-B1b 告警状态 / 事件 / 静默（schema v7） ----
+
+    /// 列出全部告警状态，按主键稳定排序。
+    fn list_alert_states(&self) -> Result<Vec<AlertState>>;
+
+    /// 按主键读取告警状态；不存在返回 `None`。
+    fn get_alert_state(
+        &self,
+        rule_id: &str,
+        agent_id: &str,
+        series_key: &str,
+    ) -> Result<Option<AlertState>>;
+
+    /// 插入或整行更新告警状态。
+    fn upsert_alert_state(&self, state: &AlertState) -> Result<()>;
+
+    /// 删除告警状态，返回受影响行数（0 = 本来不存在）。
+    fn delete_alert_state(&self, rule_id: &str, agent_id: &str, series_key: &str) -> Result<usize>;
+
+    /// 只清理 `resolved` 且 `last_eval_at < resolved_before` 的状态。
+    fn prune_alert_states(&self, resolved_before: i64) -> Result<usize>;
+
+    /// 分页清理陈旧的 pending / firing 状态，`max_rows` 限制单次删除量。
+    fn prune_stale_alert_states(&self, stale_before: i64, max_rows: usize) -> Result<usize>;
+
+    /// 插入告警事件，返回自增 id。
+    fn insert_alert_event(&self, event: &AlertEvent) -> Result<i64>;
+
+    /// 按 id 倒序分页列出事件；`before_id` 为排他游标。
+    fn list_alert_events(&self, limit: usize, before_id: Option<i64>) -> Result<Vec<AlertEvent>>;
+
+    /// 按时间清理事件，并只保留最近 `max_rows` 行。
+    fn prune_alert_events(&self, before_ts: i64, max_rows: usize) -> Result<usize>;
+
+    /// 创建静默，返回自增 id；生效中数量有上限。
+    fn create_alert_silence(&self, silence: &AlertSilence) -> Result<i64>;
+
+    /// 列出 `now` 时刻仍生效的静默。
+    fn list_active_silences(&self, now: i64) -> Result<Vec<AlertSilence>>;
+
+    /// 删除静默；`false` 表示 id 不存在。
+    fn delete_alert_silence(&self, id: i64) -> Result<bool>;
+
+    /// 清理到期静默。
+    fn prune_alert_silences(&self, before_ts: i64) -> Result<usize>;
+
+    /// 列出启用的规则（评估引擎使用）。
+    fn list_enabled_alert_rules(&self) -> Result<Vec<AlertRule>>;
+
+    /// 按最近更新时间读取指定规则至多 `limit` 条状态。
+    fn list_alert_states_for_rule(&self, rule_id: &str, limit: usize) -> Result<Vec<AlertState>>;
+
+    /// 每规则只保留最近 `keep` 条状态，返回删除行数。
+    fn prune_alert_states_for_rule(&self, rule_id: &str, keep: usize) -> Result<usize>;
+
+    /// 告警评估专用的 raw-only 最新序列快照；达到 `limit` 时截断并标记。
+    fn latest_alert_series(
+        &self,
+        metric: &str,
+        since: i64,
+        agent: Option<&str>,
+        limit: usize,
+    ) -> Result<AlertSeriesSnapshot>;
+
+    /// 单事务批量落库事件与状态（先事件后状态，at-least-once）。
+    fn apply_alert_transitions(&self, events: &[AlertEvent], states: &[AlertState]) -> Result<()>;
+
+    /// 单事务落库事件、状态与每规则状态上限清理，返回淘汰行数。
+    fn apply_alert_evaluation(
+        &self,
+        rule_id: &str,
+        events: &[AlertEvent],
+        states: &[AlertState],
+        keep_states: usize,
+    ) -> Result<usize>;
+
+    /// 当前最大告警事件 id；没有事件返回 0。
+    fn max_alert_event_id(&self) -> Result<i64>;
+
+    /// 通知队列：取 `id > after_id` 且未通知、未静默的事件。
+    fn list_pending_notification_events_after(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<AlertEvent>>;
+
+    /// 标记事件已处理并保留固定原因（如 `no_channel`）。
+    fn mark_notification_processed(&self, id: i64, notify_error: &str) -> Result<bool>;
+
+    /// 通知队列：未通知且未静默的事件，按 id 升序。
+    fn list_pending_notification_events(&self, limit: usize) -> Result<Vec<AlertEvent>>;
+
+    /// 记录通知结果；成功时清空错误信息。
+    fn mark_notification_result(&self, id: i64, notified: bool, notify_error: &str)
+        -> Result<bool>;
+
+    /// 只更新状态的 `last_notified_at`，不整行覆盖。
+    fn update_alert_state_notified(
+        &self,
+        rule_id: &str,
+        agent_id: &str,
+        series_key: &str,
+        last_notified_at: i64,
+    ) -> Result<bool>;
+
+    // ---- M4-B2 通知渠道（schema v7 `notification_channels`） ----
+
+    /// 列出全部渠道（含 secret，仅限 hub 内部使用），按名称升序。
+    fn list_notification_channels(&self) -> Result<Vec<NotificationChannel>>;
+
+    /// 按 id 读取渠道；不存在返回 `None`。
+    fn get_notification_channel(&self, id: &str) -> Result<Option<NotificationChannel>>;
+
+    /// 渠道总数。
+    fn notification_channel_count(&self) -> Result<usize>;
+
+    /// 新建渠道；达到上限、重名或配置非法返回领域错误。
+    fn create_notification_channel(&self, channel: &NotificationChannel) -> Result<()>;
+
+    /// 更新渠道的可写字段；`created_at` 保持原值。
+    fn update_notification_channel(&self, channel: &NotificationChannel) -> Result<()>;
+
+    /// 删除渠道；仍被规则引用时返回 `InUse`。
+    fn delete_notification_channel(&self, id: &str) -> Result<()>;
+
+    // ---- M6 管理 API scoped token（schema v6 `api_tokens`） ----
+
+    /// 新建 scoped token（只存哈希）；重名或非法 scope 在落库前拒绝。
+    fn create_api_token(
+        &self,
+        name: &str,
+        token_hash: &str,
+        scope: &str,
+        created_at: i64,
+    ) -> Result<ApiTokenRecord>;
+
+    /// 按 name 升序列出全部 token（含已吊销），不返回哈希或明文。
+    fn list_api_tokens(&self) -> Result<Vec<ApiTokenRecord>>;
+
+    /// 轮换 token：写入新哈希、清除吊销并重置使用时间。
+    fn rotate_api_token(&self, name: &str, token_hash: &str, now: i64) -> Result<ApiTokenRecord>;
+
+    /// 吊销 token，只写 `revoked_at`，不删行。
+    fn revoke_api_token(&self, name: &str, now: i64) -> Result<()>;
+
+    /// 鉴权：只返回未吊销 token，并节流更新 `last_used_at`。
+    fn authenticate_api_token(&self, token_hash: &str, now: i64) -> Result<Option<ApiTokenRecord>>;
+
+    // ---- M4 降采样 / 保留期 / 维护水位（schema v7） ----
+
+    /// 把 `[from_ts, to_ts)` 内已关闭分钟的 raw 聚合进 1m，按主键 upsert 幂等。
+    fn downsample_1m_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult>;
+
+    /// 把完整整点的 1m 聚合进 1h（按 `count` 加权平均），幂等。
+    fn downsample_1h_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult>;
+
+    /// raw 层行数与最旧 / 最新时间戳。
+    fn raw_stats(&self) -> Result<TierStats>;
+
+    /// 1m 层行数与最旧 / 最新时间戳。
+    fn samples_1m_stats(&self) -> Result<TierStats>;
+
+    /// 1h 层行数与最旧 / 最新时间戳。
+    fn samples_1h_stats(&self) -> Result<TierStats>;
+
+    /// 取 raw 区间内按 `(ts, rowid)` 升序的第 `offset` 条时间戳（分块用）。
+    fn raw_ts_at_offset(&self, from_ts: i64, to_ts: i64, offset: usize) -> Result<Option<i64>>;
+
+    /// 取 1m 区间内按 `(bucket_ts, rowid)` 升序的第 `offset` 条时间戳。
+    fn samples_1m_ts_at_offset(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        offset: usize,
+    ) -> Result<Option<i64>>;
+
+    /// 读取 raw 最大 `rowid` 与新区间内最旧 `ts`（迟到检测）。
+    fn raw_new_rows(&self, after_rowid: Option<i64>) -> Result<(Option<i64>, Option<i64>)>;
+
+    /// 1m 层最旧桶时间；`None` 表示该层没有数据。
+    fn samples_1m_oldest_ts(&self) -> Result<Option<i64>>;
+
+    /// 分批删除 raw 中 `ts < cutoff` 的行。
+    fn prune_samples_before(&self, cutoff: i64) -> Result<PruneResult>;
+
+    /// 分批删除 1m 中 `bucket_ts < cutoff` 的行。
+    fn prune_samples_1m_before(&self, cutoff: i64) -> Result<PruneResult>;
+
+    /// 分批删除 1h 中 `bucket_ts < cutoff` 的行。
+    fn prune_samples_1h_before(&self, cutoff: i64) -> Result<PruneResult>;
+
+    /// CAS 认领 raw `rowid` 水位；rowid 与代际都匹配才写入。
+    fn claim_raw_rowid_if_unchanged(
+        &self,
+        expected_rowid: Option<i64>,
+        expected_generation: i64,
+        new_max: i64,
+    ) -> Result<bool>;
+
+    // ---- M4-C 归档对象与归档水位（schema v7） ----
+
+    /// 插入归档对象，返回自增 id；`object_key` 重复返回 `ObjectExists`。
+    fn insert_archive_object(&self, object: &ArchiveObject) -> Result<i64>;
+
+    /// 按 id 读取归档对象；不存在返回 `None`。
+    fn get_archive_object(&self, id: i64) -> Result<Option<ArchiveObject>>;
+
+    /// 按 `object_key` 读取归档对象；不存在返回 `None`。
+    fn find_archive_object_by_key(&self, object_key: &str) -> Result<Option<ArchiveObject>>;
+
+    /// 按 id 倒序分页列出归档对象；`before_id` 为排他游标。
+    fn list_archive_objects(
+        &self,
+        limit: usize,
+        before_id: Option<i64>,
+    ) -> Result<Vec<ArchiveObject>>;
+
+    /// 更新归档对象状态，并校验合法的状态迁移。
+    fn update_archive_object_status(
+        &self,
+        id: i64,
+        status: ArchiveStatus,
+        error: &str,
+        uploaded_at: Option<i64>,
+        deleted_at: Option<i64>,
+    ) -> Result<()>;
+
+    /// 读取归档水位；键不存在返回 `None`。
+    fn get_archive_state(&self, key: &str) -> Result<Option<String>>;
+
+    /// 写入 / 更新归档水位（UPSERT）。
+    fn set_archive_state(&self, key: &str, value: &str, updated_at: i64) -> Result<()>;
+
+    /// 列出与 `[from_ts, to_ts]` 有交集的归档对象，按 `from_ts, id` 升序。
+    fn list_archive_objects_in_range(&self, from_ts: i64, to_ts: i64)
+        -> Result<Vec<ArchiveObject>>;
+
+    /// 按 `rowid` 升序分批扫描 raw；`after_rowid` 为排他游标。
+    fn scan_archive_rows(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        after_rowid: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ArchiveRawRow>>;
+
+    /// 归档对象总数。
+    fn count_archive_objects(&self) -> Result<i64>;
+}
+
+/// 存储句柄：Phase D 的多后端边界。
+///
+/// 内部是 `Arc<dyn Storage>`，`Clone` 只增加引用计数，不复制底层连接。
+/// 当前只能构造 SQLite；PostgreSQL 在 D3 实现 `Storage` 后从同一入口接入，
+/// hub 侧届时只需换构造函数，调用点仍通过 [`Deref`] 直接使用 trait 方法。
+#[derive(Clone)]
+pub struct StorageHandle {
+    inner: Arc<dyn Storage>,
+}
+
+impl StorageHandle {
+    /// 打开 SQLite 文件库；只读连接池大小会自动夹到 1–16。
+    pub fn sqlite(path: &Path, read_pool_size: usize) -> Result<Self> {
+        Ok(Self::from_sqlite(SqliteStorage::open_with_readers(
+            path,
+            read_pool_size,
+        )?))
+    }
+
+    /// 打开 SQLite 文件库，并声明 `data_dir` 为本程序专用数据目录（KI-21）。
+    ///
+    /// 与 [`StorageHandle::sqlite`] 的区别见
+    /// [`SqliteStorage::open_with_private_data_dir`]：会额外收紧数据目录权限。
+    pub fn sqlite_with_private_data_dir(
+        path: &Path,
+        read_pool_size: usize,
+        data_dir: &Path,
+    ) -> Result<Self> {
+        Ok(Self::from_sqlite(
+            SqliteStorage::open_with_private_data_dir(path, read_pool_size, data_dir)?,
+        ))
+    }
+
+    /// 打开内存 SQLite（共享缓存），供测试与只读 CLI 使用。
+    pub fn sqlite_memory() -> Result<Self> {
+        Ok(Self::from_sqlite(SqliteStorage::open_in_memory()?))
+    }
+
+    /// 以 `&dyn Storage` 借用底层存储。
+    pub fn as_storage(&self) -> &dyn Storage {
+        self.inner.as_ref()
+    }
+
+    fn from_sqlite(storage: SqliteStorage) -> Self {
+        Self {
+            inner: Arc::new(storage),
+        }
+    }
+}
+
+impl Deref for StorageHandle {
+    type Target = dyn Storage;
+
+    fn deref(&self) -> &Self::Target {
+        // 直接借用 Arc 里的 trait object：`Target` 默认 `'static`，
+        // 不能走 `as_storage()`（其返回的 object lifetime 绑定在 `&self` 上）。
+        &*self.inner
+    }
+}
+
+// 编译期证明句柄可跨线程共享：`Storage: Send + Sync` 保证 `Arc<dyn Storage>`
+// 同时满足 `Send + Sync`，hub 不需要任何 `unsafe impl`。
+#[allow(dead_code)]
+fn _assert_storage_handle_is_send_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<StorageHandle>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `StorageHandle` 通过 `Deref` 直接暴露 trait object；`Clone` 只共享
+    /// 同一个 `Arc`，不会复制底层连接。
+    #[test]
+    fn storage_handle_exposes_dyn_storage_and_clones_the_arc() {
+        let handle = StorageHandle::sqlite_memory().expect("打开内存库失败");
+        assert!(handle.list_agents().unwrap().is_empty());
+
+        let cloned = handle.clone();
+        assert_eq!(
+            Arc::strong_count(&handle.inner),
+            2,
+            "Clone 应共享同一个 Arc，而不是复制底层存储"
+        );
+        let via_trait: &dyn Storage = cloned.as_storage();
+        assert_eq!(via_trait.sample_count("missing").unwrap(), 0);
+    }
 }

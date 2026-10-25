@@ -16,9 +16,7 @@ use anyhow::Result;
 use rustboard_common::config::HubConfig;
 use serde::Serialize;
 
-use crate::storage::sqlite::{
-    SqliteStorage, DOWNSAMPLE_MAX_CHUNK_ROWS, STATE_RAW_PRUNE_GENERATION,
-};
+use crate::storage::sqlite::{DOWNSAMPLE_MAX_CHUNK_ROWS, STATE_RAW_PRUNE_GENERATION};
 use crate::storage::{Storage, TierStats, BUCKET_1H_MS, BUCKET_1M_MS};
 
 /// `maintenance_state` 键：1m 层已完整聚合到（不含）该时间戳。
@@ -141,7 +139,7 @@ fn bucket_floor(ts: i64, bucket_ms: i64) -> i64 {
 /// - key 不存在或值为空串 → `None`（空串供 hub 清除 `last_error` 使用，也把
 ///   被清空的水位当作「缺失」处理，宁可重做也不误删）；
 /// - 非法值 → `Err`，明确点名字段，不静默跳过损坏的进度。
-fn read_state_i64(db: &SqliteStorage, key: &str) -> Result<Option<i64>> {
+fn read_state_i64(db: &dyn Storage, key: &str) -> Result<Option<i64>> {
     let Some(raw) = db.get_maintenance_state(key)? else {
         return Ok(None);
     };
@@ -156,7 +154,7 @@ fn read_state_i64(db: &SqliteStorage, key: &str) -> Result<Option<i64>> {
 }
 
 /// 持久化水位（十进制字符串）。
-fn write_watermark(db: &SqliteStorage, key: &str, watermark: i64, now: i64) -> Result<()> {
+fn write_watermark(db: &dyn Storage, key: &str, watermark: i64, now: i64) -> Result<()> {
     db.set_maintenance_state(key, &watermark.to_string(), now)
 }
 
@@ -164,7 +162,7 @@ fn write_watermark(db: &SqliteStorage, key: &str, watermark: i64, now: i64) -> R
 ///
 /// 桶不可拆分（拆开会让 avg/count 只统计到一部分行），所以若第一个桶本身
 /// 就超过行数上限，则整桶处理。返回值为分钟桶边界。
-fn raw_chunk_end(db: &SqliteStorage, from_ts: i64, max_end: i64) -> Result<i64> {
+fn raw_chunk_end(db: &dyn Storage, from_ts: i64, max_end: i64) -> Result<i64> {
     let Some(ts) = db.raw_ts_at_offset(from_ts, max_end, DOWNSAMPLE_MAX_CHUNK_ROWS)? else {
         return Ok(max_end);
     };
@@ -176,7 +174,7 @@ fn raw_chunk_end(db: &SqliteStorage, from_ts: i64, max_end: i64) -> Result<i64> 
 }
 
 /// 计算一段 1m 的分块结束点：单事务最多约 [`DOWNSAMPLE_MAX_CHUNK_ROWS`] 行。
-fn minute_chunk_end(db: &SqliteStorage, from_ts: i64, max_end: i64) -> Result<i64> {
+fn minute_chunk_end(db: &dyn Storage, from_ts: i64, max_end: i64) -> Result<i64> {
     let Some(ts) = db.samples_1m_ts_at_offset(from_ts, max_end, DOWNSAMPLE_MAX_CHUNK_ROWS)? else {
         return Ok(max_end);
     };
@@ -193,7 +191,7 @@ fn minute_chunk_end(db: &SqliteStorage, from_ts: i64, max_end: i64) -> Result<i6
 /// 2. 让 1h 重新聚合受影响的整点小时。
 ///
 /// 必须先于 1m 水位回拨落库：即使随后崩溃，下一轮仍能从回拨后的 1h 水位重算。
-fn rewind_hour_watermark(db: &SqliteStorage, rewind_1m: i64, now: i64) -> Result<()> {
+fn rewind_hour_watermark(db: &dyn Storage, rewind_1m: i64, now: i64) -> Result<()> {
     let Some(current) = read_state_i64(db, STATE_DOWNSAMPLE_1H_WATERMARK)? else {
         // 1h 还没有水位：它本来就会从最旧 1m 桶重新聚合，无需额外回拨。
         return Ok(());
@@ -206,7 +204,7 @@ fn rewind_hour_watermark(db: &SqliteStorage, rewind_1m: i64, now: i64) -> Result
 }
 
 /// 重算一段 1m 区间，按桶/行数分块，避免高基数下把整段塞进一个长事务。
-fn recompute_1m_range(db: &SqliteStorage, from_ts: i64, to_ts: i64) -> Result<(usize, usize)> {
+fn recompute_1m_range(db: &dyn Storage, from_ts: i64, to_ts: i64) -> Result<(usize, usize)> {
     let mut buckets = 0usize;
     let mut rows = 0usize;
     let mut cursor = from_ts;
@@ -224,7 +222,7 @@ fn recompute_1m_range(db: &SqliteStorage, from_ts: i64, to_ts: i64) -> Result<(u
 }
 
 /// 重算一段 1h 区间，按桶/行数分块。
-fn recompute_1h_range(db: &SqliteStorage, from_ts: i64, to_ts: i64) -> Result<(usize, usize)> {
+fn recompute_1h_range(db: &dyn Storage, from_ts: i64, to_ts: i64) -> Result<(usize, usize)> {
     let mut buckets = 0usize;
     let mut rows = 0usize;
     let mut cursor = from_ts;
@@ -248,7 +246,7 @@ fn recompute_1h_range(db: &SqliteStorage, from_ts: i64, to_ts: i64) -> Result<(u
 /// 桶，重新聚合到 `closed_end`。回拨后的水位同时是 raw 保留期的删除门禁，
 /// 因此重算完成前不会删掉迟到数据。
 fn run_one_minute_tier(
-    db: &SqliteStorage,
+    db: &dyn Storage,
     now: i64,
     max_backfill_chunks: Option<u32>,
 ) -> Result<DownsampleTierReport> {
@@ -361,7 +359,7 @@ fn run_one_minute_tier(
 /// 1m 因迟到重放回拨时，`rewind_hour_watermark` 会同步回拨 1h 水位，本函数
 /// 从回拨处重新聚合受影响的整点小时。
 fn run_one_hour_tier(
-    db: &SqliteStorage,
+    db: &dyn Storage,
     now: i64,
     max_backfill_chunks: Option<u32>,
 ) -> Result<DownsampleTierReport> {
@@ -438,7 +436,7 @@ fn run_one_hour_tier(
 /// 无 raw 数据时不写水位；失败返回 `Err`（不 panic），由调用方记录 WARN 与
 /// `maintenance_state.last_error`，下一轮重试。
 pub fn run_downsample(
-    db: &SqliteStorage,
+    db: &dyn Storage,
     now: i64,
     max_backfill_hours: Option<u32>,
 ) -> Result<DownsampleReport> {
@@ -462,7 +460,7 @@ fn layer_cutoff(days: u32, now: i64) -> Option<i64> {
 
 /// raw 层保留：同时受 1m 降采样水位与归档门禁。
 fn retention_raw(
-    db: &SqliteStorage,
+    db: &dyn Storage,
     days: u32,
     now: i64,
     watermark_1m: Option<i64>,
@@ -509,7 +507,7 @@ fn retention_raw(
 
 /// 1m 层保留：受 1h 降采样水位门禁。
 fn retention_minute(
-    db: &SqliteStorage,
+    db: &dyn Storage,
     days: u32,
     now: i64,
     watermark_1h: Option<i64>,
@@ -537,7 +535,7 @@ fn retention_minute(
 }
 
 /// 1h 层保留：最老的一层，没有更上层水位门禁。
-fn retention_hour(db: &SqliteStorage, days: u32, now: i64) -> Result<RetentionLayerReport> {
+fn retention_hour(db: &dyn Storage, days: u32, now: i64) -> Result<RetentionLayerReport> {
     let mut report = RetentionLayerReport {
         retention_days: days,
         ..RetentionLayerReport::default()
@@ -560,7 +558,7 @@ fn retention_hour(db: &SqliteStorage, days: u32, now: i64) -> Result<RetentionLa
 /// 后者会阻止 raw 删除并标记 `blocked_by_archive`。任何一层删除失败都返回
 /// `Err`，已提交的批次保持幂等，下一轮继续。
 pub fn run_retention(
-    db: &SqliteStorage,
+    db: &dyn Storage,
     cfg: &HubConfig,
     now: i64,
     archive_gate: ArchiveGate,
@@ -584,7 +582,7 @@ pub fn run_retention(
 }
 
 /// 读取当前维护状态（各层行数 / 时间范围 / 水位 / 最近错误）。
-pub fn maintenance_status(db: &SqliteStorage) -> Result<MaintenanceStatus> {
+pub fn maintenance_status(db: &dyn Storage) -> Result<MaintenanceStatus> {
     let last_error = db
         .get_maintenance_state(STATE_LAST_ERROR)?
         .filter(|value| !value.trim().is_empty());
@@ -603,7 +601,7 @@ pub fn maintenance_status(db: &SqliteStorage) -> Result<MaintenanceStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::sqlite::AggregateRowForTest;
+    use crate::storage::sqlite::{AggregateRowForTest, SqliteStorage};
     use crate::storage::Storage;
     use rustboard_common::model::{Sample, SampleBatch};
     use std::sync::atomic::{AtomicU64, Ordering};
