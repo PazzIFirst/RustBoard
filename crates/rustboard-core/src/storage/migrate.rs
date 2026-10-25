@@ -860,11 +860,12 @@ fn import_all_inner(
         });
     }
 
-    // 显式 id 不会推进序列；导入后统一 setval，避免后续写入撞主键。
-    reset_sequences(tx)?;
-
-    // 最后一道门：行数/范围/哈希数量/水位全部一致才允许提交。
+    // 先做数据校验，再推进序列：setval 不属于事务（PostgreSQL 序列不随
+    // ROLLBACK 回退），放在校验失败路径之前会留下无意义的序列副作用。
     let api_token_hashes = verify_migration(tx, source)?;
+
+    // 显式 id 不会推进序列；数据确认无误后统一 setval，避免后续写入撞主键。
+    reset_sequences(tx)?;
 
     Ok(build_report(
         sqlite_schema_version,
