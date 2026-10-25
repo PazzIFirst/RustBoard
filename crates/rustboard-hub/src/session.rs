@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 
 use crate::control::{ControlCommand, CONTROL_COMMAND_BUFFER};
 
@@ -49,8 +49,15 @@ pub struct SessionRegistry {
 /// 连接清空后 slot 仍保留在全局 map 里（agent 数量有界）：删除 slot 会引入
 /// 「刚删完又被 register 创建」的 ABA 竞态，而保留空 slot 没有这个问题。
 /// 所有查询都按「空 slot 等于不在线」处理。
-struct AgentSlot {
+pub(crate) struct AgentSlot {
     state: Mutex<SlotState>,
+    /// 串行化 `register` 与 blocking 线程上的会话清理。
+    ///
+    /// 旧实现让 cleanup 在 slot 锁内做 PG `is_revoked + set_status`；重连风暴时
+    /// 新会话的 async `register` 会同步抢 slot 锁，把 tokio worker 卡在数据库
+    /// 往返上。这把异步 gate 让 register 只 await（不阻塞 worker），cleanup 在
+    /// blocking 线程上 `blocking_lock` 后再进入 slot 锁做原有的短临界区写入。
+    cleanup_gate: AsyncMutex<()>,
 }
 
 /// slot 锁保护的状态：该 agent 当前的全部连接。
@@ -111,11 +118,22 @@ impl AgentSlot {
             state: Mutex::new(SlotState {
                 connections: HashMap::new(),
             }),
+            cleanup_gate: AsyncMutex::new(()),
         }
     }
 
     fn lock(&self) -> MutexGuard<'_, SlotState> {
         lock(&self.state)
+    }
+
+    /// async register 侧等待清理结束；只 await gate，不在 worker 上做 DB。
+    pub(crate) async fn acquire_cleanup_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.cleanup_gate.lock().await
+    }
+
+    /// blocking 清理侧取得同一把 gate；只能在 blocking 线程 / 非 async 上下文调用。
+    pub(crate) fn acquire_cleanup_gate_blocking(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.cleanup_gate.blocking_lock()
     }
 }
 
@@ -144,6 +162,11 @@ impl SessionRegistry {
         self.lock_map().get(agent_id).cloned()
     }
 
+    /// 供 blocking 清理路径取得 per-agent gate；slot 不存在时返回 `None`。
+    pub(crate) fn cleanup_slot(&self, agent_id: &str) -> Option<Arc<AgentSlot>> {
+        self.agent_slot(agent_id)
+    }
+
     /// 取 agent 的 slot，不存在则创建。返回时全局 map 锁已释放。
     fn agent_slot_or_create(&self, agent_id: &str) -> Arc<AgentSlot> {
         let mut inner = self.lock_map();
@@ -155,10 +178,11 @@ impl SessionRegistry {
 
     /// 注册一条新连接，返回连接编号与取消信号接收端。
     ///
-    /// 锁顺序：先取 slot（释放全局 map 锁），再锁 slot 插入连接。若旧连接的清理
-    /// 回调正持有同一把 slot 锁写 offline/revoked，这里会等它结束才插入；调用方
-    /// 随后写 online，因此新 online 一定晚于旧 offline。
-    pub fn register(&self, agent_id: &str) -> SessionHandle {
+    /// 锁顺序：先取 slot（释放全局 map 锁）→ await per-agent cleanup gate →
+    /// 短暂持有 slot 锁插入连接。旧连接的清理在 blocking 线程持有 gate 并写
+    /// offline/revoked；本函数只 await gate（不阻塞 tokio worker），等清理结束
+    /// 才插入新连接。调用方随后写 online，因此新 online 一定晚于旧 offline。
+    pub async fn register(&self, agent_id: &str) -> SessionHandle {
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         // 初始值不会触发 `changed()`；真正的关闭原因只由 shutdown/reconfigure 写入。
         let (shutdown, receiver) = watch::channel(ShutdownReason::Revoke);
@@ -167,6 +191,7 @@ impl SessionRegistry {
         let (control, control_rx) = mpsc::channel(CONTROL_COMMAND_BUFFER);
 
         let slot = self.agent_slot_or_create(agent_id);
+        let _gate = slot.acquire_cleanup_gate().await;
         let active = {
             let mut state = slot.lock();
             state.connections.insert(
@@ -186,6 +211,19 @@ impl SessionRegistry {
             shutdown: receiver,
             control_rx,
         }
+    }
+
+    /// 测试用同步入口：内部建 current-thread runtime 执行 [`Self::register`]。
+    ///
+    /// 仅在 `#[cfg(test)]` 且当前测试没有 tokio runtime 时使用；已有 runtime 的
+    /// 异步测试应直接 `register(...).await`，避免嵌套 runtime。
+    #[cfg(test)]
+    pub(crate) fn register_blocking(&self, agent_id: &str) -> SessionHandle {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("测试 runtime 初始化失败")
+            .block_on(self.register(agent_id))
     }
 
     /// 取该 agent **最新一条连接**的控制命令发送端。
@@ -312,6 +350,9 @@ impl SessionRegistry {
     /// 两个回调都在 slot 锁内运行，必须是短临界区且**不得再调用本注册表**
     /// （会反向获取同一把锁而死锁）。`on_latest_removed` 的写库失败由调用方
     /// best-effort 处理，不影响连接清理本身。
+    ///
+    /// 生产清理路径由 [`SessionRegistry::cleanup_slot`] 先取得并持有 per-agent
+    /// cleanup gate；本方法只保证 slot 锁内的原子性，不负责串行化 `register`。
     pub fn unregister_with_fallback<F, G>(
         &self,
         agent_id: &str,
@@ -438,8 +479,8 @@ mod tests {
     #[test]
     fn only_last_connection_marks_agent_offline() {
         let registry = SessionRegistry::new();
-        let first = registry.register("a");
-        let second = registry.register("a");
+        let first = registry.register_blocking("a");
+        let second = registry.register_blocking("a");
         assert_ne!(first.conn_id, second.conn_id);
         // 旧连接先断开：还有新连接，不能置 offline。
         assert!(!registry.unregister("a", first.conn_id));
@@ -455,8 +496,8 @@ mod tests {
     #[test]
     fn unregister_last_and_run_only_fires_for_last_connection() {
         let registry = SessionRegistry::new();
-        let first = registry.register("a");
-        let second = registry.register("a");
+        let first = registry.register_blocking("a");
+        let second = registry.register_blocking("a");
         let calls = Arc::new(AtomicUsize::new(0));
 
         let first_calls = calls.clone();
@@ -501,7 +542,7 @@ mod tests {
     #[test]
     fn cleanup_callback_blocks_register_until_it_returns() {
         let registry = SessionRegistry::new();
-        let old = registry.register("a");
+        let old = registry.register_blocking("a");
         let old_id = old.conn_id;
 
         let (entered_tx, entered_rx) = mpsc::channel();
@@ -511,6 +552,9 @@ mod tests {
         let cleanup_registry = registry.clone();
         let cleanup_finished = callback_finished.clone();
         let cleanup_thread = std::thread::spawn(move || {
+            // 生产清理会先拿 per-agent cleanup gate；这里复现同一顺序。
+            let slot = cleanup_registry.cleanup_slot("a").expect("slot 必须存在");
+            let _gate = slot.acquire_cleanup_gate_blocking();
             cleanup_registry.unregister_last_and_run("a", old_id, || {
                 entered_tx.send(()).expect("测试线程必须存活");
                 release_rx.recv().expect("等待测试线程释放临界区");
@@ -528,7 +572,7 @@ mod tests {
         let register_observed = callback_finished.clone();
         let register_thread = std::thread::spawn(move || {
             started_tx.send(()).expect("测试线程必须存活");
-            let handle = register_registry.register("a");
+            let handle = register_registry.register_blocking("a");
             registered_tx
                 .send((handle.conn_id, register_observed.load(Ordering::SeqCst)))
                 .expect("测试线程必须存活");
@@ -563,7 +607,7 @@ mod tests {
     #[test]
     fn cleanup_callback_on_one_agent_does_not_block_another() {
         let registry = SessionRegistry::new();
-        let old = registry.register("slow");
+        let old = registry.register_blocking("slow");
         let old_id = old.conn_id;
 
         let (entered_tx, entered_rx) = mpsc::channel();
@@ -582,7 +626,7 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         let register_registry = registry.clone();
         let register_thread = std::thread::spawn(move || {
-            let handle = register_registry.register("fast");
+            let handle = register_registry.register_blocking("fast");
             done_tx.send(handle.conn_id).expect("测试线程必须存活");
         });
         let fast_id = done_rx
@@ -602,7 +646,7 @@ mod tests {
     #[test]
     fn empty_slot_is_hidden_and_reusable() {
         let registry = SessionRegistry::new();
-        let first = registry.register("a");
+        let first = registry.register_blocking("a");
         assert!(registry.unregister("a", first.conn_id));
 
         assert!(!registry.has_active("a"));
@@ -611,7 +655,7 @@ mod tests {
         assert!(!registry.shutdown("a"));
         assert!(!registry.reconfigure("a"));
 
-        let second = registry.register("a");
+        let second = registry.register_blocking("a");
         assert!(second.conn_id > first.conn_id, "conn_id 必须继续递增");
         assert!(registry.has_active("a"));
         assert_eq!(registry.active_agents(), vec!["a".to_string()]);
@@ -622,8 +666,8 @@ mod tests {
     #[test]
     fn shutdown_targets_every_connection_of_agent() {
         let registry = SessionRegistry::new();
-        let first = registry.register("a");
-        let second = registry.register("a");
+        let first = registry.register_blocking("a");
+        let second = registry.register_blocking("a");
         assert!(registry.shutdown("a"));
         assert_eq!(*first.shutdown.borrow(), ShutdownReason::Revoke);
         assert_eq!(*second.shutdown.borrow(), ShutdownReason::Revoke);
@@ -633,8 +677,8 @@ mod tests {
     #[test]
     fn shutdown_all_covers_every_listed_agent() {
         let registry = SessionRegistry::new();
-        let a = registry.register("a");
-        let b = registry.register("b");
+        let a = registry.register_blocking("a");
+        let b = registry.register_blocking("b");
         registry.shutdown_all(&["a".to_string(), "b".to_string(), "c".to_string()]);
         assert_eq!(*a.shutdown.borrow(), ShutdownReason::Revoke);
         assert_eq!(*b.shutdown.borrow(), ShutdownReason::Revoke);
@@ -644,8 +688,8 @@ mod tests {
     #[test]
     fn shutdown_does_not_signal_other_agents() {
         let registry = SessionRegistry::new();
-        let a = registry.register("a");
-        let b = registry.register("b");
+        let a = registry.register_blocking("a");
+        let b = registry.register_blocking("b");
 
         assert!(registry.shutdown("a"));
         assert_eq!(*a.shutdown.borrow(), ShutdownReason::Revoke);
@@ -657,10 +701,10 @@ mod tests {
     #[test]
     fn stale_conn_id_does_not_remove_replacement_connection() {
         let registry = SessionRegistry::new();
-        let old = registry.register("a");
+        let old = registry.register_blocking("a");
         assert!(registry.unregister("a", old.conn_id));
 
-        let new = registry.register("a");
+        let new = registry.register_blocking("a");
         assert_ne!(old.conn_id, new.conn_id);
         assert!(!registry.unregister("a", old.conn_id));
         assert!(registry.has_active("a"));
@@ -670,11 +714,41 @@ mod tests {
         assert_eq!(*new.shutdown.borrow(), ShutdownReason::Revoke);
     }
 
+    /// cleanup gate 被持有时，register 只 await、不占 tokio worker；释放后正常插入。
+    ///
+    /// current-thread runtime 上若 register 同步抢 slot 锁/阻塞 worker，下面的
+    /// `timeout` 无法按时返回；这里同时验证 release 后连接号递增。
+    #[tokio::test]
+    async fn register_awaits_cleanup_gate_without_blocking_runtime() {
+        let registry = SessionRegistry::new();
+        let old = registry.register("a").await;
+        let slot = registry.cleanup_slot("a").expect("slot 必须存在");
+        let gate = slot.acquire_cleanup_gate().await;
+
+        let register_registry = registry.clone();
+        let mut register = tokio::spawn(async move { register_registry.register("a").await });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut register)
+                .await
+                .is_err(),
+            "cleanup gate 持有期间 register 不得完成"
+        );
+
+        drop(gate);
+        let handle = tokio::time::timeout(Duration::from_secs(1), register)
+            .await
+            .expect("释放 gate 后 register 必须完成")
+            .expect("register 任务不得 panic");
+        assert!(handle.conn_id > old.conn_id);
+        assert!(registry.has_active("a"));
+    }
+
     /// 会话循环用 `watch::Receiver::changed()` 等待吊销；这里验证信号真的能唤醒它。
     #[tokio::test]
     async fn shutdown_wakes_handle_waiting_for_signal() {
         let registry = SessionRegistry::new();
-        let mut handle = registry.register("a");
+        let mut handle = registry.register("a").await;
         let waiter = tokio::spawn(async move {
             handle.shutdown.changed().await.ok();
             *handle.shutdown.borrow()
@@ -693,8 +767,8 @@ mod tests {
     #[test]
     fn control_sender_prefers_latest_connection() {
         let registry = SessionRegistry::new();
-        let mut old = registry.register("a");
-        let mut new = registry.register("a");
+        let mut old = registry.register_blocking("a");
+        let mut new = registry.register_blocking("a");
 
         // 先投一条：只有新连接能收到。
         let sender = registry
@@ -726,7 +800,7 @@ mod tests {
     #[test]
     fn closed_control_channel_is_reported_as_offline() {
         let registry = SessionRegistry::new();
-        let handle = registry.register("a");
+        let handle = registry.register_blocking("a");
         let sender = registry.control_sender("a").expect("应取得发送端");
         drop(handle.control_rx);
         let (reply, _reply_rx) = tokio::sync::oneshot::channel();
@@ -745,9 +819,9 @@ mod tests {
     #[test]
     fn reconfigure_signals_every_connection_with_reconfigure() {
         let registry = SessionRegistry::new();
-        let first = registry.register("a");
-        let second = registry.register("a");
-        let other = registry.register("b");
+        let first = registry.register_blocking("a");
+        let second = registry.register_blocking("a");
+        let other = registry.register_blocking("b");
 
         assert!(registry.reconfigure("a"));
         assert_eq!(*first.shutdown.borrow(), ShutdownReason::Reconfigure);
@@ -781,7 +855,7 @@ mod tests {
         let persisted = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
 
         // 旧连接登记时仍是最新连接：正常写库。
-        let old = registry.register("a");
+        let old = registry.register_blocking("a");
         let record = persisted.clone();
         assert!(
             registry
@@ -799,7 +873,7 @@ mod tests {
         assert!(registry.is_latest("a", old.conn_id));
 
         // 新连接登记后成为最新连接，写库成功。
-        let new = registry.register("a");
+        let new = registry.register_blocking("a");
         let record = persisted.clone();
         assert!(
             registry
@@ -856,13 +930,13 @@ mod tests {
     fn latest_disconnect_falls_back_to_remaining_capabilities() {
         let registry = SessionRegistry::new();
 
-        let old = registry.register("a");
+        let old = registry.register_blocking("a");
         let old_sender = registry.control_sender("a").expect("旧连接在线");
         assert!(registry
             .set_capabilities("a", old.conn_id, caps(&["docker"]), |_| Ok(()))
             .expect("登记旧连接能力"));
 
-        let new = registry.register("a");
+        let new = registry.register_blocking("a");
         assert!(registry
             .set_capabilities("a", new.conn_id, caps(&["systemd"]), |_| Ok(()))
             .expect("登记新连接能力"));
@@ -913,7 +987,7 @@ mod tests {
         let registry = SessionRegistry::new();
         let persisted = Arc::new(AtomicUsize::new(0));
 
-        let old = registry.register("a");
+        let old = registry.register_blocking("a");
         let count = persisted.clone();
         assert!(registry
             .set_capabilities("a", old.conn_id, caps(&["docker"]), move |_| {
@@ -924,7 +998,7 @@ mod tests {
         assert_eq!(persisted.load(Ordering::SeqCst), 1);
 
         // 新连接已注册但还没 Hello：latest_capabilities 必须是 None，不能冒充空能力。
-        let new = registry.register("a");
+        let new = registry.register_blocking("a");
         assert_eq!(registry.latest_capabilities("a"), None);
 
         // 旧连接（曾经的最新连接）断开：不是最新连接，不做能力回退。
@@ -957,11 +1031,11 @@ mod tests {
         assert_eq!(persisted.load(Ordering::SeqCst), 1);
 
         // 反过来：最新连接尚未 Hello 就断开，旧连接有能力时必须回退，而不是写空。
-        let old = registry.register("b");
+        let old = registry.register_blocking("b");
         assert!(registry
             .set_capabilities("b", old.conn_id, caps(&["docker"]), |_| Ok(()))
             .expect("登记旧连接能力"));
-        let unregistered = registry.register("b");
+        let unregistered = registry.register_blocking("b");
         let fallback = Arc::new(Mutex::new(None::<Vec<String>>));
         let captured = fallback.clone();
         let outcome = registry.unregister_with_fallback(
@@ -984,8 +1058,8 @@ mod tests {
     #[test]
     fn latest_disconnect_without_registered_fallback_keeps_history() {
         let registry = SessionRegistry::new();
-        let old = registry.register("a");
-        let latest = registry.register("a");
+        let old = registry.register_blocking("a");
+        let latest = registry.register_blocking("a");
 
         let outcome = registry.unregister_with_fallback(
             "a",
@@ -1004,7 +1078,7 @@ mod tests {
     #[test]
     fn set_capabilities_propagates_persist_error() {
         let registry = SessionRegistry::new();
-        let handle = registry.register("a");
+        let handle = registry.register_blocking("a");
         let result = registry.set_capabilities("a", handle.conn_id, caps(&["docker"]), |_| {
             anyhow::bail!("模拟写库失败")
         });

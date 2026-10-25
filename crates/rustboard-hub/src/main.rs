@@ -4953,11 +4953,10 @@ async fn handle_session(mut socket: WebSocket, state: AppState, hello: AgentHell
 
     // 从这里开始，所有退出路径（正常关闭 / recv 错误 / send 错误 / 心跳超时 /
     // 入库错误 / 任务失败）都由 `cleanup` 统一执行状态清理。
-    // `register` 对同一 agent 会等旧连接的清理回调（写 offline/revoked）结束才插入
-    // 新连接，因此下面的 `upsert_agent(online)` 一定晚于旧 offline 落库。
-    // register 只操作内存注册表，不直接触达数据库；旧连接的 PG 清理在 blocking
-    // 线程执行，这里最多等待一次写入完成，不会在 worker 上跑同步 PG。
-    let handle = state.sessions.register(&agent_id);
+    // `register` 先 await per-agent cleanup gate：旧连接的清理（PG is_revoked +
+    // set_status）在 blocking 线程上执行，worker 只 await、不抢 slot 锁；清理结束
+    // 后才插入新连接，因此下面的 `upsert_agent(online)` 一定晚于旧 offline 落库。
+    let handle = state.sessions.register(&agent_id).await;
     let mut cleanup = SessionCleanup::new(
         state.storage.clone(),
         state.sessions.clone(),
@@ -5760,12 +5759,22 @@ impl SessionCleanup {
 /// 调用 `has_active` 二次检查（slot 已空且锁仍未释放，新连接插不进来）。
 ///
 /// 两个回调都只做单行数据库写入；失败处理与日志全部移到 slot 锁外。
+///
+/// 进入 slot 锁前先拿 per-agent cleanup gate：`register` 在 async 侧 await 同一
+/// 把 gate，因此清理的 PG 写入与「新连接注册 + 写 online」严格串行，而 tokio
+/// worker 不会阻塞在 slot 的 std Mutex 上。本函数必须在 blocking 线程或非 async
+/// 上下文执行（`blocking_lock`）。
 fn finish_session_cleanup(
     storage: Arc<StorageHandle>,
     sessions: Arc<SessionRegistry>,
     agent_id: String,
     conn_id: u64,
 ) {
+    // gate 的 guard 借用 slot；先保留 Arc 再取 guard，drop 顺序为 guard -> Arc。
+    let cleanup_slot = sessions.cleanup_slot(&agent_id);
+    let _gate = cleanup_slot
+        .as_ref()
+        .map(|slot| slot.acquire_cleanup_gate_blocking());
     let revoked_agent_id = agent_id.clone();
     let fallback_agent_id = agent_id.clone();
     let fallback_storage = storage.clone();
@@ -8213,7 +8222,7 @@ mod tests {
     async fn m2_settings_range_404_and_reconfigure() {
         let state = hub_state("token");
         state.storage.upsert_agent(&test_agent("agent-1")).unwrap();
-        let session = state.sessions.register("agent-1");
+        let session = state.sessions.register("agent-1").await;
         let router = admin_router(state.clone());
 
         let (status, _, body) = admin_call(
@@ -9063,7 +9072,7 @@ mod tests {
     }
 
     /// 建好 agents 记录 + 能力行并注册一条在线会话，返回的句柄必须活到测试结束。
-    fn m3_register_agent(
+    async fn m3_register_agent(
         state: &AppState,
         agent_id: &str,
         capabilities: &[&str],
@@ -9080,7 +9089,7 @@ mod tests {
                 now_ms(),
             )
             .unwrap();
-        state.sessions.register(agent_id)
+        state.sessions.register(agent_id).await
     }
 
     /// 在会话侧按顺序应答控制命令；返回已应答条数。
@@ -9130,7 +9139,7 @@ mod tests {
     #[tokio::test]
     async fn m3_control_status_reports_capabilities_without_audit() {
         let state = m3_state(m3_control_cfg());
-        let handle = m3_register_agent(&state, "a1", &["systemd", "logs"]);
+        let handle = m3_register_agent(&state, "a1", &["systemd", "logs"]).await;
         // 直接写入未知能力，GET 必须过滤掉（旧 agent / 恶意 Hello 的历史数据）。
         state
             .storage
@@ -9186,7 +9195,7 @@ mod tests {
         let mut cfg = m3_control_cfg();
         cfg.systemd = false;
         let state = m3_state(cfg);
-        let _online = m3_register_agent(&state, "a1", &["systemd"]);
+        let _online = m3_register_agent(&state, "a1", &["systemd"]).await;
         let router = admin_router(state.clone());
 
         let (status, body) =
@@ -9199,7 +9208,7 @@ mod tests {
         let mut cfg = m3_control_cfg();
         cfg.logs = true;
         let state2 = m3_state(cfg);
-        let _online2 = m3_register_agent(&state2, "a2", &["docker"]);
+        let _online2 = m3_register_agent(&state2, "a2", &["docker"]).await;
         let router2 = admin_router(state2.clone());
         let (status, body) = m3_post(
             &router2,
@@ -9225,7 +9234,7 @@ mod tests {
         let mut cfg = m3_control_cfg();
         cfg.enabled = false;
         let state3 = m3_state(cfg);
-        let _online3 = m3_register_agent(&state3, "a4", &["logs"]);
+        let _online3 = m3_register_agent(&state3, "a4", &["logs"]).await;
         let router3 = admin_router(state3.clone());
         let (status, body) =
             m3_post(&router3, "a4", r#"{"capability":"logs","action":"list"}"#).await;
@@ -9245,7 +9254,7 @@ mod tests {
     #[tokio::test]
     async fn m3_control_post_validation_failures_are_audited() {
         let state = m3_state(m3_control_cfg());
-        let _online = m3_register_agent(&state, "a1", &["systemd", "process", "logs"]);
+        let _online = m3_register_agent(&state, "a1", &["systemd", "process", "logs"]).await;
         let router = admin_router(state.clone());
 
         let too_long = "a".repeat(rustboard_common::control::MAX_TARGET_LEN + 1);
@@ -9279,7 +9288,8 @@ mod tests {
     #[tokio::test]
     async fn m3_control_post_success_shapes_and_audit_pagination() {
         let state = m3_state(m3_control_cfg());
-        let handle = m3_register_agent(&state, "a1", &["systemd", "docker", "process", "logs"]);
+        let handle =
+            m3_register_agent(&state, "a1", &["systemd", "docker", "process", "logs"]).await;
         let responder = m3_spawn_responder(
             handle.control_rx,
             vec![
@@ -9458,7 +9468,7 @@ mod tests {
         let mut cfg = m3_control_cfg();
         cfg.request_timeout_ms = 20;
         let state = m3_state(cfg);
-        let handle = m3_register_agent(&state, "a1", &["systemd", "docker"]);
+        let handle = m3_register_agent(&state, "a1", &["systemd", "docker"]).await;
         let responder = m3_spawn_responder(
             handle.control_rx,
             vec![
@@ -9467,7 +9477,7 @@ mod tests {
             ],
         );
         // 另一台在线 agent 故意不应答：覆盖超时分支（保持句柄存活让通道不关闭）。
-        let _silent = m3_register_agent(&state, "a2", &["docker"]);
+        let _silent = m3_register_agent(&state, "a2", &["docker"]).await;
         let router = admin_router(state.clone());
 
         let body = r#"{"capability":"systemd","action":"restart","target":"nginx.service","confirm":true}"#;
@@ -9569,7 +9579,7 @@ mod tests {
         let mut cfg = m3_control_cfg();
         cfg.max_output_bytes = 1024;
         let state = m3_state(cfg);
-        let handle = m3_register_agent(&state, "a1", &["logs"]);
+        let handle = m3_register_agent(&state, "a1", &["logs"]).await;
         let lines: Vec<String> = (0..500).map(|_| "x".repeat(4096)).collect();
         let responder = m3_spawn_responder(
             handle.control_rx,
@@ -9630,7 +9640,7 @@ mod tests {
     async fn m3_control_nonzero_exit_is_audited_as_error() {
         const SECRET: &str = "SECRET-STDERR-MUST-NOT-LEAK";
         let state = m3_state(m3_control_cfg());
-        let handle = m3_register_agent(&state, "a1", &["docker"]);
+        let handle = m3_register_agent(&state, "a1", &["docker"]).await;
         let responder = m3_spawn_responder(
             handle.control_rx,
             vec![Ok(ControlResult::ActionOutput {
@@ -9667,7 +9677,7 @@ mod tests {
     #[tokio::test]
     async fn m3_control_pending_limit_maps_to_429() {
         let state = m3_state(m3_control_cfg());
-        let handle = m3_register_agent(&state, "a1", &["logs"]);
+        let handle = m3_register_agent(&state, "a1", &["logs"]).await;
         let responder = m3_spawn_responder(
             handle.control_rx,
             vec![Err(ControlError::new("too_many_pending", "待处理命令过多"))],
@@ -9749,7 +9759,7 @@ mod tests {
     #[tokio::test]
     async fn m3_control_signaled_command_is_audited_as_error() {
         let state = m3_state(m3_control_cfg());
-        let handle = m3_register_agent(&state, "a1", &["docker"]);
+        let handle = m3_register_agent(&state, "a1", &["docker"]).await;
         let responder = m3_spawn_responder(
             handle.control_rx,
             vec![Ok(ControlResult::ActionOutput {
@@ -9836,7 +9846,7 @@ mod tests {
     fn session_cleanup_marks_offline_after_last_connection() {
         let (dir, storage, sessions) = session_cleanup_fixture("cleanup-offline");
         storage.upsert_agent(&test_agent("a1")).unwrap();
-        let handle = sessions.register("a1");
+        let handle = sessions.register_blocking("a1");
         let mut cleanup = SessionCleanup::new(
             storage.clone(),
             sessions.clone(),
@@ -9850,7 +9860,7 @@ mod tests {
         assert!(sessions.active_agents().is_empty());
 
         // finished 已置位：之后新连接握手写 online，再次 finish 不得覆盖。
-        let _new = sessions.register("a1");
+        let _new = sessions.register_blocking("a1");
         storage.upsert_agent(&test_agent("a1")).unwrap();
         cleanup.finish();
         assert_eq!(
@@ -9867,8 +9877,8 @@ mod tests {
     fn session_cleanup_keeps_online_when_new_connection_exists() {
         let (dir, storage, sessions) = session_cleanup_fixture("cleanup-reconnect");
         storage.upsert_agent(&test_agent("a1")).unwrap();
-        let old = sessions.register("a1");
-        let new = sessions.register("a1");
+        let old = sessions.register_blocking("a1");
+        let new = sessions.register_blocking("a1");
         // 真实 handle_session 顺序：新连接 register 之后 upsert_agent(online)。
         storage.upsert_agent(&test_agent("a1")).unwrap();
 
@@ -9900,7 +9910,7 @@ mod tests {
         let (dir, storage, sessions) = session_cleanup_fixture("cleanup-capabilities");
         storage.upsert_agent(&test_agent("a1")).unwrap();
 
-        let old = sessions.register("a1");
+        let old = sessions.register_blocking("a1");
         assert!(register_connection_capabilities(
             &storage,
             &sessions,
@@ -9913,7 +9923,7 @@ mod tests {
             vec!["docker".to_string()]
         );
 
-        let new = sessions.register("a1");
+        let new = sessions.register_blocking("a1");
         assert!(register_connection_capabilities(
             &storage,
             &sessions,
@@ -9966,7 +9976,7 @@ mod tests {
         let (dir, storage, sessions) = session_cleanup_fixture("cleanup-capabilities-stale");
         storage.upsert_agent(&test_agent("a1")).unwrap();
 
-        let old = sessions.register("a1");
+        let old = sessions.register_blocking("a1");
         assert!(register_connection_capabilities(
             &storage,
             &sessions,
@@ -9975,7 +9985,7 @@ mod tests {
             &["docker"],
         ));
 
-        let new = sessions.register("a1");
+        let new = sessions.register_blocking("a1");
         assert!(register_connection_capabilities(
             &storage,
             &sessions,
@@ -10194,7 +10204,7 @@ mod tests {
     fn session_cleanup_restores_revoked_status() {
         let (dir, storage, sessions) = session_cleanup_fixture("cleanup-revoked");
         storage.upsert_agent(&test_agent("a1")).unwrap();
-        let handle = sessions.register("a1");
+        let handle = sessions.register_blocking("a1");
         storage.revoke_agent("a1", now_ms()).unwrap();
         assert_eq!(agent_status(&storage, "a1"), "revoked");
 
@@ -10217,7 +10227,7 @@ mod tests {
         for round in 0..20 {
             let agent_id = format!("revoked-{round}");
             storage.upsert_agent(&test_agent(&agent_id)).unwrap();
-            let handle = sessions.register(&agent_id);
+            let handle = sessions.register_blocking(&agent_id);
             storage.revoke_agent(&agent_id, now_ms()).unwrap();
 
             let (done_tx, done_rx) = mpsc::channel::<()>();
@@ -10243,7 +10253,7 @@ mod tests {
             let register_agent = agent_id.clone();
             let register_done = done_tx.clone();
             let register = std::thread::spawn(move || {
-                let _handle = register_sessions.register(&register_agent);
+                let _handle = register_sessions.register_blocking(&register_agent);
                 // 模拟新会话握手：upsert 不得把 revoked 改回 online。
                 register_storage
                     .upsert_agent(&test_agent(&register_agent))
@@ -10269,13 +10279,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// a. 确定性交错：旧清理回调停在 slot 锁内（模拟慢 DB），新 register 必须阻塞；
+    /// a. 确定性交错：旧清理持 cleanup gate + slot 锁做慢 DB 写入，新 register 必须等；
     /// 释放后旧 offline 先落库、新 online 后写，最终 DB 状态是 online。
     #[test]
     fn new_register_waits_for_old_cleanup_callback() {
         let (dir, storage, sessions) = session_cleanup_fixture("cleanup-barrier");
         storage.upsert_agent(&test_agent("a1")).unwrap();
-        let old = sessions.register("a1");
+        let old = sessions.register_blocking("a1");
 
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -10283,6 +10293,11 @@ mod tests {
         let cleanup_sessions = sessions.clone();
         let old_id = old.conn_id;
         let cleanup = std::thread::spawn(move || {
+            // 与生产清理一致：先拿 per-agent cleanup gate，再进 slot 锁做 DB 写。
+            let slot = cleanup_sessions
+                .cleanup_slot("a1")
+                .expect("清理时 slot 必须存在");
+            let _gate = slot.acquire_cleanup_gate_blocking();
             cleanup_sessions.unregister_last_and_run("a1", old_id, || {
                 // 与生产回调一致：先查吊销，再写单行状态。DB 写推迟到释放点之后，
                 // 以便把「清理临界区」拉长成可观察窗口（不用 sleep 等待）。
@@ -10306,7 +10321,7 @@ mod tests {
         let register_sessions = sessions.clone();
         let register = std::thread::spawn(move || {
             started_tx.send(()).expect("测试线程必须存活");
-            let _handle = register_sessions.register("a1");
+            let _handle = register_sessions.register_blocking("a1");
             // 真实 handle_session 顺序：register 返回后写 online。
             register_storage
                 .upsert_agent(&test_agent("a1"))
@@ -10347,7 +10362,7 @@ mod tests {
     fn concurrent_session_churn_has_no_deadlock() {
         let (dir, storage, sessions) = session_cleanup_fixture("cleanup-churn");
         storage.upsert_agent(&test_agent("hot")).unwrap();
-        let mut current = sessions.register("hot");
+        let mut current = sessions.register_blocking("hot");
 
         for round in 0..100 {
             let (done_tx, done_rx) = mpsc::channel::<()>();
@@ -10356,7 +10371,7 @@ mod tests {
             let register_storage = storage.clone();
             let register_done = done_tx.clone();
             let register = std::thread::spawn(move || {
-                let handle = register_sessions.register("hot");
+                let handle = register_sessions.register_blocking("hot");
                 // 新会话握手：register 之后写 online。
                 register_storage
                     .upsert_agent(&test_agent("hot"))
@@ -12498,7 +12513,7 @@ mod tests {
     #[tokio::test]
     async fn v6_control_audit_actor_uses_token_name() {
         let state = m3_state(m3_control_cfg());
-        let handle = m3_register_agent(&state, "a1", &["systemd"]);
+        let handle = m3_register_agent(&state, "a1", &["systemd"]).await;
         let responder = m3_spawn_responder(
             handle.control_rx,
             vec![
@@ -12560,7 +12575,7 @@ mod tests {
     #[tokio::test]
     async fn v033_revoked_agent_control_returns_403_without_dispatch() {
         let state = m3_state(m3_control_cfg());
-        let mut handle = m3_register_agent(&state, "a1", &["systemd"]);
+        let mut handle = m3_register_agent(&state, "a1", &["systemd"]).await;
         let router = admin_router(state.clone());
         state.storage.revoke_agent("a1", now_ms()).unwrap();
 
@@ -12593,7 +12608,7 @@ mod tests {
     #[tokio::test]
     async fn v033_control_revocation_gate_blocks_queued_command_after_revoke() {
         let state = m3_state(m3_control_cfg());
-        let mut handle = m3_register_agent(&state, "a1", &["systemd"]);
+        let mut handle = m3_register_agent(&state, "a1", &["systemd"]).await;
 
         // revoke 前 gate 放行（未吊销 agent 仍正常投递，既有测试继续覆盖完整成功路径）。
         control_revocation_gate(&state, "a1")
@@ -12639,7 +12654,7 @@ mod tests {
     #[tokio::test]
     async fn v033_dropped_reply_after_revoke_returns_agent_revoked() {
         let state = m3_state(m3_control_cfg());
-        let mut handle = m3_register_agent(&state, "a1", &["systemd"]);
+        let mut handle = m3_register_agent(&state, "a1", &["systemd"]).await;
         let router = admin_router(state.clone());
 
         // 在独立任务里发起控制请求：它会通过能力/吊销检查并把命令投进会话队列，
