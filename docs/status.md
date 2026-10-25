@@ -297,6 +297,18 @@ ACME→self-signed 强制重签与 wrapper `--force` 不再自动 offline，但�
 问题。hosted release workflow、完整面板→hub HTTPS `hub_ca`/arm64 原生门禁
 未执行。
 
+**Phase C 内存基线（2026-10-25，x86_64 release 静态包）**：hub
+`self_monitor=false`、panel HTTP、agent 已 enrollment 的独立空闲进程，60s 后：
+
+| 服务 | RSS | PSS | 说明 |
+|---|---:|---:|---|
+| hub | 15.2 MiB | 15.2 MiB | 无 agent 连接，SQLite，admin HTTP 回环 |
+| panel | 7.7 MiB | 7.7 MiB | HTTP，连接本地 hub，静态资源空闲 |
+| agent | 7.45 MiB | 7.45 MiB | 已 enrollment，5s 采样，hub 本机 |
+
+合计约 30.4 MiB；`t4g.nano`（0.5 GiB）运行三服务足够，但不足以在本机编译
+workspace/构建 Docker 镜像。arm64 机器到位后按同一方法复测并记录。
+
 **Phase C 限制**：面板证书无热加载，续期后需重启；ACME volume 用非 root
 `--user 10001` 启动时没有 `NET_BIND_SERVICE`，自动续期可能无法绑定 80/443；
 默认 compose 不发布 80/443，需要 ACME 叠加文件；旧 v0.4 指纹 agent 不兼容 ACME
