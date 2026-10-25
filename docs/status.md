@@ -19,7 +19,7 @@
 | M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | v0.4.1 已知问题修复 | 🟢 完成 | KI-29 rowid 竞态、KI-31 64 MiB 配置/下载一致性、KI-28 拒绝日志采样、KI-20 安装命令引用；SFTP 真实环境 29/29，M4 基线渗透无高危；v041 26/26；v0.4.1 发布 |
 | v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
-| M5 安装与交付 | 🟡 进行中（Phase C 主体已实现，待 RC） | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126（arm64 QEMU + 来源校验）；Phase C C0–C8 已实现 ACME/agent TLS/面板 TLS/管理端 TLS/Docker 与文档，尚未完成 C9 全量 e2e、独立评审/渗透与 `v1.0.0-rc.1`；正式 v1.0.0 待 Phase E |
+| M5 安装与交付 | 🟢 Phase C RC 完成（`v1.0.0-rc.2`），Phase D/E 待 | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126；Phase C C0–C8 + 真实 LE staging + 独立评审/渗透 + hosted RC（offline/Docker/arm64/镜像/SBOM/attestation）全绿；`v1.0.0` 未发布，Phase D/E 待 |
 
 ## 构建产物清理（2026-10-25 Phase C 收尾）
 
@@ -221,7 +221,7 @@
       [渗透报告](security/2026-10-25-m5-phase-b-pentest.md)
 - [ ] 正式 `v1.0.0`：CHANGELOG 归档、tag、Release、镜像在 Phase E 完成
 
-### Phase C（2026-10-25，进行中：主体已实现，待评审与 RC）
+### Phase C（2026-10-25，RC 已完成：`v1.0.0-rc.2`）
 
 - [x] **C0** ACME 依赖与 Pebble spike：`instant-acme 0.8.5` + ring 在 MSRV 1.89
       可编译、无 aws-lc/cmake；Pebble 验证 DNS/IP、`shortlived`、TLS-ALPN-01；
@@ -544,9 +544,10 @@ v0.4.1 已完成并发布；v0.4.2 修复 CI ANSI 测试助手，并把 vendored
 升级到稳定 ECC 栈（crypto-bigint 0.7.6，RUSTSEC-2026-0387）。M5 Phase A 已完成
 安装器内核与自签三步安装（e2e 121/121）；Phase B 已完成两架构静态 musl、离线包、
 Docker/多架构与 tag 触发 release workflow 的本地验收。Phase C 的 ACME、agent TLS、
-面板 TLS、管理端 TLS、Docker/文档已实现 C0–C8，当前待 C9 全量 e2e、独立评审/
-渗透与 `v1.0.0-rc.1`，**尚未发布**；之后进入 Phase D（PostgreSQL/备份迁移），
-v1.0.0 正式发布在 Phase E。
+面板 TLS、管理端 TLS、Docker/文档已实现 C0–C8，C9 完成真实 LE staging（域名
+HTTP-01/TLS-ALPN、公网 IP `shortlived`）、独立评审/渗透与 hosted RC
+**`v1.0.0-rc.2`**（prerelease，未提升 latest）；`v1.0.0` 尚未发布。之后进入
+Phase D（PostgreSQL/备份迁移），v1.0.0 正式发布在 Phase E。
 计划见
 [M5 计划](plans/2026-10-24-m5-install-delivery.md)、
 [Phase A 设计](plans/2026-10-24-m5-phase-a-installer.md) 与
