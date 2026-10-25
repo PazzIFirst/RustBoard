@@ -477,51 +477,45 @@ pub fn load_validated_ca_at(cert_dir_path: &Path) -> Result<ValidatedCa> {
     Ok(ValidatedCa { cert_pem, key_pem })
 }
 
-/// 确保 hub 的 CA 与服务端证书存在，返回服务端证书的 SHA-256 指纹（hex）。
+/// 确保客户端证书 CA（`ca.crt` / `ca.key`）存在且配套。
 ///
-/// 规则（第四轮复审 S1-3）：
-/// - **先**校验 SAN 列表：失败时不创建任何 CA 文件（不留下半个 CA）；
-/// - `ca.crt` / `ca.key` 只缺一个：直接报错，绝不静默重建（否则新 CA + 旧 server
-///   会让所有 agent 失效）；提示从备份恢复；
+/// C3 拆分后，CA 只用于签发/校验**客户端证书**（mTLS、enrollment、续期），
+/// 不再参与服务端证书来源。本函数只创建/校验 CA，绝不创建、读取或改写
+/// `server.crt` / `server.key`，因此 ACME 模式可以安全地只准备客户端 CA。
+///
+/// 规则与旧 `ensure_hub_material` 的 CA 部分完全一致：
+/// - `ca.crt` / `ca.key` 只缺一个：直接报错，绝不静默重建；
 /// - 两个都在但不配套：报错；
-/// - 两个都不在：才允许新建 CA。若此时已存在服务端证书（旧 CA 签的），必须
-///   **成对备份并强制重签**服务端证书，再自检新链，不能留下旧 server；
-/// - 已存在的 CA + 服务端材料不会被覆盖（覆盖会让所有已安装 agent 立即失联）。
-///
-/// `policy` 只对新签发的材料生效；CA 已存在时 `ca_days` 无意义。
-pub fn ensure_hub_material(data_dir: &Path, sans: &[String], policy: CertPolicy) -> Result<String> {
+/// - 两个都不在：才允许新建。
+pub fn ensure_client_ca(data_dir: &Path, policy: CertPolicy) -> Result<()> {
     policy.validate()?;
-    // 1) SAN 先校验：确保 init 失败时不会留下半个 CA 目录。
-    parse_server_sans(sans)?;
-
     let dir = cert_dir(data_dir);
-    // KI-21：证书目录完全由 hub 拥有，旧版本遗留的 0755 也要在启动时收紧到 0700。
-    // 这里只改目录创建；备份命名/清理逻辑不在本任务的范围内。
+    // KI-21：证书目录完全由 hub 拥有，旧版本遗留的 0755 也要收紧到 0700。
     crate::fsutil::ensure_private_dir(&dir, 0o700)?;
+    ensure_client_ca_at(&dir, policy).map(|_created| ())
+}
 
+/// 内部实现：返回本次是否新建了 CA（仅用于日志语义）。
+fn ensure_client_ca_at(dir: &Path, policy: CertPolicy) -> Result<bool> {
     let ca_cert_path = dir.join(CA_CERT_FILE);
     let ca_key_path = dir.join(CA_KEY_FILE);
-    let ca_cert_exists = ca_cert_path.exists();
-    let ca_key_exists = ca_key_path.exists();
-
-    let mut created_new_ca = false;
-    let existing_ca = match (ca_cert_exists, ca_key_exists) {
+    match (ca_cert_path.exists(), ca_key_path.exists()) {
         (true, true) => {
             // 已存在：必须可解析且配套（不重新生成）。
-            Some(load_validated_ca_at(&dir).context("已有 CA 材料校验失败，拒绝继续签发")?)
+            load_validated_ca_at(dir).context("已有 CA 材料校验失败，拒绝继续签发")?;
+            Ok(false)
         }
         (false, false) => {
             let key = KeyPair::generate()?;
             let cert = ca_params(policy.ca_days)?.self_signed(&key)?;
             write_private(&ca_key_path, key.serialize_pem().as_bytes())?;
             write_public(&ca_cert_path, cert.pem().as_bytes())?;
-            created_new_ca = true;
             tracing::info!(path = %ca_cert_path.display(), days = policy.ca_days, "已生成 CA");
             // 新建 CA 既可能是全新安装，也可能是「整目录被删后恢复」。用 println 明确提示，
             // 保证与 RUST_LOG/日志级别无关；替换 CA 后旧 agent 的 ca.crt 与客户端证书
             // 都属于旧 CA，必须重新纳管才能继续 mTLS。
             println!("已新建 CA；如果这是恢复/替换场景，所有已纳管 agent 都需要重新纳管。");
-            None
+            Ok(true)
         }
         (true, false) => bail!(
             "CA 私钥缺失（{}），但 CA 证书仍在：拒绝自动重建 CA（会签出无效链并让所有 agent 失效）。\
@@ -537,7 +531,58 @@ pub fn ensure_hub_material(data_dir: &Path, sans: &[String], policy: CertPolicy)
              所有 agent 都需要重新纳管",
             ca_cert_path.display()
         ),
-    };
+    }
+}
+
+/// 确保自签服务端证书存在且由当前客户端 CA 签发、SAN 覆盖 `sans`。
+///
+/// 这是 C3 拆分后的 self-signed 服务端材料入口：CA 必须已存在（缺失时先按
+/// [`ensure_client_ca`] 的规则创建），返回服务端证书的 SHA-256 指纹（hex）。
+///
+/// 自签模式的文件/备份/指纹语义与旧 [`ensure_hub_material`] 完全一致：
+/// - 已存在的 CA + 服务端材料不会被覆盖（覆盖会让已安装 agent 立即失联）；
+/// - 现存材料失配/半套/CA 被替换时，成对备份后用当前 CA 重签；
+/// - 先写 key（0600）再写 cert（0644），失败路径不产生无意义备份。
+pub fn ensure_self_signed_server(
+    data_dir: &Path,
+    sans: &[String],
+    policy: CertPolicy,
+) -> Result<String> {
+    policy.validate()?;
+    // SAN 先校验：失败时不创建任何 CA 文件（不留下半个 CA）。
+    parse_server_sans(sans)?;
+    let dir = cert_dir(data_dir);
+    crate::fsutil::ensure_private_dir(&dir, 0o700)?;
+    let created_new_ca = ensure_client_ca_at(&dir, policy)?;
+    ensure_self_signed_server_with_ca(data_dir, sans, policy, created_new_ca)
+}
+
+/// 旧入口：确保 CA + 自签服务端证书都存在，返回服务端证书指纹。
+///
+/// 保留为 wrapper 以维持既有调用方与测试的行为；ACME 模式请分别调用
+/// [`ensure_client_ca`] + `rustboard-hub tls issue`，**不要**调用本函数。
+pub fn ensure_hub_material(data_dir: &Path, sans: &[String], policy: CertPolicy) -> Result<String> {
+    policy.validate()?;
+    // 1) SAN 先校验：确保 init 失败时不会留下半个 CA 目录。
+    parse_server_sans(sans)?;
+
+    let dir = cert_dir(data_dir);
+    // KI-21：证书目录完全由 hub 拥有，旧版本遗留的 0755 也要在启动时收紧到 0700。
+    // 这里只改目录创建；备份命名/清理逻辑不在本任务的范围内。
+    crate::fsutil::ensure_private_dir(&dir, 0o700)?;
+    let created_new_ca = ensure_client_ca_at(&dir, policy)?;
+    ensure_self_signed_server_with_ca(data_dir, sans, policy, created_new_ca)
+}
+
+/// 已确保 CA 存在后的自签服务端材料实现。
+fn ensure_self_signed_server_with_ca(
+    data_dir: &Path,
+    sans: &[String],
+    policy: CertPolicy,
+    created_new_ca: bool,
+) -> Result<String> {
+    let dir = cert_dir(data_dir);
+    let ca = load_validated_ca_at(&dir).context("读取新建/既有 CA 失败")?;
 
     let server_cert_path = dir.join(SERVER_CERT_FILE);
     let server_key_path = dir.join(SERVER_KEY_FILE);
@@ -545,12 +590,12 @@ pub fn ensure_hub_material(data_dir: &Path, sans: &[String], policy: CertPolicy)
     // 重建 CA 时是否原本就有 server 材料——这决定了是否必须提示「所有 agent 需重新纳管」。
     let had_server_material = server_cert_path.exists() || server_key_path.exists();
 
-    // 2) CA 已存在且 server 对也齐全时，必须确认现存 server 证书确实由当前 CA
-    //    签发、SAN 覆盖 server_names、且 **与 server.key 配套**；否则说明 CA 被换过、
-    //    配置加了 SAN，或上次写盘中断留下半套材料——留着旧 server 会让 hub 起不来
-    //    或在 run 阶段被自愈成另一个指纹。
+    // CA 已存在且 server 对也齐全时，必须确认现存 server 证书确实由当前 CA
+    // 签发、SAN 覆盖 server_names、且 **与 server.key 配套**；否则说明 CA 被换过、
+    // 配置加了 SAN，或上次写盘中断留下半套材料——留着旧 server 会让 hub 起不来
+    // 或在 run 阶段被自愈成另一个指纹。
     let mut server_needs_reissue = !server_complete || created_new_ca;
-    if let (false, Some(ca)) = (server_needs_reissue, existing_ca.as_ref()) {
+    if !server_needs_reissue {
         let server_pem = std::fs::read_to_string(&server_cert_path)
             .with_context(|| format!("读取服务端证书失败: {}", server_cert_path.display()))?;
         let key_pem = std::fs::read_to_string(&server_key_path)
@@ -590,7 +635,6 @@ pub fn ensure_hub_material(data_dir: &Path, sans: &[String], policy: CertPolicy)
     }
 
     if server_needs_reissue {
-        let ca = load_validated_ca_at(&dir).context("读取新建/既有 CA 失败")?;
         let (cert_pem, key_pem) = issue_server_cert(&ca.key_pem, sans, policy.server_days)?;
         // 自检：链由当前 CA 签发、CN/SAN/有效期符合预期，然后才写盘。
         validate_server_cert(&cert_pem, &ca.cert_pem, sans, crate::util::now_ms())?;
@@ -621,7 +665,7 @@ pub fn ensure_hub_material(data_dir: &Path, sans: &[String], policy: CertPolicy)
                     fingerprint = %new_fingerprint,
                     backups = %backup_list,
                     "CA 已重建且服务端证书已用新 CA 重签：所有 agent 都需要重新纳管；\
-                     旧服务端材料备份: {backup_list}"
+                      旧服务端材料备份: {backup_list}"
                 );
             } else {
                 tracing::info!(
@@ -634,7 +678,7 @@ pub fn ensure_hub_material(data_dir: &Path, sans: &[String], policy: CertPolicy)
                 fingerprint = %new_fingerprint,
                 backups = %backup_list,
                 "已用当前 CA 重签服务端证书：服务端指纹变化，使用指纹钉扎的旧版 agent 需升级；\
-                 如果 CA 也被替换过，所有 agent 都需要重新纳管；旧材料备份: {backup_list}"
+                  如果 CA 也被替换过，所有 agent 都需要重新纳管；旧材料备份: {backup_list}"
             );
         }
         tracing::info!(
@@ -981,6 +1025,140 @@ fn check_server_cert(
     Ok(())
 }
 
+/// 校验一张**公开 CA 签发**的服务端叶子证书（ACME 证书）。
+///
+/// 与 [`validate_server_cert`] 的区别：ACME 证书通常没有 CN 或 CN 是域名，
+/// 因此**不要求** `CN = rustboard-hub`；也不要求由本地 CA 签发（链由 TLS
+/// 握手阶段按系统根 / 自定义根验证）。这里只校验与证书来源无关的硬性条件：
+/// 1. 有效期：已生效、未过期；
+/// 2. SAN 覆盖 `expected_sans`（DNS / IP 精确匹配）；
+/// 3. EKU 扩展存在时必须包含 `serverAuth`（`anyExtendedKeyUsage` 视为满足）；
+/// 4. BasicConstraints 扩展存在时不得是 CA（叶子证书不允许 ca=true）。
+///
+/// 任何一项失败都返回中文错误，调用方据此在写盘前放弃，旧材料保持不变。
+pub fn validate_public_server_cert(
+    cert_pem: &str,
+    expected_sans: &[String],
+    now_ms: i64,
+) -> Result<()> {
+    let expected =
+        parse_server_sans(expected_sans).context("期望的服务端证书 SAN 列表非法，拒绝校验证书")?;
+
+    let certs = load_certs(cert_pem).context("解析服务端证书 PEM 失败")?;
+    let (_, cert) = x509_parser::parse_x509_certificate(certs[0].as_ref())
+        .map_err(|err| anyhow!("解析服务端证书失败: {err:?}"))?;
+
+    // 1) 有效期。ACME 证书的 notBefore 由 CA 决定，给 60s 时钟偏差容忍。
+    let validity = cert.validity();
+    let not_before = validity.not_before.timestamp();
+    let not_after = validity.not_after.timestamp();
+    let now_s = now_ms / 1_000;
+    if not_after <= now_s {
+        bail!(
+            "服务端证书已过期（notAfter={}，now={}）；请执行 `rustboard-hub tls renew` 续期",
+            format_unix_utc(not_after),
+            format_unix_utc(now_s)
+        );
+    }
+    if not_before > now_s + 60 {
+        bail!(
+            "服务端证书尚未生效（notBefore={}，now={}）；请检查系统时间",
+            format_unix_utc(not_before),
+            format_unix_utc(now_s)
+        );
+    }
+
+    // 2) 遍历扩展：收集 SAN、EKU、BasicConstraints。
+    let mut dns_names: Vec<String> = Vec::new();
+    let mut raw_ips: Vec<Vec<u8>> = Vec::new();
+    let mut saw_eku = false;
+    let mut server_auth = false;
+    for extension in cert.extensions() {
+        match extension.parsed_extension() {
+            ParsedExtension::SubjectAlternativeName(san) => {
+                for name in &san.general_names {
+                    match name {
+                        GeneralName::DNSName(name) => dns_names.push((*name).to_string()),
+                        GeneralName::IPAddress(raw) => raw_ips.push(raw.to_vec()),
+                        _ => {}
+                    }
+                }
+            }
+            ParsedExtension::ExtendedKeyUsage(eku) => {
+                saw_eku = true;
+                // RFC 5280：anyExtendedKeyUsage 等价于不限制用途。
+                server_auth = eku.server_auth || eku.any;
+            }
+            ParsedExtension::BasicConstraints(basic) if basic.ca => {
+                bail!("服务端证书是 CA 证书（BasicConstraints ca=true），不能作为服务端叶子证书");
+            }
+            _ => {}
+        }
+    }
+    if saw_eku && !server_auth {
+        bail!("服务端证书的 EKU 不含 serverAuth（当前证书不能用于 TLS 服务端）");
+    }
+
+    for san in &expected {
+        match san {
+            ServerSan::Dns(name) => {
+                // DNS SAN 大小写不敏感；配置保留用户输入，证书里可能被 CA 规范化。
+                if !dns_names
+                    .iter()
+                    .any(|actual| actual.eq_ignore_ascii_case(name))
+                {
+                    bail!("服务端证书的 SAN 未覆盖域名 {name:?}（实际 DNS SAN: {dns_names:?}）");
+                }
+            }
+            ServerSan::Ip(ip) => {
+                let octets: Vec<u8> = match ip {
+                    std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+                    std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+                };
+                if !raw_ips.iter().any(|raw| raw == &octets) {
+                    bail!("服务端证书的 SAN 未覆盖 IP {ip}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 读取证书里的公开 SAN 列表（`DNS:example.com` / `IP:192.0.2.1`），供 CLI 展示。
+///
+/// 只解析叶子证书扩展，不做任何信任判断；绝不含私钥/账户信息。
+pub fn public_cert_names(pem: &str) -> Result<Vec<String>> {
+    let certs = load_certs(pem).context("解析证书 PEM 失败")?;
+    let (_, cert) = x509_parser::parse_x509_certificate(certs[0].as_ref())
+        .map_err(|err| anyhow!("解析证书失败: {err:?}"))?;
+    let mut names = Vec::new();
+    for extension in cert.extensions() {
+        if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
+            for name in &san.general_names {
+                match name {
+                    GeneralName::DNSName(dns) => names.push(format!("DNS:{dns}")),
+                    GeneralName::IPAddress(raw) => {
+                        let text = match raw.len() {
+                            4 => {
+                                std::net::Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]).to_string()
+                            }
+                            16 => {
+                                let mut octets = [0u8; 16];
+                                octets.copy_from_slice(raw);
+                                std::net::Ipv6Addr::from(octets).to_string()
+                            }
+                            _ => format!("<非法 IP SAN: {raw:?}>"),
+                        };
+                        names.push(format!("IP:{text}"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(names)
+}
+
 /// 解析并校验客户端 CSR（不签发），用于在消费一次性 token 之前拒绝无效 CSR。
 pub fn validate_client_csr(csr_pem: &str) -> Result<()> {
     CertificateSigningRequestParams::from_pem(csr_pem)
@@ -1158,6 +1336,48 @@ pub fn admin_server_config(
     }
     validate_existing_server_cert(&cert_pem, &ca_pem, expected_sans, crate::util::now_ms())
         .context("管理 API TLS 证书校验失败（CA 链 / SAN / 有效期）")?;
+
+    let certs = load_certs(&cert_pem)?;
+    let key = load_key(&key_pem)?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
+/// 管理 API 的 TLS 服务端配置（公开 CA / ACME 证书）：server-auth，不要求客户端证书。
+///
+/// 与 [`admin_server_config`] 的区别：不要求证书由本地 `ca.crt` 签发，改用
+/// [`validate_public_server_cert`] 做 SAN / 有效期 / EKU / 非 CA 校验，因此
+/// ACME（含 IP identifier、回环 IP SAN）签发的证书可以直接用于管理端口。
+/// CA 链由客户端在握手阶段按系统根 / 自定义根验证。
+pub fn admin_server_config_public(
+    data_dir: &Path,
+    expected_sans: &[String],
+) -> Result<Arc<rustls::ServerConfig>> {
+    let dir = cert_dir(data_dir);
+    let cert_path = dir.join(SERVER_CERT_FILE);
+    let cert_pem = std::fs::read_to_string(&cert_path)
+        .with_context(|| format!("读取服务端证书失败: {}", cert_path.display()))?;
+    let key_path = dir.join(SERVER_KEY_FILE);
+    // 与服务端入口一致：旧版本可能留下过宽权限，加载前收紧到 0600。
+    crate::fsutil::harden(&key_path, 0o600)?;
+    let key_pem = std::fs::read_to_string(&key_path)
+        .with_context(|| format!("读取服务端私钥失败: {}", key_path.display()))?;
+
+    if !cert_matches_key(&cert_pem, &key_pem)? {
+        return Err(anyhow!(
+            "服务端证书与私钥不匹配（{} 与 {} 不是一对，可能是签发/写盘中途被中断）；\
+             执行 `rustboard-hub tls issue --config <config>` 重新获取证书",
+            cert_path.display(),
+            key_path.display()
+        ));
+    }
+    validate_public_server_cert(&cert_pem, expected_sans, crate::util::now_ms())
+        .context("管理 API TLS 证书校验失败（SAN / 有效期 / EKU），请重新执行 tls issue")?;
 
     let certs = load_certs(&cert_pem)?;
     let key = load_key(&key_pem)?;
@@ -2991,6 +3211,177 @@ mod tests {
             peer_common_name(cert.der().as_ref()).as_deref(),
             Some("agent-first")
         );
+    }
+
+    /// 生成一张"公开 CA 风格"的测试叶子证书：无 CN、指定 SAN / 有效期 / EKU。
+    fn public_leaf(
+        sans: &[&str],
+        not_before: OffsetDateTime,
+        not_after: OffsetDateTime,
+        eku: Option<ExtendedKeyUsagePurpose>,
+        is_ca: IsCa,
+    ) -> String {
+        let mut params = CertificateParams::new(
+            sans.iter()
+                .map(|san| (*san).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        // ACME 证书可以没有 CN：这里显式清空，确保校验器不依赖 CN。
+        params.distinguished_name = DistinguishedName::new();
+        params.not_before = not_before;
+        params.not_after = not_after;
+        params.is_ca = is_ca;
+        params.extended_key_usages = eku.into_iter().collect();
+        let key = KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().pem()
+    }
+
+    fn ok_window() -> (OffsetDateTime, OffsetDateTime) {
+        let now = OffsetDateTime::now_utc();
+        (now - TimeDuration::hours(1), now + TimeDuration::days(30))
+    }
+
+    /// C3：公开证书校验不要求 CN=rustboard-hub，只看 SAN / 有效期 / EKU / 非 CA。
+    #[test]
+    fn c3_validate_public_cert_accepts_acme_style_leaf_without_cn() {
+        let (not_before, not_after) = ok_window();
+        let pem = public_leaf(
+            &["board.example.com", "127.0.0.1"],
+            not_before,
+            not_after,
+            Some(ExtendedKeyUsagePurpose::ServerAuth),
+            IsCa::NoCa,
+        );
+        validate_public_server_cert(
+            &pem,
+            &["board.example.com".into(), "127.0.0.1".into()],
+            crate::util::now_ms(),
+        )
+        .expect("ACME 风格证书必须通过公开校验");
+        let names = public_cert_names(&pem).unwrap();
+        assert!(names.contains(&"DNS:board.example.com".to_string()));
+        assert!(names.contains(&"IP:127.0.0.1".to_string()));
+    }
+
+    /// EKU 扩展不存在时允许（部分私有 CA 不写 EKU），存在时必须含 serverAuth。
+    #[test]
+    fn c3_validate_public_cert_eku_rules() {
+        let (not_before, not_after) = ok_window();
+        let sans = ["board.example.com".to_string()];
+        let without_eku = public_leaf(
+            &["board.example.com"],
+            not_before,
+            not_after,
+            None,
+            IsCa::NoCa,
+        );
+        validate_public_server_cert(&without_eku, &sans, crate::util::now_ms())
+            .expect("缺少 EKU 扩展时应放行");
+
+        let client_only = public_leaf(
+            &["board.example.com"],
+            not_before,
+            not_after,
+            Some(ExtendedKeyUsagePurpose::ClientAuth),
+            IsCa::NoCa,
+        );
+        let err = validate_public_server_cert(&client_only, &sans, crate::util::now_ms())
+            .expect_err("EKU 只有 clientAuth 必须拒绝");
+        assert!(
+            format!("{err:#}").contains("serverAuth"),
+            "错误信息: {err:#}"
+        );
+    }
+
+    /// SAN 未覆盖 / 已过期 / 尚未生效 / CA 证书都必须拒绝，且错误信息可执行。
+    #[test]
+    fn c3_validate_public_cert_rejects_bad_san_expiry_and_ca() {
+        let (not_before, not_after) = ok_window();
+        let sans = ["board.example.com".to_string()];
+        let pem = public_leaf(
+            &["board.example.com"],
+            not_before,
+            not_after,
+            Some(ExtendedKeyUsagePurpose::ServerAuth),
+            IsCa::NoCa,
+        );
+
+        let err = validate_public_server_cert(
+            &pem,
+            &["other.example.com".to_string()],
+            crate::util::now_ms(),
+        )
+        .expect_err("SAN 不覆盖必须拒绝");
+        assert!(
+            format!("{err:#}").contains("SAN 未覆盖"),
+            "错误信息: {err:#}"
+        );
+
+        let now = OffsetDateTime::now_utc();
+        let expired = public_leaf(
+            &["board.example.com"],
+            now - TimeDuration::days(10),
+            now - TimeDuration::days(1),
+            Some(ExtendedKeyUsagePurpose::ServerAuth),
+            IsCa::NoCa,
+        );
+        let err = validate_public_server_cert(&expired, &sans, crate::util::now_ms())
+            .expect_err("过期证书必须拒绝");
+        assert!(format!("{err:#}").contains("已过期"), "错误信息: {err:#}");
+
+        let future = public_leaf(
+            &["board.example.com"],
+            now + TimeDuration::hours(2),
+            now + TimeDuration::days(1),
+            Some(ExtendedKeyUsagePurpose::ServerAuth),
+            IsCa::NoCa,
+        );
+        let err = validate_public_server_cert(&future, &sans, crate::util::now_ms())
+            .expect_err("尚未生效的证书必须拒绝");
+        assert!(format!("{err:#}").contains("尚未生效"), "错误信息: {err:#}");
+
+        let ca = public_leaf(
+            &["board.example.com"],
+            not_before,
+            not_after,
+            Some(ExtendedKeyUsagePurpose::ServerAuth),
+            IsCa::Ca(BasicConstraints::Unconstrained),
+        );
+        let err = validate_public_server_cert(&ca, &sans, crate::util::now_ms())
+            .expect_err("CA 证书不能作为服务端叶子证书");
+        assert!(format!("{err:#}").contains("CA 证书"), "错误信息: {err:#}");
+    }
+
+    /// C3 拆分：ensure_client_ca 只创建 ca.crt/ca.key，不碰 server 材料；
+    /// 随后 ensure_self_signed_server 复用同一 CA，重复调用指纹不变。
+    #[test]
+    fn c3_client_ca_and_self_signed_server_are_split() {
+        let dir = temp_dir("split-ca");
+        let sans = ["localhost".to_string()];
+        ensure_client_ca(&dir, CertPolicy::default()).unwrap();
+        let certs = cert_dir(&dir);
+        assert!(certs.join(CA_CERT_FILE).exists());
+        assert!(certs.join(CA_KEY_FILE).exists());
+        assert!(
+            !certs.join(SERVER_CERT_FILE).exists(),
+            "CA 拆分后不得顺手写 server.crt"
+        );
+        assert!(
+            !certs.join(SERVER_KEY_FILE).exists(),
+            "CA 拆分后不得顺手写 server.key"
+        );
+
+        let first = ensure_self_signed_server(&dir, &sans, CertPolicy::default()).unwrap();
+        assert!(certs.join(SERVER_CERT_FILE).exists());
+        assert!(certs.join(SERVER_KEY_FILE).exists());
+        // 再次调用必须复用已有材料，指纹/文件都不变。
+        let second = ensure_self_signed_server(&dir, &sans, CertPolicy::default()).unwrap();
+        assert_eq!(first, second);
+        // wrapper 入口在同一材料上也必须返回相同指纹。
+        let third = ensure_hub_material(&dir, &sans, CertPolicy::default()).unwrap();
+        assert_eq!(first, third);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A8：私钥 0600、证书 0644、目录 0700 的既有断言不退化。

@@ -21,6 +21,9 @@ http-body = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 hmac = { workspace = true }
+# M5 Phase C C4：ACME 客户端。显式关闭默认 aws-lc-rs，改用纯 Rust `ring`
+# + hyper-rustls；不引入 cmake/openssl。版本锁死以复现 C0 spike 的结论。
+instant-acme = { version = "=0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
 reqwest = { workspace = true }
 # object_store 0.14 的 HTTP 传输使用 reqwest 0.13；显式启用 rustls（ring provider），
 # 避免 object_store 的 `aws` feature 拉入 aws-lc-rs。此别名不直接在代码中使用，
@@ -52,3 +55,8 @@ uuid = { workspace = true }
 [dev-dependencies]
 # `#[tokio::test(start_paused = true)]`：用虚拟时间验证空闲超时，仅测试构建启用。
 tokio = { workspace = true, features = ["test-util"] }
+# C4 测试解析 TLS-ALPN-01 挑战证书的 critical acmeIdentifier 扩展。
+# 与 rustboard-common 使用同一版本，不新增第三方依赖。
+x509-parser = { workspace = true }
+# C4 续期阈值测试需要构造固定有效期的证书。
+time = { workspace = true }

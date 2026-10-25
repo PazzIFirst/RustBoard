@@ -198,6 +198,14 @@ pub fn spawn_server_renewal(
     tx: TlsConfigSender,
     _live: Arc<RwLock<CertStatus>>,
 ) {
+    // C3：ACME 模式的 server 证书由 acme::renewal 管理，绝不启动自签续期。
+    if cfg.tls.mode.is_acme() {
+        tracing::debug!(
+            mode = cfg.tls.mode.as_str(),
+            "ACME 模式：跳过自签服务端证书续期任务"
+        );
+        return;
+    }
     tokio::spawn(async move {
         // 配置层要求 ≥ 60 秒；这里再 max(1) 只是防御「手工改配置绕过校验」导致的
         // 0 周期忙循环（见文件头关于检查周期的说明）。
@@ -304,22 +312,28 @@ pub fn reload_server_config_if_changed(
     let dir = tls::cert_dir(&cfg.data_dir);
     let cert_path = dir.join(tls::SERVER_CERT_FILE);
     let key_path = dir.join(tls::SERVER_KEY_FILE);
-    let ca_path = dir.join(tls::CA_CERT_FILE);
 
     let cert_pem = std::fs::read_to_string(&cert_path)
         .with_context(|| format!("读取服务端证书失败: {}", cert_path.display()))?;
     let key_pem = std::fs::read_to_string(&key_path)
         .with_context(|| format!("读取服务端私钥失败: {}", key_path.display()))?;
-    let ca_pem = std::fs::read_to_string(&ca_path)
-        .with_context(|| format!("读取 CA 证书失败: {}", ca_path.display()))?;
 
-    // 1) key/cert 必须配套：rotate 先写 key 后写 cert，中间状态不能热加载。
+    // 1) key/cert 必须配套：rotate/issue 先写 key 后写 cert，中间状态不能热加载。
     if !tls::cert_matches_key(&cert_pem, &key_pem).context("校验证书与私钥配套失败")? {
         bail!("服务端证书与私钥不配套，拒绝热加载");
     }
-    // 2) CA 链、CN、有效期与 SAN 覆盖。
-    tls::validate_existing_server_cert(&cert_pem, &ca_pem, &cfg.server_names, now_ms())
-        .context("热加载证书校验失败（CA 链 / SAN / 有效期）")?;
+    // 2) 按证书来源选择校验：self-signed 校验本地 CA 链；ACME 只做公开校验
+    //    （SAN / 有效期 / EKU / 非 CA），链由客户端在握手时按公共根验证。
+    if cfg.tls.mode.is_acme() {
+        tls::validate_public_server_cert(&cert_pem, &cfg.effective_server_names(), now_ms())
+            .context("热加载 ACME 证书校验失败（SAN / 有效期 / EKU）")?;
+    } else {
+        let ca_path = dir.join(tls::CA_CERT_FILE);
+        let ca_pem = std::fs::read_to_string(&ca_path)
+            .with_context(|| format!("读取 CA 证书失败: {}", ca_path.display()))?;
+        tls::validate_existing_server_cert(&cert_pem, &ca_pem, &cfg.server_names, now_ms())
+            .context("热加载证书校验失败（CA 链 / SAN / 有效期）")?;
+    }
     let status = CertStatus::from_pem(&cert_pem)?;
 
     // 3) 指纹没变：无需替换（避免每 10s 重建 rustls 配置）。
@@ -497,6 +511,15 @@ pub fn renew_server_cert_files(
     force: bool,
     override_days: Option<u32>,
 ) -> Result<Option<RenewedServerCert>> {
+    // C3：ACME 模式的 server.crt/key 由 acme::renewal / `tls issue|renew` 写入。
+    // 这里必须无条件跳过，避免自签任务把 ACME 证书覆盖掉。
+    if cfg.tls.mode.is_acme() {
+        tracing::debug!(
+            mode = cfg.tls.mode.as_str(),
+            "ACME 模式：服务端证书由 ACME 管理，跳过自签文件级续签"
+        );
+        return Ok(None);
+    }
     let dir = tls::cert_dir(&cfg.data_dir);
     let cert_path = dir.join(tls::SERVER_CERT_FILE);
     let key_path = dir.join(tls::SERVER_KEY_FILE);
@@ -635,6 +658,14 @@ pub fn check_and_renew(
     force: bool,
     override_days: Option<u32>,
 ) -> Result<Option<String>> {
+    // C3：ACME 模式不跑自签续期（不获取锁、不读/写 server 材料）。
+    if cfg.tls.mode.is_acme() {
+        tracing::debug!(
+            mode = cfg.tls.mode.as_str(),
+            "ACME 模式：跳过自签 check_and_renew"
+        );
+        return Ok(None);
+    }
     let cert_dir = tls::cert_dir(&cfg.data_dir);
     // KI-11（严重项）：自动续签与 CLI rotate-cert 必须互斥，否则可能交错
     // 写 key/cert，得到一对不配套的材料。
@@ -800,6 +831,10 @@ fn classify_startup_material(cfg: &HubConfig, ca: &tls::ValidatedCa) -> Result<S
 /// 其他任何异常（CA 材料非法、证书不可解析、非当前 CA 签发、CN/SAN 不覆盖、
 /// 尚未生效等）都在写盘前拒绝启动。
 pub fn load_or_repair_tls_config(cfg: &HubConfig) -> Result<Arc<ServerConfig>> {
+    // C3：ACME 模式只加载/校验，绝不自签修复；缺失/非法时给可执行错误。
+    if cfg.tls.mode.is_acme() {
+        return load_acme_tls_config(cfg);
+    }
     // S1-1：任何启动路径都先校验 CA 材料与 server_names，再尝试加载。
     // `server_config` 只把 ca.crt 当信任根，并不会发现 ca.key 缺失/不配套；
     // 所以这两个检查必须在进入 repair 分支之前无条件执行。
@@ -927,12 +962,74 @@ fn repair_tls_material(
     Ok(config)
 }
 
+/// ACME 模式的启动加载：只校验/加载，绝不自签修复。
+///
+/// 前置条件：
+/// - 客户端证书 CA（`ca.crt`/`ca.key`）仍存在且配套（agent mTLS 与 enrollment 需要）；
+/// - 服务端证书/私钥已由 `rustboard-hub tls issue` 写入且配套、SAN 覆盖
+///   `effective_server_names()`、未过期、EKU 含 serverAuth、非 CA。
+///
+/// 任何缺失/非法都返回带可执行命令的错误，**不会**生成自签证书。
+fn load_acme_tls_config(cfg: &HubConfig) -> Result<Arc<ServerConfig>> {
+    let expected_sans = cfg.effective_server_names();
+    tls::parse_server_sans(&expected_sans).context("ACME 模式 tls.domains 非法，拒绝启动")?;
+    // 客户端证书 CA 与 ACME 服务端证书来源无关，但 mTLS 仍必须依赖它。
+    tls::load_validated_ca(&cfg.data_dir).context(
+        "客户端证书 CA 校验失败（ACME 模式的 agent mTLS 仍需要 ca.crt/ca.key）；\
+         请执行 `rustboard-hub init` 准备客户端 CA，且不要删除 ca.crt/ca.key",
+    )?;
+
+    let material = crate::acme::store::read_server_material(&cfg.data_dir)
+        .context("读取 ACME 服务端证书材料失败，拒绝启动")?;
+    let Some(material) = material else {
+        bail!(
+            "ACME 服务端证书尚未签发（{} 与 {} 不存在）；请执行 \
+             `rustboard-hub tls issue --config <hub.toml>` 获取证书后重启。\
+             本模式不会自动生成自签证书。",
+            tls::cert_dir(&cfg.data_dir)
+                .join(tls::SERVER_CERT_FILE)
+                .display(),
+            tls::cert_dir(&cfg.data_dir)
+                .join(tls::SERVER_KEY_FILE)
+                .display()
+        );
+    };
+    if !tls::cert_matches_key(&material.cert_pem, &material.key_pem)
+        .context("ACME 服务端证书与私钥无法解析")?
+    {
+        bail!(
+            "ACME 服务端证书与私钥不配套（可能是写盘中断）；请执行 \
+             `rustboard-hub tls issue --config <hub.toml>` 重新获取证书"
+        );
+    }
+    tls::validate_public_server_cert(&material.cert_pem, &expected_sans, now_ms()).context(
+        "ACME 服务端证书校验失败；请执行 `rustboard-hub tls issue --config <hub.toml>` \
+         重新获取证书（旧证书保持不动）",
+    )?;
+    tls::server_config(&cfg.data_dir)
+        .context("构建 ACME TLS 配置失败（检查 ca.crt/ca.key 与证书文件权限）")
+}
+
+/// 按证书来源构建管理 API TLS 配置。
+///
+/// - self-signed：沿用 CA 链校验（[`tls::admin_server_config`]）；
+/// - ACME：使用公开校验（SAN/有效期/EKU/非 CA），允许回环 IP SAN，链由客户端验证。
+pub fn build_admin_server_config(cfg: &HubConfig) -> Result<Arc<ServerConfig>> {
+    let expected_sans = cfg.effective_server_names();
+    if cfg.tls.mode.is_acme() {
+        tls::admin_server_config_public(&cfg.data_dir, &expected_sans)
+    } else {
+        tls::admin_server_config(&cfg.data_dir, &expected_sans)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use rustboard_common::config::ServerTlsMode;
     use rustboard_common::tls::{CA_CERT_FILE, CA_KEY_FILE, SERVER_CERT_FILE, SERVER_KEY_FILE};
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -2461,5 +2558,141 @@ mod tests {
         assert!(!lock_path.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- M5 Phase C C3/C4：ACME 模式下自签任务必须完全跳过 ----
+
+    fn acme_config(dir: &Path, mode: ServerTlsMode, domains: &[&str]) -> HubConfig {
+        let mut cfg = test_config(dir, 365, 30);
+        cfg.tls.mode = mode;
+        cfg.tls.acme_email = "admin@example.com".to_string();
+        cfg.tls.acme_directory = "https://localhost:14000/dir".to_string();
+        cfg.tls.domains = domains.iter().map(|domain| (*domain).to_string()).collect();
+        cfg.server_names = cfg.tls.domains.clone();
+        cfg
+    }
+
+    /// 生成 ACME 风格的公开证书（无 CN、SAN 指定、serverAuth、非 CA）。
+    fn public_pair(domain: &str) -> (String, String) {
+        use rcgen::{
+            CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+            KeyUsagePurpose,
+        };
+        let mut params = CertificateParams::new(vec![domain.to_string()]).unwrap();
+        params.distinguished_name = DistinguishedName::new();
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    #[test]
+    fn c3_acme_mode_never_runs_self_signed_renewal() {
+        let dir = temp_dir("acme-no-selfsigned");
+        tls::ensure_client_ca(&dir, tls::CertPolicy::default()).unwrap();
+        let cfg = acme_config(&dir, ServerTlsMode::AcmeDomain, &["board.example.com"]);
+
+        // 即使 force=true，也必须返回 Ok(None) 且不写 server.crt/key。
+        assert!(renew_server_cert_files(&cfg, true, Some(10))
+            .unwrap()
+            .is_none());
+        let (cert, key) = public_pair("board.example.com");
+        let config = tls::server_config_from_paths(&cert, &key).unwrap();
+        let (tx, rx) = watch::channel(config);
+        assert!(check_and_renew(&cfg, &tx, true, None).unwrap().is_none());
+        assert!(!rx.has_changed().unwrap(), "ACME 模式不得推送自签配置");
+
+        let certs = tls::cert_dir(&dir);
+        assert!(
+            !certs.join(SERVER_CERT_FILE).exists(),
+            "不得写自签 server.crt"
+        );
+        assert!(
+            !certs.join(SERVER_KEY_FILE).exists(),
+            "不得写自签 server.key"
+        );
+        assert!(managed_backups(&dir, SERVER_CERT_FILE).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn c3_acme_startup_without_cert_never_self_signs() {
+        let dir = temp_dir("acme-no-cert");
+        tls::ensure_client_ca(&dir, tls::CertPolicy::default()).unwrap();
+        let cfg = acme_config(&dir, ServerTlsMode::AcmeDomain, &["board.example.com"]);
+        let err = load_or_repair_tls_config(&cfg).expect_err("ACME 无证书必须报错");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("tls issue"),
+            "错误信息应给出可执行命令: {text}"
+        );
+        let certs = tls::cert_dir(&dir);
+        assert!(!certs.join(SERVER_CERT_FILE).exists());
+        assert!(!certs.join(SERVER_KEY_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn c3_acme_startup_loads_installed_cert_and_admin_public_path() {
+        let dir = temp_dir("acme-load");
+        tls::ensure_client_ca(&dir, tls::CertPolicy::default()).unwrap();
+        let cfg = acme_config(&dir, ServerTlsMode::AcmeIp, &["127.0.0.1"]);
+        let (cert, key) = public_pair("127.0.0.1");
+        crate::acme::store::install_server_material_locked(
+            &dir,
+            &cert,
+            &key,
+            &cfg.effective_server_names(),
+        )
+        .unwrap();
+
+        let config = load_or_repair_tls_config(&cfg).expect("已安装的 ACME 证书必须能启动");
+        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        // 管理端 required 在 ACME 下走公共校验，并允许回环 IP SAN。
+        build_admin_server_config(&cfg).expect("ACME 管理端 TLS 必须接受回环 IP SAN");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn c3_acme_reload_uses_public_validation_and_switches() {
+        let dir = temp_dir("acme-reload");
+        tls::ensure_client_ca(&dir, tls::CertPolicy::default()).unwrap();
+        let cfg = acme_config(&dir, ServerTlsMode::AcmeDomain, &["board.example.com"]);
+        let (cert1, key1) = public_pair("board.example.com");
+        crate::acme::store::install_server_material_locked(
+            &dir,
+            &cert1,
+            &key1,
+            &cfg.effective_server_names(),
+        )
+        .unwrap();
+        let initial = load_or_repair_tls_config(&cfg).unwrap();
+        let (tx, rx) = watch::channel(initial);
+        let live = RwLock::new(CertStatus::from_pem(&cert1).unwrap());
+
+        let (cert2, key2) = public_pair("board.example.com");
+        crate::acme::store::install_server_material_locked(
+            &dir,
+            &cert2,
+            &key2,
+            &cfg.effective_server_names(),
+        )
+        .unwrap();
+        assert!(reload_server_config_if_changed(&cfg, &tx, &live).unwrap());
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(
+            live_fingerprint_for_test(&live),
+            tls::fingerprint_of_pem(&cert2).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn live_fingerprint_for_test(live: &RwLock<CertStatus>) -> String {
+        live.read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .fingerprint
+            .clone()
     }
 }

@@ -54,6 +54,7 @@ use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 
+mod acme;
 mod alerts;
 mod alerts_engine;
 mod archive;
@@ -283,6 +284,11 @@ enum Cmd {
         #[command(subcommand)]
         action: AgentAction,
     },
+    /// M5：ACME 服务端证书状态 / 强制签发 / 到期续期。
+    Tls {
+        #[command(subcommand)]
+        action: TlsAction,
+    },
     /// 查看当前使用的端口与访问地址。
     Ports {
         #[arg(short, long)]
@@ -348,6 +354,26 @@ enum ArchiveAction {
     },
     /// 立即执行一轮归档（忽略每日计划时间，同样只处理已到期数据）。
     Run {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+}
+
+/// `tls` 子命令（M5 Phase C C4）。
+#[derive(Subcommand)]
+enum TlsAction {
+    /// 只读打印模式、域名、profile、directory 与当前证书信息（SAN/到期/指纹）。
+    Status {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// 强制重新签发并安装 ACME 证书（旧材料成对备份；失败保留旧证书）。
+    Issue {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// 仅在到期前续期（剩余寿命 > min(lifetime/3, 48h) 时不做任何网络请求）。
+    Renew {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
@@ -506,6 +532,11 @@ fn main() -> Result<()> {
                 ttl_minutes,
             } => agent_add(config, name, ttl_minutes),
             AgentAction::Revoke { config, id } => agent_revoke(config, id),
+        },
+        Cmd::Tls { action } => match action {
+            TlsAction::Status { config } => tls_status(config),
+            TlsAction::Issue { config } => tls_issue(config),
+            TlsAction::Renew { config } => tls_renew(config),
         },
         Cmd::Ports { config } => print_ports(config),
         Cmd::Maintenance { action } => maintenance_command(action),
@@ -967,12 +998,35 @@ fn init(
         server_days: cfg.server_cert_validity_days,
         client_days: cfg.client_cert_validity_days,
     };
-    let fingerprint = tls::ensure_hub_material(&cfg.data_dir, &cfg.server_names, policy)?;
+    // C3：self-signed 生成/复用 CA + 服务端证书；ACME 只准备客户端证书 CA，
+    // 服务端证书必须由 `tls issue` 从 ACME 获取，绝不写自签 server 材料。
+    let fingerprint = if cfg.tls.mode.is_acme() {
+        tls::ensure_client_ca(&cfg.data_dir, policy)?;
+        None
+    } else {
+        Some(tls::ensure_hub_material(
+            &cfg.data_dir,
+            &cfg.server_names,
+            policy,
+        )?)
+    };
     cfg.save(&path)?;
 
     println!("已写入配置: {}", path.display());
     println!("证书目录: {}", tls::cert_dir(&cfg.data_dir).display());
-    println!("服务端证书指纹: {fingerprint}");
+    match &fingerprint {
+        Some(fingerprint) => println!("服务端证书指纹: {fingerprint}"),
+        None => {
+            println!(
+                "ACME 模式（{}）：只生成客户端证书 CA，未写 server.crt/server.key。",
+                cfg.tls.mode.as_str()
+            );
+            println!(
+                "  下一步获取 ACME 证书: rustboard-hub tls issue --config {}",
+                path.display()
+            );
+        }
+    }
     println!(
         "证书有效期: CA {} 天 / 服务端 {} 天 / 客户端 {} 天（剩余 ≤ {} 天时自动续签）",
         cfg.ca_validity_days,
@@ -998,6 +1052,9 @@ fn init(
                 cfg.admin_listen
             );
         }
+    } else if cfg.tls.mode.is_acme() {
+        println!("管理 API HTTPS：使用 ACME 证书（server-auth，不要求客户端证书）");
+        println!("  证书 SAN 必须覆盖管理端访问地址（tls.domains）；取得证书后重启 hub 生效。");
     } else {
         println!("管理 API HTTPS：复用 server.crt / server.key（server-auth，不要求客户端证书）");
         println!("  证书 SAN 必须包含管理端访问地址；变更 server_names 后需执行 rotate-cert。");
@@ -1260,6 +1317,14 @@ pub(crate) fn new_secret() -> String {
 fn rotate_cert(config: Option<PathBuf>, force: bool, days: Option<u32>) -> Result<()> {
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
     let cfg = load_config(&path)?;
+    // C3：ACME 模式的服务端证书由 ACME 管理，绝不能走自签 rotate。
+    if cfg.tls.mode.is_acme() {
+        bail!(
+            "当前证书来源是 {}，不能使用 rotate-cert；请用 `rustboard-hub tls issue`（强制重签）\
+             或 `rustboard-hub tls renew`（到期续期）",
+            cfg.tls.mode.as_str()
+        );
+    }
     let dir = tls::cert_dir(&cfg.data_dir);
     let cert_path = dir.join(tls::SERVER_CERT_FILE);
 
@@ -1343,8 +1408,180 @@ fn rotate_cert(config: Option<PathBuf>, force: bool, days: Option<u32>) -> Resul
     Ok(())
 }
 
-/// 数据库文件的直接父目录是否就是要声明的私有 `data_dir`。
-///
+/// `rustboard-hub tls status`：只读展示证书来源、公开状态与当前证书信息。
+fn tls_status(config: Option<PathBuf>) -> Result<()> {
+    let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
+    let cfg = load_config(&path)?;
+    cfg.validate().context("hub 配置校验失败")?;
+    println!("配置文件: {}", path.display());
+    println!("证书来源: {}", cfg.tls.mode.as_str());
+    println!("证书名字: {}", cfg.effective_server_names().join(", "));
+    println!(
+        "profile: {}",
+        acme::effective_profile(&cfg.tls).unwrap_or("(未设置)")
+    );
+    println!("挑战: {}", cfg.tls.challenge.as_str());
+    println!("ACME directory: {}", cfg.tls.acme_directory);
+    let ca_file = cfg.tls.acme_ca_file.trim();
+    println!(
+        "自定义 ACME CA: {}",
+        if ca_file.is_empty() {
+            "(系统根)"
+        } else {
+            ca_file
+        }
+    );
+
+    let material = acme::store::read_server_material(&cfg.data_dir)
+        .context("读取服务端证书材料失败（状态只读，不写盘）")?;
+    let Some(material) = material else {
+        println!("服务端证书: 未签发");
+        if cfg.tls.mode.is_acme() {
+            println!(
+                "  执行 `rustboard-hub tls issue --config {}` 获取证书",
+                path.display()
+            );
+            bail!(
+                "ACME 服务端证书缺失（{}）",
+                tls::cert_dir(&cfg.data_dir)
+                    .join(tls::SERVER_CERT_FILE)
+                    .display()
+            );
+        }
+        println!(
+            "  执行 `rustboard-hub init --config {}` 生成自签证书",
+            path.display()
+        );
+        bail!(
+            "服务端证书缺失（{}）",
+            tls::cert_dir(&cfg.data_dir)
+                .join(tls::SERVER_CERT_FILE)
+                .display()
+        );
+    };
+    let names = tls::public_cert_names(&material.cert_pem).context("读取证书 SAN 失败")?;
+    let (not_before, not_after) = tls::validity_unix(&material.cert_pem)?;
+    println!(
+        "服务端证书: {}",
+        tls::cert_dir(&cfg.data_dir)
+            .join(tls::SERVER_CERT_FILE)
+            .display()
+    );
+    println!("  SAN: {}", names.join(", "));
+    println!("  notBefore: {}", tls::format_unix_utc(not_before));
+    println!("  notAfter: {}", tls::format_unix_utc(not_after));
+    println!(
+        "  剩余天数: {}",
+        tls::days_left(&material.cert_pem, now_ms())?
+    );
+    println!("  指纹: {}", tls::fingerprint_of_pem(&material.cert_pem)?);
+
+    if cfg.tls.mode.is_acme() {
+        match acme::store::read_state(&cfg.data_dir)? {
+            Some(state) => {
+                println!(
+                    "上次签发: {}",
+                    state
+                        .last_issue_unix
+                        .map(tls::format_unix_utc)
+                        .unwrap_or_else(|| "(无)".to_string())
+                );
+                println!(
+                    "下次计划尝试: {}",
+                    state
+                        .next_attempt_unix
+                        .map(tls::format_unix_utc)
+                        .unwrap_or_else(|| "(无)".to_string())
+                );
+                if let Some(error) = state.last_error {
+                    println!("最近错误: {error}");
+                }
+            }
+            None => println!("ACME 状态: 尚未创建（首次 issue 后写入）"),
+        }
+    }
+    Ok(())
+}
+
+/// `rustboard-hub tls issue`：强制重新签发 ACME 证书并原子安装。
+fn tls_issue(config: Option<PathBuf>) -> Result<()> {
+    let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
+    let cfg = load_config(&path)?;
+    cfg.validate().context("hub 配置校验失败")?;
+    if !cfg.tls.mode.is_acme() {
+        bail!(
+            "当前证书来源是 {}，不是 ACME；自签证书请使用 `rustboard-hub rotate-cert --force`",
+            cfg.tls.mode.as_str()
+        );
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let issued = runtime.block_on(acme::renewal::issue_and_install(&cfg))?;
+    println!("ACME 证书已签发并安装（已有旧材料时已成对备份）");
+    print_issued_cert(&issued);
+    println!(
+        "运行中的 hub 会在 ≤10s 内热加载新证书（无需重启）；\
+         若当前没有运行中的 hub，下次启动会直接使用新证书。"
+    );
+    Ok(())
+}
+
+/// `rustboard-hub tls renew`：仅在到期前续期；未到窗口时零网络请求、零写入。
+fn tls_renew(config: Option<PathBuf>) -> Result<()> {
+    let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
+    let cfg = load_config(&path)?;
+    cfg.validate().context("hub 配置校验失败")?;
+    if !cfg.tls.mode.is_acme() {
+        bail!(
+            "当前证书来源是 {}，不是 ACME；自签证书请使用 `rustboard-hub rotate-cert`",
+            cfg.tls.mode.as_str()
+        );
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    match runtime.block_on(acme::renewal::renew_if_due(&cfg, None))? {
+        Some(issued) => {
+            println!("ACME 证书已续期并安装（已有旧材料时已成对备份）");
+            print_issued_cert(&issued);
+            println!("运行中的 hub 会在 ≤10s 内热加载新证书（无需重启）。");
+        }
+        None => {
+            let material = acme::store::read_server_material(&cfg.data_dir)?
+                .context("未到续期窗口，但服务端证书材料缺失")?;
+            println!(
+                "当前证书剩余 {} 天，高于续期阈值 min(lifetime/3, 48h)，未续期。",
+                tls::days_left(&material.cert_pem, now_ms())?
+            );
+            println!(
+                "  证书到期: {}",
+                tls::format_unix_utc(tls::not_after_unix(&material.cert_pem)?)
+            );
+            println!("  立即强制重签请执行 `rustboard-hub tls issue`。");
+        }
+    }
+    Ok(())
+}
+
+/// 打印 ACME 签发结果的公开信息（绝不打印私钥或 token）。
+fn print_issued_cert(issued: &acme::client::IssuedCert) {
+    println!(
+        "  服务端证书指纹: {}",
+        tls::fingerprint_of_pem(&issued.cert_pem).unwrap_or_else(|_| "(无法解析)".to_string())
+    );
+    println!(
+        "  证书到期: {}（剩余 {} 天）",
+        tls::format_unix_utc(issued.not_after),
+        tls::days_left(&issued.cert_pem, now_ms()).unwrap_or(0)
+    );
+    match tls::public_cert_names(&issued.cert_pem) {
+        Ok(names) => println!("  证书 SAN: {}", names.join(", ")),
+        Err(err) => println!("  证书 SAN: 无法解析（{err}）"),
+    }
+}
+
+/// 数据库文件的直接父目录是否就是要声明的私有 `data_dir`。///
 /// 只有「非空父目录且恰好等于 `data_dir`」才允许走
 /// [`SqliteStorage::open_with_private_data_dir`] 收紧目录权限；相对路径（父目录为空）
 /// 与外置数据库一律返回 false，调用方走普通构造，绝不 chmod 可能共享的父目录。
@@ -1459,8 +1696,8 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         // KI-21：证书目录同样是 hub 专用目录，旧版本的 0755 在启动时收紧到 0700；
         // 目录不存在时保持缺失，由后续构建/自愈流程暴露真实错误。
         harden_existing_cert_dir(&cfg.data_dir)?;
-        // 启动自愈：上次续签在写盘中途被中断时，key/cert 会不配套，
-        // 直接构建配置会永久失败；这里用 CA 强制重签一对再继续。
+        // 启动加载：self-signed 允许有限自愈（配对损坏/仅过期）；ACME 只加载/校验，
+        // 证书缺失时给 `rustboard-hub tls issue` 的明确提示，绝不自签。
         let tls_config = cert_rotation::load_or_repair_tls_config(&cfg)?;
         // KI-10：记录初始监听器证书摘要，供 `/api/v1/system` 区分 live 与 disk。
         let initial_cert = cert_rotation::read_disk_cert_status(&cfg)
@@ -1471,7 +1708,12 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
                 std::fs::read_to_string(tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE))?;
             tls::fingerprint_of_pem(&pem)?
         };
-        tracing::info!(fingerprint, "TLS 已启用");
+        tracing::info!(
+            fingerprint,
+            mode = cfg.tls.mode.as_str(),
+            names = %cfg.effective_server_names().join(","),
+            "TLS 已启用"
+        );
         // 管理端 watcher 以「启动时实际构建配置的证书」为基线，而不是启动后读 live：
         // 避免极端竞态下把启动后才切换的指纹误当成已加载。
         let initial_admin_fingerprint = fingerprint.clone();
@@ -1507,11 +1749,19 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
 
         spawn_revoke_watcher(storage.clone(), sessions);
 
-        // 服务端证书续签：每 `cert_check_interval_secs` 检查一次，需要时重签并把新的
-        // rustls 配置推进 watch；accept 循环每条新连接读一次，老连接不受影响。
+        // 服务端证书续期：self-signed 用本地 CA 重签；ACME 用 orders/挑战续期。
+        // 两者都通过 watch 推送新 rustls 配置；accept 循环每条新连接读一次。
         let (tls_tx, tls_rx) = watch::channel(tls_config);
-        cert_rotation::spawn_server_renewal(state.cfg.clone(), tls_tx.clone(), live_cert.clone());
-        // KI-10：每 10s 轮询磁盘证书，运行中 rotate 后 mTLS ≤10s 热加载；
+        if cfg.tls.mode.is_acme() {
+            acme::renewal::spawn_acme_renewal(state.cfg.clone(), tls_tx.clone());
+        } else {
+            cert_rotation::spawn_server_renewal(
+                state.cfg.clone(),
+                tls_tx.clone(),
+                live_cert.clone(),
+            );
+        }
+        // KI-10：每 10s 轮询磁盘证书，运行中 rotate/issue 后 mTLS ≤10s 热加载；
         // 管理端 watcher 每 2s 跟随 live_cert，合计最迟约 12s（对外承诺 ≤15s）。
         cert_rotation::spawn_cert_file_watcher(state.cfg.clone(), tls_tx, live_cert.clone());
 
@@ -1521,7 +1771,7 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
         let admin_tls = match cfg.admin_tls {
             AdminTlsMode::Off => None,
             AdminTlsMode::Required => {
-                let config = tls::admin_server_config(&cfg.data_dir, &cfg.server_names)
+                let config = cert_rotation::build_admin_server_config(&cfg)
                     .context("构建管理 API TLS 配置失败")?;
                 let (admin_tx, admin_rx) = watch::channel(config);
                 spawn_admin_tls_watcher(
@@ -1559,7 +1809,11 @@ fn run(cfg: HubConfig, db_path: PathBuf) -> Result<()> {
 
         let agent_addr = cfg.agent_listen.clone();
         let admin_addr = cfg.admin_listen.clone();
-        tracing::info!(%agent_addr, "agent 接入监听（TLS）");
+        tracing::info!(
+            %agent_addr,
+            mode = cfg.tls.mode.as_str(),
+            "agent 接入监听（TLS）"
+        );
         match cfg.admin_tls {
             AdminTlsMode::Off => {
                 tracing::info!(%admin_addr, "管理 API 监听（HTTP，仅回环）");
@@ -1616,19 +1870,20 @@ fn validate_admin_tls(cfg: &HubConfig) -> Result<()> {
         }
         AdminTlsMode::Required => {
             let ip = sock.ip();
+            // self-signed 用 server_names；ACME 用 tls.domains（effective_server_names）。
+            let effective_names = cfg.effective_server_names();
             if ip.is_unspecified() {
                 // 通配绑定不知道客户端用哪个地址访问，跳过精确 SAN 检查；但如果
-                // server_names 只有回环名，远端客户端必然校验证书失败，提前告警。
-                if all_loopback_server_names(&cfg.server_names) {
+                // 证书名字只有回环名，远端客户端必然校验证书失败，提前告警。
+                if all_loopback_server_names(&effective_names) {
                     tracing::warn!(
-                        "管理 API 使用通配绑定，但 server_names 全部是回环名；\
-                         远端客户端校验证书会失败，请补充可访问的 IP / DNS SAN 后执行 rotate-cert"
+                        "管理 API 使用通配绑定，但证书名字全部是回环名；\
+                         远端客户端校验证书会失败，请补充可访问的 IP / DNS SAN 后重新签发"
                     );
                 }
                 return Ok(());
             }
-            let names: Vec<&str> = cfg
-                .server_names
+            let names: Vec<&str> = effective_names
                 .iter()
                 .map(|name| name.trim())
                 .filter(|name| !name.is_empty())
@@ -1644,9 +1899,11 @@ fn validate_admin_tls(cfg: &HubConfig) -> Result<()> {
                 !ip.is_loopback() && names.iter().any(|name| name.parse::<IpAddr>().is_err());
             if !covered && !dns_covered {
                 bail!(
-                    "admin_tls=\"required\" 且管理 API 绑定 {ip}，但 server_names 中既没有该 IP SAN、\
-                     也没有可用于远端访问的 DNS SAN；请先把 {ip}（或管理端 DNS 名）加入 \
-                     server_names，再执行 `rustboard-hub rotate-cert --force` 重签服务端证书"
+                    "admin_tls=\"required\" 且管理 API 绑定 {ip}，但证书名字（server_names / \
+                     ACME tls.domains）中既没有该 IP SAN、也没有可用于远端访问的 DNS SAN；\
+                     请先把 {ip}（或管理端 DNS 名）加入 server_names / tls.domains，\
+                     self-signed 执行 `rustboard-hub rotate-cert --force`，\
+                     ACME 执行 `rustboard-hub tls issue` 重新签发证书"
                 );
             }
         }
@@ -1991,8 +2248,8 @@ fn reload_admin_tls_if_changed(
     if current == last_fingerprint {
         return Ok(None);
     }
-    let config = tls::admin_server_config(&cfg.data_dir, &cfg.server_names)
-        .context("管理 API TLS 配置构建失败")?;
+    let config = cert_rotation::build_admin_server_config(cfg)
+        .context("管理 API TLS 配置构建失败（检查证书 SAN / 有效期 / EKU）")?;
     // 构建期间证书可能又被 rotate：与 mTLS 热加载一致，本周期跳过，下周期重试。
     let confirmed = cert_rotation::read_disk_cert_status(cfg)?;
     if confirmed.fingerprint != current {
