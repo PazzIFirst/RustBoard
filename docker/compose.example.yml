@@ -1,4 +1,4 @@
-# RustBoard Docker Compose 示例（Phase B）。
+# RustBoard Docker Compose 示例（Phase B/C）。
 #
 # 使用前请：
 # 1. 准备 dist/<arch>/bin 与 web/dist，构建三个镜像（见 docker/README.md）；
@@ -10,8 +10,16 @@
 # 启动 agent（默认不启动）：
 #   RUSTBOARD_VERSION=v1.0.0 docker compose -f docker/compose.example.yml --profile agent up -d
 #
+# TLS 默认是 self-signed，安装阶段自动 --offline（与 Phase B 一致）。
+# 需要 ACME（HTTP-01 / TLS-ALPN-01）时改用叠加文件；它会给 hub 发布 80/443，
+# 并把 RUSTBOARD_TLS_MODE 切到 acme-domain：
+#   docker compose -f docker/compose.example.yml \
+#     -f docker/compose.acme.example.yml up -d
+# 本文件默认不发布 80/443，避免不需要 ACME 的部署多开端口。
+#
 # 注意：hub 与 panel 共享 network namespace。panel 必须通过 127.0.0.1:8444
-# 访问 hub 管理 API，而 Phase B 的管理口仍只允许回环明文。
+# 访问 hub 管理 API；默认管理口仍是回环明文。`RUSTBOARD_ADMIN_TLS=required`
+# 可启用管理端 HTTPS，但必须同时覆盖 healthcheck（见 docker/README.md §8）。
 
 name: rustboard
 
@@ -30,14 +38,27 @@ services:
       - hub_data:/data
       # 可选共享 admin token。它是敏感卷，只给 hub 写、panel 只读挂载。
       - hub_run:/run/rustboard
+      # 可选（仅私有 / Pebble ACME）：只读挂载 CA PEM，并把
+      # RUSTBOARD_ACME_CA_FILE 设为容器内路径（默认不挂载）。
+      # - ./secrets/acme-ca.pem:/run/rustboard/acme-ca.pem:ro
     environment:
       RUSTBOARD_LISTEN: "0.0.0.0:8443"
       RUSTBOARD_ADMIN_LISTEN: "127.0.0.1:8444"
       RUSTBOARD_ADMIN_TOKEN_SHARE: "/run/rustboard/admin_token"
       RUSTBOARD_NAME: "${RUSTBOARD_HUB_NAME:-rustboard-hub}"
+      # 默认自签证书；安装阶段 entrypoint 自动追加 --offline。
+      RUSTBOARD_TLS_MODE: "self-signed"
+      # 可选：管理 API 明文（off，默认，仅回环）或 HTTPS（required）。
+      # required 时镜像内置 healthcheck 会失败，必须按 docker/README.md §8 覆盖。
+      # RUSTBOARD_ADMIN_TLS: "required"
+      # ACME 变量只在首次安装且 RUSTBOARD_TLS_MODE=acme-* 时使用；本文件不启用。
+      # 如需 ACME 请用 docker/compose.acme.example.yml 叠加，并把 80/443 发布出去。
+      # RUSTBOARD_ACME_EMAIL / RUSTBOARD_ACME_DOMAIN / RUSTBOARD_ACME_CHALLENGE
+      # RUSTBOARD_ACME_PROFILE / RUSTBOARD_ACME_CA_FILE / RUSTBOARD_ACME_DIRECTORY
       # 必须换成 agent 实际连接的域名 / IP；它会进入服务端证书 SAN。
       RUSTBOARD_ADVERTISE: "${RUSTBOARD_HUB_ADVERTISE:-hub.example.com}"
       # 可选：额外 SAN，逗号分隔（例如 "10.0.0.10,hub.example.com"）。
+      # ACME 模式下证书 SAN 由 ACME 标识决定，这里只影响回退自签的证书。
       RUSTBOARD_SAN: "${RUSTBOARD_HUB_SAN:-}"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8444/healthz"]

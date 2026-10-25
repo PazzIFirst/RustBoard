@@ -12,6 +12,27 @@
 
 ### Added
 
+- Phase C ACME 服务端证书：hub `[tls]` 新增 `self-signed` / `acme-domain` /
+  `acme-ip`，基于 `instant-acme 0.8.5`（ring，无 aws-lc）实现 HTTP-01 与
+  TLS-ALPN-01、域名与公网 IPv4 `shortlived` 签发；账户/状态/证书原子落盘并
+  持久化到 `<data_dir>/certs`，新增 `rustboard-hub tls status|issue|renew`
+- Phase C 安装器：ACME 参数校验、80/443 四层只读诊断（本地 bind、ufw/firewalld/
+  nftables/iptables、云元数据、staging 实跑）、最多 3 轮失败回退 self-signed、
+  `--admin-tls required` 的 HTTPS 健康检查（自定义 SNI/CA）
+- Phase C agent TLS 三模式：`fingerprint`（旧默认）/ `system-roots` / `custom-ca`，
+  安装器新增 `--tls-mode` / `--server-ca`；ACME hub 的 `agent add` 输出按模式
+  生成命令并提示旧指纹 agent 升级
+- Phase C 面板直连 HTTPS：`--tls-cert` / `--tls-key` / `--hub-ca` /
+  `--public-origin` / `--cookie-secure`，证书/私钥配套、有效期、SAN、权限与
+  符号链接在写盘前校验；直连 TLS 强制 Cookie Secure，支持 hub `admin_tls=required`
+- Phase C Docker/Compose：hub 镜像 `EXPOSE 8443 80 443`（80/443 仅 ACME 元数据，
+  默认不发布）、`RUSTBOARD_TLS_MODE`/`RUSTBOARD_ACME_*`、`docker/compose.acme.example.yml`
+  叠加文件、降权后保留 `NET_BIND_SERVICE` 供自动续期绑定 80/443
+- Phase C 文档：`docs/install/tls.md`、`panel-tls.md`、`troubleshooting.md`，并更新
+  `acme.md`、`docker.md`、`offline.md`、`release.md`、`docker/README.md` 与 README
+- Phase C 发布门禁（C1）：release workflow 增加 `delivery-docker`、
+  `delivery-arm64`，checkout 固定 `github.sha`，正式发布 job 增加
+  `environment: release` 人工审批
 - M5 Phase B 交付物：`packaging/build-release.sh` 以固定
   `rust:1.89-alpine@sha256:4b800f2e...` 在 buildx 目标平台 native 构建
   `x86_64`/`aarch64` 静态 musl 二进制，生成 `serverdashboard-v<version>-<arch>.tar.gz`、
@@ -43,6 +64,16 @@
 
 ### Changed
 
+- Phase C：新增配置字段全部 `#[serde(default)]`；旧 `hub.toml`/`agent.toml`/
+  `panel.toml` 无 TLS 字段时行为与 v0.4.2 一致（self-signed + 指纹、面板 HTTP）
+- ACME 模式由 `acme_renewal` 管理：剩余寿命 ≤ `min(lifetime/3, 48h)` 时续期，
+  失败按 1m/5m/15m/1h/6h 退避并保留旧证书，成功后热加载新连接；self-signed
+  仍由 `cert_rotation` 续签
+- Docker 默认行为保持 self-signed + 安装阶段 `--offline`，默认 compose 仍不发布
+  80/443；ACME 需显式叠加 `docker/compose.acme.example.yml`，不会影响既有
+  Docker 门禁
+- `--offline` 与 ACME 硬互斥；显式 `--tls acme-*` 时离线包不自动追加 `--offline`，
+  默认 self-signed 仍自动离线
 - hub/panel/agent 的 systemd unit 以 root 运行并启用 `NoNewPrivileges`、
   `PrivateTmp`、`ProtectSystem=strict`、最小 `ReadWritePaths`；配置/私钥 0600、
   数据目录 0700。Phase A 暂不引入专用服务用户，Phase E 评估
@@ -53,6 +84,17 @@
 
 ### Security
 
+- Phase C ACME：账户 credentials、证书私钥 0600，key authorization/私钥不进 argv、
+  日志或错误输出；ACME directory 只允许 `https://` 且拒绝 userinfo/fragment，
+  挑战服务限制 Host/SNI、请求大小与超时；失败保留旧证书
+- Phase C 面板/admin TLS：私钥 0600、证书不允许 group/other 写，拒绝符号链接与
+  不配套证书；直连 TLS 强制 Cookie Secure；`admin_tls=required` 才能绑定非回环
+  管理口；面板 `hub_ca` 只与 `https://` hub 搭配
+- Phase C Docker：8444 仍不 EXPOSE/不发布；ACME 80/443 仅作为镜像元数据，默认
+  compose 不发布；entrypoint 保留的 `NET_BIND_SERVICE` 仅用于 80/443 挑战，
+  继续以 UID/GID 10001、`--no-new-privs` 运行
+- Phase C 安装器在写盘前拒绝 `--offline` + ACME、缺失邮箱/域名、非法 challenge/
+  profile/directory/CA 与不可绑定 80/443；ACME 失败不伪造成功，回退后状态可查
 - 离线包 `install.sh` 在写任何文件之前完成 SHA256SUMS、ELF 架构/版本和 prefix
   所有权校验；web 用 staging + rename 原子替换；拒绝明文 secret argv
 - Docker 镜像不包含 `/etc/rustboard`、私钥或 token；hub/panel/agent 主进程均降权到

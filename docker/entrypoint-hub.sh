@@ -2,11 +2,16 @@
 # RustBoard Hub 容器入口。
 #
 # 安全约定：
-# - 不启用 set -x，不打印 admin token / 私钥 / 配置内容；
+# - 不启用 set -x，不打印 admin token / 私钥 / ACME 账户 key / 配置内容；
 # - 首次启动以 root 执行 `rustboard-hub install`、收紧权限并 chown 到 10001，
 #   随后用 setpriv 降权；主进程始终以 UID/GID 10001 运行；
+# - 降权时只保留 NET_BIND_SERVICE（inheritable + ambient）：ACME 自动续期在
+#   运行期仍需临时绑定 80/443，其余能力不保留、--no-new-privs 继续生效；
+# - TLS 模式由 RUSTBOARD_TLS_MODE 控制（默认 self-signed，安装阶段追加 --offline）；
+#   ACME 模式读取 RUSTBOARD_ACME_* 并在首次安装时映射为 CLI 参数，绝不追加
+#   --offline；缺失/非法参数在写盘前失败；
 # - 已初始化的 volume 支持 `docker run --user 10001:10001`，此时只校验配置可读，
-#   不执行 install / chown；
+#   不执行 install / chown；非 root 启动不保留绑定低端口的能力，不建议用于 ACME；
 # - 失败时以非零码退出，不启动服务，也不删除已有 /data 数据。
 
 set -euo pipefail
@@ -20,6 +25,20 @@ readonly HUB_DATA_DIR=/data/var/lib/rustboard/hub
 readonly HUB_BIN=/usr/local/bin/rustboard-hub
 readonly SETPRIV=/usr/bin/setpriv
 
+# 服务端证书来源：self-signed（默认）/ acme-domain / acme-ip。
+# ACME 只允许在首次安装时通过环境变量选择；已有配置以 hub.toml 为准。
+readonly TLS_MODE="${RUSTBOARD_TLS_MODE:-self-signed}"
+# 管理 API：off（默认，仅回环 HTTP）/ required（HTTPS）。
+readonly ADMIN_TLS_MODE="${RUSTBOARD_ADMIN_TLS:-}"
+
+# ACME 安装参数；只在首次安装且 TLS_MODE 为 acme-* 时填充。
+ACME_EMAIL=""
+ACME_CHALLENGE=""
+ACME_DIRECTORY=""
+ACME_PROFILE=""
+ACME_CA_FILE=""
+ACME_DOMAINS=()
+
 log() {
   printf '[entrypoint-hub] %s\n' "$*" >&2
 }
@@ -27,6 +46,161 @@ log() {
 die() {
   log "错误: $*"
   exit 1
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+# 环境变量本身可以提前失败；它们不会写配置，也不包含 secret。
+validate_tls_mode_env() {
+  case "$TLS_MODE" in
+    self-signed|acme-domain|acme-ip) ;;
+    *) die "RUSTBOARD_TLS_MODE 只接受 self-signed / acme-domain / acme-ip" ;;
+  esac
+  case "$ADMIN_TLS_MODE" in
+    ""|off|required) ;;
+    *) die "RUSTBOARD_ADMIN_TLS 只接受 off / required" ;;
+  esac
+}
+
+has_acme_env() {
+  [ -n "${RUSTBOARD_ACME_EMAIL:-}" ] \
+    || [ -n "${RUSTBOARD_ACME_DOMAIN:-}" ] \
+    || [ -n "${RUSTBOARD_ACME_CHALLENGE:-}" ] \
+    || [ -n "${RUSTBOARD_ACME_PROFILE:-}" ] \
+    || [ -n "${RUSTBOARD_ACME_CA_FILE:-}" ] \
+    || [ -n "${RUSTBOARD_ACME_DIRECTORY:-}" ]
+}
+
+# 当前进程是否仍有 CAP_NET_BIND_SERVICE（bit 10）。只用于非 root 启动提示；
+# /proc 不可读时按“没有”处理，提示偏保守。
+has_net_bind_service() {
+  local cap_eff
+  cap_eff="$(awk '$1 == "CapEff:" { print $2; exit }' /proc/self/status 2>/dev/null || true)"
+  [ -n "$cap_eff" ] || return 1
+  (( (16#$cap_eff & (1 << 10)) != 0 ))
+}
+
+# 在写盘 / 调用 install 之前校验 ACME 环境变量。错误信息只说明哪个变量不合法，
+# 不回显邮箱、域名或配置内容；证书私钥/账户 key 不会出现在环境变量里。
+validate_acme_env() {
+  local raw challenge directory profile ca domain adv matched
+  local -a parts=()
+
+  raw="$(trim "${RUSTBOARD_ACME_EMAIL:-}")"
+  [ -n "$raw" ] || die "ACME 模式需要 RUSTBOARD_ACME_EMAIL（联系方式，不会打印该值）"
+  case "$raw" in
+    *[[:space:][:cntrl:]]*|*"@"*"@"*)
+      die "RUSTBOARD_ACME_EMAIL 格式非法（不能含空白/控制字符或重复 @）" ;;
+  esac
+  case "$raw" in
+    *@*) ;;
+    *) die "RUSTBOARD_ACME_EMAIL 格式非法（缺少 @）" ;;
+  esac
+  ACME_EMAIL="$raw"
+
+  raw="$(trim "${RUSTBOARD_ACME_DOMAIN:-}")"
+  [ -n "$raw" ] || die "ACME 模式需要 RUSTBOARD_ACME_DOMAIN（多个用逗号分隔）"
+  ACME_DOMAINS=()
+  IFS=',' read -r -a parts <<< "$raw"
+  for domain in "${parts[@]}"; do
+    domain="$(trim "$domain")"
+    [ -n "$domain" ] || die "RUSTBOARD_ACME_DOMAIN 含空条目"
+    case "$domain" in
+      *[[:space:][:cntrl:]]*) die "RUSTBOARD_ACME_DOMAIN 含空白或控制字符" ;;
+      *"*"*) die "不支持通配符证书；请逐个列出域名" ;;
+    esac
+    ACME_DOMAINS+=("$domain")
+  done
+  [ "${#ACME_DOMAINS[@]}" -gt 0 ] || die "RUSTBOARD_ACME_DOMAIN 不能为空"
+  if [ "$TLS_MODE" = "acme-ip" ]; then
+    [ "${#ACME_DOMAINS[@]}" -eq 1 ] || die "RUSTBOARD_TLS_MODE=acme-ip 需要恰好一个 IPv4"
+    if ! [[ "${ACME_DOMAINS[0]}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      die "RUSTBOARD_TLS_MODE=acme-ip 的 RUSTBOARD_ACME_DOMAIN 不是 IPv4"
+    fi
+  else
+    [ "${#ACME_DOMAINS[@]}" -le 20 ] || die "RUSTBOARD_TLS_MODE=acme-domain 最多 20 个域名"
+  fi
+
+  challenge="$(trim "${RUSTBOARD_ACME_CHALLENGE:-http-01}")"
+  case "$challenge" in
+    http-01|tls-alpn-01) ;;
+    *) die "RUSTBOARD_ACME_CHALLENGE 只接受 http-01 / tls-alpn-01" ;;
+  esac
+  ACME_CHALLENGE="$challenge"
+
+  directory="$(trim "${RUSTBOARD_ACME_DIRECTORY:-}")"
+  if [ -n "$directory" ]; then
+    case "$directory" in
+      https://*) ;;
+      *) die "RUSTBOARD_ACME_DIRECTORY 必须以 https:// 开头" ;;
+    esac
+    case "$directory" in
+      *[[:space:][:cntrl:]]*|*"@"*|*"#"*)
+        die "RUSTBOARD_ACME_DIRECTORY 含非法字符（空白 / userinfo / fragment）" ;;
+    esac
+  fi
+  ACME_DIRECTORY="$directory"
+
+  profile="$(trim "${RUSTBOARD_ACME_PROFILE:-}")"
+  if [ -n "$profile" ] && ! [[ "$profile" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+    die "RUSTBOARD_ACME_PROFILE 只允许 1–64 个字母 / 数字 / - / _"
+  fi
+  ACME_PROFILE="$profile"
+
+  ca="$(trim "${RUSTBOARD_ACME_CA_FILE:-}")"
+  if [ -n "$ca" ]; then
+    case "$ca" in
+      /*) ;;
+      *) die "RUSTBOARD_ACME_CA_FILE 必须是容器内绝对路径" ;;
+    esac
+    [ -f "$ca" ] || die "RUSTBOARD_ACME_CA_FILE 不是普通文件（请只读挂载 PEM）"
+    [ -r "$ca" ] || die "RUSTBOARD_ACME_CA_FILE 不可读"
+  fi
+  ACME_CA_FILE="$ca"
+
+  # ACME 证书只覆盖 RUSTBOARD_ACME_DOMAIN。RUSTBOARD_ADVERTISE 用于生成 agent
+  # 安装 URL；若不在证书标识内则忽略，避免写出证书不覆盖的地址。
+  adv="$(trim "${RUSTBOARD_ADVERTISE:-}")"
+  if [ -n "$adv" ]; then
+    matched=0
+    for domain in "${ACME_DOMAINS[@]}"; do
+      if [ "${domain,,}" = "${adv,,}" ]; then
+        matched=1
+        break
+      fi
+    done
+    if [ "$matched" -ne 1 ]; then
+      log "警告: RUSTBOARD_ADVERTISE 不在 RUSTBOARD_ACME_DOMAIN 中，已忽略（将使用第一个域名）"
+      RUSTBOARD_ADVERTISE=""
+    fi
+  fi
+}
+
+# 把已校验的 ACME 参数追加到 install_args。调用前必须已执行 validate_acme_env。
+append_acme_install_args() {
+  local domain
+  install_args+=(
+    --tls "$TLS_MODE"
+    --acme-email "$ACME_EMAIL"
+    --acme-challenge "$ACME_CHALLENGE"
+  )
+  for domain in "${ACME_DOMAINS[@]}"; do
+    install_args+=(--domain "$domain")
+  done
+  if [ -n "$ACME_PROFILE" ]; then
+    install_args+=(--acme-profile "$ACME_PROFILE")
+  fi
+  if [ -n "$ACME_CA_FILE" ]; then
+    install_args+=(--acme-ca "$ACME_CA_FILE")
+  fi
+  if [ -n "$ACME_DIRECTORY" ]; then
+    install_args+=(--acme-directory "$ACME_DIRECTORY")
+  fi
 }
 
 # 显式参数（例如 `--version` 或排障命令）会跳过初始化，直接 exec。
@@ -198,6 +372,9 @@ share_admin_token_if_requested() {
   log "已写入共享 admin token: $share（内容不打印）"
 }
 
+# 环境变量取值在任何 install / exec 之前校验：非法值不能带进运行阶段。
+validate_tls_mode_env
+
 # 非 root：只允许已初始化 volume，直接运行，避免尝试 chown / install。
 if [ "$(id -u)" -ne 0 ]; then
   validate_config_readable
@@ -205,6 +382,10 @@ if [ "$(id -u)" -ne 0 ]; then
     && [ ! -r "${RUSTBOARD_ADMIN_TOKEN_SHARE}" ]; then
     die "非 root 启动不会生成共享 admin token；请先用 root 启动一次，\
 或确认 ${RUSTBOARD_ADMIN_TOKEN_SHARE} 对 UID $RUSTBOARD_UID 可读。"
+  fi
+  if ! has_net_bind_service; then
+    log "提示: 非 root 启动未保留 NET_BIND_SERVICE；ACME 自动续期需要绑定 80/443，\
+若当前 volume 使用 ACME，请改用默认 root 入口启动（自签模式不受影响）"
   fi
   log "以 uid=$(id -u) 启动：已初始化 volume，跳过 install 与 chown"
   exec "$HUB_BIN" run --config "$CONFIG_FILE"
@@ -214,11 +395,22 @@ fi
 reject_unsafe_symlinks
 if [ ! -e "$CONFIG_FILE" ]; then
   log "首次初始化：在 $DATA_ROOT 安装 hub（--no-systemd --panel no，不写入镜像）"
+
+  # 先校验 ACME 环境变量，再做任何目录/文件写入：缺失或非法时 /data 不产生
+  # 本次安装残留。self-signed 若混入 ACME 变量也在这里失败，避免静默忽略。
+  if [ "$TLS_MODE" = "self-signed" ]; then
+    if has_acme_env; then
+      die "检测到 RUSTBOARD_ACME_* 但 RUSTBOARD_TLS_MODE=self-signed；\
+请显式设置 RUSTBOARD_TLS_MODE=acme-domain|acme-ip，或移除 ACME 变量"
+    fi
+  else
+    validate_acme_env
+  fi
+
   prepare_first_install_root
 
   install_args=(
     --yes
-    --offline
     --no-systemd
     --prefix /data
     --listen "${RUSTBOARD_LISTEN:-0.0.0.0:8443}"
@@ -227,9 +419,23 @@ if [ ! -e "$CONFIG_FILE" ]; then
     --panel no
   )
 
+  if [ "$TLS_MODE" = "self-signed" ]; then
+    # 默认行为与 Phase B 一致：自签 + 安装阶段 --offline。
+    install_args+=(--offline --tls self-signed)
+    log "TLS 模式: self-signed（安装阶段 --offline）"
+  else
+    # ACME 必须访问 ACME 目录并完成 80/443 挑战，绝不能追加 --offline。
+    log "TLS 模式: $TLS_MODE（不使用 --offline；安装阶段需要访问 ACME 目录并绑定 80/443）"
+    append_acme_install_args
+  fi
+  if [ -n "$ADMIN_TLS_MODE" ]; then
+    install_args+=(--admin-tls "$ADMIN_TLS_MODE")
+  fi
+
   # 可选：把 agent 实际访问的域名/IP 写进服务端证书 SAN。
   # 容器 hostname 通常不是 agent 使用的地址；不设置时 agent 在 enrollment 后
   # 可能因证书 SAN 不匹配而校验证书失败。RUSTBOARD_SAN 用逗号分隔多个值。
+  # ACME 模式的证书 SAN 由 ACME 标识决定；RUSTBOARD_SAN 只影响回退自签的证书。
   if [ -n "${RUSTBOARD_ADVERTISE:-}" ]; then
     install_args+=(--advertise "$RUSTBOARD_ADVERTISE")
   fi
@@ -247,18 +453,22 @@ if [ ! -e "$CONFIG_FILE" ]; then
   fi
 else
   log "检测到已有配置，跳过 install（不删除数据）"
+  if [ "$TLS_MODE" != "self-signed" ] || [ -n "$ADMIN_TLS_MODE" ]; then
+    log "提示: RUSTBOARD_TLS_MODE / RUSTBOARD_ADMIN_TLS 只在首次初始化时生效；\
+当前配置保持不变。模式或管理端 TLS 变更请备份后执行 rustboard-hub install --force"
+  fi
 fi
 
 validate_config_readable
 ensure_initialized_ownership
 share_admin_token_if_requested
 
-log "配置就绪，降权到 $RUSTBOARD_UID:$RUSTBOARD_GID 启动 hub"
+log "配置就绪，降权到 $RUSTBOARD_UID:$RUSTBOARD_GID 启动 hub（保留 NET_BIND_SERVICE）"
 exec "$SETPRIV" \
   --reuid="$RUSTBOARD_UID" \
   --regid="$RUSTBOARD_GID" \
   --clear-groups \
   --no-new-privs \
-  --inh-caps=-all \
-  --ambient-caps=-all \
+  --inh-caps=+net_bind_service \
+  --ambient-caps=+net_bind_service \
   "$HUB_BIN" run --config "$CONFIG_FILE"

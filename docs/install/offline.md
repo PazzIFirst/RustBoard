@@ -1,11 +1,12 @@
-# 离线安装（M5 Phase B）
+# 离线安装（M5 Phase B/C）
 
 离线包面向不能访问外网、也不允许安装器做任何外部网络探测的服务器。包内已经包含
 hub / panel / agent 三个静态 musl 二进制、前端静态资源、systemd unit 参考文件和
 `install.sh`；安装时不需要下载依赖。
 
-> 当前版本按 `Cargo.toml` 为 `0.4.2`，Phase B 产物用 `v0.4.2` 验证；正式
-> `v1.0.0` 发布在 Phase E 完成版本归档后触发。包布局与命令不随版本变化。
+> 当前版本按 `Cargo.toml` 为 `0.4.2`，Phase B 产物用 `v0.4.2` 验证；Phase C 的
+> ACME/面板 TLS 已在主线实现，但尚未完成 C9 全量 e2e/评审/RC。正式 `v1.0.0`
+> 发布在 Phase E 完成版本归档后触发。包布局与命令不随版本变化。
 >
 > 构建/维护说明见 [packaging/README.md](../../packaging/README.md)；Docker 交付见
 > [docker.md](docker.md)。
@@ -86,8 +87,10 @@ sudo ./install.sh agent --yes \
   --fingerprint SHA256:<64-hex>
 ```
 
-`install.sh` 会自动追加 `--offline`，并调用对应二进制的 Phase A 安装器；配置、
-证书、事务回滚、systemd 与健康检查逻辑全部复用 Phase A，不在脚本里重写。
+默认（未显式指定 `--tls`）时，`install.sh` 会自动追加 `--offline` 并调用对应
+二进制的安装器；配置、证书、事务回滚、systemd 与健康检查逻辑全部复用 Phase A，
+不在脚本里重写。显式 `--tls acme-domain|acme-ip` 时**不会**自动追加 `--offline`
+（ACME 必须联网），两者同时出现会在写盘前失败；见 §4.1。
 
 常用参数：
 
@@ -142,6 +145,31 @@ panel 默认从同 prefix 的 `hub.toml` 读取 token；跨 prefix 时必须显�
 
 真正无网环境建议先在测试机校验 tarball 与包内 `SHA256SUMS`，再拷贝到目标机。
 
+### 4.1 离线与 ACME 互斥
+
+ACME 必须访问证书颁发机构并完成 80/443 挑战，不能离线签发。规则是硬约束：
+
+- 默认 self-signed（未显式 `--tls`）仍自动 `--offline`，行为与 Phase B 一致；
+- 显式 `--tls acme-domain|acme-ip` 时，`install.sh` 不自动追加 `--offline`；
+- 同时出现 `--offline` 与 ACME 模式/任何 ACME 参数时，在写 web、解包、校验和、
+  读安装状态之前直接失败；
+- 离线包内的二进制可以之后在线使用；约束只针对“本次安装是否允许联网”。
+
+失败示例（不会写任何文件）：
+
+```bash
+sudo ./install.sh hub --yes --offline \
+  --tls acme-domain --acme-email admin@example.com \
+  --domain board.example.com
+# 错误: --offline 与 ACME 互斥：ACME 必须访问证书颁发机构并完成 80/443 挑战，
+#       离线模式不会发起任何网络请求。请去掉 --offline，或改用 --tls self-signed（默认）
+```
+
+需要 ACME 时去掉 `--offline`（包括离线包附带的自动 `--offline` 行为），并确认
+80/443、DNS、防火墙/安全组；详见 [acme.md](acme.md) 与 [tls.md](tls.md)。Docker
+的等效开关是 `RUSTBOARD_TLS_MODE`（ACME 时不追加 `--offline`），见
+[docker.md](docker.md)。
+
 ## 5. systemd、升级与回滚
 
 - 默认 root prefix 且系统有 systemd 时，安装器写 unit、`enable --now`，通过
@@ -165,3 +193,5 @@ panel 默认从同 prefix 的 `hub.toml` 读取 token；跨 prefix 时必须显�
 | panel 缺 hub token | 用 `--hub-token-file`，或先安装 hub 使其同 prefix 的 `hub.toml` 存在 |
 | 面板页面 503 | 包内 `web/` 未安装到 prefix；检查 `share/rustboard/web/index.html` 与安装日志 |
 | 服务启动失败 | `journalctl -u rustboard-<role>`；不要删除 `/var/lib/rustboard` 数据目录 |
+| `--offline 与 ACME 互斥` | 去掉 `--offline` 或改 self-signed；ACME 必须联网，见 §4.1 |
+| Docker ACME 端口不通 | 默认 compose 不发布 80/443；用 `docker/compose.acme.example.yml` 叠加，见 [docker.md](docker.md) |

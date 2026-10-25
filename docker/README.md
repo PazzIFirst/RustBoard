@@ -1,11 +1,14 @@
 # RustBoard Docker 镜像与 Compose
 
-本文覆盖 Phase B 的 hub / panel / agent 三个运行时镜像。镜像**不编译 Rust**，只复制
+本文覆盖 Phase B/C 的 hub / panel / agent 三个运行时镜像。镜像**不编译 Rust**，只复制
 `packaging/build-release.sh` 产出的 musl 静态二进制和 `web/dist` 前端产物；基础镜像、
-端口、降权和 healthcheck 都在 `docker/Dockerfile` 中固定。
+端口、降权和 healthcheck 都在 `docker/Dockerfile` 中固定。Phase C 增加 ACME
+（80/443 元数据、`RUSTBOARD_TLS_MODE`/`RUSTBOARD_ACME_*`）、面板直连 HTTPS
+与管理端 TLS 的容器侧说明。
 
-> 安全基线：hub 管理 API 仍只绑 `127.0.0.1:8444`，Phase B 不提供管理端 TLS/远程面板。
-> 因此 panel 必须与 hub 共享 network namespace，且**任何情况下都不要把 8444 发布到宿主**。
+> 安全基线：hub 管理 API **默认**仍只绑 `127.0.0.1:8444`；Phase C 支持
+> `RUSTBOARD_ADMIN_TLS=required` 的 HTTPS，但默认示例不启用。panel 默认与 hub
+> 共享 network namespace，且**任何情况下都不要把 8444 发布到宿主**。
 
 ## 1. 构建前提
 
@@ -90,6 +93,9 @@ done
   三个 target 分别构建。镜像构建本身仍要执行 arm64 的 `apt-get`/`useradd` 层，
   因此需要 binfmt/QEMU 或 arm64 builder；Rust 编译不在此 Dockerfile 内发生。
 - `latest` 只用于稳定版本；生产建议固定 `vX.Y.Z` 或 digest。
+- hub 镜像的默认 `EXPOSE` 为 `8443 80 443`：8443 是 agent 入口；80/443 是
+  ACME HTTP-01/TLS-ALPN-01 挑战期间的元数据，默认 compose **不发布**，8444
+  永不 EXPOSE。
 - 本地调试可以只构造成 `rustboard-hub:dev`，再 `docker tag` 成 Compose 里使用的
   `ghcr.io/pazzifirst/rustboard-hub:dev`，并用 `RUSTBOARD_VERSION=dev` 启动。
 
@@ -116,6 +122,16 @@ docker compose -f docker/compose.example.yml ps
 docker compose -f docker/compose.example.yml logs -f hub
 ```
 
+需要 ACME 时叠加专用文件（ACME 默认不发布 80/443，见 §13）：
+
+```bash
+RUSTBOARD_VERSION=v1.0.0 \
+RUSTBOARD_ACME_EMAIL=admin@example.com \
+RUSTBOARD_ACME_DOMAIN=board.example.com \
+docker compose -f docker/compose.example.yml \
+  -f docker/compose.acme.example.yml up -d
+```
+
 启动 agent（下面的 fingerprint 从 `rustboard-hub ports` 的“证书指纹”读取）：
 
 ```bash
@@ -133,6 +149,8 @@ docker compose -f docker/compose.example.yml --profile agent up -d
 - `RUSTBOARD_HUB_ADVERTISE` 只在 hub **首次初始化**时生效，会写进服务端证书 SAN。
   不设置时证书只覆盖容器 hostname、127.0.0.1、localhost；agent 用外部域名/IP 连接时
   会在 enrollment 后的 CA + 主机名校验阶段失败。`RUSTBOARD_SAN` 可追加逗号分隔的 SAN。
+  ACME 模式下证书 SAN 由 `RUSTBOARD_ACME_DOMAIN` 决定；`RUSTBOARD_ADVERTISE` 必须
+  是其中一个标识，否则 entrypoint 会忽略它并使用第一个域名。
 - 配置已存在后，entrypoint 会跳过 install；此时改 SAN 需要修改
   `/data/etc/rustboard/hub.toml` 的 `server_names`，再在容器内执行
   `rustboard-hub rotate-cert --force --config /data/etc/rustboard/hub.toml`。
@@ -140,8 +158,8 @@ docker compose -f docker/compose.example.yml --profile agent up -d
 
 ## 4. 为什么 hub / panel 共享 network namespace
 
-Phase A 规定 hub 管理 API 默认只绑回环，且安装器不支持 `admin_tls = "required"`；
-Phase B 没有新增管理端 TLS。panel 要访问 `http://127.0.0.1:8444`，只能和 hub 处于同一
+hub 管理 API **默认**只绑回环。Phase C 虽支持 `admin_tls = "required"`，默认
+compose 仍未启用；panel 要访问 `http://127.0.0.1:8444`，只能和 hub 处于同一
 loopback 命名空间：
 
 ```yaml
@@ -153,9 +171,10 @@ panel:
 
 - panel 没有自己的 `ports`，8080 由 **hub 服务**统一发布（示例绑到宿主 `127.0.0.1`）；
 - 8444 既不 `EXPOSE` 也不发布；不要额外加 `-p 8444:8444`；
-- 远程访问 panel 请用 SSH 隧道、VPN 或反代；直接暴露面板明文 HTTP 不在本阶段安全范围内；
-- 远程 panel（独立主机/容器）需要 Phase C 的管理端 HTTPS，不能通过把 `admin_listen`
-  改成 `0.0.0.0` 绕过。
+- 远程访问 panel 请用 SSH 隧道、VPN、反代或面板直连 HTTPS；直接暴露面板明文
+  HTTP 仍不在默认安全范围内；
+- 远程 panel（独立主机/容器）需要管理端 HTTPS + 面板 TLS/反代，不能通过把
+  `admin_listen` 改成 `0.0.0.0` 且保持 `admin_tls=off` 绕过（hub 会拒绝启动）。
 
 ## 5. 首次启动、root 与 UID 10001
 
@@ -165,7 +184,7 @@ panel:
 2. 首启执行 `rustboard-<role> install --prefix /data --no-systemd`；
 3. `chown` 到 `10001:10001`，收紧配置/数据目录权限；
 4. `exec setpriv --reuid=10001 --regid=10001 --clear-groups --no-new-privs
-   --inh-caps=-all --ambient-caps=-all ... run`。
+   --inh-caps=+net_bind_service --ambient-caps=+net_bind_service ... run`。
 
 验证：
 
@@ -177,7 +196,10 @@ docker compose -f docker/compose.example.yml exec agent id
 ```
 
 应看到 `uid=10001 gid=10001`。`docker inspect ... .Config.User` 为空/root 是正常的，
-它描述的是 entrypoint 的启动身份，不是主进程身份。
+它描述的是 entrypoint 的启动身份，不是主进程身份。降权后仅保留
+`NET_BIND_SERVICE`（inheritable + ambient），用于 ACME 自动续期绑定 80/443；
+`--no-new-privs` 仍生效。非 root `--user 10001` 启动没有该能力，ACME 续期可能
+失败，见 §13。
 
 ### 5.1 首启时 /data 必须是 root:root
 
@@ -308,15 +330,16 @@ start/stop/restart、结束进程、读日志，也能伪造执行结果（hub �
 
 ### 管理口
 
-- hub 管理 API 只绑 `127.0.0.1:8444`，不 `EXPOSE`、不发布；
-- 如果覆盖 `RUSTBOARD_ADMIN_LISTEN` 为非回环，Phase A hub 会拒绝启动（`admin_tls=off`）；
-- 远程面板需要 Phase C 的 HTTPS/反代，不要在本文阶段开放明文 8444。
+- hub 管理 API 默认只绑 `127.0.0.1:8444`，不 `EXPOSE`、不发布；
+- 如果覆盖 `RUSTBOARD_ADMIN_LISTEN` 为非回环，必须同时设置
+  `RUSTBOARD_ADMIN_TLS=required`，否则 hub 拒绝启动（`admin_tls=off`）；
+- 远程面板需要 HTTPS/反代；不要在未启用管理端 TLS 时开放明文 8444。
 
 ## 8. 健康检查
 
 | 服务 | 检查 | 说明 |
 |---|---|---|
-| hub | `curl -fsS http://127.0.0.1:8444/healthz` | 管理口回环，免鉴权 |
+| hub | `curl -fsS http://127.0.0.1:8444/healthz` | 默认管理口回环 HTTP，免鉴权；`admin_tls=required` 时必须改用 HTTPS（见 §13） |
 | panel | `curl -fsS http://127.0.0.1:8080/healthz` | panel 自身端口 |
 | agent | `rustboard-agent cert-info --config /data/etc/rustboard/agent.toml` | 未 enrollment/证书过期时非零 |
 
@@ -344,6 +367,8 @@ docker compose -f docker/compose.example.yml exec panel \
 
 healthcheck 的端口硬编码为 8444 / 8080。若覆盖 `RUSTBOARD_ADMIN_LISTEN` 或
 `PANEL_LISTEN`，必须同步覆盖镜像 healthcheck，否则会一直 unhealthy。
+启用 `admin_tls=required` 后内置 HTTP healthcheck 必然失败，必须改为 HTTPS +
+正确 SNI/CA（示例见 §13），不能用 `-k` 跳过校验。
 
 ## 9. 只读根文件系统 / tmpfs（可选）
 
@@ -371,6 +396,7 @@ Compose 可在服务下增加：
 - hub 的 `/run/rustboard` 必须是可写 volume（或 tmpfs），panel 以 `:ro` 挂载；
 - 如果应用/底层库还需要其它可写路径，按日志补 `tmpfs`，不要为了“能跑”直接去掉
   `read_only`；
+- ACME 证书/账户在 `/data`，只读根不影响签发；挑战端口绑定不需要写文件系统；
 - 验证方法同 §8：healthz、`docker exec ... id`、日志无 permission denied。
 
 ## 10. 升级与回滚
@@ -386,8 +412,11 @@ Compose 可在服务下增加：
   ```
 
   entrypoint 检测到已有配置会跳过 install，数据/证书/配置保留；但新版本可能自动执行
-  SQLite schema 迁移。
+  SQLite schema 迁移。ACME 部署升级时同样要带 `-f docker/compose.acme.example.yml`，
+  否则端口/环境变量会退回默认 self-signed 叠加（已有配置仍不会被改写）。
 - 升级前先停机备份 `hub_data` / `panel_data`；备份含私钥/token，必须加密并按 secret 管理。
+- ACME 证书、账户与状态都在 `hub_data`，升级不会重写；切换 ACME directory/profile
+  需要 `install --force` + `tls issue`，不要只改环境变量（见 §13.4）。
 - 回滚：
 
   ```bash
@@ -437,13 +466,105 @@ org.opencontainers.image.licenses=MIT
 | panel 报 token 权限不是 0600 | `chmod 0600 /run/rustboard/admin_token`；不要放宽到 0644 |
 | agent healthcheck unhealthy | enrollment token 过期/已用、hub URL 不可达、指纹错误、证书 SAN 不匹配；看 agent 日志并重新 `agent add` |
 | agent 提示证书 SAN/主机名不匹配 | 首次未设置 `RUSTBOARD_ADVERTISE`/`RUSTBOARD_SAN`；更新 `hub.toml` 的 `server_names` 后 `rotate-cert --force`，agent 重新 enrollment |
-| hub/panel 一直 unhealthy | 覆盖了 8444/8080 但没改 healthcheck；或服务启动失败，先看容器日志 |
+| hub/panel 一直 unhealthy | 覆盖了 8444/8080 但没改 healthcheck；或服务启动失败，先看容器日志。`admin_tls=required` 时必须用 HTTPS healthcheck |
+| ACME 容器内 80/443 可 bind、公网不通 | 默认 compose 不发布 80/443；用 ACME 叠加文件/`-p`，再查云安全组；见 §13 |
+| 改了 `RUSTBOARD_TLS_MODE` 不生效 | 已有 `/data/etc/rustboard/hub.toml`，entrypoint 跳过 install；见 §13.4 |
+| `--user 10001` 下 ACME 续期报绑定失败 | 非 root 无 `NET_BIND_SERVICE`；ACME 用默认 root entrypoint |
+| `RUSTBOARD_ACME_*` 缺失/非法 | entrypoint 在 install 前退出；按提示补变量，不要加 `--offline` |
 | `COPY dist/... not found` | 未先运行构建脚本，或 `--platform` 对应架构的 `dist/<arch>/bin` 不存在 |
 | 镜像内找不到 web | `web/dist` 未构建，或 `.dockerignore` 误排除了 `web/dist` |
 
-## 13. 相关文档
+## 13. ACME 模式（Phase C）
+
+### 13.1 叠加启动
+
+默认 compose 是 **self-signed + 安装阶段 `--offline`**，且**不发布 80/443**，
+因此既有 Docker 门禁（panel 共享 netns、8444 不发布）不受影响。ACME 用叠加文件：
+
+```bash
+RUSTBOARD_VERSION=v1.0.0 \
+RUSTBOARD_ACME_EMAIL=admin@example.com \
+RUSTBOARD_ACME_DOMAIN=board.example.com \
+RUSTBOARD_ACME_CHALLENGE=http-01 \
+docker compose -f docker/compose.example.yml \
+  -f docker/compose.acme.example.yml up -d
+```
+
+叠加后 hub 发布 `8443`（agent）、`80`（HTTP-01）、`443`（TLS-ALPN-01）与
+`127.0.0.1:8080`（panel）；8444 仍不 EXPOSE、不发布。panel 仍共享 hub 的
+network namespace。
+
+### 13.2 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `RUSTBOARD_TLS_MODE` | `self-signed` | `self-signed` / `acme-domain` / `acme-ip` |
+| `RUSTBOARD_ACME_EMAIL` | 无（ACME 必填） | 账户邮箱；不打印 |
+| `RUSTBOARD_ACME_DOMAIN` | 无（ACME 必填） | 逗号分隔；domain 1–20 个 DNS，IP 恰好一个 IPv4 |
+| `RUSTBOARD_ACME_CHALLENGE` | `http-01` | `http-01` / `tls-alpn-01` |
+| `RUSTBOARD_ACME_PROFILE` | 空 | 例如 `shortlived`；IP 留空运行时默认 |
+| `RUSTBOARD_ACME_CA_FILE` | 空 | 容器内绝对路径；仅私有/Pebble ACME，需只读挂载 |
+| `RUSTBOARD_ACME_DIRECTORY` | LE production | 自定义目录；调试用 staging |
+| `RUSTBOARD_ADMIN_TLS` | 空（off） | `off` / `required`；required 必须覆盖 healthcheck |
+
+- self-signed 仍由 entrypoint 追加 `--offline`；ACME 模式**绝不**追加。
+- ACME 变量缺失/非法时在 install 前退出，不写配置；不要用 `--offline` 绕过。
+- `RUSTBOARD_ADVERTISE` 在 ACME 模式下必须是证书标识之一，否则被忽略并使用
+  第一个域名（避免 agent 安装 URL 与证书不一致）。
+
+### 13.3 证书持久化、能力与 healthcheck
+
+- 证书、ACME 账户与状态在 `hub_data`：
+  `/data/var/lib/rustboard/hub/certs/`。重建容器不会重新申请；`down -v` 会
+  删除它们（含私钥/账户），不要把删除 volume 当作常规“重置证书”手段。
+- 私钥/账户 0600、证书 0644、目录 0700；备份 `hub_data` 等于备份私钥。
+- 首次安装以 root 完成；之后 `setpriv` 降权到 10001，但保留
+  `NET_BIND_SERVICE` 供自动续期绑定 80/443。只读根（`/tmp`、`/run` tmpfs）仍可用。
+- `admin_tls=required` 时覆盖 healthcheck（示例；公共 ACME 去掉 `--cacert`）：
+
+  ```yaml
+  healthcheck:
+    test: ["CMD", "curl", "-fsS",
+           "--cacert", "/data/var/lib/rustboard/hub/certs/ca.crt",
+           "--resolve", "board.example.com:8444:127.0.0.1",
+           "https://board.example.com:8444/healthz"]
+  ```
+
+### 13.4 模式变更
+
+已有 `hub.toml` 时 entrypoint 跳过 install；改环境变量不会切换证书来源。用
+root 直接执行安装器（会成对备份旧证书）：
+
+```bash
+# 1) 停掉旧 hub/panel，释放 80/443/8443/8080（会短暂中断服务）
+docker compose -f docker/compose.example.yml \
+  -f docker/compose.acme.example.yml stop panel hub
+
+# 2) 以 root 执行安装器；--service-ports 让 ACME 挑战从公网可达 80/443
+docker compose -f docker/compose.example.yml \
+  -f docker/compose.acme.example.yml run --rm --service-ports hub \
+  rustboard-hub install --force --no-systemd --prefix /data \
+    --listen 0.0.0.0:8443 --admin-listen 127.0.0.1:8444 --panel no \
+    --tls acme-domain --acme-email admin@example.com \
+    --domain board.example.com --acme-challenge http-01
+
+# 3) 用新配置重建服务
+docker compose -f docker/compose.example.yml \
+  -f docker/compose.acme.example.yml up -d
+```
+
+或删除 `hub_data` 重新初始化（丢数据，仅可重建环境）。切换后先 `up -d`，再执行
+`docker compose exec hub rustboard-hub tls status --config /data/etc/rustboard/hub.toml`
+确认来源。
+
+> Docker ACME 的端到端验证需要公网 80/443 或 Pebble 端口映射；C8 只做
+> compose/脚本静态检查，不伪造签发成功。真实 LE staging 留 C9 手工门禁。
+
+## 14. 相关文档
 
 - [M5 Phase B 交付计划](../docs/plans/2026-10-25-m5-phase-b-delivery.md)
 - [M5 Phase A 安装器计划](../docs/plans/2026-10-24-m5-phase-a-installer.md)
+- [服务端 TLS](../docs/install/tls.md) / [ACME](../docs/install/acme.md) /
+  [面板 TLS](../docs/install/panel-tls.md) / [故障排查](../docs/install/troubleshooting.md)
 - [AGENTS.md](../AGENTS.md) §6/§9
 - 构建脚本：`packaging/build-release.sh`（由 Phase B 构建流水线提供）

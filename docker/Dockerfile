@@ -47,7 +47,10 @@ WORKDIR /
 STOPSIGNAL SIGTERM
 
 # ---------------------------------------------------------------------------
-# hub：agent 接入 8443；管理口 8444 只绑容器内 127.0.0.1，不 EXPOSE、不发布。
+# hub：agent 接入 8443；ACME 签发/续期时挑战服务会临时绑定 80（HTTP-01）或
+# 443（TLS-ALPN-01），所以这两个端口只作为元数据 EXPOSE；默认 Compose 不发布，
+# 需要 ACME 时用 docker/compose.acme.example.yml 叠加或手工 -p 80:80 -p 443:443。
+# 管理口 8444 只绑容器内 127.0.0.1，不 EXPOSE、不发布。
 # ---------------------------------------------------------------------------
 FROM base AS hub
 
@@ -60,8 +63,11 @@ COPY web/dist/ /usr/share/rustboard/web/
 RUN test -s /usr/share/rustboard/web/index.html \
  && chmod 0755 /usr/local/bin/rustboard-hub /usr/local/bin/entrypoint-hub.sh
 
-EXPOSE 8443
+# 8443 是 agent 接入；80/443 仅 ACME 挑战期间使用（元数据，默认不发布）。
+EXPOSE 8443 80 443
 
+# healthcheck 固定用管理口回环 HTTP。`admin_tls=required` 时管理口只接受 HTTPS，
+# 必须在 Compose/`docker run` 中覆盖本 healthcheck（见 docker/README.md §8）。
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=5 \
   CMD ["curl", "-fsS", "http://127.0.0.1:8444/healthz"]
 

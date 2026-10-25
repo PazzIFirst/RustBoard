@@ -1,0 +1,58 @@
+# RustBoard Docker Compose ACME 叠加示例（M5 Phase C）。
+#
+# 用法（必须和默认文件一起使用）：
+#   RUSTBOARD_VERSION=v1.0.0 \
+#   RUSTBOARD_ACME_EMAIL=admin@example.com \
+#   RUSTBOARD_ACME_DOMAIN=board.example.com \
+#   docker compose -f docker/compose.example.yml \
+#     -f docker/compose.acme.example.yml up -d
+#
+# 这个叠加文件只做四件事：
+# 1. 给 hub 发布 TCP 80（HTTP-01）与 443（TLS-ALPN-01）；默认文件仍不发布；
+# 2. 把 hub 的 RUSTBOARD_TLS_MODE 切到 acme-domain；
+# 3. 传入 ACME 邮箱 / 域名 / 挑战 / 可选 profile、directory、私有 CA；
+# 4. 保持 panel 与 hub 共享 network namespace，8444 仍不 EXPOSE、不发布。
+#
+# 重要：
+# - 首次启动前必须把邮箱、域名换成真实值；ACME 会访问公网并消耗 Let's Encrypt
+#   的限额，调试请先设置 RUSTBOARD_ACME_DIRECTORY 指向 staging。
+# - 证书、ACME 账户与状态都保存在 hub_data volume 的
+#   /data/var/lib/rustboard/hub/certs 下；重建容器不会重新申请。
+# - 已有 volume 的 TLS 模式不会被本文件改写。切换 self-signed ↔ ACME 需要
+#   `rustboard-hub install --force ...`（见 docs/install/docker.md）或删除 volume
+#   （会丢数据）；不要只改环境变量。
+# - 80/443 需要云安全组和本机防火墙放行；安装器只做只读诊断，不会自动改防火墙。
+# - 公网 IP 证书请把 RUSTBOARD_TLS_MODE 改成 acme-ip、域名填公网 IPv4；entrypoint
+#   会拒绝非 IPv4 的 acme-ip 标识。
+#
+# 本文件不定义 name：Compose 项目名沿用默认文件，避免叠加后成为两个项目。
+
+services:
+  hub:
+    ports:
+      # HTTP-01：ACME 服务端 GET /.well-known/acme-challenge/<token>。
+      - "80:80"
+      # TLS-ALPN-01：ACME 服务端只以 ALPN acme-tls/1 握手。
+      # http-01 模式也保留 443 发布，便于切换挑战；不需要时可删掉本行。
+      - "443:443"
+    environment:
+      RUSTBOARD_TLS_MODE: "acme-domain"
+      # 必填：ACME 账户联系邮箱（不会打印到日志）。
+      RUSTBOARD_ACME_EMAIL: "${RUSTBOARD_ACME_EMAIL:-admin@example.com}"
+      # 必填：逗号分隔的域名；acme-domain 1–20 个，acme-ip 恰好一个 IPv4。
+      RUSTBOARD_ACME_DOMAIN: "${RUSTBOARD_ACME_DOMAIN:-hub.example.com}"
+      # http-01（默认）或 tls-alpn-01。
+      RUSTBOARD_ACME_CHALLENGE: "${RUSTBOARD_ACME_CHALLENGE:-http-01}"
+      # 可选：例如 shortlived；acme-ip 留空时运行时默认 shortlived。
+      RUSTBOARD_ACME_PROFILE: "${RUSTBOARD_ACME_PROFILE:-}"
+      # 可选：ACME directory；调试用 Let's Encrypt staging：
+      # https://acme-staging-v02.api.letsencrypt.org/directory
+      RUSTBOARD_ACME_DIRECTORY: "${RUSTBOARD_ACME_DIRECTORY:-}"
+      # agent 安装 URL 使用的主机名；必须是 RUSTBOARD_ACME_DOMAIN 中的一项。
+      # 默认与第一个/唯一域名一致；多域名时请显式设置 RUSTBOARD_HUB_ADVERTISE。
+      RUSTBOARD_ADVERTISE: "${RUSTBOARD_HUB_ADVERTISE:-${RUSTBOARD_ACME_DOMAIN:-hub.example.com}}"
+      # 可选（仅私有 / Pebble ACME）：容器内 CA PEM 路径。启用时必须同时取消
+      # 下面 volumes 中的只读挂载注释；路径不是普通文件时 entrypoint 会在安装前退出。
+      # RUSTBOARD_ACME_CA_FILE: "/run/rustboard/acme-ca.pem"
+    # volumes:
+    #   - ./secrets/acme-ca.pem:/run/rustboard/acme-ca.pem:ro

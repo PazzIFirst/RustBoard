@@ -6,10 +6,11 @@ Phase B 新增 `.github/workflows/release.yml`：只由 `v*` tag push 触发。�
 正式发布 job 增加 `environment: release` 人工闸门。
 
 > **当前状态**：workflow 已随 Phase B 落地，Phase C C1 已增加 `delivery-docker`、
-> `delivery-arm64` 与 release environment，但尚未用真实 `v1.0.0` tag 执行。
+> `delivery-arm64` 与 release environment；Phase C 的 ACME/面板 TLS 已在主线实现，
+> 但尚未完成 C9 全量 e2e/评审/渗透，也尚未用真实 `v1.0.0-rc.1` tag 执行。
 > `Cargo.toml` 仍是 `0.4.2`，版本归档、CHANGELOG `[v1.0.0]` 与正式发布属于 Phase E；
-> hosted arm64 的完整验证留到 Phase C 的 `v1.0.0-rc.1`。Phase B/C 的 checkpoint
-> 不创建/移动 `v1.0.0` tag。
+> hosted arm64 与真实 LE staging 的完整验证留到 Phase C 的 `v1.0.0-rc.1`。
+> Phase B/C 的 checkpoint 不创建/移动 `v1.0.0` tag。
 
 ## 1. 触发条件
 
@@ -181,6 +182,11 @@ packaging/release-notes.sh 0.4.2 CHANGELOG.md
 
 # workflow 静态检查
 actionlint .github/workflows/release.yml
+
+# Compose（默认与 ACME 叠加）语法
+docker compose -f docker/compose.example.yml config >/dev/null
+docker compose -f docker/compose.example.yml \
+  -f docker/compose.acme.example.yml config >/dev/null
 ```
 
 `tests/e2e/v100-offline.sh`、`tests/e2e/v100-docker.sh`、`tests/e2e/v100-arm64.sh`
@@ -189,3 +195,29 @@ actionlint .github/workflows/release.yml
 `delivery-arm64` 在 `ubuntu-24.04-arm` 上原生跑包安装与容器 e2e，不使用 QEMU。
 真正的 tag 触发、GHCR 推送、多架构 manifest、GitHub Release、attestation 与
 hosted arm64 完整链路只能在 `v1.0.0-rc.1`/正式 tag 的发布环境验证。
+
+## 7. ACME 与发布门禁
+
+ACME 是**运行期/安装期**能力，不改变 tag 触发条件、版本一致性、main 祖先或
+`delivery-*` 门禁：
+
+- `verify` 仍只校验版本/tag/main 与 fmt/clippy/test/audit/web；
+- `delivery-docker` 仍使用默认 `docker/compose.example.yml`（self-signed，不发布
+  80/443），不会主动申请公网证书；ACME 叠加文件只做 `compose config` 语法检查；
+- 证书、ACME 账户、CA 私钥不进镜像、SBOM 或 GitHub Release 资产；
+- 发布失败/RC 失败仍按 §5 处理，不因为 ACME 是可选能力而跳过门禁。
+
+**RC 前手工门禁**（不放进 CI，因为需要真实公网入口/DNS 与 Let's Encrypt 配额）：
+
+1. 用 `v1.0.0-rc.1` 二进制 + staging directory 验证域名 `http-01` 与
+   `tls-alpn-01`，记录证书 SAN/链/到期；
+2. 至少在一种公网 IPv4 上验证 `acme-ip` + `shortlived`（或等价 6 天证书）；
+3. 验证 80/443 四层诊断（本地 bind、本机防火墙、云安全组、staging 实跑）与
+   失败回退 self-signed；
+4. 验证续期阈值/退避/热加载与失败保留旧证书；
+5. 结果记录到 Phase C 证据文档；真实 production 证书可在 RC 环境按需申请，
+   但**不得**把 staging 证书当生产证书，也不得伪造 ACME 成功。
+
+操作步骤见 [acme.md](acme.md) 与 [tls.md](tls.md)；Docker 叠加见
+[docker.md §6](docker.md#6-acme-与证书持久化) 与
+[docker/README.md](../../docker/README.md)。

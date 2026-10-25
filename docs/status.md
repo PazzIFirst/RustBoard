@@ -19,7 +19,7 @@
 | M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | v0.4.1 已知问题修复 | 🟢 完成 | KI-29 rowid 竞态、KI-31 64 MiB 配置/下载一致性、KI-28 拒绝日志采样、KI-20 安装命令引用；SFTP 真实环境 29/29，M4 基线渗透无高危；v041 26/26；v0.4.1 发布 |
 | v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
-| M5 安装与交付 | 🟡 进行中（Phase B 完成） | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126（arm64 QEMU + 来源校验）、workspace 1080 tests；多架构 manifest 本地已验证；Phase B 评审/渗透复测完成；GHCR 真实推送与正式 v1.0.0 待 Phase E |
+| M5 安装与交付 | 🟡 进行中（Phase C 主体已实现，待 RC） | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126（arm64 QEMU + 来源校验）；Phase C C0–C8 已实现 ACME/agent TLS/面板 TLS/管理端 TLS/Docker 与文档，尚未完成 C9 全量 e2e、独立评审/渗透与 `v1.0.0-rc.1`；正式 v1.0.0 待 Phase E |
 
 ## M1 明细
 
@@ -214,12 +214,70 @@
       [渗透报告](security/2026-10-25-m5-phase-b-pentest.md)
 - [ ] 正式 `v1.0.0`：CHANGELOG 归档、tag、Release、镜像在 Phase E 完成
 
+### Phase C（2026-10-25，进行中：主体已实现，待评审与 RC）
+
+- [x] **C0** ACME 依赖与 Pebble spike：`instant-acme 0.8.5` + ring 在 MSRV 1.89
+      可编译、无 aws-lc/cmake；Pebble 验证 DNS/IP、`shortlived`、TLS-ALPN-01；
+      结论见 [C0 spike](plans/2026-10-25-m5-phase-c-spike.md)
+- [x] **C1** 发布门禁：`tests/e2e/v100-docker.sh` 支持 `DOCKER_ARCH`/`SKIP_ARM64`；
+      release workflow 增加 `delivery-docker`/`delivery-arm64`、checkout 固定
+      `github.sha`、release environment；hosted 验证留 C9
+- [x] **C2** 配置与 agent TLS：`[tls]`、`tls_mode`/`server_ca`，旧配置默认
+      `self-signed`/`fingerprint`；安装器 `--tls-mode`/`--server-ca`；
+      `hub agent add` 按 ACME/自签输出信任命令并提示旧 agent 升级
+- [x] **C3** 证书存储与 client CA 拆分：`ca.crt/key` 只作客户端 CA；
+      `server.crt/key` 由 self-signed 或 ACME 写入；原子写、成对备份（每类 5 份）、
+      `CertLock`；ACME 模式下 `cert_rotation` 不接管服务端证书
+- [x] **C4** ACME 客户端与挑战：账户 load-or-create、订单/轮询/finalize、CSR、
+      HTTP-01（80）与 TLS-ALPN-01（443，自定义 `ResolvesServerCert`）、
+      自定义 ACME CA、错误分类；私钥/账户 key 不打印
+- [x] **C5** 安装器 80/443 诊断与回退：本地 bind + `ss`、防火墙只读探测、
+      云元数据 1s、staging 实跑、最多 3 轮；失败回退 self-signed；`--offline`
+      与 ACME 在写盘前互斥；`admin_tls=required` HTTPS 健康检查
+- [x] **C6** 续期/热加载/告警：剩余寿命 ≤ `min(lifetime/3, 48h)` 续期，
+      1m/5m/15m/1h/6h 退避，失败保留旧证书；成功原子写并触发热加载；
+      `tls status|issue|renew` 与自动续期共用锁
+- [x] **C7** 面板 TLS 与管理端 TLS：`--tls-cert/--tls-key/--hub-ca/--public-origin/
+      --cookie-secure`，证书/私钥配套、权限、SAN、符号链接校验；直连 TLS
+      强制 Cookie Secure；hub `--admin-tls required` 与面板 `hub_ca`
+- [x] **C8** Docker/离线/文档：hub 镜像 `EXPOSE 8443 80 443`（80/443 仅 ACME
+      元数据，默认 compose 不发布）；`RUSTBOARD_TLS_MODE`/`RUSTBOARD_ACME_*`；
+      降权保留 `NET_BIND_SERVICE`；新增 `docker/compose.acme.example.yml`；
+      `docs/install/tls.md`、`panel-tls.md`、`troubleshooting.md` 与
+      acme/docker/offline/release/README/CHANGELOG 更新
+- [ ] **C9** 全量 e2e：`v100-acme.sh`（Pebble HTTP-01/TLS-ALPN）、
+      `v100-acme-ip.sh`、`v100-acme-renew.sh`、`v100-acme-fallback.sh`、
+      `v100-tls-agent.sh`、`v100-panel-tls.sh`、`v100-admin-tls.sh`，以及
+      install/offline/arm64/docker 回归
+- [ ] 独立评审（只读）与渗透（本地实例）：ACME 目录 SSRF、挑战端口、key 权限、
+      token 日志、旧 agent 降级、admin/panel TLS、Docker 端口/证书卷
+- [ ] RC 前手工门禁：真实 Let's Encrypt staging（域名 HTTP-01/TLS-ALPN +
+      公网 IPv4 `shortlived`），记录 SAN/链/到期/续期；不得伪造成功
+- [ ] `v1.0.0-rc.1`：版本/CHANGELOG 归档、tag、真实 release workflow
+      （`delivery-e2e`/`delivery-docker`/`delivery-arm64`、staging 镜像、SBOM、
+      attestation、pre-release 不 latest）；RC 通过后才进入 Phase D/E
+
+**Phase C 已验证（本地）**：`bash -n docker/entrypoint-hub.sh`；默认与 ACME 叠加
+Compose `config` 语法；`docker/Dockerfile` hub `EXPOSE 8443 80 443`；
+`DOCKER_ARCH=amd64 SKIP_ARM64=1 bash tests/e2e/v100-docker.sh`
+**123 PASS / 0 FAIL / 1 SKIP**（可选 arm64/QEMU 检查按设计 SKIP，由
+`delivery-arm64` 原生覆盖）；O.hub/O.union 已同步 80/443 元数据，C.3/H.13/H.14
+仍断言默认 compose 不发布 80/443、8444 不发布。**未验证**：真实 ACME 签发、
+Docker 内 ACME 端到端、面板 HTTPS e2e、管理端 TLS e2e、hosted RC。
+
+**Phase C 限制**：面板证书无热加载，续期后需重启；ACME volume 用非 root
+`--user 10001` 启动时没有 `NET_BIND_SERVICE`，自动续期可能无法绑定 80/443；
+默认 compose 不发布 80/443，需要 ACME 叠加文件；旧 v0.4 指纹 agent 不兼容 ACME
+hub，需升级。
+
 计划：[Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)；
 [Phase C 计划](plans/2026-10-25-m5-phase-c-tls-release-gates.md)。
 离线/Docker/发布文档：[offline](install/offline.md)、[docker](install/docker.md)、
-[release](install/release.md)。
+[release](install/release.md)；TLS 文档：[tls](install/tls.md)、
+[acme](install/acme.md)、[panel-tls](install/panel-tls.md)、
+[troubleshooting](install/troubleshooting.md)。
 
-- [ ] Phase C/D/E：ACME/面板 TLS、PostgreSQL/备份迁移、压力/长稳/v1.0.0
+- [ ] Phase D/E：PostgreSQL/备份迁移、压力/长稳/v1.0.0
 
 > Phase A 的 e2e 只覆盖 x86_64 本机 systemd；arm64、离线 netns、Docker 镜像与
 > 真实 ACME/PG 属于后续 Phase，不作为本阶段完成项。
@@ -440,8 +498,10 @@
 v0.4.1 已完成并发布；v0.4.2 修复 CI ANSI 测试助手，并把 vendored SFTP 依赖
 升级到稳定 ECC 栈（crypto-bigint 0.7.6，RUSTSEC-2026-0387）。M5 Phase A 已完成
 安装器内核与自签三步安装（e2e 121/121）；Phase B 已完成两架构静态 musl、离线包、
-Docker/多架构与 tag 触发 release workflow 的本地验收，checkpoint 后进入 Phase C
-（ACME/面板 TLS）与 Phase D（PostgreSQL/备份迁移），v1.0.0 正式发布在 Phase E。
+Docker/多架构与 tag 触发 release workflow 的本地验收。Phase C 的 ACME、agent TLS、
+面板 TLS、管理端 TLS、Docker/文档已实现 C0–C8，当前待 C9 全量 e2e、独立评审/
+渗透与 `v1.0.0-rc.1`，**尚未发布**；之后进入 Phase D（PostgreSQL/备份迁移），
+v1.0.0 正式发布在 Phase E。
 计划见
 [M5 计划](plans/2026-10-24-m5-install-delivery.md)、
 [Phase A 设计](plans/2026-10-24-m5-phase-a-installer.md) 与

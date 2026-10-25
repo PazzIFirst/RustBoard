@@ -2,11 +2,15 @@
 
 本文只讲**安装器**如何为 hub 申请和续期 ACME 证书，以及安装前后需要人工确认的
 DNS、端口、防火墙与云安全组。ACME 客户端、挑战服务与续期的内部实现见
-[Phase C 计划](../plans/2026-10-25-m5-phase-c-tls-release-gates.md)。
+[Phase C 计划](../plans/2026-10-25-m5-phase-c-tls-release-gates.md)；证书来源、
+目录/权限、agent 三种信任模式与续期机制见 [tls.md](tls.md)；按错误信息排查见
+[troubleshooting.md](troubleshooting.md)。
 
-> **实现状态**：安装器的参数、80/443 只读诊断、失败回退与 HTTPS 健康检查已随
-> Phase C C5 落地；实际签发依赖 C4 的 `rustboard-hub tls issue` 子命令。在未包含
-> C4 的构建中，安装器会明确提示“当前二进制没有 `tls issue`”，并按
+> **实现状态**：Phase C C4（ACME 客户端/挑战）、C5（安装器 80/443 诊断、回退、
+> HTTPS 健康检查）与 C6（续期/热加载）已随主线落地；`rustboard-hub tls
+> status|issue|renew` 已可用。但尚未完成 C9 全量 e2e、独立评审/渗透与
+> `v1.0.0-rc.1` 的真实 Let's Encrypt staging 验证。
+> 未包含 C4 的旧二进制会明确提示“当前二进制没有 `tls issue`”，并按
 > `tls.fallback_to_self_signed` 回退为自签证书，**不会假装 ACME 成功**。
 > 本文不声称已经通过真实 Let's Encrypt 生产环境的 RC 验证。
 
@@ -284,7 +288,7 @@ ACME 模式下 agent 不能继续用 v0.4 的指纹钉扎。`hub agent add` 会�
   48 小时阈值时续期；成功原子替换 `server.crt` / `server.key` 并热加载新连接，
   不需要重启。
 - 续期失败保留旧证书并告警，不会把运行中的服务停掉。
-- 手动查看 / 续期（C4 / C6 命令，随 Phase C 发布）：
+- 手动查看 / 续期（C4/C6 已实现；旧二进制没有 `tls` 子命令）：
 
 ```bash
 rustboard-hub tls status --config /etc/rustboard/hub.toml
@@ -309,8 +313,12 @@ sudo rustboard-hub tls issue --config /etc/rustboard/hub.toml
 - `--admin-tls required` 时，同机 panel 使用
   `https://<证书 SAN 覆盖的主机名>:<管理端口>`；自签 / 私有 ACME 会附
   `--hub-ca <hub data_dir>/certs/ca.crt`，公共 ACME 使用系统根。若 panel 版本
-  尚不支持 `--hub-ca`，安装会失败并提示先用 `--panel no` 跳过，不会静默降级成
-  不校验证书。
+  尚不支持 `--hub-ca`，安装会以未知参数失败；用 `--panel no` 跳过同机面板，
+  升级 panel 后按 [panel-tls.md](panel-tls.md)
+  手工配置，不会静默降级成不校验证书。
+- 面板直连 HTTPS（`--tls-cert/--tls-key/--public-origin`）与 ACME 是两件独立
+  的事：ACME 签的是 hub 的 `server.crt`，面板仍需自己的证书；详见
+  [panel-tls.md](panel-tls.md)。
 
 ## 11. Let's Encrypt 速率限制
 
@@ -340,3 +348,27 @@ sudo rustboard-hub tls issue --config /etc/rustboard/hub.toml
   管理 API 仍需要 Bearer token。
 - 生产环境建议保留 `fallback_to_self_signed = true` 作为兜底，但回退后必须用
   `rustboard-hub tls status` 确认实际证书来源，不要把自签安装误当成 ACME。
+
+## 13. Docker、面板与其他交付方式
+
+- **Docker**：默认 `docker/compose.example.yml` 是 self-signed，不发布 80/443，
+  安装阶段 `--offline`；ACME 用 `docker/compose.acme.example.yml` 叠加，把
+  80/443、`RUSTBOARD_TLS_MODE=acme-domain`、邮箱/域名/挑战传进容器。证书/账户
+  持久化在 `hub_data`，entrypoint 降权时保留 `NET_BIND_SERVICE` 供续期绑定
+  80/443。变量、端口、只读根、healthcheck 与模式切换见
+  [docker.md §6](docker.md#6-acme-与证书持久化) 和
+  [docker/README.md](../../docker/README.md)。
+- **离线**：`--offline` 与 ACME 互斥；默认 self-signed 仍自动离线。失败示例与
+  规则见 [offline.md §4.1](offline.md#41-离线与-acme-互斥)。
+- **面板**：面板没有内置 ACME；直连 HTTPS 用 `--tls-cert/--tls-key`，反代终止
+  TLS 时保持回环 HTTP。与 hub 的 `admin_tls=required`、`hub_ca`、Cookie/CSP、
+  续期重启见 [panel-tls.md](panel-tls.md)。
+- **发布**：ACME 不改变 tag/RC 门禁；RC 前需人工跑 LE staging（域名 + 公网 IP），
+  见 [release.md §7](release.md#7-acme-与发布门禁)。
+- **总览**：证书来源、目录权限、续期/退避/热加载、agent 三模式与回滚见
+  [tls.md](tls.md)；80/443、DNS、SNI、权限等排错见
+  [troubleshooting.md](troubleshooting.md)。
+
+> **未验证项**：真实 Let's Encrypt staging/production、Docker 内 ACME 端到端
+> （需要公网 80/443 或 Pebble 映射）尚未在 C8 执行；本文只描述已实现行为与
+> 手工步骤，不把 compose/脚本静态检查当作签发成功。

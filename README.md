@@ -12,8 +12,8 @@
 已知问题见 [docs/known-issues.md](docs/known-issues.md)。
 协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面、v0.3.x 硬化、M4 告警/归档、v0.4.1 已知问题修复、v0.4.2 安全补丁已完成；M5 Phase A 已完成，Phase B 交付物已完成（v0.4.2；v1.0.0 正式发布在 Phase E）。**
-> Phase B 交付静态 musl 离线包、Docker 多架构镜像和 release workflow；证书仍只有自签模式，ACME（域名 / 公网 IP 自动续期）在 Phase C 交付。
+> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面、v0.3.x 硬化、M4 告警/归档、v0.4.1 已知问题修复、v0.4.2 安全补丁已完成；M5 Phase A/B 已完成，Phase C 主体已实现（ACME、agent TLS 三模式、面板 TLS、管理端 TLS、Docker/发布门禁），正在等待 C9 全量 e2e、独立评审/渗透与 `v1.0.0-rc.1`。v1.0.0 正式发布在 Phase E。**
+> Phase B 交付静态 musl 离线包、Docker 多架构镜像和 release workflow；Phase C 增加 ACME（域名 / 公网 IP 自动续期）、面板直连 HTTPS 与迁移文档。ACME 尚未经过真实 Let's Encrypt staging/RC，本文不声称 RC 已完成。
 >
 > 线协议版本为 **2**：hub 与 agent 必须严格一致。版本不符时 hub 回 `bad_protocol`
 > 且不下发 Welcome，agent 打印明确错误并以非零码退出，不会进入重连循环。
@@ -77,19 +77,32 @@ logs = true
   是主要防线。
 - 操作前请在面板上二次确认；`curl` 直接调用时必须带 `"confirm": true`（start 除外）。
 
-## 安装与交付（M5 Phase B）
+## 安装与交付（M5 Phase B/C）
 
-Phase B 提供三类正式交付物，协议/数据库/配置与 Phase A 一致：
+Phase B 提供三类正式交付物；Phase C 在同一交付形态上增加 TLS 能力，协议 v2、
+SQLite schema v7 与旧配置默认行为不变：
 
 - **离线包**：`serverdashboard-v<version>-{x86_64,aarch64}.tar.gz`，含三个静态 musl
   二进制、前端、systemd unit 参考、`install.sh` 与逐文件 `SHA256SUMS`。校验后执行
   `sudo ./install.sh hub|panel|agent --yes`；`--offline` 默认开启，含义是“不发起外部
   网络探测”。详见 [离线安装](docs/install/offline.md)。
 - **Docker**：`ghcr.io/pazzifirst/rustboard-{hub,panel,agent}`，多架构、主进程
-  UID 10001。panel 必须与 hub 共享 network namespace，8444 永不发布到宿主。详见
-  [Docker 部署](docs/install/docker.md)。
+  UID 10001。默认 self-signed、不发布 80/443；ACME 用
+  `docker/compose.acme.example.yml` 叠加并发布 80/443。panel 默认与 hub 共享
+  network namespace，8444 永不发布到宿主。详见 [Docker 部署](docs/install/docker.md)。
 - **Release**：`v*` tag 触发两架构构建、SBOM、attestation、GitHub Release 与镜像
-  发布；普通 push 不推镜像。详见 [发布流水线](docs/install/release.md)。
+  发布；普通 push 不推镜像。ACME 不改变 tag/RC 门禁，RC 前需手工做 Let's Encrypt
+  staging。详见 [发布流水线](docs/install/release.md)。
+
+TLS 文档：
+
+- [服务端 TLS 总览](docs/install/tls.md)：三种证书来源、目录/权限、ACME 配置、
+  续期阈值/退避/热加载、失败回退、agent 三模式、`tls status/issue/renew`；
+- [ACME 安装](docs/install/acme.md)：DNS、80/443、防火墙/安全组、staging、回退；
+- [面板直连 HTTPS](docs/install/panel-tls.md)：证书/私钥、`hub_ca`、
+  `public_origin`、Cookie/CSP、反代 vs 直连；
+- [TLS 故障排查](docs/install/troubleshooting.md)：端口、DNS、SNI/SAN、证书链、
+  权限、Docker/管理端常见错误。
 
 本地验收：
 
@@ -102,11 +115,16 @@ PACKAGE=dist/serverdashboard-v0.4.2-x86_64.tar.gz SKIP_BUILD=1 \
 # 完整时才可用 SKIP_BUILD=1；缺源默认 fail-closed（ALLOW_UNVERIFIED=1 仅用于
 # 源不可得的逃生场景，打印 WARN、不计 PASS；hash 不一致仍然失败）。
 bash tests/e2e/v100-docker.sh
+
+# Compose 语法（默认 self-signed 与 ACME 叠加；不真正申请证书）
+docker compose -f docker/compose.example.yml config >/dev/null
+docker compose -f docker/compose.example.yml \
+  -f docker/compose.acme.example.yml config >/dev/null
 ```
 
 > 当前 `Cargo.toml` 仍为 `0.4.2`；`v1.0.0` 的 CHANGELOG 归档、tag 与正式发布在
-> Phase E 完成。Phase B 只负责交付物与流水线，不改变协议帧、SQLite schema 或配置
-> 必填项。
+> Phase E 完成。Phase C 主体已实现但尚未 RC；不改变协议帧、SQLite schema 或配置
+> 必填项（新字段均有默认值）。
 
 ## 快速开始（开发环境）
 
@@ -182,6 +200,9 @@ rustboard-hub token revoke --name panel-prod                 # 不删行，保�
   ```
   否则拒绝启动。修改 `server_names` 后先 `rotate-cert --force`。
 - 管理证书复用 hub 的 `certs/server.crt`；Panel 连私有 CA 时配置 `hub_ca`。
+- Phase C 起 hub 支持 ACME 服务端证书（`[tls]`），管理口 `admin_tls=required`
+  也可配 ACME 域名；配置、80/443 与回退见 [tls.md](docs/install/tls.md) 与
+  [acme.md](docs/install/acme.md)。
 - v0.3.4 起增加未认证失败限速：同一来源 IP 每分钟失败达到
   `admin_auth_failure_limit_per_min`（默认 60，0 关闭，最大 600）后返回
   429 + `Retry-After`，超限路径不再计算 SHA-256 或查询 SQLite，401 WARN 也按窗口采样。
@@ -262,8 +283,10 @@ rustboard-hub token revoke --name panel-prod                 # 不删行，保�
    反代需设置 `X-Forwarded-Proto: https` 并正确传递 `X-Forwarded-For`；未配置
    `trusted_proxies` 时所有 XFF/XFP 都被忽略，避免伪造头绕过登录限速或 Cookie 安全属性。
 
-面板自身监听仍是明文 HTTP（M5 前不提供面板 TLS）；对外暴露必须走 VPN/SSH/反代。
-面板访问 hub 的 HTTP 客户端强制直连（忽略 `HTTP_PROXY`），且远程 `http://` 会拒绝启动。
+Phase C 起面板可直连 HTTPS：`--tls-cert/--tls-key/--public-origin`，证书/私钥
+权限、`hub_ca`、Cookie/CSP 与续期重启见 [panel-tls.md](docs/install/panel-tls.md)。
+不配置 TLS 时仍监听明文 HTTP，对外暴露必须走 VPN/SSH/反代；面板访问 hub 的 HTTP
+客户端强制直连（忽略 `HTTP_PROXY`），且远程 `http://` 会拒绝启动。
 
 ## 端口
 
@@ -274,7 +297,8 @@ rustboard-hub token revoke --name panel-prod                 # 不删行，保�
 |---|---|---|---|
 | agent 接入 | 随机五位数 | WSS + mTLS | 必须公网可达 |
 | 管理 API | 随机五位数 | HTTP（回环）/ HTTPS（`admin_tls=required`） | 默认只绑回环；非回环必须 `admin_tls=required`，远程面板走 HTTPS + `hub_ca` |
-| 面板 | 随机五位数 | HTTP | 默认只绑回环；对外必须走 VPN/反代，M5 前不提供面板自身 TLS |
+| 面板 | 随机五位数 | HTTP / HTTPS | 默认只绑回环；Phase C 可用 `--tls-cert/--tls-key` 直连 HTTPS，否则走 VPN/反代 |
+| ACME 挑战 | 80 / 443 | HTTP-01 / TLS-ALPN-01 | 仅 ACME 签发/续期期间临时绑定；Docker 需显式发布 |
 
 随时在终端查看当前端口：
 

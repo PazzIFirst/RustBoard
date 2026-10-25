@@ -14,9 +14,10 @@
 #      FATAL，明确提示先运行 packaging/build-release.sh --arch "$DOCKER_ARCH"；
 #   2) 三镜像 buildx --load 构建（linux/$DOCKER_ARCH）与架构断言；
 #   3) 镜像隔离：无 /etc/rustboard/<role>.toml、无 /var/lib/rustboard、无 .key/.pem、
-#      无运行期 admin token；默认端口仅 hub 8443 / panel 8080，8444 不 EXPOSE；
+#      无运行期 admin token；hub 默认 EXPOSE 8443/80/443（80/443 仅 ACME 元数据，
+#      默认 compose 不发布）、panel 8080，8444 不 EXPOSE；
 #   4) hub：healthcheck、管理口 8444 /healthz、配置 0600、--no-systemd 无 unit、
-#      web 静态目录、主进程 UID 10001、tini 为 root、只发布 8443；
+#      web 静态目录、主进程 UID 10001、tini 为 root、运行容器只发布 8443；
 #   5) 重启幂等：docker restart 后 config/admin_token 的 sha256 不变；
 #   6) --user 10001:10001：已初始化 volume 可启动，空 volume 必须非零退出且不写配置；
 #   7) panel：共享 hub netns + hub_run volume（token 文件 0600、panel ro 挂载）、
@@ -1309,7 +1310,7 @@ port_checks() {
     mappings=$(probe_ports "${PORT_PROBE_PREFIX}-${role}")
     targets=$(port_targets_csv "$mappings")
     case "$role" in
-      hub) check_csv_eq "O.$role" "hub 默认 EXPOSE/发布端口仅 8443" "$targets" "8443" ;;
+      hub) check_csv_eq "O.$role" "hub 默认 EXPOSE 端口为 8443/80/443（80/443 仅 ACME）" "$targets" "80,443,8443" ;;
       panel) check_csv_eq "O.$role" "panel 默认 EXPOSE/发布端口仅 8080" "$targets" "8080" ;;
       agent) check_csv_eq "O.$role" "agent 默认不 EXPOSE 端口" "$targets" "" ;;
     esac
@@ -1317,7 +1318,7 @@ port_checks() {
     docker rm -f "${PORT_PROBE_PREFIX}-${role}" >/dev/null 2>&1 || true
   done
 
-  check_csv_eq "O.union" "三镜像默认端口并集仅 8443/8080" "$union" "8080,8443"
+  check_csv_eq "O.union" "三镜像默认端口并集为 80/443/8080/8443（80/443 仅 ACME）" "$union" "80,443,8080,8443"
   if printf '%s\n' "$union" | tr ',' '\n' | grep -qx '8444'; then
     fail "O.8444" "8444 出现在镜像默认端口（不得发布管理口）"
   else
