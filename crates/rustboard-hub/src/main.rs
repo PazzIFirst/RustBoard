@@ -556,6 +556,26 @@ fn load_config(path: &std::path::Path) -> Result<HubConfig> {
     })
 }
 
+/// 只读加载配置：`tls status` 专用，绝不调用 `harden` / 写回配置文件。
+///
+/// `HubConfig::load` → `load_toml` 会先把 0644 的配置收紧到 0600，诊断命令不应
+/// 产生这种磁盘副作用。这里直接读取并解析，权限与内容都保持不变；错误上下文与
+/// [`load_config`] 保持一致。其他命令仍使用 [`load_config`] 的既有语义。
+fn load_config_read_only(path: &FsPath) -> Result<HubConfig> {
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "读取配置失败: {}（先执行 rustboard-hub init）",
+            path.display()
+        )
+    })?;
+    toml::from_str(&text).with_context(|| {
+        format!(
+            "读取配置失败: {}（先执行 rustboard-hub init）",
+            path.display()
+        )
+    })
+}
+
 /// hub 配置里的默认采样间隔范围校验。
 ///
 /// `HubConfig::validate` 在 `rustboard-common`（panel 线同时维护），这里在
@@ -1527,8 +1547,14 @@ fn warn_acme_material_permissions(data_dir: &FsPath) -> Result<()> {
             Ok(meta) => meta,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("检查 {label} 权限失败: {}", path.display()))
+                // 诊断命令不能因为单个路径 stat 失败（EACCES/ENOTDIR 等）整体退出；
+                // 打印 WARN 后继续检查其余路径，保证 `tls status` 仍可用。
+                println!(
+                    "WARN: 无法检查 {label} 的权限或类型（{}）：{err}；\
+                     tls status 只读，不会跟随或修改该路径。请检查路径与读取权限后重试。",
+                    path.display()
+                );
+                continue;
             }
         };
         if meta.file_type().is_symlink() {
@@ -1568,7 +1594,8 @@ fn warn_acme_material_permissions(data_dir: &FsPath) -> Result<()> {
 /// `rustboard-hub tls status`：只读展示证书来源、公开状态与当前证书信息。
 fn tls_status(config: Option<PathBuf>) -> Result<()> {
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_HUB_CONFIG));
-    let cfg = load_config(&path)?;
+    // 诊断命令只读：不能用 load_config（load_toml 会把 0644 配置收紧到 0600）。
+    let cfg = load_config_read_only(&path)?;
     cfg.validate().context("hub 配置校验失败")?;
     println!("配置文件: {}", path.display());
     println!("证书来源: {}", cfg.tls.mode.as_str());
@@ -1636,7 +1663,8 @@ fn tls_status(config: Option<PathBuf>) -> Result<()> {
     println!("  指纹: {}", tls::fingerprint_of_pem(&material.cert_pem)?);
 
     if cfg.tls.mode.is_acme() {
-        match acme::store::read_state(&cfg.data_dir)? {
+        // 只读诊断：损坏的 state.toml 不能在这里留下 `.corrupt-*` 备份文件。
+        match acme::store::read_state_read_only(&cfg.data_dir)? {
             Some(state) => {
                 println!(
                     "上次签发: {}",

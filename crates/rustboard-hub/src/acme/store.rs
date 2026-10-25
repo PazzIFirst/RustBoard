@@ -41,20 +41,105 @@ pub fn account_path(data_dir: &Path) -> PathBuf {
     acme_dir(data_dir).join(ACCOUNT_FILE)
 }
 
-/// 启动期收紧 ACME 私有文件权限（L-01）：`account.json` 与 `state.toml` 只允许 0600。
+/// 读取 ACME 私有文件前的父目录检查：`certs` 与 `certs/acme` 若存在必须是真实目录。
+///
+/// 账户文件含私钥，状态文件决定续期行为；只要父级被换成符号链接，读取就会被
+/// 重定向到数据目录之外的任意文件。这里先拒绝父级符号链接/非目录，最终文件仍由
+/// [`ensure_regular_acme_file`] 用 [`std::fs::symlink_metadata`] 检查，绝不跟随。
+fn ensure_acme_read_dirs(data_dir: &Path) -> Result<()> {
+    for (label, dir) in [
+        ("证书目录", tls::cert_dir(data_dir)),
+        ("ACME 私有目录", acme_dir(data_dir)),
+    ] {
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_symlink() => bail!(
+                "{label}是符号链接: {}；拒绝跟随读取 ACME 私有文件。\
+                 请先删除该链接并恢复真实目录（或从备份恢复）后重试。",
+                dir.display()
+            ),
+            Ok(meta) if !meta.is_dir() => bail!(
+                "{label}不是目录: {}（可能是普通文件、FIFO 或设备）；\
+                 拒绝继续读取 ACME 私有文件。请先移除它并恢复真实目录后重试。",
+                dir.display()
+            ),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("检查{label}失败: {}", dir.display()))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 目标存在时必须是普通文件：符号链接、目录、FIFO、设备一律拒绝。
+///
+/// 缺失不在这里报错，由调用方按“文件不存在”的语义返回 `None`。
+fn ensure_regular_acme_file(path: &Path, label: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "{label}是符号链接: {}；拒绝跟随读取。请先删除该链接，再执行 \
+             `rustboard-hub tls issue` 重新创建。",
+            path.display()
+        ),
+        Ok(meta) if !meta.file_type().is_file() => bail!(
+            "{label}不是普通文件: {}（可能是目录、FIFO 或设备）；拒绝读取。\
+             请先移除它，再执行 `rustboard-hub tls issue` 重新创建。",
+            path.display()
+        ),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("检查 {label} 失败: {}", path.display())),
+    }
+}
+
+/// 启动期收紧 ACME 私有目录与文件权限（L-01）。
 ///
 /// 语义：
-/// - 只处理**已经存在**的文件；目录或文件不存在时正常返回（首次启动 / 尚未启用 ACME）；
-/// - 先用 [`std::fs::symlink_metadata`] 检查**目标本身**：符号链接直接报错，
+/// - 先处理 `<data_dir>/certs/acme`：目录已存在时用 [`std::fs::symlink_metadata`]
+///   拒绝符号链接/非目录，再用 [`fsutil::harden_dir`] 只收紧到 0700；目录不存在
+///   则正常跳过（首次启动 / 尚未启用 ACME）；
+/// - 再处理**已经存在**的 `account.json` / `state.toml`：符号链接直接报错，
 ///   绝不跟随读取，也绝不 chmod 链接目标；
 /// - 普通文件交给 [`fsutil::harden`] 只收紧到 0600：已是 0600 时不调用 chmod，
 ///   比 0600 更严格（例如 0400）也保持原样，不放宽；
 /// - 目录 / FIFO / 设备等非普通文件同样报错，避免把非文件当成 ACME 材料；
-/// - `chmod` 失败（只读文件系统、EACCES、非属主等）必须返回错误，由调用方阻止启动。
+/// - `chmod` / 目录收紧失败（只读文件系统、EACCES、非属主等）必须返回错误，
+///   由调用方阻止启动。
 ///
 /// 由 `hub run` 在数据目录 `ensure_private_dir(0700)` 之后、任何 TLS/ACME 读取之前
 /// 调用，且与 `tls.mode` 无关（切换回 self-signed 后旧 ACME 文件仍可能留在盘上）。
 pub fn harden_acme_material(data_dir: &Path) -> Result<()> {
+    let dir = acme_dir(data_dir);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "ACME 私有目录是符号链接: {}；拒绝跟随，也拒绝修改链接目标的权限。\
+             请先删除该链接并恢复真实目录（或从备份恢复），再执行 \
+             `rustboard-hub tls issue` 重新创建账户/状态文件，然后重启 hub。",
+            dir.display()
+        ),
+        Ok(meta) if !meta.is_dir() => bail!(
+            "ACME 私有路径不是目录: {}（可能是普通文件、FIFO 或设备）；拒绝收紧权限。\
+             请先移除它，再执行 `rustboard-hub tls issue` 重新创建 ACME 私有目录，\
+             然后重启 hub。",
+            dir.display()
+        ),
+        Ok(_) => {
+            fsutil::harden_dir(&dir, 0o700).with_context(|| {
+                format!(
+                    "收紧 ACME 私有目录权限失败: {}；hub 启动需要当前用户能修改该目录。\
+                     请先手工执行 `chmod 700 {}`（确认目录属于运行 hub 的用户），\
+                     或删除该目录后执行 `rustboard-hub tls issue` 重建，再重启 hub",
+                    dir.display(),
+                    dir.display()
+                )
+            })?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("检查 ACME 私有目录失败: {}", dir.display()))
+        }
+    }
     for path in [account_path(data_dir), state_path(data_dir)] {
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(meta) => meta,
@@ -66,17 +151,17 @@ pub fn harden_acme_material(data_dir: &Path) -> Result<()> {
         };
         if meta.file_type().is_symlink() {
             bail!(
-                "ACME 私有文件是符号链接: {}；拒绝跟随，也拒绝修改链接目标。请删除该链接并\
-                 恢复真实的 ACME 账户/状态文件；账户文件丢失时可执行 \
-                 `rustboard-hub tls issue` 重新创建账户后再启动 hub。",
+                "ACME 私有文件是符号链接: {}；拒绝跟随，也拒绝修改链接目标。请先删除该链接，\
+                 再执行 `rustboard-hub tls issue` 重新创建账户/状态文件（或从备份恢复）；\
+                 修复后再启动 hub。",
                 path.display()
             );
         }
         if !meta.file_type().is_file() {
             bail!(
                 "ACME 私有路径不是普通文件: {}（可能是目录、FIFO 或设备）；拒绝收紧权限。\
-                 请移除它并恢复真实的 ACME 账户/状态文件，或执行 `rustboard-hub tls issue` \
-                 重新创建账户后再启动 hub。",
+                 请先移除它，再执行 `rustboard-hub tls issue` 重新创建账户/状态文件\
+                 （或从备份恢复）；修复后再启动 hub。",
                 path.display()
             );
         }
@@ -144,8 +229,25 @@ impl AcmeState {
 }
 
 /// 读取状态；文件不存在返回 `None`，损坏时先备份再报错（绝不静默覆盖）。
+///
+/// 读取前拒绝父目录或目标本身的符号链接，目标必须是普通文件（拒绝目录 / FIFO /
+/// 设备）。`tls issue` / `tls renew` 使用本函数，因此损坏文件会先备份。
 pub fn read_state(data_dir: &Path) -> Result<Option<AcmeState>> {
+    read_state_inner(data_dir, true)
+}
+
+/// 只读诊断读取状态：语义与 [`read_state`] 相同，但损坏时**不备份、不写任何文件**。
+///
+/// 供 `tls status` 使用：诊断命令即使遇到损坏的 `state.toml` 也不能在 ACME 目录
+/// 里留下 `.corrupt-*` 文件。符号链接 / 非普通文件同样直接拒绝，绝不跟随。
+pub fn read_state_read_only(data_dir: &Path) -> Result<Option<AcmeState>> {
+    read_state_inner(data_dir, false)
+}
+
+fn read_state_inner(data_dir: &Path, backup_on_corrupt: bool) -> Result<Option<AcmeState>> {
     let path = state_path(data_dir);
+    ensure_acme_read_dirs(data_dir)?;
+    ensure_regular_acme_file(&path, "ACME 状态文件")?;
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -155,7 +257,7 @@ pub fn read_state(data_dir: &Path) -> Result<Option<AcmeState>> {
     };
     match toml::from_str::<AcmeState>(&text) {
         Ok(state) => Ok(Some(state)),
-        Err(err) => {
+        Err(err) if backup_on_corrupt => {
             let backup = backup_corrupt(&path)
                 .with_context(|| format!("ACME 状态文件损坏（{}），且备份失败", path.display()))?;
             bail!(
@@ -165,6 +267,12 @@ pub fn read_state(data_dir: &Path) -> Result<Option<AcmeState>> {
                 backup.display()
             )
         }
+        Err(err) => bail!(
+            "ACME 状态文件损坏（{}）: {err}；`tls status` 是只读诊断，不会备份或改写该文件。\
+             请修复该文件，或先自行备份后删除它，再执行 `rustboard-hub tls issue` \
+             重建状态。",
+            path.display()
+        ),
     }
 }
 
@@ -180,22 +288,14 @@ pub fn write_state(data_dir: &Path, state: &AcmeState) -> Result<()> {
 
 /// 读取账户 credentials JSON；不存在返回 `None`，损坏时备份并报错。
 ///
-/// 读取前先对目标本身做 [`std::fs::symlink_metadata`]：账户文件含私钥，是符号链接
-/// 时必须直接拒绝，不能先跟随读取；随后的 [`fsutil::harden`] 同样不会 chmod 链接目标。
+/// 读取前先检查父目录不是符号链接/非目录，再对目标本身做
+/// [`std::fs::symlink_metadata`]：账户文件含私钥，符号链接、目录、FIFO、设备等
+/// 非普通文件必须直接拒绝，不能先跟随读取；随后的 [`fsutil::harden`] 同样不会
+/// chmod 链接目标。
 pub fn read_account(data_dir: &Path) -> Result<Option<String>> {
     let path = account_path(data_dir);
-    match std::fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_symlink() => bail!(
-            "ACME 账户文件是符号链接: {}；拒绝跟随读取（账户文件含私钥）。请删除该链接并\
-             恢复真实文件，或执行 `rustboard-hub tls issue` 重新创建账户。",
-            path.display()
-        ),
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err).with_context(|| format!("检查 ACME 账户失败: {}", path.display()))
-        }
-    }
+    ensure_acme_read_dirs(data_dir)?;
+    ensure_regular_acme_file(&path, "ACME 账户文件")?;
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),

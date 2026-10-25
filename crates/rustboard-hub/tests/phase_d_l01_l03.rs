@@ -14,6 +14,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -154,6 +155,33 @@ fn seed_acme_files(data_dir: &Path) -> (PathBuf, PathBuf) {
     set_mode(&account, 0o644);
     set_mode(&state, 0o644);
     (account, state)
+}
+
+/// `certs/acme/` 的文件名集合 + 内容快照（含符号链接指向），用于证明只读命令
+/// 没有备份、改写或新增任何文件（例如 `.corrupt-*`）。
+fn snapshot_dir(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut snapshot = BTreeMap::new();
+    for entry in
+        fs::read_dir(dir).unwrap_or_else(|err| panic!("读取 {} 失败: {err}", dir.display()))
+    {
+        let entry = entry.expect("读取目录项");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path).expect("stat 目录项");
+        let content = if meta.file_type().is_symlink() {
+            format!(
+                "symlink:{}",
+                fs::read_link(&path).expect("读取符号链接").display()
+            )
+            .into_bytes()
+        } else if meta.is_file() {
+            fs::read(&path).expect("读取文件内容")
+        } else {
+            b"<non-file>".to_vec()
+        };
+        snapshot.insert(name, content);
+    }
+    snapshot
 }
 
 /// 读取配置文本并替换指定段落中的一个键（支持跨行数组）。
@@ -435,25 +463,25 @@ fn run_starts_when_acme_account_and_state_are_absent() {
     );
 }
 
-/// L-01 验收点：account.json 是符号链接时启动失败，且不得跟随链接 chmod 目标。
-#[test]
-fn run_fails_on_symlinked_account_without_chmodding_target() {
-    let install = init_install("symlink", 0);
+/// 启动时 ACME 私有文件是符号链接必须拒绝；不跟随 chmod、不改目标内容/权限。
+fn assert_symlinked_acme_file_rejected(tag: &str, file_name: &str, content: &str) {
+    let install = init_install(tag, 0);
     let acme_dir = install.data_dir.join("certs/acme");
     fs::create_dir_all(&acme_dir).expect("创建 certs/acme");
     set_mode(&acme_dir, 0o700);
-    let target = install.dir.path.join("outside-account.json");
-    fs::write(&target, ACCOUNT_JSON).expect("写符号链接目标");
+    let target = install.dir.path.join(format!("outside-{file_name}"));
+    fs::write(&target, content).expect("写符号链接目标");
     set_mode(&target, 0o644);
     let target_before = fs::read(&target).expect("读取符号链接目标");
-    let link = acme_dir.join("account.json");
-    std::os::unix::fs::symlink(&target, &link).expect("创建 account.json 符号链接");
+    let link = acme_dir.join(file_name);
+    std::os::unix::fs::symlink(&target, &link)
+        .unwrap_or_else(|err| panic!("创建 {file_name} 符号链接失败: {err}"));
     assert!(
         fs::symlink_metadata(&link)
             .expect("stat 符号链接")
             .file_type()
             .is_symlink(),
-        "前置条件：account.json 必须是符号链接"
+        "前置条件：{file_name} 必须是符号链接"
     );
 
     let mut run = HubRun::spawn(&install.config);
@@ -461,18 +489,18 @@ fn run_fails_on_symlinked_account_without_chmodding_target() {
     if exit.is_none() {
         let (status, stdout, stderr) = run.stop();
         panic!(
-            "account.json 是符号链接时 hub run 必须在 20s 内失败退出，但仍存活；\
+            "{file_name} 是符号链接时 hub run 必须在 20s 内失败退出，但仍存活；\
              终止状态={status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
     let (status, stdout, stderr) = run.stop();
     assert!(
         !status.success(),
-        "account.json 是符号链接时 hub run 必须非零退出；status={status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "{file_name} 是符号链接时 hub run 必须非零退出；status={status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("account.json"),
-        "失败信息必须点名 account.json，便于定位；stderr:\n{stderr}"
+        stderr.contains(file_name),
+        "失败信息必须点名 {file_name}，便于定位；stderr:\n{stderr}"
     );
     assert!(
         fs::symlink_metadata(&link)
@@ -500,13 +528,31 @@ fn run_fails_on_symlinked_account_without_chmodding_target() {
     );
 }
 
-/// L-01 验收点：`tls status` 只读；检测到 0644 必须 WARN 并给出修复建议。
+/// L-01 验收点：account.json 是符号链接时启动失败，且不得跟随链接 chmod 目标。
+#[test]
+fn run_fails_on_symlinked_account_without_chmodding_target() {
+    assert_symlinked_acme_file_rejected("symlink-account", "account.json", ACCOUNT_JSON);
+}
+
+/// L-01 验收点：state.toml 是符号链接时启动同样必须拒绝，且不跟随、不改目标。
+#[test]
+fn run_fails_on_symlinked_state_without_chmodding_target() {
+    assert_symlinked_acme_file_rejected("symlink-state", "state.toml", STATE_TOML);
+}
+
+/// L-01 验收点：`tls status` 只读；检测到 0644 必须分别 WARN 账户与状态文件，
+/// 且不得 harden 配置文件、不得在 `certs/acme/` 新增备份（如 `.corrupt-*`）。
 #[test]
 fn tls_status_warns_on_0644_and_keeps_files_unchanged() {
     let install = init_install("status", 0);
     let (account, state) = seed_acme_files(&install.data_dir);
+    let acme_dir = install.data_dir.join("certs/acme");
     let account_before = fs::read(&account).expect("读取 account.json");
     let state_before = fs::read(&state).expect("读取 state.toml");
+    // 配置也故意放宽到 0644：status 是只读诊断，不能像启动路径那样 harden 它。
+    set_mode(&install.config, 0o644);
+    let config_before = fs::read(&install.config).expect("读取 hub.toml");
+    let snapshot_before = snapshot_dir(&acme_dir);
 
     let output = hub(&[
         "tls",
@@ -518,6 +564,20 @@ fn tls_status_warns_on_0644_and_keeps_files_unchanged() {
     assert!(
         text.contains("WARN"),
         "tls status 检测到 0644 时必须输出 WARN；输出:\n{text}"
+    );
+    let account_warn = text
+        .lines()
+        .any(|line| line.contains("WARN") && line.contains("ACME 账户文件"));
+    let state_warn = text
+        .lines()
+        .any(|line| line.contains("WARN") && line.contains("ACME 状态文件"));
+    assert!(
+        account_warn,
+        "必须单独输出含“ACME 账户文件”的 WARN 行；输出:\n{text}"
+    );
+    assert!(
+        state_warn,
+        "必须单独输出含“ACME 状态文件”的 WARN 行；输出:\n{text}"
     );
     let has_repair_hint = (text.contains("chmod")
         && (text.contains("600") || text.contains("0600")))
@@ -549,6 +609,109 @@ fn tls_status_warns_on_0644_and_keeps_files_unchanged() {
         fs::read(&state).expect("status 后读取 state.toml"),
         state_before,
         "tls status 不得改写 state.toml"
+    );
+    assert_eq!(
+        file_mode(&install.config),
+        Some(0o644),
+        "tls status 不得把 hub.toml harden 成 0600"
+    );
+    assert_eq!(
+        fs::read(&install.config).expect("status 后读取 hub.toml"),
+        config_before,
+        "tls status 不得改写 hub.toml"
+    );
+    assert_eq!(
+        snapshot_dir(&acme_dir),
+        snapshot_before,
+        "tls status 不得在 certs/acme/ 新增/改写文件（含 .corrupt-* 备份）"
+    );
+}
+
+/// L-01 验收点：ACME 模式下 state.toml 损坏时 `tls status` 必须报错退出，
+/// 且只读诊断不得在 `certs/acme/` 生成 `.corrupt-*` 备份或任何新文件。
+#[test]
+fn tls_status_corrupt_state_is_error_and_creates_no_backup() {
+    let install = init_install("status-corrupt", 0);
+    let config_text = fs::read_to_string(&install.config).expect("读取 hub.toml");
+    let config_text = set_config_value(&config_text, Some("tls"), "mode", "\"acme-domain\"");
+    let config_text = set_config_value(
+        &config_text,
+        Some("tls"),
+        "acme_email",
+        "\"admin@example.com\"",
+    );
+    let config_text = set_config_value(
+        &config_text,
+        Some("tls"),
+        "acme_directory",
+        "\"https://127.0.0.1:1/dir\"",
+    );
+    let config_text = set_config_value(
+        &config_text,
+        Some("tls"),
+        "domains",
+        "[\"board.example.com\"]",
+    );
+    let config_text = set_config_value(&config_text, Some("tls"), "staging_check", "false");
+    rewrite_config(&install.config, &config_text);
+
+    let acme_dir = install.data_dir.join("certs/acme");
+    fs::create_dir_all(&acme_dir).expect("创建 certs/acme");
+    set_mode(&acme_dir, 0o700);
+    let account = acme_dir.join("account.json");
+    fs::write(&account, ACCOUNT_JSON).expect("写 account.json");
+    set_mode(&account, 0o600);
+    let state = acme_dir.join("state.toml");
+    let corrupt_state = b"this is not = valid toml [[[\n";
+    fs::write(&state, corrupt_state).expect("写损坏的 state.toml");
+    set_mode(&state, 0o600);
+    let snapshot_before = snapshot_dir(&acme_dir);
+
+    let output = hub(&[
+        "tls",
+        "status",
+        "--config",
+        install.config.to_str().expect("config 路径是 UTF-8"),
+    ]);
+    let output_text = combined(&output);
+    assert!(
+        !output.status.success(),
+        "ACME 模式下损坏的 state.toml 必须让 tls status 非零退出；输出:\n{output_text}"
+    );
+    assert!(
+        output_text.contains("state.toml"),
+        "错误必须点名 state.toml；输出:\n{output_text}"
+    );
+    assert!(
+        output_text.contains("损坏")
+            || output_text.to_lowercase().contains("parse")
+            || output_text.to_lowercase().contains("toml"),
+        "错误必须说明 state.toml 解析/格式损坏，而不是笼统失败；输出:\n{output_text}"
+    );
+    assert_eq!(
+        snapshot_dir(&acme_dir),
+        snapshot_before,
+        "tls status 是只读诊断，不得备份/改写/新增 certs/acme/ 下的文件（含 .corrupt-*）"
+    );
+    assert_eq!(
+        file_mode(&state),
+        Some(0o600),
+        "tls status 不得改写损坏 state.toml 的权限"
+    );
+    assert_eq!(
+        fs::read(&state).expect("status 后读取 state.toml"),
+        corrupt_state,
+        "tls status 不得改写损坏 state.toml 的内容"
+    );
+    assert_eq!(
+        file_mode(&account),
+        Some(0o600),
+        "tls status 不得改写 account.json 的权限"
+    );
+    assert_eq!(
+        fs::read(&account).expect("status 后读取 account.json"),
+        ACCOUNT_JSON.as_bytes(),
+        "tls status 不得改写 account.json 的内容"
     );
 }
 
@@ -593,6 +756,36 @@ fn misleading_loopback_acme_advice(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn is_numbered_path_start(line: &str, number: u8) -> bool {
+    let trimmed = line.trim_start();
+    [")", ".", "、"]
+        .iter()
+        .any(|separator| trimmed.starts_with(&format!("{number}{separator}")))
+}
+
+/// 按错误信息中 `1) / 2) / 3)` 的编号切片，确保每条路径的关键词只在本路径内命中。
+fn numbered_path_sections(text: &str) -> [String; 3] {
+    let lines: Vec<&str> = text.lines().collect();
+    let find = |number: u8| {
+        lines
+            .iter()
+            .position(|line| is_numbered_path_start(line, number))
+            .unwrap_or_else(|| panic!("错误信息缺少第 {number} 条路径；完整 stderr:\n{text}"))
+    };
+    let first = find(1);
+    let second = find(2);
+    let third = find(3);
+    assert!(
+        first < second && second < third,
+        "三条路径编号顺序异常（{first}/{second}/{third}）；完整 stderr:\n{text}"
+    );
+    [
+        lines[first..second].join("\n"),
+        lines[second..third].join("\n"),
+        lines[third..].join("\n"),
+    ]
 }
 
 /// L-03 验收点：ACME 域名证书 + 回环管理口 + admin_tls=required 必须 fail-closed，
@@ -675,30 +868,38 @@ fn acme_domain_with_loopback_admin_tls_reports_three_paths() {
         "ACME 域名 + 回环 admin_tls=required 必须非零退出；status={status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
-    // 三条路径的关键词必须同时出现在 stderr。
+    // 三条路径必须分别自包含：各路径的关键词只在该路径切片内断言，避免用
+    // 前面路径出现的 self-signed / 127.0.0.1 / rotate-cert 让第 3 条虚假通过。
+    let [path1, path2, path3] = numbered_path_sections(&stderr);
     assert!(
-        stderr.contains("0.0.0.0:8444"),
-        "缺少路径 1（0.0.0.0:8444 + 防火墙限制来源）；stderr:\n{stderr}"
+        path1.contains("0.0.0.0:8444")
+            && path1.contains("防火墙")
+            && path1.contains("安全组"),
+        "路径 1 必须同时包含 0.0.0.0:8444、防火墙、安全组；实际路径 1:\n{path1}\n完整 stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("admin_tls = \"off\"") || stderr.contains("admin_tls=\"off\""),
-        "缺少路径 2（admin_tls = \"off\"）；stderr:\n{stderr}"
+        (path2.contains("admin_tls = \"off\"") || path2.contains("admin_tls=\"off\""))
+            && path2.contains("反向代理"),
+        "路径 2 必须同时包含 admin_tls = \"off\" 与反向代理；实际路径 2:\n{path2}\n完整 stderr:\n{stderr}"
+    );
+    let path3_unique_phrase = path3.contains("仅 self-signed")
+        || path3.contains("仅限 self-signed")
+        || path3.contains("只有 self-signed");
+    assert!(
+        path3_unique_phrase,
+        "路径 3 必须带“仅 self-signed”（或等价唯一限定短语）；实际路径 3:\n{path3}\n完整 stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("反向代理"),
-        "路径 2 必须说明 TLS 交给反向代理；stderr:\n{stderr}"
+        path3.contains("加入 server_names"),
+        "路径 3 必须明确写“加入 server_names”；实际路径 3:\n{path3}\n完整 stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("self-signed") || stderr.contains("自签"),
-        "缺少路径 3（self-signed 证书）；stderr:\n{stderr}"
+        path3.contains("包含 127.0.0.1 SAN") || path3.contains("包含 ::1 SAN"),
+        "路径 3 必须明确写“包含 127.0.0.1 SAN”（或 ::1 SAN）；实际路径 3:\n{path3}\n完整 stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("127.0.0.1") || stderr.contains("::1"),
-        "路径 3 必须点名回环 IP SAN（127.0.0.1 / ::1）；stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("rotate-cert"),
-        "路径 3 必须给出 rotate-cert 可执行命令；stderr:\n{stderr}"
+        path3.contains("rotate-cert"),
+        "路径 3 必须给出 rotate-cert 可执行命令；实际路径 3:\n{path3}\n完整 stderr:\n{stderr}"
     );
 
     // 不得出现“把回环 IP 加入公共 ACME / tls.domains”的误导。
@@ -709,6 +910,20 @@ fn acme_domain_with_loopback_admin_tls_reports_three_paths() {
     if let Some(line) = misleading_loopback_acme_advice(&stderr) {
         panic!("错误信息包含“给公共 ACME 证书加回环 IP”的误导建议: {line}\n完整 stderr:\n{stderr}");
     }
+}
+
+fn current_euid() -> u32 {
+    let output = Command::new("id").arg("-u").output().expect("执行 id -u");
+    assert!(
+        output.status.success(),
+        "id -u 失败: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("解析 id -u 输出")
 }
 
 /// `chattr(1)` 设置/清除不可变位；用来在 root 下制造 chmod EACCES。
@@ -745,11 +960,21 @@ impl Drop for ImmutableFile {
 
 /// L-01 验收点：权限收紧失败（EACCES）时启动失败，不能静默继续。
 ///
-/// 当前以 root 运行，普通 0555 目录对 root 无效；这里用 `chattr +i` 让 account.json
-/// 的 chmod 稳定返回 EPERM/EACCES。文件系统不支持不可变位时显式跳过并打印原因，
-/// 不把“无法构造故障”当成通过。
+/// 以 root 运行时普通 0555 目录无法阻止 chmod；这里用 `chattr +i` 让 account.json
+/// 的 chmod 稳定返回 EPERM/EACCES。该用例需要 root + CAP_LINUX_IMMUTABLE，故显式
+/// `#[ignore]`，默认套件不计入 passed。root 门禁必须额外执行：
+/// `cargo test ... -- --ignored --exact run_fails_when_account_hardening_is_denied`。
+/// 非 root 误跑时直接 panic 说明原因，不再静默 return 造成假跳过。
 #[test]
+#[ignore = "requires root + chattr +i (CAP_LINUX_IMMUTABLE)"]
 fn run_fails_when_account_hardening_is_denied() {
+    let euid = current_euid();
+    if euid != 0 {
+        panic!(
+            "run_fails_when_account_hardening_is_denied 带 #[ignore]，只能由 root 门禁执行；\
+             当前 euid={euid}，非 root 下 chattr +i 必然 EPERM，无法构造权限收紧失败"
+        );
+    }
     let install = init_install("harden-denied", 0);
     let acme_dir = install.data_dir.join("certs/acme");
     fs::create_dir_all(&acme_dir).expect("创建 certs/acme");
@@ -760,11 +985,10 @@ fn run_fails_when_account_hardening_is_denied() {
     let before = fs::read(&account).expect("读取 account.json");
 
     if let Err(reason) = set_immutable(&account, true) {
-        eprintln!(
-            "SKIP run_fails_when_account_hardening_is_denied：无法构造权限收紧失败（{reason}）；\
-             需要支持 chattr +i 的文件系统或非 root 测试环境"
+        panic!(
+            "无法构造权限收紧失败（{reason}）；该 #[ignore] 用例要求 root + 支持 chattr +i \
+             （CAP_LINUX_IMMUTABLE）的文件系统"
         );
-        return;
     }
     let _immutable = ImmutableFile {
         path: account.clone(),
@@ -784,11 +1008,12 @@ fn run_fails_when_account_hardening_is_denied() {
         !status.success(),
         "权限收紧失败时 hub run 必须非零退出，不能静默继续；status={status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    let account_path = account.display().to_string();
     assert!(
-        stderr.contains("account.json")
-            || stderr.contains("权限")
-            || stderr.to_lowercase().contains("permission"),
-        "失败信息必须说明 account.json 权限收紧失败；stderr:\n{stderr}"
+        (stderr.contains("启动前收紧") || stderr.contains("权限失败"))
+            && stderr.contains(&account_path),
+        "失败信息必须同时包含“启动前收紧/权限失败”和具体 account.json 路径；\
+         stderr:\n{stderr}"
     );
     assert_eq!(
         file_mode(&account),
