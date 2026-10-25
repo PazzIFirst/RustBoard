@@ -27,9 +27,9 @@
 
 ```bash
 # 静态与版本
-file dist/x86_64/bin/rustboard-hub          # 期望 static-linked / static-pie
-ldd  dist/x86_64/bin/rustboard-hub          # 期望 "not a dynamic executable"
-dist/aarch64/bin/rustboard-hub --version
+file dist/amd64/bin/rustboard-hub           # 期望 static-linked / static-pie
+ldd  dist/amd64/bin/rustboard-hub           # 期望 statically linked / not a dynamic executable
+dist/arm64/bin/rustboard-hub --version
 
 # 包与校验
 tar -tzf serverdashboard-v1.0.0-x86_64.tar.gz
@@ -41,7 +41,7 @@ unshare -n bash -c 'ip link set lo up; ./install.sh hub --offline --prefix /opt/
 # 断言无外部 connect（strace 只允许 loopback/Unix）
 
 # arm64
-qemu-aarch64-static dist/aarch64/bin/rustboard-hub --version
+qemu-aarch64-static dist/arm64/bin/rustboard-hub --version
 docker run --rm --platform linux/arm64 ghcr.io/pazzifirst/rustboard-hub:v1.0.0 --version
 
 # 多架构与隔离
@@ -119,7 +119,8 @@ serverdashboard-v1.0.0-x86_64/
   1. 校验自身架构与 `VERSION`；
   2. 用 `sha256sum -c` 校验包内二进制/web/unit；
   3. 把 web 安装到 `/usr/share/rustboard/web`（仅 hub/panel 包或同包）；
-  4. `exec bin/rustboard-<role> install --offline ...`，不重复实现配置逻辑；
+  4. 以子进程调用 `bin/rustboard-<role> install --offline ...`（不 `exec`，失败时由
+     `install.sh` 恢复旧 web），不重复实现配置逻辑；
   5. token/密码仍走 Phase A 的 0600 文件/stdin，不接受 argv。
 - `--offline` 的语义固定为“**不发起外部网络探测**”；本地端口 bind、
   loopback `/healthz`、systemd 操作仍可发生。文档和 `--help` 必须写清。
@@ -212,7 +213,8 @@ verify (version/tag/main 祖先/测试门禁)
 - CI：先以 `workflow_dispatch` 或 main 上的独立 `install-e2e` job 试运行
   root+systemd 的 v100；稳定后再纳入默认 CI。GitHub hosted runner 需要
   `sudo`，若 systemd 不可用则明确 skip 并保留本地门禁，不伪装通过。
-- 所有脚本 `set -euo pipefail`、临时目录 `mktemp` + trap 清理、`/opt` 前缀、
+- 发布脚本 `set -euo pipefail`；e2e 用 `set -uo pipefail` + PASS/FAIL 计数；
+  临时目录 `mktemp` + trap 清理、`/opt` 前缀、
   不碰生产路径。
 
 ## 4. 文件与接口

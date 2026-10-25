@@ -821,28 +821,38 @@ fn paths_for_role_validated(
     Paths::for_role(role, raw_prefix, overrides)
 }
 
-/// 安装锁作用域：dry-run 只读不加锁，其余流程必须持有全局锁。
+/// 安装锁作用域：dry-run 只读不加锁；父进程已持锁时也无需（且不能）再加锁；
+/// 其余流程必须持有全局锁。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InstallLockScope {
     None,
     Global,
 }
 
-fn install_lock_scope(dry_run: bool) -> InstallLockScope {
-    if dry_run {
+/// 根据 dry-run 与锁继承标记决定锁作用域。
+///
+/// `inherited` 必须来自 [`InstallLock::inherited`]（`RUSTBOARD_INSTALL_LOCK_HELD`
+/// 精确为 `1`），不能由 CLI 参数控制；dry-run 一律不加锁，即使环境变量被设置。
+fn install_lock_scope(dry_run: bool, inherited: bool) -> InstallLockScope {
+    if dry_run || inherited {
         InstallLockScope::None
     } else {
         InstallLockScope::Global
     }
 }
 
-/// 获取安装全局锁；dry-run 返回 `None`。
+/// 获取安装全局锁；dry-run 或已继承父进程锁时返回 `None`。
 ///
 /// hub / panel / agent 共用同一份 `install-state.toml`，必须用全局锁串行；
 /// 角色锁只串行同一角色，不能防止不同角色并发覆盖 state。锁在读取 state 之前
-/// 获取，并持有到整个函数结束。
+/// 获取，本地获取的锁由调用方持有到整个函数结束；继承来的锁由父进程持有到本
+/// 进程退出。
+///
+/// 已继承（`RUSTBOARD_INSTALL_LOCK_HELD=1`）时**绝不能**再调用
+/// [`InstallLock::acquire_global`]：对同一把锁重复 flock 会失败（自锁），而
+/// 父进程的锁已经提供了串行保护。
 fn acquire_install_lock(dry_run: bool) -> Result<Option<InstallLock>> {
-    match install_lock_scope(dry_run) {
+    match install_lock_scope(dry_run, InstallLock::inherited()) {
         InstallLockScope::None => Ok(None),
         InstallLockScope::Global => InstallLock::acquire_global()
             .map(Some)
@@ -917,8 +927,11 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
     };
 
     // 非 dry-run 全程持有全局锁：锁在读取 state 之前获取，避免 hub / panel /
-    // agent 并发读同一份状态后互相覆盖；hub 调起的 panel 子进程通过
-    // RUSTBOARD_INSTALL_LOCK_HELD=1 跳过同一把锁，避免自锁。
+    // agent 并发读同一份状态后互相覆盖。锁可能来自父进程：packaging/install.sh
+    // 先在写 web 之前 flock `/run/rustboard-install.lock`，设置
+    // RUSTBOARD_INSTALL_LOCK_HELD=1 后再启动本命令，并一直持有到本进程退出；
+    // 此时 acquire_install_lock 直接复用父进程的锁，不能再 flock 同一把锁。
+    // hub 调起的 panel 子进程同样继承该标记并跳过，避免自锁。
     let _lock = acquire_install_lock(false)?;
 
     let state = InstallState::load(&paths.state)?;
@@ -1286,7 +1299,9 @@ fn install_panel(args: &InstallArgs, paths: &Paths, cfg: &HubConfig, manage: boo
         command.arg("--no-systemd");
     }
     // hub 持有全局锁直到整个安装（含面板子进程）结束；panel 必须跳过重复加锁，
-    // 否则 open + flock 同一把锁会自锁。该变量只是父子进程约定，不是安全边界。
+    // 否则 open + flock 同一把锁会自锁。若 hub 自身也是 packaging/install.sh 的
+    // 子进程，则锁由 wrapper 持有到 hub 退出（见 install 入口注释）。该变量只是
+    // 父子进程约定，不是安全边界。
     command.env("RUSTBOARD_INSTALL_LOCK_HELD", "1");
     command.stdin(Stdio::null());
 
@@ -2716,11 +2731,66 @@ mod tests {
     }
 
     #[test]
-    fn install_lock_scope_is_global_for_writes_only() {
-        assert_eq!(install_lock_scope(true), InstallLockScope::None);
-        assert_eq!(install_lock_scope(false), InstallLockScope::Global);
+    fn install_lock_scope_skips_dry_run_and_inherited_child() {
+        assert_eq!(install_lock_scope(true, false), InstallLockScope::None);
+        assert_eq!(install_lock_scope(true, true), InstallLockScope::None);
+        assert_eq!(install_lock_scope(false, true), InstallLockScope::None);
+        assert_eq!(install_lock_scope(false, false), InstallLockScope::Global);
         // dry-run 不加锁：这个 helper 在测试环境也能安全执行，不触碰 /run。
         assert!(acquire_install_lock(true).unwrap().is_none());
+    }
+
+    /// 环境变量是进程级全局状态，测试并行时必须串行。
+    static LOCK_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 临时修改 `RUSTBOARD_INSTALL_LOCK_HELD`，Drop（含 panic）时还原。
+    struct LockHeldEnvGuard {
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl LockHeldEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let original = std::env::var_os(rustboard_install::LOCK_HELD_ENV);
+            match value {
+                Some(value) => std::env::set_var(rustboard_install::LOCK_HELD_ENV, value),
+                None => std::env::remove_var(rustboard_install::LOCK_HELD_ENV),
+            }
+            Self { original }
+        }
+    }
+
+    impl Drop for LockHeldEnvGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => std::env::set_var(rustboard_install::LOCK_HELD_ENV, value),
+                None => std::env::remove_var(rustboard_install::LOCK_HELD_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_lock_env_is_exactly_one_and_skips_global_flock() {
+        let _serial = LOCK_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // 父进程（packaging/install.sh）持锁后设 =1：必须直接复用父进程的锁，
+        // 不得再 flock。返回 Ok(None) 即证明没有调用 acquire_global。
+        let env = LockHeldEnvGuard::set(Some("1"));
+        assert!(InstallLock::inherited());
+        assert!(acquire_install_lock(false).unwrap().is_none());
+        drop(env);
+
+        // 0 / 未设置 / 其他值都不算继承；只断言决策，避免测试真的去 flock /run。
+        for value in [Some("0"), None, Some("true"), Some("")] {
+            let _env = LockHeldEnvGuard::set(value);
+            assert!(!InstallLock::inherited(), "{value:?} 不应视为已继承");
+            assert_eq!(
+                install_lock_scope(false, InstallLock::inherited()),
+                InstallLockScope::Global,
+                "{value:?} 应走全局锁"
+            );
+        }
     }
 
     #[cfg(unix)]

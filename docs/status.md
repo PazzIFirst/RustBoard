@@ -1,6 +1,6 @@
 # 实现进度
 
-> 最后更新：2026-10-24　｜　对应需求稿：[requirements.md](requirements.md)
+> 最后更新：2026-10-25　｜　对应需求稿：[requirements.md](requirements.md)
 
 ## 总体
 
@@ -19,7 +19,7 @@
 | M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | v0.4.1 已知问题修复 | 🟢 完成 | KI-29 rowid 竞态、KI-31 64 MiB 配置/下载一致性、KI-28 拒绝日志采样、KI-20 安装命令引用；SFTP 真实环境 29/29，M4 基线渗透无高危；v041 26/26；v0.4.1 发布 |
 | v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
-| M5 安装与交付 | 🟡 进行中（Phase A 完成） | 安装器内核、hub/panel/agent `install`/`upgrade`/`uninstall`、systemd、自签三步安装 e2e 121/121；离线包/多架构/ACME/PG/面板 TLS 待 B–D |
+| M5 安装与交付 | 🟡 进行中（Phase B 完成） | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126（arm64 QEMU + 来源校验）、workspace 1080 tests；多架构 manifest 本地已验证；Phase B 评审/渗透复测完成；GHCR 真实推送与正式 v1.0.0 待 Phase E |
 
 ## M1 明细
 
@@ -187,8 +187,37 @@
 - [x] 门禁：workspace 1079 tests、fmt/clippy/audit 0；独立评审 + 渗透三轮，
       高危/严重项修复后由新评审/渗透复验（报告见
       `docs/security/2026-10-24-m5-phase-a-install-pentest.md`）
-- [ ] Phase B：musl x86_64/arm64、离线包、Docker/多架构、release workflow
-      （计划：[Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)）
+### Phase B（2026-10-25 完成）
+
+- [x] 静态构建入口 `docker/Dockerfile.build`：固定
+      `rust:1.89-alpine@sha256:4b800f2e...`，buildx 在目标平台 native 构建；x86_64 已验证 static-pie，aarch64 已验证
+      statically linked；二者均无 `INTERP`、`--version` 0.4.2
+- [x] 离线包：`packaging/build-release.sh` 生成两架构 tarball、包内/外部
+      `SHA256SUMS`、确定性 tar；`packaging/install.sh` 先校验再写，prefix 安全、
+      web 原子安装、拒绝明文 secret argv
+- [x] 离线 netns e2e：`tests/e2e/v100-offline.sh` **122 PASS / 0 FAIL / 0 SKIP**（含 agent 真实 enrollment、STRICT=1 复测）；
+      只允许 Unix/loopback connect；hub/panel 实际启动 healthz；重复安装幂等；
+      篡改包与明文 argv 在写盘前失败
+- [x] Docker：`docker/Dockerfile` 四 target、三 entrypoint、compose 示例；
+      `tests/e2e/v100-docker.sh` **126 PASS / 0 FAIL / 0 SKIP**（含 agent 真实 enrollment、panel `--user`、arm64 QEMU 镜像、来源校验）；
+      hub/panel 主进程 UID 10001、tini root、8444 不发布、panel 共享 netns、
+      restart 幂等、空 volume `--user` fail-fast、agent 空 env 零落盘
+- [x] Release workflow：`v*` tag 触发、tag/版本/main 祖先门禁、两架构原生构建、
+      三镜像 staging→正式/sha/latest、SBOM/attestation、delivery-e2e、draft→publish；
+      `actionlint` 通过
+- [x] arm64 离线包 e2e（B-G4）：`tests/e2e/v100-arm64.sh` **40 PASS / 0 FAIL / 2 SKIP**
+      （x86 主机不直接执行 package install.sh，按设计 SKIP；二进制 qemu 运行/hub healthz 通过）
+- [x] 多架构 manifest：本地 registry 实测三 role 的 `v0.4.2`/`sha-<12>`/`latest` digest 一致，
+      amd64+arm64 均在 manifest；GHCR 真实推送仍待 v1.0.0 发布
+- [x] 独立评审 + 渗透：首轮 + 第三轮独立评审、渗透复测完成；H-01/H-02 关闭，
+      S1 信号残余书面接受；证据见 [Phase B 交付证据](security/2026-10-25-m5-phase-b-delivery-evidence.md)、
+      [渗透报告](security/2026-10-25-m5-phase-b-pentest.md)
+- [ ] 正式 `v1.0.0`：CHANGELOG 归档、tag、Release、镜像在 Phase E 完成
+
+计划：[Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)。
+离线/Docker/发布文档：[offline](install/offline.md)、[docker](install/docker.md)、
+[release](install/release.md)。
+
 - [ ] Phase C/D/E：ACME/面板 TLS、PostgreSQL/备份迁移、压力/长稳/v1.0.0
 
 > Phase A 的 e2e 只覆盖 x86_64 本机 systemd；arm64、离线 netns、Docker 镜像与
@@ -409,9 +438,10 @@
 
 v0.4.1 已完成并发布；v0.4.2 修复 CI ANSI 测试助手，并把 vendored SFTP 依赖
 升级到稳定 ECC 栈（crypto-bigint 0.7.6，RUSTSEC-2026-0387）。M5 Phase A 已完成
-安装器内核与自签三步安装（e2e 121/121）；下一步按计划进入 Phase B：musl
-x86_64/arm64、离线包、多架构 Docker 与 tag 触发的 release workflow，随后并行
-Phase C（ACME/面板 TLS）与 Phase D（PostgreSQL/备份迁移）。计划见
+安装器内核与自签三步安装（e2e 121/121）；Phase B 已完成两架构静态 musl、离线包、
+Docker/多架构与 tag 触发 release workflow 的本地验收，checkpoint 后进入 Phase C
+（ACME/面板 TLS）与 Phase D（PostgreSQL/备份迁移），v1.0.0 正式发布在 Phase E。
+计划见
 [M5 计划](plans/2026-10-24-m5-install-delivery.md)、
 [Phase A 设计](plans/2026-10-24-m5-phase-a-installer.md) 与
 [Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)。控制面/告警/归档均按

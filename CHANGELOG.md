@@ -12,6 +12,22 @@
 
 ### Added
 
+- M5 Phase B 交付物：`packaging/build-release.sh` 以固定
+  `rust:1.89-alpine@sha256:4b800f2e...` 在 buildx 目标平台 native 构建
+  `x86_64`/`aarch64` 静态 musl 二进制，生成 `serverdashboard-v<version>-<arch>.tar.gz`、
+  包内/外部 `SHA256SUMS` 与确定性 tar
+- 离线包 `install.sh`：先校验包内 SHA256SUMS、ELF 架构/版本，再校验 prefix 安全性，
+  原子安装 web，最后以子进程调用 Phase A 安装器并在失败时回滚 web；默认
+  `--offline`，拒绝明文 token/password argv
+- `docker/Dockerfile`（hub/panel/agent 多 target）、三个 entrypoint、
+  `docker/compose.example.yml` 与 `docker/README.md`：基础镜像固定 digest，首启
+  root 初始化后 `setpriv` 降权到 UID/GID 10001；hub 管理口 8444 始终保持回环，
+  panel 与 hub 共享 network namespace
+- `.github/workflows/release.yml`：`v*` tag 触发，校验 tag/版本/main 祖先后跑门禁，
+  构建两架构离线包与三镜像 staging manifest，生成 SPDX SBOM、GitHub
+  attestation，全部资产成功后才提升正式/sha/latest 并 publish draft
+- `tests/e2e/v100-offline.sh`、`v100-arm64.sh`、`v100-docker.sh`：netns 无外联安装、
+  arm64 qemu/原生运行、Docker 隔离/非 root/共享 netns/重启幂等/空 volume fail-fast
 - M5 Phase A 安装器：新增 `rustboard-install` 库（路径规划、系统探测、ANSI 提示、
   安装状态、带回滚的事务、systemd unit 渲染、`/healthz` 等待）与
   `packaging/systemd/rustboard-{hub,panel,agent}.service`
@@ -32,9 +48,20 @@
   数据目录 0700。Phase A 暂不引入专用服务用户，Phase E 评估
 - unit 不启用 `RestrictSUIDSGID`：systemd 257 的该 seccomp 过滤器会让 RustBoard
   依赖的 `openat2(2)` 返回 ENOSYS，`NoNewPrivileges` 已覆盖 setuid/setgid 提权
+- Phase B 保持协议 v2、SQLite schema v7 与配置字段不变；静态 musl、离线包和 Docker
+  只是交付形态变化，不改变运行期行为
 
 ### Security
 
+- 离线包 `install.sh` 在写任何文件之前完成 SHA256SUMS、ELF 架构/版本和 prefix
+  所有权校验；web 用 staging + rename 原子替换；拒绝明文 secret argv
+- Docker 镜像不包含 `/etc/rustboard`、私钥或 token；hub/panel/agent 主进程均降权到
+  UID/GID 10001，hub 8444 不 EXPOSE/不发布，panel 与 hub 共享 network namespace
+- hub 共享 admin token 时只解析 `hub.toml` 顶层值，原子写 0600/10001 文件；
+  entrypoint 拒绝受管路径符号链接，避免 root 首启被 volume 内链接诱导越界写入；
+  install.sh 对 child stderr 做常见 secret 形态脱敏，但模式化过滤不是安全边界
+- Release workflow 仅在 tag 对应 main 祖先、版本一致且全部门禁通过后构建；失败保持
+  draft 不 publish；SBOM/attestation 与镜像 digest 一并记录，已发布 tag 不移动
 - 安装器不把 token/密码放进 argv、unit、日志或错误输出；token 只从 0600 文件读取，
   临时 hub→panel token 文件用后即删；所有 systemd 命令走参数数组
 - 安装事务只递归删除本次新建的数据目录；已有数据、配置、证书在失败/卸载默认路径下

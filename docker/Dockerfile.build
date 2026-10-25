@@ -1,0 +1,72 @@
+# RustBoard 静态 musl 发布构建（M5 Phase B / B1 spike 结论）。
+#
+# 用途：由 packaging/build-release.sh 调用，用 buildx 在目标架构上 native 构建：
+#   docker buildx build --platform linux/<amd64|arm64> \
+#     --target export --output type=local,dest=dist/<arch> \
+#     -f docker/Dockerfile.build .
+#
+# 结论（详见 packaging/README.md）：
+# - 固定 rust:1.89-alpine digest，不使用 cross / cargo-zigbuild / 手拼交叉工具链；
+# - 镜像内 apk 只安装 musl-dev perl make file（readelf 已随 rust 镜像提供）；
+# - 每个架构在对应平台的容器里 native 编译，产物为 static-pie musl 二进制。
+#
+# 安全：
+# - 只 COPY 构建必需目录；target/、.git、.env、证书/私钥都不会进入构建阶段；
+# - 最终交付阶段是 `scratch`，只包含三个二进制，不包含任何配置或 secret。
+
+FROM rust:1.89-alpine@sha256:4b800f2e72e04be908e5f634c504c741bd943b763d1d8ad7b096cc340e1b5b46 AS build
+
+# buildx 在 --platform 下自动注入；仅用于日志，不参与产物选择。
+ARG TARGETARCH
+
+ENV CARGO_INCREMENTAL=0
+ENV CARGO_BUILD_JOBS=8
+
+# ring / bundled rusqlite 需要 C 工具链；perl/make 供部分 build script 使用，
+# file 用于静态链接断言（readelf 来自基础镜像）。
+RUN apk add --no-cache musl-dev perl make file
+
+WORKDIR /src
+
+# 只复制 workspace 构建所需内容。tests/docs/web 不参与编译；web 资源由
+# packaging/build-release.sh 在包内组装，不进入镜像构建。
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY vendor ./vendor
+COPY packaging/systemd ./packaging/systemd
+
+# 不使用 host target/，也不使用跨架构 C 工具链：容器平台即目标平台。
+RUN echo "==> native musl build for TARGETARCH=${TARGETARCH}" \
+    && cargo build --locked --release \
+        -p rustboard-hub \
+        -p rustboard-panel \
+        -p rustboard-agent
+
+# 静态断言必须发生在导出之前：
+# - file 断言 static / static-pie；
+# - readelf -l 断言没有 INTERP（不依赖 ldd 在 Alpine 上的输出）；
+# - --version 验证产物可执行（arm64 构建由 buildx binfmt/QEMU 执行）。
+RUN set -eux; \
+    for name in rustboard-hub rustboard-panel rustboard-agent; do \
+        bin="target/release/${name}"; \
+        desc=$(file -b "$bin"); \
+        echo "${name}: ${desc}"; \
+        case "$desc" in \
+            *"static-pie linked"* | *"statically linked"*) ;; \
+            *) echo "error: ${name} is not statically linked: ${desc}" >&2; exit 1 ;; \
+        esac; \
+        phdr=$(readelf -lW "$bin"); \
+        if printf '%s\n' "$phdr" | grep -q 'INTERP'; then \
+            echo "error: ${name} has INTERP (dynamic executable)" >&2; \
+            exit 1; \
+        fi; \
+        "$bin" --version; \
+    done
+
+# buildx --target export --output type=local 的交付阶段。
+# 只保留三个二进制，不包含 target/、.git、配置、token 或私钥。
+FROM scratch AS export
+
+COPY --from=build /src/target/release/rustboard-hub /bin/rustboard-hub
+COPY --from=build /src/target/release/rustboard-panel /bin/rustboard-panel
+COPY --from=build /src/target/release/rustboard-agent /bin/rustboard-agent

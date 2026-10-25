@@ -1,0 +1,803 @@
+name: Release
+
+# 发布流水线：只由 v* tag push 触发。普通 push / PR 不推镜像。
+on:
+  push:
+    tags:
+      - "v*"
+
+# 默认最小权限；各 job 按需声明，避免 verify/build 持有 packages/attestation 权限。
+permissions:
+  contents: read
+
+# 同一 tag 的发布串行执行；不取消正在运行的发布，避免留下半成品 draft。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+jobs:
+  # 1. 版本/tag/main 祖先与全部门禁。任何失败都不会进入构建与推送。
+  verify:
+    name: 校验与发布门禁
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      stable: ${{ steps.version.outputs.stable }}
+    steps:
+      - name: 检出代码（完整历史）
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 安装 Rust stable（rustfmt / clippy）
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --component clippy
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      # 必须在任何构建/推送之前完成。tag 与 workspace 版本必须一致（v 前缀）。
+      - name: 校验 tag、workspace 版本与 main 祖先
+        id: version
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag 必须形如 vX.Y.Z（可带预发布后缀），实际为 ${tag}"
+            exit 1
+          fi
+          # Docker/GHCR tag 不允许 '+'，在昂贵的构建开始前明确拒绝。
+          if [[ "$tag" == *"+"* ]]; then
+            echo "::error::tag 不能包含 '+'（SemVer build metadata 不是合法镜像 tag）"
+            exit 1
+          fi
+
+          metadata_file="$(mktemp)"
+          trap 'rm -f "$metadata_file"' EXIT
+          cargo metadata --locked --no-deps --format-version 1 > "$metadata_file"
+
+          version="$(python3 - "$metadata_file" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              metadata = json.load(handle)
+
+          members = set(metadata.get("workspace_members") or [])
+          if not members:
+              raise SystemExit("cargo metadata 未返回 workspace_members")
+          versions = {
+              package.get("version")
+              for package in metadata.get("packages", [])
+              if package.get("id") in members
+          }
+          if len(versions) != 1:
+              raise SystemExit(f"workspace 版本不一致或缺失: {sorted(v for v in versions if v)}")
+          version = versions.pop()
+          if not isinstance(version, str) or not version:
+              raise SystemExit("workspace 版本为空")
+          print(version)
+          PY
+          )"
+
+          tag_version="${tag#v}"
+          if [ "$tag_version" != "$version" ]; then
+            echo "::error::tag ${tag} 与 Cargo.toml workspace 版本 ${version} 不一致"
+            exit 1
+          fi
+
+          # 发布物必须来自 main 祖先提交；显式 fetch main 后再判断。
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::${GITHUB_SHA} 不是 origin/main 的祖先，拒绝发布"
+            exit 1
+          fi
+
+          if [[ "$tag_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            stable=true
+          else
+            stable=false
+          fi
+
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "stable=$stable"
+          } >> "$GITHUB_OUTPUT"
+          echo "版本校验通过: tag=${tag} version=${version} stable=${stable}"
+
+      # 已发布的 tag 不重建、不覆盖资产；只允许重跑失败后留下的 draft。
+      - name: 拒绝重跑已发布的 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" --json isDraft --jq '.isDraft' > /tmp/release-draft 2>/dev/null; then
+            if [ "$(cat /tmp/release-draft)" != "true" ]; then
+              echo "::error::Release ${tag} 已发布；请发布新的 patch 版本，不要重跑已发布 tag"
+              exit 1
+            fi
+            echo "检测到已有 draft Release，将在重建资产后发布"
+          else
+            echo "未发现 Release，将创建 draft"
+          fi
+
+      # notes 在 verify 内提取并作为 artifact 传给 release，避免 staging 已推送后才发现缺失。
+      - name: 提取 CHANGELOG 发布说明
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-meta
+          release_notes="$(bash packaging/release-notes.sh "$VERSION" CHANGELOG.md)"
+          test -n "$release_notes"
+          printf '%s\n' "$release_notes" > release-meta/release-notes.md
+          test -s release-meta/release-notes.md
+
+      - name: 缓存 cargo 与 target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: 格式检查
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+
+      - name: Clippy（警告即错误）
+        run: |
+          set -euo pipefail
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: 单元与集成测试
+        run: |
+          set -euo pipefail
+          cargo test --workspace --locked
+
+      - name: 缓存 cargo-audit
+        id: cache-audit
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-v1
+
+      - name: 安装 cargo-audit
+        if: steps.cache-audit.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cargo install cargo-audit --locked
+
+      - name: 依赖漏洞扫描
+        run: |
+          set -euo pipefail
+          cargo audit
+
+      # SBOM 也前移到 verify：避免 manifest 已推 staging 后才发现 cargo metadata 失败。
+      - name: 生成 SPDX SBOM（x86_64 / aarch64）
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          source_date_epoch="$(git log -1 --format=%ct "$GITHUB_SHA")"
+          export SOURCE_DATE_EPOCH="$source_date_epoch"
+          python3 packaging/sbom.py \
+            --output release-meta/sbom-x86_64.spdx.json \
+            --version "$VERSION" \
+            --revision "$GITHUB_SHA" \
+            --arch x86_64
+          python3 packaging/sbom.py \
+            --output release-meta/sbom-aarch64.spdx.json \
+            --version "$VERSION" \
+            --revision "$GITHUB_SHA" \
+            --arch aarch64
+          test -s release-meta/sbom-x86_64.spdx.json
+          test -s release-meta/sbom-aarch64.spdx.json
+
+      - name: 上传发布说明与 SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-meta
+          path: release-meta
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: 安装 Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      # web/dist 只在这里构建一次；build/images 通过 artifact 复用，避免 arm64 重复 pnpm。
+      - name: 前端类型检查、单测与构建
+        working-directory: web
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm exec tsc --noEmit
+          pnpm test
+          pnpm build
+
+      - name: 上传前端产物
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 7
+          if-no-files-found: error
+
+  # 2. 两架构原生构建：静态 musl 二进制 + 离线包 + 包内校验和。
+  build:
+    name: 构建 ${{ matrix.arch }} 离线包
+    permissions:
+      contents: read
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            pkgarch: x86_64
+            runner: ubuntu-latest
+          # 公开仓库可用的 GitHub 原生 arm64 runner；避免 QEMU 构建。
+          - arch: arm64
+            pkgarch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: 下载前端产物
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: 安装 buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: 构建静态二进制与离线包
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          bash packaging/build-release.sh \
+            --arch "${{ matrix.arch }}" \
+            --version "$VERSION" \
+            --revision "$GITHUB_SHA" \
+            --web-dir web/dist \
+            --out dist
+
+      - name: 校验构建产物布局
+        run: |
+          set -euo pipefail
+          for role in hub panel agent; do
+            test -f "dist/${{ matrix.arch }}/bin/rustboard-${role}"
+          done
+          compgen -G "dist/serverdashboard-v*-${{ matrix.pkgarch }}.tar.gz" > /dev/null
+          test -f "dist/SHA256SUMS.${{ matrix.pkgarch }}"
+          file "dist/${{ matrix.arch }}/bin/rustboard-hub"
+          ls -l dist
+
+      - name: 上传 dist（供 images / manifest / release 使用）
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist
+          retention-days: 7
+          if-no-files-found: error
+
+  # 发布前的真实交付门禁：x86_64 离线包在独立 netns 中完成三角色安装与本地启动。
+  # 失败则 release 不运行（staging 镜像可能已存在，但不会创建正式 tag / Release）。
+  delivery-e2e:
+    name: 离线安装 e2e（x86_64）
+    permissions:
+      contents: read
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: 下载 x86_64 离线包
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-amd64
+          path: dist
+
+      # v100-offline 的 provenance 校验需要仓库内 web/dist（fail-closed）；与 build job 一致。
+      - name: 下载前端产物
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: 安装 e2e 依赖（缺什么装什么）
+        run: |
+          set -euo pipefail
+          missing=()
+          for cmd in strace unshare ip curl file; do
+            if ! command -v "$cmd" > /dev/null 2>&1; then
+              case "$cmd" in
+                ip) missing+=(iproute2) ;;
+                unshare) missing+=(util-linux) ;;
+                *) missing+=("$cmd") ;;
+              esac
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "${missing[@]}"
+          fi
+
+      - name: 运行离线安装 e2e
+        run: |
+          set -euo pipefail
+          package=""
+          for candidate in dist/serverdashboard-v*-x86_64.tar.gz; do
+            if [ -f "$candidate" ]; then
+              package="$candidate"
+              break
+            fi
+          done
+          if [ -z "$package" ]; then
+            echo "::error::找不到 x86_64 离线包"
+            exit 1
+          fi
+          package="$(readlink -f "$package")"
+          e2e_script="$PWD/tests/e2e/v100-offline.sh"
+          test -f "$e2e_script"
+          sudo env PACKAGE="$package" SKIP_BUILD=1 STRICT=1 bash "$e2e_script"
+
+  # 3. 每个架构分别构建并推送三个镜像的临时 tag：<tag>-<arch>。
+  images:
+    name: 镜像 ${{ matrix.role }} / ${{ matrix.arch }}
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - verify
+      - build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            role: hub
+            runner: ubuntu-latest
+          - arch: amd64
+            role: panel
+            runner: ubuntu-latest
+          - arch: amd64
+            role: agent
+            runner: ubuntu-latest
+          - arch: arm64
+            role: hub
+            runner: ubuntu-24.04-arm
+          - arch: arm64
+            role: panel
+            runner: ubuntu-24.04-arm
+          - arch: arm64
+            role: agent
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: 下载对应架构 dist
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist
+
+      - name: 下载前端产物
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: 安装 buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: 登录 GHCR
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: 构建并推送 ${{ matrix.role }} 临时架构 tag
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/pazzifirst/rustboard-${{ matrix.role }}"
+          docker buildx build \
+            --file docker/Dockerfile \
+            --target "${{ matrix.role }}" \
+            --platform "linux/${{ matrix.arch }}" \
+            --build-arg "VERSION=${VERSION}" \
+            --build-arg "REVISION=${GITHUB_SHA}" \
+            --provenance=mode=max \
+            --sbom=true \
+            --tag "${image}:${TAG}-${{ matrix.arch }}" \
+            --push \
+            .
+          echo "已推送 ${image}:${TAG}-${{ matrix.arch }}"
+
+  # 4. 只合成 staging 多架构 tag；正式 :${TAG} 留到 release 全部成功后提升。
+  manifest:
+    name: 合成多架构 manifest
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - verify
+      - build
+      - images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 下载 amd64 dist
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-amd64
+          path: dist
+
+      - name: 下载 arm64 dist
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-arm64
+          path: dist
+
+      # 合并镜像前先确认两个架构的包与发布脚本生成的校验和一致。
+      - name: 校验两架构 dist 与 SHA256SUMS
+        run: |
+          set -euo pipefail
+          for pkgarch in x86_64 aarch64; do
+            test -f "dist/SHA256SUMS.${pkgarch}"
+            compgen -G "dist/serverdashboard-v*-${pkgarch}.tar.gz" > /dev/null
+            (
+              cd dist
+              sha256sum -c --strict "SHA256SUMS.${pkgarch}"
+            )
+          done
+
+      - name: 安装 buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: 登录 GHCR
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: 合成 manifest、校验架构并写 digest
+        env:
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          : > dist/image-digests.txt
+
+          for role in hub panel agent; do
+            image="ghcr.io/pazzifirst/rustboard-${role}"
+
+            docker buildx imagetools create -t "${image}:${TAG}-staging" \
+              "${image}:${TAG}-amd64" \
+              "${image}:${TAG}-arm64"
+
+            raw_manifest="$(docker buildx imagetools inspect --raw "${image}:${TAG}-staging")"
+            printf '%s' "$raw_manifest" | python3 -c '
+          import json
+          import sys
+
+          image = sys.argv[1]
+          manifest = json.load(sys.stdin)
+          architectures = {
+              entry.get("platform", {}).get("architecture")
+              for entry in manifest.get("manifests", [])
+          }
+          missing = {"amd64", "arm64"} - architectures
+          if missing:
+              missing_text = ",".join(sorted(missing))
+              raise SystemExit(f"{image} manifest 缺少架构: {missing_text}")
+          arch_text = ",".join(sorted(a for a in architectures if a))
+          print(f"{image} manifest 架构: {arch_text}")
+          ' "$image"
+
+            digest="$(docker buildx imagetools inspect "${image}:${TAG}-staging" --format '{{.Manifest.Digest}}')"
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::${image}:${TAG}-staging 的 digest 非法: ${digest}"
+              exit 1
+            fi
+            printf '%s %s\n' "$image" "$digest" >> dist/image-digests.txt
+          done
+
+          cat dist/image-digests.txt
+
+      - name: 上传镜像 digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-digests
+          path: dist/image-digests.txt
+          retention-days: 7
+          if-no-files-found: error
+
+  # 5. 资产/SBOM/attestation 全部成功后：staging -> 正式 tag + sha tag -> latest -> 发布 draft。
+  release:
+    name: 发布 GitHub Release
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    needs:
+      - verify
+      - manifest
+      - delivery-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # imagetools 用于 staging -> 正式 tag 的提升；固定安装 buildx 避免依赖 runner 状态。
+      - name: 安装 buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: 下载 amd64 dist
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-amd64
+          path: dist
+
+      - name: 下载 arm64 dist
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-arm64
+          path: dist
+
+      - name: 下载镜像 digest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: image-digests
+          path: dist
+
+      - name: 下载发布说明与 SBOM
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-meta
+          path: dist
+
+      - name: 校验发布资产并生成跨架构 SHA256SUMS
+        run: |
+          set -euo pipefail
+          test -s dist/release-notes.md
+          test -s dist/sbom-x86_64.spdx.json
+          test -s dist/sbom-aarch64.spdx.json
+          test -s dist/image-digests.txt
+          test -s dist/SHA256SUMS.x86_64
+          test -s dist/SHA256SUMS.aarch64
+          (cd dist && sha256sum -c SHA256SUMS.x86_64 && sha256sum -c SHA256SUMS.aarch64)
+
+          tarball_count="$(compgen -G "dist/serverdashboard-v*-*.tar.gz" | wc -l)"
+          if [ "$tarball_count" -ne 2 ]; then
+            echo "::error::期望 2 个 tarball，实际 ${tarball_count} 个"
+            exit 1
+          fi
+
+          # 跨架构校验和覆盖 tarball、SBOM 与镜像 digest；per-arch SHA256SUMS 单独上传。
+          (
+            cd dist
+            sha256sum serverdashboard-*.tar.gz sbom-*.spdx.json image-digests.txt > SHA256SUMS
+          )
+          test -s dist/SHA256SUMS
+          cat dist/SHA256SUMS
+
+      - name: 创建或复用 draft Release 并上传资产
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          STABLE: ${{ needs.verify.outputs.stable }}
+        run: |
+          set -euo pipefail
+          create_flags=()
+          edit_flags=()
+          if [ "$STABLE" = "true" ]; then
+            edit_flags+=(--prerelease=false)
+          else
+            create_flags+=(--prerelease)
+            edit_flags+=(--prerelease)
+          fi
+
+          if gh release view "$TAG" --json isDraft --jq '.isDraft' > /tmp/release-draft 2>/dev/null; then
+            if [ "$(cat /tmp/release-draft)" != "true" ]; then
+              echo "::error::Release ${TAG} 已发布，拒绝覆盖资产"
+              exit 1
+            fi
+            gh release edit "$TAG" \
+              --title "RustBoard ${TAG}" \
+              --notes-file dist/release-notes.md \
+              "${edit_flags[@]}"
+          else
+            gh release create "$TAG" \
+              --draft \
+              --verify-tag \
+              --title "RustBoard ${TAG}" \
+              --notes-file dist/release-notes.md \
+              "${create_flags[@]}"
+          fi
+          gh release upload "$TAG" \
+            dist/serverdashboard-*.tar.gz \
+            dist/SHA256SUMS \
+            dist/SHA256SUMS.x86_64 \
+            dist/SHA256SUMS.aarch64 \
+            dist/sbom-*.spdx.json \
+            dist/image-digests.txt \
+            --clobber
+
+      - name: 生成 tarball / SBOM 的 artifact attestation
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/sbom-*.spdx.json
+
+      - name: 读取镜像 digest
+        id: digests
+        run: |
+          set -euo pipefail
+          for role in hub panel agent; do
+            image="ghcr.io/pazzifirst/rustboard-${role}"
+            digest="$(awk -v image="$image" '$1 == image { print $2 }' dist/image-digests.txt)"
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::${image} 的 digest 缺失或非法: ${digest}"
+              exit 1
+            fi
+            echo "${role}=${digest}" >> "$GITHUB_OUTPUT"
+          done
+
+      # 写入 registry 的 attestation 需要 docker 凭据；token 只进 stdin。
+      - name: 登录 GHCR（写入镜像 attestation）
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: hub 镜像 attestation
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ghcr.io/pazzifirst/rustboard-hub
+          subject-digest: ${{ steps.digests.outputs.hub }}
+          push-to-registry: true
+
+      - name: panel 镜像 attestation
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ghcr.io/pazzifirst/rustboard-panel
+          subject-digest: ${{ steps.digests.outputs.panel }}
+          push-to-registry: true
+
+      - name: agent 镜像 attestation
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ghcr.io/pazzifirst/rustboard-agent
+          subject-digest: ${{ steps.digests.outputs.agent }}
+          push-to-registry: true
+
+      # 资产与全部 attestation 成功后才把 staging 提升为正式 tag 与 sha-<short>；
+      # 失败则 Release 保持 draft。
+      - name: 将 staging 提升为正式 tag 与 sha-<short> 并校验 digest
+        env:
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:12}"
+          if [[ ! "$short_sha" =~ ^[0-9a-f]{12}$ ]]; then
+            echo "::error::GITHUB_SHA 前 12 位不是合法短 SHA: ${short_sha}"
+            exit 1
+          fi
+
+          for role in hub panel agent; do
+            image="ghcr.io/pazzifirst/rustboard-${role}"
+            staging_expected="$(awk -v image="$image" '$1 == image { print $2 }' dist/image-digests.txt)"
+            if [[ ! "$staging_expected" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::${image} 的 staging digest 缺失或非法: ${staging_expected}"
+              exit 1
+            fi
+
+            staging_live="$(docker buildx imagetools inspect \
+              "${image}:${TAG}-staging" --format '{{.Manifest.Digest}}')"
+            if [ "$staging_live" != "$staging_expected" ]; then
+              echo "::error::${image} staging digest 已变化: 期望 ${staging_expected}，实际 ${staging_live}"
+              exit 1
+            fi
+
+            docker buildx imagetools create \
+              -t "${image}:${TAG}" \
+              -t "${image}:sha-${short_sha}" \
+              "${image}:${TAG}-staging"
+
+            promoted="$(docker buildx imagetools inspect \
+              "${image}:${TAG}" --format '{{.Manifest.Digest}}')"
+            if [ "$promoted" != "$staging_expected" ]; then
+              echo "::error::${image} 正式 tag digest 与 staging 不一致: 期望 ${staging_expected}，实际 ${promoted}"
+              exit 1
+            fi
+
+            promoted_sha="$(docker buildx imagetools inspect \
+              "${image}:sha-${short_sha}" --format '{{.Manifest.Digest}}')"
+            if [ "$promoted_sha" != "$staging_expected" ]; then
+              echo "::error::${image} sha tag digest 与 staging 不一致: 期望 ${staging_expected}，实际 ${promoted_sha}"
+              exit 1
+            fi
+            echo "已提升 ${image}:${TAG} 与 ${image}:sha-${short_sha} = ${promoted}"
+          done
+
+      # B-G9：正式 tag 与 sha tag 都提升成功后才补 latest；失败则 Release 保持 draft。
+      # 仅在稳定 tag（纯 X.Y.Z）时执行；预发布 tag 不移动 latest。
+      - name: 补 latest（仅稳定版）
+        if: needs.verify.outputs.stable == 'true'
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          for role in hub panel agent; do
+            image="ghcr.io/pazzifirst/rustboard-${role}"
+            docker buildx imagetools create -t "${image}:latest" "${image}:${TAG}"
+            formal="$(docker buildx imagetools inspect "${image}:${TAG}" --format '{{.Manifest.Digest}}')"
+            latest="$(docker buildx imagetools inspect "${image}:latest" --format '{{.Manifest.Digest}}')"
+            if [ "$formal" != "$latest" ]; then
+              echo "::error::${image}:latest digest 与 ${TAG} 不一致: formal=${formal} latest=${latest}"
+              exit 1
+            fi
+          done
+
+      # 只有前面所有步骤（含 latest 提升）成功才会执行；失败时 draft 保留，不 publish。
+      - name: 发布 Release（取消 draft）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false
+          echo "已发布 Release ${TAG}"

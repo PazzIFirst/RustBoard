@@ -12,8 +12,8 @@
 已知问题见 [docs/known-issues.md](docs/known-issues.md)。
 协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面、v0.3.x 硬化、M4 告警/归档、v0.4.1 已知问题修复与 v0.4.2 安全补丁已完成（v0.4.2）。**
-> 证书目前只有自签模式，ACME（域名 / 公网 IP 自动续期）在 M5 交付。
+> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面、v0.3.x 硬化、M4 告警/归档、v0.4.1 已知问题修复、v0.4.2 安全补丁已完成；M5 Phase A 已完成，Phase B 交付物已完成（v0.4.2；v1.0.0 正式发布在 Phase E）。**
+> Phase B 交付静态 musl 离线包、Docker 多架构镜像和 release workflow；证书仍只有自签模式，ACME（域名 / 公网 IP 自动续期）在 Phase C 交付。
 >
 > 线协议版本为 **2**：hub 与 agent 必须严格一致。版本不符时 hub 回 `bad_protocol`
 > 且不下发 Welcome，agent 打印明确错误并以非零码退出，不会进入重连循环。
@@ -76,6 +76,37 @@ logs = true
   可以伪造执行结果；hub 审计不能抵抗被控 agent。控制面能力默认关闭、白名单与操作确认
   是主要防线。
 - 操作前请在面板上二次确认；`curl` 直接调用时必须带 `"confirm": true`（start 除外）。
+
+## 安装与交付（M5 Phase B）
+
+Phase B 提供三类正式交付物，协议/数据库/配置与 Phase A 一致：
+
+- **离线包**：`serverdashboard-v<version>-{x86_64,aarch64}.tar.gz`，含三个静态 musl
+  二进制、前端、systemd unit 参考、`install.sh` 与逐文件 `SHA256SUMS`。校验后执行
+  `sudo ./install.sh hub|panel|agent --yes`；`--offline` 默认开启，含义是“不发起外部
+  网络探测”。详见 [离线安装](docs/install/offline.md)。
+- **Docker**：`ghcr.io/pazzifirst/rustboard-{hub,panel,agent}`，多架构、主进程
+  UID 10001。panel 必须与 hub 共享 network namespace，8444 永不发布到宿主。详见
+  [Docker 部署](docs/install/docker.md)。
+- **Release**：`v*` tag 触发两架构构建、SBOM、attestation、GitHub Release 与镜像
+  发布；普通 push 不推镜像。详见 [发布流水线](docs/install/release.md)。
+
+本地验收：
+
+```bash
+(cd web && pnpm install --frozen-lockfile && pnpm build)
+packaging/build-release.sh --arch amd64
+PACKAGE=dist/serverdashboard-v0.4.2-x86_64.tar.gz SKIP_BUILD=1 \
+  bash tests/e2e/v100-offline.sh
+# 仅当已显式 PACKAGE 且 dist/amd64/bin 三二进制、packaging/install.sh、web/dist
+# 完整时才可用 SKIP_BUILD=1；缺源默认 fail-closed（ALLOW_UNVERIFIED=1 仅用于
+# 源不可得的逃生场景，打印 WARN、不计 PASS；hash 不一致仍然失败）。
+bash tests/e2e/v100-docker.sh
+```
+
+> 当前 `Cargo.toml` 仍为 `0.4.2`；`v1.0.0` 的 CHANGELOG 归档、tag 与正式发布在
+> Phase E 完成。Phase B 只负责交付物与流水线，不改变协议帧、SQLite schema 或配置
+> 必填项。
 
 ## 快速开始（开发环境）
 

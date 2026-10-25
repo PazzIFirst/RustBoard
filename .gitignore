@@ -9,3 +9,4 @@ web/dist
 .pnpm-store/
 tests/pentest/evidence/
 tests/pentest/__pycache__/
+dist/

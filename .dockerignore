@@ -1,0 +1,48 @@
+# Docker 构建上下文裁剪。
+#
+# 构建镜像只需要：
+#   dist/<arch>/bin/rustboard-{hub,panel,agent}
+#   web/dist/
+#   docker/entrypoint-*.sh
+# 以及 Dockerfile 自身。以下被排除的内容不得包含 dist/、web/dist、docker/、
+# packaging/、Cargo.toml、Cargo.lock、crates/vendor 或 packaging/systemd。
+
+# Git / 编辑器 / 本地工作区
+.git/
+.github/
+.worktrees/
+.idea/
+.vscode/
+.DS_Store
+
+# Rust / 前端构建缓存
+target/
+**/target/
+web/node_modules/
+**/node_modules/
+.pnpm-store/
+
+# 文档与测试（tests/pentest/evidence 是原始证据，可能含敏感抓包）
+docs/
+tests/
+tests/pentest/evidence/
+
+# 日志与本地环境文件
+*.log
+**/*.log
+**/.env
+**/.env.*
+
+# 私钥 / 证书类文件绝不进入构建上下文（镜像也不需要它们）
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.token
+secrets/
+
+# 注意：
+# - 不要排除 dist/ 或 web/dist/，否则 hub/panel 镜像的 COPY 会失败；
+# - 不要排除 docker/ 或 packaging/；
+# - dist 下的 tarball 可以保留在上下文中（构建不会 COPY），不要用通配符误伤
+#   dist/<arch>/bin。

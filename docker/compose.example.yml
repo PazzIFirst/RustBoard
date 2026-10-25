@@ -1,0 +1,106 @@
+# RustBoard Docker Compose 示例（Phase B）。
+#
+# 使用前请：
+# 1. 准备 dist/<arch>/bin 与 web/dist，构建三个镜像（见 docker/README.md）；
+# 2. 把下面的 hub.example.com、REPLACE_WITH_... 占位符换成真实值；
+# 3. 不要把 8444 发布到宿主；不要给 panel 添加 ports。
+#
+# 启动 hub + panel：
+#   RUSTBOARD_VERSION=v1.0.0 docker compose -f docker/compose.example.yml up -d
+# 启动 agent（默认不启动）：
+#   RUSTBOARD_VERSION=v1.0.0 docker compose -f docker/compose.example.yml --profile agent up -d
+#
+# 注意：hub 与 panel 共享 network namespace。panel 必须通过 127.0.0.1:8444
+# 访问 hub 管理 API，而 Phase B 的管理口仍只允许回环明文。
+
+name: rustboard
+
+services:
+  hub:
+    image: ghcr.io/pazzifirst/rustboard-hub:${RUSTBOARD_VERSION:-latest}
+    hostname: rustboard-hub
+    restart: unless-stopped
+    ports:
+      # agent 接入（mTLS），需要对外。
+      - "8443:8443"
+      # panel 监听在 hub 的 network namespace 中，由 hub 服务发布 8080。
+      # 默认只绑宿主回环；远程访问请用 SSH 隧道 / VPN / 反代。
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - hub_data:/data
+      # 可选共享 admin token。它是敏感卷，只给 hub 写、panel 只读挂载。
+      - hub_run:/run/rustboard
+    environment:
+      RUSTBOARD_LISTEN: "0.0.0.0:8443"
+      RUSTBOARD_ADMIN_LISTEN: "127.0.0.1:8444"
+      RUSTBOARD_ADMIN_TOKEN_SHARE: "/run/rustboard/admin_token"
+      RUSTBOARD_NAME: "${RUSTBOARD_HUB_NAME:-rustboard-hub}"
+      # 必须换成 agent 实际连接的域名 / IP；它会进入服务端证书 SAN。
+      RUSTBOARD_ADVERTISE: "${RUSTBOARD_HUB_ADVERTISE:-hub.example.com}"
+      # 可选：额外 SAN，逗号分隔（例如 "10.0.0.10,hub.example.com"）。
+      RUSTBOARD_SAN: "${RUSTBOARD_HUB_SAN:-}"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8444/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+  panel:
+    image: ghcr.io/pazzifirst/rustboard-panel:${RUSTBOARD_VERSION:-latest}
+    # 与 hub 共享 loopback，才能访问 127.0.0.1:8444；不要给本服务加 ports。
+    network_mode: "service:hub"
+    depends_on:
+      hub:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - panel_data:/data
+      # 只读挂载 hub 写出的 admin token。该卷含敏感 token。
+      - hub_run:/run/rustboard:ro
+    environment:
+      HUB_URL: "http://127.0.0.1:8444"
+      HUB_TOKEN_FILE: "/run/rustboard/admin_token"
+      PANEL_LISTEN: "0.0.0.0:8080"
+      PANEL_STATIC_DIR: "/usr/share/rustboard/web"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+  agent:
+    image: ghcr.io/pazzifirst/rustboard-agent:${RUSTBOARD_VERSION:-latest}
+    profiles: ["agent"]
+    restart: unless-stopped
+    volumes:
+      - agent_data:/data
+      # enrollment token 只以 0600 文件挂载，禁止放进环境变量或镜像。
+      - ${RUSTBOARD_ENROLL_TOKEN_FILE:-./secrets/enroll.token}:/run/rustboard/enroll_token:ro
+    environment:
+      RUSTBOARD_HUB_URL: "${RUSTBOARD_HUB_URL:-wss://hub.example.com:8443/agent/ws}"
+      RUSTBOARD_TOKEN_FILE: "/run/rustboard/enroll_token"
+      RUSTBOARD_FINGERPRINT: "${RUSTBOARD_HUB_FINGERPRINT:-REPLACE_WITH_64_HEX_FINGERPRINT}"
+      RUSTBOARD_NAME: "${RUSTBOARD_AGENT_NAME:-agent-01}"
+    healthcheck:
+      # 未完成 enrollment 前必然失败；Dockerfile 给了 90s start-period。
+      test: ["CMD", "rustboard-agent", "cert-info", "--config", "/data/etc/rustboard/agent.toml"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    # 默认非 privileged、不挂 docker.sock、不启用控制面。
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  hub_data:
+  panel_data:
+  # 敏感：包含 hub admin_token。只允许 hub（rw）与 panel（ro）挂载。
+  hub_run:
+  agent_data:
