@@ -28,6 +28,16 @@
   （`docker builder prune -af`）；保留 `target/baseline-bin`（v0.4.0 冻结基线）。
 - 结果：62%（59 GiB 可用）；未删除源码、测试、文档、`vendor/`、`tests/pentest/`。
 
+## 构建产物清理（2026-10-26 Phase D 收尾）
+
+- 触发：`target` 44 GiB（>30 GiB 阈值），根分区 84%（26 GiB 可用）。
+- 清理：`target/debug`（含测试/构建产物）；保留 `target/baseline-bin`（v0.4.0
+  冻结基线）、`target/doc`、`target/install-policy-tests`。
+- 结果：根分区 55%（69 GiB 可用），`target` 约 517 MiB；未删除源码、测试、
+  文档、`vendor/`、`tests/pentest/`。
+- 测试环境：删除临时 PostgreSQL 容器 `rb-d3-pg` 与 `/tmp/rb-d3-pg.env`；
+  保留 `rb-pebble`（Phase C ACME 测试实例）不动。
+
 ## M1 明细
 
 已完成：
