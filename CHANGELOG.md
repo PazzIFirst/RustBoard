@@ -10,6 +10,18 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.2] - 2026-10-26
+
+### Fixed
+
+- 安装前缀允许 root 拥有的祖先目录（如 `/home`、`/opt` 0755），同时继续拒绝
+  其他非当前 euid 属主与 group/other 可写目录，修复非 root CI 上 Phase C 面板
+  集成测试的假阴性
+- 离线安装与 arm64 e2e 的临时 prefix 从 `/opt` 改为 `$HOME`，避免 GitHub runner
+  上 `/opt` 0777 触发安装前缀安全拒绝
+- Docker e2e 的已初始化 volume 预检改从容器的 `/data` 视图确认，避免 CI 上宿主
+  bind-mount 源路径不可见导致的假阴性
+
 ## [1.0.0-rc.1] - 2026-10-26
 
 ### Added
