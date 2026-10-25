@@ -269,10 +269,13 @@
 --all-targets` 通过、`cargo audit` 0 高危、actionlint 通过；`v100-offline.sh`
 **122 PASS / 0 FAIL / 0 SKIP（STRICT=1）**；`v100-docker.sh` amd64
 **123 PASS / 0 FAIL / 1 SKIP**（可选 arm64/QEMU 按设计 SKIP）；`v100-acme.sh`
-Pebble **3/3**（HTTP-01、TLS-ALPN-01、IP shortlived）真实签发；另手工跑通
+Pebble **3/3**（HTTP-01、TLS-ALPN-01、IP shortlived）真实签发；另跑通
 `hub install --tls acme-domain`（Pebble TLS-ALPN）→ `--force --tls self-signed`
 切换，确认 ACME 证书被既有 CA 重签、`openssl verify` 通过；该流程已固化为
-[v100-acme-upgrade.sh](tests/e2e/v100-acme-upgrade.sh) 并实跑通过；panel
+[v100-acme-upgrade.sh](tests/e2e/v100-acme-upgrade.sh)。本地 arm64（非 LTO
+快速构建，不替代发布 profile）`v100-arm64.sh` **40 PASS / 0 FAIL / 2 SKIP**：
+两个 SKIP 是 x86 宿主无法执行 aarch64 包内 install.sh/原生 systemd 路径，已用
+qemu 直接运行 hub/panel/agent 验证；hosted 原生仍待 RC。panel
 `phase_c_panel_tls` **14/14**；web 80/80 + build。独立渗透报告
 [2026-10-25-m5-phase-c-pentest.md](security/2026-10-25-m5-phase-c-pentest.md)：
 **高危 0 / 中危 0 / 低危 3**；L-02（TLS-ALPN 无 ALPN 客户端仍见挑战证书）
