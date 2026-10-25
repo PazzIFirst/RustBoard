@@ -288,8 +288,11 @@ qemu 直接运行 hub/panel/agent 验证；hosted 原生仍待 RC。panel
 ACME→self-signed 强制重签与 wrapper `--force` 不再自动 offline，但尚无独立
 升级/回退 e2e；私有 ACME 已支持 `tls.agent_ca_file`/`--agent-ca` 显式稳定根，
 未设置时仍从 `server.crt` 链尾派生（intermediate 轮换需人工更新已分发锚）；
-真实 Let's Encrypt staging（域名 + 公网 IPv4 shortlived）、hosted release
-workflow、完整面板→hub HTTPS `hub_ca`/arm64 原生门禁未执行。
+真实 Let's Encrypt staging 已尝试：用 `185-180-19-163.sslip.io` + LE staging
+`tls-alpn-01`，DNS 解析正确（DoH 确认）但订单 `Invalid`，本机 NAT/公网 443
+入站未打通；改用 `example.com` 邮箱时被 LE `invalidContact` 拒绝，属测试邮箱
+问题。hosted release workflow、完整面板→hub HTTPS `hub_ca`/arm64 原生门禁
+未执行。
 
 **Phase C 限制**：面板证书无热加载，续期后需重启；ACME volume 用非 root
 `--user 10001` 启动时没有 `NET_BIND_SERVICE`，自动续期可能无法绑定 80/443；
