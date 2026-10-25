@@ -214,7 +214,8 @@
       [渗透报告](security/2026-10-25-m5-phase-b-pentest.md)
 - [ ] 正式 `v1.0.0`：CHANGELOG 归档、tag、Release、镜像在 Phase E 完成
 
-计划：[Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)。
+计划：[Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)；
+[Phase C 计划](plans/2026-10-25-m5-phase-c-tls-release-gates.md)。
 离线/Docker/发布文档：[offline](install/offline.md)、[docker](install/docker.md)、
 [release](install/release.md)。
 
@@ -444,5 +445,6 @@ Docker/多架构与 tag 触发 release workflow 的本地验收，checkpoint 后
 计划见
 [M5 计划](plans/2026-10-24-m5-install-delivery.md)、
 [Phase A 设计](plans/2026-10-24-m5-phase-a-installer.md) 与
-[Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)。控制面/告警/归档均按
+[Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)、
+[Phase C 计划](plans/2026-10-25-m5-phase-c-tls-release-gates.md)。控制面/告警/归档均按
 “默认关闭或最小暴露 + 审计/固定错误码”交付。
