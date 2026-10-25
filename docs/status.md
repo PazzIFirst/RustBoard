@@ -269,9 +269,10 @@ Pebble **3/3**（HTTP-01、TLS-ALPN-01、IP shortlived）真实签发；panel
 **仍未完成 / RC 阻断**：本地 arm64 最终包未重建（QEMU 构建超时，hosted
 `delivery-arm64` 待 RC）；升级/回退虽已补事务 guard、new data_dir OwnedDir、
 ACME→self-signed 强制重签与 wrapper `--force` 不再自动 offline，但尚无独立
-升级/回退 e2e；私有 ACME 的 `agent-ca.pem` 仍取链尾 intermediate，CA 轮换时
-已分发信任锚的 agent/panel 需人工更新；真实 Let's Encrypt staging（域名 +
-公网 IPv4 shortlived）、独立渗透、hosted release workflow 未执行。
+升级/回退 e2e；私有 ACME 已支持 `tls.agent_ca_file`/`--agent-ca` 显式稳定根，
+未设置时仍从 `server.crt` 链尾派生（intermediate 轮换需人工更新已分发锚）；
+真实 Let's Encrypt staging（域名 + 公网 IPv4 shortlived）、独立渗透、hosted
+release workflow 未执行。
 
 **Phase C 限制**：面板证书无热加载，续期后需重启；ACME volume 用非 root
 `--user 10001` 启动时没有 `NET_BIND_SERVICE`，自动续期可能无法绑定 80/443；
