@@ -262,9 +262,11 @@
 - [x] RC 前手工门禁：真实 Let's Encrypt staging（域名 HTTP-01/TLS-ALPN +
       公网 IPv4 `shortlived`），见
       [LE staging 证据](security/2026-10-25-m5-phase-c-le-staging-evidence.md)
-- [ ] `v1.0.0-rc.1`：版本/CHANGELOG 归档、tag、真实 release workflow
+- [x] `v1.0.0-rc.2`：版本/CHANGELOG 归档、tag、真实 release workflow
       （`delivery-e2e`/`delivery-docker`/`delivery-arm64`、staging 镜像、SBOM、
-      attestation、pre-release 不 latest）；RC 通过后才进入 Phase D/E
+      attestation、pre-release 不 latest）；rc.1 因 runner `/opt` 权限与
+      Docker volume 预检假阴性失败，保留 tag 不移动，rc.2 全绿
+- [x] RC 证据：[v1.0.0-rc.2 发布证据](security/2026-10-25-m5-phase-c-rc-evidence.md)
 
 **Phase C 已验证（本地，2026-10-25）**：`cargo fmt/clippy/check`、workspace
 **1221 passed / 0 failed / 4 ignored**、MSRV 1.89 `cargo check --workspace
@@ -289,10 +291,12 @@ qemu 直接运行 hub/panel/agent 验证；hosted 原生仍待 RC。panel
 回环 admin required 被 fail-closed 拒绝）保留为低危/文档约束。O.hub/O.union 已同步 80/443 元数据，C.3/H.13/H.14 仍断言
 默认 compose 不发布 80/443、8444 不发布。
 
-**仍未完成 / RC 阻断**：hosted release workflow、`delivery-arm64` 原生
-runner、GHCR/SBOM/attestation 尚未执行；本地 arm64 包是 `LTO=false` 快速构建，
-不替代发布 profile；私有 ACME 未设置 `tls.agent_ca_file` 时仍从链尾派生
-intermediate（轮换需人工更新已分发锚）；低危 L-01/L-03 保留。
+**RC 已发布**：`v1.0.0-rc.2`（prerelease）通过 hosted `delivery-e2e`、
+`delivery-docker`、原生 `delivery-arm64`、SBOM 与 attestation；详见
+[RC 证据](security/2026-10-25-m5-phase-c-rc-evidence.md)。**`v1.0.0` 未发布，
+Phase B tag 未移动**。残余风险：私有 ACME 未设置 `tls.agent_ca_file` 时仍从
+链尾派生 intermediate；低危 L-01/L-03 保留；24h 长稳/千 agent 压力留待
+正式里程碑发布前。
 
 **Phase C 内存基线（2026-10-25，x86_64 release 静态包）**：hub
 `self_monitor=false`、panel HTTP、agent 已 enrollment 的独立空闲进程，60s 后：
