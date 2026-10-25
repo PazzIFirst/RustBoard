@@ -252,7 +252,7 @@
       降权保留 `NET_BIND_SERVICE`；新增 `docker/compose.acme.example.yml`；
       `docs/install/tls.md`、`panel-tls.md`、`troubleshooting.md` 与
       acme/docker/offline/release/README/CHANGELOG 更新
-- [ ] **C9** 全量 e2e：`v100-acme.sh`（Pebble HTTP-01/TLS-ALPN）、
+- [x] **C9** 全量 e2e：`v100-acme.sh`（Pebble HTTP-01/TLS-ALPN）、
       `v100-acme-ip.sh`、`v100-acme-renew.sh`、`v100-acme-fallback.sh`、
       `v100-tls-agent.sh`、`v100-panel-tls.sh`、`v100-admin-tls.sh`，以及
       install/offline/arm64/docker 回归
@@ -361,10 +361,10 @@ hub，需升级。
 | D-G4 | ingest 幂等、吊销、retention、downsample、alert、archive、audit、token 全绿 | ✅ | `postgres_core` 10 + parity；并发幂等/CAS 与非法批次已修；PG downsample 生成另有 `archive.rs` 单测（未计入上述 10/16 实库计数） |
 | D-G5 | PG 200 agent 写入/查询达标 | ✅ Storage 级 200 agent；hub 端真实 200 agent 端到端仍 Phase E | `postgres_load` 3 passed：200 OS 线程/200 agent，5 批×3 点，3000 samples、1000 ingest_batches、0 失败，pool=8；断连 kill 4 条池连接后首次重试成功、53 行无丢失；并发同键每轮 1 Inserted+1 Duplicate。**不是** hub 端真实 200 agent 端到端 |
 | D-G6 | `migrate` 失败不切换/不破坏 SQLite，成功可回切 | ✅ | `postgres_migrate` 6；失败不改配置、不删 SQLite，成功后配置原子切换 |
-| D-G7 | 备份/恢复后点数、范围、告警状态、token 数一致 | ✅ | `phase_d_backup` 5；manifest SHA256、PG dump/restore、SQLite VACUUM INTO |
+| D-G7 | 备份/恢复后点数、范围、告警状态、token 数一致 | ✅ | `phase_d_backup` 14；manifest SHA256、PG dump/restore、SQLite VACUUM INTO、旧 WAL/恶意路径/并发 migrate |
 | D-G8 | 安装器 `--db` 探测、配置、脱敏，不自动建库/角色 | ✅ | 安装器 PG 探测先于写盘；失败不改 hub.toml/unit/二进制 |
 | D-G9 | Docker 可接 PG；默认 compose 仍 SQLite | ✅ | `docker/compose.postgres.example.yml`、`RUSTBOARD_DATABASE*`；默认 compose 未变 |
-| D-G10 | 全量 fmt/clippy/test/audit、独立评审/渗透、checkpoint | ⏳ 待评审/渗透/checkpoint | 全 workspace `cargo test --workspace --locked` 已通过：**1364 passed / 0 failed / 5 ignored**（2026-10-26，`RUSTBOARD_TEST_PG` + 本机 PG16 client）；独立评审/渗透与 checkpoint 仍待完成 |
+| D-G10 | 全量 fmt/clippy/test/audit、独立评审/渗透、checkpoint | ⏳ 待评审/渗透/checkpoint | 全 workspace `cargo test --workspace --locked` 已通过：**1380 passed / 0 failed / 5 ignored**（2026-10-26，`RUSTBOARD_TEST_PG` + 本机 PG16 client）；独立评审/渗透与 checkpoint 仍待完成 |
 
 #### Phase D 测试证据（2026-10-26，全 workspace 已复跑）
 
@@ -375,13 +375,14 @@ hub，需升级。
 | `postgres_parity` | 16 passed |
 | `postgres_migrate` | 6 passed |
 | `postgres_load` | 3 passed（200 OS 线程/200 agent，3000 samples/1000 batches，0 失败；总耗时 1.45–2.83s；断连恢复与同键并发见 D-G5） |
-| `phase_d_backup` | 5 passed（含真实 PG backup/restore；本机安装 PG16 client 后执行，不使用 mock 冒充 PG dump） |
+| `phase_d_backup` | 14 passed（含真实 PG backup/restore、恶意备份路径、旧 WAL、并发 migrate、restore 回滚；PG16 client） |
 | `phase_d_l01_l03` | 7 passed + 1 ignored（root + `chattr +i` 权限失败用例） |
-| `rustboard-hub` | 420 passed + 3 ignored |
-| 全 workspace | **1364 passed / 0 failed / 5 ignored**（`cargo test --workspace --locked`，2026-10-26，`RUSTBOARD_TEST_PG` + 本机 PG16 client；含上述 PG 测试） |
+| `rustboard-hub` | 425 passed + 3 ignored |
+| 全 workspace | **1380 passed / 0 failed / 5 ignored**（`cargo test --workspace --locked`，2026-10-26，`RUSTBOARD_TEST_PG` + 本机 PG16 client；含上述 PG 测试） |
 
 CI 的 PostgreSQL service job 覆盖 `postgres_schema`/`postgres_core`/
-`postgres_parity`/`postgres_migrate`/`postgres_load`，同 commit 必须全绿。
+`postgres_parity`/`postgres_migrate`/`postgres_load`，并安装 PG16 client、额外执行
+`phase_d_backup` 与 `install_cmd::tests`；同 commit 必须全绿。
 `postgres_load` 是 storage 级 200 agent 压测，不等于 hub 端 200 agent 端到端；
 Phase E 仍保留 hub 级真实压测。
 
@@ -409,9 +410,9 @@ Phase E 仍保留 hub 级真实压测。
    已通过；hub 端真实 200 agent 端到端、100/500/1000 agent、≥24h 长稳与 RSS
    门禁尚未执行，storage 级 load 不能替代 hub 端真实压测。
 7. 备份包含 agent secret、API token 哈希、证书私钥与数据库内容，必须按 secret
-   管理；迁移/恢复前必须停 hub。`migrate` 在有 systemd 时拒绝运行中的 hub；
-   无 systemd 时只 WARN，不做 PID 伪造检查；`--dry-run` 目标非空且未给
-   `--force` 也会非零退出。
+   管理；迁移/恢复前必须停 hub。`migrate`/`restore` 在有 systemd 且 unit active
+   时拒绝；无 systemd/无法确认时必须显式 `--hub-stopped`（fail-closed），
+   不做 PID 伪造检查；`--dry-run` 目标非空且未给 `--force` 也会非零退出。
 
 ### Phase E 剩余
 
@@ -649,7 +650,7 @@ Phase E 仍保留 hub 级真实压测。
 ## 下一步建议
 
 Phase D 已完成 PostgreSQL 显式 opt-in、`migrate`/`backup`/`restore` CLI 与
-L-01/L-03 收口，全 workspace 测试 **1364 passed / 0 failed / 5 ignored**；
+L-01/L-03 收口，全 workspace 测试 **1380 passed / 0 failed / 5 ignored**；
 默认 SQLite 不变，`v1.0.0-rc.2` 不移动，Phase D checkpoint tag 待打。下一步：
 hub 端真实 200 agent、100/500/1000 与 24h 长稳、真实 TLS PG smoke、独立评审/
 渗透与最终 fmt/clippy/audit，门禁全绿后归档 CHANGELOG、发布 `v1.0.0`。计划见

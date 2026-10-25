@@ -205,7 +205,7 @@ rustboard-hub restore --from <dir> [--force] [--yes]
 
 迁移步骤（生产）：
 
-1. `hub backup --out /var/lib/rustboard/backups/<ts>`；
+1. `hub backup --out /var/lib/rustboard/backups`（命令内部再创建 `<ts>/`）；
 2. 停 hub；
 3. `hub migrate --to postgres://... --dry-run`；
 4. `hub migrate --to postgres://... --yes`；
@@ -402,3 +402,27 @@ rustboard-hub restore --from <dir> [--force] [--yes]
 - 独立评审 + 本地渗透无未修复高危；
 - 文档、CHANGELOG、status 更新；
 - checkpoint tag 只打全绿提交；`v1.0.0-rc.2` 不移动，`v1.0.0` 仍留 Phase E。
+
+
+## 11. 实施偏差与最终边界
+
+- **StorageHandle 形式**：§3.2 原计划静态枚举 `StorageBackend`；实际用
+  `Arc<dyn Storage>` + `StorageHandle`（同步 trait object），避免 97 个方法在
+  enum 与两后端间重复转发。行为/对象安全已由 `postgres_parity` 16 个用例覆盖。
+- **PG 索引数量**：SQLite v7 基线实际为 19 个显式命名索引（不是 20）；PG 等价
+  建出 19 个，另加主键/唯一隐式索引。
+- **samples 唯一约束**：SQLite v7 没有 `(agent_id, metric, labels, ts)` UNIQUE，
+  PG 按基线不添加；幂等由 `ingest_batches` 原子占位保证。
+- **200 agent**：`postgres_load` 为 Storage 级 200 OS 线程/200 agent；hub 端真实
+  200 agent 端到端、100/500/1000 与 24h 长稳仍在 Phase E。
+- **`migrate --force` TLS**：非空目标清空路径仍使用 `connect_for_schema`
+  （NoTls），仅支持 `sslmode=disable`；`verify-full` 非空目标需手工备份并
+  TRUNCATE。迁移整体串行锁 key `0x5242_5047_0000_0013`；`--hub-stopped`
+  用于无 systemd/容器部署的 fail-closed 声明。
+- **外部工具**：PG 备份/恢复依赖 `pg_dump`/`pg_restore`，客户端主版本应与
+  服务端一致（PG16 client + PG16 server 已验证）；Docker 默认 compose 仍 SQLite，
+  PG overlay pin `postgres:16-alpine`。
+- **单 hub**：PG 后端没有 leader/多活；多 hub 会重复告警/通知/归档，Phase E 仍
+  需明确部署约束或实现单写者。
+- **L-01/L-03**：L-01 启动 fail-closed；L-03 不放宽 `validate_admin_tls`，仅改
+  错误文案与文档。
