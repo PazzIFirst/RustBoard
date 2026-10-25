@@ -1048,8 +1048,18 @@ fn insert_rows(tx: &mut Transaction<'_>, spec: &TableSpec, rows: Vec<Vec<PgValue
     let params: Vec<Box<dyn ToSql + Sync>> =
         rows.into_iter().flatten().map(PgValue::into_sql).collect();
     let refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|value| value.as_ref()).collect();
-    tx.execute(sql.as_str(), &refs)
-        .with_context(|| format!("批量写入 PostgreSQL 表 {} 失败", spec.name))?;
+    if let Err(err) = tx.execute(sql.as_str(), &refs) {
+        return match err.code() {
+            Some(code) => Err(anyhow!(
+                "批量写入 PostgreSQL 表 {} 失败（SQLSTATE {}）；目标事务将回滚；为避免错误详情回显源库内容，未输出数据库原始错误",
+                spec.name,
+                code.code()
+            )),
+            // 连接级错误不含源行内容，保留原始错误便于排障。
+            None => Err(err)
+                .with_context(|| format!("批量写入 PostgreSQL 表 {} 失败", spec.name)),
+        };
+    }
     Ok(())
 }
 
@@ -1360,9 +1370,7 @@ fn verify_maintenance_state(tx: &mut Transaction<'_>, source: &SqliteConnection)
             .map(|row| row.get(0));
         if source_value != target_value {
             bail!(
-                "迁移校验失败：maintenance_state.{key} 值不一致（源 {:?}，目标 {:?}）",
-                source_value,
-                target_value
+                "迁移校验失败：maintenance_state.{key} 值不一致；为避免回显源库内容，错误中不输出具体值"
             );
         }
     }
@@ -1614,6 +1622,13 @@ mod tests {
             convert_value("samples", &column, 0, ValueRef::Integer(3)).unwrap(),
             PgValue::Real(value) if value == 3.0
         ));
+    }
+
+    #[test]
+    fn immutable_uri_percent_encodes_special_characters() {
+        let path = Path::new("/tmp/rb d5/source?#%.db");
+        let uri = immutable_sqlite_uri(path).expect("生成 immutable URI 失败");
+        assert_eq!(uri, "file:/tmp/rb%20d5/source%3F%23%25.db?immutable=1");
     }
 
     #[test]

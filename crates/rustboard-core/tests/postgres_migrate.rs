@@ -688,6 +688,34 @@ fn pg_count(client: &mut postgres::Client, table: &str) -> i64 {
         .get(0)
 }
 
+/// 构建只有 agent + `count` 条 samples 的源库，用于批量/并发测试。
+fn build_bulk_fixture(tag: &str, count: usize) -> (TempDir, PathBuf) {
+    let temp = TempDir::new(tag);
+    let path = temp.0.join("bulk.db");
+    {
+        let storage = SqliteStorage::open(&path).expect("创建 bulk SQLite 失败");
+        storage
+            .upsert_agent(&agent_record("agent-bulk", "Bulk", "online"))
+            .unwrap();
+        let samples = (0..count)
+            .map(|index| {
+                Sample::new(
+                    "cpu.usage",
+                    BASE_TS + i64::try_from(index).unwrap(),
+                    index as f64 * 0.25,
+                )
+            })
+            .collect();
+        assert!(matches!(
+            storage
+                .insert_batch(&sample_batch("agent-bulk", 1, 0, samples))
+                .unwrap(),
+            IngestOutcome::Inserted { inserted } if inserted == count
+        ));
+    }
+    (temp, path)
+}
+
 /// archive_objects 的（id, object_key, status, uploaded_at, deleted_at）。
 type ArchiveRow = (i64, String, String, Option<i64>, Option<i64>);
 
@@ -940,6 +968,15 @@ fn migrates_all_tables_and_preserves_ids() {
     assert_eq!(report.sqlite_schema_version, 7);
     assert_eq!(report.postgres_schema_version, 7);
     assert_eq!(report.tables.len(), TABLES.len());
+    assert_eq!(
+        report
+            .tables
+            .iter()
+            .map(|table| table.table.as_str())
+            .collect::<Vec<_>>(),
+        TABLES.to_vec(),
+        "报告表顺序必须与 PG schema/导入顺序一致"
+    );
 
     let source = open_readonly(&fixture.path);
     let mut source_counts = Vec::new();
@@ -1106,6 +1143,115 @@ fn migrates_all_tables_and_preserves_ids() {
             .unwrap();
         rows.map(|row| row.unwrap()).collect()
     };
+    // TEXT JSON 列原样复制：notification_channels.config_json 与
+    // alert_rules.filter_labels/channel_ids 不能改序列化格式。
+    let source_channels: Vec<(String, String, bool)> = {
+        let conn = open_readonly(&fixture.path);
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, config_json, enabled
+                 FROM notification_channels ORDER BY id",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            })
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    };
+    let target_channels: Vec<(String, String, bool)> = client
+        .query(
+            "SELECT id, config_json, enabled
+             FROM notification_channels ORDER BY id",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    assert_eq!(
+        source_channels, target_channels,
+        "notification_channels.config_json 未原样复制"
+    );
+
+    let source_rule_text: Vec<(String, Option<String>, String, String)> = {
+        let conn = open_readonly(&fixture.path);
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, filter_agent_id, filter_labels, channel_ids
+                 FROM alert_rules ORDER BY id",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    };
+    let target_rule_text: Vec<(String, Option<String>, String, String)> = client
+        .query(
+            "SELECT id, filter_agent_id, filter_labels, channel_ids
+             FROM alert_rules ORDER BY id",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+        .collect();
+    assert_eq!(
+        source_rule_text, target_rule_text,
+        "alert_rules 的 NULL/TEXT JSON 列映射不一致"
+    );
+
+    // 两张水位表的 key/value 文本必须逐行原样保留。
+    let source_maintenance: Vec<(String, String)> = {
+        let conn = open_readonly(&fixture.path);
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM maintenance_state ORDER BY key")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    };
+    let target_maintenance: Vec<(String, String)> = client
+        .query("SELECT key, value FROM maintenance_state ORDER BY key", &[])
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        source_maintenance, target_maintenance,
+        "maintenance_state 文本值未原样复制"
+    );
+
+    let source_archive_state: Vec<(String, String)> = {
+        let conn = open_readonly(&fixture.path);
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM archive_state ORDER BY key")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    };
+    let target_archive_state: Vec<(String, String)> = client
+        .query("SELECT key, value FROM archive_state ORDER BY key", &[])
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        source_archive_state, target_archive_state,
+        "archive_state 文本值未原样复制"
+    );
+
     let target_events: Vec<(i64, bool, bool, Option<f64>)> = client
         .query(
             "SELECT id, notified, silenced, value
@@ -1433,30 +1579,8 @@ fn bulk_samples_5000_rows_migrate() {
         skip(NAME);
         return;
     };
-    let temp = TempDir::new("bulk");
-    let path = temp.0.join("bulk.db");
     const COUNT: usize = 5_000;
-    {
-        let storage = SqliteStorage::open(&path).expect("创建 bulk SQLite 失败");
-        storage
-            .upsert_agent(&agent_record("agent-bulk", "Bulk", "online"))
-            .unwrap();
-        let samples = (0..COUNT)
-            .map(|index| {
-                Sample::new(
-                    "cpu.usage",
-                    BASE_TS + i64::try_from(index).unwrap(),
-                    index as f64 * 0.25,
-                )
-            })
-            .collect();
-        assert!(matches!(
-            storage
-                .insert_batch(&sample_batch("agent-bulk", 1, 0, samples))
-                .unwrap(),
-            IngestOutcome::Inserted { inserted } if inserted == COUNT
-        ));
-    }
+    let (_temp, path) = build_bulk_fixture("bulk", COUNT);
 
     let storage = db.open_raw_storage();
     let report = migrate_sqlite_to_postgres(&path, &storage)
@@ -1514,6 +1638,65 @@ fn bulk_samples_5000_rows_migrate() {
         .unwrap()
         .get(0);
     assert_eq!(next_id, COUNT as i64 + 1);
+}
+
+// ---------------------------------------------------------------------------
+// 6. 并发：两个迁移同时启动，只有一个能导入；另一个必须看到非空目标并回滚
+// ---------------------------------------------------------------------------
+
+#[test]
+fn concurrent_migrations_allow_only_one_import() {
+    const NAME: &str = "concurrent_migrations_allow_only_one_import";
+    let Some(db) = TestDatabase::create("concurrent") else {
+        skip(NAME);
+        return;
+    };
+    const COUNT: usize = 5_000;
+    let (_temp, path) = build_bulk_fixture("concurrent", COUNT);
+    let source_hash_before = hash_source(&path);
+    let storage = db.open_raw_storage();
+
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| migrate_sqlite_to_postgres(&path, &storage));
+        let second = scope.spawn(|| migrate_sqlite_to_postgres(&path, &storage));
+        (first.join().unwrap(), second.join().unwrap())
+    });
+
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+    for result in [first, second] {
+        match result {
+            Ok(report) => successes.push(report),
+            Err(error) => failures.push(format!("{error:#}")),
+        }
+    }
+    assert_eq!(
+        successes.len(),
+        1,
+        "两个并发迁移必须恰好一个成功；failures={failures:?}"
+    );
+    assert_eq!(failures.len(), 1, "另一个并发迁移必须失败");
+    assert!(
+        failures[0].contains("非空"),
+        "后到的迁移必须因目标非空被拒绝：{}",
+        failures[0]
+    );
+    let report = &successes[0];
+    assert_eq!(report.total_rows, COUNT as u64 + 3);
+
+    let mut client = db.client();
+    assert_eq!(
+        pg_count(&mut client, "samples"),
+        COUNT as i64,
+        "并发迁移不能重复导入 samples"
+    );
+    assert_eq!(pg_count(&mut client, "ingest_batches"), 1);
+    assert_eq!(pg_count(&mut client, "agents"), 1);
+    assert_eq!(
+        hash_source(&path),
+        source_hash_before,
+        "并发迁移修改了 SQLite 源库"
+    );
 }
 
 // 让 `MigrateReport` 在测试里被使用，避免只作为返回值类型出现时误判 dead_code。
