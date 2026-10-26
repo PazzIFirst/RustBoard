@@ -245,7 +245,7 @@ fn meta_is_atomic_and_evictions_do_not_resurrect() {
         buf.pending_bytes()
     );
 
-    // 没有遗留的临时 meta 文件。
+    // 没有遗留的临时 meta 文件。#34 起 backup meta 是正常状态的一部分。
     let leftovers: Vec<String> = std::fs::read_dir(dir.path())
         .expect("read_dir 失败")
         .map(|entry| {
@@ -255,7 +255,7 @@ fn meta_is_atomic_and_evictions_do_not_resurrect() {
                 .to_string_lossy()
                 .into_owned()
         })
-        .filter(|name| name != "buffer.log" && name != "buffer.meta")
+        .filter(|name| name != "buffer.log" && name != "buffer.meta" && name != "buffer.meta.bak")
         .collect();
     assert!(
         leftovers.is_empty(),

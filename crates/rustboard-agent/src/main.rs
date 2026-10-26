@@ -233,6 +233,11 @@ enum Cmd {
     Install(install_cmd::InstallArgs),
     /// 卸载本机 agent（默认保留配置与数据）。
     Uninstall(install_cmd::UninstallArgs),
+    /// 本地磁盘缓冲的运维操作（必须停止 agent 后执行）。
+    Buffer {
+        #[command(subcommand)]
+        cmd: BufferCmd,
+    },
     Init {
         #[arg(short, long)]
         config: Option<PathBuf>,
@@ -255,6 +260,22 @@ enum Cmd {
         data_dir: Option<PathBuf>,
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BufferCmd {
+    /// 显式把缓冲读偏移重置到日志开头（恢复入口）。
+    ///
+    /// 会重发已 ACK 的批次，依赖 hub 按 (agent_id, epoch, seq) 判重；
+    /// 启动流程不会自动执行，必须由运维显式指定 --from-start。
+    Repair {
+        /// agent 配置文件路径（默认 /etc/rustboard/agent.toml）。
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// 必须显式确认：允许重发已 ACK 前缀。
+        #[arg(long)]
+        from_start: bool,
     },
 }
 
@@ -323,7 +344,55 @@ fn main() -> Result<()> {
         Cmd::Renew { config } => renew(config),
         Cmd::Install(args) => install_cmd::install(args),
         Cmd::Uninstall(args) => install_cmd::uninstall(args),
+        Cmd::Buffer { cmd } => match cmd {
+            BufferCmd::Repair { config, from_start } => buffer_repair(config, from_start),
+        },
     }
+}
+
+/// `buffer repair --from-start`：显式重置读偏移，允许重发已 ACK 前缀。
+///
+/// 不做任何自动判断：必须传 `--from-start`。真正的磁盘操作在
+/// `rustboard_core::buffer::repair_from_start`，它只改两条 meta，不改日志。
+fn buffer_repair(config: Option<PathBuf>, from_start: bool) -> Result<()> {
+    if !from_start {
+        bail!(
+            "拒绝执行：必须显式指定 --from-start。该操作会把缓冲读偏移重置到 0，\
+             重发已 ACK 的批次，依赖 hub 按 (agent_id, epoch, seq) 判重。"
+        );
+    }
+    let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_CONFIG));
+    let cfg = AgentConfig::load(&path).with_context(|| {
+        format!(
+            "读取配置失败: {}（先执行 rustboard-agent init）",
+            path.display()
+        )
+    })?;
+    cfg.validate().context("缓冲修复前配置校验失败")?;
+    let report = rustboard_core::buffer::repair_from_start(&cfg.data_dir)
+        .with_context(|| format!("修复本地缓冲失败: {}", cfg.data_dir.display()))?;
+    println!("缓冲目录: {}", cfg.data_dir.display());
+    println!("buffer.log: {} 字节（未被修改）", report.log_bytes);
+    println!(
+        "修复前 meta: primary {}，backup {}",
+        if report.had_primary {
+            "存在"
+        } else {
+            "不存在"
+        },
+        if report.had_backup {
+            "存在"
+        } else {
+            "不存在"
+        }
+    );
+    println!("已将读偏移重置为 0（primary 与 backup 均为 0）。");
+    println!("请确认 agent 已停止后再继续：本命令不获取运行锁。");
+    println!(
+        "下次启动会从日志开头恢复；已 ACK 批次可能重发，由 hub 按 \
+         (agent_id, epoch, seq) 判重，不会重复入库。"
+    );
+    Ok(())
 }
 
 /// 实现 `agent init`：组装默认配置 → 校验 → 落盘。
@@ -2891,6 +2960,85 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("server_ca"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #34：`buffer repair --from-start` 的 CLI 形状：子命令存在、flag 可解析，
+    /// 缺少 flag 时执行层必须拒绝，`--help` 能看到该 flag。
+    #[test]
+    fn v100_buffer_repair_cli_shape() {
+        let parsed = Cli::try_parse_from(["rustboard-agent", "buffer", "repair", "--from-start"])
+            .expect("buffer repair --from-start 应能解析");
+        match parsed.cmd {
+            Cmd::Buffer {
+                cmd: BufferCmd::Repair { config, from_start },
+            } => {
+                assert!(from_start, "--from-start 必须被识别");
+                assert!(config.is_none());
+            }
+            _ => panic!("应解析为 buffer repair 子命令"),
+        }
+
+        // 不带 flag 也能解析（由执行层给出明确拒绝信息与操作风险）。
+        let parsed = Cli::try_parse_from(["rustboard-agent", "buffer", "repair"])
+            .expect("不带 --from-start 也应能解析出 repair 子命令");
+        match parsed.cmd {
+            Cmd::Buffer {
+                cmd: BufferCmd::Repair { from_start, .. },
+            } => assert!(!from_start),
+            _ => panic!("应解析为 buffer repair 子命令"),
+        }
+
+        let help = match Cli::try_parse_from(["rustboard-agent", "buffer", "repair", "--help"]) {
+            Ok(_) => panic!("--help 应以 DisplayHelp 结束"),
+            Err(err) => err,
+        };
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        let text = help.to_string();
+        assert!(text.contains("--from-start"), "帮助必须展示 --from-start");
+        assert!(
+            text.contains("重发") || text.contains("ACK"),
+            "帮助必须说明会重发已 ACK 数据: {text}"
+        );
+    }
+
+    /// #34：缺少 --from-start 时拒绝执行且不碰 meta；显式指定后两条 meta 都归零。
+    #[test]
+    fn v100_buffer_repair_requires_explicit_flag_and_resets_metas() {
+        let dir = temp_dir("buffer-repair");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = AgentConfig {
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let cfg_path = dir.join("agent.toml");
+        cfg.save(&cfg_path).expect("写入测试配置失败");
+
+        let err = buffer_repair(Some(cfg_path.clone()), false)
+            .expect_err("未指定 --from-start 必须拒绝执行");
+        assert!(
+            err.to_string().contains("--from-start"),
+            "错误信息必须点明缺少的 flag: {err}"
+        );
+        assert!(!dir.join("buffer.meta").exists(), "拒绝执行时不得创建 meta");
+        assert!(
+            !dir.join("buffer.meta.bak").exists(),
+            "拒绝执行时不得创建 backup meta"
+        );
+
+        // 模拟两条 meta 都已不可用的现场。
+        std::fs::write(dir.join("buffer.meta"), "1").unwrap();
+        std::fs::write(dir.join("buffer.meta.bak"), "2").unwrap();
+        buffer_repair(Some(cfg_path), true).expect("显式 --from-start 应成功");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("buffer.meta")).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("buffer.meta.bak")).unwrap(),
+            "0"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
