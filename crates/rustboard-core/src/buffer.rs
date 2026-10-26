@@ -34,7 +34,7 @@
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use rustboard_common::model::SampleBatch;
@@ -54,15 +54,10 @@ const MAX_RECORD_PAYLOAD_BYTES: u64 = 8 * 1024 * 1024;
 
 /// header 本身损坏时，向后逐字节寻找有效记录的最大扫描距离。
 ///
-/// 正常批次的 payload 受 hub 的 1 MiB WebSocket 消息上限约束，下一条记录起点
-/// 通常就在 1 MiB 内；留 2 MiB 余量后按尾部损坏处理，避免极端损坏文件让启动
-/// 扫描无上界。
-const RESYNC_SCAN_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
-
-/// header 损坏后重同步时最多尝试解码的 payload 总字节数（防损坏文件导致
-/// 长时间/大内存的探测）。正常中间损坏由 `record_extent` 快路径处理，
-/// 不消耗这个预算。
-const RESYNC_DECODE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+/// 单条合法记录的 payload 上限与 `push` 一致（`MAX_RECORD_PAYLOAD_BYTES`），
+/// 因此下一条记录起点至多在该距离处（再留 4 字节给它的长度头）；超过后按
+/// 尾部损坏处理，避免极端损坏文件让启动扫描无上界。
+const RESYNC_SCAN_LIMIT_BYTES: u64 = MAX_RECORD_PAYLOAD_BYTES + 8;
 
 /// 主 meta 文件名（十进制 `read_offset`）。
 const META_FILE: &str = "buffer.meta";
@@ -230,7 +225,12 @@ impl DiskBuffer {
     }
 
     /// 校验 meta 值是否是当前日志的合法记录边界：
-    /// `offset == len`，或该偏移处能完整读出 `[len][msgpack]` 并解码。
+    /// `offset == 0`、`offset == len`，或该偏移处能完整读出 `[len][msgpack]`
+    /// 并解码。
+    ///
+    /// 0 必须无条件接受：它不可能跳过任何未确认记录；即使首条记录损坏，
+    /// recover 也会从 0 开始向前重同步。若要求首条可解码，两 meta 都是 0 的
+    /// 现场（压实后 / repair --from-start 后）遇到首条损坏就会误 fail-closed。
     fn valid_boundary(&mut self, state: &MetaState, len: u64) -> Option<u64> {
         let MetaState::Value(offset) = state else {
             return None;
@@ -239,7 +239,7 @@ impl DiskBuffer {
         if offset > len {
             return None;
         }
-        if offset == len {
+        if offset == 0 || offset == len {
             return Some(offset);
         }
         record_at(&mut self.file, offset, len).map(|_| offset)
@@ -330,7 +330,8 @@ impl DiskBuffer {
             let Some((record_len, batch)) = record_at(&mut self.file, offset, len) else {
                 // 先看后面是否还有可解码记录：有则是中间损坏，向前重同步；
                 // 没有才按尾部撕裂处理，避免把后续有效记录一起截掉。
-                let Some(next) = resync_after_bad_record(&mut self.file, offset, len) else {
+                let Some(next) = resync_after_bad_record(&mut self.file, &self.path, offset, len)
+                else {
                     break;
                 };
                 tracing::warn!(
@@ -535,6 +536,18 @@ impl DiskBuffer {
         }
 
         let payload = rmp_serde::to_vec(batch).map_err(std::io::Error::other)?;
+        // 与 recover 的 MAX_RECORD_PAYLOAD_BYTES 保持一致：超限批次直接拒绝，
+        // 不能先写进日志、下次启动再被当成损坏记录截掉。
+        if payload.len() as u64 > MAX_RECORD_PAYLOAD_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "批次 payload {} 字节超过缓冲单条记录上限 {} 字节，拒绝写入",
+                    payload.len(),
+                    MAX_RECORD_PAYLOAD_BYTES
+                ),
+            ));
+        }
         let mut record = Vec::with_capacity(4 + payload.len());
         record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         record.extend_from_slice(&payload);
@@ -660,7 +673,10 @@ impl DiskBuffer {
         let pending_total: u64 = self.pending.iter().map(|p| p.len).sum();
         // 文件超过水位，或 [read_offset, write_offset) 里还有已确认前缀/中间
         // 损坏空洞（区间长度大于 pending 有效字节）时都值得压实。
-        if len > threshold || remaining > pending_total {
+        // pending 清空但仍残留已确认前缀时也必须压实：否则文件里留着 ACK 数据，
+        // 一旦两条 meta 都丢失，就会从 0 重放全部 ACK 前缀（hub 判重窗口有限）。
+        let acked_prefix_only = self.pending.is_empty() && self.read_offset > 0;
+        if len > threshold || remaining > pending_total || acked_prefix_only {
             self.compact()?;
         }
         Ok(())
@@ -923,58 +939,81 @@ fn record_extent(file: &mut File, offset: u64, len: u64) -> Option<u64> {
 /// 坏记录之后的下一条有效记录起点。
 ///
 /// 快路径：长度头完好 → 校验其后是否是一条有效记录（或正好到 EOF）；
-/// 慢路径：长度头也损坏 → 向后逐字节搜索，最多扫
-/// `RESYNC_SCAN_LIMIT_BYTES`，并受 `RESYNC_DECODE_BUDGET_BYTES` 解码预算约束。
-fn resync_after_bad_record(file: &mut File, offset: u64, len: u64) -> Option<u64> {
+/// 慢路径：长度头也损坏 → 向后逐字节搜索，最多扫 `RESYNC_SCAN_LIMIT_BYTES`。
+fn resync_after_bad_record(file: &mut File, path: &Path, offset: u64, len: u64) -> Option<u64> {
     if let Some(end) = record_extent(file, offset, len) {
         if end == len || record_at(file, end, len).is_some() {
             return Some(end);
         }
     }
-    find_next_valid_record(file, offset + 1, len)
+    find_next_valid_record(file, path, offset + 1, len)
 }
 
-/// 从 `from` 起逐字节寻找下一条可解码记录（有扫描距离与解码预算上限）。
+/// 从 `from` 起逐字节寻找下一条可解码记录（最多扫 `RESYNC_SCAN_LIMIT_BYTES`）。
 ///
-/// 用完整 `SampleBatch` 解码作为最终判据；先用首字节的 msgpack array/map
-/// 类型做廉价过滤，避免损坏区域里每个字节都尝试分配 payload。不额外要求
-/// “后面还必须有一条有效记录”，否则中间损坏后只剩最后一条有效记录时会被
-/// 误判成尾部撕裂而删掉。
-fn find_next_valid_record(file: &mut File, from: u64, len: u64) -> Option<u64> {
+/// 用完整 `SampleBatch` 解码作为最终判据；先用长度头与 payload 前两字节的
+/// msgpack 结构（array/map + 字符串头）做廉价过滤，避免损坏区域里每个字节
+/// 都尝试分配/解码。这里刻意不设“解码字节预算”：只要预算按未成功解码的
+/// 候选累计，损坏区里的假候选就可能把它耗光，让后面的真实记录被误当尾部
+/// 截断。工作量改由扫描窗口上限 + 两级廉价过滤控制。
+///
+/// 头部扫描用独立句柄 + `BufReader` 顺序读取，避免每个字节一次 seek+read；
+/// 候选校验仍用原句柄与完整解码。不额外要求“后面还必须有一条有效记录”，
+/// 否则中间损坏后只剩最后一条有效记录时会被误判成尾部撕裂而删掉。
+fn find_next_valid_record(file: &mut File, path: &Path, from: u64, len: u64) -> Option<u64> {
     let scan_end = len.min(from.saturating_add(RESYNC_SCAN_LIMIT_BYTES));
-    let mut decoded_bytes = 0u64;
+    if from.checked_add(4)? > scan_end {
+        return None;
+    }
+    // 独立打开扫描句柄：dup 的 fd 会共享文件偏移，不能与 file 混用顺序读。
+    let mut reader = BufReader::new(File::open(path).ok()?);
+    reader.seek(SeekFrom::Start(from)).ok()?;
+    let mut header = [0u8; 4];
+    reader.read_exact(&mut header).ok()?;
     let mut candidate = from;
-    while candidate + 4 <= scan_end {
-        let Some(end) = record_extent(file, candidate, len) else {
-            candidate += 1;
-            continue;
-        };
-        let record_len = end - candidate;
-        // 先读 payload 首字节做廉价类型过滤，再决定是否完整解码。
-        if plausible_msgpack_container(file, candidate + 4).unwrap_or(false)
-            && decoded_bytes + record_len <= RESYNC_DECODE_BUDGET_BYTES
-            && record_at(file, candidate, len).is_some()
-        {
-            return Some(candidate);
+
+    loop {
+        let payload_len = u64::from(u32::from_le_bytes(header));
+        if payload_len > 0 && payload_len <= MAX_RECORD_PAYLOAD_BYTES {
+            if let Some(end) = candidate.checked_add(4 + payload_len) {
+                if end <= len
+                    && plausible_sample_batch_prefix(file, candidate + 4).unwrap_or(false)
+                    && record_at(file, candidate, len).is_some()
+                {
+                    return Some(candidate);
+                }
+            }
         }
-        decoded_bytes = decoded_bytes.saturating_add(record_len);
+        if candidate + 4 >= scan_end {
+            break;
+        }
+        let mut next = [0u8; 1];
+        if reader.read_exact(&mut next).is_err() {
+            break;
+        }
+        header.rotate_left(1);
+        header[3] = next[0];
         candidate += 1;
     }
     None
 }
 
-/// payload 首字节是否可能是 msgpack 的 array/map（结构体按数组或 map 编码）。
+/// payload 前两字节是否可能是 `SampleBatch` 的 msgpack 结构。
 ///
-/// 仅是廉价预过滤，最终仍由 `BatchCodec::decode` 判定；若编码形式未来变化，
-/// 最坏退化为该损坏场景下找不到有效记录并按尾部截断。
-fn plausible_msgpack_container(file: &mut File, payload_offset: u64) -> std::io::Result<bool> {
+/// `SampleBatch` 按结构体编码：首字节是 array/map 头，第二个字段是字符串
+/// （agent_id；map 编码时则是第一个 key）。两级检查都是 O(1) 读字节，不做
+/// 分配；仅是廉价预过滤，最终仍由 `BatchCodec::decode` 判定。若编码形式
+/// 未来变化，最坏退化为该损坏场景下找不到有效记录并按尾部截断。
+fn plausible_sample_batch_prefix(file: &mut File, payload_offset: u64) -> std::io::Result<bool> {
     file.seek(SeekFrom::Start(payload_offset))?;
-    let mut first = [0u8; 1];
-    file.read_exact(&mut first)?;
-    Ok(matches!(
-        first[0],
+    let mut prefix = [0u8; 2];
+    file.read_exact(&mut prefix)?;
+    let container = matches!(
+        prefix[0],
         0x80..=0x8f | 0x90..=0x9f | 0xdc..=0xdd | 0xde..=0xdf
-    ))
+    );
+    let first_field_is_string = matches!(prefix[1], 0xa0..=0xbf | 0xd9..=0xdb);
+    Ok(container && first_field_is_string)
 }
 
 /// 以 0600 新建文件（Unix 下禁止跟随符号链接），用于损坏日志副本。

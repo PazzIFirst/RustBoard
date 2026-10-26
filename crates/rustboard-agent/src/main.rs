@@ -387,6 +387,7 @@ fn buffer_repair(config: Option<PathBuf>, from_start: bool) -> Result<()> {
         }
     );
     println!("已将读偏移重置为 0（primary 与 backup 均为 0）。");
+    println!("请确认 agent 已停止后再继续：本命令不获取运行锁。");
     println!(
         "下次启动会从日志开头恢复；已 ACK 批次可能重发，由 hub 按 \
          (agent_id, epoch, seq) 判重，不会重复入库。"

@@ -507,3 +507,140 @@ fn both_metas_invalid_fail_closed_preserves_files() {
     assert_eq!(std::fs::read_to_string(&primary).unwrap(), "not-a-number");
     assert_eq!(std::fs::read_to_string(&backup).unwrap(), "999999999");
 }
+
+/// repair --from-start 写入 0/0 后，即使首条记录损坏也必须能进入 recover 重同步。
+#[test]
+fn repair_from_start_accepts_zero_offset_even_with_corrupt_first_record() {
+    let dir = TempDir::new("repair-zero-corrupt-first");
+    {
+        let mut buf = DiskBuffer::open(dir.path(), MIB, 0).unwrap();
+        for seq in 0..3 {
+            buf.push(&batch_with(1, seq, 0)).unwrap();
+        }
+    }
+    corrupt_payload_byte(dir.path(), 0);
+    repair_from_start(dir.path()).expect("repair 失败");
+    let (primary, backup) = meta_paths(dir.path());
+    assert_eq!(read_meta(&primary), Some(0));
+    assert_eq!(read_meta(&backup), Some(0));
+
+    let mut buf = DiskBuffer::open(dir.path(), MIB, 0)
+        .expect("offset=0 必须无条件视为合法边界，首条损坏交给 recover 重同步");
+    assert_eq!(pending_seqs(&mut buf), vec![1, 2]);
+    assert_eq!(corrupt_copies(dir.path()).len(), 1, "首条损坏也要留副本");
+    drop(buf);
+    let mut buf = DiskBuffer::open(dir.path(), MIB, 0).expect("二次打开仍应成功");
+    assert_eq!(pending_seqs(&mut buf), vec![1, 2]);
+}
+
+/// 大记录长度头损坏后，重同步预算不得被“可算长度但未解码”的垃圾候选耗尽。
+#[test]
+fn corrupt_header_of_large_record_still_resyncs_to_later_records() {
+    let dir = TempDir::new("large-header-corrupt");
+    let max_bytes = 8 * MIB;
+    {
+        let mut buf = DiskBuffer::open(dir.path(), max_bytes, 0).unwrap();
+        buf.push(&batch_with(1, 0, 0)).unwrap();
+        buf.push(&batch_with(1, 1, MIB as usize)).unwrap();
+        buf.push(&batch_with(1, 2, 0)).unwrap();
+        buf.push(&batch_with(1, 3, 0)).unwrap();
+    }
+    let layout = record_layout(dir.path());
+    assert!(layout[1].1 > 900_000, "测试前置条件：第 2 条必须是大记录");
+    let log_path = dir.path().join(LOG_FILE);
+    let mut bytes = std::fs::read(&log_path).unwrap();
+    let (offset, record_len) = layout[1];
+    // 用 [00 20 00 00] 重复填充 payload：大量字节位置都能算出 ≤8 MiB 的
+    // “记录长度”，但 payload 首字节是 0x00/0x20，不会通过 msgpack 类型过滤。
+    // 旧实现会为这些未解码候选扣预算并把真实记录当尾部截断。
+    for (i, byte) in bytes[offset as usize + 4..(offset + record_len) as usize]
+        .iter_mut()
+        .enumerate()
+    {
+        *byte = [0x00u8, 0x20, 0x00, 0x00][i % 4];
+    }
+    bytes[offset as usize..offset as usize + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(&log_path, &bytes).unwrap();
+
+    let mut buf = DiskBuffer::open(dir.path(), max_bytes, 0).expect("大记录头损坏必须自愈");
+    assert_eq!(
+        pending_seqs(&mut buf),
+        vec![0, 2, 3],
+        "后续有效记录不得因重同步预算记账错误被误截断"
+    );
+    assert_eq!(corrupt_copies(dir.path()).len(), 1);
+}
+
+/// pending 清空（全部 ACK）后必须压实物理删除 ACK 前缀；双 meta 丢失也不得重放。
+#[test]
+fn acked_all_is_compacted_and_meta_loss_does_not_replay() {
+    let dir = TempDir::new("acked-all-compact");
+    {
+        let mut buf = DiskBuffer::open(dir.path(), MIB, 0).unwrap();
+        for seq in 0..3 {
+            buf.push(&batch_with(1, seq, 0)).unwrap();
+        }
+        buf.ack(1, 2).unwrap();
+        assert_eq!(buf.pending_len(), 0);
+    }
+    assert_eq!(
+        file_len(&dir.path().join(LOG_FILE)),
+        0,
+        "全部 ACK 后应压实为 0 字节，不能把 ACK 前缀留在文件里"
+    );
+    let (primary, backup) = meta_paths(dir.path());
+    // 模拟两条 meta 都丢失（磁盘损坏 / 人为删除）。
+    let _ = std::fs::remove_file(&primary);
+    let _ = std::fs::remove_file(&backup);
+    let mut buf = DiskBuffer::open(dir.path(), MIB, 0).expect("日志已清空时 meta 丢失不得重放 ACK");
+    assert_eq!(buf.pending_len(), 0);
+    assert_eq!(buf.pending_bytes(), 0);
+}
+
+/// 陈旧/非法 backup 不得覆盖有效 primary（旧版本只维护 primary 的降级场景）。
+#[test]
+fn stale_backup_never_overrides_valid_primary() {
+    let dir = TempDir::new("stale-backup");
+    {
+        let mut buf = DiskBuffer::open(dir.path(), MIB, 0).unwrap();
+        for seq in 0..3 {
+            buf.push(&batch_with(1, seq, 0)).unwrap();
+        }
+        buf.ack(1, 0).unwrap();
+    }
+    let (primary, backup) = meta_paths(dir.path());
+    let primary_value = read_meta(&primary).expect("primary 应存在");
+    // 1) 陈旧但仍是合法边界的 backup（0）：primary 优先，不得重放 seq=0。
+    std::fs::write(&backup, "0").unwrap();
+    let mut buf = DiskBuffer::open(dir.path(), MIB, 0).unwrap();
+    assert_eq!(pending_seqs(&mut buf), vec![1, 2]);
+    assert_eq!(read_meta(&primary), Some(primary_value));
+    drop(buf);
+    // 2) 非法/越界 backup：仍以 primary 为准。
+    std::fs::write(&backup, "999999999").unwrap();
+    let mut buf = DiskBuffer::open(dir.path(), MIB, 0).unwrap();
+    assert_eq!(pending_seqs(&mut buf), vec![1, 2]);
+    assert_eq!(read_meta(&primary), Some(primary_value));
+}
+
+/// push 与 recover 共用 8 MiB 单条上限：超限批次直接拒绝，不写进日志。
+#[test]
+fn push_rejects_payload_above_recover_cap() {
+    let dir = TempDir::new("push-cap");
+    let mut buf = DiskBuffer::open(dir.path(), MIB, 0).unwrap();
+    let oversized = batch_with(1, 0, MAX_RECORD_PAYLOAD_BYTES as usize);
+    let err = buf
+        .push(&oversized)
+        .expect_err("超过 8 MiB 的 payload 必须拒绝");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("上限"), "错误信息: {err}");
+    assert_eq!(
+        file_len(&dir.path().join(LOG_FILE)),
+        0,
+        "拒绝后不得写入任何字节"
+    );
+    assert_eq!(buf.pending_len(), 0);
+    // 正常批次不受影响。
+    buf.push(&batch_with(1, 1, 0)).unwrap();
+    assert_eq!(pending_seqs(&mut buf), vec![1]);
+}
