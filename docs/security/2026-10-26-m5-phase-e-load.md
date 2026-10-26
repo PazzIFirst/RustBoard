@@ -67,6 +67,10 @@
 - 硬门禁：0 丢点/重复、0 未处理错误、`/healthz` 0 失败、hub 未重启、
   **RssAnon 增长 ≤10%**、FD/线程相对 1h 基线 +≤32、`hub.log` 无 panic/ERROR；
   总 RSS/RssFile 仅报告（静态二进制代码页 demand paging 不是堆泄漏）。
+- **1h 基线（01:00）**：RssAnon 46.2MiB、总 RSS 59.0MiB、RssFile 12.8MiB、
+  DB 105MiB、线程 81、FD 223、health 100%、0 错误/重试；40–60min RssAnon 在
+  45.4–46.4MiB 平台，未随 DB（55→105MiB）继续上涨，符合“页缓存/线程栈预热后
+  稳定”的预期。
 - 状态：**运行中，尚无最终结论**。2h 与结束时检查 RssAnon/FD/线程曲线；若
   RssAnon 仍持续单边上涨或 24h >10%，按缺陷处理，不发布 `v1.0.0`。
 - 前两次 24h 已提前停止（debug/glibc 21min RSS 趋势；600s 基线把 SQLite 页
