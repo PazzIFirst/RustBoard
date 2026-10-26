@@ -54,6 +54,12 @@
 
 ### Fixed
 
+- 采集器 #35/#36：磁盘容量按 `/proc/mounts` 原始字节解析并传给 `statvfs`，
+  非法 UTF-8 路径的 label 改为唯一、可逆的 `\xNN` 编码（字面反斜杠写 `\\`）；
+  CPU 每核 `core` 标签改用实际 `cpuN` 编号，汇总计数回退时重建基线并跳过整帧，
+  单核计数回退只跳过该核。**兼容性**：历史 `cpu.cores.usage` 的 `core` 是顺序索引，
+  旧序列不迁移、与新编号序列并存（同一核心可能同时出现旧索引与新编号两条历史线）；
+  协议 v2、数据库 schema 与指标名不变
 - L-01：修复旧 ACME `account.json`/`state.toml` 的 0644 权限只在签发时收紧的问题；
   hub 启动即收紧，`tls status` 不再写文件
 - PostgreSQL：修复并发 ingest 幂等/CAS、非法批次处理与迁移源库只读快照问题，
