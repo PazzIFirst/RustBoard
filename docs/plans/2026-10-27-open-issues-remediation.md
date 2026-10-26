@@ -120,8 +120,9 @@ ALTER TABLE samples_1m ADD COLUMN aggregated_1h INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX idx_samples_1m_unaggregated ON samples_1m(bucket_ts)
   WHERE aggregated_1h = 0;
 
--- 归档对象：区分 v7 旧对象与 v8 claim 对象
+-- 归档对象：区分 v7 旧对象与 v8 claim 对象；attempts 供重试告警
 ALTER TABLE archive_objects ADD COLUMN ledger_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE archive_objects ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
 ```
 
 - SQLite 使用 `rowid` 作为 raw 稳定行键；PG 使用 `samples.id`。Storage 新增
@@ -141,14 +142,20 @@ ALTER TABLE archive_objects ADD COLUMN ledger_version INTEGER NOT NULL DEFAULT 0
    文档必须写明 v8 单向、回退恢复备份，安装器/升级脚本检查版本并阻止旧二进制
    启动。
 2. `archive_object_id` 初始为 NULL；`ledger_version=0` 表示 v7 旧对象。
-3. `aggregated_1m`：
-   - 有 1m 水位：`ts < 水位` 的旧 raw 标记为 1（沿用 v7 已聚合事实），其余为 0。
-   - 无水位/空库：全部 0。
-   - `ts` 超出新时间策略的旧行单独计数并以 1 隔离（见 §4.2），避免维护循环
-     被历史坏数据卡住。
-4. `samples_1m.last_ts`：优先回填该桶现存 raw 的 `MAX(ts)`；raw 已删的桶回填
-   `bucket_ts + 59999`（保守值，避免迟到行错误改写 last）。
-5. `samples_1m.aggregated_1h`：`bucket_ts < 1h 水位` 的旧桶置 1，其余 0。
+3. `aggregated_1m`（**按桶对账，不按水位**）：
+   - v7 是先提交 1m、再单独写水位；崩溃窗口内 raw 可能已聚合但水位未推进，
+     只按 `ts < 水位` 标记会双计；只按水位置 0 也会把已聚合行再算一次。
+   - 迁移按桶：该 `(agent_id, metric, labels, bucket_ts)` 已有 1m 行 → 桶内
+     raw 一律标记 1；没有 1m 行 → 标记 0。历史 late 若落在已有桶内无法与
+     正常行区分，按“已包含”处理，宁可少补也不双计；新 late 行一律 0。
+   - 空库/无水位：全部 0。`ts` 超出可接受范围的行单独隔离并计数（见 §4.2）。
+4. `samples_1m.last_ts`：**不从可能未聚合的 raw 回填**。legacy 桶统一回填
+   `bucket_ts + 59999`（保守值，不因 late 改写 last_value）；新桶写入精确值。
+5. `samples_1m.aggregated_1h`（**按小时对账，不用非整点水位**）：
+   - 该 `(agent_id, metric, labels, floor(bucket_ts,1h))` 已有 1h 行 → 该小时
+     所有 1m 行置 1；否则该小时所有 1m 行置 0。
+   - 禁止用 `bucket_ts < 1h 水位` 标记：1h 水位可能不是整点，会留下没有
+     1h 行的半小空洞。
 6. **归档账本迁移**：
    - `archive.enabled=false` 或水位为空：不进入 ledger 重建。
    - `archive.enabled=true` 且已有水位：写 `archive_state.archive_ledger_pending=1`，
@@ -160,7 +167,11 @@ ALTER TABLE archive_objects ADD COLUMN ledger_version INTEGER NOT NULL DEFAULT 0
    - 新增 CLI：`rustboard-hub archive ledger status` / `archive ledger rebuild`
      （后者用于中断后续跑；默认 worker 自动执行，retention 始终阻塞直到完成）。
 7. 迁移在一个 `BEGIN IMMEDIATE`/PG 事务内完成；失败整体回滚，不部分写。
-8. 备份：迁移前 `rustboard-hub backup` 或运维快照；v8 库不应再由 v7 二进制打开
+8. **legacy 1m horizon 审计**：v8 启动时用最终配置检查
+   `retention_1m_days >= max_late_days + 2`（非 0）；不满足则拒绝启动并点名
+   字段，不能静默接受。已超过 1m retention、仍为 `aggregated_1m=0` 的旧 raw
+   标记隔离并计数，禁止 delta 建一个缺少历史点的 1m 桶。
+9. 备份：迁移前 `rustboard-hub backup` 或运维快照；v8 库不应再由 v7 二进制打开
    （v7 不会识别新列），升级后不得回退；回滚必须恢复备份。
 
 ### 3.3 索引与查询
@@ -180,20 +191,26 @@ ALTER TABLE archive_objects ADD COLUMN ledger_version INTEGER NOT NULL DEFAULT 0
 **目标**：每条被 retention 删除的 raw 都能指向一个已成功上传的归档对象；
 迟到行、重试、崩溃都不能绕过。
 
-**claim 流程（单事务）**：
+**claim 流程（CSV 在事务外、claim 短事务）**：
 
-1. 选 `archive_object_id IS NULL`、`ts` 在可归档日内的 raw，按 `ts,rowid` 排序，
-   限制 `max_shard_rows`。
-2. 生成 CSV.GZ（gzip mtime=0，确定性）与 manifest；`created_at=now` 固定。
-3. 插入 `archive_objects`：`ledger_version=1`、key 加 `-v8`、status=pending、
-   rows/bytes/sha256/from_ts/to_ts 来自该行集。
-4. `UPDATE samples SET archive_object_id=? WHERE rowid IN (...) AND
-   archive_object_id IS NULL`；受影响行数必须等于选中行数，否则回滚重试。
-5. 提交后上传对象 + manifest；成功置 uploaded，失败置 failed。
-6. 失败/崩溃后的重试：按 `archive_object_id` 读取**同一行集**，用对象
-   `created_at` 重建完全相同的 CSV/manifest；不重新扫描 raw，不纳入新 late 行。
-7. 新 late 行仍是 NULL，下一轮生成**新对象**（`part-00002-v8`），不需要重扫
-   已归档日。
+1. 读候选 `archive_object_id IS NULL`、`ts` 在可归档日内的 raw，按 `ts,rowid`
+   排序，限制 `max_shard_rows`。
+2. **在写事务外**生成 CSV.GZ（gzip mtime=0，确定性）与 manifest；按
+   `max_object_bytes` 切成多个逻辑对象（每片独立 key），不要把超限片硬塞进
+   一个 `archive_object_id`。`created_at=now` 固定。
+3. 对每个片开一个**短写事务**：插入 `archive_objects`（`ledger_version=1`、
+   `-v8` key、status=pending、正确 rows/bytes/sha256/from_ts/to_ts），再
+   `UPDATE samples SET archive_object_id=? WHERE rowid IN (...) AND
+   archive_object_id IS NULL`；affected 必须等于行数，否则回滚该片并重新
+   读候选（另一 worker 已 claim）。
+4. 提交后上传对象 + manifest；成功置 uploaded，失败置 failed。事务内不做
+   gzip/哈希/网络，避免 SQLite 单写连接 + 5s busy_timeout 阻塞 ingest。
+5. 失败/崩溃后的重试：按 `archive_object_id` 读回**同一行集**，用对象
+   `created_at` 重建相同 CSV/manifest；不重新扫描 raw，不纳入新 late 行。
+6. 新 late 行仍是 NULL，下一轮生成**新对象**（如 `part-00002-v8`），不需要
+   重扫已归档日。
+7. failed 对象累计重试次数并暴露 `archive status`/WARN；不自动删除 raw，
+   retention 保持阻塞并告警，避免“重试上限=丢唯一副本”。
 
 **retention（archive 启用）**：
 
@@ -256,26 +273,34 @@ max_future_skew_secs = 300  # 默认 5 分钟
      `min=min(...)`、`max=max(...)`；
      `avg=(avg*count_old + delta.avg*delta.count)/(count_old+delta.count)`；
      `last_value/last_ts = delta.last` 当且仅当 `delta.last_ts > last_ts`。
-   - 置该桶 `aggregated_1h=0`。
+   - **将该桶所在整小时的所有 1m 行置 `aggregated_1h=0`**，不能只置当前桶：
+     否则 retention 会删掉同小时其他 1m 行，1h 重算拿不到完整源。
    - 将本批 raw 行置 `aggregated_1m=1`；`UPDATE ... WHERE rowid IN (...) AND
      aggregated_1m=0` 的 affected 必须等于本批行数，否则回滚重试。选择与认领
      必须在同一个写事务内完成，禁止两个 worker 重复合并同一行。
 4. 水位只推进到已处理的 `closed_end`，不后退；不再调用
-   `rewind_hour_watermark`。
+   `rewind_hour_watermark`。**删除旧的“每轮重算最近 2 个 1m 桶/小时”路径**，
+   否则会与 delta 合并交错、重复计数。
 
 **1h 处理**：
 
 1. 选 `samples_1m.aggregated_1h=0 AND bucket_ts < closed_hour` 的小时。
-2. 单事务按该小时全部 1m 行重算 1h（沿用加权 avg/min/max/last 规则）。
-3. 将该小时所有 1m 行置 `aggregated_1h=1`；写入 1h 水位（只前进）。
+2. **持小时锁**：SQLite 在写事务内完成 SELECT/重算/UPDATE；PostgreSQL 对
+   该小时 1m 行 `SELECT ... FOR UPDATE` 后重算。1m delta 更新同一行会被
+   阻塞到 1h 提交，再置 0 触发下一轮，不会出现“1h 已标记 1、delta 又漏算”。
+3. 单事务按该小时全部 1m 行重算 1h（沿用加权 avg/min/max/last 规则），
+   并将该小时所有 1m 行置 `aggregated_1h=1`；写入 1h 水位（只前进）。
+   `UPDATE` 的 affected 行数必须与锁定的 1m 行数一致，否则回滚。
 
 **retention**：
 
 - raw：`aggregated_1m=1`；archive 启用时再加 §4.1 的 uploaded join；
   `archive_ledger_pending=1` 时禁止。
-- 1m：`aggregated_1h=1`；迟到 1m 更新会置 0，从而自动跳过。
-- 约束：`retention_1m_days >= max_late_days + 2`（非 0 时），保证受迟到影响的
-  小时仍有完整 1m 源；否则启动失败并点名字段。
+- 1m：只有**整小时所有 1m 行** `aggregated_1h=1` 才允许删除；任一行 0 时
+  整小时跳过（SQL 排除 dirty hour），避免残缺 1h 源。
+- 约束：`retention_1m_days >= max_late_days + 2`（非 0 时）；启动/升级时
+  还要做一次 legacy 检查：已超过 1m horizon 且 `aggregated_1m=0` 的 raw
+  不得 delta 建残缺 1m，应隔离/计数并由 `maintenance status` 暴露。
 - `bucket_floor` 改为 `checked_mul`，溢出返回显式错误；维护任务遇到坏行
   记录错误并跳过，不 panic、不回绕水位。
 
@@ -669,3 +694,45 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 本文件确认前：不创建 worktree、不改业务代码、不打 tag、不移动 rc.2。
 确认后按 R0 → R1a → R1b → R1c/R2/R3 → R4 → R5 执行；每个阶段完成即更新
 本文件状态与证据链接。
+
+## 12. 执行记录（滚动更新）
+
+> 2026-10-27 开工。issue 关闭权限归用户：Agent 只补评论，不自行关闭。
+
+### 12.1 R0 设计评审
+
+独立只读评审发现并已写回本计划的严重问题：
+
+1. v7 迁移不能按 1m 水位标 `aggregated_1m`；改为按桶对账。
+2. 1h 不能按非整点水位标记；改为按小时是否存在 1h 行对账。
+3. 归档 claim 不能在写事务内做 CSV/分片；改为事务外生成、短事务 claim、按字节拆对象。
+4. 1h 需锁小时/`FOR UPDATE`，dirty hour 整小时阻止 1m retention；1m 更新置整小时 `aggregated_1h=0`。
+5. PG 旧库必须显式 ALTER；v8 单向升级/旧二进制风险需在升级文档阻断。
+
+### 12.2 已提交分支（尚未合入 main）
+
+| 分支 | 提交 | 内容 | 验证 |
+|---|---|---|---|
+| `feat/v100-data` | `0147a29` | schema v8、迁移、归档 claim 原语、离线迁移 v8 | core+hub 全绿；9 个 v8 测试 |
+| `feat/v100-webdav` | `f607e6d` | #29 逐级 MKCOL、严格 DAV 测试 | hub 全绿；严格 DAV 黑盒 `archive test` 通过 |
+| `feat/v100-ci` | `a4ecea9` | #40 v031 入 CI + cryptography | actionlint/yaml/bash -n 通过 |
+| `feat/v100-collectors` | `dbd1b05` | #35/#36 字节路径/CPU ID + 回退保护 | core collect 21/21；clippy |
+| `feat/v100-agent` | `308e525` | #42/#43/#44/#48 | agent/common/hub 全绿；待复审建议修复 |
+| `feat/v100-panel` | `5df03f3` | #37/#38/#39/#41 | panel 184+14、web 93；#39 严重项修复中 |
+| `feat/v100-buffer` | `b5c8e7c` | #34 双 meta/中间损坏重同步/repair CLI | core buffer 29、core/agent 全绿；待复审 |
+
+### 12.3 进行中
+
+- `feat/v100-archive`：R1a-2 worker claim/重试/拆分（#27/#28）。
+- `feat/v100-downsample`：R1b 增量 1m/1h、retention、#50（#32/#33/#50）。
+- `feat/v100-alerts`：#30/#31 告警状态与标签过滤下推。
+- `feat/v100-agent2`：#45 enrollment marker、#46 进程组。
+- `feat/v100-panel` 复审整改：ACME/DNS SAN 推导、CA 写入顺序。
+- `feat/v100-agent` 复审整改：#43 Guard 满表、#48 URL 脱敏、#44 drain 控制队列。
+- `feat/v100-buffer` 独立复审。
+
+### 12.4 未做/待做
+
+- 以上分支独立测试/复审完成后，建集成分支合并并跑全量门禁。
+- 尚未关闭或评论任何 issue；修复合并后按用户要求只补证据评论。
+- 24h 长稳需在最终二进制上重跑，不能复用 2026-10-26 的 2h 中止证据。
