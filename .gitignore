@@ -10,3 +10,7 @@ web/dist
 tests/pentest/evidence/
 tests/pentest/__pycache__/
 dist/
+
+# Python 字节码（测试脚本运行时生成，可重建）
+__pycache__/
+*.pyc
