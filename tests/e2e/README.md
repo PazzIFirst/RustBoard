@@ -26,12 +26,35 @@
 |---|---|
 | Linux | 脚本使用 `mktemp`、`sed -i`、`awk`、`date +%s%3N` 等 GNU 工具 |
 | bash 4.4+ | 使用数组与 `set -euo pipefail` |
-| Python 3.8+ | **仅标准库**（`ssl` / `socket` / `hashlib` / `urllib`）；无需 `pip install`，也不联网。`v031.sh` 额外需要已安装的 `cryptography`（只用于生成过期证书）；`v034.sh` 的 fake agent (`v034_agent.py`) 与 `v035.sh` 的 flood helper 复用 `probe.py` |
+| Python 3.8+ | **仅标准库**（`ssl` / `socket` / `hashlib` / `urllib`）；无需 `pip install`，也不联网。`v031.sh` 额外需要已安装的 `cryptography`（只用于生成过期证书；CI 通过 apt `python3-cryptography` 安装）；`v034.sh` 的 fake agent (`v034_agent.py`) 与 `v035.sh` 的 flood helper 复用 `probe.py` |
 | cargo / rustc | 用于 `cargo build --locked`（`hardening.sh` / `control.sh` / `v031.sh` / `v032.sh` / `v033.sh` / `v034.sh` / `v035.sh` 构建 hub/agent，前三套与 `v033.sh` / `v034.sh` 还会构建 panel；`v033.sh` / `v034.sh` / `v035.sh` 仅使用隔离 target） |
 | curl | `control.sh` / `v032.sh` / `v033.sh` / `v034.sh` 用 curl 访问 hub 管理 API（`control.sh` / `v033.sh` 还访问面板 API；`v033.sh` 用 `--cacert` 校验 admin TLS；`v034.sh` 用 curl 轮询面板会话失效与 `Retry-After`） |
 
 脚本不会安装任何依赖，也不会访问网络。`probe.py` 里自带最小 MessagePack
 编解码器和 RFC 6455 客户端。
+
+## CI 矩阵
+
+`.github/workflows/ci.yml` 的 `e2e` job 在 Ubuntu runner 上按以下顺序执行：
+
+| 顺序 | 脚本 |
+|---:|---|
+| 1 | `security.sh` |
+| 2 | `cert-rotation.sh` |
+| 3 | `panel.sh` |
+| 4 | `hardening.sh` |
+| 5 | `control.sh` |
+| 6 | `v031.sh`（已入 CI） |
+| 7 | `v032.sh` |
+| 8 | `v033.sh` |
+| 9 | `v034.sh` |
+| 10 | `v035.sh` |
+| 11 | `v040.sh` |
+| 12 | `v041.sh` |
+
+`v031.sh` 所需的 `cryptography` 由该 job 通过 apt `python3-cryptography` 安装，
+并用系统解释器 `/usr/bin/python3` 运行；任一 e2e 脚本以非零码退出都会使 job 失败。
+`v100-*.sh` 依赖 root、systemd、Docker 或长稳资源，不在该 job 中运行。
 
 ## 运行
 
