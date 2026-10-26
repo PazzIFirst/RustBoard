@@ -489,6 +489,110 @@ fn claim_object(key: &str, rows: &[ArchiveRawRow]) -> ArchiveObject {
 }
 
 #[test]
+fn archive_rows_for_object_is_ordered_by_ts_for_deterministic_retry() {
+    let dir = TempDb::new("readback-order");
+    let storage = SqliteStorage::open(&dir.db_path()).unwrap();
+    // 先写 ts=2000、再写 ts=1000：rowid 顺序与 ts 顺序相反。
+    insert_batch(
+        &storage,
+        0,
+        vec![Sample::new("m", 2_000, 2.0), Sample::new("m", 1_000, 1.0)],
+    );
+    let rows = storage
+        .list_unclaimed_archive_rows(0, 10_000, 100)
+        .expect("读取未认领行失败");
+    assert_eq!(
+        rows.iter().map(|row| row.ts).collect::<Vec<_>>(),
+        vec![1_000, 2_000],
+        "claim 扫描必须按 ts, rowid 排序"
+    );
+    assert_eq!(
+        rows.iter().map(|row| row.rowid).collect::<Vec<_>>(),
+        vec![2, 1]
+    );
+
+    let object = claim_object("v8/part-00001-v8.csv.gz", &rows);
+    let object_id = storage
+        .claim_archive_rows(&object, &rows)
+        .expect("claim 失败");
+    let readback = storage
+        .archive_rows_for_object(object_id)
+        .expect("读回 claim 行集失败");
+    assert_eq!(
+        readback, rows,
+        "重试重建必须与 claim 扫描顺序一致，否则 CSV/SHA 不一致"
+    );
+}
+
+#[test]
+fn archive_retryable_objects_are_v8_only_and_failures_increment_attempts() {
+    let dir = TempDb::new("retryable");
+    let storage = SqliteStorage::open(&dir.db_path()).unwrap();
+    insert_batch(
+        &storage,
+        0,
+        vec![Sample::new("m", 1_000, 1.0), Sample::new("m", 2_000, 2.0)],
+    );
+    let rows = storage
+        .list_unclaimed_archive_rows(0, 10_000, 100)
+        .expect("读取未认领行失败");
+    let object = claim_object("v8/part-00001-v8.csv.gz", &rows);
+    let object_id = storage
+        .claim_archive_rows(&object, &rows)
+        .expect("claim 失败");
+
+    // v7 旧对象即使 pending 也不得进入 v8 重试列表，也不能补写 bytes/sha。
+    let mut legacy = claim_object("v7/part-00001.csv.gz", &rows);
+    legacy.ledger_version = LEDGER_VERSION_V7;
+    let legacy_id = storage.insert_archive_object(&legacy).unwrap();
+    let error = storage
+        .update_archive_object_metadata(legacy_id, 1, &"f".repeat(64))
+        .expect_err("v7 对象不得补写 v8 元数据");
+    assert_eq!(
+        error.downcast_ref::<ArchiveStoreError>(),
+        Some(&ArchiveStoreError::InvalidTransition)
+    );
+
+    let retryable = storage
+        .list_retryable_archive_objects(10, None)
+        .expect("列出重试对象失败");
+    assert_eq!(retryable.len(), 1);
+    assert_eq!(retryable[0].id, object_id);
+
+    storage
+        .record_archive_object_failure(object_id, "backend_unavailable")
+        .expect("记录失败状态失败");
+    let failed = storage.get_archive_object(object_id).unwrap().unwrap();
+    assert_eq!(failed.status, ArchiveStatus::Failed);
+    assert_eq!(failed.error, "backend_unavailable");
+    assert_eq!(failed.attempts, 1);
+
+    storage
+        .record_archive_object_failure(object_id, "backend_unavailable")
+        .expect("第二次记录失败状态失败");
+    let failed = storage.get_archive_object(object_id).unwrap().unwrap();
+    assert_eq!(failed.attempts, 2, "每次失败必须累计 attempts");
+
+    // 已上传对象不再进入重试列表；记录 failure 的合法迁移不是本用例职责。
+    storage
+        .update_archive_object_status(object_id, ArchiveStatus::Uploaded, "", Some(3_000), None)
+        .unwrap();
+    let uploaded = storage.get_archive_object(object_id).unwrap().unwrap();
+    assert_eq!(uploaded.status, ArchiveStatus::Uploaded);
+    assert_eq!(uploaded.attempts, 2);
+
+    let retryable = storage.list_retryable_archive_objects(10, None).unwrap();
+    assert!(
+        retryable.iter().all(|object| object.id != object_id),
+        "uploaded 对象不得继续重试"
+    );
+    // v7 对象原样保留，worker 不会重试。
+    let legacy_after = storage.get_archive_object(legacy_id).unwrap().unwrap();
+    assert_eq!(legacy_after.ledger_version, LEDGER_VERSION_V7);
+    assert_eq!(legacy_after.attempts, 0);
+}
+
+#[test]
 fn concurrent_claims_only_one_succeeds_and_rows_are_readable() {
     let dir = TempDb::new("claim-race");
     {

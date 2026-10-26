@@ -514,6 +514,14 @@ impl Storage for PostgresStorage {
         PostgresStorage::list_archive_objects(self, limit, before_id)
     }
 
+    fn list_retryable_archive_objects(
+        &self,
+        limit: usize,
+        after_id: Option<i64>,
+    ) -> Result<Vec<ArchiveObject>> {
+        PostgresStorage::list_retryable_archive_objects(self, limit, after_id)
+    }
+
     fn update_archive_object_status(
         &self,
         id: i64,
@@ -573,6 +581,10 @@ impl Storage for PostgresStorage {
 
     fn archive_rows_for_object(&self, object_id: i64) -> Result<Vec<ArchiveRawRow>> {
         PostgresStorage::archive_rows_for_object(self, object_id)
+    }
+
+    fn record_archive_object_failure(&self, id: i64, error: &str) -> Result<()> {
+        PostgresStorage::record_archive_object_failure(self, id, error)
     }
 
     fn update_archive_object_metadata(&self, id: i64, bytes: u64, sha256: &str) -> Result<()> {

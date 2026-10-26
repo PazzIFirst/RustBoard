@@ -402,6 +402,26 @@ enum ArchiveAction {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// v8 归档 ledger 重建状态与手动续跑。
+    Ledger {
+        #[command(subcommand)]
+        action: ArchiveLedgerAction,
+    },
+}
+
+/// `archive ledger` 子命令（R1a-2）。
+#[derive(Subcommand)]
+enum ArchiveLedgerAction {
+    /// 输出 archive_ledger_pending / 旧水位 / 对象数（JSON）。
+    Status {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// 标记 ledger 待重建并立即执行一轮归档；完整成功后清除 pending。
+    Rebuild {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
 }
 
 /// `tls` 子命令（M5 Phase C C4）。
@@ -918,6 +938,20 @@ fn archive_command(action: ArchiveAction) -> Result<()> {
         ArchiveAction::Test { config } => println!("{}", archive_test_json(config)?),
         ArchiveAction::Status { config } => println!("{}", archive_status_json(config)?),
         ArchiveAction::Run { config } => println!("{}", archive_run_json(config)?),
+        ArchiveAction::Ledger { action } => archive_ledger_command(action)?,
+    }
+    Ok(())
+}
+
+/// `archive ledger` 子命令入口；只负责打印业务函数返回的 JSON。
+fn archive_ledger_command(action: ArchiveLedgerAction) -> Result<()> {
+    match action {
+        ArchiveLedgerAction::Status { config } => {
+            println!("{}", archive_ledger_status_json(config)?);
+        }
+        ArchiveLedgerAction::Rebuild { config } => {
+            println!("{}", archive_ledger_rebuild_json(config)?);
+        }
     }
     Ok(())
 }
@@ -980,6 +1014,45 @@ fn archive_run_json(config: Option<PathBuf>) -> Result<String> {
         ))
         .context("归档任务失败（archive run）")?;
     Ok(serde_json::to_string_pretty(&report)?)
+}
+
+/// `archive ledger status`：只读 pending 标记 / 旧水位 / 对象数。
+///
+/// `archive.enabled = false` 时也可执行，用于查看迁移留下的待重建标记。
+fn archive_ledger_status_json(config: Option<PathBuf>) -> Result<String> {
+    let (storage, _cfg) = open_maintenance_storage(config)?;
+    let status = archive::ledger_status(&storage).context("读取归档 ledger 状态失败")?;
+    Ok(serde_json::to_string_pretty(&status)?)
+}
+
+/// `archive ledger rebuild`：先置 pending=1，再立即跑一轮归档。
+///
+/// 失败 / 中断时 pending 保持为 1（R1b 接入后 retention 会继续阻塞）；
+/// 完整成功由 worker 清除 pending。输出只含固定报告与 ledger 状态，不含后端
+/// URL / 凭据 / 对象内容。
+fn archive_ledger_rebuild_json(config: Option<PathBuf>) -> Result<String> {
+    let (storage, cfg) = open_maintenance_storage(config)?;
+    if !cfg.archive.enabled {
+        bail!("归档未启用（archive.enabled = false）");
+    }
+    let store = archive::build_store(&cfg.archive)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("初始化归档 ledger 重建运行时失败")?;
+    let report = runtime
+        .block_on(archive::rebuild_ledger(
+            &storage,
+            &cfg,
+            store.as_ref(),
+            now_ms(),
+        ))
+        .context("归档 ledger 重建失败（archive ledger rebuild）")?;
+    let ledger = archive::ledger_status(&storage).context("读取归档 ledger 状态失败")?;
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "report": report,
+        "ledger": ledger,
+    }))?)
 }
 
 // init 的参数与 `init` 子命令的 CLI 字段一一对应，拆结构体只会多一层搬运。
@@ -2772,13 +2845,14 @@ const MAX_ARCHIVE_DOWNLOAD_PRINCIPALS: usize = 1024;
 const ARCHIVE_DOWNLOAD_SEND_TIMEOUT: Duration = Duration::from_secs(120);
 /// `archive_objects.error` 允许透传的固定错误码；其它内容（可能来自人工改库 /
 /// 旧版本）一律收敛为 `archive_error`，避免把 URL 或后端正文带到 API。
-const ARCHIVE_OBJECT_ERROR_CODES: [&str; 6] = [
+const ARCHIVE_OBJECT_ERROR_CODES: [&str; 7] = [
     "invalid_key",
     "invalid_manifest",
     "invalid_status",
     "encode_failed",
     "backend_unavailable",
     "not_found",
+    "rows_missing",
 ];
 
 /// 归档对象列表响应：`objects` 按 id 倒序，`next_before_id` 是下一页排他游标。
@@ -2804,6 +2878,10 @@ struct ArchiveObjectView {
     created_at: i64,
     uploaded_at: Option<i64>,
     deleted_at: Option<i64>,
+    /// failed 重试次数（v8 claim 对象；旧 v7 对象为 0）。
+    attempts: i64,
+    /// 对象 claim 行集已缺失，无法再重建上传（error = `rows_missing`）。
+    rows_missing: bool,
     /// 是否可下载：状态就绪且对象大小未超过固定 64 MiB 下载上限。
     downloadable: bool,
 }
@@ -2821,6 +2899,7 @@ fn archive_object_downloadable(object: &ArchiveObject) -> bool {
 impl From<ArchiveObject> for ArchiveObjectView {
     fn from(object: ArchiveObject) -> Self {
         let downloadable = archive_object_downloadable(&object);
+        let rows_missing = object.error == "rows_missing";
         Self {
             id: object.id,
             object_key: object.object_key,
@@ -2835,6 +2914,8 @@ impl From<ArchiveObject> for ArchiveObjectView {
             created_at: object.created_at,
             uploaded_at: object.uploaded_at,
             deleted_at: object.deleted_at,
+            attempts: object.attempts,
+            rows_missing,
             downloadable,
         }
     }
@@ -11362,6 +11443,37 @@ mod tests {
                 action: ArchiveAction::Run { .. }
             }
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["rustboard-hub", "archive", "ledger", "status"])
+                .unwrap()
+                .cmd,
+            Cmd::Archive {
+                action: ArchiveAction::Ledger {
+                    action: ArchiveLedgerAction::Status { .. }
+                }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "rustboard-hub",
+                "archive",
+                "ledger",
+                "rebuild",
+                "--config",
+                "hub.toml",
+            ])
+            .unwrap()
+            .cmd,
+            Cmd::Archive {
+                action: ArchiveAction::Ledger {
+                    action: ArchiveLedgerAction::Rebuild { .. }
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["rustboard-hub", "archive", "ledger"]).is_err(),
+            "ledger 必须指定 status / rebuild"
+        );
         // maintenance 只接受 downsample / retention，archive 走独立子命令。
         assert!(
             Cli::try_parse_from(["rustboard-hub", "maintenance", "run", "--task", "archive"])
@@ -11733,6 +11845,8 @@ mod tests {
         assert_eq!(objects[0]["rows"], 42);
         assert_eq!(objects[0]["bytes"], 128);
         assert_eq!(objects[0]["sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(objects[0]["attempts"], 0);
+        assert_eq!(objects[0]["rows_missing"], false);
         assert!(
             objects[0].get("backend").is_none(),
             "列表不返回 backend 字段"
@@ -11782,6 +11896,32 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "query={query}");
             assert_eq!(json_body(&body)["error"], "bad_request", "query={query}");
         }
+    }
+
+    /// R1a-2：对象视图暴露 attempts 与 rows_missing，固定错误码不被掩码。
+    #[test]
+    fn archive_object_view_exposes_rows_missing_and_attempts() {
+        let mut object = archive_object_record(
+            "rustboard/2026/10/24/part-00001-v8.csv.gz",
+            ArchiveStatus::Failed,
+            "rows_missing",
+        );
+        object.attempts = 3;
+        let view = ArchiveObjectView::from(object);
+        assert_eq!(view.attempts, 3);
+        assert!(view.rows_missing);
+        assert_eq!(view.error, "rows_missing");
+        assert!(!view.downloadable);
+
+        let mut other = archive_object_record(
+            "rustboard/2026/10/24/part-00002-v8.csv.gz",
+            ArchiveStatus::Failed,
+            "backend_unavailable",
+        );
+        other.attempts = 1;
+        let view = ArchiveObjectView::from(other);
+        assert!(!view.rows_missing);
+        assert_eq!(view.error, "backend_unavailable");
     }
 
     /// M4-C2b：下载 200 的响应头与字节；走真实 router + mock WebDAV。

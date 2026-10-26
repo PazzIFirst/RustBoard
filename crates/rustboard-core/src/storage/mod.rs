@@ -751,6 +751,17 @@ pub trait Storage: Send + Sync {
         before_id: Option<i64>,
     ) -> Result<Vec<ArchiveObject>>;
 
+    /// 按 id 升序分页列出**待重试**的 v8 归档对象（`pending` / `failed`）。
+    ///
+    /// 只返回 `ledger_version = LEDGER_VERSION_V8` 的对象：旧 v7 对象没有
+    /// claim 行集，不能按行重建，也不得复用其 key。`after_id` 是上一页最后
+    /// 一条的 id（排他）。worker 用它做崩溃恢复与失败重试。
+    fn list_retryable_archive_objects(
+        &self,
+        limit: usize,
+        after_id: Option<i64>,
+    ) -> Result<Vec<ArchiveObject>>;
+
     /// 更新归档对象状态，并校验合法的状态迁移。
     fn update_archive_object_status(
         &self,
@@ -805,16 +816,27 @@ pub trait Storage: Send + Sync {
 
     /// 按 `archive_object_id` 读回 claim 行集（重试重建 CSV/manifest 用）。
     ///
-    /// 按行键升序返回；对象不存在或行已删除返回空列表。
+    /// 按 `ts, rowid`（PG 为 `ts, id`）升序返回，与 claim 扫描顺序一致；
+    /// 只有同一顺序才能在第 3 步重试时重建字节级一致的 CSV。对象不存在或行
+    /// 已删除返回空列表。
     fn archive_rows_for_object(&self, object_id: i64) -> Result<Vec<ArchiveRawRow>>;
+
+    /// 记录一次上传失败：状态置 `failed`、覆盖 `error`，`attempts` 加一。
+    ///
+    /// 只允许 `pending` / `failed` 迁移到 `failed`；已 `uploaded` /
+    /// `local_deleted` 的对象返回 [`crate::archive::ArchiveStoreError::InvalidTransition`]，
+    /// 不得回退。id 不存在返回
+    /// [`crate::archive::ArchiveStoreError::NotFound`]。
+    fn record_archive_object_failure(&self, id: i64, error: &str) -> Result<()>;
 
     /// CSV.GZ 在 claim 事务外生成后，补对象的 `bytes` / `sha256` 元数据。
     ///
     /// claim 只做「插入对象 + UPDATE 行集」，`bytes`/`sha256` 可先留占位；
     /// 大对象编码与上传不得占用 claim 事务，避免阻塞 ingest。`sha256` 必须
-    /// 是 64 位小写十六进制；仅 `pending` / `failed` 对象允许更新，
-    /// 对象不存在返回 [`crate::archive::ArchiveStoreError::NotFound`]，
-    /// 其余状态返回 `InvalidTransition`。
+    /// 是 64 位小写十六进制；仅 v8（`ledger_version=1`）且 `pending` /
+    /// `failed` 的对象允许更新，对象不存在返回
+    /// [`crate::archive::ArchiveStoreError::NotFound`]，
+    /// 其它 ledger 版本 / 状态返回 `InvalidTransition`。
     fn update_archive_object_metadata(&self, id: i64, bytes: u64, sha256: &str) -> Result<()>;
 
     /// 记录一次上传尝试：仅 `pending` / `failed` 对象允许，`attempts += 1`。

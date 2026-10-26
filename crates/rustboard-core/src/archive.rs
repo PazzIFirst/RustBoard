@@ -41,6 +41,12 @@ pub const MAX_ARCHIVE_PREFIX_BYTES: usize = 64;
 /// 分片最大编号（`part-00001` ..= `part-99999`）。
 pub const MAX_ARCHIVE_SHARD: u32 = 99_999;
 
+/// v8 claim 对象的 key 后缀：`part-00001-v8.csv.gz`。
+///
+/// 旧 v7 对象没有 claim 行集，worker 不得复用其 key；v8 对象统一带该后缀，
+/// 两类对象可以在同一目录共存且互不覆盖。
+pub const V8_OBJECT_KEY_SUFFIX: &str = "-v8";
+
 /// v7 旧归档对象的 ledger 版本：没有 claim 行集，只能作为历史对象保留。
 pub const LEDGER_VERSION_V7: i64 = 0;
 
@@ -405,10 +411,67 @@ pub fn build_object_keys(
     day: ArchiveDay,
     shard: &str,
 ) -> ArchiveResult<ArchiveObjectKeys> {
+    build_object_keys_with_suffix(prefix, day, shard, "")
+}
+
+/// 生成 v8 claim 对象 key：
+/// `<prefix>/<yyyy>/<mm>/<dd>/part-NNNNN-v8.csv.gz` 与同名 `.manifest.json`。
+///
+/// 与 [`build_object_keys`] 使用同一套 prefix / 日期 / 分片校验；后缀固定为
+/// [`V8_OBJECT_KEY_SUFFIX`]，不会与旧 v7 对象 key 冲突。
+pub fn build_v8_object_keys(
+    prefix: &str,
+    day: ArchiveDay,
+    shard: &str,
+) -> ArchiveResult<ArchiveObjectKeys> {
+    build_object_keys_with_suffix(prefix, day, shard, V8_OBJECT_KEY_SUFFIX)
+}
+
+/// 从标准 `.csv.gz` / `.manifest.json` key 的文件名解析分片号。
+///
+/// 同时接受 v7（`part-00001`）与 v8（`part-00001-v8`）形状；只解析最后一段
+/// 文件名，不信任前面的 prefix / 日期，调用方只应把它用于「避免 key 冲突」的
+/// 分片编号上限计算。非法形状返回 `None`。
+pub fn parse_object_key_shard(object_key: &str) -> Option<u32> {
+    let file = object_key.rsplit('/').next()?;
+    let base = file
+        .strip_suffix(".csv.gz")
+        .or_else(|| file.strip_suffix(".manifest.json"))?;
+    let shard = base.strip_suffix(V8_OBJECT_KEY_SUFFIX).unwrap_or(base);
+    validate_shard(shard).ok()
+}
+
+/// 对象 key 是否是合法的 v8 claim key（有 `-v8` 后缀，且分片段合法）。
+///
+/// 只检查文件名形状，不校验 prefix / 日期；非法 key（例如 `part-0000-v8`
+/// 或重复 `-v8-v8`）返回 `false`。
+pub fn is_v8_object_key(object_key: &str) -> bool {
+    let Some(file) = object_key.rsplit('/').next() else {
+        return false;
+    };
+    let Some(base) = file
+        .strip_suffix(".csv.gz")
+        .or_else(|| file.strip_suffix(".manifest.json"))
+    else {
+        return false;
+    };
+    let Some(shard) = base.strip_suffix(V8_OBJECT_KEY_SUFFIX) else {
+        return false;
+    };
+    validate_shard(shard).is_ok()
+}
+
+/// key 生成的共用实现；`suffix` 只来自本模块常量，不接受外部输入。
+fn build_object_keys_with_suffix(
+    prefix: &str,
+    day: ArchiveDay,
+    shard: &str,
+    suffix: &str,
+) -> ArchiveResult<ArchiveObjectKeys> {
     validate_prefix(prefix)?;
     let shard_number = validate_shard(shard)?;
     let base = format!(
-        "{prefix}/{:04}/{:02}/{:02}/part-{shard_number:05}",
+        "{prefix}/{:04}/{:02}/{:02}/part-{shard_number:05}{suffix}",
         day.year, day.month, day.day
     );
     Ok(ArchiveObjectKeys {

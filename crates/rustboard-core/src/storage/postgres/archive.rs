@@ -34,7 +34,7 @@ use postgres::Row;
 use rustboard_common::util::now_ms;
 
 use super::PostgresStorage;
-use crate::archive::{ArchiveObject, ArchiveStatus, ArchiveStoreError};
+use crate::archive::{ArchiveObject, ArchiveStatus, ArchiveStoreError, LEDGER_VERSION_V8};
 use crate::downsample::STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID;
 use crate::storage::sqlite::{
     validate_archive_claim, validate_archive_sha256, ArchiveRawRow, MAX_ARCHIVE_TS_MS,
@@ -1153,6 +1153,36 @@ impl PostgresStorage {
         .context("list_archive_objects")
     }
 
+    /// 按 id 升序分页列出待重试的 v8 归档对象（`pending` / `failed`）。
+    ///
+    /// 只包含 `ledger_version = LEDGER_VERSION_V8` 的对象：v7 旧对象没有 claim
+    /// 行集，不能按 `archive_rows_for_object` 重建。`after_id` 为上一页最后
+    /// 一条的 id（排他）；`limit == 0` 返回空列表。
+    pub fn list_retryable_archive_objects(
+        &self,
+        limit: usize,
+        after_id: Option<i64>,
+    ) -> Result<Vec<ArchiveObject>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let sql = format!(
+            "SELECT {ARCHIVE_OBJECT_COLUMNS} FROM archive_objects \
+             WHERE ledger_version = $1 AND status IN ('pending', 'failed') \
+               AND ($2::BIGINT IS NULL OR id > $2) ORDER BY id ASC LIMIT $3"
+        );
+        self.with_client(|client| {
+            let rows = client
+                .query(&sql, &[&LEDGER_VERSION_V8, &after_id, &limit])
+                .context("执行 list_retryable_archive_objects SQL 失败")?;
+            rows.iter()
+                .map(row_to_archive_object)
+                .collect::<Result<Vec<_>>>()
+        })
+        .context("list_retryable_archive_objects")
+    }
+
     /// 更新归档对象状态，并校验合法迁移。
     ///
     /// 允许 `pending -> uploaded -> local_deleted` 与
@@ -1202,6 +1232,42 @@ impl PostgresStorage {
             Ok(())
         })
         .context("update_archive_object_status")
+    }
+
+    /// 记录一次上传失败：状态置 `failed`、覆盖 `error`，`attempts` 加一。
+    ///
+    /// 只允许 `pending` / `failed` 迁移到 `failed`；已 `uploaded` /
+    /// `local_deleted` 的状态回退返回 [`ArchiveStoreError::InvalidTransition`]。
+    /// id 不存在返回 [`ArchiveStoreError::NotFound`]。
+    pub fn record_archive_object_failure(&self, id: i64, error: &str) -> Result<()> {
+        self.with_client(|client| {
+            let mut tx = client.transaction().context("开启归档失败记录事务失败")?;
+            let current: Option<String> = tx
+                .query_opt(
+                    "SELECT status FROM archive_objects WHERE id = $1 FOR UPDATE",
+                    &[&id],
+                )
+                .context("读取归档对象当前状态失败")?
+                .map(|row| row.get(0));
+            let Some(current) = current else {
+                return Err(ArchiveStoreError::NotFound.into());
+            };
+            let current = ArchiveStatus::parse(&current)
+                .ok_or_else(|| anyhow!("archive_objects.status 字段值非法"))?;
+            if !matches!(current, ArchiveStatus::Pending | ArchiveStatus::Failed) {
+                return Err(ArchiveStoreError::InvalidTransition.into());
+            }
+            tx.execute(
+                "UPDATE archive_objects
+                 SET status = 'failed', error = $2, attempts = attempts + 1
+                 WHERE id = $1",
+                &[&id, &error],
+            )
+            .context("执行归档失败记录 SQL 失败")?;
+            tx.commit().context("提交归档失败记录事务失败")?;
+            Ok(())
+        })
+        .context("record_archive_object_failure")
     }
 
     /// 读取归档水位；键不存在返回 `None`。
@@ -1406,19 +1472,21 @@ impl PostgresStorage {
         let bytes = i64::try_from(bytes).context("归档对象字节数超出 BIGINT 范围")?;
         self.with_client(|client| {
             let mut tx = client.transaction().context("开启归档元数据更新事务失败")?;
-            let status: Option<String> = tx
+            let object: Option<(i64, String)> = tx
                 .query_opt(
-                    "SELECT status FROM archive_objects WHERE id = $1 FOR UPDATE",
+                    "SELECT ledger_version, status FROM archive_objects WHERE id = $1 FOR UPDATE",
                     &[&id],
                 )
                 .context("读取归档对象状态失败")?
-                .map(|row| row.get(0));
-            let Some(status) = status else {
+                .map(|row| (row.get(0), row.get(1)));
+            let Some((ledger_version, status)) = object else {
                 return Err(ArchiveStoreError::NotFound.into());
             };
             let status = ArchiveStatus::parse(&status)
                 .ok_or_else(|| anyhow!("archive_objects.status 字段值非法"))?;
-            if !matches!(status, ArchiveStatus::Pending | ArchiveStatus::Failed) {
+            if ledger_version != LEDGER_VERSION_V8
+                || !matches!(status, ArchiveStatus::Pending | ArchiveStatus::Failed)
+            {
                 return Err(ArchiveStoreError::InvalidTransition.into());
             }
             tx.execute(
@@ -1486,8 +1554,10 @@ impl PostgresStorage {
 
     /// 按 `archive_object_id` 读回 claim 行集，按 `ts, samples.id` 升序。
     ///
-    /// 排序与 claim/scan 的 `(ts, id)` 一致，重试才能重建字节级相同的 CSV；
-    /// 对象不存在或行已删除返回空列表。
+    /// 上传失败 / 崩溃后的重试必须用同一行集重建 CSV 与 manifest，不能重扫 raw；
+    /// 排序必须与 claim 扫描（`list_unclaimed_archive_rows` 的 `ts, id`）一致，
+    /// 否则重试会输出不同的行顺序，导致 SHA-256 与已记录对象不一致。
+    /// 对象不存在或行已删除时返回空列表。
     pub fn archive_rows_for_object(&self, object_id: i64) -> Result<Vec<ArchiveRawRow>> {
         self.with_client(|client| {
             let rows = client
@@ -2503,6 +2573,31 @@ mod tests {
         let err = storage
             .record_archive_attempt(object_id)
             .expect_err("uploaded 后不得再记录尝试");
+        assert_eq!(
+            err.downcast_ref::<ArchiveStoreError>(),
+            Some(&ArchiveStoreError::InvalidTransition)
+        );
+
+        // uploaded 不得被迟到的失败记录翻回 failed（双 worker 竞态防线）。
+        let err = storage
+            .record_archive_object_failure(object_id, "backend_unavailable")
+            .expect_err("uploaded 后不得记录失败");
+        assert_eq!(
+            err.downcast_ref::<ArchiveStoreError>(),
+            Some(&ArchiveStoreError::InvalidTransition)
+        );
+
+        // v7 旧对象没有 claim 行集，禁止补写 v8 元数据。
+        let mut legacy = archive_object("v7/old.csv.gz", 1_000, 2_000, ArchiveStatus::Pending);
+        legacy.ledger_version = crate::archive::LEDGER_VERSION_V7;
+        legacy.bytes = 0;
+        legacy.sha256.clear();
+        let legacy_id = storage
+            .insert_archive_object(&legacy)
+            .expect("插入 v7 对象失败");
+        let err = storage
+            .update_archive_object_metadata(legacy_id, 1, &"f".repeat(64))
+            .expect_err("v7 对象不得补写 v8 元数据");
         assert_eq!(
             err.downcast_ref::<ArchiveStoreError>(),
             Some(&ArchiveStoreError::InvalidTransition)
