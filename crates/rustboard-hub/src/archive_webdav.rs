@@ -15,10 +15,16 @@
 //! - `put` 按 key 后缀设置 `Content-Type`：`.csv.gz` → `application/gzip`，
 //!   `.manifest.json` → `application/json`，其余探针对象用
 //!   `application/octet-stream`；
+//! - `put` 之前自 base 逐级 `MKCOL` 父 collection（201 = 新建，405 = 已存在）：
+//!   base collection 必须由运维预先创建且可写，本模块不会 `MKCOL` base 本身，
+//!   也不会回收空 collection；探针对象仍会删除。已创建的 collection 按 store
+//!   实例缓存，并发首次创建时依赖 405 幂等成功；
 //! - `head` 只返回对象大小，不暴露 ETag / URL / 响应头。
 //!
 //! 网络层不打印任何后端信息；失败时上层只看到固定的中文错误。
 
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -48,6 +54,11 @@ pub struct WebdavColdStore {
     base: Url,
     username: String,
     password: String,
+    /// 已确认存在的 collection（相对 base 的路径，不含首尾 `/`）。
+    ///
+    /// 只在同步代码段内加锁、绝不跨 `.await` 持有，避免异步锁与 `Send` 约束；
+    /// 并发首次创建时可能重复发 MKCOL，后到者按 405 已存在处理。
+    created_collections: Mutex<BTreeSet<String>>,
 }
 
 impl WebdavColdStore {
@@ -91,6 +102,7 @@ impl WebdavColdStore {
             base,
             username: config.username.clone(),
             password: config.password.clone(),
+            created_collections: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -100,6 +112,93 @@ impl WebdavColdStore {
         self.base.join(key).map_err(|_| ArchiveError::InvalidKey)
     }
 
+    /// 计算 key 的全部父 collection，按从浅到深排列。
+    ///
+    /// 例如 `rustboard/2026/10/18/part-00001.csv.gz` 返回
+    /// `rustboard`、`rustboard/2026`、`rustboard/2026/10`、
+    /// `rustboard/2026/10/18`。base collection 由运维预先创建，不在此列。
+    fn parent_collections(key: &str) -> ArchiveResult<Vec<String>> {
+        validate_key(key)?;
+        let segments = key.split('/').collect::<Vec<_>>();
+        let mut collections = Vec::with_capacity(segments.len().saturating_sub(1));
+        for depth in 1..segments.len() {
+            collections.push(segments[..depth].join("/"));
+        }
+        Ok(collections)
+    }
+
+    fn is_collection_cached(&self, collection: &str) -> bool {
+        self.created_collections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(collection)
+    }
+
+    fn cache_collection(&self, collection: &str) {
+        self.created_collections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(collection.to_string());
+    }
+
+    /// 清除 key 父链的缓存，用于 PUT 409 后重建被外部删除 / 迁移的 collection。
+    fn forget_parent_collections(&self, key: &str) -> ArchiveResult<()> {
+        let collections = Self::parent_collections(key)?;
+        let mut cached = self
+            .created_collections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for collection in collections {
+            cached.remove(&collection);
+        }
+        Ok(())
+    }
+
+    /// 逐级创建 key 的父 collection。
+    ///
+    /// 201 表示新建成功，405 表示已存在（并发创建 / 缓存未命中），两者都成功；
+    /// 401 / 403 / 409 / 3xx / 5xx 统一折叠为固定的
+    /// [`ArchiveError::BackendUnavailable`]。客户端已禁用重定向，3xx 不会被跟随。
+    async fn ensure_parent_collections(&self, key: &str) -> ArchiveResult<()> {
+        for collection in Self::parent_collections(key)? {
+            if self.is_collection_cached(&collection) {
+                continue;
+            }
+            self.create_collection(&collection).await?;
+            self.cache_collection(&collection);
+        }
+        Ok(())
+    }
+
+    /// 对单个 collection 发 `MKCOL`；错误不包含 URL、凭据或响应正文。
+    async fn create_collection(&self, collection: &str) -> ArchiveResult<()> {
+        let url = self
+            .base
+            .join(&format!("{collection}/"))
+            .map_err(|_| ArchiveError::BackendUnavailable)?;
+        // `MKCOL` 不是 reqwest 预置常量，但它是合法的 HTTP 方法。
+        let method =
+            reqwest::Method::from_bytes(b"MKCOL").map_err(|_| ArchiveError::BackendUnavailable)?;
+        let response = self
+            .client
+            .request(method, url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .map_err(|_| ArchiveError::BackendUnavailable)?;
+        match response.status() {
+            // 201：新建成功；200 / 204：部分后端对已存在 collection 的返回；
+            // 405：collection 已存在。
+            reqwest::StatusCode::OK
+            | reqwest::StatusCode::CREATED
+            | reqwest::StatusCode::NO_CONTENT
+            | reqwest::StatusCode::METHOD_NOT_ALLOWED => Ok(()),
+            // 202（异步接受、尚未建好）等其它 2xx 不得视为已创建，否则会写进
+            // 缓存，导致之后 PUT 永久 409。401 / 403 / 409 / 3xx / 5xx 同理。
+            _ => Err(ArchiveError::BackendUnavailable),
+        }
+    }
+
     async fn require_success(response: reqwest::Response) -> ArchiveResult<reqwest::Response> {
         if response.status().is_success() {
             Ok(response)
@@ -107,21 +206,35 @@ impl WebdavColdStore {
             Err(ArchiveError::BackendUnavailable)
         }
     }
-}
 
-#[async_trait]
-impl ColdStore for WebdavColdStore {
-    async fn put(&self, key: &str, data: &[u8]) -> ArchiveResult<()> {
-        let url = self.object_url(key)?;
-        let response = self
-            .client
+    /// 发送对象 PUT；传输层错误折叠为固定错误。
+    async fn send_put(&self, url: Url, key: &str, data: &[u8]) -> ArchiveResult<reqwest::Response> {
+        self.client
             .put(url)
             .basic_auth(&self.username, Some(&self.password))
             .header(header::CONTENT_TYPE, content_type_for(key))
             .body(data.to_vec())
             .send()
             .await
-            .map_err(|_| ArchiveError::BackendUnavailable)?;
+            .map_err(|_| ArchiveError::BackendUnavailable)
+    }
+}
+
+#[async_trait]
+impl ColdStore for WebdavColdStore {
+    async fn put(&self, key: &str, data: &[u8]) -> ArchiveResult<()> {
+        // 严格 DAV 后端要求父 collection 存在，否则 PUT 会返回 409。
+        self.ensure_parent_collections(key).await?;
+        let url = self.object_url(key)?;
+        let response = self.send_put(url.clone(), key, data).await?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            // 409 多半是 collection 被外部删除 / 迁移：清父链缓存，重新逐级
+            // MKCOL 后只重试一次 PUT；仍失败则返回固定错误，不无限重试。
+            self.forget_parent_collections(key)?;
+            self.ensure_parent_collections(key).await?;
+            let response = self.send_put(url, key, data).await?;
+            return Self::require_success(response).await.map(|_| ());
+        }
         Self::require_success(response).await.map(|_| ())
     }
 
@@ -189,6 +302,7 @@ impl ColdStore for WebdavColdStore {
 
     async fn test(&self) -> ArchiveResult<()> {
         // 每次随机 key，避免并发测试互相覆盖；失败也一定尝试清理。
+        // `put` 会复用同一套逐级 MKCOL 逻辑创建 `health` collection。
         let key = format!("health/{}.probe", uuid::Uuid::new_v4());
         let payload = b"rustboard-archive-probe";
 
@@ -279,7 +393,7 @@ async fn read_body_limited(mut response: reqwest::Response) -> ArchiveResult<Vec
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Mutex};
 
     use axum::body::Bytes;
@@ -296,24 +410,37 @@ pub(crate) mod test_support {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct DavRequest {
         pub method: String,
-        /// 去掉 `/dav/` 前缀后的对象路径。
+        /// 去掉 `/dav/` 前缀与末尾 `/` 后的对象 / collection 路径。
         pub path: String,
+        /// 去掉 `/dav/` 前缀后的原始路径，保留 MKCOL 末尾 `/` 等细节。
+        pub raw_path: String,
         pub content_type: Option<String>,
         pub authorization: Option<String>,
         pub body: Vec<u8>,
     }
 
     /// mock 的可变状态；所有字段由同一个 `Mutex` 保护，测试直接读写。
+    ///
+    /// 默认是**严格 DAV**：父 collection 不存在时 PUT 返回 409，必须用 MKCOL
+    /// 逐级创建；base collection `/dav` 视为预先存在。
     #[derive(Debug, Default)]
     pub(crate) struct DavInner {
         pub objects: BTreeMap<String, Vec<u8>>,
+        /// 已存在的 collection（相对 `/dav` 的路径，不含首尾 `/`）。
+        pub collections: BTreeSet<String>,
         pub requests: Vec<DavRequest>,
         pub fail_put: Option<u16>,
+        pub fail_mkcol: Option<u16>,
         pub fail_get: Option<u16>,
         pub fail_head: Option<u16>,
         pub fail_delete: Option<u16>,
         /// PUT 返回 302 并带 Location，用于验证客户端不跟随重定向。
         pub redirect_put: bool,
+        /// MKCOL 返回 302 并带 Location，用于验证客户端不跟随重定向。
+        pub redirect_mkcol: bool,
+        /// MKCOL 实际新建 / 命中已存在的次数；用于断言 201 / 405 处理。
+        pub mkcol_created: u32,
+        pub mkcol_existing: u32,
     }
 
     #[derive(Clone)]
@@ -373,9 +500,13 @@ pub(crate) mod test_support {
         body: Bytes,
     ) -> Response {
         let mut inner = state.inner.lock().expect("mock WebDAV 状态锁未被毒化");
+        // 保留原始 URI 供断言（MKCOL 必须以 `/` 结尾）；规范化路径用于查找。
+        let raw_path = path;
+        let path = raw_path.trim_end_matches('/').to_string();
         inner.requests.push(DavRequest {
             method: method.as_str().to_string(),
             path: path.clone(),
+            raw_path,
             content_type: headers
                 .get(header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
@@ -389,19 +520,19 @@ pub(crate) mod test_support {
 
         if method == Method::PUT && inner.redirect_put {
             drop(inner);
-            let mut response = StatusCode::FOUND.into_response();
-            response.headers_mut().insert(
-                header::LOCATION,
-                HeaderValue::from_static("/dav/redirected"),
-            );
-            return response;
+            return redirect_response();
+        }
+        if method.as_str() == "MKCOL" && inner.redirect_mkcol {
+            drop(inner);
+            return redirect_response();
         }
 
-        let failure = match method {
-            Method::PUT => inner.fail_put,
-            Method::GET => inner.fail_get,
-            Method::HEAD => inner.fail_head,
-            Method::DELETE => inner.fail_delete,
+        let failure = match method.as_str() {
+            "PUT" => inner.fail_put,
+            "MKCOL" => inner.fail_mkcol,
+            "GET" => inner.fail_get,
+            "HEAD" => inner.fail_head,
+            "DELETE" => inner.fail_delete,
             _ => None,
         };
         if let Some(status) = failure {
@@ -409,8 +540,18 @@ pub(crate) mod test_support {
             return fixed_response(status);
         }
 
+        if method.as_str() == "MKCOL" {
+            return mkcol(&mut inner, &path);
+        }
+
         match method {
             Method::PUT => {
+                // 严格 DAV：父 collection 不存在时拒绝写入（RFC 4918 409）。
+                let parent = parent_collection(&path);
+                if !parent.is_empty() && !inner.collections.contains(parent) {
+                    drop(inner);
+                    return fixed_response(409);
+                }
                 inner.objects.insert(path, body.to_vec());
                 drop(inner);
                 StatusCode::CREATED.into_response()
@@ -455,6 +596,35 @@ pub(crate) mod test_support {
         }
     }
 
+    /// 严格 DAV 的 MKCOL：已存在 → 405，父缺失 → 409，新建 → 201。
+    fn mkcol(inner: &mut DavInner, path: &str) -> Response {
+        if path.is_empty() || inner.collections.contains(path) {
+            inner.mkcol_existing = inner.mkcol_existing.saturating_add(1);
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let parent = parent_collection(path);
+        if !parent.is_empty() && !inner.collections.contains(parent) {
+            return fixed_response(409);
+        }
+        inner.collections.insert(path.to_string());
+        inner.mkcol_created = inner.mkcol_created.saturating_add(1);
+        StatusCode::CREATED.into_response()
+    }
+
+    /// 对象 / collection 的父路径；顶层返回空串（base collection 恒存在）。
+    fn parent_collection(path: &str) -> &str {
+        path.rsplit_once('/').map_or("", |(parent, _)| parent)
+    }
+
+    fn redirect_response() -> Response {
+        let mut response = StatusCode::FOUND.into_response();
+        response.headers_mut().insert(
+            header::LOCATION,
+            HeaderValue::from_static("/dav/redirected"),
+        );
+        response
+    }
+
     fn fixed_response(status: u16) -> Response {
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         (status, "upstream-secret-body").into_response()
@@ -463,7 +633,9 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::MockDav;
+    use std::sync::Arc;
+
+    use super::test_support::{DavRequest, MockDav};
     use super::*;
     use base64::Engine as _;
     use rustboard_core::archive::ArchiveManifest;
@@ -472,10 +644,34 @@ mod tests {
         WebdavColdStore::new(&mock.config()).expect("mock WebDAV 配置必须可构造")
     }
 
+    /// 每个 MKCOL 请求的原始 URI 都必须以 `/` 结尾（collection URI 规范）。
+    fn assert_mkcol_raw_paths_end_with_slash(requests: &[DavRequest]) {
+        let mut seen = false;
+        for request in requests.iter().filter(|request| request.method == "MKCOL") {
+            seen = true;
+            assert!(
+                request.raw_path.ends_with('/'),
+                "MKCOL URI 必须以 / 结尾: {:?}",
+                request.raw_path
+            );
+        }
+        assert!(seen, "应至少有一个 MKCOL 请求");
+    }
+
     fn basic_auth_header(username: &str, password: &str) -> String {
         let encoded =
             base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
         format!("Basic {encoded}")
+    }
+
+    /// 固定错误且不得回显 base URL、凭据或上游响应正文。
+    fn assert_fixed_error_without_leak(error: &ArchiveError, base_url: &str) {
+        assert_eq!(error, &ArchiveError::BackendUnavailable);
+        let message = error.to_string();
+        assert_eq!(message, "冷存储后端不可用");
+        for leaked in [base_url, "dav-user", "dav-password", "upstream-secret-body"] {
+            assert!(!message.contains(leaked), "错误泄露了 {leaked}: {message}");
+        }
     }
 
     #[tokio::test]
@@ -490,9 +686,13 @@ mod tests {
 
         {
             let inner = mock.inner.lock().unwrap();
-            assert_eq!(inner.requests.len(), 2);
-            let put_object = &inner.requests[0];
-            assert_eq!(put_object.method, "PUT");
+            let puts = inner
+                .requests
+                .iter()
+                .filter(|request| request.method == "PUT")
+                .collect::<Vec<_>>();
+            assert_eq!(puts.len(), 2);
+            let put_object = puts[0];
             assert_eq!(put_object.path, object_key);
             assert_eq!(put_object.content_type.as_deref(), Some("application/gzip"));
             assert_eq!(
@@ -500,12 +700,29 @@ mod tests {
                 Some(basic_auth_header("dav-user", "dav-password").as_str())
             );
             assert_eq!(put_object.body, b"gzip-payload");
-            let put_manifest = &inner.requests[1];
+            let put_manifest = puts[1];
             assert_eq!(
                 put_manifest.content_type.as_deref(),
                 Some("application/json")
             );
             assert_eq!(inner.objects.get(object_key).unwrap(), b"gzip-payload");
+            // 两个对象共享父 collection：只在首次 PUT 前逐级创建一次。
+            assert_eq!(
+                inner
+                    .requests
+                    .iter()
+                    .filter(|request| request.method == "MKCOL")
+                    .map(|request| request.path.as_str())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "rustboard",
+                    "rustboard/2026",
+                    "rustboard/2026/10",
+                    "rustboard/2026/10/18"
+                ]
+            );
+            assert_eq!(inner.mkcol_created, 4);
+            assert_mkcol_raw_paths_end_with_slash(&inner.requests);
         }
 
         assert_eq!(
@@ -629,28 +846,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_probe_roundtrip_leaves_no_object() {
+    async fn test_probe_roundtrip_leaves_no_object_and_reuses_health_collection() {
         let mock = MockDav::spawn().await;
         let store = store(&mock);
         store.test().await.unwrap();
+        {
+            let inner = mock.inner.lock().unwrap();
+            assert!(inner.objects.is_empty(), "探针对象必须清理");
+            let methods: Vec<&str> = inner
+                .requests
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect();
+            assert_eq!(
+                methods,
+                vec!["MKCOL", "PUT", "HEAD", "GET", "DELETE"],
+                "首次 test 必须先创建 health collection"
+            );
+            assert_eq!(inner.requests[0].path, "health");
+            assert_eq!(
+                inner.requests[0].authorization.as_deref(),
+                Some(basic_auth_header("dav-user", "dav-password").as_str()),
+                "MKCOL 也必须携带 Basic auth"
+            );
+            let probe = &inner.requests[1];
+            assert!(
+                probe.path.starts_with("health/") && probe.path.ends_with(".probe"),
+                "探针 key 格式不符: {}",
+                probe.path
+            );
+            assert_eq!(
+                probe.content_type.as_deref(),
+                Some("application/octet-stream")
+            );
+            assert_eq!(inner.mkcol_created, 1);
+            assert_mkcol_raw_paths_end_with_slash(&inner.requests);
+        }
+
+        // 第二次 test 命中 collection 缓存，不再 MKCOL。
+        store.test().await.unwrap();
         let inner = mock.inner.lock().unwrap();
-        assert!(inner.objects.is_empty(), "探针对象必须清理");
-        let methods: Vec<&str> = inner
-            .requests
-            .iter()
-            .map(|request| request.method.as_str())
-            .collect();
-        assert_eq!(methods, vec!["PUT", "HEAD", "GET", "DELETE"]);
-        let probe = &inner.requests[0];
-        assert!(
-            probe.path.starts_with("health/") && probe.path.ends_with(".probe"),
-            "探针 key 格式不符: {}",
-            probe.path
-        );
         assert_eq!(
-            probe.content_type.as_deref(),
-            Some("application/octet-stream")
+            inner
+                .requests
+                .iter()
+                .filter(|request| request.method == "MKCOL")
+                .count(),
+            1,
+            "health collection 必须按 store 实例缓存"
         );
+        assert!(inner.objects.is_empty(), "探针对象必须清理");
     }
 
     #[tokio::test]
@@ -669,7 +914,8 @@ mod tests {
             .iter()
             .map(|request| request.method.as_str())
             .collect();
-        assert_eq!(methods, vec!["PUT", "HEAD", "GET", "DELETE"]);
+        assert_eq!(methods, vec!["MKCOL", "PUT", "HEAD", "GET", "DELETE"]);
+        assert_eq!(inner.requests[0].path, "health");
     }
 
     #[tokio::test]
@@ -684,11 +930,40 @@ mod tests {
                 .unwrap_err(),
             ArchiveError::BackendUnavailable
         );
+        let inner = mock.inner.lock().unwrap();
         assert_eq!(
-            mock.inner.lock().unwrap().requests.len(),
+            inner
+                .requests
+                .iter()
+                .filter(|request| request.method == "PUT")
+                .count(),
             1,
-            "禁止重定向：不得向 Location 再发请求"
+            "禁止重定向：302 后不得重发 PUT"
         );
+        assert!(
+            inner
+                .requests
+                .iter()
+                .all(|request| request.path != "redirected"),
+            "不得向 Location 再发请求"
+        );
+        assert_eq!(inner.mkcol_created, 4, "PUT 前父 collection 应已创建");
+    }
+
+    #[tokio::test]
+    async fn mkcol_redirects_are_not_followed() {
+        let mock = MockDav::spawn().await;
+        let store = store(&mock);
+        mock.inner.lock().unwrap().redirect_mkcol = true;
+        let error = store
+            .put("rustboard/2026/10/18/part-00001.csv.gz", b"x")
+            .await
+            .unwrap_err();
+        assert_fixed_error_without_leak(&error, &mock.base_url);
+        let inner = mock.inner.lock().unwrap();
+        assert_eq!(inner.requests.len(), 1, "MKCOL 302 后不得跟随");
+        assert_eq!(inner.requests[0].method, "MKCOL");
+        assert!(inner.objects.is_empty(), "MKCOL 失败不得写入对象");
     }
 
     #[tokio::test]
@@ -708,5 +983,297 @@ mod tests {
         let json = rustboard_core::archive::manifest_json(&manifest).unwrap();
         store.put(key, json.as_bytes()).await.unwrap();
         assert_eq!(store.get(key).await.unwrap(), json.as_bytes());
+    }
+
+    /// mock 自身必须是严格 DAV：父 collection 缺失时 PUT=409，逐级 MKCOL 后才 201。
+    #[tokio::test]
+    async fn strict_mock_rejects_put_until_parent_collections_exist() {
+        let mock = MockDav::spawn().await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .build()
+            .unwrap();
+        let key = "rustboard/2026/10/18/part-00001.csv.gz";
+        let object_url = format!("{}/{key}", mock.base_url);
+
+        let response = client.put(&object_url).body("x").send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+
+        let method = reqwest::Method::from_bytes(b"MKCOL").unwrap();
+        // 直接父 collection 也不能跳过中间层级。
+        let direct_parent = format!("{}/rustboard/2026/10/18/", mock.base_url);
+        let response = client
+            .request(method.clone(), direct_parent)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+
+        for collection in [
+            "rustboard",
+            "rustboard/2026",
+            "rustboard/2026/10",
+            "rustboard/2026/10/18",
+        ] {
+            let url = format!("{}/{collection}/", mock.base_url);
+            let response = client.request(method.clone(), url).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+        }
+
+        let response = client.put(&object_url).body("x").send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+        assert_eq!(mock.inner.lock().unwrap().objects.get(key).unwrap(), b"x");
+    }
+
+    /// 跨新日期只创建缺失的那一级 collection；同日期 / 同父路径全部命中缓存。
+    #[tokio::test]
+    async fn new_date_creates_only_missing_collection() {
+        let mock = MockDav::spawn().await;
+        let store = store(&mock);
+        store
+            .put("rustboard/2026/10/18/part-00001.csv.gz", b"day-18")
+            .await
+            .unwrap();
+        store
+            .put("rustboard/2026/10/18/part-00002.csv.gz", b"day-18-again")
+            .await
+            .unwrap();
+        store
+            .put("rustboard/2026/10/19/part-00001.csv.gz", b"day-19")
+            .await
+            .unwrap();
+
+        let inner = mock.inner.lock().unwrap();
+        assert_eq!(
+            inner
+                .requests
+                .iter()
+                .filter(|request| request.method == "MKCOL")
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "rustboard",
+                "rustboard/2026",
+                "rustboard/2026/10",
+                "rustboard/2026/10/18",
+                "rustboard/2026/10/19",
+            ],
+            "只应创建缺失的 collection"
+        );
+        assert_eq!(inner.mkcol_created, 5);
+        assert_eq!(inner.mkcol_existing, 0);
+        assert!(inner.collections.contains("rustboard/2026/10/19"));
+        assert_eq!(inner.objects.len(), 3);
+        assert_mkcol_raw_paths_end_with_slash(&inner.requests);
+    }
+
+    /// 其他客户端已建好 collection 时 MKCOL 返回 405：视为成功并写入缓存。
+    #[tokio::test]
+    async fn existing_collections_from_other_clients_are_treated_as_success() {
+        let mock = MockDav::spawn().await;
+        let store = store(&mock);
+        let collections = [
+            "rustboard",
+            "rustboard/2026",
+            "rustboard/2026/10",
+            "rustboard/2026/10/18",
+        ];
+        {
+            let mut inner = mock.inner.lock().unwrap();
+            for collection in collections {
+                inner.collections.insert(collection.to_string());
+            }
+        }
+
+        let key = "rustboard/2026/10/18/part-00001.csv.gz";
+        store.put(key, b"payload").await.unwrap();
+        {
+            let inner = mock.inner.lock().unwrap();
+            assert_eq!(inner.mkcol_created, 0);
+            assert_eq!(inner.mkcol_existing, 4, "405 必须按已存在处理");
+            assert_eq!(inner.objects.get(key).unwrap(), b"payload");
+            assert_eq!(
+                inner
+                    .requests
+                    .iter()
+                    .filter(|request| request.method == "PUT")
+                    .count(),
+                1,
+                "405 后仍必须继续 PUT"
+            );
+        }
+
+        // 已确认存在的 collection 进缓存，再传其它对象不再 MKCOL。
+        store
+            .put("rustboard/2026/10/18/part-00002.csv.gz", b"payload-2")
+            .await
+            .unwrap();
+        let inner = mock.inner.lock().unwrap();
+        assert_eq!(
+            inner
+                .requests
+                .iter()
+                .filter(|request| request.method == "MKCOL")
+                .count(),
+            4,
+            "同一 store 不得重复 MKCOL"
+        );
+        assert_eq!(inner.objects.len(), 2);
+    }
+
+    /// 并发首次上传共享父 collection：所有 PUT 都必须成功（405 幂等）。
+    #[tokio::test]
+    async fn concurrent_puts_share_collection_creation() {
+        let mock = MockDav::spawn().await;
+        let store = Arc::new(store(&mock));
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = Vec::new();
+        for shard in 0..8 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .put(
+                        &format!("rustboard/2026/10/18/part-{shard:05}.csv.gz"),
+                        b"concurrent",
+                    )
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await.expect("并发任务不得 panic").unwrap();
+        }
+
+        let inner = mock.inner.lock().unwrap();
+        assert_eq!(inner.objects.len(), 8, "所有并发对象都必须写入");
+        for collection in [
+            "rustboard",
+            "rustboard/2026",
+            "rustboard/2026/10",
+            "rustboard/2026/10/18",
+        ] {
+            assert!(
+                inner.collections.contains(collection),
+                "collection 未创建: {collection}"
+            );
+        }
+        assert!(
+            inner.mkcol_created >= 1,
+            "至少应有一个 MKCOL 真正创建 collection"
+        );
+        assert_eq!(
+            inner.mkcol_created + inner.mkcol_existing,
+            inner
+                .requests
+                .iter()
+                .filter(|request| request.method == "MKCOL")
+                .count() as u32,
+            "每个 MKCOL 请求都应有 201 / 405 结果"
+        );
+    }
+
+    /// 202 / 401 / 403 / 409 / 5xx：固定错误、不继续 PUT、不泄露后端信息。
+    ///
+    /// 202 尤其不能被当成“已创建”，否则 collection 缓存会永久命中，后续 PUT 409。
+    #[tokio::test]
+    async fn mkcol_failures_are_fixed_errors_without_leaks() {
+        for status in [202, 401, 403, 409, 500] {
+            let mock = MockDav::spawn().await;
+            let store = store(&mock);
+            mock.inner.lock().unwrap().fail_mkcol = Some(status);
+            let error = store
+                .put("rustboard/2026/10/18/part-00001.csv.gz", b"secret-data")
+                .await
+                .unwrap_err();
+            assert_fixed_error_without_leak(&error, &mock.base_url);
+
+            let inner = mock.inner.lock().unwrap();
+            assert_eq!(
+                inner.requests.len(),
+                1,
+                "MKCOL 失败（{status}）后不得继续 PUT"
+            );
+            assert_eq!(inner.requests[0].method, "MKCOL");
+            assert!(inner.objects.is_empty());
+            assert_eq!(inner.mkcol_created, 0);
+        }
+    }
+
+    /// PUT 409：清父链缓存、重新 MKCOL 后重试一次，覆盖外部删除 collection。
+    #[tokio::test]
+    async fn put_retries_once_after_external_collection_deletion() {
+        let mock = MockDav::spawn().await;
+        let store = store(&mock);
+        let key = "rustboard/2026/10/18/part-00001.csv.gz";
+        store.put(key, b"before").await.unwrap();
+        {
+            // 模拟另一个客户端删除日期 collection（其下对象一并消失）。
+            let mut inner = mock.inner.lock().unwrap();
+            inner.collections.remove("rustboard/2026/10/18");
+            inner.objects.remove(key);
+        }
+
+        store.put(key, b"after").await.unwrap();
+        let inner = mock.inner.lock().unwrap();
+        assert_eq!(inner.objects.get(key).unwrap(), b"after");
+        assert!(inner.collections.contains("rustboard/2026/10/18"));
+        assert_eq!(
+            inner
+                .requests
+                .iter()
+                .filter(|request| request.method == "PUT")
+                .count(),
+            3,
+            "首次成功 + 409 + 重试成功"
+        );
+        assert_eq!(
+            inner
+                .requests
+                .iter()
+                .filter(|request| request.method == "MKCOL")
+                .count(),
+            8,
+            "409 后必须清父链缓存并逐级重建"
+        );
+        assert_mkcol_raw_paths_end_with_slash(&inner.requests);
+    }
+
+    /// PUT 409 只重试一次；重建后仍冲突必须失败关闭，不无限重试。
+    #[tokio::test]
+    async fn put_conflict_retries_only_once_then_fails_closed() {
+        let mock = MockDav::spawn().await;
+        let store = store(&mock);
+        mock.inner.lock().unwrap().fail_put = Some(409);
+        let error = store
+            .put("rustboard/2026/10/18/part-00001.csv.gz", b"x")
+            .await
+            .unwrap_err();
+        assert_fixed_error_without_leak(&error, &mock.base_url);
+
+        let inner = mock.inner.lock().unwrap();
+        assert_eq!(
+            inner
+                .requests
+                .iter()
+                .filter(|request| request.method == "PUT")
+                .count(),
+            2,
+            "首次 PUT 409 后只允许重试一次"
+        );
+        assert_eq!(
+            inner
+                .requests
+                .iter()
+                .filter(|request| request.method == "MKCOL")
+                .count(),
+            8,
+            "重试前必须重新逐级 MKCOL"
+        );
+        assert_eq!(inner.mkcol_created, 4);
+        assert_eq!(inner.mkcol_existing, 4);
+        assert!(inner.objects.is_empty());
+        assert_mkcol_raw_paths_end_with_slash(&inner.requests);
     }
 }
