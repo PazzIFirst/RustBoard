@@ -199,7 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         choices=("auto", "on", "off"),
         help=(
-            "RSS 10%% 增长门禁：auto=仅 duration>=3600 启用（默认）；"
+            "RssAnon 10%% 增长门禁：auto=仅 duration>=3600 启用（默认）；"
             "on/--rss-gate=强制启用；off=短档只记录"
         ),
     )
@@ -372,26 +372,35 @@ def read_proc_stat(pid: int) -> dict | None:
 
 
 def read_proc_status(pid: int) -> dict:
-    values = {"rss_kb": None, "threads": None}
+    values = {
+        "rss_kb": None,
+        "rss_anon_kb": None,
+        "rss_file_kb": None,
+        "rss_shmem_kb": None,
+        "threads": None,
+    }
+    fields = {
+        "VmRSS:": "rss_kb",
+        "RssAnon:": "rss_anon_kb",
+        "RssFile:": "rss_file_kb",
+        "RssShmem:": "rss_shmem_kb",
+        "Threads:": "threads",
+    }
     try:
         text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return values
     for line in text.splitlines():
-        if line.startswith("VmRSS:"):
+        for prefix, key in fields.items():
+            if not line.startswith(prefix):
+                continue
             parts = line.split()
             if len(parts) >= 2:
                 try:
-                    values["rss_kb"] = int(parts[1])
+                    values[key] = int(parts[1])
                 except ValueError:
                     pass
-        elif line.startswith("Threads:"):
-            parts = line.split()
-            if len(parts) >= 2:
-                try:
-                    values["threads"] = int(parts[1])
-                except ValueError:
-                    pass
+            break
     return values
 
 
@@ -991,6 +1000,9 @@ def monitor_loop(ctx: RunContext, pid: int) -> None:
                     "health_ms": round(latency_ms, 3),
                     "health_error": health_error,
                     "rss_kb": status_fields["rss_kb"],
+                    "rss_anon_kb": status_fields["rss_anon_kb"],
+                    "rss_file_kb": status_fields["rss_file_kb"],
+                    "rss_shmem_kb": status_fields["rss_shmem_kb"],
                     "threads": status_fields["threads"],
                     "fds": fds,
                     "cpu_pct": None if cpu_pct is None else round(cpu_pct, 3),
@@ -1039,6 +1051,9 @@ def read_metrics(path: Path) -> dict[str, list]:
             "health_ok",
             "health_ms",
             "rss_kb",
+            "rss_anon_kb",
+            "rss_file_kb",
+            "rss_shmem_kb",
             "threads",
             "fds",
             "cpu_pct",
@@ -1364,11 +1379,12 @@ def scan_hub_log(path: Path) -> dict:
 
 
 def rss_gate_enabled(args: argparse.Namespace) -> bool:
-    """RSS 10% 硬门禁只适用于长稳档。
+    """RssAnon（匿名 RSS）10% 硬门禁只适用于长稳档。
 
     方案 §1.2 只对 ≥24h 长稳要求 RSS 增长 ≤10%；10min 档要求记录资源、0 丢点/
-    重复/未处理错误/panic。默认在 duration>=3600s 时启用，也可用 `--rss-gate
-    on/off` 显式覆盖（bare `--rss-gate` 等价 on）。
+    重复/未处理错误/panic。静态 musl 二进制的 RssFile 代码页按需 fault-in 会
+    推高总 RSS，不是堆泄漏，因此硬门禁只看 RssAnon。默认在 duration>=3600s
+    时启用，也可用 `--rss-gate on/off` 显式覆盖（bare `--rss-gate` 等价 on）。
     """
     if args.rss_gate == "on":
         return True
@@ -1401,6 +1417,12 @@ def resource_summary(ctx: RunContext) -> dict:
     rss_baseline, rss_mode, rss_count, rss_warmup = baseline_window(
         elapsed, columns["rss_kb"], warmup, ctx.args.duration_secs
     )
+    anon_baseline, anon_mode, anon_count, anon_warmup = baseline_window(
+        elapsed, columns["rss_anon_kb"], warmup, ctx.args.duration_secs
+    )
+    file_baseline, file_mode, file_count, file_warmup = baseline_window(
+        elapsed, columns["rss_file_kb"], warmup, ctx.args.duration_secs
+    )
     fd_baseline, fd_mode, fd_count, fd_warmup = baseline_window(
         elapsed, columns["fds"], warmup, ctx.args.duration_secs
     )
@@ -1408,9 +1430,13 @@ def resource_summary(ctx: RunContext) -> dict:
         elapsed, columns["threads"], warmup, ctx.args.duration_secs
     )
     rss_values = [v for v in columns["rss_kb"] if v is not None]
+    anon_values = [v for v in columns["rss_anon_kb"] if v is not None]
+    file_values = [v for v in columns["rss_file_kb"] if v is not None]
     fd_values = [v for v in columns["fds"] if v is not None]
     thread_values = [v for v in columns["threads"] if v is not None]
     rss_end = tail_median(rss_values)
+    anon_end = tail_median(anon_values)
+    file_end = tail_median(file_values)
     fd_end = tail_median(fd_values)
     threads_end = tail_median(thread_values)
     health_ok_values = columns["health_ok"]
@@ -1432,6 +1458,10 @@ def resource_summary(ctx: RunContext) -> dict:
 
     return {
         "metrics_samples": len(elapsed),
+        "rss_metric": "RssAnon",
+        "rss_total_gate_threshold_pct": 25.0,
+        "rss_total_gate_enabled": False,
+        # 总 RSS 仅报告（含代码页 demand paging）；硬门禁在 rss_anon_kb。
         "rss_kb": {
             "start": rss_values[0] if rss_values else None,
             "baseline": rss_baseline,
@@ -1441,9 +1471,32 @@ def resource_summary(ctx: RunContext) -> dict:
             "end": rss_end,
             "max": max(rss_values) if rss_values else None,
             "growth_pct": growth(rss_baseline, rss_end),
+            "report_only": True,
+            "report_threshold_pct": 25.0,
+            "gate_enabled": False,
+        },
+        "rss_anon_kb": {
+            "start": anon_values[0] if anon_values else None,
+            "baseline": anon_baseline,
+            "baseline_mode": anon_mode,
+            "baseline_warmup_secs": anon_warmup,
+            "baseline_samples": anon_count,
+            "end": anon_end,
+            "max": max(anon_values) if anon_values else None,
+            "growth_pct": growth(anon_baseline, anon_end),
             "gate_enabled": rss_gate,
             "gate_threshold_pct": 10.0,
             "gate_mode": ctx.args.rss_gate,
+        },
+        "rss_file_kb": {
+            "start": file_values[0] if file_values else None,
+            "baseline": file_baseline,
+            "baseline_mode": file_mode,
+            "baseline_warmup_secs": file_warmup,
+            "baseline_samples": file_count,
+            "end": file_end,
+            "max": max(file_values) if file_values else None,
+            "growth_pct": growth(file_baseline, file_end),
         },
         "fd": {
             "baseline": fd_baseline,
@@ -1576,23 +1629,25 @@ def build_summary(ctx: RunContext) -> dict:
         failures.append("healthz 样本为 0（监控线程未运行或 metrics 缺失）")
     elif health_resources["failures"] > 0:
         failures.append(f"healthz 失败 {health_resources['failures']} 次")
-    rss_resources = resources["rss_kb"]
-    if rss_resources["gate_enabled"] and (
-        rss_resources["baseline"] is None or rss_resources["end"] is None
+    rss_anon_resources = resources["rss_anon_kb"]
+    if rss_anon_resources["gate_enabled"] and (
+        rss_anon_resources["baseline"] is None
+        or rss_anon_resources["end"] is None
     ):
-        failures.append("RSS 基线或结束值缺失，无法完成长稳门禁")
+        failures.append("RssAnon 基线或结束值缺失，无法完成长稳门禁")
     elif (
-        rss_resources["gate_enabled"]
-        and rss_resources["growth_pct"] is not None
-        and rss_resources["growth_pct"] > rss_resources["gate_threshold_pct"]
+        rss_anon_resources["gate_enabled"]
+        and rss_anon_resources["growth_pct"] is not None
+        and rss_anon_resources["growth_pct"]
+        > rss_anon_resources["gate_threshold_pct"]
     ):
         failures.append(
-            f"RSS 增长 {rss_resources['growth_pct']}% 超过 "
-            f"{rss_resources['gate_threshold_pct']}%（长稳门禁）"
+            f"RssAnon 增长 {rss_anon_resources['growth_pct']}% 超过 "
+            f"{rss_anon_resources['gate_threshold_pct']}%（长稳门禁）"
         )
-    elif not rss_resources["gate_enabled"]:
+    elif not rss_anon_resources["gate_enabled"]:
         ctx.notes.append(
-            "RSS 10% 硬门禁未启用（duration<3600s 或 --rss-gate off），"
+            "RssAnon 10% 硬门禁未启用（duration<3600s 或 --rss-gate off），"
             "本次只记录高水位，不能据此宣称长稳通过"
         )
     fd_resources = resources["fd"]
@@ -1715,6 +1770,7 @@ def build_summary(ctx: RunContext) -> dict:
             "max": round(max(ack_values), 3) if ack_values else None,
             "mean": round(sum(ack_values) / len(ack_values), 3) if ack_values else None,
         },
+        "rss_metric": "RssAnon",
         "throughput": {
             "batches_per_sec": round(acked / duration, 3) if duration > 0 else None,
             "samples_per_sec": round(acked * len(AGENT_METRICS) / duration, 3)
@@ -1758,6 +1814,8 @@ def print_summary(summary: dict, summary_path: Path) -> None:
     ack = summary.get("ack_ms", {})
     resources = summary.get("resources", {})
     rss = resources.get("rss_kb", {})
+    rss_anon = resources.get("rss_anon_kb", {})
+    rss_file = resources.get("rss_file_kb", {})
     fd = resources.get("fd", {})
     threads = resources.get("threads", {})
     db = summary.get("db") or {}
@@ -1795,11 +1853,25 @@ def print_summary(summary: dict, summary_path: Path) -> None:
         )
     )
     print(
-        "rss_kb start={start} baseline={baseline} end={end} growth={growth}%".format(
-            start=rss.get("start"),
-            baseline=rss.get("baseline"),
-            end=rss.get("end"),
-            growth=rss.get("growth_pct"),
+        "rss_kb(total) baseline={b} end={e} growth={g}% "
+        "(report-only; threshold={t}%, gate={gate})".format(
+            b=rss.get("baseline"),
+            e=rss.get("end"),
+            g=rss.get("growth_pct"),
+            t=rss.get("report_threshold_pct"),
+            gate=rss.get("gate_enabled"),
+        )
+    )
+    print(
+        "rss_anon_kb baseline={b} end={e} growth={g}% gate={gate} | "
+        "rss_file_kb baseline={fb} end={fe} growth={fg}%".format(
+            b=rss_anon.get("baseline"),
+            e=rss_anon.get("end"),
+            g=rss_anon.get("growth_pct"),
+            gate=rss_anon.get("gate_enabled"),
+            fb=rss_file.get("baseline"),
+            fe=rss_file.get("end"),
+            fg=rss_file.get("growth_pct"),
         )
     )
     print(
@@ -2118,7 +2190,7 @@ def self_check() -> int:
     issues = []
     summary = build_summary(ctx)
     failures = summary["failures"]
-    for needle in ("metrics 样本不足", "healthz 样本为 0", "RSS 基线或结束值缺失"):
+    for needle in ("metrics 样本不足", "healthz 样本为 0", "RssAnon 基线或结束值缺失"):
         if not any(needle in failure for failure in failures):
             issues.append(f"空 metrics 未触发: {needle}")
 

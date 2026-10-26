@@ -12,7 +12,7 @@
 | 升级/卸载/恢复 | `v100-install.sh` 中可在本环境执行的部分 + 手工 `--no-systemd`；systemd 不可用时明确 SKIP，不伪造 | 旧配置/数据保留；uninstall 默认保留 config/data，`--purge` 删除；恢复后点数一致 |
 | Docker/镜像 | S4 rc.2 预发布证据 104/104；**版本升 1.0.0 后必须重建 dist/镜像并用 `EXPECTED_VERSION=1.0.0` 重跑 amd64**；arm64 PG overlay 未覆盖时明确记录范围，不能把 arm64 SKIP 写成通过 | v1.0.0 自身证据 |
 | 最终评审/渗透 | 独立只读评审 + 本地渗透清单（认证/传输/注入/资源/泄露/依赖/配置） | 无未修复高危；严重问题修复后换人复审 |
-| 门禁 | fmt/clippy/test/audit、actionlint、shellcheck、CI | 全绿 |
+| 门禁 | fmt/clippy/test（含 PG）/audit、actionlint、shellcheck、同一 commit CI + release `postgres` job | 全绿；shellcheck 范围为本阶段新增脚本（`v100-load.sh`/`v100-pg-tls.sh`/`v100-docker-pg.sh`），既有 `control.sh`/`v100-install.sh` 的 SC2034/SC2318 单列，不作为本阶段新增回归 |
 
 **环境限制**：本机 systemd 未运行，`v100-install.sh` 的 unit 用例无法完整执行；
 必须记录 SKIP 原因，不能把“未执行”写成通过。arm64 依赖 qemu/binfmt 与当前

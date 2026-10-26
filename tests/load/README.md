@@ -134,7 +134,8 @@ labels 为空，`ts` 每批唯一）；默认 5s，60s 档每 agent 12 批。
 | 重复 | `ingest_batches` 的 `(agent_id, epoch, seq)` 重复组数；`samples` 的 `(agent_id, metric, ts)` 重复组数，均必须为 0 |
 | ACK 延迟 | 从 `send_binary` 返回到收到匹配 ACK 的毫秒数；输出 p50/p95/p99/min/max/mean |
 | 吞吐 | `acked / duration`（batch/s）与 ×3（sample/s），按名义运行时长 |
-| RSS | 基线：`warmup` 后 30s 窗口的中位数；结束：最后 10 个样本中位数。增长 >10% **仅对 ≥1h 长稳档**作为失败门禁（默认 `duration_secs >= 3600` 启用，可用 Python `--rss-gate on/off` 覆盖）；10min/短档只记录高水位。60s 短档没有 warmup 后样本时，基线 warmup 夹到 `duration/2`，并在 `resources.rss_kb.baseline_mode` 标注 |
+| RssAnon（匿名 RSS） | 基线：`warmup` 后 30s 窗口的中位数；结束：最后 10 个样本中位数。增长 >10% **仅对 ≥1h 长稳档**作为失败门禁（默认 `duration_secs >= 3600` 启用，可用 Python `--rss-gate on/off` 覆盖）；10min/短档只记录高水位。60s 短档没有 warmup 后样本时，基线 warmup 夹到 `duration/2`，并在 `resources.rss_anon_kb.baseline_mode` 标注 |
+| RSS（总，含 RssFile） | 继续记录 `baseline/end/max/growth_pct`；默认 `report_only=true`，`rss_total_gate_threshold_pct=25` 仅作报告参考，**不是硬门禁**。RssFile 是静态二进制代码页 demand paging，不属于堆/匿名内存泄漏 |
 | FD / 线程 | 同样基线/结束口径；结束值相对基线 +32 的硬门禁**仅对 ≥1h 长稳档**生效（默认 `duration_secs >= 3600`，可用 Python `--leak-gate on/off` 覆盖）。短档记录 `baseline/end/delta/max`，不因 tokio blocking pool 高水位判失败 |
 | health | 每秒 `GET /healthz`，状态必须 200 且 body 去空白后等于 `ok`；失败次数必须 0，样本数必须 >0 |
 | hub 重启 | `/proc/<pid>/stat` 的 starttime 运行前后必须一致，PID 必须存活 |
@@ -148,7 +149,12 @@ labels 为空，`ts` 每批唯一）；默认 5s，60s 档每 agent 12 批。
 `retry_gate`、`ack_ms`、`throughput`、`resources`、`db`、`hub`、`admin_api`、
 `hub_log`、`git_head`、`hub_bin_sha256`、`sqlite_db_sha256`、`failures`、`passed`。
 `metrics.jsonl` 每秒一行，含 `health_status/health_body_ok/health_ok/health_ms`、
-`rss_kb`、`threads`、`fds`、`cpu_pct`、`db_main_bytes/db_wal_bytes` 与累计计数。
+`rss_kb`、`rss_anon_kb`、`rss_file_kb`、`rss_shmem_kb`、`threads`、`fds`、
+`cpu_pct`、`db_main_bytes/db_wal_bytes` 与累计计数。
+`summary.resources.rss_anon_kb` 记录匿名 RSS 的 `baseline/end/max/growth_pct` 与
+`gate_enabled/gate_threshold_pct=10/gate_mode`；`resources.rss_file_kb` 记录文件页
+RSS；`resources.rss_kb` 只报告总 RSS。`summary.rss_metric="RssAnon"` 标注硬门禁
+指标。
 `db.snapshot_mode` 记录 SQLite 只读快照口径，`db.snapshot_consistent` 记录查询前后
 `ingest_batches` 计数是否一致。`resources.fd.gate_enabled` /
 `resources.threads.gate_enabled` / `resources.resource_leak_gate` 记录 FD/线程
@@ -165,26 +171,32 @@ labels 为空，`ts` 每批唯一）；默认 5s，60s 档每 agent 12 批。
   200 且 body 为 `ok`，失败 0 次；hub PID/starttime 未变化；
 - FD / 线程增长 ≤32，且 baseline/end 必须非空（读不到 /proc 指标即失败）——
   该 +32 门禁**仅 ≥1h 长稳档**启用；10min/短档只记录，不据此判失败；
-- RSS 增长 ≤10%（**仅 ≥1h 长稳档**；门禁启用时 baseline/end 必须非空；10min/短档
-  只记录，不据此判失败）；
+- **RssAnon** 增长 ≤10%（**仅 ≥1h 长稳档**；门禁启用时 baseline/end 必须非空；
+  10min/短档只记录，不据此判失败）；总 RSS（含 RssFile）只报告，不参与硬门禁；
 - 管理 API 检查通过；`hub.log` 读取成功且无 `panicked`/`ERROR`；
 - `git_head`（40 hex）、`hub_bin_sha256`、`sqlite_db_sha256` 均存在，证据可绑定
   提交、构建产物与数据库；编排脚本的泄露扫描通过；
 - 所有 agent 线程在 join 时限内退出。
 
-### RSS 门禁适用范围
+### RssAnon（匿名 RSS）门禁适用范围
 
 方案 §1.2 只对 **≥24h 长稳**要求 RSS 增长 ≤10%；10min 档（100 / 200 / 500 /
 1000 agent）的要求是 0 丢点/重复/未处理错误/panic、healthz 可用，并记录资源
-曲线。因此工具按以下口径执行：
+曲线。静态 musl 二进制的代码页会按需 fault-in，总 RSS 的 `RssFile` 可能持续
+增长，这不是堆/栈泄漏；因此硬门禁只看 `/proc/<pid>/status` 的 `RssAnon`
+（匿名 RSS），总 RSS 只报告：
 
-- 默认只有 `duration_secs >= 3600` 才把 `growth_pct > 10` 加入 `failures`；
-- Python 可用 `--rss-gate on` 显式启用、`--rss-gate off` 显式关闭（bare
-  `--rss-gate` 等价于 `on`）；
-- `summary.resources.rss_kb` 始终记录 `baseline`、`end`、`max`、`growth_pct`，
-  并额外记录 `gate_enabled`、`gate_threshold_pct=10`、`gate_mode`；
+- 每秒采集 `VmRSS`（总）、`RssAnon`、`RssFile`、`RssShmem`；
+- 默认只有 `duration_secs >= 3600` 才把 `rss_anon_kb.growth_pct > 10` 加入
+  `failures`；Python 可用 `--rss-gate on` 显式启用、`--rss-gate off` 关闭
+  （bare `--rss-gate` 等价于 `on`）；
+- `summary.rss_metric="RssAnon"`；`resources.rss_anon_kb` 记录
+  `baseline/end/max/growth_pct` 与 `gate_enabled/gate_threshold_pct=10/gate_mode`；
+- `resources.rss_kb` 继续记录总 RSS 的 `baseline/end/max/growth_pct`，并标注
+  `report_only=true`、`report_threshold_pct=25`；`rss_total_gate_enabled=false`，
+  25% 仅用于观察，默认不判失败；
 - 门禁关闭时 `summary.notes` 会注明“只记录高水位”，短档结果**不能**用来宣称
-  24h 长稳通过；24h 若 RSS 仍 >10%，必须按缺陷处理。
+  24h 长稳通过；24h 若 **RssAnon** 仍 >10%，必须按缺陷处理。
 
 ### FD / 线程泄漏门禁适用范围
 
