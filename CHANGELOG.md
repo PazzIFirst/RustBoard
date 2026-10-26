@@ -41,6 +41,9 @@
 
 - hub 的 PostgreSQL 读写路径统一走 `spawn_blocking`；PG 连接池在 Tokio runtime
   外创建，Drop 时移交线程，避免同步驱动阻塞 runtime
+- hub 主 runtime 的 blocking 线程池上限设为 64，避免 200/1000 agent 压测时
+  默认 512 线程带来的栈/allocator 高水位；突发批次在队列等待，SQLite 单写与
+  PG 默认 pool 8 并行度不受影响
 - PostgreSQL 为显式 opt-in：默认 SQLite、协议 v2、证书格式与既有配置默认行为
   不变；不做自动双写，默认 compose 仍不包含 PostgreSQL
 - 离线安装与 PostgreSQL 硬互斥：`--offline` + `--db postgres://...` 在写盘前失败；
@@ -84,9 +87,9 @@
   200 agent 证据，hub 级压力结论仅覆盖 SQLite。
 - Docker PG overlay e2e 只覆盖 `linux/amd64`（104/104，1 项 arm64 SKIP）；
   arm64 的 PG overlay 未在本地验证，发布说明不得写成“arm64 已通过”。
-- 200 agent 24h 长稳使用 `target/debug` 构建，作为发布前稳定性预检；`v1.0.0`
-  静态包/镜像发布前仍需短档 smoke 并记录版本/hash，不能把 debug 24h 直接当作
-  发布产物 24h。
+- 200 agent 24h 长稳使用**静态 musl 发布产物**、1h RssAnon 基线运行；尚需在
+  1.0.0 最终二进制上复核短档并记录版本/hash。1000 agent 修复后仅有 300s 证据，
+  发布前需补 10min；PG hub 级压测未实现，不能把 storage 级 load 当作 hub 级。
 
 ## [1.0.0-rc.2] - 2026-10-26
 
