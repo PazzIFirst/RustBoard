@@ -368,6 +368,26 @@ enum ArchiveAction {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// v8 归档 ledger 重建状态与手动续跑。
+    Ledger {
+        #[command(subcommand)]
+        action: ArchiveLedgerAction,
+    },
+}
+
+/// `archive ledger` 子命令（R1a-2）。
+#[derive(Subcommand)]
+enum ArchiveLedgerAction {
+    /// 输出 archive_ledger_pending / 旧水位 / 对象数（JSON）。
+    Status {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// 标记 ledger 待重建并立即执行一轮归档；完整成功后清除 pending。
+    Rebuild {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
 }
 
 /// `tls` 子命令（M5 Phase C C4）。
@@ -879,6 +899,20 @@ fn archive_command(action: ArchiveAction) -> Result<()> {
         ArchiveAction::Test { config } => println!("{}", archive_test_json(config)?),
         ArchiveAction::Status { config } => println!("{}", archive_status_json(config)?),
         ArchiveAction::Run { config } => println!("{}", archive_run_json(config)?),
+        ArchiveAction::Ledger { action } => archive_ledger_command(action)?,
+    }
+    Ok(())
+}
+
+/// `archive ledger` 子命令入口；只负责打印业务函数返回的 JSON。
+fn archive_ledger_command(action: ArchiveLedgerAction) -> Result<()> {
+    match action {
+        ArchiveLedgerAction::Status { config } => {
+            println!("{}", archive_ledger_status_json(config)?);
+        }
+        ArchiveLedgerAction::Rebuild { config } => {
+            println!("{}", archive_ledger_rebuild_json(config)?);
+        }
     }
     Ok(())
 }
@@ -941,6 +975,45 @@ fn archive_run_json(config: Option<PathBuf>) -> Result<String> {
         ))
         .context("归档任务失败（archive run）")?;
     Ok(serde_json::to_string_pretty(&report)?)
+}
+
+/// `archive ledger status`：只读 pending 标记 / 旧水位 / 对象数。
+///
+/// `archive.enabled = false` 时也可执行，用于查看迁移留下的待重建标记。
+fn archive_ledger_status_json(config: Option<PathBuf>) -> Result<String> {
+    let (storage, _cfg) = open_maintenance_storage(config)?;
+    let status = archive::ledger_status(&storage).context("读取归档 ledger 状态失败")?;
+    Ok(serde_json::to_string_pretty(&status)?)
+}
+
+/// `archive ledger rebuild`：先置 pending=1，再立即跑一轮归档。
+///
+/// 失败 / 中断时 pending 保持为 1（R1b 接入后 retention 会继续阻塞）；
+/// 完整成功由 worker 清除 pending。输出只含固定报告与 ledger 状态，不含后端
+/// URL / 凭据 / 对象内容。
+fn archive_ledger_rebuild_json(config: Option<PathBuf>) -> Result<String> {
+    let (storage, cfg) = open_maintenance_storage(config)?;
+    if !cfg.archive.enabled {
+        bail!("归档未启用（archive.enabled = false）");
+    }
+    let store = archive::build_store(&cfg.archive)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("初始化归档 ledger 重建运行时失败")?;
+    let report = runtime
+        .block_on(archive::rebuild_ledger(
+            &storage,
+            &cfg,
+            store.as_ref(),
+            now_ms(),
+        ))
+        .context("归档 ledger 重建失败（archive ledger rebuild）")?;
+    let ledger = archive::ledger_status(&storage).context("读取归档 ledger 状态失败")?;
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "report": report,
+        "ledger": ledger,
+    }))?)
 }
 
 // init 的参数与 `init` 子命令的 CLI 字段一一对应，拆结构体只会多一层搬运。
@@ -11257,6 +11330,37 @@ mod tests {
                 action: ArchiveAction::Run { .. }
             }
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["rustboard-hub", "archive", "ledger", "status"])
+                .unwrap()
+                .cmd,
+            Cmd::Archive {
+                action: ArchiveAction::Ledger {
+                    action: ArchiveLedgerAction::Status { .. }
+                }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "rustboard-hub",
+                "archive",
+                "ledger",
+                "rebuild",
+                "--config",
+                "hub.toml",
+            ])
+            .unwrap()
+            .cmd,
+            Cmd::Archive {
+                action: ArchiveAction::Ledger {
+                    action: ArchiveLedgerAction::Rebuild { .. }
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["rustboard-hub", "archive", "ledger"]).is_err(),
+            "ledger 必须指定 status / rebuild"
+        );
         // maintenance 只接受 downsample / retention，archive 走独立子命令。
         assert!(
             Cli::try_parse_from(["rustboard-hub", "maintenance", "run", "--task", "archive"])

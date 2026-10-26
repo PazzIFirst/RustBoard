@@ -34,7 +34,7 @@ use postgres::Row;
 use rustboard_common::util::now_ms;
 
 use super::PostgresStorage;
-use crate::archive::{ArchiveObject, ArchiveStatus, ArchiveStoreError};
+use crate::archive::{ArchiveObject, ArchiveStatus, ArchiveStoreError, LEDGER_VERSION_V8};
 use crate::downsample::STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID;
 use crate::storage::sqlite::{
     validate_archive_claim, validate_archive_sha256, ArchiveRawRow, MAX_ARCHIVE_TS_MS,
@@ -823,6 +823,36 @@ impl PostgresStorage {
         .context("list_archive_objects")
     }
 
+    /// 按 id 升序分页列出待重试的 v8 归档对象（`pending` / `failed`）。
+    ///
+    /// 只包含 `ledger_version = LEDGER_VERSION_V8` 的对象：v7 旧对象没有 claim
+    /// 行集，不能按 `archive_rows_for_object` 重建。`after_id` 为上一页最后
+    /// 一条的 id（排他）；`limit == 0` 返回空列表。
+    pub fn list_retryable_archive_objects(
+        &self,
+        limit: usize,
+        after_id: Option<i64>,
+    ) -> Result<Vec<ArchiveObject>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let sql = format!(
+            "SELECT {ARCHIVE_OBJECT_COLUMNS} FROM archive_objects \
+             WHERE ledger_version = $1 AND status IN ('pending', 'failed') \
+               AND ($2::BIGINT IS NULL OR id > $2) ORDER BY id ASC LIMIT $3"
+        );
+        self.with_client(|client| {
+            let rows = client
+                .query(&sql, &[&LEDGER_VERSION_V8, &after_id, &limit])
+                .context("执行 list_retryable_archive_objects SQL 失败")?;
+            rows.iter()
+                .map(row_to_archive_object)
+                .collect::<Result<Vec<_>>>()
+        })
+        .context("list_retryable_archive_objects")
+    }
+
     /// 更新归档对象状态，并校验合法迁移。
     ///
     /// 允许 `pending -> uploaded -> local_deleted` 与
@@ -872,6 +902,42 @@ impl PostgresStorage {
             Ok(())
         })
         .context("update_archive_object_status")
+    }
+
+    /// 记录一次上传失败：状态置 `failed`、覆盖 `error`，`attempts` 加一。
+    ///
+    /// 只允许 `pending` / `failed` 迁移到 `failed`；已 `uploaded` /
+    /// `local_deleted` 的状态回退返回 [`ArchiveStoreError::InvalidTransition`]。
+    /// id 不存在返回 [`ArchiveStoreError::NotFound`]。
+    pub fn record_archive_object_failure(&self, id: i64, error: &str) -> Result<()> {
+        self.with_client(|client| {
+            let mut tx = client.transaction().context("开启归档失败记录事务失败")?;
+            let current: Option<String> = tx
+                .query_opt(
+                    "SELECT status FROM archive_objects WHERE id = $1 FOR UPDATE",
+                    &[&id],
+                )
+                .context("读取归档对象当前状态失败")?
+                .map(|row| row.get(0));
+            let Some(current) = current else {
+                return Err(ArchiveStoreError::NotFound.into());
+            };
+            let current = ArchiveStatus::parse(&current)
+                .ok_or_else(|| anyhow!("archive_objects.status 字段值非法"))?;
+            if !current.can_transition_to(ArchiveStatus::Failed) {
+                return Err(ArchiveStoreError::InvalidTransition.into());
+            }
+            tx.execute(
+                "UPDATE archive_objects
+                 SET status = 'failed', error = $2, attempts = attempts + 1
+                 WHERE id = $1",
+                &[&id, &error],
+            )
+            .context("执行归档失败记录 SQL 失败")?;
+            tx.commit().context("提交归档失败记录事务失败")?;
+            Ok(())
+        })
+        .context("record_archive_object_failure")
     }
 
     /// 读取归档水位；键不存在返回 `None`。
@@ -1091,16 +1157,18 @@ impl PostgresStorage {
         .context("count_invalid_archive_raw_rows")
     }
 
-    /// 按 `archive_object_id` 读回 claim 行集，按 `samples.id` 升序。
+    /// 按 `archive_object_id` 读回 claim 行集，按 `ts, samples.id` 升序。
     ///
-    /// 上传失败 / 崩溃后的重试必须用同一行集重建 CSV 与 manifest；
+    /// 上传失败 / 崩溃后的重试必须用同一行集重建 CSV 与 manifest，不能重扫 raw；
+    /// 排序必须与 claim 扫描（`list_unclaimed_archive_rows` 的 `ts, id`）一致，
+    /// 否则重试会输出不同的行顺序，导致 SHA-256 与已记录对象不一致。
     /// 对象不存在或行已删除时返回空列表。
     pub fn archive_rows_for_object(&self, object_id: i64) -> Result<Vec<ArchiveRawRow>> {
         self.with_client(|client| {
             let rows = client
                 .query(
                     "SELECT id, agent_id, metric, labels, ts, value FROM samples \
-                     WHERE archive_object_id = $1 ORDER BY id ASC",
+                     WHERE archive_object_id = $1 ORDER BY ts ASC, id ASC",
                     &[&object_id],
                 )
                 .context("执行 archive_rows_for_object SQL 失败")?;
