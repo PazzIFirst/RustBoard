@@ -430,8 +430,7 @@ Phase E 仍保留 hub 级真实压测。
 - [ ] hub 端真实 200 agent 端到端（storage 级 200 已通过，不等同）；
       100/500/1000 agent 三档压力与 ≥24h 长稳（RSS 增长 >10% 视为不通过）
 - [ ] 真实 TLS PostgreSQL 的 `verify-full` 安装→启动→读写 smoke
-- [ ] Phase D 收口：独立评审/渗透、`fmt`/`clippy -D warnings`/`audit`、
-      同 commit CI `postgres` job 全绿，然后打 checkpoint tag `checkpoint/2026-10-26-m5-phase-d-postgres-backup`
+- [ ] PostgreSQL Docker 镜像内 e2e：真实容器启动 hub、PG、backup/restore
 - [ ] `v1.0.0`：CHANGELOG 归档、tag、GitHub Release、镜像与 `latest`；
       **不移动 `v1.0.0-rc.2`**，未完成上述门禁前不发布
 
@@ -662,9 +661,9 @@ Phase E 仍保留 hub 级真实压测。
 
 Phase D 已完成 PostgreSQL 显式 opt-in、`migrate`/`backup`/`restore` CLI 与
 L-01/L-03 收口，全 workspace 测试 **1380 passed / 0 failed / 5 ignored**；
-默认 SQLite 不变，`v1.0.0-rc.2` 不移动，Phase D checkpoint tag 已打。下一步：
-hub 端真实 200 agent、100/500/1000 与 24h 长稳、真实 TLS PG smoke、独立评审/
-渗透与最终 fmt/clippy/audit，门禁全绿后归档 CHANGELOG、发布 `v1.0.0`。计划见
+默认 SQLite 不变，`v1.0.0-rc.2` 不移动，Phase D checkpoint tag 已打。下一步进入
+Phase E：hub 端真实 200 agent、100/500/1000 与 24h 长稳、真实 TLS PG smoke、
+PostgreSQL 镜像内 e2e；门禁全绿后归档 CHANGELOG、发布 `v1.0.0`。计划见
 [M5 计划](plans/2026-10-24-m5-install-delivery.md)、
 [Phase A 设计](plans/2026-10-24-m5-phase-a-installer.md) 与
 [Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)、
