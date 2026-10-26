@@ -83,6 +83,9 @@ C_LOG="$TMP_DIR/agent-c.log"
 D_CFG="$TMP_DIR/agent-d.toml"
 D_DATA="$TMP_DIR/agent-d"
 D_LOG="$TMP_DIR/agent-d.log"
+E_CFG="$TMP_DIR/agent-e.toml"
+E_DATA="$TMP_DIR/agent-e"
+E_LOG="$TMP_DIR/agent-e.log"
 PANEL_CFG="$TMP_DIR/panel.toml"
 PANEL_LOG="$TMP_DIR/panel.log"
 PANEL_JAR="$TMP_DIR/panel.cookies"
@@ -93,6 +96,10 @@ DOCKER_LOG="$LOG_DIR/docker.argv"
 JOURNAL_LOG="$LOG_DIR/journalctl.argv"
 NGINX_LOG="$LOG_DIR/nginx.log"
 SYMLINK_LOG="$LOG_DIR/evil-link"
+# KI-22 硬链接夹具：victim 与白名单 target 必须位于同一目录/文件系统。
+HARDLINK_SENTINEL="KI22-E2E-VICTIM-SENTINEL"
+HARDLINK_VICTIM_LOG="$LOG_DIR/ki22-victim.log"
+HARDLINK_LOG="$LOG_DIR/ki22-hardlink.log"
 
 cleanup() {
   local code=$?
@@ -107,7 +114,7 @@ cleanup() {
 
   if (( code != 0 || FAILS > 0 )); then
     echo "===== control e2e 失败现场 =====" >&2
-    for log in "$HUB_LOG" "$A_LOG" "$B_LOG" "$C_LOG" "$D_LOG" "$PANEL_LOG" \
+    for log in "$HUB_LOG" "$A_LOG" "$B_LOG" "$C_LOG" "$D_LOG" "$E_LOG" "$PANEL_LOG" \
                "$TMP_DIR/init.log" "$TMP_DIR/panel-init.log" "$TMP_DIR/curl.err"; do
       if [[ -s "$log" ]]; then
         echo "---- $(basename "$log") (tail -n 80) ----" >&2
@@ -858,8 +865,74 @@ else
   fail "5.17 启动日志未说明符号链接"
 fi
 
+# 启动期硬链接拒绝（KI-22）：victim 与白名单 target 是同一 inode 的两个硬链接。
+# openat2 不拦截硬链接，agent 必须在读取前 fstat 拒绝（nlink != 1），fail-closed。
+printf 'victim-prefix\n%s\nvictim-suffix\n' "$HARDLINK_SENTINEL" > "$HARDLINK_VICTIM_LOG"
+if ln -- "$HARDLINK_VICTIM_LOG" "$HARDLINK_LOG" 2>"$TMP_DIR/ln.err"; then
+  HARDLINK_NLINK=$(stat -c '%h' "$HARDLINK_LOG" 2>/dev/null || true)
+else
+  HARDLINK_NLINK=""
+fi
+
+E_TOKEN=$(add_agent_token "control-e")
+write_base_agent_config "$E_CFG" "control-e" "$E_TOKEN" "$E_DATA"
+cat > "$TMP_DIR/control-e.toml" <<EOF
+[control]
+enabled = true
+systemd = false
+docker = false
+process = false
+logs = true
+command_timeout_secs = 10
+max_log_lines = 200
+journalctl_path = "${FAKE_DIR}/journalctl"
+
+[[control.log_sources]]
+id = "hardlink-escape"
+kind = "file"
+target = "${HARDLINK_LOG}"
+name = "Hardlink"
+EOF
+set_control_table "$E_CFG" "$TMP_DIR/control-e.toml"
+
+if [[ "$HARDLINK_NLINK" == "2" ]]; then
+  set +e
+  timeout 15 "$AGENT_BIN" run --config "$E_CFG" > "$E_LOG" 2>&1
+  E_RC=$?
+  set -e
+  # 启动校验必须先于 enrollment：失败时不写 agent_id，hub 上也不能出现该 agent。
+  api GET "/api/v1/agents"
+  E_LIST_STATUS=$STATUS
+  E_REGISTERED=$(json_get 'any(a.get("name")=="control-e" for a in d)')
+  if [[ -s "$E_DATA/agent_id" ]]; then E_STATE="存在"; else E_STATE="缺失"; fi
+  if (( E_RC != 0 && E_RC != 124 )) && [[ "$E_LIST_STATUS" == "200" ]] \
+    && [[ "$E_REGISTERED" == "False" ]] && [[ "$E_STATE" == "缺失" ]]; then
+    pass "5.18 硬链接日志源启动失败且未进入在线状态（nlink=${HARDLINK_NLINK}，rc=${E_RC}）"
+  else
+    fail "5.18 硬链接日志源未 fail-closed（nlink=${HARDLINK_NLINK}，rc=${E_RC}；rc=124 表示 15s 内未退出；agents 查询 HTTP ${E_LIST_STATUS:-?}；hub 注册=[${E_REGISTERED:-未知}]；agent_id 文件=${E_STATE}）"
+  fi
+
+  E_HAS_HARDLINK=0
+  if grep -Fq -- "硬链接" "$E_LOG" 2>/dev/null; then
+    E_HAS_HARDLINK=1
+  fi
+  E_SENTINEL_LEAK=0
+  for log in "$E_LOG" "$HUB_LOG"; do
+    if grep -Fq -- "$HARDLINK_SENTINEL" "$log" 2>/dev/null; then
+      E_SENTINEL_LEAK=1
+    fi
+  done
+  if (( E_HAS_HARDLINK == 1 && E_SENTINEL_LEAK == 0 )); then
+    pass "5.19 硬链接错误可读且未泄露 victim sentinel"
+  else
+    fail "5.19 硬链接错误不可读或泄露 sentinel（hardlink_msg=${E_HAS_HARDLINK}，sentinel_leak=${E_SENTINEL_LEAK}；见 agent-e.log）"
+  fi
+else
+  fail "5.18 前置环境不支持硬链接：stat -c %h [${HARDLINK_LOG}] = [${HARDLINK_NLINK:-?}]（期望 2；ln/stat 失败或文件系统不支持硬链接，见 $TMP_DIR/ln.err）"
+fi
+
 # v0.3.2 #19 契约：journalctl 必须带 --reverse，fake 也据此按新→旧输出。
-check_contains "5.18 journalctl 使用 --reverse" "$JOURNAL_ARGS" "--reverse"
+check_contains "5.20 journalctl 使用 --reverse" "$JOURNAL_ARGS" "--reverse"
 
 # ---------------------------------------------------------------------------
 # 6. 审计

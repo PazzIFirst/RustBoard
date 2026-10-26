@@ -10,6 +10,9 @@
 //!   （兼容独立 `/var` 分区、bind mount 与 `/tmp`），跨挂载本身不构成路径逃逸；
 //! - `O_NONBLOCK` 打开后再 `fstat`，只接受普通文件；FIFO / 设备 / 目录一律拒绝，
 //!   避免日志文件被替换成 FIFO 后永久阻塞控制线程；
+//! - 打开后 `fstat` 要求 `nlink == 1`，拒绝硬链接逃逸：`openat2` 不拦截硬链接，
+//!   日志文件存在多个硬链接时一律拒绝读取；检查在读取前，失败不返回 `File`、
+//!   不读取任何内容；
 //! - 内核不支持 `openat2`（ENOSYS）时直接失败并返回错误，**不降级**到 `fs::read`；
 //! - 文件不存在允许启动（logrotate 场景），但父目录不存在 / 是符号链接
 //!   会在启动时报清晰错误；每次 tail 都重新打开，不缓存 fd；
@@ -20,6 +23,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use anyhow::{bail, Context};
@@ -84,6 +88,10 @@ fn validate_file_source(target: &str) -> anyhow::Result<()> {
                 }
                 Some(libc::ENOTDIR) => {
                     format!("日志路径中的父目录不是目录: {}", path.display())
+                }
+                // 普通文件 / nlink 校验与路径本身不合法（fstat 后的安全拒绝）。
+                _ if err.kind() == io::ErrorKind::InvalidInput => {
+                    format!("日志文件校验失败: {}", path.display())
                 }
                 _ => format!("打开日志文件失败（openat2）: {}", path.display()),
             };
@@ -168,8 +176,12 @@ fn tail_file(
     let path = Path::new(target);
     // 每次 tail 都重新解析完整路径并打开，不缓存父目录 fd 或文件 fd：日志轮转/替换后
     // 立即读取新文件，同时父目录被替换成符号链接会被 openat2 拒绝。
+    // 错误只带配置中的来源 id 与路径（不是文件内容），便于定位是哪条白名单来源失败；
+    // 保留 `openat2` 字样以维持既有诊断文案的兼容性。
     let mut file = open_log_path_absolute(path).map_err(|err| {
-        ControlError::control_failed(format!("打开日志文件失败（openat2）: {err}"))
+        ControlError::control_failed(format!(
+            "打开日志文件失败（openat2，来源 {source_id}，路径 {target}）: {err}"
+        ))
     })?;
     let size = file
         .metadata()
@@ -393,6 +405,7 @@ fn cap_output(lines: Vec<String>) -> (Vec<String>, bool) {
 /// 父目录与文件名在同一次 syscall 内解析，避免“先打开父目录、再打开文件”之间父目录
 /// 被替换成符号链接的 TOCTOU 窗口。路径中任一分量是符号链接、magic link，或借 `..`
 /// 逃逸根目录都会被拒绝；跨挂载点不受限制（独立 `/var` 分区等部署仍可用）。
+/// 打开后的 `fstat` 要求是普通文件且 `nlink == 1`，拒绝硬链接逃逸。
 /// 内核不支持 `openat2` 时直接失败，不降级。
 fn open_log_path_absolute(path: &Path) -> io::Result<File> {
     let file = open_absolute_at_root(
@@ -408,6 +421,16 @@ fn open_log_path_absolute(path: &Path) -> io::Result<File> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "日志文件不是普通文件（FIFO / 设备 / 目录）",
+        ));
+    }
+    // `openat2` 只防符号链接 / magic link / `..` 逃逸，不拦截硬链接：对日志目录有写权限
+    // 的攻击者可把白名单路径换成指向敏感文件的硬链接。要求 nlink == 1，多硬链接一律
+    // 拒绝；检查在任何 read/seek 之前，失败时 File 被丢弃，不读取目标内容。
+    let nlink = metadata.nlink();
+    if nlink != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("日志文件硬链接数不为 1（nlink={nlink}），拒绝读取（可能是硬链接逃逸）"),
         ));
     }
     Ok(file)
@@ -502,6 +525,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
+
+    // 硬链接逃逸回归用例见 logs/tests/logs_hardlink_tests.rs。
+    #[path = "logs_hardlink_tests.rs"]
+    mod hardlink;
 
     fn temp_dir(tag: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -1003,8 +1030,6 @@ mod tests {
     /// 仍然完整关闭父路径 TOCTOU / 符号链接逃逸；跨挂载本身不构成路径逃逸。
     #[test]
     fn cross_mount_log_path_is_readable() {
-        use std::os::unix::fs::MetadataExt;
-
         let root_dev = std::fs::metadata("/").unwrap().dev();
         let content = b"cross-mount-line\n";
         let mut checked = false;
