@@ -187,6 +187,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hello-timeout", type=float, default=15.0, help="Hello→Welcome 超时")
     parser.add_argument("--enroll-timeout", type=float, default=30.0, help="Enrollment 超时")
     parser.add_argument("--health-timeout", type=float, default=3.0, help="healthz 请求超时")
+    parser.add_argument(
+        "--rss-gate",
+        nargs="?",
+        const="on",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help=(
+            "RSS 10%% 增长门禁：auto=仅 duration>=3600 启用（默认）；"
+            "on/--rss-gate=强制启用；off=短档只记录"
+        ),
+    )
     parser.add_argument("--db-stabilize-secs", type=float, default=10.0, help="等待 SQLite 计数稳定上限")
     return parser
 
@@ -1242,10 +1253,25 @@ def scan_hub_log(path: Path) -> dict:
     return result
 
 
+def rss_gate_enabled(args: argparse.Namespace) -> bool:
+    """RSS 10% 硬门禁只适用于长稳档。
+
+    方案 §1.2 只对 ≥24h 长稳要求 RSS 增长 ≤10%；10min 档要求记录资源、0 丢点/
+    重复/未处理错误/panic。默认在 duration>=3600s 时启用，也可用 `--rss-gate
+    on/off` 显式覆盖（bare `--rss-gate` 等价 on）。
+    """
+    if args.rss_gate == "on":
+        return True
+    if args.rss_gate == "off":
+        return False
+    return args.duration_secs >= 3600
+
+
 def resource_summary(ctx: RunContext) -> dict:
     columns = read_metrics(ctx.metrics_path)
     elapsed = columns["elapsed"]
     warmup = ctx.args.warmup_secs
+    rss_gate = rss_gate_enabled(ctx.args)
     rss_baseline, rss_mode, rss_count, rss_warmup = baseline_window(
         elapsed, columns["rss_kb"], warmup, ctx.args.duration_secs
     )
@@ -1288,6 +1314,9 @@ def resource_summary(ctx: RunContext) -> dict:
             "end": rss_end,
             "max": max(rss_values) if rss_values else None,
             "growth_pct": growth(rss_baseline, rss_end),
+            "gate_enabled": rss_gate,
+            "gate_threshold_pct": 10.0,
+            "gate_mode": ctx.args.rss_gate,
         },
         "fd": {
             "baseline": fd_baseline,
@@ -1381,8 +1410,21 @@ def build_summary(ctx: RunContext) -> dict:
         failures.append("运行结束时 hub 进程已不存在")
     if resources["health"]["failures"] > 0:
         failures.append(f"healthz 失败 {resources['health']['failures']} 次")
-    if resources["rss_kb"]["growth_pct"] is not None and resources["rss_kb"]["growth_pct"] > 10.0:
-        failures.append(f"RSS 增长 {resources['rss_kb']['growth_pct']}% 超过 10%")
+    rss_resources = resources["rss_kb"]
+    if (
+        rss_resources["gate_enabled"]
+        and rss_resources["growth_pct"] is not None
+        and rss_resources["growth_pct"] > rss_resources["gate_threshold_pct"]
+    ):
+        failures.append(
+            f"RSS 增长 {rss_resources['growth_pct']}% 超过 "
+            f"{rss_resources['gate_threshold_pct']}%（长稳门禁）"
+        )
+    elif not rss_resources["gate_enabled"]:
+        ctx.notes.append(
+            "RSS 10% 硬门禁未启用（duration<3600s 或 --rss-gate off），"
+            "本次只记录高水位，不能据此宣称长稳通过"
+        )
     if resources["fd"]["delta"] is not None and resources["fd"]["delta"] > 32:
         failures.append(f"FD 结束比基线多 {resources['fd']['delta']}，超过 +32")
     if resources["threads"]["delta"] is not None and resources["threads"]["delta"] > 32:

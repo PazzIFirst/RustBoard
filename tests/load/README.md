@@ -130,7 +130,7 @@ labels 为空，`ts` 每批唯一）；默认 5s，60s 档每 agent 12 批。
 | 重复 | `ingest_batches` 的 `(agent_id, epoch, seq)` 重复组数；`samples` 的 `(agent_id, metric, ts)` 重复组数，均必须为 0 |
 | ACK 延迟 | 从 `send_binary` 返回到收到匹配 ACK 的毫秒数；输出 p50/p95/p99/min/max/mean |
 | 吞吐 | `acked / duration`（batch/s）与 ×3（sample/s），按名义运行时长 |
-| RSS | 基线：`warmup` 后 30s 窗口的中位数；结束：最后 10 个样本中位数；增长 >10% 失败。60s 短档没有 warmup 后样本时，基线 warmup 夹到 `duration/2`，并在 `resources.rss_kb.baseline_mode` 标注 |
+| RSS | 基线：`warmup` 后 30s 窗口的中位数；结束：最后 10 个样本中位数。增长 >10% **仅对 ≥1h 长稳档**作为失败门禁（默认 `duration_secs >= 3600` 启用，可用 Python `--rss-gate on/off` 覆盖）；10min/短档只记录高水位。60s 短档没有 warmup 后样本时，基线 warmup 夹到 `duration/2`，并在 `resources.rss_kb.baseline_mode` 标注 |
 | FD / 线程 | 同样基线/结束口径；结束值相对基线允许 +32 |
 | health | 每秒 `GET /healthz`，状态必须 200；失败次数必须 0 |
 | hub 重启 | `/proc/<pid>/stat` 的 starttime 运行前后必须一致，PID 必须存活 |
@@ -150,9 +150,24 @@ labels 为空，`ts` 每批唯一）；默认 5s，60s 档每 agent 12 批。
 - 0 丢点、0 重复；`db.batches == planned` 且 `db.samples == planned×3`；
 - `unacked == 0`、`sent == planned`、`errors == 0`；
 - `/healthz` 失败 0 次；hub PID/starttime 未变化；
-- RSS 增长 ≤10%，FD / 线程增长 ≤32；
+- FD / 线程增长 ≤32；
+- RSS 增长 ≤10%（**仅 ≥1h 长稳档**；10min/短档只记录，不据此判失败）；
 - 管理 API 检查通过；`hub.log` 无 `panicked`/`ERROR`；
 - 所有 agent 线程在 join 时限内退出。
+
+### RSS 门禁适用范围
+
+方案 §1.2 只对 **≥24h 长稳**要求 RSS 增长 ≤10%；10min 档（100 / 200 / 500 /
+1000 agent）的要求是 0 丢点/重复/未处理错误/panic、healthz 可用，并记录资源
+曲线。因此工具按以下口径执行：
+
+- 默认只有 `duration_secs >= 3600` 才把 `growth_pct > 10` 加入 `failures`；
+- Python 可用 `--rss-gate on` 显式启用、`--rss-gate off` 显式关闭（bare
+  `--rss-gate` 等价于 `on`）；
+- `summary.resources.rss_kb` 始终记录 `baseline`、`end`、`max`、`growth_pct`，
+  并额外记录 `gate_enabled`、`gate_threshold_pct=10`、`gate_mode`；
+- 门禁关闭时 `summary.notes` 会注明“只记录高水位”，短档结果**不能**用来宣称
+  24h 长稳通过；24h 若 RSS 仍 >10%，必须按缺陷处理。
 
 任一失败都会写 `summary.json` 并以非零码退出；编排脚本另外把 hub 崩溃、
 SIGTERM 超时、日志命中写回 `summary.failures`。
