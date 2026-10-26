@@ -35,6 +35,23 @@ const AGENT_KEY: &str = "agent.key";
 const AGENT_SECRET: &str = "agent.secret";
 const AGENT_CA: &str = "ca.crt";
 const AGENT_ID: &str = "agent_id";
+/// enrollment 完成标记：五个身份文件全部落盘后**最后**原子写入。
+///
+/// 只含公开身份材料（agent_id / 证书 DER 的 SHA-256 / 完成时间），不含 secret、
+/// CSR 或私钥；缺失它就把身份视为半完成，绝不重新纳管或随机补 agent_id。
+const ENROLLMENT_MARKER: &str = "enrollment.complete";
+/// 已纳管的五个身份文件（marker 不计入；marker 是它们全部写完后的完成信号）。
+const ENROLLED_FILES: [&str; 5] = [AGENT_CERT, AGENT_KEY, AGENT_SECRET, AGENT_CA, AGENT_ID];
+
+/// `enrollment.complete` 的内容。字段只用公开信息，禁止加入 secret / 私钥。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EnrollmentMarker {
+    agent_id: String,
+    /// 客户端证书 DER 的 SHA-256（小写 hex）；续签后随证书一起更新。
+    cert_sha256: String,
+    /// 纳管完成时间（Unix 毫秒）。
+    created_at: i64,
+}
 
 /// 运行时 `server_ca` 文件大小上限（PEM 证书 bundle）。
 const SERVER_CA_MAX_BYTES: u64 = 1024 * 1024;
@@ -429,13 +446,22 @@ fn prepare_data_dir(data_dir: &Path) -> Result<()> {
 async fn run_async(cfg: AgentConfig) -> Result<()> {
     prepare_data_dir(&cfg.data_dir)?;
 
-    // 没纳管过就先走 enrollment；拿到证书后再开始采集，避免用临时 agent_id 产生脏数据。
-    if !is_enrolled(&cfg) {
-        tracing::info!("尚未纳管，开始 enrollment");
-        ensure_enrolled(&cfg).await?;
-    }
-
-    let agent_id = load_or_create_agent_id(&cfg.data_dir)?;
+    // 先解析纳管状态：旧安装补 marker、缺 ID 从证书恢复；半完成状态 fail-closed。
+    // 绝不在仅缺 marker/ID 时重新 enrollment（那会消耗新 token 并产生错误身份）。
+    let state = resolve_enrollment(&cfg)?;
+    let agent_id = match state {
+        EnrollmentState::Fresh => {
+            tracing::info!("尚未纳管，开始 enrollment");
+            ensure_enrolled(&cfg).await?;
+            match resolve_enrollment(&cfg)? {
+                EnrollmentState::Ready { agent_id } => agent_id,
+                EnrollmentState::Fresh => {
+                    bail!("enrollment 完成后仍未检测到完整身份（缺少证书/secret/完成标记）")
+                }
+            }
+        }
+        EnrollmentState::Ready { agent_id } => agent_id,
+    };
     let boot = boot_id();
     let epoch = now_ms() as u64;
     // 会话最长存活时间的抖动种子：启动时刻派生，进程生命周期内固定。
@@ -709,10 +735,304 @@ async fn run_session_with_deadline(
     }
 }
 
+/// 便宜的纳管状态检查：marker + 五个身份文件都存在且非空。
+///
+/// 只用于 `info` 等展示路径；启动路径必须走 [`resolve_enrollment`] 校验内容。
 fn is_enrolled(cfg: &AgentConfig) -> bool {
-    cfg.data_dir.join(AGENT_CERT).exists()
-        && cfg.data_dir.join(AGENT_KEY).exists()
-        && cfg.data_dir.join(AGENT_SECRET).exists()
+    ENROLLED_FILES
+        .iter()
+        .all(|name| file_is_nonempty(&cfg.data_dir.join(name)))
+        && file_is_nonempty(&cfg.data_dir.join(ENROLLMENT_MARKER))
+}
+
+/// 文件存在、是普通文件且非空（符号链接一律不算）。
+fn file_is_nonempty(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.file_type().is_file() && meta.len() > 0,
+        Err(_) => false,
+    }
+}
+
+/// 读取可选文本文件；缺失或只有空白时返回 `None`，其他 I/O 错误上抛。
+fn read_identity_text(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => Ok(Some(text)),
+        Ok(_) => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("读取 {} 失败", path.display())),
+    }
+}
+
+fn read_required_identity_text(path: &Path) -> Result<String> {
+    read_identity_text(path)?.with_context(|| format!("{} 缺失或为空", path.display()))
+}
+
+fn join_names(names: &[&str]) -> String {
+    if names.is_empty() {
+        "无".to_string()
+    } else {
+        names.join("、")
+    }
+}
+
+/// 半完成 / 损坏身份的统一错误：只给可操作指引，不读取也不回显 secret。
+fn incomplete_enrollment_error(dir: &Path, present: &[&str], missing: &[&str]) -> anyhow::Error {
+    anyhow!(
+        "enrollment 未完成：{} 已存在，但 {} 缺失或为空。为防身份错乱，agent 不会重新纳管、\
+         不会生成随机 agent_id、也不会覆盖现有文件；请从备份恢复数据目录 {}，\
+         或删除全部残留凭据后使用新的 enrollment token 重新纳管",
+        join_names(present),
+        join_names(missing),
+        dir.display()
+    )
+}
+
+fn parse_enrollment_marker(dir: &Path, raw: &str) -> Result<EnrollmentMarker> {
+    let path = dir.join(ENROLLMENT_MARKER);
+    let marker: EnrollmentMarker = serde_json::from_str(raw).with_context(|| {
+        format!(
+            "{} 内容损坏，无法确认纳管状态；请从备份恢复该文件，\
+             不要删除其他身份文件（agent 不会重新纳管）",
+            path.display()
+        )
+    })?;
+    if marker.agent_id.trim().is_empty() {
+        bail!("{} 的 agent_id 为空；请从备份恢复", path.display());
+    }
+    let digest = marker.cert_sha256.trim();
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!(
+            "{} 的 cert_sha256 不是合法 SHA-256 hex；请从备份恢复",
+            path.display()
+        );
+    }
+    Ok(marker)
+}
+
+fn read_enrollment_marker(dir: &Path) -> Result<Option<EnrollmentMarker>> {
+    let path = dir.join(ENROLLMENT_MARKER);
+    match read_identity_text(&path)? {
+        Some(raw) => Ok(Some(parse_enrollment_marker(dir, &raw)?)),
+        None => Ok(None),
+    }
+}
+
+fn cert_sha256(cert_pem: &str) -> Result<String> {
+    tls::fingerprint_of_pem(cert_pem).context("计算客户端证书 SHA-256 失败")
+}
+
+/// 原子写完成标记（0600）。调用方必须已经写完 cert/key/secret/CA/agent_id。
+fn write_enrollment_marker(
+    dir: &Path,
+    agent_id: &str,
+    cert_pem: &str,
+    created_at: i64,
+) -> Result<()> {
+    let marker = EnrollmentMarker {
+        agent_id: agent_id.trim().to_string(),
+        cert_sha256: cert_sha256(cert_pem)?,
+        created_at,
+    };
+    let encoded = serde_json::to_vec(&marker).context("编码 enrollment.complete 失败")?;
+    let path = dir.join(ENROLLMENT_MARKER);
+    fsutil::atomic_write(&path, &encoded, 0o600)
+        .with_context(|| format!("写入 {} 失败（完成标记必须最后落盘）", path.display()))?;
+    Ok(())
+}
+
+/// 证书续签后刷新 marker 的证书指纹，保留原 `created_at`（纳管完成时间）。
+fn refresh_enrollment_marker(dir: &Path, agent_id: &str, cert_pem: &str) -> Result<()> {
+    let created_at = read_enrollment_marker(dir)?
+        .map(|marker| marker.created_at)
+        .unwrap_or_else(now_ms);
+    write_enrollment_marker(dir, agent_id, cert_pem, created_at)
+}
+
+/// 已纳管时只读 marker / agent_id 并校验身份，**绝不再生成随机 UUID**。
+///
+/// 历史名称保留（调用点与测试沿用）；半完成或损坏状态返回可操作错误，
+/// 调用方必须先经过 [`resolve_enrollment`] 的恢复 / 迁移流程。
+fn load_or_create_agent_id(dir: &Path) -> Result<String> {
+    let marker_path = dir.join(ENROLLMENT_MARKER);
+    let raw = read_identity_text(&marker_path)?.with_context(|| {
+        format!(
+            "尚未纳管：缺少 {}；请先执行 rustboard-agent run（不会生成随机 agent_id）",
+            marker_path.display()
+        )
+    })?;
+    let marker = parse_enrollment_marker(dir, &raw)?;
+
+    let id_path = dir.join(AGENT_ID);
+    let agent_id = read_identity_text(&id_path)?
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .with_context(|| {
+            format!(
+                "enrollment.complete 存在但 {} 缺失或为空；请从备份恢复（不会生成随机 agent_id）",
+                id_path.display()
+            )
+        })?;
+    if marker.agent_id != agent_id {
+        bail!(
+            "agent_id（{agent_id}）与 enrollment.complete 记录的 {} 不一致；请从备份恢复",
+            marker.agent_id
+        );
+    }
+
+    for name in ENROLLED_FILES {
+        if !file_is_nonempty(&dir.join(name)) {
+            bail!("已纳管状态缺少 {name}；请从备份恢复数据目录，agent 不会重新纳管");
+        }
+    }
+    let cert = read_required_identity_text(&dir.join(AGENT_CERT))?;
+    let key = read_required_identity_text(&dir.join(AGENT_KEY))?;
+    let ca = read_required_identity_text(&dir.join(AGENT_CA))?;
+    let summary = tls::cert_summary(&cert).context("解析 agent.crt 失败")?;
+    if summary.common_name.as_deref() != Some(agent_id.as_str()) {
+        bail!(
+            "agent.crt 的 CN（{}）与 agent_id（{agent_id}）不一致；请从备份恢复",
+            summary.common_name.as_deref().unwrap_or("(无)")
+        );
+    }
+    if !tls::cert_matches_key(&cert, &key).context("校验 agent.crt 与 agent.key 失败")? {
+        bail!("agent.crt 与 agent.key 不配套；请从备份恢复");
+    }
+    tls::load_certs(&ca).context("解析 ca.crt 失败；请从备份恢复")?;
+    let expected = cert_sha256(&cert)?;
+    if !marker.cert_sha256.eq_ignore_ascii_case(&expected) {
+        bail!(
+            "enrollment.complete 与 agent.crt 不一致；请从备份恢复，\
+             或执行 rustboard-agent run 按当前证书修复"
+        );
+    }
+    Ok(agent_id)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EnrollmentState {
+    /// 没有任何客户端凭据，可以安全地走 enrollment。
+    Fresh,
+    /// 身份完整（必要时已补齐 marker / 恢复 agent_id）。
+    Ready { agent_id: String },
+}
+
+/// 启动时解析纳管状态：补 marker、恢复缺失 ID，或对半完成状态 fail-closed。
+///
+/// 判定顺序：
+/// 1. marker 存在 / 任一客户端凭据存在 → 按「已纳管或半完成」处理，绝不重新纳管；
+/// 2. cert/key/secret/CA 缺任一 → 报错并保留现场；
+/// 3. agent_id 缺失 → 用 marker 记录或证书 CN 恢复，不生成随机 UUID；
+/// 4. marker 缺失 → 全部身份校验通过后最后补写；
+/// 5. marker 指纹与当前证书不一致 → 仅在 cert/key/CN 全部一致时按当前证书修复。
+fn resolve_enrollment(cfg: &AgentConfig) -> Result<EnrollmentState> {
+    let dir = &cfg.data_dir;
+    let marker = read_enrollment_marker(dir)?;
+    let has_credential = [AGENT_CERT, AGENT_KEY, AGENT_SECRET]
+        .iter()
+        .any(|name| file_is_nonempty(&dir.join(name)));
+
+    let mut present: Vec<&str> = ENROLLED_FILES
+        .iter()
+        .copied()
+        .filter(|name| file_is_nonempty(&dir.join(name)))
+        .collect();
+    if marker.is_some() {
+        present.push(ENROLLMENT_MARKER);
+    }
+
+    if marker.is_none() && !has_credential {
+        // 没有任何客户端凭据：全新安装。残留的 ca.crt / agent_id 不构成可用身份，
+        // 正常 enrollment 会用新值覆盖它们，因此这里不阻止。
+        return Ok(EnrollmentState::Fresh);
+    }
+
+    let missing: Vec<&str> = [AGENT_CERT, AGENT_KEY, AGENT_SECRET, AGENT_CA]
+        .into_iter()
+        .filter(|name| !file_is_nonempty(&dir.join(name)))
+        .collect();
+    if !missing.is_empty() {
+        return Err(incomplete_enrollment_error(dir, &present, &missing));
+    }
+
+    let cert = read_required_identity_text(&dir.join(AGENT_CERT))?;
+    let key = read_required_identity_text(&dir.join(AGENT_KEY))?;
+    let ca = read_required_identity_text(&dir.join(AGENT_CA))?;
+    let agent_id_on_disk = read_identity_text(&dir.join(AGENT_ID))?
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+
+    let summary = tls::cert_summary(&cert).context(
+        "解析 agent.crt 失败；无法确认已纳管身份，拒绝重新纳管或覆盖现有文件（请从备份恢复）",
+    )?;
+    let common_name = summary.common_name.filter(|name| !name.trim().is_empty()).context(
+        "agent.crt 没有可解析的 CN；无法恢复 agent_id，也不会生成随机身份（请从备份恢复或重新纳管）",
+    )?;
+    if !tls::cert_matches_key(&cert, &key).context("校验 agent.crt 与 agent.key 配套关系失败")?
+    {
+        bail!("agent.crt 与 agent.key 不配套；拒绝覆盖现有身份（请从备份恢复或重新纳管）");
+    }
+    tls::load_certs(&ca).context("解析 ca.crt 失败；CA 缺失或损坏时不会猜测信任模型")?;
+
+    let (agent_id, marker) = match (agent_id_on_disk, marker) {
+        (Some(agent_id), marker) => {
+            if common_name != agent_id {
+                bail!(
+                    "agent.crt 的 CN（{common_name}）与 agent_id（{agent_id}）不一致；\
+                     拒绝重新纳管或覆盖现有身份（请从备份恢复）"
+                );
+            }
+            (agent_id, marker)
+        }
+        (None, marker) => {
+            // 只缺 agent_id：优先用 marker 记录的 ID，其次从证书 CN 恢复。
+            // 两条路径都不生成随机 UUID。
+            let recovered = match &marker {
+                Some(marker) => marker.agent_id.clone(),
+                None => common_name.clone(),
+            };
+            if common_name != recovered {
+                bail!(
+                    "agent.crt 的 CN（{common_name}）与待恢复的 agent_id（{recovered}）不一致；\
+                     拒绝生成新身份（请从备份恢复）"
+                );
+            }
+            let id_path = dir.join(AGENT_ID);
+            fsutil::atomic_write(&id_path, recovered.as_bytes(), 0o644)
+                .with_context(|| format!("恢复 agent_id 失败: {}", id_path.display()))?;
+            tracing::info!(agent = %recovered, "agent_id 缺失，已从证书 CN / 完成标记恢复");
+            (recovered, marker)
+        }
+    };
+
+    match marker {
+        Some(marker) => {
+            if marker.agent_id != agent_id {
+                bail!(
+                    "enrollment.complete 记录的 agent_id（{}）与 agent_id 文件（{agent_id}）不一致；\
+                     拒绝覆盖现有身份（请从备份恢复）",
+                    marker.agent_id
+                );
+            }
+            let expected = cert_sha256(&cert)?;
+            if !marker.cert_sha256.eq_ignore_ascii_case(&expected) {
+                // 证书续签在「证书已落盘、marker 未更新」之间崩溃会走到这里。
+                // cert/key/CN 已全部校验，按当前证书修复 marker，不覆盖身份文件。
+                tracing::warn!(
+                    agent = %agent_id,
+                    "enrollment.complete 的证书指纹与当前 agent.crt 不一致，按当前证书修复标记"
+                );
+                write_enrollment_marker(dir, &agent_id, &cert, marker.created_at)?;
+            }
+        }
+        None => {
+            write_enrollment_marker(dir, &agent_id, &cert, now_ms())?;
+            tracing::info!(agent = %agent_id, "enrollment 缺少完成标记，已校验身份并补齐");
+        }
+    }
+
+    // 统一走只读加载器做最终校验：marker + 五个文件 + 身份一致。
+    let agent_id = load_or_create_agent_id(dir)?;
+    Ok(EnrollmentState::Ready { agent_id })
 }
 
 /// 读取已纳管 agent 的客户端证书与私钥。
@@ -1052,6 +1372,25 @@ async fn try_enroll(cfg: &AgentConfig) -> std::result::Result<(), EnrollError> {
                 0o644,
             )
             .map_err(|e| EnrollError::Fatal(anyhow!("写入 agent_id 失败: {e}")))?;
+            // #45：五个身份文件写完并自洽后再最后原子写完成标记。marker 缺失时
+            // 下次启动会走「旧安装校验后补 marker」，不会重新 enrollment / 换身份。
+            if !tls::cert_matches_key(&resp.cert_pem, &key_pem)
+                .map_err(|e| EnrollError::Fatal(anyhow!("校验纳管证书与私钥失败: {e}")))?
+            {
+                return Err(EnrollError::Fatal(anyhow!(
+                    "hub 返回的证书与本机私钥不配套，拒绝写入完成标记"
+                )));
+            }
+            let cn = tls::cert_summary(&resp.cert_pem)
+                .map_err(|e| EnrollError::Fatal(anyhow!("解析纳管证书失败: {e}")))?
+                .common_name;
+            if cn.as_deref() != Some(resp.agent_id.as_str()) {
+                return Err(EnrollError::Fatal(anyhow!(
+                    "hub 返回的证书 CN 与分配的 agent_id 不一致，拒绝写入完成标记"
+                )));
+            }
+            write_enrollment_marker(&cfg.data_dir, &resp.agent_id, &resp.cert_pem, now_ms())
+                .map_err(|e| EnrollError::Fatal(anyhow!("写入 enrollment.complete 失败: {e}")))?;
             tracing::info!(agent = %resp.agent_id, "纳管成功");
             Ok(())
         }
@@ -1393,6 +1732,15 @@ where
     fsutil::atomic_write(&cert_path, cert_pem.as_bytes(), 0o644)
         .with_context(|| format!("写入客户端证书失败: {}", cert_path.display()))?;
 
+    // #45：marker 绑定证书指纹；续签后必须同步更新。即使这里失败，证书本身
+    // 已校验并落盘，下次启动会按当前证书修复 marker（只改标记，不覆盖身份）。
+    if let Err(err) = refresh_enrollment_marker(&cfg.data_dir, agent_id, &cert_pem) {
+        tracing::warn!(
+            error = %err,
+            "更新 enrollment.complete 失败；下次启动会按当前证书修复完成标记"
+        );
+    }
+
     let days_left = tls::days_left(&cert_pem, now_ms())?;
     tracing::info!(
         not_after = %tls::format_unix_utc(not_after),
@@ -1705,19 +2053,6 @@ where
     }
 }
 
-fn load_or_create_agent_id(dir: &std::path::Path) -> Result<String> {
-    let path = dir.join(AGENT_ID);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let id = existing.trim().to_string();
-        if !id.is_empty() {
-            return Ok(id);
-        }
-    }
-    let id = uuid::Uuid::new_v4().to_string();
-    fsutil::atomic_write(&path, id.as_bytes(), 0o644)?;
-    Ok(id)
-}
-
 /// `cert-info`：打印客户端证书的公开信息。
 ///
 /// 缺证书或证书已过期都以非零退出码结束（`main` 返回 Err），方便脚本与 e2e 断言。
@@ -1783,15 +2118,14 @@ fn renew(config: Option<PathBuf>) -> Result<()> {
 }
 
 async fn renew_once(cfg: &AgentConfig) -> Result<()> {
-    if !is_enrolled(cfg) {
-        bail!("尚未纳管（缺少 agent.crt / agent.key / agent.secret），先执行 rustboard-agent run");
-    }
-    // 不能在这里 create：拿一个随机 agent_id 去连，hub 会因 CN 不一致直接拒绝。
-    let agent_id = std::fs::read_to_string(cfg.data_dir.join(AGENT_ID))
-        .ok()
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
-        .context("读取 agent_id 失败（尚未纳管？）")?;
+    // 手工续签同样走身份解析：旧安装可补 marker；半完成状态直接失败，
+    // 不能拿随机/缺失的 agent_id 去连 hub。
+    let agent_id = match resolve_enrollment(cfg)? {
+        EnrollmentState::Fresh => {
+            bail!("尚未纳管（缺少完整身份或 enrollment.complete），先执行 rustboard-agent run")
+        }
+        EnrollmentState::Ready { agent_id } => agent_id,
+    };
 
     let ws = connect(cfg, true).await?;
     let (mut sink, mut stream) = ws.split();
@@ -2246,6 +2580,8 @@ mod tests {
         fsutil::atomic_write(&dir.join(AGENT_ID), b"agent-test", 0o644).unwrap();
         // 纳管成功时 hub 会下发 ca.crt；续签的签发者校验依赖它。
         fsutil::atomic_write(&dir.join(AGENT_CA), ca_pem.as_bytes(), 0o644).unwrap();
+        // #45：与真实 enrollment 一致，全部身份文件写完后最后写入完成标记。
+        write_enrollment_marker(dir, "agent-test", &cert_pem, now_ms()).unwrap();
 
         AgentConfig {
             data_dir: dir.to_path_buf(),
@@ -2268,6 +2604,7 @@ mod tests {
         let dir = temp_dir("renew");
         let cfg = enrolled_config(&dir, 1);
         let key_before = std::fs::read_to_string(dir.join(AGENT_KEY)).unwrap();
+        let marker_before = read_enrollment_marker(&dir).unwrap().unwrap();
 
         let csr = tls::make_csr_with_key(&key_before).unwrap();
         let new_cert = hub_sign(&dir, &csr, 90);
@@ -2295,6 +2632,409 @@ mod tests {
             key_before,
             "续签必须复用原私钥"
         );
+        // #45：marker 绑定证书指纹，续签后必须同步；created_at 仍表示纳管时间。
+        let marker_after = read_enrollment_marker(&dir).unwrap().unwrap();
+        assert_eq!(marker_after.agent_id, "agent-test");
+        assert_eq!(
+            marker_after.cert_sha256,
+            cert_sha256(&new_cert).unwrap(),
+            "续签后 marker 必须绑定新证书"
+        );
+        assert_eq!(
+            marker_after.created_at, marker_before.created_at,
+            "续签不得改写纳管完成时间"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：读出五个身份文件的原始内容，用于断言迁移/恢复没有覆盖身份。
+    fn identity_snapshot(dir: &Path) -> Vec<(&'static str, Vec<u8>)> {
+        ENROLLED_FILES
+            .into_iter()
+            .map(|name| (name, std::fs::read(dir.join(name)).unwrap()))
+            .collect()
+    }
+
+    fn remove_identity_file(dir: &Path, name: &str) {
+        std::fs::remove_file(dir.join(name)).unwrap();
+    }
+
+    /// #45：`is_enrolled` 必须同时要求 marker 与五个身份文件，空文件不算。
+    #[test]
+    fn v100_is_enrolled_requires_marker_and_five_files() {
+        let dir = temp_dir("marker-required");
+        let cfg = enrolled_config(&dir, 90);
+        assert!(is_enrolled(&cfg), "完整 enrollment 状态必须为已纳管");
+
+        for name in [AGENT_CA, AGENT_ID, ENROLLMENT_MARKER] {
+            let path = dir.join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert!(!is_enrolled(&cfg), "缺少 {name} 不得算已纳管");
+            let mode = if name == ENROLLMENT_MARKER {
+                0o600
+            } else {
+                0o644
+            };
+            fsutil::atomic_write(&path, &bytes, mode).unwrap();
+            assert!(is_enrolled(&cfg), "恢复 {name} 后应重新算已纳管");
+        }
+
+        // 空 marker 不是完成标记。
+        std::fs::write(dir.join(ENROLLMENT_MARKER), b"").unwrap();
+        assert!(!is_enrolled(&cfg), "空 marker 不得算已纳管");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：旧安装（五个文件齐全、无 marker）升级启动时只补 marker，
+    /// 不重新 enrollment、不生成新 agent_id、不覆盖任何身份文件。
+    #[test]
+    fn v100_legacy_install_without_marker_migrates_without_new_identity() {
+        let dir = temp_dir("legacy-migrate");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        let before = identity_snapshot(&dir);
+        assert!(!is_enrolled(&cfg));
+
+        let state = resolve_enrollment(&cfg).expect("旧安装身份自洽时必须能补齐 marker");
+        assert_eq!(
+            state,
+            EnrollmentState::Ready {
+                agent_id: "agent-test".to_string()
+            }
+        );
+        assert_eq!(
+            identity_snapshot(&dir),
+            before,
+            "补 marker 不得改写 cert/key/secret/CA/agent_id"
+        );
+
+        let marker = read_enrollment_marker(&dir).unwrap().unwrap();
+        assert_eq!(marker.agent_id, "agent-test");
+        assert_eq!(
+            marker.cert_sha256,
+            cert_sha256(&String::from_utf8(before[0].1.clone()).unwrap()).unwrap()
+        );
+
+        // 再次启动（幂等）：marker 与全部身份文件都不再变化。
+        let after_first = std::fs::read(dir.join(ENROLLMENT_MARKER)).unwrap();
+        resolve_enrollment(&cfg).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join(ENROLLMENT_MARKER)).unwrap(),
+            after_first,
+            "重复启动不得重写 marker"
+        );
+        assert_eq!(identity_snapshot(&dir), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：有 cert/key/secret/CA 但缺 marker 与 agent_id 时，从证书 CN 恢复
+    /// 同一身份并补 marker；绝不随机生成 UUID。
+    #[test]
+    fn v100_missing_agent_id_recovers_from_cert_cn() {
+        let dir = temp_dir("recover-cn");
+        let cfg = enrolled_config(&dir, 90);
+        let before = identity_snapshot(&dir);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        remove_identity_file(&dir, AGENT_ID);
+
+        let state = resolve_enrollment(&cfg).expect("证书 CN 可解析时必须恢复身份");
+        assert_eq!(
+            state,
+            EnrollmentState::Ready {
+                agent_id: "agent-test".to_string()
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(AGENT_ID)).unwrap().trim(),
+            "agent-test",
+            "必须从证书 CN 恢复，不能生成随机 UUID"
+        );
+        assert_eq!(
+            identity_snapshot(&dir)[..4],
+            before[..4],
+            "恢复 agent_id 不得改写证书/私钥/secret/CA"
+        );
+        let marker = read_enrollment_marker(&dir).unwrap().unwrap();
+        assert_eq!(marker.agent_id, "agent-test");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：marker 是 0600 JSON，只含公开身份信息，不含 secret / 私钥。
+    #[cfg(unix)]
+    #[test]
+    fn v100_marker_is_private_json_without_secrets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("marker-json");
+        enrolled_config(&dir, 90);
+        let path = dir.join(ENROLLMENT_MARKER);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "enrollment.complete 必须是 0600");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["agent_id"], "agent-test");
+        assert_eq!(
+            value["cert_sha256"],
+            cert_sha256(&std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap()).unwrap()
+        );
+        assert!(value["created_at"].as_i64().unwrap() > 0);
+        assert!(!raw.contains("test-secret"), "marker 不得包含 agent secret");
+        assert!(!raw.contains("PRIVATE KEY"), "marker 不得包含私钥");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：每个写点的半完成状态都必须 fail-closed；不能重新纳管或随机补身份。
+    #[test]
+    fn v100_half_completed_identity_fails_closed() {
+        // (1) 逐个写点崩溃：只有 cert / 有 cert+key / 有 cert+key+secret。
+        for kept in [
+            vec![AGENT_CERT],
+            vec![AGENT_CERT, AGENT_KEY],
+            vec![AGENT_CERT, AGENT_KEY, AGENT_SECRET],
+        ] {
+            let dir = temp_dir("half-write-point");
+            let cfg = enrolled_config(&dir, 90);
+            let kept_before: Vec<(&str, Vec<u8>)> = kept
+                .iter()
+                .map(|name| (*name, std::fs::read(dir.join(name)).unwrap()))
+                .collect();
+            for name in ENROLLED_FILES {
+                if !kept.contains(&name) {
+                    remove_identity_file(&dir, name);
+                }
+            }
+            remove_identity_file(&dir, ENROLLMENT_MARKER);
+
+            let err = resolve_enrollment(&cfg).unwrap_err();
+            let text = format!("{err:#}");
+            assert!(text.contains("enrollment 未完成"), "{text}");
+            assert!(!dir.join(AGENT_ID).exists(), "半完成时不得生成 agent_id");
+            assert!(
+                !dir.join(ENROLLMENT_MARKER).exists(),
+                "半完成时不得写 marker"
+            );
+            for (name, bytes) in kept_before {
+                assert_eq!(
+                    std::fs::read(dir.join(name)).unwrap(),
+                    bytes,
+                    "半完成状态不得覆盖 {name}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // (2) 有 cert/key/secret/agent_id 但缺 CA（v0.1 残留）：不猜信任模型。
+        let dir = temp_dir("half-no-ca");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        remove_identity_file(&dir, AGENT_CA);
+        let id_before = std::fs::read(dir.join(AGENT_ID)).unwrap();
+        let err = resolve_enrollment(&cfg).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("ca.crt"), "错误必须点名 ca.crt: {text}");
+        assert!(text.contains("不会重新纳管"), "{text}");
+        assert_eq!(std::fs::read(dir.join(AGENT_ID)).unwrap(), id_before);
+        assert!(!dir.join(ENROLLMENT_MARKER).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // (3) 证书损坏：无法恢复 CN，也不生成随机身份。
+        let dir = temp_dir("half-corrupt-cert");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        std::fs::write(dir.join(AGENT_CERT), b"not a certificate").unwrap();
+        let id_before = std::fs::read(dir.join(AGENT_ID)).unwrap();
+        let err = resolve_enrollment(&cfg).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("解析 agent.crt 失败"),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read(dir.join(AGENT_ID)).unwrap(), id_before);
+        assert!(!dir.join(ENROLLMENT_MARKER).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：marker 与身份文件不一致时 fail-closed，不覆盖 ID / 证书。
+    #[test]
+    fn v100_marker_mismatch_fails_closed_without_overwrite() {
+        let dir = temp_dir("marker-mismatch");
+        let cfg = enrolled_config(&dir, 90);
+        let cert_before = std::fs::read(dir.join(AGENT_CERT)).unwrap();
+        let id_before = std::fs::read(dir.join(AGENT_ID)).unwrap();
+
+        let mut marker = read_enrollment_marker(&dir).unwrap().unwrap();
+        marker.agent_id = "other-agent".to_string();
+        fsutil::atomic_write(
+            &dir.join(ENROLLMENT_MARKER),
+            serde_json::to_vec(&marker).unwrap().as_slice(),
+            0o600,
+        )
+        .unwrap();
+        let err = resolve_enrollment(&cfg).unwrap_err();
+        assert!(format!("{err:#}").contains("不一致"), "{err:#}");
+        assert_eq!(std::fs::read(dir.join(AGENT_ID)).unwrap(), id_before);
+        assert_eq!(std::fs::read(dir.join(AGENT_CERT)).unwrap(), cert_before);
+
+        // 损坏的 marker JSON 同样 fail-closed。
+        std::fs::write(dir.join(ENROLLMENT_MARKER), b"{broken").unwrap();
+        let err = resolve_enrollment(&cfg).unwrap_err();
+        assert!(format!("{err:#}").contains("内容损坏"), "{err:#}");
+        assert_eq!(std::fs::read(dir.join(AGENT_ID)).unwrap(), id_before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：续签在「证书已落盘、marker 未更新」之间崩溃后，只有身份全部
+    /// 校验通过才按当前证书修复 marker。
+    #[test]
+    fn v100_stale_marker_is_repaired_only_after_identity_validation() {
+        let dir = temp_dir("stale-marker");
+        let cfg = enrolled_config(&dir, 90);
+        let created_at = read_enrollment_marker(&dir).unwrap().unwrap().created_at;
+        let key = std::fs::read_to_string(dir.join(AGENT_KEY)).unwrap();
+        let csr = tls::make_csr_with_key(&key).unwrap();
+        let new_cert = hub_sign(&dir, &csr, 120);
+        fsutil::atomic_write(&dir.join(AGENT_CERT), new_cert.as_bytes(), 0o644).unwrap();
+
+        let state = resolve_enrollment(&cfg).expect("身份自洽时允许修复续签遗留的 marker");
+        assert_eq!(
+            state,
+            EnrollmentState::Ready {
+                agent_id: "agent-test".to_string()
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap(),
+            new_cert,
+            "修复 marker 不得回滚已续签的证书"
+        );
+        let marker = read_enrollment_marker(&dir).unwrap().unwrap();
+        assert_eq!(marker.cert_sha256, cert_sha256(&new_cert).unwrap());
+        assert_eq!(marker.created_at, created_at, "保留纳管完成时间");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：最后一个写点（marker）失败时保留可恢复的半完成状态；障碍移除后
+    /// 重启仍恢复同一身份，不重新 enrollment。
+    #[test]
+    fn v100_marker_write_failure_keeps_identity_recoverable() {
+        let dir = temp_dir("marker-write-fail");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        let before = identity_snapshot(&dir);
+
+        let marker_path = dir.join(ENROLLMENT_MARKER);
+        std::os::unix::fs::symlink(dir.join("not-a-marker-target"), &marker_path).unwrap();
+        let err = resolve_enrollment(&cfg).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("enrollment.complete"),
+            "{err:#}"
+        );
+        assert_eq!(identity_snapshot(&dir), before, "写 marker 失败不得改身份");
+        assert!(std::fs::symlink_metadata(&marker_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        std::fs::remove_file(&marker_path).unwrap();
+        let state = resolve_enrollment(&cfg).expect("障碍移除后必须能补齐 marker");
+        assert_eq!(
+            state,
+            EnrollmentState::Ready {
+                agent_id: "agent-test".to_string()
+            }
+        );
+        assert_eq!(identity_snapshot(&dir), before, "恢复后身份必须完全一致");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 缺 ID 恢复时，ID 写入失败也不得留下 marker 或随机身份。
+        let dir = temp_dir("id-write-fail");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        remove_identity_file(&dir, AGENT_ID);
+        std::fs::create_dir(dir.join(AGENT_ID)).unwrap();
+        let err = resolve_enrollment(&cfg).unwrap_err();
+        assert!(format!("{err:#}").contains("agent_id"), "{err:#}");
+        assert!(
+            !dir.join(ENROLLMENT_MARKER).exists(),
+            "ID 未写成时不得写 marker"
+        );
+        std::fs::remove_dir(dir.join(AGENT_ID)).unwrap();
+        resolve_enrollment(&cfg).expect("障碍移除后必须能从 CN 恢复");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(AGENT_ID)).unwrap().trim(),
+            "agent-test"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：未纳管或身份对不上时，`load_or_create_agent_id` 只报错，
+    /// 绝不落盘随机 UUID（token 已被消耗的场景尤其重要）。
+    #[test]
+    fn v100_load_or_create_agent_id_never_generates_random_identity() {
+        // 空目录：未纳管。
+        let dir = temp_dir("no-random-empty");
+        fsutil::ensure_dir(&dir, 0o700).unwrap();
+        let err = load_or_create_agent_id(&dir).unwrap_err();
+        assert!(format!("{err:#}").contains("尚未纳管"), "{err:#}");
+        assert!(!dir.join(AGENT_ID).exists(), "不得生成随机 agent_id");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 只有证书的半完成状态：同样只报错。
+        let dir = temp_dir("no-random-half");
+        let cfg = enrolled_config(&dir, 90);
+        for name in [
+            AGENT_KEY,
+            AGENT_SECRET,
+            AGENT_CA,
+            AGENT_ID,
+            ENROLLMENT_MARKER,
+        ] {
+            remove_identity_file(&dir, name);
+        }
+        let err = load_or_create_agent_id(&dir).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("enrollment.complete"),
+            "{err:#}"
+        );
+        assert!(!dir.join(AGENT_ID).exists());
+        assert!(resolve_enrollment(&cfg).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 旧安装 agent_id 与证书 CN 对不上：报错且不覆盖 ID，也不补 marker。
+        let dir = temp_dir("no-random-mismatch");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        fsutil::atomic_write(&dir.join(AGENT_ID), b"other-agent", 0o644).unwrap();
+        let err = resolve_enrollment(&cfg).unwrap_err();
+        assert!(format!("{err:#}").contains("不一致"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(AGENT_ID)).unwrap().trim(),
+            "other-agent",
+            "对不上时不得覆盖原 agent_id"
+        );
+        assert!(!dir.join(ENROLLMENT_MARKER).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：正常重启（resolve 多次）身份与 marker 完全不变。
+    #[test]
+    fn v100_identity_is_stable_across_restarts() {
+        let dir = temp_dir("stable-restart");
+        let cfg = enrolled_config(&dir, 90);
+        let snapshot = identity_snapshot(&dir);
+        let marker = std::fs::read(dir.join(ENROLLMENT_MARKER)).unwrap();
+        for _ in 0..3 {
+            let state = resolve_enrollment(&cfg).unwrap();
+            assert_eq!(
+                state,
+                EnrollmentState::Ready {
+                    agent_id: "agent-test".to_string()
+                }
+            );
+        }
+        assert_eq!(identity_snapshot(&dir), snapshot);
+        assert_eq!(std::fs::read(dir.join(ENROLLMENT_MARKER)).unwrap(), marker);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

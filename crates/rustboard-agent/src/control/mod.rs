@@ -162,12 +162,18 @@ impl ControlDispatcher {
         let cfg = self.cfg.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let _permit = permit;
             let timeout = Duration::from_secs(
                 cfg.command_timeout_secs
                     .saturating_add(CONTROL_TIMEOUT_GRACE_SECS),
             );
-            let joined = tokio::task::spawn_blocking(move || execute(&cfg, &op));
+            // #46：许可必须由真正执行 `execute` 的 blocking 任务持有。外层
+            // `timeout` 只决定何时回错误，即使超时先到，许可也要等命令及其
+            // 进程组被回收、`execute` 真正返回后才释放，避免“超时后仍可无限
+            // 创建新命令”。
+            let joined = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                execute(&cfg, &op)
+            });
             let response = match tokio::time::timeout(timeout, joined).await {
                 Ok(Ok(Ok(result))) => ControlResponse::success(id, result),
                 Ok(Ok(Err(error))) => ControlResponse::failure(id, error),
@@ -176,6 +182,10 @@ impl ControlDispatcher {
                     ControlError::control_failed(format!("控制任务失败: {join_error}")),
                 ),
                 Err(_) => {
+                    tracing::warn!(
+                        id,
+                        "控制操作执行超时；后台任务仍在运行，容量许可将在其返回后释放"
+                    );
                     ControlResponse::failure(id, ControlError::control_failed("控制操作执行超时"))
                 }
             };

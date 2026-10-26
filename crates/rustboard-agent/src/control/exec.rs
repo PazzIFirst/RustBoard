@@ -1,16 +1,21 @@
 //! 无 shell 的外部命令执行：参数数组、环境变量白名单、超时与输出截断。
 //!
-//! 安全约束：
+//! 安全 / 资源约束：
 //! - 一律 `Command::new(绝对路径).args([...])`，不经过 shell；
 //! - `env_clear()` 后只保留固定的 `PATH` 与 `LANG=C`；
-//! - 每个命令有超时，超时 `kill()` + `wait()`；
-//! - stdout / stderr 各自只保留前 `max_output` 字节，其余持续读空防止子进程阻塞。
+//! - Unix 下子进程通过 `process_group(0)` 成为独立进程组组长；超时或父进程已退出
+//!   但后代仍持有输出管道时，对**整个进程组**发 `SIGKILL` 并回收；
+//! - stdout / stderr 设为非阻塞，用 `poll(2)` + deadline 读取，不创建无法取消的
+//!   reader 线程；每次唤醒最多读固定次数，deadline 始终可检查；
+//! - 每个流只保留前 `max_output` 字节，超出部分继续读空防止子进程写满管道阻塞。
 
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread::JoinHandle;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::process::CommandExt;
 
 use rustboard_common::config::ControlConfig;
 use rustboard_common::control::{ControlError, ControlResult, TRUNCATED_MARKER};
@@ -22,6 +27,12 @@ pub const CHILD_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 const READ_CHUNK: usize = 8 * 1024;
 const WAIT_POLL: Duration = Duration::from_millis(10);
+/// 父进程退出后等待后代关闭输出管道的宽限时间；超过则杀掉整个进程组。
+const READER_GRACE: Duration = Duration::from_millis(500);
+/// 杀掉进程组后等待管道 EOF 的宽限时间。仍不 EOF 就关闭读端，绝不无限等待。
+const KILL_DRAIN_GRACE: Duration = Duration::from_millis(250);
+/// 每次 poll 唤醒最多读多少次：高速写入时也要回到主循环检查 deadline。
+const MAX_DRAIN_READS: usize = 64;
 
 /// 一次命令执行的结果。
 pub struct ExecOutput {
@@ -105,6 +116,8 @@ pub fn run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // 独立进程组：超时 / 后代持有管道时可以一次结束命令及其全部后代。
+    command.process_group(0);
 
     let mut child = command.spawn().map_err(|err| {
         ControlError::control_failed(format!("启动 {} 失败: {err}", program.display()))
@@ -118,41 +131,98 @@ pub fn run(
         .stderr
         .take()
         .ok_or_else(|| ControlError::control_failed("无法捕获命令 stderr"))?;
-    let stdout_reader = spawn_reader(stdout, max_output);
-    let stderr_reader = spawn_reader(stderr, max_output);
 
+    if let Err(err) =
+        set_nonblocking(stdout.as_raw_fd()).and_then(|()| set_nonblocking(stderr.as_raw_fd()))
+    {
+        // 子进程可能已经阻塞在写管道上；先结束整组再回收，避免留下卡死的命令。
+        let _ = kill_process_group(child.id());
+        let _ = child.wait();
+        return Err(ControlError::control_failed(format!(
+            "设置命令输出管道非阻塞失败: {err}"
+        )));
+    }
+
+    let mut pipes = [OutputPipe::new(stdout), OutputPipe::new(stderr)];
     let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if started.elapsed() >= timeout {
-                    // 超时：先杀进程再回收，避免留下僵尸；读线程在管道关闭后结束。
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    join_reader(stdout_reader);
-                    join_reader(stderr_reader);
-                    return Err(ControlError::control_failed(format!(
-                        "命令执行超时（{}ms）",
-                        timeout.as_millis()
-                    )));
-                }
-                std::thread::sleep(WAIT_POLL);
-            }
+    let deadline = started + timeout;
+
+    loop {
+        // 先观察退出但**不回收**：进程保持 zombie，PID 在后续 killpg 前不会被复用，
+        // 因此“父进程已退出、后代仍持有管道”时杀进程组不会误伤新进程。
+        match child_exited_without_reaping(&child) {
+            Ok(true) => break,
+            Ok(false) => {}
             Err(err) => {
-                let _ = child.kill();
+                let _ = kill_process_group(child.id());
                 let _ = child.wait();
-                join_reader(stdout_reader);
-                join_reader(stderr_reader);
+                drain_until_eof(&mut pipes, max_output, Instant::now() + KILL_DRAIN_GRACE);
                 return Err(ControlError::control_failed(format!(
                     "等待命令退出失败: {err}"
                 )));
             }
         }
-    };
 
-    let (stdout_bytes, stdout_truncated) = join_reader(stdout_reader);
-    let (stderr_bytes, stderr_truncated) = join_reader(stderr_reader);
+        let now = Instant::now();
+        if now >= deadline {
+            let _ = kill_process_group(child.id());
+            let _ = child.wait();
+            drain_until_eof(&mut pipes, max_output, Instant::now() + KILL_DRAIN_GRACE);
+            return Err(ControlError::control_failed(format!(
+                "命令执行超时（{}ms）",
+                timeout.as_millis()
+            )));
+        }
+
+        let wait = (deadline - now).min(WAIT_POLL);
+        if let Err(err) = wait_readable(&pipes, wait) {
+            let _ = kill_process_group(child.id());
+            let _ = child.wait();
+            drain_until_eof(&mut pipes, max_output, Instant::now() + KILL_DRAIN_GRACE);
+            return Err(ControlError::control_failed(format!(
+                "等待命令输出失败: {err}"
+            )));
+        }
+        for pipe in &mut pipes {
+            if !pipe.eof {
+                pipe.drain(max_output);
+            }
+        }
+    }
+
+    // 子进程已退出：先把管道读空。若后代仍持有写端（例如 `sleep 30 &`），
+    // READER_GRACE 内等不到 EOF 就杀整组，再给一小段回收时间。
+    drain_until_eof(&mut pipes, max_output, Instant::now() + READER_GRACE);
+    if pipes.iter().any(|pipe| !pipe.eof) {
+        match kill_process_group(child.id()) {
+            Ok(()) => tracing::warn!(
+                pid = child.id(),
+                "命令父进程已退出但后代仍持有输出管道，已结束整个进程组"
+            ),
+            Err(err) => tracing::warn!(
+                pid = child.id(),
+                error = %err,
+                "命令后代仍持有输出管道，结束进程组失败"
+            ),
+        }
+        drain_until_eof(&mut pipes, max_output, Instant::now() + KILL_DRAIN_GRACE);
+    }
+    if pipes.iter().any(|pipe| !pipe.eof) {
+        // 后代脱离进程组且仍持有管道（例如自行 setsid）。没有 reader 线程，
+        // 关闭读端即可返回，不会泄漏线程或无限等待；记录错误供运维排查。
+        tracing::error!(
+            pid = child.id(),
+            "命令后代进程未在宽限期内退出；关闭输出管道并返回"
+        );
+    }
+
+    // waitid 只观察不回收，这里才真正 reap；失败则无法确认退出状态。
+    let status = child
+        .wait()
+        .map_err(|err| ControlError::control_failed(format!("回收命令进程失败: {err}")))?;
+    let [stdout_pipe, stderr_pipe] = pipes;
+    let (stdout_bytes, stdout_truncated) = stdout_pipe.finish();
+    let (stderr_bytes, stderr_truncated) = stderr_pipe.finish();
     Ok(ExecOutput {
         stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
         stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
@@ -189,42 +259,183 @@ pub fn summarize(text: &str, max_chars: usize) -> String {
     out.trim().to_string()
 }
 
-fn spawn_reader<R>(reader: R, cap: usize) -> JoinHandle<(Vec<u8>, bool)>
-where
-    R: Read + Send + 'static,
-{
-    std::thread::spawn(move || read_capped(reader, cap))
+/// 子进程退出但没有被 `wait` 回收时返回 `true`。
+///
+/// 使用 `waitid(..., WNOWAIT)` 只观察、不 reap：保留 zombie 可以让 PID（同时是
+/// 进程组 ID）在后续 `killpg` 之前不被内核复用。真正的回收在 [`run`] 末尾的
+/// `child.wait()` 完成。
+fn child_exited_without_reaping(child: &Child) -> std::io::Result<bool> {
+    let pid = libc::pid_t::try_from(child.id())
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "子进程 PID 超出范围"))?;
+    // SAFETY: siginfo_t 是内核写入的 POD 结构；调用前清零，waitid 只写该结构。
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: pid 是本进程刚 spawn 的子进程；info 是本次调用内有效的可写指针。
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc == 0 {
+        // si_pid == 0 表示还没有已退出的子进程。
+        return Ok(unsafe { info.si_pid() } != 0);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.kind() == ErrorKind::Interrupted {
+        return Ok(false);
+    }
+    Err(err)
 }
 
-fn join_reader(handle: JoinHandle<(Vec<u8>, bool)>) -> (Vec<u8>, bool) {
-    handle.join().unwrap_or_else(|_| (Vec::new(), true))
+/// 对子进程所在的独立进程组发 `SIGKILL`。
+///
+/// `process_group(0)` 保证 PGID == 子进程 PID。组已经不存在（后代全部退出）
+/// 时视为成功；其他错误向上报告，由调用方记录。
+fn kill_process_group(pid: u32) -> std::io::Result<()> {
+    let pgid = libc::pid_t::try_from(pid)
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "进程组 ID 超出范围"))?;
+    // SAFETY: kill(2) 只接收整数；负 PGID 表示进程组，信号固定为 SIGKILL。
+    let rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err)
 }
 
-/// 只保留前 `cap` 字节，但继续读空管道，防止子进程因写满 pipe buffer 卡死。
-fn read_capped<R: Read>(mut reader: R, cap: usize) -> (Vec<u8>, bool) {
-    let mut kept = Vec::new();
-    let mut truncated = false;
-    let mut buf = [0u8; READ_CHUNK];
+/// 把 pipe 设为非阻塞读，配合 `poll(2)` 实现可取消的 deadline 读取。
+fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl 只操作整数 fd 与标志位，不涉及 Rust 侧内存所有权。
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: 同上；F_SETFL 只修改该 fd 的文件状态标志。
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// 等待任一未 EOF 的管道可读，或超时。
+fn wait_readable(pipes: &[OutputPipe; 2], timeout: Duration) -> std::io::Result<()> {
+    let mut fds: Vec<libc::pollfd> = pipes
+        .iter()
+        .filter(|pipe| !pipe.eof)
+        .map(|pipe| libc::pollfd {
+            fd: pipe.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    if fds.is_empty() {
+        // 两个流都已 EOF 但子进程尚未退出：有界睡眠，避免忙等。
+        std::thread::sleep(timeout.min(WAIT_POLL));
+        return Ok(());
+    }
+    let millis = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
     loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(read) => {
-                let room = cap.saturating_sub(kept.len());
-                if room == 0 {
-                    truncated = true;
-                    continue;
-                }
-                let take = room.min(read);
-                kept.extend_from_slice(&buf[..take]);
-                if take < read {
-                    truncated = true;
-                }
-            }
-            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => break,
+        // SAFETY: fds 是本函数内有效的数组；长度与指针一致，内核只写 revents。
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, millis) };
+        if ready >= 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+/// stdout / stderr 的公共读接口：两者都是 `Read + AsRawFd`，但类型不同，
+/// 用 trait object 放进同一个数组。
+trait ReadFd: Read + AsRawFd {}
+impl<T: Read + AsRawFd> ReadFd for T {}
+
+/// 非阻塞读取一个输出流；EOF / 读错误都把该流标记为结束。
+struct OutputPipe {
+    reader: Box<dyn ReadFd>,
+    fd: RawFd,
+    kept: Vec<u8>,
+    truncated: bool,
+    eof: bool,
+}
+
+impl OutputPipe {
+    fn new<R: Read + AsRawFd + 'static>(reader: R) -> Self {
+        let fd = reader.as_raw_fd();
+        Self {
+            reader: Box::new(reader),
+            fd,
+            kept: Vec::new(),
+            truncated: false,
+            eof: false,
         }
     }
-    (kept, truncated)
+
+    /// 只保留前 `cap` 字节，但继续读空管道，防止子进程因写满 pipe buffer 卡死。
+    fn drain(&mut self, cap: usize) {
+        let mut buf = [0u8; READ_CHUNK];
+        for _ in 0..MAX_DRAIN_READS {
+            match self.reader.read(&mut buf) {
+                Ok(0) => {
+                    self.eof = true;
+                    return;
+                }
+                Ok(read) => {
+                    let room = cap.saturating_sub(self.kept.len());
+                    if room == 0 {
+                        self.truncated = true;
+                        continue;
+                    }
+                    let take = room.min(read);
+                    self.kept.extend_from_slice(&buf[..take]);
+                    if take < read {
+                        self.truncated = true;
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => return,
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.eof = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> (Vec<u8>, bool) {
+        (self.kept, self.truncated)
+    }
+}
+
+/// 在 deadline 内持续读空两个管道；deadline 到期或全部 EOF 即返回。
+fn drain_until_eof(pipes: &mut [OutputPipe; 2], cap: usize, deadline: Instant) {
+    loop {
+        for pipe in pipes.iter_mut() {
+            if !pipe.eof {
+                pipe.drain(cap);
+            }
+        }
+        if pipes.iter().all(|pipe| pipe.eof) {
+            return;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let wait = (deadline - now).min(WAIT_POLL);
+        if let Err(err) = wait_readable(pipes, wait) {
+            tracing::debug!(error = %err, "等待命令输出管道失败，提前结束读取");
+            return;
+        }
+    }
 }
 
 /// 测试用全局锁：多个测试会写临时可执行脚本并 spawn 子进程；并行 fork 时
@@ -261,6 +472,29 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
         path
+    }
+
+    fn sh() -> PathBuf {
+        resolve_tool("", "sh").expect("候选目录里应能找到 sh")
+    }
+
+    /// 当前进程打开的文件描述符数量（用于泄漏回归）。
+    fn open_fd_count() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+
+    /// 当前进程线程数量（用于泄漏回归）。
+    fn thread_count() -> usize {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Threads:")?.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0)
     }
 
     #[test]
@@ -303,7 +537,7 @@ mod tests {
     fn timeout_kills_command_and_returns_control_failed() {
         let _guard = test_serial_guard();
         let dir = temp_dir("timeout");
-        // exec sleep：kill 直接命中 sleep，读线程随管道关闭退出，不会等满 5s。
+        // exec sleep：kill 进程组后管道关闭，读取有界结束，不会等满 5s。
         let script = write_script(&dir, "hang", "exec sleep 5");
         let started = Instant::now();
         let err = run(&script, &[], Duration::from_millis(100), 1024)
@@ -317,6 +551,127 @@ mod tests {
             started.elapsed()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #46：父 shell 在前台 `wait` 一个后台 sleep 时，超时必须杀掉整个进程组，
+    /// 而不是只杀 sh 后继续等后台 sleep 关管道。
+    #[test]
+    fn timeout_kills_whole_process_group() {
+        let _guard = test_serial_guard();
+        let sh = sh();
+        let started = Instant::now();
+        let err = run(
+            &sh,
+            &["-c", "sleep 2 & wait"],
+            Duration::from_millis(100),
+            1024,
+        )
+        .err()
+        .expect("超时必须失败");
+        assert_eq!(err.code, rustboard_common::control::codes::CONTROL_FAILED);
+        assert!(err.message.contains("超时"), "错误信息: {}", err.message);
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "必须杀掉整个进程组，不能等后台 sleep 自然结束: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// #46：父进程立即退出、后台后代持有 stdout/stderr 时，读取必须在
+    /// READER_GRACE 内结束，并杀掉后代，避免命令永久挂住。
+    #[test]
+    fn parent_exit_with_background_descendant_is_bounded_and_killed() {
+        let _guard = test_serial_guard();
+        let dir = temp_dir("bg-descendant");
+        let marker = dir.join("descendant-alive");
+        let sh = sh();
+        // 后台子 shell 1s 后写 marker；父 shell 立即退出。若没有 killpg，
+        // marker 会在宽限期后被写出，测试失败。
+        let body = format!("(sleep 1; echo alive > '{}') &", marker.display());
+        let started = Instant::now();
+        let out = run(&sh, &["-c", &body], Duration::from_secs(5), 1024)
+            .expect("父进程正常退出本身不是错误");
+        let elapsed = started.elapsed();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "后代持有管道时必须在 grace 内返回: {elapsed:?}"
+        );
+
+        std::thread::sleep(Duration::from_millis(1_200));
+        assert!(
+            !marker.exists(),
+            "后台后代必须在 grace 内被 killpg 结束，不能继续执行"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #46：连续超时不得泄漏 FD / 线程。用独立子进程运行探针，避免其他并行
+    /// 测试的临时 FD / 线程干扰计数。
+    #[test]
+    fn repeated_timeouts_do_not_leak_fds_or_threads() {
+        let _guard = test_serial_guard();
+        if std::env::var_os("RUSTBOARD_EXEC_LEAK_PROBE").is_some() {
+            let sh = sh();
+            let before = (open_fd_count(), thread_count());
+            for _ in 0..12 {
+                let err = run(
+                    &sh,
+                    &["-c", "sleep 30 & wait"],
+                    Duration::from_millis(20),
+                    256,
+                )
+                .err()
+                .expect("超时必须失败");
+                assert!(err.message.contains("超时"), "{}", err.message);
+            }
+            let after = (open_fd_count(), thread_count());
+            println!(
+                "EXEC_LEAK_PROBE fd_before={} fd_after={} threads_before={} threads_after={}",
+                before.0, after.0, before.1, after.1
+            );
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("无法定位测试二进制");
+        let output = Command::new(exe)
+            .arg("--exact")
+            .arg("control::exec::tests::repeated_timeouts_do_not_leak_fds_or_threads")
+            .arg("--nocapture")
+            .env("RUSTBOARD_EXEC_LEAK_PROBE", "1")
+            .output()
+            .expect("无法启动泄漏检测子进程");
+        assert!(
+            output.status.success(),
+            "泄漏检测子进程失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // 先去掉 "EXEC_LEAK_PROBE " 前缀再取值。
+        let fields: Vec<&str> = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("EXEC_LEAK_PROBE "))
+            .unwrap_or_else(|| panic!("探针没有输出计数: {stdout}"))
+            .split_whitespace()
+            .collect();
+        let mut values = std::collections::HashMap::new();
+        for field in fields {
+            if let Some((key, value)) = field.split_once('=') {
+                values.insert(key, value.parse::<usize>().unwrap());
+            }
+        }
+        let fd_before = values["fd_before"];
+        let fd_after = values["fd_after"];
+        let threads_before = values["threads_before"];
+        let threads_after = values["threads_after"];
+        assert!(
+            fd_after <= fd_before,
+            "连续超时泄漏 FD: before={fd_before} after={fd_after}"
+        );
+        assert!(
+            threads_after <= threads_before,
+            "连续超时泄漏线程: before={threads_before} after={threads_after}"
+        );
     }
 
     #[test]
