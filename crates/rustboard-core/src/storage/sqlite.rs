@@ -554,35 +554,29 @@ const PRUNE_ARCHIVED_RAW_SQL: &str = "DELETE FROM samples WHERE rowid IN \
 /// 1m 保留期：只删**整小时都已 `aggregated_1h=1`** 的行。
 ///
 /// 调用方已把 `?1` 向下取整到整点；dirty hour 只要有一行未聚合，整小时跳过。
-const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE rowid IN \
-     (SELECT m.rowid FROM samples_1m m \
-      WHERE m.bucket_ts < ?1 \
-        AND NOT EXISTS ( \
-            SELECT 1 FROM samples_1m d \
-            WHERE d.aggregated_1h = 0 \
-              AND d.bucket_ts >= (m.bucket_ts / 3600000) * 3600000 \
-              AND d.bucket_ts < (m.bucket_ts / 3600000) * 3600000 + 3600000 \
-        ) \
-        AND NOT EXISTS ( \
-            SELECT 1 FROM samples s \
-            WHERE s.aggregated_1m = 0 \
-              AND s.ts >= (m.bucket_ts / 3600000) * 3600000 \
-              AND s.ts < (m.bucket_ts / 3600000) * 3600000 + 3600000 \
-        ) \
-        AND EXISTS ( \
-            SELECT 1 FROM samples_1h h \
-            WHERE h.agent_id = m.agent_id AND h.metric = m.metric \
-              AND h.labels = m.labels \
-              AND h.bucket_ts = (m.bucket_ts / 3600000) * 3600000 \
-              AND h.count = ( \
-                  SELECT COALESCE(SUM(x.count), 0) FROM samples_1m x \
-                  WHERE x.agent_id = m.agent_id AND x.metric = m.metric \
-                    AND x.labels = m.labels \
-                    AND x.bucket_ts >= (m.bucket_ts / 3600000) * 3600000 \
-                    AND x.bucket_ts < (m.bucket_ts / 3600000) * 3600000 + 3600000 \
-              ) \
-        ) \
-      ORDER BY m.bucket_ts LIMIT ?2)";
+const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE \
+     (agent_id, metric, labels, (bucket_ts / 3600000) * 3600000) IN ( \
+     SELECT g.agent_id, g.metric, g.labels, g.hour_start \
+     FROM ( \
+         SELECT agent_id, metric, labels, \
+                (bucket_ts / 3600000) * 3600000 AS hour_start, \
+                SUM(count) AS source_count, \
+                MAX(CASE WHEN aggregated_1h = 0 THEN 1 ELSE 0 END) AS dirty \
+         FROM samples_1m \
+         WHERE bucket_ts < ?1 \
+         GROUP BY agent_id, metric, labels, hour_start \
+     ) g \
+     LEFT JOIN samples_1h h \
+       ON h.agent_id = g.agent_id AND h.metric = g.metric \
+      AND h.labels = g.labels AND h.bucket_ts = g.hour_start \
+     WHERE g.dirty = 0 AND h.count = g.source_count \
+       AND NOT EXISTS ( \
+           SELECT 1 FROM samples s \
+           WHERE s.aggregated_1m = 0 \
+             AND s.ts >= g.hour_start AND s.ts < g.hour_start + 3600000 \
+       ) \
+     ORDER BY g.hour_start LIMIT ?2 \
+)";
 const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE rowid IN \
      (SELECT rowid FROM samples_1h WHERE bucket_ts < ?1 ORDER BY bucket_ts LIMIT ?2)";
 
@@ -7930,6 +7924,32 @@ mod tests {
         assert_eq!(s.samples_1h_stats().unwrap().rows, 2);
         assert_eq!(s.prune_samples_1h_before(hour).unwrap().deleted, 1);
         assert_eq!(s.samples_1h_stats().unwrap().oldest_ts, Some(hour));
+    }
+
+    /// 1m retention 按 (series,hour) 整组删除，不能被 5000 行批次截断后
+    /// 让等式门禁永久失效（旧实现 6000 行只能删 5000，剩 1000 永不清）。
+    #[test]
+    fn r1b_prune_1m_deletes_more_than_batch_rows_per_hour() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let hour = 1_699_999_200_000;
+        let mut rows: Vec<(&str, &str, i64, f64)> = Vec::new();
+        for series in 0..100 {
+            let metric: &'static str = Box::leak(format!("cpu.{series}").into_boxed_str());
+            for minute in 0..60 {
+                rows.push((metric, "{}", hour + minute * 60_000, 1.0));
+            }
+        }
+        insert_samples(&s, "a1", &rows);
+        s.downsample_1m_range(hour, hour + BUCKET_1H_MS).unwrap();
+        s.downsample_1h_range(hour, hour + BUCKET_1H_MS).unwrap();
+        assert_eq!(s.samples_1m_stats().unwrap().rows, 6_000);
+        let pruned = s.prune_samples_1m_before(hour + BUCKET_1H_MS).unwrap();
+        assert_eq!(pruned.deleted, 6_000, "整组删除必须覆盖 >5000 行小时");
+        assert_eq!(s.samples_1m_stats().unwrap().rows, 0);
+        assert_eq!(
+            s.prune_samples_1m_before(hour + BUCKET_1H_MS).unwrap(),
+            PruneResult::default()
+        );
     }
 
     /// KI-29：raw 删除最大 rowid 行后，水位必须在同一批事务里降到新 MAX。

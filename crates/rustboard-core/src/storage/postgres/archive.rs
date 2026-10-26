@@ -178,35 +178,29 @@ const PRUNE_ARCHIVED_RAW_SQL: &str = "DELETE FROM samples WHERE id IN \
         JOIN archive_objects o ON o.id = s.archive_object_id \
       WHERE s.ts < $1 AND s.aggregated_1m = 1 AND o.status = 'uploaded' \
       ORDER BY s.ts LIMIT $2)";
-const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE id IN \
-     (SELECT m.id FROM samples_1m m \
-      WHERE m.bucket_ts < $1 \
-        AND NOT EXISTS ( \
-            SELECT 1 FROM samples_1m d \
-            WHERE d.aggregated_1h = 0 \
-              AND d.bucket_ts >= (m.bucket_ts / 3600000) * 3600000 \
-              AND d.bucket_ts < (m.bucket_ts / 3600000) * 3600000 + 3600000 \
-        ) \
-        AND NOT EXISTS ( \
-            SELECT 1 FROM samples s \
-            WHERE s.aggregated_1m = 0 \
-              AND s.ts >= (m.bucket_ts / 3600000) * 3600000 \
-              AND s.ts < (m.bucket_ts / 3600000) * 3600000 + 3600000 \
-        ) \
-        AND EXISTS ( \
-            SELECT 1 FROM samples_1h h \
-            WHERE h.agent_id = m.agent_id AND h.metric = m.metric \
-              AND h.labels = m.labels \
-              AND h.bucket_ts = (m.bucket_ts / 3600000) * 3600000 \
-              AND h.count = ( \
-                  SELECT COALESCE(SUM(x.count), 0) FROM samples_1m x \
-                  WHERE x.agent_id = m.agent_id AND x.metric = m.metric \
-                    AND x.labels = m.labels \
-                    AND x.bucket_ts >= (m.bucket_ts / 3600000) * 3600000 \
-                    AND x.bucket_ts < (m.bucket_ts / 3600000) * 3600000 + 3600000 \
-              ) \
-        ) \
-      ORDER BY m.bucket_ts LIMIT $2)";
+const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE \
+     (agent_id, metric, labels, (bucket_ts / 3600000) * 3600000) IN ( \
+     SELECT g.agent_id, g.metric, g.labels, g.hour_start \
+     FROM ( \
+         SELECT agent_id, metric, labels, \
+                (bucket_ts / 3600000) * 3600000 AS hour_start, \
+                SUM(count) AS source_count, \
+                MAX(CASE WHEN aggregated_1h = 0 THEN 1 ELSE 0 END) AS dirty \
+         FROM samples_1m \
+         WHERE bucket_ts < $1 \
+         GROUP BY agent_id, metric, labels, hour_start \
+     ) g \
+     LEFT JOIN samples_1h h \
+       ON h.agent_id = g.agent_id AND h.metric = g.metric \
+      AND h.labels = g.labels AND h.bucket_ts = g.hour_start \
+     WHERE g.dirty = 0 AND h.count = g.source_count \
+       AND NOT EXISTS ( \
+           SELECT 1 FROM samples s \
+           WHERE s.aggregated_1m = 0 \
+             AND s.ts >= g.hour_start AND s.ts < g.hour_start + 3600000 \
+       ) \
+     ORDER BY g.hour_start LIMIT $2 \
+)";
 const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE id IN \
      (SELECT id FROM samples_1h WHERE bucket_ts < $1 ORDER BY bucket_ts LIMIT $2)";
 
