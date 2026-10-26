@@ -550,6 +550,10 @@ impl Storage for PostgresStorage {
         PostgresStorage::count_invalid_archive_raw_rows(self)
     }
 
+    fn record_archive_attempt(&self, id: i64) -> Result<i64> {
+        PostgresStorage::record_archive_attempt(self, id)
+    }
+
     fn count_archive_objects(&self) -> Result<i64> {
         PostgresStorage::count_archive_objects(self)
     }

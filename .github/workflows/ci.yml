@@ -132,6 +132,9 @@ jobs:
           --test postgres_load
           --locked
 
+      - name: PostgreSQL 存储层单元测试（归档 claim / 元数据）
+        run: cargo test -p rustboard-core --lib --locked storage::postgres::archive::tests
+
       - name: Phase D5b backup/restore + 安装器 PG 探测
         run: |
           cargo test -p rustboard-hub --test phase_d_backup --locked
