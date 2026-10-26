@@ -760,6 +760,20 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 - 尚未关闭或评论任何 issue；修复合并/发布证据齐后只补评论，由用户确认关闭。
 - 24h 长稳不能复用 2026-10-26 的 2h 中止证据。
 
+### 12.6 rc.3 准备与 1h 历史保护（2026-10-27 07:08）
+
+- 集成分支已升 `1.0.0-rc.3`（`2ad7e0a`），`Cargo.lock`、docker-pg E2E 默认版本同步。
+- 复审发现整小时冻结会误标同小时其它 series；已改为 **按 series**：
+  `AGGREGATE_1H_SQL` 仅当 `excluded.count >= samples_1h.count` 才更新；
+  1m retention 还要求同 series 的 1h count 等于 1m sum；SQLite/PG 同规则。
+- 新增/修正 SQLite 多 series 回归测试；全 workspace + 真实 PG 在 `2ad933a` rc=0，
+  fmt/clippy 通过。
+- rc.3 包构建在 guard 前生成，已删除；arm64 构建因源码变更取消。**不得用旧包发布**。
+- 安装 E2E 121/121、离线 122/122、Docker PG 104/0（1 arm64 SKIP）、security 9/9、
+  panel 159/159 均在 guard 前/rc.3 中间提交通过；最终二进制需重跑。
+- 下一步：重建 rc.3 两架构包，重跑 install/offline/docker-pg/arm64，再做 100/500/1000
+  与 3h 预检/24h；全部通过才 tag rc.3、升 v1.0.0。
+
 ### 12.5 磁盘清理（2026-10-27）
 
 - 清理前根分区 100%（0 可用），/tmp tmpfs 96%；清理 `/root/code/serverdashboard/target/debug`、已完成分支的 `target/v100-*`、`.worktrees/*/target` 及 `/tmp` 旧 `rb-*`/review 临时目录后，根分区约 66%、/tmp 约 58%。
