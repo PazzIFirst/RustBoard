@@ -453,6 +453,71 @@ docker compose -f docker/compose.example.yml \
 
 详见 [docker/README.md](../../docker/README.md) §14。
 
+### 7.1 Docker PG overlay e2e（Phase E S4）
+
+> **状态**：脚本与本节已落盘，截至 2026-10-26 编写环境**尚未执行**（只做静态
+> 检查）。以下为脚本的判定标准与已知限制，不是运行结果；Phase E 主 Agent
+> 运行后回填，运行前不要写“已通过”。
+
+脚本必须带 dist 来源绑定运行；仅校验 `--version`/revision 不能排除同名旧
+rc.2 dist，因此 S4 运行前要重建 dist 并生成 manifest（重建后必须重新生成）：
+
+```bash
+mkdir -p target
+{
+  printf 'hub=%s\n'   "$(sha256sum dist/amd64/bin/rustboard-hub   | awk '{ print $1 }')"
+  printf 'panel=%s\n' "$(sha256sum dist/amd64/bin/rustboard-panel | awk '{ print $1 }')"
+  printf 'agent=%s\n' "$(sha256sum dist/amd64/bin/rustboard-agent | awk '{ print $1 }')"
+  printf 'web=%s\n'   "$(sha256sum web/dist/index.html             | awk '{ print $1 }')"
+} > target/dist-manifest.txt
+
+bash tests/e2e/v100-docker-pg.sh --dist-manifest target/dist-manifest.txt
+# 或：EXPECTED_DIST_SHA256='hub=... panel=... agent=... web=...' \
+#       bash tests/e2e/v100-docker-pg.sh
+```
+
+脚本把 HEAD、四个 dist sha256、三个镜像 ID 写入证据 `provenance.txt`；manifest
+与当前 dist 任一不符会在 build 前 FATAL。它在 Docker 内验证 PG overlay：
+
+- 用当前 dist 构建 `:local-s4` hub/panel/agent 镜像，**不**使用旧 rc.2
+  GHCR 镜像或同名旧 dist；hub 镜像内没有 `pg_dump`/`pg_restore`/`psql`；
+- 默认 compose 仍是 SQLite，无 postgres service、无 5432/8444 发布；
+- PG overlay 用 stock `postgres:16-alpine`；本机只有 `postgres:16` 时脚本在
+  临时 override 中替换 image（不联网拉取），两个镜像都没有则明确 FAIL；
+- 密码只写 0600 secret（PG 侧 `POSTGRES_PASSWORD_FILE`，hub 侧
+  `RUSTBOARD_DATABASE_PASSWORD_FILE`）；hub/postgres 的 compose 配置与容器
+  inspect 不得出现密码明文，PG client 容器用 `PGPASSWORD` 环境变量取得密码，
+  是明确的临时例外（`--rm` 容器，结束后删除）；
+- 断言 hub.toml 为 `postgres://rustboard@postgres:5432/rustboard?sslmode=disable`，
+  且**没有** `db_sslrootcert`；5432 不发布；
+- 真实 agent enrollment 后 PG `samples` / `ingest_batches` / `agents` >0；
+  停/启 postgres+hub 后计数不减少、hub.toml 哈希不变；默认 compose 也会
+  `restart hub` 验证 config/admin_token 哈希不变；
+- 外部 `postgres:16` client 容器执行 `pg_dump -Fc` → 新库
+  `rustboard_restore` `pg_restore`，`samples` / `ingest_batches` / `agents` /
+  `schema_migrations` 计数一致，原库计数不变；密码只通过 0600 `--env-file`
+  以 `PGPASSWORD` 传递，不进 argv。
+
+已知限制：
+
+- stock compose 的 `sslmode=disable` 只适合本机/受信内网；生产必须按 §3/§3.1
+  配置 PostgreSQL 证书并改成 `verify-full` + `db_sslrootcert`。Docker 容器的
+  真实 TLS 链路见 S3 的 `tests/e2e/v100-pg-tls.sh`、本文件 §3.1 与
+  [Phase E PG TLS 方案](../plans/2026-10-26-phase-e-pg-tls.md)，不要把本
+  overlay 的 disable 结果当作生产 TLS 已验证；
+- hub 静态镜像不含 PostgreSQL client；备份/恢复必须用宿主或临时
+  `postgres:16` 容器。镜像内缺客户端是**预期行为**，不是缺陷；
+- compose 的 file secret 沿用宿主文件属主/权限。默认 root:root 0600 时，直接
+  `--user 10001:10001` 的 hub 进程读不到密码文件；e2e 的 `--user` 用例使用
+  同内容、0600 且属主 10001 的测试副本。生产若直接用 `--user`，需为该
+  secret 安排 UID 10001 可读的只读权限，或继续用默认 root 入口先完成初始化；
+- 当前单 hub 语义：e2e 不会让两个 hub 同时写同一个 PG；
+- 脚本只跑 amd64，依赖本机 Docker 与本地镜像，不进入 CI；`docker build` 的
+  `apt-get` 层可能需要网络/缓存；`--user 10001` 用例需要 root 把 0600 测试
+  密码文件 chown 到 10001；
+- 证据目录 `target/docker-pg-e2e/<UTC>-<PID>/`，失败保留，`provenance.txt`
+  记录 HEAD/dist sha256/镜像 ID；secret 在退出时**尝试**删除，删除失败计 FAIL。
+
 ## 8. 测试与排错
 
 - PG 实库测试（需要本地 PostgreSQL 16/17，登录角色需 `CREATEDB`；

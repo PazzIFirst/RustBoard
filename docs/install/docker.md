@@ -250,3 +250,94 @@ docker compose -f docker/compose.example.yml \
   5432 不发布，默认不包含 PG。PG 备份/恢复需要宿主 `pg_dump`/`pg_restore`，
   且当前为单 hub 语义。详见 [postgres.md](postgres.md) §7 与
   [docker/README.md](../../docker/README.md) §14。
+
+## 8. Phase E S4：PostgreSQL overlay e2e
+
+> **状态**：脚本与本章已落盘，截至 2026-10-26 编写环境**尚未执行**（只做了
+> `bash -n` / `shellcheck` / `git diff --check`）。下面的 PASS 条件是脚本的
+> 判定标准，不是运行结果；实际结果由 Phase E 主 Agent 在独立环境运行后回填。
+> 在拿到运行输出前，不要对外声称 S4 已通过。
+
+脚本必须带 dist 来源绑定运行（**验证码版本号不够**，同名旧 rc.2 dist 也可能
+通过 `--version`；manifest 把本次源码产物与 e2e 强绑定）：
+
+```bash
+# 主 Agent 在 S4 前用 packaging/build-release.sh --arch amd64 重建 dist，
+# 然后生成 manifest（顺序不能反；重建 dist 后必须重新生成）：
+mkdir -p target
+{
+  printf 'hub=%s\n'   "$(sha256sum dist/amd64/bin/rustboard-hub   | awk '{ print $1 }')"
+  printf 'panel=%s\n' "$(sha256sum dist/amd64/bin/rustboard-panel | awk '{ print $1 }')"
+  printf 'agent=%s\n' "$(sha256sum dist/amd64/bin/rustboard-agent | awk '{ print $1 }')"
+  printf 'web=%s\n'   "$(sha256sum web/dist/index.html             | awk '{ print $1 }')"
+} > target/dist-manifest.txt
+
+bash tests/e2e/v100-docker-pg.sh --dist-manifest target/dist-manifest.txt
+# 或：EXPECTED_DIST_SHA256='hub=... panel=... agent=... web=...' \
+#       bash tests/e2e/v100-docker-pg.sh
+```
+
+`--dist-manifest` 与 `EXPECTED_DIST_SHA256` 二选一且**必填**；缺失、格式非法或
+四个 sha256 任一与当前 dist 不符都会在 build 前 FATAL。脚本把 HEAD、四个 dist
+sha256、三个本地镜像 ID 写入 `target/docker-pg-e2e/<UTC>-<PID>/provenance.txt`
+作为来源证据。它只使用当前源码重建的 dist 与本地镜像，不联网拉取、不构建
+arm64（S5 独立）：
+
+1. 用 `dist/amd64/bin` 与 `web/dist` 构建
+   `ghcr.io/pazzifirst/rustboard-{hub,panel,agent}:local-s4`；断言 hub 镜像内
+   `rustboard-hub --version` 与当前源码一致（默认期望 `1.0.0-rc.2`），
+   `org.opencontainers.image.revision` 等于当前 HEAD，且 dist sha256 与
+   manifest 强匹配，**不是**旧 rc.2 GHCR 镜像或同名旧 dist；
+2. 断言 hub 镜像内没有 `pg_dump` / `pg_restore` / `psql`；
+3. 默认 compose（`RUSTBOARD_VERSION=local-s4`）`config` 无 postgres service、
+   无 5432/8444 发布；实跑 hub+panel healthy，hub 配置为
+   `sqlite:///data/var/lib/rustboard/hub/rustboard.db`，`hub_data` volume 内的
+   `rustboard.db` 通过 SQLite integrity/schema 检查；
+4. PG overlay（默认文件 + `docker/compose.postgres.example.yml`）启动
+   postgres+hub（含 panel）；密码只落 0600 secret；hub 配置为
+   `postgres://rustboard@postgres:5432/rustboard?sslmode=disable`，没有
+   `db_sslrootcert`，5432 不发布；管理口 `/healthz` 与 Bearer
+   `/api/v1/agents` 可用且不打印 token；
+5. 真实 agent 用一次性 token + `hub ports` 指纹启动，达到 cert-info
+   healthy/online，PG `samples` / `ingest_batches` / `agents` 均 >0；
+6. 按顺序停/启 postgres 与 hub 后，hub.toml 哈希不变、计数不减少；
+7. 已初始化 hub volume 以 `--user 10001:10001` 启动短时 hub，health 200、
+   日志无权限错误、配置哈希不变；
+8. 用外部 `postgres:16` client 容器 `pg_dump -Fc`，恢复到新库
+   `rustboard_restore` 后四张核心表计数一致，原库计数不变；
+9. 默认 SQLite 与 PG overlay 的项目、**network 与 volume 名集合**完全独立；
+10. 默认 compose `restart hub` 后 `hub.toml` 与 `admin_token` 哈希不变。
+
+运行前置：
+
+- Linux amd64、Docker 24+、compose v2+、buildx（缺失时回退 `docker build`，
+  并显式传 `--build-arg TARGETARCH=amd64`）、curl、python3；
+- 本机已有 `debian:bookworm-slim` 与 `postgres:16`（或
+  `postgres:16-alpine`）。overlay 默认 pin `postgres:16-alpine`；本机没有
+  alpine 时脚本只在临时 compose override 中改用本地 `postgres:16`，
+  **不会 pull**；两者都没有时明确 FAIL；
+- 宿主 8443/8080 空闲；脚本不会停止无关容器；
+- `docker build` 的 `apt-get` 层可能需要访问 Debian 软件源；若本机没有构建
+  缓存/网络，请预先准备好基础镜像与构建缓存。脚本本身不 pull；
+- `--user 10001` 用例需要 root 才能 `chown` 0600 测试密码文件到 10001；它使用
+  已初始化 volume，不重新安装；
+- 当前 `Cargo.toml` 版本为 `1.0.0-rc.2`。版本归档后重跑请用
+  `EXPECTED_VERSION=<新版本>`，否则 preflight 会拒绝旧 dist。
+
+成功且 cleanup 无残留时最后一行是 `全部 N 项通过`；失败、中断（HUP/INT/TERM）
+或资源残留只输出“未通过/中断”，以非 0 退出。证据（脱敏日志、计数、
+`provenance.txt`）在 `target/docker-pg-e2e/<UTC>-<PID>/`，失败保留。密码/token
+在独立 `/tmp` secret 目录，脚本退出时**尝试**删除；删除失败会计入 FAIL，且
+不会进入证据目录。hub/postgres 的 compose 配置与容器 inspect 不得出现密码
+明文；PG client 容器以 `PGPASSWORD` 环境变量取得密码，是明确的临时例外
+（`--rm` 容器）。
+
+限制：
+
+- 只验证 `linux/amd64`；多架构/arm64 由 S5 覆盖；
+- PG overlay 用 stock postgres 镜像，`sslmode=disable` 只适合本机/受信内网；
+  生产 TLS 见 [postgres.md](postgres.md) §3.1 与 §7.1；
+- hub 镜像不含 PostgreSQL client，备份/恢复必须用宿主 `postgresql-client`
+  或临时 `postgres:16` 容器；不要为了备份给镜像加包；
+- 当前是单 hub 语义，e2e 不会启动多个写同一个 PG 的 hub；
+- 该脚本依赖 Docker、固定宿主端口与本地镜像，**不进入 CI**。
