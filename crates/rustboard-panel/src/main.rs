@@ -2439,10 +2439,11 @@ fn init(
     };
     cfg.admin_password_hash =
         auth::hash_password(&password).context("生成 Argon2id 密码哈希失败")?;
-    cfg.save(&path)?;
 
-    if let Some(ca) = &prepared_ca {
-        ca.write()?;
+    // 事务：CA 先落盘，配置后落盘；配置失败回滚 CA。密码打印在事务成功之后。
+    write_init_artifacts(prepared_ca.as_ref(), || Ok(cfg.save(&path)?))?;
+
+    if let Some(_ca) = &prepared_ca {
         println!("hub CA: {}", cfg.hub_ca);
     }
 
@@ -2666,31 +2667,53 @@ struct HubInitPlan {
     ca_source: Option<PathBuf>,
 }
 
-/// 已读取并校验、等待 `cfg.save` 成功后落盘的 hub CA。
+/// 已读取并校验、待写入的 hub CA（含旧文件备份）。
 ///
-/// 分两阶段是为了满足 #39 的失败语义：`--force` 覆盖旧配置时，不能在所有
-/// 校验 / 密码哈希 / 配置写入成功之前先覆盖旧 `hub-ca.pem`，否则后续失败会
-/// 留下“旧配置 + 新 CA”或丢失旧 CA。
+/// #39 的失败语义：CA 必须先于配置文件落盘；CA 写失败时配置完全不动，配置
+/// 写失败时恢复旧 CA / 删除新 CA。这样 `--force` 不会先覆盖旧 CA 再失败，
+/// 也不会出现“配置已换、CA 还是旧的”这种半更新状态。
 struct PreparedHubCa {
     dest: PathBuf,
     bytes: Vec<u8>,
-    /// 目标文件是否在本次 init 前已存在；失败时只清理本次新建的文件。
-    dest_existed_before: bool,
+    /// 旧 CA 内容；`None` 表示目标原本不存在。回滚时写回或删除。
+    previous: Option<Vec<u8>>,
+    /// 测试注入：模拟 CA 写失败（生产构建中不存在）。
+    #[cfg(test)]
+    fail_write: bool,
 }
 
 impl PreparedHubCa {
-    /// 在密码 / 哈希 / `cfg.save` 全部成功之后写入 CA。
-    fn write(&self) -> Result<()> {
+    /// 写入新 CA；任何失败都立即回滚旧 CA。
+    fn install(&self) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_write {
+            self.rollback();
+            bail!("注入的 hub CA 写入失败");
+        }
+        if let Some(parent) = self.dest.parent() {
+            fsutil::ensure_dir(parent, 0o700)
+                .with_context(|| format!("创建 hub CA 目录失败: {}", parent.display()))?;
+        }
         if let Err(error) = fsutil::atomic_write(&self.dest, &self.bytes, 0o644) {
-            // 只删除本次新建的文件；--force 场景下已有的旧 CA 是可用的信任锚，
-            // 不能因为一次失败写入把它删掉。
-            if !self.dest_existed_before {
-                let _ = std::fs::remove_file(&self.dest);
-            }
+            // 理论上 atomic_write 失败不会改旧文件；仍显式回滚，保证“旧 CA
+            // 字节不变 / 无新 CA 残留”。
+            self.rollback();
             return Err(error)
                 .with_context(|| format!("写入 hub CA 失败: {}", self.dest.display()));
         }
         Ok(())
+    }
+
+    /// 恢复旧 CA；原本不存在则删除新 CA。失败也不覆盖原始错误。
+    fn rollback(&self) {
+        match &self.previous {
+            Some(bytes) => {
+                let _ = fsutil::atomic_write(&self.dest, bytes, 0o644);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.dest);
+            }
+        }
     }
 
     fn config_path(&self) -> Result<String> {
@@ -2699,6 +2722,25 @@ impl PreparedHubCa {
             .map(str::to_string)
             .ok_or_else(|| anyhow!("hub CA 路径不是有效 UTF-8: {}", self.dest.display()))
     }
+}
+
+/// 事务顺序：先写 CA，再保存配置；配置保存失败时恢复旧 CA / 删除新 CA。
+///
+/// 密码只在本函数成功返回后打印，因此失败路径不会输出密码。
+fn write_init_artifacts(
+    ca: Option<&PreparedHubCa>,
+    save_config: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if let Some(ca) = ca {
+        ca.install()?;
+    }
+    if let Err(error) = save_config() {
+        if let Some(ca) = ca {
+            ca.rollback();
+        }
+        return Err(error).context("写入面板配置失败");
+    }
+    Ok(())
 }
 
 /// `admin_tls=off` 时的回环 authority：`0.0.0.0` / `[::]` 转成回环地址。
@@ -2957,9 +2999,30 @@ fn prepare_hub_ca(
         }
     })?;
     let dest = hub_ca_destination(config_path)?;
-    let dest_existed_before = match std::fs::symlink_metadata(&dest) {
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+    let previous = match std::fs::symlink_metadata(&dest) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!(
+                "hub CA 目标 {} 是符号链接，拒绝覆盖；请先人工处理",
+                dest.display()
+            );
+        }
+        Ok(meta) if !meta.is_file() => {
+            bail!("hub CA 目标 {} 不是普通文件，拒绝覆盖", dest.display());
+        }
+        Ok(meta) => {
+            if meta.len() > MAX_TLS_FILE_BYTES {
+                bail!(
+                    "旧 hub CA 超过 1 MiB 上限（{} 字节）: {}",
+                    meta.len(),
+                    dest.display()
+                );
+            }
+            Some(
+                std::fs::read(&dest)
+                    .with_context(|| format!("备份旧 hub CA 失败: {}", dest.display()))?,
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(error).with_context(|| format!("检查 hub CA 目标失败: {}", dest.display()))
         }
@@ -2967,7 +3030,9 @@ fn prepare_hub_ca(
     Ok(Some(PreparedHubCa {
         dest,
         bytes,
-        dest_existed_before,
+        previous,
+        #[cfg(test)]
+        fail_write: false,
     }))
 }
 
@@ -5589,7 +5654,7 @@ mod tests {
             "prepare 阶段只读取校验，不能在 cfg.save 前写 CA"
         );
 
-        prepared.write().unwrap();
+        prepared.install().unwrap();
         assert_eq!(
             std::fs::read(&copied_path).unwrap(),
             std::fs::read(&source).unwrap(),
@@ -5644,20 +5709,103 @@ mod tests {
         assert!(format!("{error:#}").contains("https://"));
     }
 
-    /// #39：CA 落盘失败时不得删除 --force 场景下已有的旧 CA。
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// #39：注入 CA 写失败——旧 CA / 旧配置字节不变，且不保存新配置。
     #[test]
-    fn prepared_hub_ca_write_failure_keeps_existing_target() {
+    fn init_ca_write_failure_keeps_old_ca_and_config() {
         let dir = TempSite::new();
         let dest = dir.dir.join("hub-ca.pem");
-        // 目录让原子 rename 失败，模拟落盘失败；已有目标必须保留。
-        std::fs::create_dir(&dest).unwrap();
+        let config_path = dir.dir.join("panel.toml");
+        std::fs::write(&dest, b"old-ca-bytes").unwrap();
+        std::fs::write(&config_path, b"old-config-bytes").unwrap();
         let prepared = PreparedHubCa {
             dest: dest.clone(),
-            bytes: b"-----BEGIN CERTIFICATE-----\n".to_vec(),
-            dest_existed_before: true,
+            bytes: b"new-ca-bytes".to_vec(),
+            previous: Some(b"old-ca-bytes".to_vec()),
+            fail_write: true,
         };
-        assert!(prepared.write().is_err(), "写入目录必须失败");
-        assert!(dest.is_dir(), "失败时不得删除已有目标");
+
+        let mut saved = false;
+        let error = write_init_artifacts(Some(&prepared), || {
+            saved = true;
+            std::fs::write(&config_path, b"new-config-bytes").unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!saved, "CA 写失败时不得保存配置");
+        assert!(format!("{error:#}").contains("注入"), "{error:#}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old-ca-bytes");
+        assert_eq!(std::fs::read(&config_path).unwrap(), b"old-config-bytes");
+        assert!(
+            file_names(&dir.dir)
+                .iter()
+                .all(|name| !name.starts_with('.')),
+            "失败后不得残留临时文件"
+        );
+    }
+
+    /// #39：注入 cfg.save 失败——恢复旧 CA 字节，旧配置不变。
+    #[test]
+    fn init_config_save_failure_restores_old_ca() {
+        let dir = TempSite::new();
+        let dest = dir.dir.join("hub-ca.pem");
+        let config_path = dir.dir.join("panel.toml");
+        std::fs::write(&dest, b"old-ca-bytes").unwrap();
+        std::fs::write(&config_path, b"old-config-bytes").unwrap();
+        let prepared = PreparedHubCa {
+            dest: dest.clone(),
+            bytes: b"new-ca-bytes".to_vec(),
+            previous: Some(b"old-ca-bytes".to_vec()),
+            fail_write: false,
+        };
+
+        let error = write_init_artifacts(Some(&prepared), || Err(anyhow!("注入的配置保存失败")))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("配置保存失败"), "{error:#}");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"old-ca-bytes",
+            "cfg.save 失败必须恢复旧 CA 字节"
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), b"old-config-bytes");
+        assert!(
+            file_names(&dir.dir)
+                .iter()
+                .all(|name| !name.starts_with('.')),
+            "失败后不得残留临时文件"
+        );
+    }
+
+    /// #39：原本没有 CA 时 cfg.save 失败——删除新 CA，无残留。
+    #[test]
+    fn init_config_save_failure_removes_new_ca() {
+        let dir = TempSite::new();
+        let dest = dir.dir.join("hub-ca.pem");
+        let prepared = PreparedHubCa {
+            dest: dest.clone(),
+            bytes: b"new-ca-bytes".to_vec(),
+            previous: None,
+            fail_write: false,
+        };
+
+        assert!(
+            write_init_artifacts(Some(&prepared), || Err(anyhow!("注入的配置保存失败"))).is_err()
+        );
+        assert!(!dest.exists(), "cfg.save 失败必须删除新 CA");
+        assert!(
+            file_names(&dir.dir)
+                .iter()
+                .all(|name| !name.starts_with('.')),
+            "失败后不得残留临时文件"
+        );
     }
 
     /// #39：无效 CA 在写配置前失败；--force 场景下不得覆盖旧 CA。
