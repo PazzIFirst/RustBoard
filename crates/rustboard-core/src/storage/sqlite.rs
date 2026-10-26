@@ -2266,9 +2266,10 @@ impl Storage for SqliteStorage {
         metric: &str,
         since: i64,
         agent: Option<&str>,
+        filter_labels: &Labels,
         limit: usize,
     ) -> Result<AlertSeriesSnapshot> {
-        SqliteStorage::latest_alert_series(self, metric, since, agent, limit)
+        SqliteStorage::latest_alert_series(self, metric, since, agent, filter_labels, limit)
     }
 
     fn apply_alert_transitions(&self, events: &[AlertEvent], states: &[AlertState]) -> Result<()> {
@@ -2954,7 +2955,11 @@ const ALERT_EVENT_INSERT_SQL: &str = "INSERT INTO alert_events
          notify_error, silenced)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
 
-/// 插入或整行更新一条状态；单条 upsert 与批量事务共用。
+/// 插入或更新一条状态；单条 upsert 与批量事务共用。
+///
+/// `last_notified_at` 只由新插入行携带（引擎的新序列为 NULL），冲突分支
+/// **绝不覆盖**：通知时间归 [`SqliteStorage::update_alert_state_notified`] 独占，
+/// 避免“引擎读旧快照 → worker 写通知时间 → 引擎提交”把冷却锚点冲掉。
 const ALERT_STATE_UPSERT_SQL: &str = "INSERT INTO alert_states
         (rule_id, agent_id, series_key, state, since, last_eval_at, last_value,
          last_notified_at)
@@ -2963,8 +2968,7 @@ const ALERT_STATE_UPSERT_SQL: &str = "INSERT INTO alert_states
         state = excluded.state,
         since = excluded.since,
         last_eval_at = excluded.last_eval_at,
-        last_value = excluded.last_value,
-        last_notified_at = excluded.last_notified_at";
+        last_value = excluded.last_value";
 
 /// B2 `notify_error` 的存储上限（字节）；B2 的错误信息也只能是脱敏后的摘要。
 const MAX_ALERT_NOTIFY_ERROR_BYTES: usize = 512;
@@ -2988,10 +2992,15 @@ const ALERT_STATE_PRUNE_FOR_RULE_SQL: &str = "DELETE FROM alert_states
          ORDER BY (state = 'resolved') ASC, last_eval_at DESC, rowid DESC LIMIT ?2
      )";
 
-/// 构造 `latest_alert_series` 的 SQL；`has_agent` 只影响占位符数量。
+/// 构造 `latest_alert_series` 的 SQL；`has_agent` / `filter_labels` 只影响
+/// 占位符数量与过滤子句。
+///
+/// 标签过滤是**精确子集**：每个过滤标签生成一个参数化的
+/// `EXISTS (SELECT 1 FROM json_each(samples.labels) ...)`，在 `ROW_NUMBER` 与
+/// `LIMIT` 之前生效。键与值只作为绑定参数传入，绝不拼接到 SQL 字符串里。
 ///
 /// 单独抽出来是为了 EXPLAIN QUERY PLAN 测试能断言走 `(metric, ts)` 索引。
-fn latest_alert_series_sql(has_agent: bool) -> String {
+fn latest_alert_series_sql(has_agent: bool, filter_labels: &Labels) -> String {
     // 索引名来自固定分支；`INDEXED BY` 保证无统计信息时也走预期索引，避免
     // 优化器误选 `idx_samples_ts` 后逐行过滤 metric（全窗口扫描）。
     let index = if has_agent {
@@ -3008,10 +3017,23 @@ fn latest_alert_series_sql(has_agent: bool) -> String {
              FROM samples INDEXED BY {index}
              WHERE metric = ?1 AND ts >= ?2"
     );
+    let mut next_param = 3;
     if has_agent {
-        sql.push_str(" AND agent_id = ?");
+        sql.push_str(&format!(" AND agent_id = ?{next_param}"));
+        next_param += 1;
     }
-    sql.push_str(") WHERE rn = 1 ORDER BY agent_id ASC, labels ASC LIMIT ?");
+    for _ in filter_labels {
+        let key_param = next_param;
+        let value_param = next_param + 1;
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM json_each(samples.labels) AS filter_label \
+             WHERE filter_label.key = ?{key_param} AND filter_label.value = ?{value_param})"
+        ));
+        next_param += 2;
+    }
+    sql.push_str(&format!(
+        ") WHERE rn = 1 ORDER BY agent_id ASC, labels ASC LIMIT ?{next_param}"
+    ));
     sql
 }
 
@@ -3183,7 +3205,9 @@ impl SqliteStorage {
             .optional()?)
     }
 
-    /// 插入或整行更新一条告警状态（主键冲突时覆盖状态、时间与值）。
+    /// 插入或更新一条告警状态：冲突时覆盖状态、时间与值，但**保留**
+    /// 库中已有的 `last_notified_at`（由通知 worker 独占；新行按传入值写入，
+    /// 引擎构造的新序列为 NULL）。
     pub fn upsert_alert_state(&self, state: &AlertState) -> Result<()> {
         self.lock_write().execute(
             ALERT_STATE_UPSERT_SQL,
@@ -3439,14 +3463,12 @@ impl SqliteStorage {
     /// 语义：
     /// - 只查 `samples` 原始表，**不回退** 1m / 1h（旧桶不能当当前值）；
     /// - 只取 `ts >= since` 的样本；
+    /// - `filter_labels` 是精确子集，SQL 侧用参数化 `json_each` 下推，先过滤再
+    ///   做 `ROW_NUMBER` / 排序 / `LIMIT`，因此截断只作用于匹配的序列；
     /// - 每个 `(agent_id, labels)` 取 `ts` 最大的一行，同 `ts` 取 `rowid` 最大；
     /// - `agent` 为 `Some` 时只查该 agent；
     /// - SQL 侧向数据库要 `limit + 1` 行：拿到 `limit + 1` 条就说明还有更多序列，
     ///   返回前 `limit` 条并置 `truncated = true`，**不返回 QueryTooLarge**。
-    ///
-    /// 注意：labels 过滤由引擎在返回后完成，因此截断发生在过滤之前。某一 metric
-    /// 的序列基数远超上限时，即使规则带较窄的 `filter_labels` 也可能漏评估；
-    /// 应优先用 `filter_agent_id` 收窄，或拆分 metric。
     ///
     /// `limit == 0` 返回空快照且 `truncated = true`（有数据也不返回）。
     pub fn latest_alert_series(
@@ -3454,6 +3476,7 @@ impl SqliteStorage {
         metric: &str,
         since: i64,
         agent: Option<&str>,
+        filter_labels: &Labels,
         limit: usize,
     ) -> Result<AlertSeriesSnapshot> {
         if limit == 0 {
@@ -3463,13 +3486,17 @@ impl SqliteStorage {
             });
         }
         let conn = self.lock_read();
-        let sql = latest_alert_series_sql(agent.is_some());
+        let sql = latest_alert_series_sql(agent.is_some(), filter_labels);
         let mut params: Vec<rusqlite::types::Value> = vec![
             rusqlite::types::Value::Text(metric.to_string()),
             rusqlite::types::Value::Integer(since),
         ];
         if let Some(agent_id) = agent {
             params.push(rusqlite::types::Value::Text(agent_id.to_string()));
+        }
+        for (key, value) in filter_labels {
+            params.push(rusqlite::types::Value::Text(key.clone()));
+            params.push(rusqlite::types::Value::Text(value.clone()));
         }
         // 多取一条用于判断是否被截断；溢出时退回 usize::MAX 会被 SQLite 当成
         // 极大值处理，实际不可能有那么多序列。
@@ -8395,16 +8422,32 @@ mod tests {
             Some(state.clone())
         );
 
+        // 通知时间由 notify_worker 的专用 UPDATE 独占写入。
+        assert!(s
+            .update_alert_state_notified("rule-1", "agent-1", "series-1", 1_500)
+            .unwrap());
+
+        // 引擎持有的是旧快照（last_notified_at = Some(2_050)）：冲突分支必须
+        // 保留库中的 1_500，其余状态机字段照常覆盖。
         state.state = AlertStateKind::Firing;
         state.since = 2_000;
         state.last_eval_at = 2_100;
         state.last_value = None;
         state.last_notified_at = Some(2_050);
         s.upsert_alert_state(&state).unwrap();
+        let stored = s
+            .get_alert_state("rule-1", "agent-1", "series-1")
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            s.get_alert_state("rule-1", "agent-1", "series-1").unwrap(),
-            Some(state.clone()),
-            "upsert 必须覆盖状态、时间与值"
+            stored.last_notified_at,
+            Some(1_500),
+            "upsert 冲突分支不得覆盖 worker 写入的 last_notified_at"
+        );
+        state.last_notified_at = Some(1_500);
+        assert_eq!(
+            stored, state,
+            "upsert 仍必须覆盖状态、时间与值（通知时间除外）"
         );
 
         let mut second = alert_state("rule-1", "agent-2", "");
@@ -8412,6 +8455,14 @@ mod tests {
         second.since = 500;
         second.last_eval_at = 500;
         s.upsert_alert_state(&second).unwrap();
+        // 新插入行的 last_notified_at 仍按传入值写入（引擎新序列为 NULL）。
+        assert_eq!(
+            s.get_alert_state("rule-1", "agent-2", "")
+                .unwrap()
+                .unwrap()
+                .last_notified_at,
+            None
+        );
         let states = s.list_alert_states().unwrap();
         assert_eq!(states.len(), 2);
         assert_eq!(states[0], state, "按 (rule, agent, series) 稳定排序");
@@ -8616,7 +8667,7 @@ mod tests {
         seed_metric_sample(&s, "a3", 7, Labels::new(), 500, 99.0);
 
         let snapshot = s
-            .latest_alert_series("disk.used_percent", 1_000, None, 10)
+            .latest_alert_series("disk.used_percent", 1_000, None, &Labels::new(), 10)
             .unwrap();
         assert!(!snapshot.truncated);
         assert_eq!(snapshot.rows.len(), 3);
@@ -8637,25 +8688,25 @@ mod tests {
 
         // limit+1 探测：3 条序列、limit=2 → 只回 2 条且 truncated。
         let bounded = s
-            .latest_alert_series("disk.used_percent", 1_000, None, 2)
+            .latest_alert_series("disk.used_percent", 1_000, None, &Labels::new(), 2)
             .unwrap();
         assert!(bounded.truncated);
         assert_eq!(bounded.rows.len(), 2);
         // limit=0 不返回数据。
         let empty = s
-            .latest_alert_series("disk.used_percent", 1_000, None, 0)
+            .latest_alert_series("disk.used_percent", 1_000, None, &Labels::new(), 0)
             .unwrap();
         assert!(empty.truncated);
         assert!(empty.rows.is_empty());
 
         // agent 过滤与 since 过滤。
         let a2 = s
-            .latest_alert_series("disk.used_percent", 1_000, Some("a2"), 10)
+            .latest_alert_series("disk.used_percent", 1_000, Some("a2"), &Labels::new(), 10)
             .unwrap();
         assert_eq!(a2.rows.len(), 1);
         assert_eq!(a2.rows[0].agent_id, "a2");
         let recent = s
-            .latest_alert_series("disk.used_percent", 2_600, None, 10)
+            .latest_alert_series("disk.used_percent", 2_600, None, &Labels::new(), 10)
             .unwrap();
         assert_eq!(recent.rows.len(), 1);
         assert_eq!(recent.rows[0].ts, 3_000);
@@ -8665,12 +8716,121 @@ mod tests {
         s.downsample_1m_range(100_000, 200_000).unwrap();
         s.prune_samples_before(200_000).unwrap();
         let raw_only = s
-            .latest_alert_series("disk.used_percent", 0, None, 10)
+            .latest_alert_series("disk.used_percent", 0, None, &Labels::new(), 10)
             .unwrap();
         assert!(
             raw_only.rows.is_empty(),
             "raw-only 查询不得回退到 1m: {raw_only:?}"
         );
+    }
+
+    /// 标签过滤必须下推到 SQL：5001 条序列时，排序最后的目标序列在 `limit=1`
+    /// 下仍能被找到；多标签、空过滤、无匹配、特殊键值与注入字符串都只作为
+    /// 参数绑定。
+    #[test]
+    fn m4_b1b_latest_alert_series_pushes_label_filter_before_limit() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let now = 1_700_000_000_000;
+
+        // 前 5000 条与目标无关的序列；目标序列按 (agent_id, labels) 排在最后。
+        let bulk: Vec<Sample> = (0..5_000)
+            .map(|index| {
+                let mut labels = Labels::new();
+                labels.insert("instance".into(), format!("bulk-{index:04}"));
+                Sample {
+                    metric: "disk.used_percent".into(),
+                    labels,
+                    ts: now - 1_000,
+                    value: 10.0,
+                }
+            })
+            .collect();
+        s.insert_batch(&SampleBatch {
+            agent_id: "a0".into(),
+            epoch: 1,
+            seq: 1,
+            boot_id: "boot".into(),
+            sent_at: now,
+            samples: bulk,
+        })
+        .unwrap();
+
+        let mut target_labels = Labels::new();
+        target_labels.insert("__proto__".into(), "x'; DROP TABLE samples; --".into());
+        target_labels.insert("path".into(), "a\"b\\c\n中文".into());
+        target_labels.insert("empty".into(), "".into());
+        target_labels.insert("weird\"key\\name".into(), "值".into());
+        target_labels.insert("z".into(), "target".into());
+        s.insert_batch(&SampleBatch {
+            agent_id: "z-target".into(),
+            epoch: 1,
+            seq: 1,
+            boot_id: "boot".into(),
+            sent_at: now,
+            samples: vec![Sample {
+                metric: "disk.used_percent".into(),
+                labels: target_labels.clone(),
+                ts: now - 1_000,
+                value: 95.0,
+            }],
+        })
+        .unwrap();
+
+        // 多标签精确子集；`__proto__` 是普通 JSON 键，值里的引号 / 分号只作为
+        // 绑定参数，不参与 SQL 拼接。
+        let mut filter = Labels::new();
+        filter.insert("__proto__".into(), "x'; DROP TABLE samples; --".into());
+        filter.insert("weird\"key\\name".into(), "值".into());
+        filter.insert("z".into(), "target".into());
+        let filtered = s
+            .latest_alert_series("disk.used_percent", 0, None, &filter, 1)
+            .unwrap();
+        assert!(!filtered.truncated, "过滤后只剩目标序列，不应触发截断");
+        assert_eq!(filtered.rows.len(), 1);
+        assert_eq!(filtered.rows[0].agent_id, "z-target");
+        assert_eq!(filtered.rows[0].labels, target_labels);
+        assert!((filtered.rows[0].value - 95.0).abs() < 1e-9);
+
+        // 证明目标确实是全量排序的第 5001 条，而不是数据本来就少。
+        let all = s
+            .latest_alert_series("disk.used_percent", 0, None, &Labels::new(), 10_000)
+            .unwrap();
+        assert_eq!(all.rows.len(), 5_001);
+        assert_eq!(all.rows.last().unwrap().labels, target_labels);
+
+        // 空过滤等价于不过滤，limit 仍作用于过滤后的全量集合。
+        let first_ten = s
+            .latest_alert_series("disk.used_percent", 0, None, &Labels::new(), 10)
+            .unwrap();
+        assert!(first_ten.truncated);
+        assert_eq!(first_ten.rows.len(), 10);
+
+        // 无匹配 / 多标签部分不匹配都返回空快照，且不标记截断。
+        let mut missing = Labels::new();
+        missing.insert("z".into(), "missing".into());
+        let no_match = s
+            .latest_alert_series("disk.used_percent", 0, None, &missing, 10)
+            .unwrap();
+        assert!(!no_match.truncated);
+        assert!(no_match.rows.is_empty());
+
+        let mut partial = filter.clone();
+        partial.insert("path".into(), "wrong".into());
+        let no_partial = s
+            .latest_alert_series("disk.used_percent", 0, None, &partial, 10)
+            .unwrap();
+        assert!(!no_partial.truncated);
+        assert!(no_partial.rows.is_empty());
+
+        // 注入样式的过滤键也只是参数：表结构完好、原数据仍在。
+        let mut injected = Labels::new();
+        injected.insert("k'; DROP TABLE samples; --".into(), "v".into());
+        let injected_snapshot = s
+            .latest_alert_series("disk.used_percent", 0, None, &injected, 10)
+            .unwrap();
+        assert!(injected_snapshot.rows.is_empty());
+        assert_eq!(s.sample_count("a0").unwrap(), 5_000);
+        assert_eq!(s.sample_count("z-target").unwrap(), 1);
     }
 
     /// 单事务批量写：事件与状态一起落库，空批次是 no-op。
@@ -8982,28 +9142,33 @@ mod tests {
             .is_empty());
     }
 
-    /// 告警 raw 查询必须走 `(metric, ts)` / `(agent, metric, ts)` 索引，不能全表扫描。
+    /// 告警 raw 查询必须走 `(metric, ts)` / `(agent, metric, ts)` 索引，不能全表扫描；
+    /// 标签过滤通过相关 `json_each` 子查询下推后，索引选择不能被破坏。
     #[test]
     fn m4_b1b_latest_alert_series_uses_index_without_full_scan() {
         let s = SqliteStorage::open_in_memory().unwrap();
         let conn = s.lock_read();
+        let mut filters = Labels::new();
+        filters.insert("mount".into(), "/".into());
+        filters.insert("__proto__".into(), "x".into());
         let plan_for = |has_agent: bool| -> Vec<String> {
-            let sql = format!("EXPLAIN QUERY PLAN {}", latest_alert_series_sql(has_agent));
+            let sql = format!(
+                "EXPLAIN QUERY PLAN {}",
+                latest_alert_series_sql(has_agent, &filters)
+            );
             let mut stmt = conn.prepare(&sql).unwrap();
-            let values: Vec<rusqlite::types::Value> = if has_agent {
-                vec![
-                    rusqlite::types::Value::Text("disk.used_percent".into()),
-                    rusqlite::types::Value::Integer(0),
-                    rusqlite::types::Value::Text("a1".into()),
-                    rusqlite::types::Value::Integer(10),
-                ]
-            } else {
-                vec![
-                    rusqlite::types::Value::Text("disk.used_percent".into()),
-                    rusqlite::types::Value::Integer(0),
-                    rusqlite::types::Value::Integer(10),
-                ]
-            };
+            let mut values: Vec<rusqlite::types::Value> = vec![
+                rusqlite::types::Value::Text("disk.used_percent".into()),
+                rusqlite::types::Value::Integer(0),
+            ];
+            if has_agent {
+                values.push(rusqlite::types::Value::Text("a1".into()));
+            }
+            for (key, value) in &filters {
+                values.push(rusqlite::types::Value::Text(key.clone()));
+                values.push(rusqlite::types::Value::Text(value.clone()));
+            }
+            values.push(rusqlite::types::Value::Integer(10));
             stmt.query_map(rusqlite::params_from_iter(values), |row| {
                 row.get::<_, String>(3)
             })

@@ -3014,7 +3014,7 @@ fn downsample_1m_and_1h_parity() {
 
     // 告警评估快照必须 raw-only：有 1m/1h 数据也不能回退。
     let (pg_alert_snapshot, sq_alert_snapshot) = both(&fx, |s| {
-        s.latest_alert_series("cpu.usage", 1_000_000, None, 10)
+        s.latest_alert_series("cpu.usage", 1_000_000, None, &Labels::new(), 10)
             .unwrap()
     });
     assert_eq!(
@@ -3981,7 +3981,8 @@ fn query_boundaries_and_special_values_parity() {
 
     // latest_alert_series：raw-only 快照，按 (agent_id, labels) 排序，limit 截断。
     let (pg_snapshot, sq_snapshot) = both(&fx, |s| {
-        s.latest_alert_series("cpu.usage", 0, None, 100).unwrap()
+        s.latest_alert_series("cpu.usage", 0, None, &Labels::new(), 100)
+            .unwrap()
     });
     assert_eq!(
         pg_snapshot.truncated, sq_snapshot.truncated,
@@ -3995,7 +3996,7 @@ fn query_boundaries_and_special_values_parity() {
     assert_eq!(pg_snapshot.rows.len(), 3);
     assert!(!pg_snapshot.truncated);
     let (pg_snapshot_agent, sq_snapshot_agent) = both(&fx, |s| {
-        s.latest_alert_series("cpu.usage", 1_000, Some("q1"), 100)
+        s.latest_alert_series("cpu.usage", 1_000, Some("q1"), &Labels::new(), 100)
             .unwrap()
     });
     assert_agent_series_eq(
@@ -4006,7 +4007,7 @@ fn query_boundaries_and_special_values_parity() {
     assert_eq!(pg_snapshot_agent.rows.len(), 2);
     assert!(!pg_snapshot_agent.truncated);
     let (pg_snapshot_limit, sq_snapshot_limit) = both(&fx, |s| {
-        s.latest_alert_series("cpu.usage", 1_000, Some("q1"), 1)
+        s.latest_alert_series("cpu.usage", 1_000, Some("q1"), &Labels::new(), 1)
             .unwrap()
     });
     assert_eq!(pg_snapshot_limit.rows.len(), 1);
@@ -4020,6 +4021,47 @@ fn query_boundaries_and_special_values_parity() {
         &pg_snapshot_limit.rows,
         &sq_snapshot_limit.rows,
     );
+
+    // 标签过滤必须在 LIMIT 之前生效：core=0 只有 1 条，limit=1 不应截断；
+    // 多标签特殊值、`__proto__` / 无匹配都必须与 SQLite 一致。
+    let core_zero = labels(&[("core", "0")]);
+    let (pg_snapshot_filter, sq_snapshot_filter) = both(&fx, |s| {
+        s.latest_alert_series("cpu.usage", 0, None, &core_zero, 1)
+            .unwrap()
+    });
+    assert_eq!(
+        pg_snapshot_filter.truncated, sq_snapshot_filter.truncated,
+        "过滤后 limit 截断标记必须一致"
+    );
+    assert!(!pg_snapshot_filter.truncated);
+    assert_eq!(pg_snapshot_filter.rows.len(), 1);
+    assert_agent_series_eq(
+        "latest_alert_series 标签过滤先于 limit",
+        &pg_snapshot_filter.rows,
+        &sq_snapshot_filter.rows,
+    );
+
+    let mut special_filter = Labels::new();
+    special_filter.insert("path".into(), "/".into());
+    special_filter.insert("tag".into(), "a\"b\\c\n中文".into());
+    let (pg_snapshot_special, sq_snapshot_special) = both(&fx, |s| {
+        s.latest_alert_series("mem.used", 0, None, &special_filter, 10)
+            .unwrap()
+    });
+    assert_eq!(pg_snapshot_special.rows.len(), 1);
+    assert_agent_series_eq(
+        "latest_alert_series 多标签特殊字符",
+        &pg_snapshot_special.rows,
+        &sq_snapshot_special.rows,
+    );
+
+    let proto_missing = labels(&[("__proto__", "x")]);
+    let (pg_snapshot_missing, sq_snapshot_missing) = both(&fx, |s| {
+        s.latest_alert_series("cpu.usage", 0, None, &proto_missing, 10)
+            .unwrap()
+    });
+    assert!(!pg_snapshot_missing.truncated && !sq_snapshot_missing.truncated);
+    assert!(pg_snapshot_missing.rows.is_empty() && sq_snapshot_missing.rows.is_empty());
 
     // SQL 注入字符串只作为值：表结构完好，后续写入 / 查询仍然正常。
     let (pg_intact, sq_intact) = both(&fx, |s| {

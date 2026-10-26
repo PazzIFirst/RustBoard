@@ -7,9 +7,11 @@
 //! 规则语义（与方案 §6.1–6.3 一致）：
 //! - `metric`：查 `now - max(evaluation_interval * 3, 60s)` 窗口内的最新 **raw**
 //!   样本，按 `filter_agent_id` / `filter_labels`（精确子集）过滤，每个序列独立
-//!   状态。**只读 raw、不回退 1m/1h**：旧聚合桶的 `last_value` 不能当当前值，
-//!   否则会产生误触发 / 误恢复；每规则最多 [`MAX_ALERT_SERIES_PER_RULE`] 条序列，
-//!   超出时截断并 WARN，绝不因为行数过多跳过整条规则；
+//!   状态。标签过滤**下推到存储 SQL**，先过滤再截断，因此大量不相关序列不会
+//!   挤占单规则上限。**只读 raw、不回退 1m/1h**：旧聚合桶的 `last_value` 不能
+//!   当当前值，否则会产生误触发 / 误恢复；每规则最多
+//!   [`MAX_ALERT_SERIES_PER_RULE`] 条序列，超出时截断并 WARN，绝不因为行数
+//!   过多跳过整条规则；
 //! - `agent_offline`：`now - agents.last_seen_at` 与阈值（秒）比较；每个 agent
 //!   一条状态（`series_key` 为空），已吊销 agent 跳过；
 //! - `hub_cert`：读取 `cfg.data_dir/certs/server.crt` 的剩余**小时数**
@@ -192,6 +194,32 @@ fn evaluate_with_options<F>(
 where
     F: Fn(&HubConfig) -> Result<i64>,
 {
+    evaluate_with_options_after_load(
+        storage,
+        cfg,
+        now,
+        cert_hours,
+        max_series_per_rule,
+        budget,
+        &mut |_, _| {},
+    )
+}
+
+/// 与 [`evaluate_with_options`] 相同，但在每条规则**加载完既有状态之后**调用
+/// `after_states_loaded`。生产路径传空闭包；测试用 `Barrier` 在这里固定
+/// “引擎读旧快照 → notify_worker 写通知时间 → 引擎提交” 的交错。
+fn evaluate_with_options_after_load<F>(
+    storage: &StorageHandle,
+    cfg: &HubConfig,
+    now: i64,
+    cert_hours: F,
+    max_series_per_rule: usize,
+    budget: Duration,
+    after_states_loaded: &mut dyn FnMut(&StorageHandle, &AlertRule),
+) -> Result<EvaluationReport>
+where
+    F: Fn(&HubConfig) -> Result<i64>,
+{
     let started = Instant::now();
     let rules = storage.list_enabled_alert_rules()?;
     let rule_count = rules.len().min(MAX_ALERT_RULES);
@@ -230,6 +258,8 @@ where
             report.states_evicted +=
                 storage.prune_alert_states_for_rule(&rule.id, MAX_ALERT_STATES_PER_RULE)?;
         }
+        // 测试注入点：此时旧状态已读入内存，尚未查询观测值 / 提交新状态。
+        after_states_loaded(storage, rule);
         let mut evaluator = RuleEvaluator::new(rule, now, &silences, existing_states);
         let mut budget_hit = false;
 
@@ -242,6 +272,7 @@ where
                     &rule.metric,
                     since,
                     rule.filter_agent_id.as_deref(),
+                    &rule.filter_labels,
                     max_series_per_rule,
                 ) {
                     Ok(snapshot) => snapshot,
@@ -267,9 +298,6 @@ where
                             budget_hit = true;
                             report.series_skipped_budget += snapshot.rows.len() - row_index;
                             break;
-                        }
-                        if !alerts::labels_match_filter(&rule.filter_labels, &row.labels) {
-                            continue;
                         }
                         let key = alerts::series_key(&row.metric, &row.labels);
                         evaluator.observe(&row.agent_id, &key, row.value);
@@ -828,6 +856,84 @@ mod tests {
         assert_eq!(storage.list_alert_events(10, None).unwrap().len(), 2);
     }
 
+    /// 回归 #31：5001 条序列、目标排最后；标签过滤必须在截断前下推，否则
+    /// `limit=5000` 会先吃掉前 5000 条无关序列，目标永远不会被评估。
+    #[test]
+    fn m4_b1b_metric_rule_finds_5001st_series_with_label_filter() {
+        let storage = StorageHandle::sqlite_memory().unwrap();
+        let cfg = test_cfg();
+        let now = 1_700_000_000_000;
+        let mut disk = metric_rule("filter-last", 90.0, 0);
+        disk.filter_labels.insert("z".into(), "target".into());
+        store(&storage, &disk);
+
+        let bulk: Vec<Sample> = (0..5_000)
+            .map(|index| {
+                let mut labels = Labels::new();
+                labels.insert("instance".into(), format!("bulk-{index:04}"));
+                Sample {
+                    metric: "disk.used_percent".into(),
+                    labels,
+                    ts: now - 1_000,
+                    value: 95.0,
+                }
+            })
+            .collect();
+        storage
+            .insert_batch(&SampleBatch {
+                agent_id: "a0".into(),
+                epoch: 1,
+                seq: 1,
+                boot_id: "boot".into(),
+                sent_at: now,
+                samples: bulk,
+            })
+            .unwrap();
+        let mut target_labels = Labels::new();
+        target_labels.insert("z".into(), "target".into());
+        storage
+            .insert_batch(&SampleBatch {
+                agent_id: "z-target".into(),
+                epoch: 1,
+                seq: 1,
+                boot_id: "boot".into(),
+                sent_at: now,
+                samples: vec![Sample {
+                    metric: "disk.used_percent".into(),
+                    labels: target_labels.clone(),
+                    ts: now - 1_000,
+                    value: 95.0,
+                }],
+            })
+            .unwrap();
+
+        let report = evaluate_once(&storage, &cfg, now).unwrap();
+        assert_eq!(report.series_evaluated, 1, "过滤后只应评估目标序列");
+        assert_eq!(report.firing_events, 1, "第 5001 条目标序列必须触发");
+        assert_eq!(report.truncated_rules, 0, "过滤后不足上限，不应截断");
+        let target_key = alerts::series_key("disk.used_percent", &target_labels);
+        let state = storage
+            .get_alert_state(&disk.id, "z-target", &target_key)
+            .unwrap()
+            .expect("目标序列必须有状态");
+        assert_eq!(state.state, AlertStateKind::Firing);
+        // 无关的 5000 条即使也超阈值，也不能被评估 / 落状态。
+        let bulk_labels = {
+            let mut labels = Labels::new();
+            labels.insert("instance".into(), "bulk-0000".into());
+            labels
+        };
+        assert!(storage
+            .get_alert_state(
+                &disk.id,
+                "a0",
+                &alerts::series_key("disk.used_percent", &bulk_labels)
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(storage.list_alert_events(10, None).unwrap().len(), 1);
+    }
+
     /// metric：duration 未满只更新 pending，满后触发一次。
     #[test]
     fn m4_b1b_metric_rule_waits_for_duration() {
@@ -914,6 +1020,11 @@ mod tests {
             95.0,
         );
         assert_eq!(evaluate_once(&storage, &cfg, now).unwrap().firing_events, 1);
+        let series = alerts::series_key("disk.used_percent", &Labels::new());
+        // 通知 worker 写入冷却锚点；resolve / re-fire 都不能把它冲掉。
+        assert!(storage
+            .update_alert_state_notified("flap", "a1", &series, now)
+            .unwrap());
 
         let resolved_at = now + 15_000;
         seed_sample(
@@ -937,6 +1048,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state.state, AlertStateKind::Resolved);
+        assert_eq!(
+            state.last_notified_at,
+            Some(now),
+            "resolve 写入不得冲掉通知时间"
+        );
 
         let retrigger_at = resolved_at + 15_000;
         seed_sample(
@@ -950,6 +1066,15 @@ mod tests {
         );
         let report = evaluate_once(&storage, &cfg, retrigger_at).unwrap();
         assert_eq!(report.firing_events, 1);
+        let state = storage
+            .get_alert_state("flap", "a1", &series)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.last_notified_at,
+            Some(now),
+            "re-fire 写入不得冲掉冷却锚点"
+        );
 
         let events = storage.list_alert_events(10, None).unwrap();
         assert_eq!(events.len(), 3);
@@ -957,6 +1082,123 @@ mod tests {
         assert_eq!(events[0].state, AlertStateKind::Firing);
         assert_eq!(events[1].state, AlertStateKind::Resolved);
         assert_eq!(events[2].state, AlertStateKind::Firing);
+    }
+
+    /// 回归 #30：引擎读到旧快照（last_notified_at = NULL）后，worker 在提交前
+    /// 写入 T；引擎的 upsert 冲突分支必须保留 T，随后 firing 通知必须按 T 冷却。
+    #[tokio::test]
+    async fn m4_b1b_worker_notified_at_survives_engine_commit_and_cooldown() {
+        use std::sync::{Arc, Barrier};
+
+        use crate::notify::MockNotifier;
+        use crate::notify_worker::{initialize_notify_cursor, notify_once};
+
+        let storage = StorageHandle::sqlite_memory().unwrap();
+        let cfg = test_cfg();
+        let now = 1_700_000_000_000;
+        let rule = metric_rule("notify-race", 90.0, 0);
+        store(&storage, &rule);
+
+        let series = alerts::series_key("disk.used_percent", &Labels::new());
+        storage
+            .upsert_alert_state(&AlertState {
+                rule_id: rule.id.clone(),
+                agent_id: "a1".into(),
+                series_key: series.clone(),
+                state: AlertStateKind::Firing,
+                since: now - 60_000,
+                last_eval_at: now - 15_000,
+                last_value: Some(95.0),
+                last_notified_at: None,
+            })
+            .unwrap();
+        seed_sample(
+            &storage,
+            1,
+            "a1",
+            "disk.used_percent",
+            Labels::new(),
+            now - 1_000,
+            95.0,
+        );
+
+        let worker_storage = storage.clone();
+        let engine_read = Barrier::new(2);
+        let worker_wrote = Barrier::new(2);
+        let notified_at = now;
+        let report = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                engine_read.wait();
+                assert!(worker_storage
+                    .update_alert_state_notified("notify-race", "a1", &series, notified_at)
+                    .unwrap());
+                worker_wrote.wait();
+            });
+            evaluate_with_options_after_load(
+                &storage,
+                &cfg,
+                now,
+                |_| Ok(0),
+                MAX_ALERT_SERIES_PER_RULE,
+                round_budget(&cfg),
+                &mut |_storage, _rule| {
+                    // 引擎已读完旧状态；放 worker 写 T，并等它提交后再继续。
+                    engine_read.wait();
+                    worker_wrote.wait();
+                },
+            )
+            .unwrap()
+        });
+        assert_eq!(report.state_writes, 1);
+        let state = storage
+            .get_alert_state(&rule.id, "a1", &series)
+            .unwrap()
+            .expect("状态必须存在");
+        assert_eq!(
+            state.last_notified_at,
+            Some(notified_at),
+            "引擎提交不得覆盖 worker 写入的 last_notified_at"
+        );
+        assert_eq!(state.state, AlertStateKind::Firing);
+        assert_eq!(state.last_eval_at, now, "其余状态机字段仍应推进");
+
+        // 新 firing 事件：T 仍在冷却窗口内，worker 必须跳过且不发送。
+        let cursor = initialize_notify_cursor(&storage, now).unwrap();
+        storage
+            .insert_alert_event(&AlertEvent {
+                id: 0,
+                ts: now,
+                rule_id: rule.id.clone(),
+                rule_name: rule.name.clone(),
+                agent_id: "a1".into(),
+                series_key: series.clone(),
+                state: AlertStateKind::Firing,
+                value: Some(95.0),
+                message: "冷却测试事件".into(),
+                notified: false,
+                notify_error: String::new(),
+                silenced: false,
+            })
+            .unwrap();
+        let mock = Arc::new(MockNotifier::new());
+        let cycle = notify_once(Arc::new(storage.clone()), mock.clone(), cursor, now + 1_000)
+            .await
+            .unwrap();
+        assert_eq!(cycle.skipped, 1, "冷却窗口内必须跳过");
+        assert_eq!(cycle.sent, 0);
+        assert_eq!(mock.send_count(), 0, "冷却中不能发送通知");
+        let event = storage.list_alert_events(10, None).unwrap();
+        assert_eq!(event.len(), 1);
+        assert_eq!(event[0].notify_error, "cooldown");
+        assert_eq!(
+            storage
+                .get_alert_state(&rule.id, "a1", &series)
+                .unwrap()
+                .unwrap()
+                .last_notified_at,
+            Some(notified_at),
+            "冷却判定不能改写 worker 的时间"
+        );
     }
 
     /// 无样本 / 证书读取失败不得把 firing 误判成 resolved。

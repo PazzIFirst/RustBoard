@@ -503,11 +503,16 @@ pub trait Storage: Send + Sync {
     fn prune_alert_states_for_rule(&self, rule_id: &str, keep: usize) -> Result<usize>;
 
     /// 告警评估专用的 raw-only 最新序列快照；达到 `limit` 时截断并标记。
+    ///
+    /// `filter_labels` 是精确子集：序列的 labels 必须包含其中每一对。过滤在
+    /// `ROW_NUMBER` / 排序 / `LIMIT` **之前**完成，因此截断只作用于匹配的序列，
+    /// 不会因为大量不相关序列先占满上限而漏掉目标序列。
     fn latest_alert_series(
         &self,
         metric: &str,
         since: i64,
         agent: Option<&str>,
+        filter_labels: &Labels,
         limit: usize,
     ) -> Result<AlertSeriesSnapshot>;
 
