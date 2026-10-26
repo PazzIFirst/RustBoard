@@ -27,3 +27,8 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# #42 测试：本地起 TLS 服务端验证「TLS 完成但不回 101」的 deadline。
+# 该 crate 已在 Cargo.lock（hub/panel 使用），不引入新依赖。
+tokio-rustls = { workspace = true }

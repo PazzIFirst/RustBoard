@@ -428,6 +428,19 @@ pub struct AgentConfig {
     /// 否则超长会话会错过续签窗口。范围 1–168。
     #[serde(default = "default_cert_check_interval_hours")]
     pub cert_check_interval_hours: u64,
+    /// 建连总超时（秒）：DNS 解析、TCP connect、TLS 握手与 WebSocket HTTP 101
+    /// 共用同一个 deadline。默认 10，范围 1–60；旧配置缺该字段时使用默认值。
+    ///
+    /// 超时属于可重试错误，会进入现有的指数退避重连。
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// 是否允许用明文 `ws://` 连接非回环 hub（默认 false）。
+    ///
+    /// 回环地址（`127.0.0.0/8`、`::1`、`localhost`）始终允许；其他主机必须
+    /// 显式开启。明文会暴露 enrollment token、agent secret 与采样数据，
+    /// 只应在开发 / 隔离网络使用；生产环境请改用 `wss://`。
+    #[serde(default)]
+    pub allow_insecure_ws: bool,
     /// 单批最多多少条采样点。
     pub max_batch_samples: usize,
     /// M3 控制面配置；默认全部关闭，旧配置无需新增任何字段。
@@ -454,6 +467,8 @@ impl Default for AgentConfig {
             session_max_hours: default_session_max_hours(),
             send_timeout_secs: default_send_timeout_secs(),
             cert_check_interval_hours: default_cert_check_interval_hours(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            allow_insecure_ws: false,
             max_batch_samples: 512,
             control: ControlConfig::default(),
         }
@@ -506,14 +521,18 @@ impl AgentConfig {
                     }
                 }
             }
-        } else if self.tls_mode != AgentTlsMode::Fingerprint {
+        } else {
             // 明文 ws:// 不构建 TLS connector：system-roots / custom-ca 的 CA
             // 与主机名校验会被完全忽略，必须拒绝，避免「配置了 CA 却明文传输」。
-            return Err(Error::InvalidConfig(format!(
-                "hub_url 为明文 ws:// 时只能使用 tls_mode=fingerprint；\
-                 {} 必须使用 wss://（否则 CA/主机名校验会被忽略）",
-                self.tls_mode.as_str()
-            )));
+            if self.tls_mode != AgentTlsMode::Fingerprint {
+                return Err(Error::InvalidConfig(format!(
+                    "hub_url 为明文 ws:// 时只能使用 tls_mode=fingerprint；\
+                     {} 必须使用 wss://（否则 CA/主机名校验会被忽略）",
+                    self.tls_mode.as_str()
+                )));
+            }
+            // #48：明文只允许回环；非回环必须显式 opt-in。
+            self.validate_plaintext_ws_policy()?;
         }
         // server_ca 只在 custom-ca 下有语义：其他模式携带非空 CA 会在运行时被
         // 静默忽略，必须在配置层拒绝（install/init 复用同一校验）。
@@ -557,9 +576,139 @@ impl AgentConfig {
                 self.cert_check_interval_hours
             )));
         }
+        // 建连超时必须覆盖 DNS/TCP/TLS/101：0 会立即失败，过大则黑洞地址长期挂起。
+        if !(MIN_CONNECT_TIMEOUT_SECS..=MAX_CONNECT_TIMEOUT_SECS)
+            .contains(&self.connect_timeout_secs)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "connect_timeout_secs 必须在 {MIN_CONNECT_TIMEOUT_SECS}–\
+                 {MAX_CONNECT_TIMEOUT_SECS} 秒之间，实际 {}",
+                self.connect_timeout_secs
+            )));
+        }
         self.control.validate()?;
         Ok(())
     }
+
+    /// 校验 `ws://` 明文连接策略（#48）。
+    ///
+    /// - 回环地址（`127.0.0.0/8`、`::1`、`localhost`）默认允许；
+    /// - 非回环地址必须显式 `allow_insecure_ws = true`；
+    /// - `wss://` 不受影响。
+    ///
+    /// 错误信息只包含主机名，绝不回显 URL 中的凭据或 token。
+    pub fn validate_plaintext_ws_policy(&self) -> Result<()> {
+        if !self.hub_url.starts_with("ws://") {
+            return Ok(());
+        }
+        let (host, _port) = ws_url_host_port(&self.hub_url)?;
+        if self.allow_insecure_ws || is_loopback_host(&host) {
+            return Ok(());
+        }
+        Err(Error::InvalidConfig(format!(
+            "hub_url 为明文 ws:// 且主机 {host:?} 不是回环地址；必须改用 wss://，\
+             或显式设置 allow_insecure_ws = true（仅限开发 / 隔离网络：\
+             明文会泄露 token 与采样数据）"
+        )))
+    }
+}
+
+/// 判断主机名是否属于允许明文连接的回环地址。
+///
+/// 只认 `localhost`（不区分大小写，不接受 `localhost.` 等变体）、
+/// `127.0.0.0/8` 与 IPv6 `::1`；域名解析结果不参与判断（避免 DNS rebinding
+/// 把策略检查变成一次网络请求）。
+pub fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.octets()[0] == 127,
+        Ok(IpAddr::V6(v6)) => v6.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+/// UTF-8 主机名允许的最大字符数（DNS 单标签上限 63、完整域名 253 字节）。
+const MAX_WS_URL_HOST_CHARS: usize = 253;
+
+/// 从 `ws://` / `wss://` URL 中解析主机与端口（仅用于建连与明文策略）。
+///
+/// 不引入额外 URL 依赖；只解析 authority 部分，支持 userinfo（会被忽略以
+/// 避免把凭据带到日志/错误里）、IPv6 方括号与显式端口。默认端口按 scheme
+/// 取 80 / 443。路径、查询串与 fragment 不参与解析。
+pub fn ws_url_host_port(url: &str) -> Result<(String, u16)> {
+    let (rest, default_port) = if let Some(rest) = url.strip_prefix("wss://") {
+        (rest, 443u16)
+    } else if let Some(rest) = url.strip_prefix("ws://") {
+        (rest, 80u16)
+    } else {
+        return Err(Error::InvalidConfig(
+            "hub_url 必须以 ws:// 或 wss:// 开头".into(),
+        ));
+    };
+    // authority 到第一个 / ? # 为止；userinfo 取最后一个 @ 之后，避免把
+    // token/password 打进错误信息。
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    if authority.is_empty() {
+        return Err(Error::InvalidConfig("hub_url 缺少主机名".into()));
+    }
+    if authority
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(Error::InvalidConfig(
+            "hub_url 的主机名不能包含空白或控制字符".into(),
+        ));
+    }
+
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6：必须闭合方括号，之后只能是空或 :port。
+        let Some(end) = rest.find(']') else {
+            return Err(Error::InvalidConfig("hub_url 的 IPv6 地址缺少 ]".into()));
+        };
+        let host = &rest[..end];
+        let tail = &rest[end + 1..];
+        let port = if tail.is_empty() {
+            default_port
+        } else {
+            let raw = tail
+                .strip_prefix(':')
+                .ok_or_else(|| Error::InvalidConfig("hub_url 的 IPv6 地址后只能跟端口".into()))?;
+            parse_ws_port(raw)?
+        };
+        (host, port)
+    } else if let Some((host, raw_port)) = authority.rsplit_once(':') {
+        if host.is_empty() {
+            return Err(Error::InvalidConfig("hub_url 缺少主机名".into()));
+        }
+        (host, parse_ws_port(raw_port)?)
+    } else {
+        (authority, default_port)
+    };
+
+    if host.is_empty() {
+        return Err(Error::InvalidConfig("hub_url 缺少主机名".into()));
+    }
+    if host.chars().count() > MAX_WS_URL_HOST_CHARS {
+        return Err(Error::InvalidConfig(format!(
+            "hub_url 主机名超过 {MAX_WS_URL_HOST_CHARS} 字符上限"
+        )));
+    }
+    Ok((host.to_string(), port))
+}
+
+fn parse_ws_port(raw: &str) -> Result<u16> {
+    raw.parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| Error::InvalidConfig(format!("hub_url 端口非法: {raw}")))
 }
 
 /// agent 端控制面配置。对应 `agent.toml` 的 `[control]`。
@@ -2692,6 +2841,11 @@ const MIN_SEND_TIMEOUT_SECS: u64 = 1;
 const MAX_SEND_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_SEND_TIMEOUT_SECS: u64 = 15;
 
+/// agent 建连总超时的允许范围与默认值（秒），覆盖 DNS/TCP/TLS/101。
+const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
+const MAX_CONNECT_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
 fn default_cert_renew_before_days() -> u32 {
     30
 }
@@ -2706,6 +2860,10 @@ fn default_send_timeout_secs() -> u64 {
 
 fn default_cert_check_interval_hours() -> u64 {
     6
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    DEFAULT_CONNECT_TIMEOUT_SECS
 }
 
 fn default_session_ttl_hours() -> u64 {
@@ -3338,6 +3496,178 @@ mod tests {
                 "错误信息应包含字段名: {err}"
             );
             assert!(err.contains("1–120"), "错误信息应包含范围: {err}");
+        }
+    }
+
+    /// #42：建连总超时默认 10 秒，闭区间 1–60；旧配置缺字段走默认。
+    #[test]
+    fn v100_agent_connect_timeout_defaults_and_bounds() {
+        let cfg: AgentConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.connect_timeout_secs, 10);
+        assert_eq!(AgentConfig::default().connect_timeout_secs, 10);
+
+        // 旧配置没有该字段：必须使用默认值且能启动。
+        let old: AgentConfig = toml::from_str(
+            "hub_url = \"wss://hub.example.com:8443/agent/ws\"\nserver_fingerprint = \"ab\"\n",
+        )
+        .unwrap();
+        assert_eq!(old.connect_timeout_secs, 10);
+        old.validate()
+            .expect("旧配置缺 connect_timeout_secs 必须能启动");
+
+        let explicit: AgentConfig = toml::from_str("connect_timeout_secs = 30\n").unwrap();
+        assert_eq!(explicit.connect_timeout_secs, 30);
+        explicit.validate().expect("30 秒必须合法");
+
+        for secs in [1, 60] {
+            let cfg = AgentConfig {
+                connect_timeout_secs: secs,
+                ..AgentConfig::default()
+            };
+            cfg.validate()
+                .unwrap_or_else(|err| panic!("{secs} 秒必须合法: {err}"));
+        }
+
+        for secs in [0, 61] {
+            let cfg = AgentConfig {
+                connect_timeout_secs: secs,
+                ..AgentConfig::default()
+            };
+            let err = cfg
+                .validate()
+                .expect_err(&format!("{secs} 秒必须被拒绝"))
+                .to_string();
+            assert!(
+                err.contains("connect_timeout_secs"),
+                "错误信息应包含字段名: {err}"
+            );
+            assert!(err.contains("1–60"), "错误信息应包含范围: {err}");
+        }
+    }
+
+    /// #48：ws:// 默认只允许回环；非回环必须显式 allow_insecure_ws；wss 不变，
+    /// ws + custom-ca/system-roots 仍然拒绝。
+    #[test]
+    fn v100_agent_plaintext_ws_requires_loopback_or_explicit_opt_in() {
+        let base = || AgentConfig {
+            token: "super-secret-token".to_string(),
+            ..AgentConfig::default()
+        };
+
+        for url in [
+            "ws://127.0.0.1:8443/agent/ws",
+            "ws://127.42.0.9:8443/agent/ws",
+            "ws://[::1]:8443/agent/ws",
+            "ws://localhost:8443/agent/ws",
+            "ws://LOCALHOST/agent/ws",
+        ] {
+            let cfg = AgentConfig {
+                hub_url: url.to_string(),
+                ..base()
+            };
+            cfg.validate()
+                .unwrap_or_else(|err| panic!("{url} 属于回环，必须允许: {err}"));
+        }
+
+        for url in [
+            "ws://hub.example.com:8443/agent/ws",
+            "ws://10.0.0.5:8443/agent/ws",
+            "ws://[::2]:8443/agent/ws",
+            "ws://127.0.0.1.nip.io:8443/agent/ws",
+        ] {
+            let cfg = AgentConfig {
+                hub_url: url.to_string(),
+                ..base()
+            };
+            let err = cfg
+                .validate()
+                .expect_err(&format!("{url} 非回环，默认必须拒绝"))
+                .to_string();
+            assert!(
+                err.contains("allow_insecure_ws") && err.contains("ws://"),
+                "错误信息必须给出 opt-in 指引: {err}"
+            );
+            assert!(
+                !err.contains("super-secret-token"),
+                "错误信息不得泄露 token: {err}"
+            );
+
+            // 显式 opt-in 后放行。
+            let opted = AgentConfig {
+                allow_insecure_ws: true,
+                ..cfg
+            };
+            opted
+                .validate()
+                .unwrap_or_else(|err| panic!("{url} opt-in 后必须允许: {err}"));
+        }
+
+        // wss 行为不变：默认允许（fingerprint 需要非空指纹）。
+        let wss = AgentConfig {
+            hub_url: "wss://hub.example.com:8443/agent/ws".to_string(),
+            server_fingerprint: "ab".repeat(32),
+            ..base()
+        };
+        assert!(!wss.allow_insecure_ws);
+        wss.validate().expect("wss 不得受 allow_insecure_ws 影响");
+
+        // ws + custom-ca/system-roots：即使 opt-in 也必须拒绝（CA 校验会被忽略）。
+        for mode in [AgentTlsMode::CustomCa, AgentTlsMode::SystemRoots] {
+            let cfg = AgentConfig {
+                hub_url: "ws://127.0.0.1:8443/agent/ws".to_string(),
+                tls_mode: mode,
+                allow_insecure_ws: true,
+                ..base()
+            };
+            let err = cfg
+                .validate()
+                .expect_err("ws + 非 fingerprint 必须拒绝")
+                .to_string();
+            assert!(
+                err.contains("ws://") && err.contains("fingerprint"),
+                "错误信息: {err}"
+            );
+        }
+
+        // URL 缺少主机名：即使 opt-in 也不能放行。
+        let missing_host = AgentConfig {
+            hub_url: "ws:///agent/ws".to_string(),
+            allow_insecure_ws: true,
+            ..base()
+        };
+        assert!(missing_host.validate().is_err(), "缺少主机名必须报错");
+    }
+
+    /// #48：建连用的 authority 解析覆盖默认端口、userinfo、IPv6 与非法输入。
+    #[test]
+    fn v100_ws_url_host_port_parsing() {
+        assert_eq!(
+            ws_url_host_port("ws://127.0.0.1/agent/ws").unwrap(),
+            ("127.0.0.1".to_string(), 80)
+        );
+        assert_eq!(
+            ws_url_host_port("wss://hub.example.com/agent/ws").unwrap(),
+            ("hub.example.com".to_string(), 443)
+        );
+        assert_eq!(
+            ws_url_host_port("ws://[::1]:9000/agent/ws").unwrap(),
+            ("::1".to_string(), 9000)
+        );
+        // userinfo 必须被丢弃：不能进入错误信息或日志。
+        assert_eq!(
+            ws_url_host_port("ws://user:pass@hub.example.com:81/x").unwrap(),
+            ("hub.example.com".to_string(), 81)
+        );
+
+        for bad in [
+            "http://host/x",
+            "ws:///x",
+            "ws://:8443/x",
+            "ws://host:/x",
+            "ws://host:0/x",
+            "ws://host:port/x",
+        ] {
+            assert!(ws_url_host_port(bad).is_err(), "非法 URL 必须报错: {bad}");
         }
     }
 
