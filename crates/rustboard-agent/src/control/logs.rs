@@ -208,8 +208,8 @@ fn tail_journal(
     }
     let tool = exec::resolve_tool(&cfg.journalctl_path, "journalctl")?;
     let lines_arg = max_lines.to_string();
-    // `--reverse` 让 journalctl 按新→旧输出；`exec::run` 的 `read_capped` 只保留
-    // 前 256 KiB，此时留下的正好是最新内容，而不是最旧内容。
+    // `--reverse` 让 journalctl 按新→旧输出；`exec::run` 只保留前 256 KiB，
+    // 此时留下的正好是最新内容，而不是最旧内容。
     let output = exec::run(
         &tool,
         &[
@@ -1229,8 +1229,8 @@ mod tests {
     fn journal_tail_keeps_newest_lines_when_output_is_truncated() {
         let _guard = exec::test_serial_guard();
         let dir = temp_dir("journal-big");
-        // 新→旧输出 line-1000…line-1，每行约 1 KiB，总量约 1 MiB；read_capped
-        // 只保留前 256 KiB，即最新的一批行。
+        // 新→旧输出 line-1000…line-1，每行约 1 KiB，总量约 1 MiB；
+        // exec::run 只保留前 256 KiB，即最新的一批行。
         let script = write_script(
             &dir,
             "journalctl",
