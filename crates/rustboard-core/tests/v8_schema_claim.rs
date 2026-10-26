@@ -490,10 +490,17 @@ fn archive_retryable_objects_are_v8_only_and_failures_increment_attempts() {
         .claim_archive_rows(&object, &rows)
         .expect("claim 失败");
 
-    // v7 旧对象即使 pending 也不得进入 v8 重试列表。
+    // v7 旧对象即使 pending 也不得进入 v8 重试列表，也不能补写 bytes/sha。
     let mut legacy = claim_object("v7/part-00001.csv.gz", &rows);
     legacy.ledger_version = LEDGER_VERSION_V7;
     let legacy_id = storage.insert_archive_object(&legacy).unwrap();
+    let error = storage
+        .update_archive_object_metadata(legacy_id, 1, &"f".repeat(64))
+        .expect_err("v7 对象不得补写 v8 元数据");
+    assert_eq!(
+        error.downcast_ref::<ArchiveStoreError>(),
+        Some(&ArchiveStoreError::InvalidTransition)
+    );
 
     let retryable = storage
         .list_retryable_archive_objects(10, None)

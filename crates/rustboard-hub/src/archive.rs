@@ -32,9 +32,10 @@ use anyhow::{bail, Context, Result};
 use rustboard_common::config::{ArchiveBackend, ArchiveConfig, HubConfig};
 use rustboard_common::util::now_ms;
 use rustboard_core::archive::{
-    build_v8_object_keys, manifest_json, parse_object_key_shard, ArchiveDay, ArchiveError,
-    ArchiveManifest, ArchiveObject, ArchiveObjectKeys, ArchiveStatus, ArchiveStoreError, ColdStore,
-    CsvArchiveOutput, CsvArchiveWriter, LEDGER_VERSION_V8, MAX_ARCHIVE_SHARD,
+    build_v8_object_keys, is_v8_object_key, manifest_json, parse_object_key_shard, ArchiveDay,
+    ArchiveError, ArchiveManifest, ArchiveObject, ArchiveObjectKeys, ArchiveStatus,
+    ArchiveStoreError, ColdStore, CsvArchiveOutput, CsvArchiveWriter, LEDGER_VERSION_V8,
+    MAX_ARCHIVE_SHARD,
 };
 use rustboard_core::downsample::ArchiveGate;
 use rustboard_core::storage::sqlite::ArchiveRawRow;
@@ -888,7 +889,22 @@ async fn retry_pending_objects(
 
         for object in page {
             after_id = Some(object.id);
+            // 旧 v7 对象没有 claim 行集，绝不能按行重建，也不改它的记录。
             if object.ledger_version != LEDGER_VERSION_V8 {
+                tracing::warn!(
+                    object_id = object.id,
+                    ledger_version = object.ledger_version,
+                    "归档重试列表出现非 v8 对象，跳过且保持原记录"
+                );
+                continue;
+            }
+            // retry 前校验 key 形状：只允许标准 `part-NNNNN-v8` 对象 / manifest。
+            if !is_v8_object_key(&object.object_key) || !is_v8_object_key(&object.manifest_key) {
+                record_failure(storage, object.id, "invalid_key").await;
+                tracing::warn!(
+                    object_id = object.id,
+                    "归档重试对象 key 不是合法 v8 形状，标记 failed 后跳过"
+                );
                 continue;
             }
             let rows_storage = storage.clone();
@@ -899,12 +915,13 @@ async fn retry_pending_objects(
             .await?;
             if rows.is_empty() || rows.len() as u64 != object.rows {
                 record_failure(storage, object.id, "rows_missing").await;
-                bail!(
-                    "归档对象 {} 的 claim 行集缺失（期望 {} 行，实际 {} 行），无法重建",
-                    object.id,
-                    object.rows,
-                    rows.len()
+                tracing::warn!(
+                    object_id = object.id,
+                    expected_rows = object.rows,
+                    actual_rows = rows.len(),
+                    "归档对象 claim 行集缺失，标记 failed 后跳过，避免阻塞其它对象"
                 );
+                continue;
             }
 
             let output = build_csv(&rows)?;
@@ -1515,6 +1532,63 @@ mod tests {
             uploaded.get(&objects[1].object_key),
             Some(&late_expected.data)
         );
+    }
+
+    #[tokio::test]
+    async fn rows_missing_is_recorded_and_skipped_without_blocking_other_objects() {
+        let storage = StorageHandle::sqlite_memory().unwrap();
+        let mock = MockDav::spawn().await;
+        let store = WebdavColdStore::new(&mock.config()).unwrap();
+        let cfg = test_cfg();
+
+        // A 的行集随后会被误删；B 的行集保留；C 是之后到达的未认领行。
+        insert_raw_rows_with_seq(&storage, ARCHIVE_DAY_START + HOUR_MS, &[1.0, 2.0], 1);
+        insert_raw_rows_with_seq(&storage, ARCHIVE_DAY_START + 3 * HOUR_MS, &[3.0, 4.0], 2);
+        let rows = unclaimed_rows(&storage, 10);
+        assert_eq!(rows.len(), 4);
+        let a_id = claim_pending_for_test(&storage, &rows[..2], "part-00001", TEST_NOW - 20);
+        let b_id = claim_pending_for_test(&storage, &rows[2..], "part-00002", TEST_NOW - 10);
+
+        // 模拟已 claim 的 A 行被误删；旧 retention 直接按 ts 删除。
+        let pruned = storage
+            .prune_samples_before(ARCHIVE_DAY_START + 3 * HOUR_MS)
+            .unwrap();
+        assert_eq!(pruned.deleted, 2, "只删除 A 的两行");
+        insert_raw_rows_with_seq(&storage, ARCHIVE_DAY_START + 5 * HOUR_MS, &[5.0], 3);
+
+        // 不能因为 A 行集缺失而整轮失败：A 记 rows_missing 后继续 B 与 C。
+        let report = run_archive_once_with_limits(&storage, &cfg, &store, TEST_NOW, 10)
+            .await
+            .expect("rows_missing 不得阻塞其它对象");
+        assert_eq!(report.objects, 2, "B 重试上传 + C 新对象");
+
+        let mut objects = storage.list_archive_objects(10, None).unwrap();
+        objects.sort_by_key(|object| object.id);
+        assert_eq!(objects.len(), 3);
+        let a = objects.iter().find(|object| object.id == a_id).unwrap();
+        assert_eq!(a.status, ArchiveStatus::Failed);
+        assert_eq!(a.error, "rows_missing");
+        assert_eq!(a.attempts, 1);
+        let b = objects.iter().find(|object| object.id == b_id).unwrap();
+        assert_eq!(b.status, ArchiveStatus::Uploaded);
+        assert_eq!(b.attempts, 0);
+        let c = objects
+            .iter()
+            .find(|object| object.id != a_id && object.id != b_id)
+            .unwrap();
+        assert!(c.object_key.ends_with("part-00003-v8.csv.gz"));
+        assert_eq!(c.status, ArchiveStatus::Uploaded);
+        assert_eq!(c.rows, 1);
+        assert_eq!(storage.raw_stats().unwrap().rows, 3, "B 行 + C 行仍保留");
+
+        // 失败对象下一轮仍会记录一次失败并跳过，但不会卡死 B/C。
+        let report = run_archive_once_with_limits(&storage, &cfg, &store, TEST_NOW, 10)
+            .await
+            .expect("下一轮仍不得因 rows_missing 失败");
+        assert_eq!(report.objects, 0);
+        let a = storage.get_archive_object(a_id).unwrap().unwrap();
+        assert_eq!(a.error, "rows_missing");
+        assert_eq!(a.attempts, 2);
     }
 
     #[tokio::test]

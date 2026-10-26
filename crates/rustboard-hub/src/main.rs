@@ -2789,13 +2789,14 @@ const MAX_ARCHIVE_DOWNLOAD_PRINCIPALS: usize = 1024;
 const ARCHIVE_DOWNLOAD_SEND_TIMEOUT: Duration = Duration::from_secs(120);
 /// `archive_objects.error` 允许透传的固定错误码；其它内容（可能来自人工改库 /
 /// 旧版本）一律收敛为 `archive_error`，避免把 URL 或后端正文带到 API。
-const ARCHIVE_OBJECT_ERROR_CODES: [&str; 6] = [
+const ARCHIVE_OBJECT_ERROR_CODES: [&str; 7] = [
     "invalid_key",
     "invalid_manifest",
     "invalid_status",
     "encode_failed",
     "backend_unavailable",
     "not_found",
+    "rows_missing",
 ];
 
 /// 归档对象列表响应：`objects` 按 id 倒序，`next_before_id` 是下一页排他游标。
@@ -2821,6 +2822,10 @@ struct ArchiveObjectView {
     created_at: i64,
     uploaded_at: Option<i64>,
     deleted_at: Option<i64>,
+    /// failed 重试次数（v8 claim 对象；旧 v7 对象为 0）。
+    attempts: i64,
+    /// 对象 claim 行集已缺失，无法再重建上传（error = `rows_missing`）。
+    rows_missing: bool,
     /// 是否可下载：状态就绪且对象大小未超过固定 64 MiB 下载上限。
     downloadable: bool,
 }
@@ -2838,6 +2843,7 @@ fn archive_object_downloadable(object: &ArchiveObject) -> bool {
 impl From<ArchiveObject> for ArchiveObjectView {
     fn from(object: ArchiveObject) -> Self {
         let downloadable = archive_object_downloadable(&object);
+        let rows_missing = object.error == "rows_missing";
         Self {
             id: object.id,
             object_key: object.object_key,
@@ -2852,6 +2858,8 @@ impl From<ArchiveObject> for ArchiveObjectView {
             created_at: object.created_at,
             uploaded_at: object.uploaded_at,
             deleted_at: object.deleted_at,
+            attempts: object.attempts,
+            rows_missing,
             downloadable,
         }
     }
@@ -11694,6 +11702,8 @@ mod tests {
         assert_eq!(objects[0]["rows"], 42);
         assert_eq!(objects[0]["bytes"], 128);
         assert_eq!(objects[0]["sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(objects[0]["attempts"], 0);
+        assert_eq!(objects[0]["rows_missing"], false);
         assert!(
             objects[0].get("backend").is_none(),
             "列表不返回 backend 字段"
@@ -11743,6 +11753,32 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "query={query}");
             assert_eq!(json_body(&body)["error"], "bad_request", "query={query}");
         }
+    }
+
+    /// R1a-2：对象视图暴露 attempts 与 rows_missing，固定错误码不被掩码。
+    #[test]
+    fn archive_object_view_exposes_rows_missing_and_attempts() {
+        let mut object = archive_object_record(
+            "rustboard/2026/10/24/part-00001-v8.csv.gz",
+            ArchiveStatus::Failed,
+            "rows_missing",
+        );
+        object.attempts = 3;
+        let view = ArchiveObjectView::from(object);
+        assert_eq!(view.attempts, 3);
+        assert!(view.rows_missing);
+        assert_eq!(view.error, "rows_missing");
+        assert!(!view.downloadable);
+
+        let mut other = archive_object_record(
+            "rustboard/2026/10/24/part-00002-v8.csv.gz",
+            ArchiveStatus::Failed,
+            "backend_unavailable",
+        );
+        other.attempts = 1;
+        let view = ArchiveObjectView::from(other);
+        assert!(!view.rows_missing);
+        assert_eq!(view.error, "backend_unavailable");
     }
 
     /// M4-C2b：下载 200 的响应头与字节；走真实 router + mock WebDAV。

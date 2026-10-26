@@ -4904,7 +4904,7 @@ impl SqliteStorage {
                 .ok_or_else(|| anyhow::anyhow!("archive_objects.status 字段值非法"))?,
             None => return Err(ArchiveStoreError::NotFound.into()),
         };
-        if !current.can_transition_to(ArchiveStatus::Failed) {
+        if !matches!(current, ArchiveStatus::Pending | ArchiveStatus::Failed) {
             return Err(ArchiveStoreError::InvalidTransition.into());
         }
         tx.execute(
@@ -5113,19 +5113,21 @@ impl SqliteStorage {
         let bytes = i64::try_from(bytes).context("归档对象字节数超出 SQLite INTEGER 范围")?;
         let mut conn = self.lock_write();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let status: Option<String> = tx
+        let object: Option<(i64, String)> = tx
             .query_row(
-                "SELECT status FROM archive_objects WHERE id = ?1",
+                "SELECT ledger_version, status FROM archive_objects WHERE id = ?1",
                 params![id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let Some(status) = status else {
+        let Some((ledger_version, status)) = object else {
             return Err(ArchiveStoreError::NotFound.into());
         };
         let status = ArchiveStatus::parse(&status)
             .ok_or_else(|| anyhow::anyhow!("archive_objects.status 字段值非法"))?;
-        if !matches!(status, ArchiveStatus::Pending | ArchiveStatus::Failed) {
+        if ledger_version != LEDGER_VERSION_V8
+            || !matches!(status, ArchiveStatus::Pending | ArchiveStatus::Failed)
+        {
             return Err(ArchiveStoreError::InvalidTransition.into());
         }
         tx.execute(

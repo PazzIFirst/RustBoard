@@ -924,7 +924,7 @@ impl PostgresStorage {
             };
             let current = ArchiveStatus::parse(&current)
                 .ok_or_else(|| anyhow!("archive_objects.status 字段值非法"))?;
-            if !current.can_transition_to(ArchiveStatus::Failed) {
+            if !matches!(current, ArchiveStatus::Pending | ArchiveStatus::Failed) {
                 return Err(ArchiveStoreError::InvalidTransition.into());
             }
             tx.execute(
@@ -1142,19 +1142,21 @@ impl PostgresStorage {
         let bytes = i64::try_from(bytes).context("归档对象字节数超出 BIGINT 范围")?;
         self.with_client(|client| {
             let mut tx = client.transaction().context("开启归档元数据更新事务失败")?;
-            let status: Option<String> = tx
+            let object: Option<(i64, String)> = tx
                 .query_opt(
-                    "SELECT status FROM archive_objects WHERE id = $1 FOR UPDATE",
+                    "SELECT ledger_version, status FROM archive_objects WHERE id = $1 FOR UPDATE",
                     &[&id],
                 )
                 .context("读取归档对象状态失败")?
-                .map(|row| row.get(0));
-            let Some(status) = status else {
+                .map(|row| (row.get(0), row.get(1)));
+            let Some((ledger_version, status)) = object else {
                 return Err(ArchiveStoreError::NotFound.into());
             };
             let status = ArchiveStatus::parse(&status)
                 .ok_or_else(|| anyhow!("archive_objects.status 字段值非法"))?;
-            if !matches!(status, ArchiveStatus::Pending | ArchiveStatus::Failed) {
+            if ledger_version != LEDGER_VERSION_V8
+                || !matches!(status, ArchiveStatus::Pending | ArchiveStatus::Failed)
+            {
                 return Err(ArchiveStoreError::InvalidTransition.into());
             }
             tx.execute(
@@ -2216,6 +2218,31 @@ mod tests {
         let err = storage
             .record_archive_attempt(object_id)
             .expect_err("uploaded 后不得再记录尝试");
+        assert_eq!(
+            err.downcast_ref::<ArchiveStoreError>(),
+            Some(&ArchiveStoreError::InvalidTransition)
+        );
+
+        // uploaded 不得被迟到的失败记录翻回 failed（双 worker 竞态防线）。
+        let err = storage
+            .record_archive_object_failure(object_id, "backend_unavailable")
+            .expect_err("uploaded 后不得记录失败");
+        assert_eq!(
+            err.downcast_ref::<ArchiveStoreError>(),
+            Some(&ArchiveStoreError::InvalidTransition)
+        );
+
+        // v7 旧对象没有 claim 行集，禁止补写 v8 元数据。
+        let mut legacy = archive_object("v7/old.csv.gz", 1_000, 2_000, ArchiveStatus::Pending);
+        legacy.ledger_version = crate::archive::LEDGER_VERSION_V7;
+        legacy.bytes = 0;
+        legacy.sha256.clear();
+        let legacy_id = storage
+            .insert_archive_object(&legacy)
+            .expect("插入 v7 对象失败");
+        let err = storage
+            .update_archive_object_metadata(legacy_id, 1, &"f".repeat(64))
+            .expect_err("v7 对象不得补写 v8 元数据");
         assert_eq!(
             err.downcast_ref::<ArchiveStoreError>(),
             Some(&ArchiveStoreError::InvalidTransition)
