@@ -3,6 +3,8 @@
 > 日期：2026-10-26｜基线：S2 工具 `1cd56d9`；S4 使用当前源码重建的
 > amd64 静态产物（dist 由 `packaging/build-release.sh` 生成，version 仍为
 > `1.0.0-rc.2`，发布时统一升 1.0.0）。
+> 状态：**已完成**，`v100-docker-pg.sh` **104/104** 通过（1 项 arm64 SKIP），
+> 证据 `target/docker-pg-e2e/20261026t133124z-3736044/`。
 > 关联：[M5 收尾计划](2026-10-26-m5-phase-e-and-ki22.md) §1.4。
 
 ## 1. 目标

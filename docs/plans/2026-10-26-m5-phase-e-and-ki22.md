@@ -52,19 +52,21 @@ fmt/clippy/audit 通过；独立评审无严重问题，建议项已收口。
 
 ### 1.2 Phase E-1：hub 级压力与长稳
 
-- [ ] 新增可重复的 hub 级负载工具；能启动真实 hub（SQLite 与 PostgreSQL），
-      生成 N 个虚拟 agent，完成 TLS/Enroll/Hello/Batch，校验 ACK 与库内点数。
-- [ ] 200 agent 端到端（不是 Storage 级）：0 丢点、0 重复、0 未处理 panic，
-      `/healthz` 与面板/管理 API 可用；记录 ACK p50/p95、吞吐、CPU、RSS、
-      FD/线程数、DB 大小。
-- [ ] 100 / 500 / 1000 agent 三档，逐档运行并记录：
-      - 0 丢失/重复；错误率 0；无 hub panic/重启；
-      - ACK/查询延迟与资源曲线可解释，作为 v1.0.0 发布基线；
-      - 连接风暴/断连重连后不丢已提交数据。
-- [ ] ≥24h 长稳：RSS 增长 ≤10%；FD/线程/任务不泄漏；`/healthz` 持续可用；
-      数据完整性抽查通过；日志无未预期 ERROR。
-- [ ] 结果归档到 `docs/security/` 或 `docs/status.md`（含命令、环境、原始指标
-      摘要，不提交 secret）。
+- [x] 新增可重复的 hub 级负载工具（SQLite）：真实 hub、TLS/Enroll/Hello/
+      Batch/Ack、DB 点数/重复校验、资源采样、重连、证据绑定。PostgreSQL
+      hub-level 校验接口仍未实现（storage 级 PG 已由 Phase D 覆盖），本阶段
+      不作为 v1.0.0 发布门禁。
+- [x] 200 agent 端到端（不是 Storage 级）：10min 24000 批/72000 点，
+      0 丢点/重复/错误，ACK p50 118.7ms、p95 175.0ms；health 601/601；
+      FD 223→223；线程 218→218；RSS 记录 +32.8%（短档只记录）。
+- [x] 100 / 500 / 1000 agent 三档，各 10min：
+      - 100：12000 批/36000 点，0 丢/重/错，p95 93.5ms；
+      - 500：60000 批/180000 点，0 丢/重/错，p95 442.7ms，FD 523、线程 517；
+      - 1000：120000 批/360000 点，0 丢/重/错，p95 733.6ms，FD 1023、线程 529；
+        无 hub panic/重启；短档 RSS/线程仅记录，不作长稳结论。
+- [ ] ≥24h 长稳：**2026-10-26 21:33 启动，运行中**；RSS ≤10%、FD/线程不泄漏
+      是硬门禁；当前尚无 24h 结论，不能提前签收。
+- [ ] 结果归档到 `docs/security/` 或 `docs/status.md`（24h 完成后写完整报告）。
 - [ ] 若压力暴露产品缺陷：按“修复→全量门禁→200 基线→三档→24h”重跑，不用
       单条失败测试代替整轮。
 
@@ -74,27 +76,27 @@ fmt/clippy/audit 通过；独立评审无严重问题，建议项已收口。
 
 ### 1.3 Phase E-2：真实 TLS PostgreSQL
 
-- [ ] 用真实 TLS 启用的 PostgreSQL（非 `sslmode=disable`）完成
-      `verify-full` 安装→启动→读写 smoke。
-- [ ] 正确 CA/SAN/`db_sslrootcert` 成功；错误 CA、错误主机名、缺失根证书必须
-      失败且不回退 `disable`；错误不打印密码/完整 DSN。
-- [ ] 覆盖 hub 启动、agent 上报、查询、维护任务；至少一次重启后仍可连接。
-- [ ] 文档补充可复制的测试证书/实例步骤；不提交真实测试私钥。
-- [ ] 通过后把 status 的 Phase D 已知限制 5 标为已闭环；未通过则继续留在
-      Phase E 门禁，不带病发布。
+- [x] 用真实 TLS 启用的 PostgreSQL（非 `sslmode=disable`）完成
+      `verify-full` 启动→真实 agent 上报→查询 smoke。
+- [x] 正确 CA/SAN/`db_sslrootcert` 成功；错误 CA、错误主机名、缺失/目录/符号
+      链接根证书均失败，不回退 `disable`；错误不打印密码/完整 DSN。
+- [x] 覆盖 hub 启动、agent 上报、查询、至少一次重启后仍可连接；`v100-pg-tls.sh`
+      **27/27** 通过。
+- [x] 文档补充 `tests/e2e/v100-pg-tls.sh` 步骤、顶层 `db_sslrootcert` 与
+      “仅服务端认证 TLS、不支持 PG 要求客户端证书”的限制；不提交真实私钥。
+- [x] status 的 Phase D 已知限制 5 已更新为“真实 TLS 端到端已覆盖，客户端证书
+      仍不支持”。
 
 ### 1.4 Phase E-3：PostgreSQL Docker 镜像内 e2e
 
-- [ ] 重建当前源码的 hub 镜像（不拿 rc.2 旧镜像冒充），验证：
-      - 默认 compose 仍 SQLite，无 PG 服务/无 5432 暴露；
-      - PG overlay 能启动 hub + PG，完成 agent enroll/上报/查询；
-      - 容器重启后 PG 数据仍在；`--user 10001` 权限路径可用；
-      - 容器内不内置 `pg_dump`，backup/restore 的文档前置条件仍成立。
-- [ ] backup/restore：用带 PostgreSQL client 的受控环境对容器 PG 执行
-      `rustboard-hub backup/restore`（或明确记录为镜像外步骤），并做一次恢复
-      后数据一致性检查。
-- [ ] 结果写入 `docs/install/docker.md`/`postgres.md`；更新 status 的 D-G9
-      为“镜像 e2e 已通过”。
+- [x] 重建当前源码的 hub/panel/agent 镜像（dist manifest 绑定，不拿 rc.2 旧
+      镜像冒充），验证默认 compose SQLite、PG overlay、真实 agent、重启、
+      `--user 10001`、容器内无 `pg_dump`；**104/104** 通过（1 项 arm64 SKIP）。
+- [x] backup/restore：外部 `postgres:16` client `pg_dump -Fc` → 新库
+      `pg_restore`，samples/ingest_batches/agents/schema_migrations 计数一致，
+      原库不变；明确为镜像外步骤。
+- [x] 结果写入 `docs/install/docker.md` §8、`postgres.md` §7.1；status 的
+      D-G9 更新为镜像 e2e 已通过。
 
 ### 1.5 Phase E-4：v1.0.0 发布
 
@@ -172,10 +174,10 @@ fmt/clippy/audit 通过；独立评审无严重问题，建议项已收口。
 
 1. **S0 计划确认**（本文件；当前停止点）。
 2. **S1 KI-22**：✅ 修复 + 单测 + e2e + 文档；全量门禁；独立评审（无严重问题）。
-3. **S2 负载工具**：先 200 agent 基线；修任何产品问题；再 100/500/1000；
-   最后 24h。每档记录证据。
-4. **S3 TLS PG**：真实 TLS 实例 smoke；失败修复后重跑。
-5. **S4 Docker PG**：重建镜像、overlay e2e、备份恢复。
+3. **S2 负载工具**：✅ 200/100/500/1000 各 10min 通过；**24h 运行中**
+   （2026-10-26 21:33 启动），完成后写报告。
+4. **S3 TLS PG**：✅ 真实 TLS `verify-full`，27/27 通过。
+5. **S4 Docker PG**：✅ 当前源码镜像 + overlay + 备份恢复，104/104 通过。
 6. **S5 发布演练**：arm64/离线/升级/卸载/恢复；最终评审/渗透。
 7. **S6 v1.0.0**：CHANGELOG/版本/tag/Release/镜像。
 
@@ -241,4 +243,5 @@ cargo audit
 - 最终独立评审/渗透无未修复高危；全量门禁与 CI 全绿；
 - `v1.0.0` CHANGELOG/tag/Release/多架构镜像完成，`v1.0.0-rc.2` 未移动。
 
-> **当前动作：S1（KI-22）已完成并提交；下一步 S2 hub 级压测与长稳。**
+> **当前动作：S1/S3/S4 完成；S2 200/100/500/1000 短档完成，200 agent 24h
+> 长稳运行中。24h 通过后进入 S5 发布演练与最终评审/渗透，再发布 v1.0.0。**
