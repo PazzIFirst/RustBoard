@@ -1930,7 +1930,12 @@ fn run(cfg: HubConfig) -> Result<()> {
     let storage = Arc::new(open_storage_for_config(&cfg)?);
     tracing::info!(database = %database, read_pool_size = cfg.read_pool_size, "存储已就绪");
 
+    // 存储（SQLite/PG）调用统一走 spawn_blocking。默认 512 会在 200/1000 agent
+    // 压测中堆到数百个 blocking 线程，每线程的 glibc allocator arena 与线程栈形成
+    // RSS 高水位。64 足够覆盖 SQLite 单写 + PG pool 8 + 证书/维护任务；突发批次在
+    // 队列等待，而不是无限扩线程。
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(64)
         .enable_all()
         .build()?;
 
