@@ -130,6 +130,82 @@ db_sslrootcert = "/etc/rustboard/pg-ca.pem"
 `verify-full` 的主机名校验使用 DSN 的 `host`：用 IP 连接时证书必须有对应
 **IP SAN**，只有 `DNS:localhost` 的证书连 `127.0.0.1` 会失败。
 
+### 3.1 真实 TLS 验证（本机 e2e）
+
+仓库提供 `tests/e2e/v100-pg-tls.sh`，在 Linux + Docker 上启动真实的
+`postgres:16`（`ssl=on`），用临时 CA / 服务端证书和真实
+`rustboard-hub` / `rustboard-agent` 验证 `verify-full`：
+
+```bash
+bash tests/e2e/v100-pg-tls.sh
+```
+
+脚本**不联网拉取镜像**：本地必须已有 `postgres:16`；依赖 `docker`、
+`openssl`、`psql`、`curl`、`python3`、`timeout`。成功时最后输出
+`全部 N 项通过` 并以 0 退出；证据（脱敏日志、psql 计数）在
+`target/pg-tls-e2e/<UTC>-<PID>/evidence/`。失败时同一目录保留脱敏日志，
+脚本以非 0 退出。
+
+覆盖内容：
+
+1. 临时 CA（2 天）+ server key/cert，`SAN=DNS:localhost,IP:127.0.0.1`、
+   `extendedKeyUsage=serverAuth`；私钥 0600，容器只读挂载；
+2. PG16 `ssl=on`，随机回环端口；`psql sslmode=verify-full` 验证
+   `show ssl=on`（脚本用真实 `psql select 1` 等待正式实例，避免把
+   docker-entrypoint 的临时 initdb 实例当成就绪）；
+3. `hub init` 后用 PG DSN（密码 URL 编码）和顶层 `db_sslrootcert` 启动，
+   `/healthz` 200；真实 agent enroll / 上报；PG 中 `samples` /
+   `ingest_batches` / `agents` 均 > 0；
+4. 停止 hub 再在同一 PG 上重启：`/healthz` 200，样本数不减少，
+   agent 记录仍在；
+5. 负向：另一个 CA、根证书缺失 / 目录 / 符号链接、DSN host 改为
+   `127.0.0.2`（经 Python TCP 代理，证书只有 `127.0.0.1`）都必须非 0；
+   日志不得含密码或完整 DSN，DSN 必须脱敏为 `***`。
+
+证书与配置要求：
+
+- 用 IP 连接时证书必须有对应 **IP SAN**；`verify-full` 按 DSN 的 `host`
+  校验，只有 `DNS:localhost` 的证书连 `127.0.0.1` 会失败；
+- 私有 CA 必须通过 `db_sslrootcert` 显式提供；它是 TOML **顶层**字段，
+  必须写在第一个 `[section]` 之前：
+
+  ```toml
+  database = "postgres://rustboard@db.example.com:5432/rustboard?sslmode=verify-full"
+  db_sslrootcert = "/etc/rustboard/pg-ca.pem"
+
+  [control]
+  # ...
+  ```
+
+  如果追加到文件末尾，会落进 `[tls]` / `[archive]` 等段而被忽略，表现为
+  TLS handshake 的 unknown CA 错误。脚本会断言 `^db_sslrootcert` 只有一行，
+  且行号早于第一个 `[`；
+- 服务端私钥必须 0600、由 PG 运行用户可读（e2e 用挂载目录只读 + 精确
+  chown）；密码只写 0600 临时配置 / 环境文件，psql 用 `PGPASSWORD`，
+  不进入 argv；
+- 该脚本是本地 e2e，**不进入 CI**（依赖 Docker 与本机回环端口）；CI 仍只跑
+  `cargo test` 的 PG target（§8）。生产启用前请在目标机 / 预发用相同脚本或
+  等价步骤复核。
+
+### 3.2 当前限制：不支持 PostgreSQL 要求客户端证书
+
+当前 hub 的 PostgreSQL TLS 是**服务端认证**：rustls 校验服务端证书链与
+主机名，但连接使用 `with_no_client_auth`，**不会发送客户端证书**。
+
+因此：
+
+- PG 设置 `ssl_ca_file` 后会向客户端请求客户端证书；当前 hub 没有可配置的
+  `db_sslcert` / `db_sslkey`，即使 `pg_hba.conf` 没有显式要求 `clientcert`，
+  握手也会失败；
+- hub 也没有把 agent 客户端证书复用为 PG 客户端证书的配置项；
+- `tests/e2e/v100-pg-tls.sh` 明确**不设置** `ssl_ca_file`，所以它只证明
+  “服务端认证 TLS”通过，**不证明“PG 要求客户端证书”通过**；
+- 若数据库强制 mTLS，需要先为 hub 增加 `db_sslcert` / `db_sslkey`（含权限
+  0600、轮换、PKCS#8 等）的独立设计，不能把现有 `verify-full` 说成已支持。
+
+当前支持的严格模式仍是 §3 表中的 `verify-full`（服务端 CA）或显式
+`disable`；不要用临时取消 `ssl_ca_file` 的方式在生产上绕过 mTLS 要求。
+
 ## 4. 密码来源与保密
 
 优先级：
@@ -414,8 +490,13 @@ docker compose -f docker/compose.example.yml \
 | `连接 PostgreSQL 失败` / `password authentication failed` | 密码来源不对（env 优先于 URL）、角色不存在或 `pg_hba.conf` 拒绝 |
 | `schema 初始化失败` / `permission denied for schema public` | 角色不是库 owner，或缺少 `GRANT CREATE ON SCHEMA public` |
 | `sslmode 只支持 "verify-full" 或 "disable"` | 配置了 `require`/`prefer`/`verify-ca`；改成 `verify-full`（或显式 `disable`） |
-| `certificate not valid for name` | DSN host 与证书 SAN 不匹配（IP 连接需要 IP SAN） |
+| `certificate not valid for name` / `does not match host name` | DSN host 与证书 SAN 不匹配（IP 连接需要 IP SAN）；用 `psql "host=… sslmode=verify-full sslrootcert=…"` 复现 |
 | `UnknownIssuer` / 根证书错误 | 私有 CA 未通过 `db_sslrootcert` / `--db-sslrootcert` 提供，或 PEM 不含 CA |
+| `timed out waiting for connection: error performing TLS handshake` | 根 CA 不是签发服务端证书的那张、证书链不完整、主机名不匹配，或 PG 要求客户端证书（`ssl_ca_file`）；先确认 `ssl=on` 与 `db_sslrootcert`，再看 §3.2 |
+| `db_sslrootcert 文件不存在` / `指向目录` / `指向符号链接` | 配置层直接拒绝；必须是绝对路径的真实 PEM 普通文件，不接受目录/符号链接 |
+| `db_sslrootcert` 写在 `[tls]` 等段下，仍报 unknown CA | 它必须是 TOML 顶层字段；追加到文件末尾会被忽略。见 §3.1 |
+| 启动早期 `server closed connection` / `database … does not exist` | docker-entrypoint 的临时 initdb 实例；以真实 `psql select 1` 等待正式实例，不要只看容器内 `pg_isready`（e2e 已内置 2s 稳定判据） |
+| PG 要求客户端证书（设置 `ssl_ca_file`）时握手失败 | 当前 hub 使用 `with_no_client_auth`，不支持客户端证书；见 §3.2，不要通过生产上删除 `ssl_ca_file` 来绕过 |
 | `schema 版本高于当前二进制` | 用旧二进制连了已迁移的新库；升级二进制，不要降 schema |
 | `--offline 与 PostgreSQL 互斥` | 去掉 `--offline`，或改用 SQLite |
 | `pg_dump 不存在或不在 PATH` / `pg_restore 不存在` | 安装 `postgresql-client`，并让客户端主版本与服务端一致；见 §6.4 |
@@ -439,10 +520,13 @@ docker compose -f docker/compose.example.yml \
 4. **恢复后的文件属主**：root 执行 `restore` 后文件归 root；systemd 部署需交回
    hub 用户，Docker `--user 10001:10001` 需先 `chown -R 10001:10001`，否则启动
    会因权限失败。
-5. **TLS verify-full 端到端**：已有配置层/单元测试与 D0 spike（本地 TLS PG
-   连接、证书链与主机名校验）证据；尚未在真实 TLS PostgreSQL 上做完整
-   “安装→启动→读写” smoke，生产启用前请先用测试实例复核 CA/SAN/
-   `db_sslrootcert`。
+5. **TLS verify-full 端到端**：`tests/e2e/v100-pg-tls.sh` 已在真实 TLS
+   PostgreSQL 16 上覆盖 hub 启动、真实 agent enroll/上报、PG 计数、hub 重启
+   持久化，以及错误 CA / 根证书缺失、目录、符号链接 / 主机名不匹配的失败
+   路径；证据在 `target/pg-tls-e2e/<UTC>-<PID>/evidence/`。该脚本依赖本机
+   Docker，不进 CI；生产启用前仍需按 §3.1 在目标环境复核 CA/SAN/
+   `db_sslrootcert`。**当前仅服务端认证 TLS，不支持 PostgreSQL 要求客户端
+   证书**（§3.2）。
 6. **压力与长稳**：storage 级 200 agent（`postgres_load`）已通过；hub 端真实
    200 agent 端到端、100/500/1000 agent 与 24h 长稳仍在 Phase E。storage 级
    load 只验证并发写入/查询与断连重连，不能替代 hub 端真实压测。
