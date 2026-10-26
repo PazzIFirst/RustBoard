@@ -1142,12 +1142,15 @@ default_sqlite_checks() {
     fail "D.5" "默认 panel 宿主回环 8080 /healthz 非 200"
   fi
 
+  # self_monitor 默认开启时 hub 会注册内置 hub-self；初始列表允许 0 条或
+  # 恰好 1 条 hub-self（name 或 agent_id 命中），不能要求空数组。
   if fetch_agents_api "$SQLITE_HUB_CT" "$SECRETS/sqlite-agents.json"; then
-    body_db_out=$(agents_summary "$SECRETS/sqlite-agents.json" "s4-agent")
-    if [[ "$body_db_out" == *"count=0"* ]]; then
-      pass "D.6" "默认 SQLite hub 管理 API 返回 200 且 agents 为空数组"
+    body_db_out=$(agents_summary "$SECRETS/sqlite-agents.json" "hub-self")
+    if [[ "$body_db_out" == *"count=0"* ]] \
+      || [[ "$body_db_out" == *"count=1"* && "$body_db_out" == *"found=1"* ]]; then
+      pass "D.6" "默认 SQLite hub agents 允许为空或仅内置 hub-self（$body_db_out）"
     else
-      fail "D.6" "默认 SQLite hub agents API 响应异常（$body_db_out）"
+      fail "D.6" "默认 SQLite hub agents 出现 hub-self 之外的记录（$body_db_out）"
     fi
   else
     fail "D.6" "默认 SQLite hub 管理 API /api/v1/agents 调用失败"
@@ -1212,7 +1215,7 @@ default_sqlite_checks() {
 
   if copy_sqlite_db "$SQLITE_HUB_CT" "$SQLITE_COPY_DIR"; then
     if body_db_out=$("$PYTHON" "$HELPER" sqlite-check "$SQLITE_COPY_DIR/rustboard.db" 2>"$LOG_DIR/sqlite-check.err"); then
-      pass "D.12" "默认 hub_data volume 内 rustboard.db 有 schema/迁移数据（$body_db_out）"
+      pass "D.12" "默认 hub_data volume 内 rustboard.db 有 schema/数据（$body_db_out）"
     else
       fail "D.12" "默认 hub_data volume 内 rustboard.db 校验失败"
       dump_file "$LOG_DIR/sqlite-check.err" 40
@@ -1332,12 +1335,14 @@ pg_overlay_runtime_checks() {
   fi
 
   check_healthz_body "G.6" "PG hub 管理口 /healthz 返回 ok" "$PG_HUB_CT" || true
+  # 同 D.6：允许 0 条或仅内置 hub-self。
   if fetch_agents_api "$PG_HUB_CT" "$SECRETS/pg-agents-initial.json"; then
-    out=$(agents_summary "$SECRETS/pg-agents-initial.json" "s4-agent")
-    if [[ "$out" == *"count=0"* ]]; then
-      pass "G.7" "PG hub 管理 API /api/v1/agents 返回 200 且初始为空"
+    out=$(agents_summary "$SECRETS/pg-agents-initial.json" "hub-self")
+    if [[ "$out" == *"count=0"* ]] \
+      || [[ "$out" == *"count=1"* && "$out" == *"found=1"* ]]; then
+      pass "G.7" "PG hub agents 允许为空或仅内置 hub-self（$out）"
     else
-      fail "G.7" "PG hub 管理 API 初始响应异常（$out）"
+      fail "G.7" "PG hub agents 出现 hub-self 之外的记录（$out）"
     fi
   else
     fail "G.7" "PG hub 管理 API /api/v1/agents 调用失败"
@@ -2293,7 +2298,9 @@ def command_agents_check(args):
         die("agents 响应不是 JSON 数组")
     item = None
     for candidate in data:
-        if isinstance(candidate, dict) and candidate.get("name") == args[1]:
+        if not isinstance(candidate, dict):
+            continue
+        if candidate.get("name") == args[1] or candidate.get("agent_id") == args[1]:
             item = candidate
             break
     print("count=%d" % len(data))
@@ -2319,18 +2326,18 @@ def command_sqlite_check(args):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        required = {"agents", "samples", "ingest_batches", "schema_migrations"}
+        # SQLite 的 schema 版本在 PRAGMA user_version（当前 v7），没有 PG 的
+        # schema_migrations 表；不要把 PG 表名当成 SQLite 的假设。
+        required = {"agents", "samples", "ingest_batches"}
         missing = sorted(required - tables)
         if missing:
             die("SQLite 缺少核心表: " + ",".join(missing))
-        migrations = conn.execute(
-            "SELECT count(*) FROM schema_migrations"
-        ).fetchone()[0]
-        if int(migrations) <= 0:
-            die("SQLite schema_migrations 没有版本行")
+        user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if user_version < 7:
+            die("SQLite user_version=%d < 7（schema 未初始化或过旧）" % user_version)
         print(
-            "tables=%d required=1 migrations=%d integrity=ok"
-            % (len(tables), int(migrations))
+            "tables=%d required=1 user_version=%d integrity=ok"
+            % (len(tables), user_version)
         )
     except sqlite3.Error as exc:
         die("SQLite 校验失败: %s" % exc)
