@@ -760,6 +760,19 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 - 尚未关闭或评论任何 issue；修复合并/发布证据齐后只补评论，由用户确认关闭。
 - 24h 长稳不能复用 2026-10-26 的 2h 中止证据。
 
+### 12.7 rc.3 最终门禁（2026-10-27 07:30）
+
+- 源码/版本：`2ad933a`，`1.0.0-rc.3`；main 文档同步。
+- 最终 amd64 静态包已重建：`dist/serverdashboard-v1.0.0-rc.3-x86_64.tar.gz`，
+  三个二进制 `--version` 均为 `1.0.0-rc.3`。
+- 全 workspace + 真实 PostgreSQL 16：**rc=0**；fmt/clippy/audit 通过；web 93/
+  typecheck/build 通过。
+- 最终源码上重跑：install E2E 121/121、offline E2E 122/122、
+  Docker PG E2E 104 PASS/0 FAIL/1 arm64 SKIP、security 9/9、panel 159/159。
+- 3h RssAnon 预检已启动（200 agent，2h warmup，3h 总时长），证据在
+  `target/load/<run>/`；arm64 包仍在构建（qemu 静态交叉编译较慢）。
+- **尚未 tag rc.3、尚未跑 24h/1000 agent**；不得发布 v1.0.0。
+
 ### 12.6 rc.3 准备与 1h 历史保护（2026-10-27 07:08）
 
 - 集成分支已升 `1.0.0-rc.3`（`2ad7e0a`），`Cargo.lock`、docker-pg E2E 默认版本同步。
