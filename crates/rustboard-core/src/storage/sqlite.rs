@@ -475,6 +475,7 @@ ON CONFLICT(agent_id, metric, labels, bucket_ts) DO UPDATE SET
     avg_value = excluded.avg_value,
     last_value = excluded.last_value,
     count = excluded.count
+WHERE excluded.count >= samples_1h.count
 "#;
 
 /// R1b：1m 增量合并。只认领 `aggregated_1m=0` 的 raw，按桶计算 delta 后与
@@ -567,6 +568,19 @@ const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE rowid IN \
             WHERE s.aggregated_1m = 0 \
               AND s.ts >= (m.bucket_ts / 3600000) * 3600000 \
               AND s.ts < (m.bucket_ts / 3600000) * 3600000 + 3600000 \
+        ) \
+        AND EXISTS ( \
+            SELECT 1 FROM samples_1h h \
+            WHERE h.agent_id = m.agent_id AND h.metric = m.metric \
+              AND h.labels = m.labels \
+              AND h.bucket_ts = (m.bucket_ts / 3600000) * 3600000 \
+              AND h.count = ( \
+                  SELECT COALESCE(SUM(x.count), 0) FROM samples_1m x \
+                  WHERE x.agent_id = m.agent_id AND x.metric = m.metric \
+                    AND x.labels = m.labels \
+                    AND x.bucket_ts >= (m.bucket_ts / 3600000) * 3600000 \
+                    AND x.bucket_ts < (m.bucket_ts / 3600000) * 3600000 + 3600000 \
+              ) \
         ) \
       ORDER BY m.bucket_ts LIMIT ?2)";
 const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE rowid IN \
@@ -4483,36 +4497,6 @@ impl SqliteStorage {
             tx.commit()?;
             return Ok(None);
         }
-        // 旧 1m 可能已被 retention 删除，只剩部分迟到/backlog 1m；此时重算
-        // 1h 会把历史 1h 覆盖成残缺值。源 count 小于已有 1h count 时冻结该
-        // 小时：保留旧 1h，只把 1m 标记 clean，避免下一轮反复选中。
-        let source_shrunk: i64 = tx.query_row(
-            "SELECT EXISTS( \
-                 SELECT 1 FROM ( \
-                     SELECT agent_id, metric, labels, \
-                            (bucket_ts / 3600000) * 3600000 AS hour_ts, \
-                            SUM(count) AS source_count \
-                     FROM samples_1m \
-                     WHERE bucket_ts >= ?1 AND bucket_ts < ?2 \
-                     GROUP BY agent_id, metric, labels, hour_ts \
-                 ) s \
-                 JOIN samples_1h h \
-                   ON h.agent_id = s.agent_id AND h.metric = s.metric \
-                  AND h.labels = s.labels AND h.bucket_ts = s.hour_ts \
-                 WHERE s.source_count < h.count)",
-            params![hour, hour_end],
-            |row| row.get(0),
-        )?;
-        if source_shrunk != 0 {
-            tracing::warn!(hour, "1m 源 count 小于已有 1h；保留历史 1h 并冻结该小时");
-            tx.execute(
-                "UPDATE samples_1m SET aggregated_1h = 1 \
-                 WHERE bucket_ts >= ?1 AND bucket_ts < ?2",
-                params![hour, hour_end],
-            )?;
-            tx.commit()?;
-            return Ok(None);
-        }
         let rows: i64 = tx.query_row(
             "SELECT COUNT(*) FROM samples_1m WHERE bucket_ts >= ?1 AND bucket_ts < ?2",
             params![hour, hour_end],
@@ -6133,6 +6117,19 @@ mod tests {
             .unwrap();
     }
 
+    /// 测试 helper：先走真实 1h 聚合生成匹配历史，再标 1m clean。
+    fn materialize_1h_and_mark_1m(s: &SqliteStorage) {
+        if let (Some(oldest), Some(newest)) = (
+            s.samples_1m_stats().unwrap().oldest_ts,
+            s.samples_1m_stats().unwrap().newest_ts,
+        ) {
+            let from = (oldest / BUCKET_1H_MS) * BUCKET_1H_MS;
+            let to = (newest / BUCKET_1H_MS) * BUCKET_1H_MS + BUCKET_1H_MS;
+            s.downsample_1h_range(from, to).unwrap();
+        }
+        mark_all_1m_aggregated(s);
+    }
+
     /// v4：`agent_settings` 按 agent 覆盖写入，列表按 agent_id 稳定排序。
     #[test]
     fn v4_agent_settings_roundtrip() {
@@ -7693,15 +7690,31 @@ mod tests {
                 rusqlite::params![hour, hour + BUCKET_1H_MS],
             )
             .unwrap();
-        insert_samples(&s, "a1", &[("cpu.usage", "{}", hour + 121_000, 30.0)]);
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", hour + 121_000, 30.0),
+                ("cpu.usage", "{\"host\":\"b\"}", hour + 122_000, 5.0),
+            ],
+        );
         s.downsample_1m_delta(hour + BUCKET_1H_MS, 100).unwrap();
 
         let result = s.downsample_1h_hour(hour + BUCKET_1H_MS).unwrap();
-        assert!(result.is_none(), "残缺 1m 源必须冻结而不是重算");
+        assert!(result.is_some(), "残缺组应跳过 1h 更新但小时仍需标 clean");
         let rows = agg_rows(&s, "samples_1h");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].count, 2, "历史 1h count 不得被部分源覆盖");
-        assert!((rows[0].avg_value - 1.5).abs() < 1e-9);
+        assert_eq!(rows.len(), 2, "同小时其它 series 仍必须生成 1h");
+        let a = rows
+            .iter()
+            .find(|row| row.labels == "{}")
+            .expect("缺少 A 的 1h");
+        assert_eq!(a.count, 2, "历史 1h count 不得被部分源覆盖");
+        assert!((a.avg_value - 1.5).abs() < 1e-9);
+        let b = rows
+            .iter()
+            .find(|row| row.labels == "{\"host\":\"b\"}")
+            .expect("缺少 B 的 1h");
+        assert_eq!(b.count, 1, "新 series 必须正常生成 1h");
         let clean: i64 = s
             .lock_read()
             .query_row(
@@ -7711,6 +7724,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(clean, 0, "冻结后必须把 1m 标记 clean，避免下一轮反复选中");
+        assert_eq!(
+            s.prune_samples_1m_before(hour + BUCKET_1H_MS)
+                .unwrap()
+                .deleted,
+            1,
+            "只删已完整进入 1h 的 B；A 的历史 count 未追平，残缺 1m 必须保留"
+        );
     }
 
     /// M4-A2：三层统计与分块探测用的 offset 时间戳。
@@ -7870,7 +7890,7 @@ mod tests {
             ],
         );
         s.downsample_1m_range(hour - 60_000, hour + 60_000).unwrap();
-        mark_all_1m_aggregated(&s);
+        materialize_1h_and_mark_1m(&s);
         assert_eq!(s.samples_1m_stats().unwrap().rows, 2);
         assert_eq!(s.prune_samples_1m_before(hour).unwrap().deleted, 1);
         let minute = s.samples_1m_stats().unwrap();
@@ -7887,14 +7907,24 @@ mod tests {
             0,
             "dirty hour 必须整小时跳过"
         );
-        mark_all_1m_aggregated(&s);
+        materialize_1h_and_mark_1m(&s);
         assert_eq!(s.prune_samples_1m_before(hour).unwrap().deleted, 1);
 
-        // 清空 raw 后单独构造 1h 边界数据：整点边界同样是严格小于。
+        // 清空三层后单独构造 1h 边界数据：整点边界同样是严格小于。
         mark_all_raw_aggregated(&s);
         s.prune_samples_before(i64::MAX).unwrap();
-        insert_samples(&s, "a1", &[("cpu.usage", "{}", hour - 2_000_000, 5.0)]);
-        s.downsample_1m_range(hour - BUCKET_1H_MS, hour).unwrap();
+        s.prune_samples_1m_before(i64::MAX).unwrap();
+        s.prune_samples_1h_before(i64::MAX).unwrap();
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", hour - 2_000_000, 5.0),
+                ("cpu.usage", "{}", hour + 1_000, 6.0),
+            ],
+        );
+        s.downsample_1m_range(hour - BUCKET_1H_MS, hour + BUCKET_1H_MS)
+            .unwrap();
         s.downsample_1h_range(hour - BUCKET_1H_MS, hour + BUCKET_1H_MS)
             .unwrap();
         assert_eq!(s.samples_1h_stats().unwrap().rows, 2);
@@ -8533,9 +8563,11 @@ mod tests {
         assert_eq!(rows[0].agent_id, "a2");
         assert!((rows[0].value - 99.0).abs() < 1e-9);
 
-        // 1m 也为空：再回退 1h。
-        mark_all_1m_aggregated(&s);
-        s.prune_samples_1m_before(i64::MAX).unwrap();
+        // 1m 也为空：直接清空 1m 模拟保留期已删（本用例只验证 fallback，
+        // 不走 retention 的“必须已有匹配 1h”安全门禁）。
+        s.lock_write()
+            .execute("DELETE FROM samples_1m", [])
+            .unwrap();
         assert_eq!(s.samples_1m_stats().unwrap().rows, 0);
         let rows = s.latest_samples(0, &[], None).unwrap();
         assert_eq!(rows.len(), 1, "只能回退到 1h: {rows:?}");

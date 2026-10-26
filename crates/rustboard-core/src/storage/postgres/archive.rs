@@ -114,6 +114,7 @@ ON CONFLICT (agent_id, metric, labels, bucket_ts) DO UPDATE SET
     avg_value = EXCLUDED.avg_value,
     last_value = EXCLUDED.last_value,
     count = EXCLUDED.count
+WHERE EXCLUDED.count >= samples_1h.count
 "#;
 
 /// R1b：1m 增量合并。只处理已锁定的 raw `id` 集合（`$1`），按桶计算 delta
@@ -191,6 +192,19 @@ const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE id IN \
             WHERE s.aggregated_1m = 0 \
               AND s.ts >= (m.bucket_ts / 3600000) * 3600000 \
               AND s.ts < (m.bucket_ts / 3600000) * 3600000 + 3600000 \
+        ) \
+        AND EXISTS ( \
+            SELECT 1 FROM samples_1h h \
+            WHERE h.agent_id = m.agent_id AND h.metric = m.metric \
+              AND h.labels = m.labels \
+              AND h.bucket_ts = (m.bucket_ts / 3600000) * 3600000 \
+              AND h.count = ( \
+                  SELECT COALESCE(SUM(x.count), 0) FROM samples_1m x \
+                  WHERE x.agent_id = m.agent_id AND x.metric = m.metric \
+                    AND x.labels = m.labels \
+                    AND x.bucket_ts >= (m.bucket_ts / 3600000) * 3600000 \
+                    AND x.bucket_ts < (m.bucket_ts / 3600000) * 3600000 + 3600000 \
+              ) \
         ) \
       ORDER BY m.bucket_ts LIMIT $2)";
 const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE id IN \
@@ -642,36 +656,6 @@ impl PostgresStorage {
                 .get(0);
             if incomplete {
                 tx.commit().context("提交跳过 1h 重算事务失败")?;
-                return Ok(None);
-            }
-            let source_shrunk: bool = tx
-                .query_one(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM (
-                             SELECT agent_id, metric, labels,
-                                    (bucket_ts / 3600000) * 3600000 AS hour_ts,
-                                    SUM(count)::BIGINT AS source_count
-                             FROM samples_1m
-                             WHERE bucket_ts >= $1 AND bucket_ts < $2
-                             GROUP BY agent_id, metric, labels, hour_ts
-                         ) s
-                         JOIN samples_1h h
-                           ON h.agent_id = s.agent_id AND h.metric = s.metric
-                          AND h.labels = s.labels AND h.bucket_ts = s.hour_ts
-                         WHERE s.source_count < h.count)",
-                    &[&hour, &hour_end],
-                )
-                .context("检查 1h 历史 count 是否会被残缺源覆盖失败")?
-                .get(0);
-            if source_shrunk {
-                tracing::warn!(hour, "1m 源 count 小于已有 1h；保留历史 1h 并冻结该小时");
-                tx.execute(
-                    "UPDATE samples_1m SET aggregated_1h = 1
-                     WHERE bucket_ts >= $1 AND bucket_ts < $2",
-                    &[&hour, &hour_end],
-                )
-                .context("冻结残缺 1h 源失败")?;
-                tx.commit().context("提交冻结历史 1h 事务失败")?;
                 return Ok(None);
             }
             let locked: Vec<i64> = tx
@@ -2179,7 +2163,7 @@ mod tests {
             return;
         };
         let storage = pg.storage();
-        let cutoff = 1_700_000_000_000_i64;
+        let cutoff = 1_699_999_920_000_i64; // 整点，边界语义确定
         let expired_rows = PRUNE_BATCH_ROWS + 3;
 
         // 5003 条 `ts < cutoff` 的过期 raw + 1 条恰好等于 cutoff 的边界行。
@@ -2214,21 +2198,37 @@ mod tests {
         assert_eq!(ts, cutoff);
 
         // 1m / 1h：cutoff 是排他边界，等于 cutoff 的行保留。
-        for table in ["samples_1m", "samples_1h"] {
-            execute(
-                storage,
-                &format!(
-                    "INSERT INTO {table}
-                         (agent_id, metric, labels, bucket_ts, min_value, max_value,
-                          avg_value, last_value, count)
-                     VALUES ('a', 'cpu.usage', '{{}}', $1::BIGINT - 3600001, 1, 1, 1, 1, 1),
-                            ('a', 'cpu.usage', '{{}}', $1::BIGINT, 2, 2, 2, 2, 2)"
-                ),
-                &[&cutoff],
-            );
-        }
-        // v8 1m retention 只删除整小时 aggregated_1h=1 的行。
-        execute(storage, "UPDATE samples_1m SET aggregated_1h = 1", &[]);
+        // 1h 的 bucket_ts 必须是整点，不能直接复用 raw/1m 的时间戳。
+        let hour_prev = ((cutoff - 3_600_000) / 3_600_000) * 3_600_000;
+        execute(
+            storage,
+            "INSERT INTO samples_1m
+                 (agent_id, metric, labels, bucket_ts, min_value, max_value,
+                  avg_value, last_value, count)
+             VALUES ('a', 'cpu.usage', '{}', $1::BIGINT - 3600000, 1, 1, 1, 1, 1),
+                    ('a', 'cpu.usage', '{}', $1, 2, 2, 2, 2, 2)",
+            &[&cutoff],
+        );
+        execute(
+            storage,
+            "INSERT INTO samples_1h
+                 (agent_id, metric, labels, bucket_ts, min_value, max_value,
+                  avg_value, last_value, count)
+             VALUES ('a', 'cpu.usage', '{}', $1, 1, 1, 1, 1, 1),
+                    ('a', 'cpu.usage', '{}', $2, 2, 2, 2, 2, 2)",
+            &[&hour_prev, &cutoff],
+        );
+        // v8 1m retention 只删除「该 series 已有匹配 1h」的整小时；
+        // 先走真实 1h 聚合生成对应历史，再验证删除。
+        storage
+            .downsample_1h_range(cutoff - 3_600_000, cutoff)
+            .expect("生成 1h 历史失败");
+        // 边界行必须仍是 dirty；只允许其前一行被 1m retention 选中。
+        execute(
+            storage,
+            "UPDATE samples_1m SET aggregated_1h = 0 WHERE bucket_ts >= $1",
+            &[&cutoff],
+        );
         let pruned_1m = storage
             .prune_samples_1m_before(cutoff)
             .expect("1m 保留期删除失败");
