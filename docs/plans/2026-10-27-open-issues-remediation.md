@@ -724,9 +724,9 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 | `feat/v100-webdav` | `f607e6d` | #29 逐级 MKCOL、严格 DAV 测试 | hub 全绿；严格 DAV 黑盒 `archive test` 通过 |
 | `feat/v100-ci` | `a4ecea9` | #40 v031 入 CI + cryptography | actionlint/yaml/bash -n 通过 |
 | `feat/v100-collectors` | `dbd1b05` | #35/#36 字节路径/CPU ID + 回退保护 | core collect 21/21；clippy |
-| `feat/v100-agent` | `308e525` | #42/#43/#44/#48 | agent/common/hub 全绿；待复审建议修复 |
+| `feat/v100-agent` | `308e525` + `8aa99fe` | #42/#43/#44/#48 + 复审整改 | agent 153、hub 全绿；Guard/URL/drain 已修 |
 | `feat/v100-panel` | `5df03f3` | #37/#38/#39/#41 | panel 184+14、web 93；#39 严重项修复中 |
-| `feat/v100-buffer` | `b5c8e7c` | #34 双 meta/中间损坏重同步/repair CLI | core buffer 29、core/agent 全绿；待复审 |
+| `feat/v100-buffer` | `b5c8e7c` | #34 双 meta/中间损坏重同步/repair CLI | core buffer 29；复审发现 3 严重，整改中 |
 
 ### 12.3 进行中
 
@@ -735,8 +735,7 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 - `feat/v100-alerts`：#30/#31 告警状态与标签过滤下推。
 - `feat/v100-agent2`：#45 enrollment marker、#46 进程组。
 - `feat/v100-panel` 复审整改：ACME/DNS SAN 推导、CA 写入顺序（评审发现 1 严重）。
-- `feat/v100-agent` 复审整改：#43 Guard 满表、#48 URL 脱敏、#44 drain 控制队列。
-- `feat/v100-buffer` 独立复审。
+- `feat/v100-buffer` 整改 3 严重：offset=0 边界、重同步预算、空 pending 压实。
 - `feat/v100-data` 复审整改：claim 行身份、count/行序迁移、last_ts、PG claim CI。
 - `feat/v100-collectors` 已补非法 UTF-8 label 转义与 CPU 汇总回退保护。
 
