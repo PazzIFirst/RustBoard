@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use rustboard_common::config::{AgentConfig, AgentTlsMode};
+use rustboard_common::config::{is_loopback_host, ws_url_host_port, AgentConfig, AgentTlsMode};
 use rustboard_common::control::{codes as control_codes, ControlError, ControlResponse};
 use rustboard_common::fsutil;
 use rustboard_common::model::{Sample, SampleBatch};
@@ -27,6 +27,7 @@ use rustboard_common::{DEFAULT_AGENT_CONFIG, PROTOCOL_VERSION, VERSION};
 use rustboard_core::buffer::DiskBuffer;
 use rustboard_core::collect::default_collectors;
 use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 const AGENT_CERT: &str = "agent.crt";
@@ -136,6 +137,19 @@ where
     Si: Sink<Message, Error = WsError> + Unpin,
 {
     write_with_timeout(sink.close(), "Close", timeout).await
+}
+
+/// 日志 / CLI 展示用的 hub 端点：只保留 `host:port`。
+///
+/// `hub_url` 可能包含 userinfo（`user:password@host`）；原样打印会把凭据写进
+/// 日志或终端历史。IPv6 主机加方括号避免端口歧义；无法解析时返回固定占位符，
+/// 同样不回显原 URL。
+fn hub_endpoint_for_display(hub_url: &str) -> String {
+    match ws_url_host_port(hub_url) {
+        Ok((host, port)) if host.contains(':') => format!("[{host}]:{port}"),
+        Ok((host, port)) => format!("{host}:{port}"),
+        Err(_) => "(invalid hub_url)".to_string(),
+    }
 }
 
 /// H1：hub 明确拒绝协议版本。重试不会自愈，必须退出让运维升级。
@@ -298,7 +312,7 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|_| "未纳管".to_string());
             let enrolled = is_enrolled(&cfg);
             println!("配置文件: {}", path.display());
-            println!("hub: {}", cfg.hub_url);
+            println!("hub: {}", hub_endpoint_for_display(&cfg.hub_url));
             println!("agent_id: {agent_id}");
             println!("纳管状态: {}", if enrolled { "已纳管" } else { "未纳管" });
             println!("采样间隔: {}ms", cfg.sample_interval_ms);
@@ -446,12 +460,31 @@ fn init_agent(
         .context("init 参数校验失败（检查 --data-dir、--hub 等）")?;
     cfg.save(path)?;
     println!("已写入配置: {}", path.display());
-    println!("hub 地址: {}", cfg.hub_url);
+    println!("hub 地址: {}", hub_endpoint_for_display(&cfg.hub_url));
     println!("\n下一步: rustboard-agent run --config {}", path.display());
     Ok(())
 }
 
 fn run(cfg: AgentConfig) -> Result<()> {
+    // #48：显式 opt-in 的非回环明文连接在启动时告警。只记录主机名与端口，
+    // 不打印 hub_url（可能含 userinfo）或 token。
+    if cfg.hub_url.starts_with("ws://") && cfg.allow_insecure_ws {
+        match ws_url_host_port(&cfg.hub_url) {
+            Ok((host, port)) if !is_loopback_host(&host) => {
+                tracing::warn!(
+                    host = %host,
+                    port,
+                    "allow_insecure_ws=true：正在用明文 ws:// 连接非回环 hub，\
+                     token 与采样数据将以明文传输（仅限开发 / 隔离网络）"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                // 配置校验已保证 URL 合法；这里只防御性记录，不回显 URL。
+                tracing::warn!(error = %err, "解析 hub_url 失败，无法检查明文连接范围");
+            }
+        }
+    }
     // config.rs 只校验下界；这里补上限，避免本地配置本身就忙采/形同停采。
     validate_sample_interval_config(cfg.sample_interval_ms)?;
     // M3：文件日志来源的父目录 / 符号链接必须在启动前检查，坏配置直接拒绝启动。
@@ -588,7 +621,7 @@ async fn run_async(cfg: AgentConfig) -> Result<()> {
         match connect(&cfg, true).await {
             Ok(ws) => {
                 backoff_secs = 1;
-                tracing::info!(url = %cfg.hub_url, "已连接 hub");
+                tracing::info!(endpoint = %hub_endpoint_for_display(&cfg.hub_url), "已连接 hub");
                 let session_result =
                     run_session_with_deadline(ws, &session_ctx, &buffer, &notify).await;
                 if let Err(err) = session_result {
@@ -661,6 +694,46 @@ fn cert_check_due(days_left: i64, threshold: i64, now_ms: i64, last_attempt_ms: 
         return true;
     }
     now_ms.saturating_sub(last_attempt_ms) >= CERT_RENEW_RETRY_MS
+}
+
+/// 会话内周期证书检查的 deadline 与退避状态（#44）。
+///
+/// 旧实现只在「本地缓冲为空」分支检查证书：持续有 pending 批次时，
+/// `cert_timer` 分支永远抢不到执行机会，超长 backlog 会把续签窗口饿死。
+/// 现在同一个 deadline 既供空闲分支等待，也在每批 ACK 后、下一批发送前检查。
+struct CertCheckState {
+    period: Duration,
+    next_check: tokio::time::Instant,
+    /// 上次尝试续签的时间；失败后由 [`cert_check_due`] 做 1 小时退避。
+    last_attempt_ms: i64,
+}
+
+impl CertCheckState {
+    fn new(period: Duration) -> Self {
+        Self {
+            period,
+            next_check: tokio::time::Instant::now() + period,
+            last_attempt_ms: 0,
+        }
+    }
+
+    fn next_deadline(&self) -> tokio::time::Instant {
+        self.next_check
+    }
+
+    /// deadline 到期时推进到下一周期并返回 true；未到期返回 false。
+    fn take_if_due(&mut self, now: tokio::time::Instant) -> bool {
+        if now < self.next_check {
+            return false;
+        }
+        self.next_check = now + self.period;
+        true
+    }
+
+    #[cfg(test)]
+    fn force_due(&mut self) {
+        self.next_check = tokio::time::Instant::now();
+    }
 }
 
 /// 读取本地客户端证书剩余寿命（天 + 小时），同一份 PEM 只读一次。
@@ -915,16 +988,76 @@ fn tls_connector(
 }
 
 async fn connect(cfg: &AgentConfig, with_client_cert: bool) -> Result<WsStream> {
-    let connector = tls_connector(cfg, with_client_cert)?;
+    // #48：非回环明文连接必须在发出任何网络请求之前失败。配置校验之外
+    // 再加一道闸，避免调用方绕过 `AgentConfig::validate()`。
+    cfg.validate_plaintext_ws_policy()
+        .context("拒绝明文 ws:// 连接")?;
 
-    let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
-        cfg.hub_url.as_str(),
-        None,
-        false,
-        connector,
-    )
-    .await?;
-    Ok(ws)
+    let connector = tls_connector(cfg, with_client_cert)?;
+    let (host, port) =
+        ws_url_host_port(&cfg.hub_url).map_err(|err| anyhow!("hub_url 无效: {err}"))?;
+    let request = cfg
+        .hub_url
+        .as_str()
+        .into_client_request()
+        .context("hub_url 不是合法的 WebSocket URL")?;
+
+    // #42：DNS / TCP / TLS / HTTP 101 共用一个绝对 deadline；任一步超时都
+    // 返回可重试错误，由 run_async 的指数退避接管。
+    let timeout = Duration::from_secs(cfg.connect_timeout_secs);
+    let deadline = tokio::time::Instant::now() + timeout;
+    // 错误只展示 host:port，不回显完整 hub_url（可能含 userinfo）。
+    let endpoint = format!("{host}:{port}");
+    let timeout_message = || {
+        anyhow!(
+            "连接 hub 超时（{} 秒，覆盖 DNS/TCP/TLS/101）: {endpoint}",
+            cfg.connect_timeout_secs
+        )
+    };
+
+    let attempt = async move {
+        // DNS 必须在 deadline 内完成：`lookup_host` 把 getaddrinfo 交给 blocking
+        // 线程，但等待本身可被取消，不会在 timeout 内同步阻塞 runtime。
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .with_context(|| format!("解析 hub 主机失败: {host}:{port}"))?
+            .collect();
+        if addrs.is_empty() {
+            bail!("hub 主机没有可用地址: {host}:{port}");
+        }
+
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut tcp = None;
+        for addr in addrs {
+            match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => {
+                    tcp = Some(stream);
+                    break;
+                }
+                Ok(Err(err)) => {
+                    last_error =
+                        Some(anyhow::Error::new(err).context(format!("TCP 连接 {addr} 失败")));
+                }
+                // deadline 已到：不再尝试后续地址，交给外层统一报超时。
+                Err(_) => break,
+            }
+        }
+        let Some(tcp) = tcp else {
+            return Err(last_error.unwrap_or_else(|| anyhow!("连接 hub 超时（{host}:{port}）")));
+        };
+
+        // TLS 握手与 HTTP 101 仍受同一个 deadline 约束。
+        let (ws, _resp) =
+            tokio_tungstenite::client_async_tls_with_config(request, tcp, None, connector)
+                .await
+                .context("WebSocket（TLS/101）握手失败")?;
+        Ok::<WsStream, anyhow::Error>(ws)
+    };
+
+    match tokio::time::timeout_at(deadline, attempt).await {
+        Ok(result) => result,
+        Err(_) => Err(timeout_message()),
+    }
 }
 
 enum EnrollError {
@@ -1177,6 +1310,72 @@ where
     }
     tracing::info!(days_left, threshold, "客户端证书接近到期，开始续签");
     renew_client_cert(sink, stream, cfg, agent_id).await
+}
+
+/// 把已经完成、但还排在 channel 里的控制应答写回 hub（不等待新结果）。
+///
+/// 续签最多会占用 stream 20s，而 hub 侧控制命令有 15s 超时；进入续签前先 drain，
+/// 避免已经执行完的应答被压在 channel 里直到超时。发送失败说明连接不可用，
+/// 向上传播由会话结束处理。
+async fn drain_control_responses<Si>(
+    sink: &mut Si,
+    control_rx: &mut tokio::sync::mpsc::Receiver<ControlResponse>,
+    cfg: &AgentConfig,
+) -> Result<()>
+where
+    Si: Sink<Message, Error = WsError> + Unpin,
+{
+    while let Ok(response) = control_rx.try_recv() {
+        send_frame_with_config(sink, &Frame::ControlResponse(response), cfg).await?;
+    }
+    Ok(())
+}
+
+/// 周期证书检查 deadline 到点时执行一次检查（#44）。
+///
+/// 空闲分支与「每批 ACK 之后」共用；检查失败只 WARN，不影响会话，也不丢
+/// 已经完成 ACK 的批次。只有写超时说明连接可能已半死，必须向上传播重连。
+///
+/// 进入续签前先 drain 已完成控制应答：续签会长时间占用 stream，不能让 hub 的
+/// 控制命令因等待写回而超时。
+async fn run_cert_check_if_due<Si, St>(
+    sink: &mut Si,
+    stream: &mut St,
+    control_rx: &mut tokio::sync::mpsc::Receiver<ControlResponse>,
+    cfg: &AgentConfig,
+    agent_id: &str,
+    cert_check: &mut CertCheckState,
+) -> Result<()>
+where
+    Si: Sink<Message, Error = WsError> + Unpin,
+    St: Stream<Item = std::result::Result<Message, WsError>> + Unpin,
+{
+    if !cert_check.take_if_due(tokio::time::Instant::now()) {
+        return Ok(());
+    }
+    drain_control_responses(sink, control_rx, cfg).await?;
+    match client_cert_days_left(cfg) {
+        Ok(days_left) => {
+            let now = now_ms();
+            let threshold = i64::from(cfg.cert_renew_before_days);
+            if cert_check_due(days_left, threshold, now, cert_check.last_attempt_ms) {
+                cert_check.last_attempt_ms = now;
+                tracing::info!(days_left, threshold, "周期证书检查：进入续签窗口");
+                if let Err(err) = maybe_renew_client_cert(sink, stream, cfg, agent_id).await {
+                    if is_send_timeout_error(&err) {
+                        return Err(err);
+                    }
+                    tracing::warn!(error = %err, "周期证书续签失败，本次会话继续");
+                }
+            } else {
+                tracing::debug!(days_left, threshold, "周期证书检查：尚未进入续签窗口");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "周期证书检查读取本地证书失败");
+        }
+    }
+    Ok(())
 }
 
 /// 校验 hub 返回的新证书，确认它可以真的用来连接。
@@ -1436,6 +1635,52 @@ where
     }
 }
 
+/// 发送本地缓冲里的 pending 批次，逐批等待 ACK。
+///
+/// 每批 ACK 完成、下一批发送之前检查一次证书 deadline（#44）：持续有 backlog
+/// 时也不会饿死周期续签，同时不丢当前批 ACK。返回本轮处理的批次数。
+#[allow(clippy::too_many_arguments)]
+async fn upload_pending_batches<Si, St>(
+    sink: &mut Si,
+    stream: &mut St,
+    buffer: &Arc<Mutex<DiskBuffer>>,
+    control_rx: &mut tokio::sync::mpsc::Receiver<ControlResponse>,
+    dispatcher: &control::ControlDispatcher,
+    cfg: &AgentConfig,
+    agent_id: &str,
+    cert_check: &mut CertCheckState,
+) -> Result<usize>
+where
+    Si: Sink<Message, Error = WsError> + Unpin,
+    St: Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let send_timeout = Duration::from_secs(cfg.send_timeout_secs);
+    let batches = {
+        let mut guard = buffer.lock().await;
+        guard.read_next(16)?
+    };
+    let count = batches.len();
+    for batch in batches {
+        let (batch_epoch, batch_seq) = (batch.epoch, batch.seq);
+        send_frame_with_config(sink, &Frame::Batch(batch), cfg).await?;
+        // ACK 的 20s 预算从 Batch 写成功之后开始，不受发送超时影响。
+        wait_for_ack(
+            sink,
+            stream,
+            control_rx,
+            dispatcher,
+            send_timeout,
+            batch_epoch,
+            batch_seq,
+        )
+        .await?;
+        buffer.lock().await.ack(batch_epoch, batch_seq)?;
+        // 此刻没有在途 ACK，可以安全地在同一个 stream 上做周期证书检查。
+        run_cert_check_if_due(sink, stream, control_rx, cfg, agent_id, cert_check).await?;
+    }
+    Ok(count)
+}
+
 async fn session(
     ws: WsStream,
     ctx: &SessionContext<'_>,
@@ -1480,104 +1725,72 @@ async fn session(
     ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // KI-12：会话空闲时也要周期检查客户端证书。`session_max_hours = 0` 只表示
-    // 不主动重连，不能跳过续签窗口；定时器与 session_deadline 相互独立。
-    let mut cert_timer =
-        tokio::time::interval(cert_check_period(ctx.cfg.cert_check_interval_hours));
-    cert_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // 第一次 tick 立即完成：握手后已经检查过一次，跳过这次立即检查。
-    cert_timer.tick().await;
-    let mut last_cert_attempt_ms = 0i64;
+    // 不主动重连，不能跳过续签窗口；deadline 与 session_deadline 相互独立。
+    // #44：同一个 deadline 还会在每批 ACK 后检查，避免持续 backlog 饿死续签。
+    let mut cert_check = CertCheckState::new(cert_check_period(ctx.cfg.cert_check_interval_hours));
     // M3：控制请求由独立任务执行，应答经 channel 回到会话循环统一写 sink。
     // 这样控制执行不会阻塞采集、ACK 或心跳；sink 仍然只有一个写者。
     let (dispatcher, mut control_rx) = control::ControlDispatcher::new(ctx.cfg.control.clone());
 
     loop {
-        let batches = {
-            let mut guard = buffer.lock().await;
-            guard.read_next(16)?
-        };
-
-        if batches.is_empty() {
-            tokio::select! {
-                _ = ping_timer.tick() => {
-                    send_frame_with_config(&mut sink, &Frame::Ping { ts: now_ms() }, ctx.cfg)
-                        .await?;
-                }
-                _ = cert_timer.tick() => {
-                    // 只在无在途批次（本分支）检查，避免与 ACK 等待争抢同一个 stream。
-                    match client_cert_days_left(ctx.cfg) {
-                        Ok(days_left) => {
-                            let now = now_ms();
-                            let threshold = i64::from(ctx.cfg.cert_renew_before_days);
-                            if cert_check_due(days_left, threshold, now, last_cert_attempt_ms) {
-                                last_cert_attempt_ms = now;
-                                tracing::info!(days_left, threshold, "周期证书检查：进入续签窗口");
-                                if let Err(err) = maybe_renew_client_cert(
-                                    &mut sink,
-                                    &mut stream,
-                                    ctx.cfg,
-                                    ctx.agent_id,
-                                )
-                                .await
-                                {
-                                    if is_send_timeout_error(&err) {
-                                        return Err(err);
-                                    }
-                                    tracing::warn!(error = %err, "周期证书续签失败，本次会话继续");
-                                }
-                            } else {
-                                tracing::debug!(days_left, threshold, "周期证书检查：尚未进入续签窗口");
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(error = %err, "周期证书检查读取本地证书失败");
-                        }
-                    }
-                }
-                _ = notify.notified() => {}
-                Some(response) = control_rx.recv() => {
-                    send_frame_with_config(
-                        &mut sink,
-                        &Frame::ControlResponse(response),
-                        ctx.cfg,
-                    )
-                    .await?;
-                }
-                incoming = stream.next() => {
-                    match incoming {
-                        Some(Ok(Message::Close(_))) | None => bail!("hub 关闭了连接"),
-                        Some(Ok(Message::Binary(bytes))) => {
-                            handle_side_frame(
-                                &mut sink,
-                                &dispatcher,
-                                send_timeout,
-                                classify_incoming(bytes.as_ref()),
-                            )
-                            .await?;
-                        }
-                        Some(Ok(_)) => {}
-                        Some(Err(err)) => return Err(err.into()),
-                    }
-                }
-            }
+        let uploaded = upload_pending_batches(
+            &mut sink,
+            &mut stream,
+            buffer,
+            &mut control_rx,
+            &dispatcher,
+            ctx.cfg,
+            ctx.agent_id,
+            &mut cert_check,
+        )
+        .await?;
+        if uploaded > 0 {
             continue;
         }
 
-        for batch in batches {
-            let (batch_epoch, batch_seq) = (batch.epoch, batch.seq);
-            send_frame_with_config(&mut sink, &Frame::Batch(batch), ctx.cfg).await?;
-            // ACK 的 20s 预算从 Batch 写成功之后开始，不受发送超时影响。
-            wait_for_ack(
-                &mut sink,
-                &mut stream,
-                &mut control_rx,
-                &dispatcher,
-                send_timeout,
-                batch_epoch,
-                batch_seq,
-            )
-            .await?;
-            buffer.lock().await.ack(batch_epoch, batch_seq)?;
+        tokio::select! {
+            _ = ping_timer.tick() => {
+                send_frame_with_config(&mut sink, &Frame::Ping { ts: now_ms() }, ctx.cfg)
+                    .await?;
+            }
+            _ = tokio::time::sleep_until(cert_check.next_deadline()) => {
+                // 无在途批次时才走这个分支；有批次时由 upload_pending_batches
+                // 在 ACK 后检查，不会与 ACK 等待争抢同一个 stream。
+                run_cert_check_if_due(
+                    &mut sink,
+                    &mut stream,
+                    &mut control_rx,
+                    ctx.cfg,
+                    ctx.agent_id,
+                    &mut cert_check,
+                )
+                .await?;
+            }
+            _ = notify.notified() => {}
+            Some(response) = control_rx.recv() => {
+                send_frame_with_config(
+                    &mut sink,
+                    &Frame::ControlResponse(response),
+                    ctx.cfg,
+                )
+                .await?;
+            }
+            incoming = stream.next() => {
+                match incoming {
+                    Some(Ok(Message::Close(_))) | None => bail!("hub 关闭了连接"),
+                    Some(Ok(Message::Binary(bytes))) => {
+                        handle_side_frame(
+                            &mut sink,
+                            &dispatcher,
+                            send_timeout,
+                            classify_incoming(bytes.as_ref()),
+                        )
+                        .await?;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => return Err(err.into()),
+                }
+            }
         }
     }
 }
@@ -3039,7 +3252,664 @@ mod tests {
             std::fs::read_to_string(dir.join("buffer.meta.bak")).unwrap(),
             "0"
         );
+    }
 
+    // ===== v1.0.0 R2：#42 建连总超时 =====
+
+    /// 黑洞服务器：accept 后持有 socket，既不读也不写。
+    ///
+    /// 对 `ws://` 模拟「TCP 通了但永远不回 101」，对 `wss://` 模拟「TCP 通了但
+    /// 永远不发 ServerHello」。返回监听地址与后台任务句柄（测试结束 abort）。
+    async fn blackhole_listener() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定黑洞监听失败");
+        let addr = listener.local_addr().expect("读取黑洞监听地址失败");
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        (addr, handle)
+    }
+
+    fn assert_connect_timeout(err: &anyhow::Error, started: std::time::Instant, budget: u64) {
+        let elapsed = started.elapsed();
+        assert!(
+            err.to_string().contains("超时"),
+            "必须报告建连超时: {err:#}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(budget * 1_000 - 100),
+            "必须等满 {budget}s deadline 才失败，实际 {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(budget + 2),
+            "不得远超标称超时，实际 {elapsed:?}"
+        );
+    }
+
+    /// #42：TCP 已连接但 TLS 不回 ServerHello、或明文不回 HTTP 101 时，
+    /// `connect()` 必须在 `connect_timeout_secs` 内返回可重试错误；连接拒绝
+    /// 必须快速失败；慢但在 deadline 内的正常握手必须成功。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v100_connect_deadline_covers_tcp_tls_and_101() {
+        let dir = temp_dir("connect-deadline");
+        let (addr, server) = blackhole_listener().await;
+
+        // (a) 明文 ws：TCP 已接通，服务端不回 101。
+        let cfg = AgentConfig {
+            hub_url: format!("ws://{addr}/agent/ws"),
+            connect_timeout_secs: 1,
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let err = connect(&cfg, false)
+            .await
+            .expect_err("101 黑洞必须超时失败");
+        assert_connect_timeout(&err, started, 1);
+
+        // (b) wss：TCP 已接通，服务端不发 ServerHello（TLS 握手黑洞）。
+        let cfg = AgentConfig {
+            hub_url: format!("wss://{addr}/agent/ws"),
+            server_fingerprint: "ab".repeat(32),
+            connect_timeout_secs: 1,
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let err = connect(&cfg, false)
+            .await
+            .expect_err("TLS 黑洞必须超时失败");
+        assert_connect_timeout(&err, started, 1);
+        server.abort();
+        let _ = server.await;
+
+        // (c) wss：TLS 握手完成，但服务端读到 HTTP 请求后不回 101。
+        use tokio::io::AsyncReadExt as _;
+
+        let hub_dir = dir.join("hub-tls");
+        tls::ensure_hub_material(
+            &hub_dir,
+            &["localhost".to_string()],
+            tls::CertPolicy::default(),
+        )
+        .unwrap();
+        let server_config = tls::server_config(&hub_dir).unwrap();
+        let server_pem =
+            std::fs::read_to_string(tls::cert_dir(&hub_dir).join(tls::SERVER_CERT_FILE)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定 TLS 101 黑洞监听失败");
+        let tls_port = listener.local_addr().expect("读取 TLS 监听地址失败").port();
+        let tls_server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("TLS accept 失败");
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+            let mut stream = acceptor.accept(tcp).await.expect("TLS 握手必须完成");
+            let mut buf = [0u8; 1024];
+            let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+            // 已读到 HTTP 请求，但绝不写回 101。
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let cfg = AgentConfig {
+            hub_url: format!("wss://localhost:{tls_port}/agent/ws"),
+            server_fingerprint: tls::fingerprint_of_pem(&server_pem).unwrap(),
+            connect_timeout_secs: 1,
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let err = connect(&cfg, false)
+            .await
+            .expect_err("TLS 完成后不回 101 也必须超时");
+        assert_connect_timeout(&err, started, 1);
+        tls_server.abort();
+        let _ = tls_server.await;
+
+        // (d) 连接拒绝：立即失败，不能等到 deadline。
+        let free = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定临时端口失败");
+        let refused_addr = free.local_addr().expect("读取临时端口失败");
+        drop(free);
+        let cfg = AgentConfig {
+            hub_url: format!("ws://{refused_addr}/agent/ws"),
+            connect_timeout_secs: 2,
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let err = connect(&cfg, false).await.expect_err("连接拒绝必须失败");
+        assert!(
+            !err.to_string().contains("超时"),
+            "连接拒绝不得伪装成超时: {err:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "连接拒绝应立即返回，实际 {:?}",
+            started.elapsed()
+        );
+
+        // (e) 慢但仍在 deadline 内：服务端延迟 300ms 再做 WebSocket 握手。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定慢握手监听失败");
+        let slow_addr = listener.local_addr().expect("读取慢握手地址失败");
+        let slow_server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("慢握手 accept 失败");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ws = tokio_tungstenite::accept_async(tcp)
+                .await
+                .expect("慢握手 accept_async 失败");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let cfg = AgentConfig {
+            hub_url: format!("ws://{slow_addr}/agent/ws"),
+            connect_timeout_secs: 2,
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let ws = connect(&cfg, false).await.expect("慢但未超时必须成功");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(2),
+            "慢握手应成功且耗时合理，实际 {elapsed:?}"
+        );
+        drop(ws);
+        slow_server.abort();
+        let _ = slow_server.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #42：`try_enroll` / `renew_once` 都通过同一个 `connect()`，黑洞地址
+    /// 必须被同一个 deadline 约束，不能无限挂起。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v100_enroll_and_renew_are_bounded_by_connect_timeout() {
+        let (addr, server) = blackhole_listener().await;
+        let dir = temp_dir("enroll-renew-deadline");
+        std::fs::create_dir_all(&dir).expect("创建临时数据目录失败");
+
+        // try_enroll：首次纳管路径。
+        let cfg = AgentConfig {
+            hub_url: format!("ws://{addr}/agent/ws"),
+            connect_timeout_secs: 1,
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let started = std::time::Instant::now();
+        match try_enroll(&cfg).await {
+            Err(EnrollError::Retry(err)) => {
+                assert!(err.to_string().contains("超时"), "错误信息: {err:#}");
+                assert!(
+                    started.elapsed() < Duration::from_secs(3),
+                    "try_enroll 必须受建连 deadline 约束，实际 {:?}",
+                    started.elapsed()
+                );
+            }
+            Err(EnrollError::Fatal(err)) => panic!("连接超时应可重试，实际 Fatal: {err:#}"),
+            Ok(()) => panic!("黑洞服务器不可能完成纳管"),
+        }
+
+        // renew_once：已纳管后的手工续签路径。
+        let mut enrolled = enrolled_config(&dir, 90);
+        enrolled.hub_url = format!("ws://{addr}/agent/ws");
+        enrolled.connect_timeout_secs = 1;
+        let started = std::time::Instant::now();
+        let err = renew_once(&enrolled)
+            .await
+            .expect_err("黑洞服务器上的 renew_once 必须失败");
+        assert!(err.to_string().contains("超时"), "错误信息: {err:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "renew_once 必须受建连 deadline 约束，实际 {:?}",
+            started.elapsed()
+        );
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #42：`run_async` 的常驻重连循环不能卡在第一次建连；超时后必须进入
+    /// 退避并再次尝试（用 accept 次数观察，不依赖日志）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v100_run_async_retries_after_connect_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定重试监听失败");
+        let addr = listener.local_addr().expect("读取重试监听地址失败");
+        let accepted = Arc::new(AtomicU32::new(0));
+        let accepted_server = accepted.clone();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted_server.fetch_add(1, Ordering::Relaxed);
+                held.push(socket);
+            }
+        });
+
+        let dir = temp_dir("run-async-deadline");
+        let mut cfg = enrolled_config(&dir, 90);
+        cfg.hub_url = format!("ws://{addr}/agent/ws");
+        cfg.connect_timeout_secs = 1;
+        cfg.session_max_hours = 0;
+        let run = tokio::spawn(run_async(cfg));
+
+        // 第 1 次连接 1s 超时 + 1s 退避，第 2 次应在 ~2s 出现；轮询避免 CI
+        // 机器负载导致的固定 sleep 抖动。
+        let wait_until = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut count = 0;
+        while tokio::time::Instant::now() < wait_until {
+            count = accepted.load(Ordering::Relaxed);
+            if count >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            count >= 2,
+            "run_async 必须在建连超时后重试，实际只 accept {count} 次"
+        );
+
+        run.abort();
+        server.abort();
+        let _ = run.await;
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===== v1.0.0 R2：#48 明文 ws 策略 =====
+
+    /// #48：远程明文 ws 必须在发出任何网络请求之前被拒绝，且错误不泄露 token。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v100_remote_plaintext_ws_is_rejected_before_network() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
+            .await
+            .expect("绑定非回环测试监听失败");
+        let port = listener.local_addr().expect("读取监听地址失败").port();
+        let dir = temp_dir("insecure-ws-reject");
+
+        let cfg = AgentConfig {
+            // 0.0.0.0 不是回环地址；若策略失效会真的连上本地监听。
+            hub_url: format!("ws://0.0.0.0:{port}/agent/ws"),
+            token: "super-secret-token".to_string(),
+            connect_timeout_secs: 5,
+            data_dir: dir,
+            ..AgentConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let err = connect(&cfg, false)
+            .await
+            .expect_err("非回环 ws 默认必须被拒绝");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("allow_insecure_ws"),
+            "错误必须给出 opt-in 指引: {message}"
+        );
+        assert!(
+            !message.contains("super-secret-token"),
+            "错误不得泄露 token: {message}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "必须在建连前快速失败，实际 {:?}",
+            started.elapsed()
+        );
+
+        // 没有发出任何网络请求：监听端不应收到连接。
+        let accepted = tokio::time::timeout(Duration::from_millis(250), listener.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "策略拒绝不得先发网络请求（accept 到了连接）"
+        );
+    }
+
+    /// #48：loopback ws 默认允许；非回环显式 opt-in 后允许。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v100_loopback_ws_allowed_and_opt_in_unlocks_remote() {
+        let dir = temp_dir("insecure-ws-allow");
+
+        // loopback：默认合法。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定 loopback 监听失败");
+        let addr = listener.local_addr().expect("读取 loopback 地址失败");
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("loopback accept 失败");
+            let _ws = tokio_tungstenite::accept_async(tcp)
+                .await
+                .expect("loopback accept_async 失败");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let cfg = AgentConfig {
+            hub_url: format!("ws://{addr}/agent/ws"),
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        assert!(!cfg.allow_insecure_ws);
+        cfg.validate().expect("loopback ws 默认必须合法");
+        let ws = connect(&cfg, false).await.expect("loopback ws 必须能连上");
+        drop(ws);
+        server.abort();
+        let _ = server.await;
+
+        // 非回环：显式 opt-in 后允许。
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
+            .await
+            .expect("绑定 opt-in 监听失败");
+        let port = listener.local_addr().expect("读取 opt-in 地址失败").port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("opt-in accept 失败");
+            let _ws = tokio_tungstenite::accept_async(tcp)
+                .await
+                .expect("opt-in accept_async 失败");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let cfg = AgentConfig {
+            hub_url: format!("ws://0.0.0.0:{port}/agent/ws"),
+            allow_insecure_ws: true,
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        cfg.validate().expect("opt-in 后必须合法");
+        let ws = connect(&cfg, false)
+            .await
+            .expect("显式 opt-in 的远程 ws 必须能连上");
+        drop(ws);
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #48 复审：日志 / CLI 只展示 host:port，绝不回显 URL userinfo。
+    #[test]
+    fn v100_hub_endpoint_display_redacts_userinfo() {
+        assert_eq!(
+            hub_endpoint_for_display("wss://user:pass@hub.example.com:8443/agent/ws"),
+            "hub.example.com:8443"
+        );
+        assert_eq!(
+            hub_endpoint_for_display("ws://127.0.0.1:8080/agent/ws"),
+            "127.0.0.1:8080"
+        );
+        assert_eq!(
+            hub_endpoint_for_display("wss://[::1]:8443/agent/ws"),
+            "[::1]:8443"
+        );
+
+        for url in [
+            "wss://user:pass@hub.example.com:8443/agent/ws",
+            "ws://token@127.0.0.1:1/agent/ws",
+        ] {
+            let shown = hub_endpoint_for_display(url);
+            assert!(!shown.contains("user"), "不得回显 userinfo: {shown}");
+            assert!(!shown.contains("pass"), "不得回显密码: {shown}");
+            assert!(!shown.contains("token"), "不得回显 token: {shown}");
+            assert!(!shown.contains('@'), "不得回显 userinfo 分隔符: {shown}");
+        }
+
+        // 非法 URL 也不能回显原文（其中可能带凭据）。
+        let shown = hub_endpoint_for_display("not-a-url://user:pass@host/x");
+        assert_eq!(shown, "(invalid hub_url)");
+        assert!(!shown.contains("pass"));
+    }
+
+    // ===== v1.0.0 R2：#44 证书检查饥饿 =====
+
+    type DelayedStream =
+        std::pin::Pin<Box<dyn Stream<Item = std::result::Result<Message, WsError>>>>;
+
+    /// 按给定延迟返回帧；用于让控制应答有机会在 ACK 之前写回 sink。
+    fn delayed_frames(items: Vec<(Duration, Message)>) -> DelayedStream {
+        Box::pin(futures_util::stream::unfold(
+            items.into_iter(),
+            |mut iter| async move {
+                let (delay, message) = iter.next()?;
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                Some((Ok(message), iter))
+            },
+        ))
+    }
+
+    fn test_batch(seq: u64) -> SampleBatch {
+        SampleBatch {
+            agent_id: "agent-test".to_string(),
+            epoch: 1,
+            seq,
+            boot_id: "boot".to_string(),
+            sent_at: now_ms(),
+            samples: vec![Sample::new("cpu.user", now_ms(), 1.0)],
+        }
+    }
+
+    /// #44：持续有 pending 批次时，证书 deadline 在每批 ACK 后、下一批发送前
+    /// 被检查：续签发生且不丢 ACK / ControlRequest。
+    #[tokio::test]
+    async fn v100_cert_check_between_pending_batches_keeps_ack_and_control() {
+        use rustboard_common::control::{codes as common_codes, ControlOp, ControlRequest};
+
+        let dir = temp_dir("cert-check-starvation");
+        // 证书剩余 1 天 ≤ 阈值 30：一旦检查就应续签。
+        let cfg = enrolled_config(&dir, 1);
+        let key_pem = std::fs::read_to_string(dir.join(AGENT_KEY)).unwrap();
+        let new_cert = hub_sign(&dir, &tls::make_csr_with_key(&key_pem).unwrap(), 90);
+
+        let mut buffer = DiskBuffer::open(&dir, 64 * 1024 * 1024, 0).expect("打开 DiskBuffer 失败");
+        for seq in 1..=2 {
+            buffer
+                .push(&test_batch(seq))
+                .expect("写入 pending 批次失败");
+        }
+        assert_eq!(buffer.pending_len(), 2, "测试前必须有两批 pending");
+        let buffer = Arc::new(Mutex::new(buffer));
+
+        let ack = |seq: u64| {
+            Message::Binary(Frame::Ack { epoch: 1, seq }.encode().expect("Ack 编码失败"))
+        };
+        let renewal_control = Message::Binary(
+            Frame::ControlRequest(ControlRequest::new(77, ControlOp::ProcessList))
+                .encode()
+                .expect("ControlRequest 编码失败"),
+        );
+        let renewed = Message::Binary(
+            Frame::CertRenewed { cert_pem: new_cert }
+                .encode()
+                .expect("CertRenewed 编码失败"),
+        );
+        // 无法解码的控制操作：用于验证 ACK 等待路径会回 unsupported，而不是丢帧。
+        let unknown_control = Message::Binary(
+            rmp_serde::to_vec(&serde_json::json!({
+                "ControlRequest": {"id": 4242, "op": {"FutureOp": {}}}
+            }))
+            .expect("构造未知控制帧失败"),
+        );
+
+        // 顺序：Ack#1 → 续签期间的 ControlRequest → CertRenewed →
+        //       ACK 等待期间的未知 ControlRequest → 延迟后 Ack#2。
+        let mut stream = delayed_frames(vec![
+            (Duration::ZERO, ack(1)),
+            (Duration::ZERO, renewal_control),
+            (Duration::ZERO, renewed),
+            (Duration::ZERO, unknown_control),
+            (Duration::from_millis(150), ack(2)),
+        ]);
+
+        let (mut sink, sent) = RecordingSink::new();
+        let (dispatcher, mut control_rx) = control::ControlDispatcher::new(cfg.control.clone());
+        let mut cert_check = CertCheckState::new(cert_check_period(cfg.cert_check_interval_hours));
+        // 模拟「推进时钟进入续签窗口」：deadline 已到，业务侧必须检查。
+        cert_check.force_due();
+
+        let uploaded = tokio::time::timeout(
+            Duration::from_secs(5),
+            upload_pending_batches(
+                &mut sink,
+                &mut stream,
+                &buffer,
+                &mut control_rx,
+                &dispatcher,
+                &cfg,
+                "agent-test",
+                &mut cert_check,
+            ),
+        )
+        .await
+        .expect("持续 pending 时上传循环不得挂死")
+        .expect("两批都必须成功 ACK");
+        assert_eq!(uploaded, 2);
+        assert_eq!(
+            buffer.lock().await.pending_len(),
+            0,
+            "两批都必须被 ACK 丢弃"
+        );
+
+        let frames: Vec<Frame> = sent
+            .lock()
+            .expect("测试记录锁不应中毒")
+            .iter()
+            .map(|message| match message {
+                Message::Binary(bytes) => {
+                    Frame::decode(bytes.as_ref()).expect("发出的帧必须可解码")
+                }
+                other => panic!("只应发送二进制帧，实际: {other:?}"),
+            })
+            .collect();
+
+        let batch_positions: Vec<(usize, u64)> = frames
+            .iter()
+            .enumerate()
+            .filter_map(|(index, frame)| match frame {
+                Frame::Batch(batch) => Some((index, batch.seq)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            batch_positions
+                .iter()
+                .map(|(_, seq)| *seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "两批都必须发送: {frames:?}"
+        );
+        let renew_pos = frames
+            .iter()
+            .position(|frame| matches!(frame, Frame::RenewCert { .. }))
+            .expect("证书到期必须触发续签");
+        assert!(
+            batch_positions[0].0 < renew_pos && renew_pos < batch_positions[1].0,
+            "续签必须在第一批 ACK 后、第二批发送前: {frames:?}"
+        );
+
+        // 续签期间的 ControlRequest 回 busy_renewing，没有被丢弃。
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                Frame::ControlResponse(response)
+                    if response.id == 77
+                        && response.error.as_ref().is_some_and(|err| err.code == common_codes::BUSY_RENEWING)
+            )),
+            "续签期间的 ControlRequest 必须被答复: {frames:?}"
+        );
+        // ACK 等待期间的未知控制操作必须回 unsupported（不是丢帧）。
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                Frame::ControlResponse(response)
+                    if response.id == 4242
+                        && response.error.as_ref().is_some_and(|err| err.code == common_codes::UNSUPPORTED)
+            )),
+            "ACK 期间的 ControlRequest 不得丢失: {frames:?}"
+        );
+
+        // 新证书已落盘（续签真的完成）。
+        let on_disk = std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap();
+        assert_eq!(
+            tls::days_left(&on_disk, now_ms()).unwrap(),
+            90,
+            "续签证书必须落盘"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #44 复审：续签前必须先 drain 已完成的控制应答。
+    ///
+    /// 续签最多占用 stream 20s，而 hub 的控制命令超时是 15s；不 drain 会让已经
+    /// 执行完的应答被压在 channel 里直到超时。
+    #[tokio::test]
+    async fn v100_due_cert_check_drains_control_before_renew() {
+        let dir = temp_dir("cert-drain-control");
+        let cfg = enrolled_config(&dir, 1);
+        let key_pem = std::fs::read_to_string(dir.join(AGENT_KEY)).unwrap();
+        let new_cert = hub_sign(&dir, &tls::make_csr_with_key(&key_pem).unwrap(), 90);
+        let renewed = Message::Binary(
+            Frame::CertRenewed { cert_pem: new_cert }
+                .encode()
+                .expect("CertRenewed 编码失败"),
+        );
+        let mut stream = futures_util::stream::iter(vec![Ok(renewed)]);
+
+        let (mut sink, sent) = RecordingSink::new();
+        let (dispatcher, mut control_rx) = control::ControlDispatcher::new(cfg.control.clone());
+        // 模拟控制任务已完成、应答还在 channel 里排队，尚未来得及写回 hub。
+        dispatcher.unsupported(4243, "queued-before-renew");
+
+        let mut cert_check = CertCheckState::new(cert_check_period(cfg.cert_check_interval_hours));
+        cert_check.force_due();
+        run_cert_check_if_due(
+            &mut sink,
+            &mut stream,
+            &mut control_rx,
+            &cfg,
+            "agent-test",
+            &mut cert_check,
+        )
+        .await
+        .expect("到期证书检查必须成功");
+
+        let frames: Vec<Frame> = sent
+            .lock()
+            .expect("测试记录锁不应中毒")
+            .iter()
+            .map(|message| match message {
+                Message::Binary(bytes) => {
+                    Frame::decode(bytes.as_ref()).expect("发出的帧必须可解码")
+                }
+                other => panic!("只应发送二进制帧，实际: {other:?}"),
+            })
+            .collect();
+        let control_pos = frames
+            .iter()
+            .position(|frame| {
+                matches!(
+                    frame,
+                    Frame::ControlResponse(response) if response.id == 4243
+                )
+            })
+            .expect("排队的控制应答必须先写回");
+        let renew_pos = frames
+            .iter()
+            .position(|frame| matches!(frame, Frame::RenewCert { .. }))
+            .expect("证书到期必须触发续签");
+        assert!(
+            control_pos < renew_pos,
+            "控制应答必须先于续签写回: {frames:?}"
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "进入续签前 channel 必须已经 drain 空"
+        );
+
+        let on_disk = std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap();
+        assert_eq!(
+            tls::days_left(&on_disk, now_ms()).unwrap(),
+            90,
+            "续签必须完成并落盘"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -280,6 +280,24 @@ server_fingerprint = ""    # fingerprint 必填；旧配置兼容
 - 自定义 CA 文件可以是多张 PEM 的 bundle；不要指向可被普通用户替换的路径。
 - 详细迁移与逐模式示例见 [acme.md §7](acme.md#7-失败与回退) 与 agent 安装帮助。
 
+### 7.1 建连超时与明文 ws 策略（v1.0.0）
+
+```toml
+connect_timeout_secs = 10   # 1–60；覆盖 DNS / TCP / TLS / HTTP 101
+allow_insecure_ws = false   # 仅开发 / 隔离网络
+```
+
+- `connect_timeout_secs` 默认 10、范围 1–60，旧配置缺字段自动使用默认值。DNS
+  预解析、TCP connect、TLS 握手与 HTTP 101 共用同一 deadline；超时计入现有
+  指数退避重连，不会无限挂起。
+- `ws://` 默认只允许回环（`127.0.0.0/8`、`::1`、`localhost`）。连接非回环明文 hub
+  会在发出任何网络请求前失败；确需明文必须显式设置 `allow_insecure_ws = true`，
+  启动日志会 WARN（只记录 host:port，不输出 token）。明文会暴露 enrollment token、
+  agent secret 与采样数据，生产环境请改用 `wss://`。
+- `ws://` 仍不允许 `custom-ca` / `system-roots`：明文下 CA 与主机名校验会被忽略。
+- 回滚：把 `allow_insecure_ws` 改回 `false` 只会收紧策略；`wss://` 的指纹 / CA /
+  mTLS 行为不变。
+
 ## 8. 兼容、迁移与回滚
 
 - **协议/数据库不变**：不新增协议帧、不改 SQLite schema v7；只新增配置字段与

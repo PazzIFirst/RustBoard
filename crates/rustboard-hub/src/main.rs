@@ -5052,7 +5052,7 @@ async fn handle_session(mut socket: WebSocket, state: AppState, hello: AgentHell
 
         let mut shutdown = handle.shutdown;
         let mut watch_shutdown = true;
-        // 每个会话最多成功续签一次，状态跟随会话生命周期。
+        // 会话内只记录最近一次成功时间；能否续签由每 agent 冷却窗口决定。
         let mut renew = RenewState::default();
         // 绝对空闲 deadline：每秒的控制清理 tick 不会重置它，只有入站帧才续期。
         let mut idle = SessionIdle::new(SESSION_IDLE_TIMEOUT);
@@ -5296,16 +5296,18 @@ impl SessionIdle {
 
 /// 单个会话的客户端证书续签状态。
 ///
-/// 每个会话最多成功签发 1 次；跨会话的重复请求由 [`RenewGuard`] 的冷却窗口兜住。
+/// 只记录本会话最近一次成功的时间（Unix 毫秒，0 表示尚未成功），用于日志 /
+/// 指标；准入门槛完全由 [`RenewGuard`] 的每 agent 冷却窗口与容量上限决定，
+/// 因此同一会话在冷却结束后可以再次续签。
 #[derive(Default)]
 struct RenewState {
-    succeeded: bool,
+    last_success_ms: i64,
 }
 
 /// 客户端续签的冷却窗口：同一 agent 10 分钟内只允许一次尝试。
 ///
-/// 每会话 1 次可以被「断开重连」绕过，冷却表把窗口收紧到每 agent 10 分钟；
-/// 正常轮换（90 天证书、30 天阈值）完全用不到第二次请求。
+/// 冷却窗口同时约束「同会话高频重试」与「断开重连绕过会话状态」；正常轮换
+/// （90 天证书、30 天阈值）远低于该频率，保留下来的只是防刷签名与内存上界。
 const RENEW_COOLDOWN_MS: i64 = 10 * 60 * 1_000;
 /// 冷却表容量上限；超过后清理过期项，防止被大量 agent_id 撑爆内存。
 const RENEW_GUARD_MAX_ENTRIES: usize = 4_096;
@@ -5335,19 +5337,17 @@ impl RenewGuard {
             let cutoff = now_ms.saturating_sub(RENEW_COOLDOWN_MS);
             self.last_attempt_ms.retain(|_, ts| *ts > cutoff);
 
-            // 仍在窗口内的条目占满表时，淘汰最早的一条，保证内存有硬上界。
-            // 合法 agent 数远小于上限，被淘汰的只会是极久未活跃的身份。
+            // 清理过期项后仍然满表：拒绝新身份，绝不淘汰仍在冷却窗口内的记录。
+            // 否则攻击者可以用 ≥ 上限数量的新 agent_id 轮换，把任意身份的冷却
+            // 记录挤掉，从而绕过 10 分钟限流。已在表中的身份仍可正常更新。
             if self.last_attempt_ms.len() >= RENEW_GUARD_MAX_ENTRIES
                 && !self.last_attempt_ms.contains_key(agent_id)
             {
-                if let Some(oldest) = self
-                    .last_attempt_ms
-                    .iter()
-                    .min_by_key(|(_, ts)| **ts)
-                    .map(|(id, _)| id.clone())
-                {
-                    self.last_attempt_ms.remove(&oldest);
-                }
+                tracing::warn!(
+                    capacity = RENEW_GUARD_MAX_ENTRIES,
+                    "续签冷却表已满，拒绝新身份的续签尝试"
+                );
+                return false;
             }
         }
         self.last_attempt_ms.insert(agent_id.to_string(), now_ms);
@@ -5391,10 +5391,12 @@ enum SignOutcome {
 /// 处理一条 `RenewCert` 请求，返回要回给 agent 的帧。
 ///
 /// 顺序（评审要求）：
-/// 1. 会话内已成功 → 限流；
-/// 2. 全局冷却窗口 → 限流（记录尝试，**无效 CSR 也计入**）；
-/// 3. CSR 长度上限（16 KiB，O(1)，不解析）；
-/// 4. 读 CA 私钥 + 解析 CSR + 签发，全部在 `spawn_blocking` 里做。
+/// 1. 全局冷却窗口 → 限流（记录尝试，**无效 CSR 也计入**）；
+/// 2. CSR 长度上限（16 KiB，O(1)，不解析）；
+/// 3. 读 CA 私钥 + 解析 CSR + 签发，全部在 `spawn_blocking` 里做。
+///
+/// 不再有「同会话只能成功一次」的永久拒绝：证书跨多个周期轮换时，只要冷却
+/// 窗口已过就允许再次签发；成功后只更新 [`RenewState::last_success_ms`]。
 ///
 /// 安全要点：证书 CN **强制**取会话身份 `agent_id`，CSR 里自带的 CN 会被丢弃，
 /// 因此伪造 CN 也拿不到别人的身份。CSR 只作为公钥载体。
@@ -5405,10 +5407,6 @@ async fn handle_renewal(
     csr_pem: &str,
     now_ms: i64,
 ) -> Frame {
-    if renew.succeeded {
-        tracing::warn!(agent = %agent_id, "同一会话重复请求证书续签，已拒绝");
-        return problem(codes::RATE_LIMITED, "同一会话只能续签一次");
-    }
     if !ctx.guard().begin_attempt(agent_id, now_ms) {
         tracing::warn!(
             agent = %agent_id,
@@ -5448,11 +5446,12 @@ async fn handle_renewal(
     match outcome {
         Ok(SignOutcome::Signed(cert_pem)) => match tls::not_after_unix(&cert_pem) {
             Ok(not_after) => {
-                renew.succeeded = true;
-                // 日志只记身份与到期时间：CSR / 证书内容一律不入日志。
+                renew.last_success_ms = now_ms;
+                // 日志只记身份、到期时间与上次成功时间：CSR / 证书内容一律不入日志。
                 tracing::info!(
                     agent = %agent_id,
                     not_after = %tls::format_unix_utc(not_after),
+                    last_success_ms = renew.last_success_ms,
                     "客户端证书已续签"
                 );
                 Frame::CertRenewed { cert_pem }
@@ -6546,10 +6545,11 @@ mod tests {
         }
     }
 
-    /// A5/安全：走真实 `handle_renewal` 路径——CN 强制取会话身份，
-    /// 同一会话第二次、以及重连后仍在冷却窗口内的请求都被限流。
+    /// A5/安全：走真实 `handle_renewal` 路径——CN 强制取会话身份；
+    /// #43：同会话不再永久拒绝，只受 10 分钟冷却约束（冷却内拒绝、冷却后成功），
+    /// 跨两个证书周期仍能继续轮换并推进 `last_success_ms`。
     #[tokio::test]
-    async fn a5_renewal_uses_session_identity_and_rate_limits() {
+    async fn a5_renewal_uses_session_identity_and_cooldown_only() {
         let (dir, ctx) = renewal_fixture("renew-identity");
         let now = now_ms();
         let csr = csr_with_cn("hub-self");
@@ -6567,48 +6567,67 @@ mod tests {
                 let not_after = tls::not_after_unix(&cert_pem).unwrap();
                 assert!(not_after * 1_000 > now, "新证书必须尚未过期");
                 assert_eq!(tls::days_left(&cert_pem, now).unwrap(), 90);
-                assert!(session.succeeded);
+                assert_eq!(session.last_success_ms, now);
             }
             other => panic!("首次续签必须成功，实际: {other:?}"),
         }
 
-        // 同一会话第二次：即使冷却已过也必须被会话级限流拦住。
+        // 同一会话冷却窗口内：拒绝。
         let reply = handle_renewal(
             &ctx,
             &mut session,
             "session-agent",
             &csr,
-            now + RENEW_COOLDOWN_MS + 1,
+            now + RENEW_COOLDOWN_MS - 1,
         )
         .await;
         assert_eq!(problem_code(&reply), codes::RATE_LIMITED);
+        assert_eq!(
+            session.last_success_ms, now,
+            "冷区内失败不得改写上次成功时间"
+        );
+
+        // 冷却窗口到期后，同一会话必须能再次续签（旧实现会永久拒绝）。
+        let second_success_at = now + RENEW_COOLDOWN_MS;
+        match handle_renewal(&ctx, &mut session, "session-agent", &csr, second_success_at).await {
+            Frame::CertRenewed { .. } => {}
+            other => panic!("冷却结束后同一会话必须可以续签，实际: {other:?}"),
+        }
+        assert_eq!(session.last_success_ms, second_success_at);
 
         // 换一个新会话（模拟断开重连）：仍在冷却窗口内 → 仍被限流。
         let mut reconnect = RenewState::default();
-        let reply = handle_renewal(&ctx, &mut reconnect, "session-agent", &csr, now + 1_000).await;
+        let reply = handle_renewal(
+            &ctx,
+            &mut reconnect,
+            "session-agent",
+            &csr,
+            second_success_at + 1_000,
+        )
+        .await;
         assert_eq!(problem_code(&reply), codes::RATE_LIMITED);
-        assert!(!reconnect.succeeded);
+        assert_eq!(reconnect.last_success_ms, 0);
 
         // 其他 agent 不受影响。
         let mut other = RenewState::default();
         assert!(matches!(
-            handle_renewal(&ctx, &mut other, "other-agent", &csr, now + 1).await,
+            handle_renewal(&ctx, &mut other, "other-agent", &csr, second_success_at + 1).await,
             Frame::CertRenewed { .. }
         ));
 
-        // 冷却窗口到期后允许再次续签。
-        let mut later = RenewState::default();
-        assert!(matches!(
-            handle_renewal(
-                &ctx,
-                &mut later,
-                "session-agent",
-                &csr,
-                now + RENEW_COOLDOWN_MS + 1
-            )
-            .await,
-            Frame::CertRenewed { .. }
-        ));
+        // 跨两个证书周期（90 天一轮）：每次冷却都早已过去，均应成功。
+        let day_ms = 24 * 60 * 60 * 1_000i64;
+        for cycle in 1..=2 {
+            let at = second_success_at + cycle * 90 * day_ms;
+            match handle_renewal(&ctx, &mut session, "session-agent", &csr, at).await {
+                Frame::CertRenewed { .. } => {}
+                other => panic!("第 {cycle} 个周期续签必须成功，实际: {other:?}"),
+            }
+            assert_eq!(
+                session.last_success_ms, at,
+                "第 {cycle} 个周期必须记录新的成功时间"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6640,7 +6659,7 @@ mod tests {
         let mut session = RenewState::default();
         let reply = handle_renewal(&ctx, &mut session, "agent-garbage", "not a csr", now).await;
         assert_eq!(problem_code(&reply), codes::BAD_FRAME);
-        assert!(!session.succeeded);
+        assert_eq!(session.last_success_ms, 0, "失败不得记录成功时间");
 
         // 客户端有效期非法（0 天）：即使 CSR 合法也必须被拒。
         let bad_days = RenewalContext::new(tls::cert_dir(&dir), 0);
@@ -6760,6 +6779,9 @@ mod tests {
     }
 
     /// 冷却表：窗口内拒绝、窗口后放行、不同 agent 互不影响，且表大小有硬上界。
+    ///
+    /// 满表且条目仍在冷却窗口内时必须拒绝新身份：若淘汰旧条目，攻击者可用
+    /// ≥ 上限数量的新 agent_id 轮流挤掉任意身份的冷却记录，从而绕过 10 分钟限流。
     #[test]
     fn renew_guard_cooldown_and_memory_bound() {
         let mut guard = RenewGuard::new();
@@ -6776,14 +6798,40 @@ mod tests {
         );
         assert!(guard.begin_attempt("b", now), "不同 agent 的冷却互不影响");
 
-        // 塞入远多于上限的身份，表长度必须始终不超过上限（内存有硬上界）。
-        for i in 0..(RENEW_GUARD_MAX_ENTRIES + 32) {
-            assert!(guard.begin_attempt(&format!("agent-{i}"), now + i as i64));
+        // 独立表精确填满容量，所有条目都处于冷却窗口内。
+        let mut full = RenewGuard::new();
+        for i in 0..RENEW_GUARD_MAX_ENTRIES {
+            assert!(
+                full.begin_attempt(&format!("agent-{i}"), now),
+                "第 {i} 个身份在未满表时必须放行"
+            );
         }
+        assert_eq!(full.last_attempt_ms.len(), RENEW_GUARD_MAX_ENTRIES);
+
+        // 满表且全在冷却窗口：新身份拒绝，表大小不变，旧身份的冷却不被挤掉。
         assert!(
-            guard.last_attempt_ms.len() <= RENEW_GUARD_MAX_ENTRIES,
+            !full.begin_attempt("agent-overflow", now + 1),
+            "满表时不得淘汰冷却中的记录来放行新身份"
+        );
+        assert_eq!(
+            full.last_attempt_ms.len(),
+            RENEW_GUARD_MAX_ENTRIES,
+            "拒绝新身份后表大小必须保持上限"
+        );
+        assert!(
+            !full.begin_attempt("agent-0", now + 1),
+            "已有身份仍必须受冷却窗口约束"
+        );
+
+        // 冷却结束后：只清理过期项即可放行新身份，表仍不超过上限。
+        assert!(
+            full.begin_attempt("agent-overflow", now + RENEW_COOLDOWN_MS),
+            "冷却结束并清理过期项后必须放行新身份"
+        );
+        assert!(
+            full.last_attempt_ms.len() <= RENEW_GUARD_MAX_ENTRIES,
             "冷却表不得无限增长，实际 {}",
-            guard.last_attempt_ms.len()
+            full.last_attempt_ms.len()
         );
     }
 
