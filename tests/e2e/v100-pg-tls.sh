@@ -30,6 +30,9 @@ chmod 0700 -- "$RUN_DIR" "$EVIDENCE" "$SECRETS"
 HUB_BIN="$ROOT/target/debug/rustboard-hub"
 AGENT_BIN="$ROOT/target/debug/rustboard-agent"
 PG_CONTAINER=""
+PG_CONTAINER_NAME=""
+PG_NAME_WAS_FREE=0
+PG_LOG_COLLECTED=0
 PG_PORT=""
 AGENT_PORT=""
 ADMIN_PORT=""
@@ -44,6 +47,23 @@ HUB_ADMIN_TOKEN=""
 ENROLL_TOKEN=""
 AGENT_ID=""
 FINALIZED=0
+RAW_SCAN_DONE=0
+RAW_SCANNED_COUNT=0
+RAW_SECRET_COUNT=0
+CLEANUP_FAILED=0
+HEAD_COMMIT=""
+HEAD_COMMIT_EPOCH=0
+HEAD_DIRTY_ENTRIES=0
+HUB_SHA256=""
+AGENT_SHA256=""
+HUB_MTIME=""
+AGENT_MTIME=""
+HUB_MTIME_EPOCH=0
+AGENT_MTIME_EPOCH=0
+HUB_OLDER_THAN_HEAD=0
+AGENT_OLDER_THAN_HEAD=0
+PG_IMAGE_ID=""
+SCRIPT_SHA256=""
 PASS=0
 FAIL=0
 
@@ -78,6 +98,149 @@ stop_pid() {
     fi
   fi
   wait "$pid" 2>/dev/null || true
+}
+
+# 清理失败只记录、不覆盖原始退出码；正常路径会在 summary 前把它变成 FAIL。
+record_cleanup_failure() {
+  local message=$1
+  CLEANUP_FAILED=1
+  printf 'WARN: %s\n' "$message" >&2
+  printf '%s\n' "$message" >>"$EVIDENCE/cleanup-failures.txt" 2>/dev/null || true
+}
+
+# 原始文件敏感数据扫描：密码、URL 编码密码、完整 DSN、admin/enrollment token、
+# PEM 私钥块。只返回 0/1，绝不打印命中值。缺失文件返回 2。
+file_has_sensitive_data() {
+  local file=$1
+  [[ -f "$file" ]] || return 2
+  write_secret_list
+  python3 - "$file" "$SECRETS/sanitize-secrets.txt" <<'PY'
+import re
+import sys
+
+path, secret_file = sys.argv[1], sys.argv[2]
+try:
+    secrets = [line for line in open(secret_file, encoding="utf-8").read().splitlines() if line]
+except FileNotFoundError:
+    secrets = []
+data = open(path, "rb").read()
+text = data.decode("utf-8", "replace")
+key_re = re.compile(rb"-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----")
+hit = key_re.search(data) is not None or any(value in text for value in secrets)
+raise SystemExit(0 if hit else 1)
+PY
+}
+
+# docker logs 可能失败；只记录，不把失败当成“没有 secret”。
+collect_postgres_log() {
+  [[ -n "$PG_CONTAINER" ]] || return 0
+  [[ "$PG_LOG_COLLECTED" == 1 ]] && return 0
+  if docker logs "$PG_CONTAINER" >"$SECRETS/postgres.log" 2>&1; then
+    PG_LOG_COLLECTED=1
+    return 0
+  fi
+  rm -f -- "$SECRETS/postgres.log" 2>/dev/null || true
+  record_cleanup_failure "收集 PostgreSQL 容器日志失败: $PG_CONTAINER"
+  return 1
+}
+
+# 发布脱敏副本之前，扫描所有将要进入证据的原始日志。
+# 命中 secret 的文件立即删除，且不发布副本；文件本身不打印值。
+scan_raw_logs() {
+  [[ "$RAW_SCAN_DONE" == 1 ]] && return 0
+  local collected=0 file base
+  if collect_postgres_log; then
+    collected=1
+  fi
+
+  : >"$SECRETS/raw-secret-logs.txt"
+  RAW_SCANNED_COUNT=0
+  RAW_SECRET_COUNT=0
+  for file in \
+    "$SECRETS/hub.log" \
+    "$SECRETS/hub-restart.log" \
+    "$SECRETS/agent.log" \
+    "$SECRETS/postgres.log" \
+    "$SECRETS/proxy.log" \
+    "$SECRETS/hub-init.err" \
+    "$SECRETS/agent-add.err" \
+    "$SECRETS"/psql*.err \
+    "$SECRETS"/negative-*.log; do
+    [[ -f "$file" ]] || continue
+    RAW_SCANNED_COUNT=$((RAW_SCANNED_COUNT + 1))
+    if file_has_sensitive_data "$file"; then
+      base=$(basename -- "$file")
+      printf '%s\n' "$base" >>"$SECRETS/raw-secret-logs.txt"
+      if ! rm -f -- "$file"; then
+        record_cleanup_failure "删除含 secret 的原始日志失败: $base"
+      fi
+      RAW_SECRET_COUNT=$((RAW_SECRET_COUNT + 1))
+    fi
+  done
+
+  {
+    printf 'scanned=%s\n' "$RAW_SCANNED_COUNT"
+    printf 'blocked=%s\n' "$RAW_SECRET_COUNT"
+    if (( RAW_SECRET_COUNT > 0 )); then
+      printf 'blocked_files:\n'
+      sed 's/^/  /' "$SECRETS/raw-secret-logs.txt"
+      printf 'action=已删除原始 secret 日志，不发布对应脱敏副本\n'
+    else
+      printf 'action=全部原始日志未命中已知 secret/私钥标记\n'
+    fi
+  } >"$EVIDENCE/raw-log-scan.txt"
+
+  # PG 日志收集失败时不能宣称扫描完整；finalize 会再试一次。
+  if [[ "$collected" == 1 ]]; then
+    RAW_SCAN_DONE=1
+  else
+    RAW_SCAN_DONE=0
+  fi
+
+  if (( RAW_SECRET_COUNT > 0 )); then
+    printf 'FAIL: 发布前原始日志扫描发现 %s 个含 secret 的日志，已删除（文件名见 raw-log-scan.txt）\n' \
+      "$RAW_SECRET_COUNT" >&2
+    return 1
+  fi
+  [[ "$collected" == 1 ]] || return 1
+  return 0
+}
+
+remove_container() {
+  local container=$PG_CONTAINER
+  [[ -n "$container" ]] || return 0
+  if docker rm -f "$container" >/dev/null 2>&1; then
+    PG_CONTAINER=""
+    return 0
+  fi
+  record_cleanup_failure "docker rm -f $container 失败"
+  return 1
+}
+
+# docker run 成功后到变量赋值之间的窗口若被信号打断，容器名在启动前已确认不存在，
+# 因此可以安全地只按这个名字回收；不会碰到其它实例。
+cleanup_orphan_container() {
+  [[ -z "$PG_CONTAINER" && "$PG_NAME_WAS_FREE" == 1 && -n "$PG_CONTAINER_NAME" ]] || return 0
+  if docker container inspect "$PG_CONTAINER_NAME" >/dev/null 2>&1; then
+    PG_CONTAINER="$PG_CONTAINER_NAME"
+    remove_container || true
+  fi
+}
+
+remove_secrets_dir() {
+  [[ -e "$SECRETS" ]] || return 0
+  case "$SECRETS" in
+    "$ROOT"/target/pg-tls-e2e/*/.secrets) ;;
+    *)
+      record_cleanup_failure "拒绝删除非预期临时目录: $SECRETS"
+      return 1
+      ;;
+  esac
+  if rm -rf -- "$SECRETS" && [[ ! -e "$SECRETS" ]]; then
+    return 0
+  fi
+  record_cleanup_failure "rm -rf 临时 secret 目录失败: $SECRETS"
+  return 1
 }
 
 # 把密码/token 等写到 0600 的临时文件，供 Python 脱敏与扫描使用。
@@ -135,6 +298,12 @@ PY
 publish_log() {
   local src=$1 name=$2
   [[ -f "$src" ]] || return 0
+  # 纵深防御：即使前面的 raw scan 因收集失败漏掉，也绝不把含 secret 的原文写进证据。
+  if file_has_sensitive_data "$src"; then
+    record_cleanup_failure "拒绝发布含 secret 的原始日志: $(basename -- "$src")"
+    rm -f -- "$src" 2>/dev/null || true
+    return 1
+  fi
   sanitize_file "$src" "$EVIDENCE/$name"
 }
 
@@ -144,16 +313,15 @@ publish_all_logs() {
   publish_log "$SECRETS/hub-restart.log" "hub-restart.log" || true
   publish_log "$SECRETS/agent.log" "agent.log" || true
   publish_log "$SECRETS/postgres.log" "postgres.log" || true
+  publish_log "$SECRETS/proxy.log" "proxy.log" || true
   publish_log "$SECRETS/hub-init.err" "hub-init.err" || true
   publish_log "$SECRETS/agent-add.err" "agent-add.err" || true
-  publish_log "$SECRETS/psql.err" "psql.err" || true
-  publish_log "$SECRETS/psql-readiness.err" "psql-readiness.err" || true
-  for file in "$SECRETS"/negative-*.log; do
+  for file in "$SECRETS"/psql*.err; do
     [[ -f "$file" ]] || continue
     base=$(basename -- "$file")
     publish_log "$file" "$base" || true
   done
-  for file in "$SECRETS"/psql-proxy-*.err; do
+  for file in "$SECRETS"/negative-*.log; do
     [[ -f "$file" ]] || continue
     base=$(basename -- "$file")
     publish_log "$file" "$base" || true
@@ -170,11 +338,11 @@ finalize_runtime() {
   HUB_PID=""
   stop_pid "$PROXY_PID"
   PROXY_PID=""
-  if [[ -n "$PG_CONTAINER" ]]; then
-    docker logs "$PG_CONTAINER" >"$SECRETS/postgres.log" 2>&1
-    docker rm -f "$PG_CONTAINER" >/dev/null 2>&1
-    PG_CONTAINER=""
-  fi
+  # 必须在删除容器前收集日志并完成原始 secret 扫描。
+  collect_postgres_log
+  scan_raw_logs || true
+  cleanup_orphan_container
+  remove_container || true
   publish_all_logs
   FINALIZED=1
   set -e
@@ -182,26 +350,46 @@ finalize_runtime() {
 
 cleanup() {
   local status=$?
-  trap - EXIT INT TERM HUP
+  trap - EXIT HUP INT TERM
   set +e
   if [[ "$FINALIZED" == 0 ]]; then
     finalize_runtime
   fi
-  case "$SECRETS" in
-    "$ROOT"/target/pg-tls-e2e/*/.secrets) rm -rf -- "$SECRETS" ;;
-    *) printf 'WARN: 拒绝删除非预期临时目录: %s\n' "$SECRETS" >&2 ;;
-  esac
+  # finalize_runtime 结束时恢复了 set -e；清理阶段必须继续忽略单步失败，
+  # 否则会跳过证据路径/secret 清理。
+  set +e
+  cleanup_orphan_container
+  if [[ -n "$PG_CONTAINER" ]]; then
+    remove_container
+  fi
+  remove_secrets_dir || true
   printf '\n证据目录: %s\n' "$EVIDENCE"
+  if [[ "$status" -ge 128 ]]; then
+    printf 'FAIL: 脚本被信号中断（退出码 %s），未完成全部用例\n' "$status" >&2
+  fi
+  if [[ "$status" == 0 && "$CLEANUP_FAILED" != 0 ]]; then
+    printf 'FAIL: 清理失败，详见 %s/cleanup-failures.txt\n' "$EVIDENCE" >&2
+    status=1
+  fi
+  if [[ "$CLEANUP_FAILED" != 0 && -f "$EVIDENCE/summary.txt" ]]; then
+    printf 'cleanup_failed_after_summary=1\n' >>"$EVIDENCE/summary.txt" 2>/dev/null || true
+  fi
+  if [[ "$status" == 0 && "$FAIL" == 0 && "$FINALIZED" == 1 && "$CLEANUP_FAILED" == 0 ]]; then
+    printf '全部 %d 项通过\n' "$PASS"
+  fi
   exit "$status"
 }
-trap cleanup EXIT INT TERM HUP
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------- 依赖与二进制 ----------
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "缺少依赖命令: $1"
 }
-for cmd in docker openssl psql curl python3 timeout; do
+for cmd in docker openssl psql curl python3 timeout git sha256sum stat; do
   need_cmd "$cmd"
 done
 docker info >/dev/null 2>&1 || die "Docker 不可用（docker info 失败），请确认 daemon 与权限"
@@ -229,6 +417,65 @@ if [[ "$build_bins" == 1 ]]; then
 fi
 [[ -x "$HUB_BIN" ]] || die "缺少可执行文件: $HUB_BIN"
 [[ -x "$AGENT_BIN" ]] || die "缺少可执行文件: $AGENT_BIN"
+
+# 证据绑定：记录本次实际使用的二进制 hash/mtime、git HEAD 与 PG 镜像 ID。
+# 不强制重建已有二进制，但所有结果都能追溯到具体构建产物。
+HEAD_COMMIT=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null) \
+  || die "git rev-parse HEAD 失败（证据绑定需要 git 仓库）"
+[[ "$HEAD_COMMIT" =~ ^[0-9a-f]{40,64}$ ]] || die "git HEAD 格式非法"
+HEAD_COMMIT_EPOCH=$(git -C "$ROOT" log -1 --format=%ct HEAD 2>/dev/null) \
+  || die "读取 git HEAD 时间失败"
+[[ "$HEAD_COMMIT_EPOCH" =~ ^[0-9]+$ ]] || die "git HEAD 时间非法"
+git -C "$ROOT" status --porcelain >"$EVIDENCE/git-status.txt" 2>/dev/null || true
+HEAD_DIRTY_ENTRIES=$(wc -l <"$EVIDENCE/git-status.txt" | tr -d ' ')
+[[ "$HEAD_DIRTY_ENTRIES" =~ ^[0-9]+$ ]] || HEAD_DIRTY_ENTRIES=0
+
+HUB_SHA256=$(sha256sum "$HUB_BIN" | awk '{print $1}') \
+  || die "计算 hub 二进制 sha256 失败"
+AGENT_SHA256=$(sha256sum "$AGENT_BIN" | awk '{print $1}') \
+  || die "计算 agent 二进制 sha256 失败"
+[[ "$HUB_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "hub 二进制 sha256 格式非法"
+[[ "$AGENT_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "agent 二进制 sha256 格式非法"
+HUB_MTIME=$(stat -c '%y' "$HUB_BIN") || die "读取 hub 二进制 mtime 失败"
+AGENT_MTIME=$(stat -c '%y' "$AGENT_BIN") || die "读取 agent 二进制 mtime 失败"
+HUB_MTIME_EPOCH=$(stat -c '%Y' "$HUB_BIN") || die "读取 hub 二进制 mtime epoch 失败"
+AGENT_MTIME_EPOCH=$(stat -c '%Y' "$AGENT_BIN") || die "读取 agent 二进制 mtime epoch 失败"
+[[ "$HUB_MTIME_EPOCH" =~ ^[0-9]+$ ]] || die "hub mtime epoch 非法"
+[[ "$AGENT_MTIME_EPOCH" =~ ^[0-9]+$ ]] || die "agent mtime epoch 非法"
+if (( HUB_MTIME_EPOCH < HEAD_COMMIT_EPOCH )); then
+  HUB_OLDER_THAN_HEAD=1
+  printf 'WARN: hub 二进制 mtime 早于 HEAD 提交，未强制重建；证据记录为 stale\n' >&2
+fi
+if (( AGENT_MTIME_EPOCH < HEAD_COMMIT_EPOCH )); then
+  AGENT_OLDER_THAN_HEAD=1
+  printf 'WARN: agent 二进制 mtime 早于 HEAD 提交，未强制重建；证据记录为 stale\n' >&2
+fi
+PG_IMAGE_ID=$(docker image inspect -f '{{.Id}}' postgres:16 2>/dev/null) \
+  || die "读取 postgres:16 镜像 ID 失败"
+[[ -n "$PG_IMAGE_ID" ]] || die "postgres:16 镜像 ID 为空"
+SCRIPT_SHA256=$(sha256sum "$ROOT/tests/e2e/v100-pg-tls.sh" | awk '{print $1}') \
+  || die "计算 e2e 脚本 sha256 失败"
+[[ "$SCRIPT_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "e2e 脚本 sha256 格式非法"
+HUB_VERSION=$("$HUB_BIN" --version 2>/dev/null | head -1 || true)
+AGENT_VERSION=$("$AGENT_BIN" --version 2>/dev/null | head -1 || true)
+
+{
+  printf 'git_head=%s\n' "$HEAD_COMMIT"
+  printf 'git_head_epoch=%s\n' "$HEAD_COMMIT_EPOCH"
+  printf 'git_status_entries=%s\n' "$HEAD_DIRTY_ENTRIES"
+  printf 'hub_bin=%s\n' "$HUB_BIN"
+  printf 'hub_sha256=%s\n' "$HUB_SHA256"
+  printf 'hub_mtime=%s\n' "$HUB_MTIME"
+  printf 'hub_older_than_head=%s\n' "$HUB_OLDER_THAN_HEAD"
+  printf 'agent_bin=%s\n' "$AGENT_BIN"
+  printf 'agent_sha256=%s\n' "$AGENT_SHA256"
+  printf 'agent_mtime=%s\n' "$AGENT_MTIME"
+  printf 'agent_older_than_head=%s\n' "$AGENT_OLDER_THAN_HEAD"
+  printf 'postgres_image_id=%s\n' "$PG_IMAGE_ID"
+  printf 'script_sha256=%s\n' "$SCRIPT_SHA256"
+  printf 'hub_version=%s\n' "$HUB_VERSION"
+  printf 'agent_version=%s\n' "$AGENT_VERSION"
+} >"$EVIDENCE/binary-manifest.txt"
 
 # 四个互不相同的回环端口（PG、hub agent、hub admin、Python 代理）。
 # 代理必须监听 127.0.0.2，用来验证证书只含 127.0.0.1 时的 hostname 不匹配。
@@ -366,10 +613,18 @@ printf 'POSTGRES_PASSWORD=%s\n' "$PG_PASSWORD" >"$PG_ENV"
 chmod 0600 -- "$PG_ENV"
 PG_CONTAINER_NAME="rb-pg-tls-e2e-${STAMP}"
 
+# 启动前先确认这个名字不存在；这样即使 docker run 被中断/半失败，脚本也只可能
+# 回收自己刚创建的同名容器，绝不会碰别人的实例。
+if docker container inspect "$PG_CONTAINER_NAME" >/dev/null 2>&1; then
+  die "容器名已存在，拒绝复用/删除非本脚本创建的容器: $PG_CONTAINER_NAME"
+fi
+PG_NAME_WAS_FREE=1
+
 # 注意：不设置 ssl_ca_file，否则 PG 会请求客户端证书，而 hub 当前使用
 # with_no_client_auth，握手必然失败（文档记录为限制）。
-docker run -d --name "$PG_CONTAINER_NAME" \
+if docker run -d --name "$PG_CONTAINER_NAME" \
   --label "rustboard.e2e=pg-tls" \
+  --label "rustboard.e2e.run=${STAMP}" \
   -p "127.0.0.1:${PG_PORT}:5432" \
   -e POSTGRES_USER=rustboard \
   -e POSTGRES_DB=rustboard \
@@ -379,10 +634,17 @@ docker run -d --name "$PG_CONTAINER_NAME" \
   -c ssl=on \
   -c ssl_cert_file=/pgcerts/server.crt \
   -c ssl_key_file=/pgcerts/server.key \
-  -c ssl_min_protocol_version=TLSv1.2 >/dev/null \
-  || die "启动 postgres:16 容器失败"
-# 只有 docker run 成功后才记录所有权；名字冲突等失败绝不会让 trap 误删别人的容器。
-PG_CONTAINER="$PG_CONTAINER_NAME"
+  -c ssl_min_protocol_version=TLSv1.2 >/dev/null; then
+  # 成功分支内立即登记，缩小信号打断导致的未登记窗口。
+  PG_CONTAINER="$PG_CONTAINER_NAME"
+else
+  # 名字已确认此前不存在；若 docker run 留下半创建容器，只按该名字回收。
+  if docker container inspect "$PG_CONTAINER_NAME" >/dev/null 2>&1; then
+    PG_CONTAINER="$PG_CONTAINER_NAME"
+    remove_container || true
+  fi
+  die "启动 postgres:16 容器失败"
+fi
 
 # pg_isready 在 docker-entrypoint 的临时 initdb 实例阶段就可能返回 ready；
 # 它只能作为早期提示，不能作为“正式实例已可连接”的判据。
@@ -746,9 +1008,7 @@ if grep -Fq -- '***' "$SECRETS/hub.log"; then
 else
   fail_case "hub 日志未出现 *** 脱敏标记"
 fi
-publish_log "$SECRETS/hub.log" "hub.log"
-publish_log "$SECRETS/agent.log" "agent.log"
-publish_log "$SECRETS/postgres.log" "postgres.log"
+# 原始日志的发布统一延迟到 raw scan 之后（见 finalize_runtime），这里不发布副本。
 
 # ---------- 重启持久化 ----------
 
@@ -835,7 +1095,7 @@ PY
 
 run_hub_expect_failure() {
   local config=$1 log=$2 rc=0
-  if timeout 20 "$HUB_BIN" run --config "$config" >"$log" 2>&1; then
+  if timeout -k 5 20 "$HUB_BIN" run --config "$config" >"$log" 2>&1; then
     rc=0
   else
     rc=$?
@@ -843,32 +1103,42 @@ run_hub_expect_failure() {
   printf '%s\n' "$rc"
 }
 
-file_has_secret() {
-  python3 - "$1" "$SECRETS/sanitize-secrets.txt" <<'PY'
-import sys
+# 1) 错误 CA：先用 psql verify-full 证明证书确实不被信任，再验证 hub 拒绝启动。
+#    已知限制：tokio-postgres 的 Kind::Tls 只暴露 "error performing TLS handshake"，
+#    不携带 rustls 的 UnknownIssuer；因此 hub 日志只能断言通用 TLS 文本，
+#    具体“CA 不被信任”由下面的 psql 前置用例独立证明，不伪装成更具体的错误。
+wrong_psql_rc=0
+if PGPASSWORD="$PG_PASSWORD" \
+  PGSSLMODE=verify-full \
+  PGSSLROOTCERT="$WRONG_CA" \
+  psql "$PG_CONN" -At -c 'select 1' \
+  >"$SECRETS/psql-wrong-ca.out" 2>"$SECRETS/psql-wrong-ca.err"; then
+  wrong_psql_rc=0
+else
+  wrong_psql_rc=$?
+fi
+if [[ "$wrong_psql_rc" -ne 0 ]] \
+  && grep -Eqi 'certificate|SSL error|verify' "$SECRETS/psql-wrong-ca.err"; then
+  pass_case "错误 CA 前置：psql verify-full 被证书校验拒绝（证书不被信任）"
+else
+  fail_case "错误 CA 前置：psql verify-full 未按证书校验失败（rc=${wrong_psql_rc}）"
+fi
 
-secret_file = sys.argv[2]
-secrets = [line for line in open(secret_file, encoding="utf-8").read().splitlines() if line]
-data = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
-raise SystemExit(0 if any(value in data for value in secrets) else 1)
-PY
-}
-
-# 1) 错误 CA：必须非 0，日志含 TLS/证书错误且已脱敏。
 wrong_log="$SECRETS/negative-wrong-ca.log"
 wrong_rc=$(run_hub_expect_failure "$NEG_CONF_DIR/wrong-ca.toml" "$wrong_log")
 if [[ "$wrong_rc" -ne 0 && "$wrong_rc" -ne 124 ]] \
-  && grep -Eq 'TLS handshake|UnknownIssuer|certificate|证书' "$wrong_log"; then
-  pass_case "错误 CA：hub 启动非 0（rc=${wrong_rc}）且日志含 TLS/证书错误"
+  && grep -Fq -- 'error performing TLS handshake' "$wrong_log" \
+  && ! grep -Eq 'Connection refused|connection refused|os error 111|password authentication failed|database .* does not exist' "$wrong_log"; then
+  pass_case "错误 CA：hub 启动非 0（rc=${wrong_rc}）且日志含 TLS handshake 错误"
 else
-  fail_case "错误 CA：hub 未按预期失败（rc=${wrong_rc}）或日志缺少 TLS/证书错误"
+  fail_case "错误 CA：hub 未按预期失败（rc=${wrong_rc}）或日志不像 TLS 失败"
 fi
-if ! file_has_secret "$wrong_log" && grep -Fq -- '***' "$wrong_log"; then
+printf 'NOTE: 错误 CA 的 hub 日志仅含 driver 泛化的 "error performing TLS handshake"（tokio-postgres 不暴露 rustls 具体 cause）；CA 不被信任已由 psql verify-full 前置用例证明。\n'
+if ! file_has_sensitive_data "$wrong_log" && grep -Fq -- '***' "$wrong_log"; then
   pass_case "错误 CA：日志不含密码/完整 DSN，且 DSN 已脱敏为 ***"
 else
   fail_case "错误 CA：日志泄露 secret 或缺少 *** 脱敏"
 fi
-publish_log "$wrong_log" "negative-wrong-ca.log"
 
 # 2) 根证书缺失 / 目录 / 符号链接：配置校验阶段必须非 0。
 check_roots() {
@@ -880,17 +1150,18 @@ check_roots() {
   else
     fail_case "db_sslrootcert ${name}：未在配置校验阶段拒绝（rc=${rc}）"
   fi
-  if file_has_secret "$log"; then
+  if file_has_sensitive_data "$log"; then
     fail_case "db_sslrootcert ${name}：错误输出泄露 secret"
   fi
-  publish_log "$log" "negative-$name.log"
   printf '%s rc=%s expected=%s\n' "$name" "$rc" "$expected" >>"$EVIDENCE/negative-summary.txt"
 }
 
 check_roots "missing-ca" "db_sslrootcert 文件不存在"
 check_roots "dir-ca" "db_sslrootcert 指向目录"
 check_roots "symlink-ca" "db_sslrootcert 指向符号链接"
-printf 'wrong-ca rc=%s expected=TLS/证书错误\n' "$wrong_rc" >>"$EVIDENCE/negative-summary.txt"
+printf 'psql-wrong-ca rc=%s expected=证书校验错误\n' "$wrong_psql_rc" >>"$EVIDENCE/negative-summary.txt"
+printf 'wrong-ca rc=%s expected=error performing TLS handshake（driver 泛化，具体 cause 由 psql 证明）\n' \
+  "$wrong_rc" >>"$EVIDENCE/negative-summary.txt"
 
 # 3) 主机名不匹配：Python TCP 代理监听 127.0.0.2，转发到 127.0.0.1:PG。
 cat >"$SECRETS/proxy.py" <<'PY'
@@ -901,6 +1172,7 @@ import threading
 
 listen_port = int(sys.argv[1])
 target_port = int(sys.argv[2])
+print_lock = threading.Lock()
 
 
 class Handler(socketserver.BaseRequestHandler):
@@ -909,6 +1181,9 @@ class Handler(socketserver.BaseRequestHandler):
             upstream = socket.create_connection(("127.0.0.1", target_port), timeout=10)
         except OSError:
             return
+        # 只记录“已成功连到 PG”，不记录任何载荷；用于证明 hub 不是端口/连接错误。
+        with print_lock:
+            print("CONNECT", flush=True)
 
         def pipe(src, dst):
             try:
@@ -987,8 +1262,6 @@ if [[ "$proxy_verify_rc" -ne 0 ]] \
 else
   fail_case "主机名负向前置：psql verify-full 未按 hostname 校验失败（rc=${proxy_verify_rc}）"
 fi
-publish_log "$SECRETS/psql-proxy-verify.err" "psql-proxy-verify.err"
-
 # 主机名不匹配配置：DSN 的 host 改成 127.0.0.2，证书仍只有 127.0.0.1。
 python3 - "$HUB_CONFIG" "$NEG_CONF_DIR/hostname-mismatch.toml" "$PG_PORT" "$PROXY_PORT" <<'PY'
 import re
@@ -1007,29 +1280,64 @@ with open(out_path, "w", encoding="utf-8") as handle:
     handle.write(text.replace(old, new, 1))
 PY
 
+# psql 前置用例的连接线程可能刚结束；给代理日志一个短暂落盘窗口，避免把
+# 前置连接误记为 hub 的连接。
+sleep 0.5
+proxy_connects_before=$(grep -c '^CONNECT$' "$SECRETS/proxy.log" 2>/dev/null || true)
+[[ "$proxy_connects_before" =~ ^[0-9]+$ ]] || proxy_connects_before=0
 hostname_log="$SECRETS/negative-hostname-mismatch.log"
 hostname_rc=$(run_hub_expect_failure "$NEG_CONF_DIR/hostname-mismatch.toml" "$hostname_log")
+proxy_connects_after=$(grep -c '^CONNECT$' "$SECRETS/proxy.log" 2>/dev/null || true)
+[[ "$proxy_connects_after" =~ ^[0-9]+$ ]] || proxy_connects_after=0
+
+# 必须同时满足：非 0、走的是 127.0.0.2:代理端口、日志是 TLS 而非连接/认证错误、
+# 代理实际收到并转发了连接（CONNECT 数增加）。
 if [[ "$hostname_rc" -ne 0 && "$hostname_rc" -ne 124 ]] \
-  && grep -Eq 'TLS handshake|NotValidForName|certificate|证书|hostname' "$hostname_log"; then
-  pass_case "主机名不匹配：hub 启动非 0（rc=${hostname_rc}）且日志含 TLS 校验错误"
+  && grep -Fq -- 'error performing TLS handshake' "$hostname_log" \
+  && grep -Fq -- "127.0.0.2:${PROXY_PORT}" "$hostname_log" \
+  && ! grep -Eq 'Connection refused|connection refused|os error 111|password authentication failed|database .* does not exist' "$hostname_log" \
+  && (( proxy_connects_after > proxy_connects_before )); then
+  pass_case "主机名不匹配：hub 非 0（rc=${hostname_rc}）、经代理、日志为 TLS handshake 失败"
 else
-  fail_case "主机名不匹配：hub 未按预期失败（rc=${hostname_rc}）"
+  fail_case "主机名不匹配：hub 未按预期失败或并非经代理的 TLS 失败（rc=${hostname_rc}, CONNECT ${proxy_connects_before}->${proxy_connects_after}）"
 fi
-if ! file_has_secret "$hostname_log" && grep -Fq -- '***' "$hostname_log"; then
+if grep -Eq 'NotValidForName|does not match host name|hostname|certificate' "$hostname_log"; then
+  printf 'NOTE: 主机名不匹配 hub 日志包含具体 hostname/certificate 文本。\n'
+else
+  printf 'NOTE: 主机名不匹配 hub 日志仅含 driver 泛化的 "error performing TLS handshake"（tokio-postgres 不暴露 rustls 具体 cause）；hostname 原因由 psql verify-full 的明确 hostname 报错 + 代理 CONNECT 计数证明。\n'
+fi
+if (( proxy_connects_after > proxy_connects_before )); then
+  pass_case "主机名负向：hub 确实经 127.0.0.2 代理连接到 PostgreSQL（CONNECT ${proxy_connects_before} -> ${proxy_connects_after}）"
+else
+  fail_case "主机名负向：代理未观察到 hub 连接（CONNECT ${proxy_connects_before} -> ${proxy_connects_after}）"
+fi
+if ! file_has_sensitive_data "$hostname_log" && grep -Fq -- '***' "$hostname_log"; then
   pass_case "主机名不匹配：日志不含密码/完整 DSN，且 DSN 已脱敏为 ***"
 else
   fail_case "主机名不匹配：日志泄露 secret 或缺少 *** 脱敏"
 fi
-publish_log "$hostname_log" "negative-hostname-mismatch.log"
-printf 'hostname-mismatch rc=%s expected=TLS hostname 校验错误\n' \
-  "$hostname_rc" >>"$EVIDENCE/negative-summary.txt"
+printf 'hostname-mismatch rc=%s connects=%s->%s expected=TLS hostname 校验错误\n' \
+  "$hostname_rc" "$proxy_connects_before" "$proxy_connects_after" >>"$EVIDENCE/negative-summary.txt"
 
 stop_pid "$PROXY_PID"
 PROXY_PID=""
 
-# ---------- 收尾：发布日志、扫描证据 ----------
+# ---------- 收尾：raw scan -> 脱敏发布 -> 证据扫描 ----------
+
+# 必须在发布任何脱敏副本之前扫描所有原始日志；命中会删除原始文件并直接 FAIL。
+collect_postgres_log || true
+scan_raw_logs || true
+if [[ "$RAW_SCAN_DONE" == 1 && "$RAW_SECRET_COUNT" == 0 ]] && (( RAW_SCANNED_COUNT > 0 )); then
+  pass_case "发布前原始日志扫描：${RAW_SCANNED_COUNT} 个日志无密码/完整 DSN/token/私钥"
+else
+  fail_case "发布前原始日志扫描未通过（scanned=${RAW_SCANNED_COUNT}, blocked=${RAW_SECRET_COUNT}, complete=${RAW_SCAN_DONE}）"
+fi
 
 finalize_runtime
+
+if (( CLEANUP_FAILED != 0 )); then
+  fail_case "清理失败（容器/日志/secret 目录），详见 cleanup-failures.txt"
+fi
 
 # 用 Python 扫描证据目录；secret 只从 0600 文件读取，不进入 argv。
 if python3 - "$EVIDENCE" "$SECRETS/sanitize-secrets.txt" <<'PY'
@@ -1064,17 +1372,40 @@ else
   fail_case "证据目录发现 secret，已删除相关文件（具体值不打印）"
 fi
 
+# .secrets 已经完成脱敏/扫描用途；在出 summary 前删除并记录失败。
+if ! remove_secrets_dir; then
+  fail_case "清理临时 secret 目录失败（需手工检查 $SECRETS）"
+fi
+
 {
   printf 'run=%s\n' "$STAMP"
+  printf 'git_head=%s\n' "$HEAD_COMMIT"
+  printf 'git_head_epoch=%s\n' "$HEAD_COMMIT_EPOCH"
+  printf 'git_status_entries=%s\n' "$HEAD_DIRTY_ENTRIES"
+  printf 'hub_sha256=%s\n' "$HUB_SHA256"
+  printf 'hub_mtime=%s\n' "$HUB_MTIME"
+  printf 'hub_older_than_head=%s\n' "$HUB_OLDER_THAN_HEAD"
+  printf 'agent_sha256=%s\n' "$AGENT_SHA256"
+  printf 'agent_mtime=%s\n' "$AGENT_MTIME"
+  printf 'agent_older_than_head=%s\n' "$AGENT_OLDER_THAN_HEAD"
+  printf 'postgres_image_id=%s\n' "$PG_IMAGE_ID"
+  printf 'script_sha256=%s\n' "$SCRIPT_SHA256"
+  printf 'hub_version=%s\n' "$HUB_VERSION"
+  printf 'agent_version=%s\n' "$AGENT_VERSION"
+  printf 'raw_log_scanned=%s\n' "$RAW_SCANNED_COUNT"
+  printf 'raw_log_blocked=%s\n' "$RAW_SECRET_COUNT"
+  printf 'raw_log_scan_complete=%s\n' "$RAW_SCAN_DONE"
   printf 'samples_before=%s samples_after=%s\n' "$before_samples" "$after_samples"
   printf 'ingest_batches_before=%s ingest_batches_after=%s\n' "$before_batches" "$after_batches"
   printf 'agents_before=%s agents_after=%s\n' "$before_agents" "$after_agents"
+  printf 'cleanup_failed=%s\n' "$CLEANUP_FAILED"
   printf 'pass=%s fail=%s\n' "$PASS" "$FAIL"
 } >"$EVIDENCE/summary.txt"
 
 printf '\n'
 if (( FAIL == 0 )); then
-  printf '全部 %d 项通过\n' "$PASS"
+  # “全部 N 项通过”只在 EXIT cleanup 中、确认退出码 0 且清理成功后打印；
+  # 这样 TERM/HUP/INT 中断绝不会输出成功结论。
   exit 0
 fi
 printf 'FAIL: %d 项失败，%d 项通过\n' "$FAIL" "$PASS"

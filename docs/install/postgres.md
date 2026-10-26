@@ -177,9 +177,10 @@ bash tests/e2e/v100-pg-tls.sh
   # ...
   ```
 
-  如果追加到文件末尾，会落进 `[tls]` / `[archive]` 等段而被忽略，表现为
-  TLS handshake 的 unknown CA 错误。脚本会断言 `^db_sslrootcert` 只有一行，
-  且行号早于第一个 `[`；
+  如果追加到文件末尾，会落进 `[tls]` / `[archive]` 等段而被忽略，最终表现为
+  TLS 校验失败（hub 侧通常只显示 `error performing TLS handshake`，PG 服务端
+  日志可能是 `unknown CA`）。脚本会断言 `^db_sslrootcert` 只有一行，且行号
+  早于第一个 `[`；
 - 服务端私钥必须 0600、由 PG 运行用户可读（e2e 用挂载目录只读 + 精确
   chown）；密码只写 0600 临时配置 / 环境文件，psql 用 `PGPASSWORD`，
   不进入 argv；
@@ -194,9 +195,10 @@ bash tests/e2e/v100-pg-tls.sh
 
 因此：
 
-- PG 设置 `ssl_ca_file` 后会向客户端请求客户端证书；当前 hub 没有可配置的
-  `db_sslcert` / `db_sslkey`，即使 `pg_hba.conf` 没有显式要求 `clientcert`，
-  握手也会失败；
+- PG 设置 `ssl_ca_file` 并向客户端请求证书时，当前 hub 没有可配置的
+  `db_sslcert` / `db_sslkey`，不会提供客户端证书，握手会失败；是否强制取决于
+  服务端是否请求证书及 `pg_hba.conf` 的 `clientcert`/`cert` 认证配置。本次
+  e2e 明确未设置 `ssl_ca_file`，因此没有实测 mTLS 场景；
 - hub 也没有把 agent 客户端证书复用为 PG 客户端证书的配置项；
 - `tests/e2e/v100-pg-tls.sh` 明确**不设置** `ssl_ca_file`，所以它只证明
   “服务端认证 TLS”通过，**不证明“PG 要求客户端证书”通过**；
