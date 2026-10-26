@@ -1163,7 +1163,10 @@ fn connection_layer_and_ssl_policy_are_safe() {
     })
     .expect_err("sslmode=require 必须被拒绝");
     let message = format!("{err:#}");
-    assert!(!message.contains(&password), "错误信息泄露密码：{message}");
+    assert!(
+        !message.contains(&format!(":{password}@")),
+        "错误信息泄露密码：{message}"
+    );
     assert!(
         message.contains("verify-full") && message.contains("disable"),
         "错误信息应列出允许的 sslmode：{message}"

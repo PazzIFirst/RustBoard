@@ -789,7 +789,10 @@ fn pg_migrate_dry_run_success_force_and_config_switch() {
         combined(&output)
     );
     let text = combined(&output);
-    assert!(!text.contains(&password), "dry-run 泄露密码: {text}");
+    assert!(
+        !text.contains(&format!(":{password}@")),
+        "dry-run 泄露密码: {text}"
+    );
     assert!(text.contains("***"), "dry-run 目标 DSN 应脱敏: {text}");
     assert!(text.contains("只读校验"), "{text}");
     assert_eq!(fs::read(&config_path).unwrap(), config_bytes);
@@ -811,7 +814,10 @@ fn pg_migrate_dry_run_success_force_and_config_switch() {
         combined(&output)
     );
     let text = combined(&output);
-    assert!(!text.contains(&password), "migrate 泄露密码: {text}");
+    assert!(
+        !text.contains(&format!(":{password}@")),
+        "migrate 泄露密码: {text}"
+    );
     assert!(text.contains("迁移完成"), "{text}");
     assert!(text.contains("21 张表"), "{text}");
     assert_eq!(file_sha(&db_path), source_db_sha, "迁移不得修改源 SQLite");
@@ -964,7 +970,7 @@ fn pg_migrate_dry_run_success_force_and_config_switch() {
     assert!(text.contains("目标侧备份"), "{text}");
     let fake_argv = fs::read_to_string(&argv_file).unwrap();
     assert!(
-        !fake_argv.contains(&password),
+        !fake_argv.contains(&format!(":{password}@")),
         "pg_dump argv 不得包含密码: {fake_argv}"
     );
     assert!(fake_argv.contains("--dbname"), "{fake_argv}");

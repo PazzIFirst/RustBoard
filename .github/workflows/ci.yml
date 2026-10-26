@@ -65,7 +65,7 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_USER: rustboard
-          POSTGRES_PASSWORD: rustboard
+          POSTGRES_PASSWORD: rb-ci-secret-9f3a
           POSTGRES_DB: rustboard
         ports:
           - 5432:5432
@@ -77,7 +77,7 @@ jobs:
     env:
       # 实库测试每个用例 CREATE/DROP DATABASE（库名带 pid/nanos/seq），
       # 官方 postgres 镜像的 POSTGRES_USER 即 superuser，满足 CREATEDB。
-      RUSTBOARD_TEST_PG: postgres://rustboard:rustboard@localhost:5432/rustboard?sslmode=disable
+      RUSTBOARD_TEST_PG: postgres://rustboard:rb-ci-secret-9f3a@localhost:5432/rustboard?sslmode=disable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 

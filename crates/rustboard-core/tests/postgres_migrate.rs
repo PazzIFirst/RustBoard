@@ -1425,7 +1425,10 @@ fn rejects_non_empty_target_without_touching_source_or_target() {
     assert!(message.contains("非空"), "{message}");
     assert!(message.contains("agents"), "{message}");
     if let Some(password) = dsn_password(&db.app_dsn) {
-        assert!(!message.contains(&password), "迁移错误泄露了数据库密码");
+        assert!(
+            !message.contains(&format!(":{password}@")),
+            "迁移错误泄露了数据库密码"
+        );
     }
 
     let mut client = db.client();

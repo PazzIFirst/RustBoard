@@ -3836,6 +3836,9 @@ mod tests {
                 }
                 match listener.accept() {
                     Ok((tcp, _)) => {
+                        // 健康检查可能先建连探测再断开；给被接受的连接一个读超时，
+                        // 避免一条半开连接卡住整个测试服务器，造成后续 accept 饥饿。
+                        let _ = tcp.set_read_timeout(Some(Duration::from_millis(500)));
                         let Ok(connection) = rustls::ServerConnection::new(config.clone()) else {
                             continue;
                         };
@@ -3856,7 +3859,10 @@ mod tests {
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5));
                     }
-                    Err(_) => break,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    // 非阻塞 listener 上偶发 EMFILE/EAGAIN 等不应结束测试服务器；
+                    // 继续重试，等待健康检查的下一次连接。
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
                 }
             });
             (port, stop, handle)
