@@ -188,6 +188,18 @@ jobs:
       - name: 控制面回归
         run: bash tests/e2e/control.sh
 
+      - name: 安装 v031 Python 依赖（cryptography）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-cryptography
+          /usr/bin/python3 -c 'import cryptography; print("cryptography", cryptography.__version__)'
+
+      - name: v0.3.1 过期证书自愈与慢连接回归
+        env:
+          # 使用 apt 安装 cryptography 的系统解释器，避免 PATH 上其它 Python 缺模块
+          PYTHON: /usr/bin/python3
+        run: bash tests/e2e/v031.sh
+
       - name: v0.3.2 控制面可靠性回归
         run: bash tests/e2e/v032.sh
 
