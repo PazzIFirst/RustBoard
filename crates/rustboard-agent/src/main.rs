@@ -291,13 +291,14 @@ fn main() -> Result<()> {
                 )
             })?;
             let agent_id = std::fs::read_to_string(cfg.data_dir.join(AGENT_ID))
+                .ok()
                 .map(|s| s.trim().to_string())
-                .unwrap_or_else(|_| "未纳管".to_string());
-            let enrolled = is_enrolled(&cfg);
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| "未纳管".to_string());
             println!("配置文件: {}", path.display());
             println!("hub: {}", cfg.hub_url);
             println!("agent_id: {agent_id}");
-            println!("纳管状态: {}", if enrolled { "已纳管" } else { "未纳管" });
+            println!("纳管状态: {}", enrollment_status(&cfg));
             println!("采样间隔: {}ms", cfg.sample_interval_ms);
             println!("数据目录: {}", cfg.data_dir.display());
             Ok(())
@@ -743,6 +744,28 @@ fn is_enrolled(cfg: &AgentConfig) -> bool {
         .iter()
         .all(|name| file_is_nonempty(&cfg.data_dir.join(name)))
         && file_is_nonempty(&cfg.data_dir.join(ENROLLMENT_MARKER))
+}
+
+/// `info` 展示用的只读状态：旧安装缺 marker 时不能误报“未纳管”。
+///
+/// 该函数绝不写盘；真正的迁移/恢复由 [`resolve_enrollment`] 在启动时执行。
+fn enrollment_status(cfg: &AgentConfig) -> &'static str {
+    let identity = ENROLLED_FILES
+        .iter()
+        .all(|name| file_is_nonempty(&cfg.data_dir.join(name)));
+    let marker = file_is_nonempty(&cfg.data_dir.join(ENROLLMENT_MARKER));
+    let any_credential = [AGENT_CERT, AGENT_KEY, AGENT_SECRET]
+        .iter()
+        .any(|name| file_is_nonempty(&cfg.data_dir.join(name)));
+    if is_enrolled(cfg) {
+        "已纳管"
+    } else if identity {
+        "已纳管（旧安装缺少 enrollment.complete，启动 run 时会校验并补齐）"
+    } else if !any_credential && !marker {
+        "未纳管"
+    } else {
+        "未完成（身份文件不完整，启动会 fail-closed；请恢复备份或重新纳管）"
+    }
 }
 
 /// 文件存在、是普通文件且非空（符号链接一律不算）。
@@ -1349,6 +1372,31 @@ async fn try_enroll(cfg: &AgentConfig) -> std::result::Result<(), EnrollError> {
 
     match frame {
         Frame::Enrolled(resp) => {
+            // #45：先把 hub 返回的全部材料校验一遍。任何校验失败都在写盘之前
+            // 返回，不能留下“有 cert/key/secret 无 marker”的半完成身份。
+            if resp.agent_secret.trim().is_empty() {
+                return Err(EnrollError::Fatal(anyhow!(
+                    "hub 返回的 agent secret 为空，拒绝写入身份"
+                )));
+            }
+            if !tls::cert_matches_key(&resp.cert_pem, &key_pem)
+                .map_err(|e| EnrollError::Fatal(anyhow!("校验纳管证书与私钥失败: {e}")))?
+            {
+                return Err(EnrollError::Fatal(anyhow!(
+                    "hub 返回的证书与本机私钥不配套，拒绝写入身份"
+                )));
+            }
+            let cn = tls::cert_summary(&resp.cert_pem)
+                .map_err(|e| EnrollError::Fatal(anyhow!("解析纳管证书失败: {e}")))?
+                .common_name;
+            if cn.as_deref() != Some(resp.agent_id.as_str()) {
+                return Err(EnrollError::Fatal(anyhow!(
+                    "hub 返回的证书 CN 与分配的 agent_id 不一致，拒绝写入身份"
+                )));
+            }
+            tls::load_certs(&resp.ca_pem)
+                .map_err(|e| EnrollError::Fatal(anyhow!("解析 hub 下发的 CA 证书失败: {e}")))?;
+
             // 证书是公开材料；私钥与 agent secret 从创建起就是 0600。
             fsutil::atomic_write(
                 &cfg.data_dir.join(AGENT_CERT),
@@ -1372,23 +1420,8 @@ async fn try_enroll(cfg: &AgentConfig) -> std::result::Result<(), EnrollError> {
                 0o644,
             )
             .map_err(|e| EnrollError::Fatal(anyhow!("写入 agent_id 失败: {e}")))?;
-            // #45：五个身份文件写完并自洽后再最后原子写完成标记。marker 缺失时
-            // 下次启动会走「旧安装校验后补 marker」，不会重新 enrollment / 换身份。
-            if !tls::cert_matches_key(&resp.cert_pem, &key_pem)
-                .map_err(|e| EnrollError::Fatal(anyhow!("校验纳管证书与私钥失败: {e}")))?
-            {
-                return Err(EnrollError::Fatal(anyhow!(
-                    "hub 返回的证书与本机私钥不配套，拒绝写入完成标记"
-                )));
-            }
-            let cn = tls::cert_summary(&resp.cert_pem)
-                .map_err(|e| EnrollError::Fatal(anyhow!("解析纳管证书失败: {e}")))?
-                .common_name;
-            if cn.as_deref() != Some(resp.agent_id.as_str()) {
-                return Err(EnrollError::Fatal(anyhow!(
-                    "hub 返回的证书 CN 与分配的 agent_id 不一致，拒绝写入完成标记"
-                )));
-            }
+            // 五个身份文件写完后再最后原子写完成标记。marker 缺失时下次启动会走
+            // 「旧安装校验后补 marker」，不会重新 enrollment / 换身份。
             write_enrollment_marker(&cfg.data_dir, &resp.agent_id, &resp.cert_pem, now_ms())
                 .map_err(|e| EnrollError::Fatal(anyhow!("写入 enrollment.complete 失败: {e}")))?;
             tracing::info!(agent = %resp.agent_id, "纳管成功");
@@ -2657,6 +2690,38 @@ mod tests {
 
     fn remove_identity_file(dir: &Path, name: &str) {
         std::fs::remove_file(dir.join(name)).unwrap();
+    }
+
+    /// #45：`info` 对旧安装不能误报“未纳管”，对半完成状态要提示 fail-closed。
+    #[test]
+    fn v100_info_status_distinguishes_legacy_and_half_completed() {
+        let dir = temp_dir("info-status-empty");
+        let cfg = AgentConfig {
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        assert_eq!(enrollment_status(&cfg), "未纳管");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = temp_dir("info-status-legacy");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        let legacy = enrollment_status(&cfg);
+        assert!(
+            legacy.contains("旧安装") && legacy.contains("补齐"),
+            "旧安装必须提示自动补齐而不是未纳管: {legacy}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = temp_dir("info-status-half");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, AGENT_KEY);
+        let half = enrollment_status(&cfg);
+        assert!(
+            half.contains("未完成") && half.contains("fail-closed"),
+            "半完成状态必须提示 fail-closed: {half}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #45：`is_enrolled` 必须同时要求 marker 与五个身份文件，空文件不算。

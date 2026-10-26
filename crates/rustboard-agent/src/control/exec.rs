@@ -7,7 +7,9 @@
 //!   但后代仍持有输出管道时，对**整个进程组**发 `SIGKILL` 并回收；
 //! - stdout / stderr 设为非阻塞，用 `poll(2)` + deadline 读取，不创建无法取消的
 //!   reader 线程；每次唤醒最多读固定次数，deadline 始终可检查；
-//! - 每个流只保留前 `max_output` 字节，超出部分继续读空防止子进程写满管道阻塞。
+//! - 每个流只保留前 `max_output` 字节，超出部分继续读空防止子进程写满管道阻塞；
+//! - 后代通过 `setsid` 脱离进程组且仍持有管道时，输出不完整，命令返回
+//!   `control_failed`，绝不静默截断成成功结果。
 
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -208,12 +210,13 @@ pub fn run(
         drain_until_eof(&mut pipes, max_output, Instant::now() + KILL_DRAIN_GRACE);
     }
     if pipes.iter().any(|pipe| !pipe.eof) {
-        // 后代脱离进程组且仍持有管道（例如自行 setsid）。没有 reader 线程，
-        // 关闭读端即可返回，不会泄漏线程或无限等待；记录错误供运维排查。
-        tracing::error!(
-            pid = child.id(),
-            "命令后代进程未在宽限期内退出；关闭输出管道并返回"
-        );
+        // 后代通过 setsid() 等脱离进程组后，killpg 无法命中它，管道也不会 EOF。
+        // 此时输出必然不完整；不能静默返回 Ok，否则上游会把截断内容当成完整结果。
+        // 先回收直接子进程，再返回明确错误（没有 reader 线程，读端随返回值关闭）。
+        let _ = child.wait();
+        return Err(ControlError::control_failed(
+            "命令后代进程未在宽限期内退出（可能通过 setsid 脱离进程组），输出不完整",
+        ));
     }
 
     // waitid 只观察不回收，这里才真正 reap；失败则无法确认退出状态。
@@ -604,6 +607,31 @@ mod tests {
             "后台后代必须在 grace 内被 killpg 结束，不能继续执行"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #46：后代用 setsid 脱离进程组后无法 killpg，输出必然不完整；
+    /// 必须返回 control_failed，不能把截断结果静默当成成功。
+    #[test]
+    fn descendant_that_escapes_process_group_fails_command() {
+        let _guard = test_serial_guard();
+        let setsid = resolve_tool("", "setsid").expect("候选目录里应能找到 setsid");
+        let sh = sh();
+        let body = format!("'{}' sleep 3 &", setsid.display());
+        let started = Instant::now();
+        let err = run(&sh, &["-c", &body], Duration::from_secs(5), 1024)
+            .err()
+            .expect("后代脱离进程组时必须返回错误，不能静默成功");
+        assert_eq!(err.code, rustboard_common::control::codes::CONTROL_FAILED);
+        assert!(
+            err.message.contains("输出不完整"),
+            "错误信息: {}",
+            err.message
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "必须在 grace 内返回: {:?}",
+            started.elapsed()
+        );
     }
 
     /// #46：连续超时不得泄漏 FD / 线程。用独立子进程运行探针，避免其他并行
