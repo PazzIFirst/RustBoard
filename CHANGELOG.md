@@ -10,6 +10,18 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.3] - 2026-10-27
+
+### Fixed
+
+- 修复 #27–#50 全量缺陷：schema v8 归档 claim/1m/1h 增量降采样、迟到与保留期、
+  DiskBuffer 双 meta/损坏恢复、Agent 建连/续签/控制输出、面板 TLS/刷新/401、
+  WebDAV MKCOL、采集器路径与 CPU、告警状态与标签过滤、CI/e2e 等。
+- 归档重试缺行不再卡死整轮；1m retention 不会删除仍有未聚合 raw 的小时；
+  残缺 1m 不再覆盖历史 1h。
+- 时间戳策略 [#50]：60 秒/30 天准入、启动 legacy 审计与 ACK 丢弃计数。
+
+
 ### Added
 
 - Phase D PostgreSQL 后端（显式 opt-in）：`database = "postgres://..."` 时启用；
