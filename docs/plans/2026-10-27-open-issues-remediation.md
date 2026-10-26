@@ -142,20 +142,20 @@ ALTER TABLE archive_objects ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
    文档必须写明 v8 单向、回退恢复备份，安装器/升级脚本检查版本并阻止旧二进制
    启动。
 2. `archive_object_id` 初始为 NULL；`ledger_version=0` 表示 v7 旧对象。
-3. `aggregated_1m`（**按桶对账，不按水位**）：
-   - v7 是先提交 1m、再单独写水位；崩溃窗口内 raw 可能已聚合但水位未推进，
-     只按 `ts < 水位` 标记会双计；只按水位置 0 也会把已聚合行再算一次。
-   - 迁移按桶：该 `(agent_id, metric, labels, bucket_ts)` 已有 1m 行 → 桶内
-     raw 一律标记 1；没有 1m 行 → 标记 0。历史 late 若落在已有桶内无法与
-     正常行区分，按“已包含”处理，宁可少补也不双计；新 late 行一律 0。
-   - 空库/无水位：全部 0。`ts` 超出可接受范围的行单独隔离并计数（见 §4.2）。
-4. `samples_1m.last_ts`：**不从可能未聚合的 raw 回填**。legacy 桶统一回填
-   `bucket_ts + 59999`（保守值，不因 late 改写 last_value）；新桶写入精确值。
-5. `samples_1m.aggregated_1h`（**按小时对账，不用非整点水位**）：
-   - 该 `(agent_id, metric, labels, floor(bucket_ts,1h))` 已有 1h 行 → 该小时
-     所有 1m 行置 1；否则该小时所有 1m 行置 0。
-   - 禁止用 `bucket_ts < 1h 水位` 标记：1h 水位可能不是整点，会留下没有
-     1h 行的半小空洞。
+3. `aggregated_1m`（**按 count/行序对账，不按水位、也不整桶全标**）：
+   - v7 是先提交 1m、再单独写水位；已有 1m 行不等于桶内所有 raw 都已并入
+     （崩溃窗口/迟到行可能在同一桶）。
+   - 对每个 1m 桶，按 `rowid`（PG `id`）升序给 raw 编号；标记前
+     `min(1m.count, raw_count)` 条为 1，其余为 0。raw 行是追加的，v7 已聚合
+     的正是较早的行；这样迟到行保持 0，由 v8 delta 补入，不会双计。
+   - raw_count < 1m.count 说明部分 raw 已被保留期删除；现存 raw 全标 1。
+   - 没有 1m 行的桶全部 0；空库/无水位同理。`ts` 超出可接受范围的行隔离计数。
+4. `samples_1m.last_ts`：按上述被标记为 1 的 raw 取 `MAX(ts)`；raw 已删/无
+   现存已聚合行的桶才回填 `bucket_ts + 59999`。新桶写入精确值。
+5. `samples_1m.aggregated_1h`（**按 1h count/行序对账**）：
+   - 对每个 1h 桶，按 `bucket_ts,rowid` 排序 1m 行，累计 `count` ≤ 1h.count
+     的行标记 1，其余 0；这样迟到/崩溃窗口的 1m 行不会被误标后永久漏算。
+   - 没有 1h 行的整小时全部 0；禁止按非整点 1h 水位标记。
 6. **归档账本迁移**：
    - `archive.enabled=false` 或水位为空：不进入 ledger 重建。
    - `archive.enabled=true` 且已有水位：写 `archive_state.archive_ledger_pending=1`，
@@ -709,6 +709,13 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 4. 1h 需锁小时/`FOR UPDATE`，dirty hour 整小时阻止 1m retention；1m 更新置整小时 `aggregated_1h=0`。
 5. PG 旧库必须显式 ALTER；v8 单向升级/旧二进制风险需在升级文档阻断。
 
+代码复审追加（0147a29）：
+- SQLite claim 不能跨事务只凭 rowid，UPDATE 必须带行身份条件；
+- legacy `last_ts` 不能一律桶尾，需从已聚合 raw 回填；
+- 迁移不能因“已有 1m/1h 行”整桶全标，改为按 count/行序对账；
+- PG claim 单测要进 CI 实库；pending 需 config-aware；
+- 归档 metadata 更新要守卫状态/ledger；attempts 必须有写入路径。
+
 ### 12.2 已提交分支（尚未合入 main）
 
 | 分支 | 提交 | 内容 | 验证 |
@@ -727,9 +734,11 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 - `feat/v100-downsample`：R1b 增量 1m/1h、retention、#50（#32/#33/#50）。
 - `feat/v100-alerts`：#30/#31 告警状态与标签过滤下推。
 - `feat/v100-agent2`：#45 enrollment marker、#46 进程组。
-- `feat/v100-panel` 复审整改：ACME/DNS SAN 推导、CA 写入顺序。
+- `feat/v100-panel` 复审整改：ACME/DNS SAN 推导、CA 写入顺序（评审发现 1 严重）。
 - `feat/v100-agent` 复审整改：#43 Guard 满表、#48 URL 脱敏、#44 drain 控制队列。
 - `feat/v100-buffer` 独立复审。
+- `feat/v100-data` 复审整改：claim 行身份、count/行序迁移、last_ts、PG claim CI。
+- `feat/v100-collectors` 已补非法 UTF-8 label 转义与 CPU 汇总回退保护。
 
 ### 12.4 未做/待做
 
