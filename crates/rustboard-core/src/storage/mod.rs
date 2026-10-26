@@ -807,9 +807,17 @@ pub trait Storage: Send + Sync {
     ///
     /// claim 只做「插入对象 + UPDATE 行集」，`bytes`/`sha256` 可先留占位；
     /// 大对象编码与上传不得占用 claim 事务，避免阻塞 ingest。`sha256` 必须
-    /// 是 64 位小写十六进制；对象不存在返回
-    /// [`crate::archive::ArchiveStoreError::NotFound`]。
+    /// 是 64 位小写十六进制；仅 `pending` / `failed` 对象允许更新，
+    /// 对象不存在返回 [`crate::archive::ArchiveStoreError::NotFound`]，
+    /// 其余状态返回 `InvalidTransition`。
     fn update_archive_object_metadata(&self, id: i64, bytes: u64, sha256: &str) -> Result<()>;
+
+    /// 记录一次上传尝试：仅 `pending` / `failed` 对象允许，`attempts += 1`。
+    ///
+    /// 返回递增后的 attempts；对象不存在返回
+    /// [`crate::archive::ArchiveStoreError::NotFound`]，uploaded /
+    /// local_deleted 返回 `InvalidTransition`。
+    fn record_archive_attempt(&self, id: i64) -> Result<i64>;
 
     /// 统计不可归档的 raw 行数：`ts < 0` 或 `ts > now`。
     ///

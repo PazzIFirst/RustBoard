@@ -536,10 +536,12 @@ fn apply_schema_inner(client: &mut postgres::Client) -> Result<()> {
 /// **按桶对账，不按维护水位**：v7 先写 1m 行再推进水位，崩溃窗口里存在
 /// 「1m 已写、水位未推进」的桶；按水位标记会双计/漏计。因此：
 ///
-/// - `aggregated_1m`：同一分钟桶已有 1m 行的 raw 置 1，否则保持 0；
-/// - `last_ts`：legacy 桶统一 `bucket_ts + 59999`，不从可能未聚合的 raw 取值；
-/// - `aggregated_1h`：同一整点小时已有 1h 行时，该小时全部 1m 行置 1；
-///   不读非整点 1h 水位；
+/// - `aggregated_1m`：同一分钟桶 raw 按 `id` 升序编号，编号 `<= 1m.count`
+///   的置 1；raw 少于 count 全置 1，无 1m 行保持 0；
+/// - `last_ts`：按 `id` 升序取最早 `1m.count` 条 raw 的 `MAX(ts)`；无现存
+///   raw 才回填 `bucket_ts + 59999`；
+/// - `aggregated_1h`：同小时 1m 行按 `(bucket_ts, id)` 累计 `count`，
+///   累计值 `<= 1h.count` 的置 1，其余 0；不读 1h 水位；
 /// - `ledger_version` / `attempts`：DDL 默认 0，不额外更新；
 /// - 归档水位存在时写 `archive_state.archive_ledger_pending=1`，只写状态，
 ///   重新导出由 R1a-2 worker 负责。
@@ -558,28 +560,51 @@ fn apply_v8_data_migration(tx: &mut postgres::Transaction<'_>) -> Result<()> {
     let aggregated = tx
         .execute(
             "UPDATE samples SET aggregated_1m = 1
-             WHERE ts >= $1 AND ts <= $2
-               AND EXISTS (
-                 SELECT 1 FROM samples_1m m
-                 WHERE m.agent_id = samples.agent_id
-                   AND m.metric = samples.metric
-                   AND m.labels = samples.labels
-                   AND m.bucket_ts = (samples.ts / 60000) * 60000
+             WHERE id IN (
+                 SELECT s.id FROM (
+                     SELECT id, agent_id, metric, labels, ts,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY agent_id, metric, labels, (ts / 60000) * 60000
+                                ORDER BY id ASC
+                            ) AS rn
+                     FROM samples
+                     WHERE ts >= $1 AND ts <= $2
+                 ) s
+                 JOIN samples_1m m
+                   ON m.agent_id = s.agent_id
+                  AND m.metric = s.metric
+                  AND m.labels = s.labels
+                  AND m.bucket_ts = (s.ts / 60000) * 60000
+                 WHERE s.rn <= m.count
              )",
             &[&MIN_ARCHIVE_TS_MS, &now],
         )
-        .context("v8 迁移：按已有 1m 桶标记 raw 失败")?;
+        .context("v8 迁移：按 1m count/rowid 顺序标记 raw 失败")?;
     tracing::info!(aggregated, "v8 迁移：按已存在的 1m 桶标记已聚合 raw");
 
     tx.execute("UPDATE samples_1m SET last_ts = 0 WHERE last_ts != 0", &[])
         .context("v8 迁移：清理残留 1m last_ts 失败")?;
     let backfilled = tx
         .execute(
-            "UPDATE samples_1m SET last_ts = bucket_ts + 59999
+            "UPDATE samples_1m SET last_ts = COALESCE(
+                 (SELECT MAX(s.ts) FROM samples s
+                  WHERE s.agent_id = samples_1m.agent_id
+                    AND s.metric = samples_1m.metric
+                    AND s.labels = samples_1m.labels
+                    AND s.ts >= samples_1m.bucket_ts
+                    AND s.ts < samples_1m.bucket_ts + 60000
+                    AND (SELECT COUNT(*) FROM samples s2
+                         WHERE s2.agent_id = samples_1m.agent_id
+                           AND s2.metric = samples_1m.metric
+                           AND s2.labels = samples_1m.labels
+                           AND s2.ts >= samples_1m.bucket_ts
+                           AND s2.ts < samples_1m.bucket_ts + 60000
+                           AND s2.id <= s.id) <= samples_1m.count),
+                 samples_1m.bucket_ts + 59999)
              WHERE bucket_ts >= $1 AND bucket_ts <= $2",
             &[&MIN_ARCHIVE_TS_MS, &now],
         )
-        .context("v8 迁移：回填 legacy 1m last_ts 失败")?;
+        .context("v8 迁移：按 1m count/顺序回填 last_ts 失败")?;
     tracing::info!(backfilled, "v8 迁移：回填 legacy 1m last_ts");
 
     tx.execute(
@@ -590,17 +615,28 @@ fn apply_v8_data_migration(tx: &mut postgres::Transaction<'_>) -> Result<()> {
     let aggregated_hour = tx
         .execute(
             "UPDATE samples_1m SET aggregated_1h = 1
-             WHERE bucket_ts >= $1 AND bucket_ts <= $2
-               AND EXISTS (
-                 SELECT 1 FROM samples_1h h
-                 WHERE h.agent_id = samples_1m.agent_id
-                   AND h.metric = samples_1m.metric
-                   AND h.labels = samples_1m.labels
-                   AND h.bucket_ts = (samples_1m.bucket_ts / 3600000) * 3600000
+             WHERE id IN (
+                 SELECT m.id FROM (
+                     SELECT id, agent_id, metric, labels, bucket_ts, count,
+                            SUM(count) OVER (
+                                PARTITION BY agent_id, metric, labels,
+                                             (bucket_ts / 3600000) * 3600000
+                                ORDER BY bucket_ts ASC, id ASC
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                            ) AS cumulative_count
+                     FROM samples_1m
+                     WHERE bucket_ts >= $1 AND bucket_ts <= $2
+                 ) m
+                 JOIN samples_1h h
+                   ON h.agent_id = m.agent_id
+                  AND h.metric = m.metric
+                  AND h.labels = m.labels
+                  AND h.bucket_ts = (m.bucket_ts / 3600000) * 3600000
+                 WHERE m.cumulative_count <= h.count
              )",
             &[&MIN_ARCHIVE_TS_MS, &now],
         )
-        .context("v8 迁移：按已有 1h 桶标记 1m 失败")?;
+        .context("v8 迁移：按 1h count/顺序标记 1m 失败")?;
     tracing::info!(aggregated_hour, "v8 迁移：按已存在的 1h 桶标记已聚合 1m");
 
     let archived_watermark: Option<String> = tx
