@@ -186,6 +186,12 @@ const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE id IN \
               AND d.bucket_ts >= (m.bucket_ts / 3600000) * 3600000 \
               AND d.bucket_ts < (m.bucket_ts / 3600000) * 3600000 + 3600000 \
         ) \
+        AND NOT EXISTS ( \
+            SELECT 1 FROM samples s \
+            WHERE s.aggregated_1m = 0 \
+              AND s.ts >= (m.bucket_ts / 3600000) * 3600000 \
+              AND s.ts < (m.bucket_ts / 3600000) * 3600000 + 3600000 \
+        ) \
       ORDER BY m.bucket_ts LIMIT $2)";
 const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE id IN \
      (SELECT id FROM samples_1h WHERE bucket_ts < $1 ORDER BY bucket_ts LIMIT $2)";

@@ -6339,6 +6339,7 @@ fn run_maintenance_round(storage: &StorageHandle, cfg: &HubConfig) {
     let now = now_ms();
     let mut errors: Vec<String> = Vec::new();
 
+    let mut downsample_ok = true;
     match downsample::run_downsample(
         storage.as_storage(),
         now,
@@ -6346,18 +6347,23 @@ fn run_maintenance_round(storage: &StorageHandle, cfg: &HubConfig) {
     ) {
         Ok(report) => tracing::debug!(?report, "维护任务：降采样完成"),
         Err(err) => {
+            downsample_ok = false;
             let message = format!("downsample: {err:#}");
-            tracing::warn!(error = %message, "维护任务：降采样失败，下一轮重试");
+            tracing::warn!(error = %message, "维护任务：降采样失败，跳过本轮保留期");
             errors.push(message);
         }
     }
-    let gate = archive::archive_gate(storage, cfg);
-    match downsample::run_retention(storage.as_storage(), cfg, now, gate) {
-        Ok(report) => tracing::debug!(?report, "维护任务：保留期完成"),
-        Err(err) => {
-            let message = format!("retention: {err:#}");
-            tracing::warn!(error = %message, "维护任务：保留期失败，下一轮重试");
-            errors.push(message);
+    // 降采样失败时源数据状态未知；本轮不删除任何层级，避免 1m 先于迟到
+    // raw 被删。保留期下一轮重试。
+    if downsample_ok {
+        let gate = archive::archive_gate(storage, cfg);
+        match downsample::run_retention(storage.as_storage(), cfg, now, gate) {
+            Ok(report) => tracing::debug!(?report, "维护任务：保留期完成"),
+            Err(err) => {
+                let message = format!("retention: {err:#}");
+                tracing::warn!(error = %message, "维护任务：保留期失败，下一轮重试");
+                errors.push(message);
+            }
         }
     }
 

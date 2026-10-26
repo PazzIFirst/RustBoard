@@ -418,10 +418,13 @@ pub fn audit_legacy_raw_rows(
     cfg: &HubConfig,
     now: i64,
 ) -> Result<LegacyAuditReport> {
-    let min_ts = cfg.ingest.min_sample_ts(now);
+    // 只隔离真正不可表示的时间戳（负值/未来超界）；早于 max_late 的历史
+    // backlog 仍交给 delta 聚合，不能因为升级/长时间离线被静默丢弃。
+    let invalid_min_ts = 0;
     let max_ts = cfg.ingest.max_sample_ts(now);
-    let invalid_timestamp_rows = db.count_raw_rows_outside(min_ts, max_ts)?;
-    let unaggregated_invalid_rows = db.count_unaggregated_raw_rows_outside(min_ts, max_ts)?;
+    let invalid_timestamp_rows = db.count_raw_rows_outside(invalid_min_ts, max_ts)?;
+    let unaggregated_invalid_rows =
+        db.count_unaggregated_raw_rows_outside(invalid_min_ts, max_ts)?;
     let legacy_unaggregated_rows = if cfg.retention_1m_days == 0 {
         0
     } else {
@@ -429,7 +432,7 @@ pub fn audit_legacy_raw_rows(
         db.count_unaggregated_raw_rows_before(horizon)?
     };
     let isolated_rows = if unaggregated_invalid_rows > 0 {
-        db.isolate_raw_rows_outside(min_ts, max_ts)?
+        db.isolate_raw_rows_outside(invalid_min_ts, max_ts)?
     } else {
         0
     };
@@ -439,7 +442,7 @@ pub fn audit_legacy_raw_rows(
             unaggregated_invalid_rows,
             legacy_unaggregated_rows,
             isolated_rows,
-            "legacy raw 时间戳审计：超界/超过 1m horizon 的样本已隔离，不参与增量聚合"
+            "legacy raw 时间戳审计：负值/未来超界样本已隔离；早于 1m horizon 的未聚合行保留给 delta"
         );
     }
     Ok(LegacyAuditReport {
@@ -973,6 +976,56 @@ mod tests {
         assert_eq!(json["archive_ledger_pending"], false);
         assert!(json.get("downsample_1m_watermark").is_some());
         assert!(json.get("last_error").is_some());
+    }
+
+    /// #33：升级/长期离线 backlog 不得在启动审计被隔离后静默丢弃。
+    #[test]
+    fn r1b_audit_does_not_isolate_old_backlog() {
+        let db = SqliteStorage::open_in_memory().unwrap();
+        let old = NOW - 100 * DAY_MS;
+        seed(&db, "a1", vec![Sample::new("cpu.usage", old, 1.0)]);
+        let cfg = cfg_with_retention(7, 90, 730);
+        let report = audit_legacy_raw_rows(&db, &cfg, NOW).unwrap();
+        assert_eq!(
+            report.invalid_timestamp_rows, 0,
+            "旧 backlog 不是非法时间戳"
+        );
+        assert_eq!(report.isolated_rows, 0, "旧 backlog 不得被隔离");
+        assert_eq!(report.legacy_unaggregated_rows, 1);
+        assert_eq!(db.count_unaggregated_raw_rows_before(NOW).unwrap(), 1);
+
+        run_downsample(&db, NOW, None).unwrap();
+        let buckets = db.aggregate_rows_for_test("1m");
+        assert_eq!(buckets.len(), 1, "旧 backlog 必须真正进入 1m");
+        assert_eq!(buckets[0].count, 1);
+    }
+
+    /// 干净 1m 小时里只要还有未聚合 raw，就不能先删 1m；补聚合后才可删。
+    #[test]
+    fn r1b_retention_keeps_1m_hour_with_unaggregated_raw() {
+        let db = SqliteStorage::open_in_memory().unwrap();
+        let hour = bucket_floor(NOW - 2 * BUCKET_1H_MS, BUCKET_1H_MS).unwrap();
+        seed(&db, "a1", vec![Sample::new("cpu.usage", hour + 1_000, 1.0)]);
+        run_downsample(&db, NOW, None).unwrap();
+        assert_eq!(db.aggregate_rows_for_test("1m").len(), 1);
+
+        // 同一小时再来一条迟到 raw，尚未并入 1m。
+        seed(&db, "a1", vec![Sample::new("cpu.usage", hour + 2_000, 2.0)]);
+        let cutoff = hour + BUCKET_1H_MS;
+        assert_eq!(
+            db.prune_samples_1m_before(cutoff).unwrap().deleted,
+            0,
+            "同小时还有未聚合 raw 时不得删 1m"
+        );
+
+        // 真实 delta 补入迟到行；再用真实 1h 聚合把整小时标 clean。
+        run_downsample(&db, NOW, None).unwrap();
+        db.downsample_1h_range(hour, cutoff).unwrap();
+        assert_eq!(
+            db.prune_samples_1m_before(cutoff).unwrap().deleted,
+            1,
+            "raw 补聚合且 1h 完成后才允许删 1m"
+        );
     }
 
     /// 水位只前进：用更早的 now 重跑不得回拨。
