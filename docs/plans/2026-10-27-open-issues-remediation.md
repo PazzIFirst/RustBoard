@@ -731,7 +731,7 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 | `feat/v100-collectors` | `dbd1b05` | #35/#36 | 已合入集成 |
 | `feat/v100-webdav` | `f607e6d` | #29 | 已合入集成 |
 | `feat/v100-ci` | `a4ecea9` | #40 | 已合入集成 |
-| `feat/v100-integration` | `80cb61a` | 全部修复 + PG/复审整改 | 全 workspace+PG 绿；待 E2E/长稳 |
+| `feat/v100-integration` | `5fbc91b` | 全部修复 + PG/复审整改 | 全 workspace+PG/security/panel 绿；待安装/E2E/长稳 |
 
 集成验证（`v100-integration`，本机 SQLite + 真实 PostgreSQL 16）：
 
@@ -741,13 +741,14 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 - 面板 188+14、agent 170、buffer 34（含 100k push 单独 8.62s）、core 264 lib、hub 449 测试通过。
 - `tests/e2e/security.sh`：9/9 通过（无证书、CN/secret 错配、Batch 身份伪造、吊销、协议版本、双连接）。
 - `tests/e2e/panel.sh`：159/159 通过（登录/CSRF/设置/日志脱敏/健康检查）。
+- 1h 历史保护：修复后全 workspace+PG 再次 rc=0（`5fbc91b`）。
 - 已知环境注意：全 workspace 若把 `TMPDIR` 放在 ext4 会令 100k buffer 测试极慢；CI 使用默认 tmpfs。
 
 ### 12.3 复审发现与处理
 
 - 数据：claim 跨事务只凭 rowid、迁移整桶全标、legacy last_ts 错误 → 行身份 + count/行序对账，已修。
 - 归档：claim 身份/rows_missing 卡死/状态守卫/attempts → 身份校验、failed+continue、Pending|Failed、metadata ledger 守卫；与 R1b 同批后 uploaded join + ledger pending 生效。
-- 降采样：1m clean 小时仍有未聚合 raw 时被删、启动审计误隔离旧 backlog、downsample 失败仍跑 retention → 加 raw NOT EXISTS、只隔离负值/未来、失败跳过 retention；已加回归测试。
+- 降采样：1m clean 小时仍有未聚合 raw 时被删、启动审计误隔离旧 backlog、downsample 失败仍跑 retention、残缺 1m 覆盖历史 1h → raw NOT EXISTS、只隔离负值/未来、失败跳过 retention、1h 源 count 小于历史时冻结；已加回归测试。
 - Buffer：offset=0、重同步预算、空 pending 压实 → 修复；push/recover 8MiB 一致。
 - 面板：CA 写入与配置 save 原子性、非回环 SAN、远端 CA 边界 → 事务化 CA/配置，写失败回滚；无严重复审项。
 - Agent：#45 marker/身份、#46 进程组/输出截断 → 修复；无严重复审项。
