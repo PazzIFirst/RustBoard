@@ -17,9 +17,9 @@ use crate::archive::{ArchiveObject, ArchiveStatus};
 use crate::channels::NotificationChannel;
 use crate::storage::sqlite::{AlertSeriesSnapshot, ArchiveRawRow};
 use crate::storage::{
-    AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, DownsampleRangeResult,
-    IngestOutcome, MaintenanceStateEntry, NewAuditEntry, PruneResult, SampleTier, Storage,
-    TierStats,
+    AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, DownsampleDeltaResult,
+    DownsampleHourResult, DownsampleRangeResult, IngestOutcome, MaintenanceStateEntry,
+    NewAuditEntry, PruneResult, SampleTier, Storage, TierStats,
 };
 
 impl Storage for PostgresStorage {
@@ -397,6 +397,38 @@ impl Storage for PostgresStorage {
 
     fn downsample_1h_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult> {
         PostgresStorage::downsample_1h_range(self, from_ts, to_ts)
+    }
+
+    fn downsample_1m_delta(
+        &self,
+        closed_end: i64,
+        max_rows: usize,
+    ) -> Result<DownsampleDeltaResult> {
+        PostgresStorage::downsample_1m_delta(self, closed_end, max_rows)
+    }
+
+    fn downsample_1h_hour(&self, closed_hour: i64) -> Result<Option<DownsampleHourResult>> {
+        PostgresStorage::downsample_1h_hour(self, closed_hour)
+    }
+
+    fn count_unaggregated_raw_rows(&self) -> Result<i64> {
+        PostgresStorage::count_unaggregated_raw_rows(self)
+    }
+
+    fn count_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        PostgresStorage::count_raw_rows_outside(self, min_ts, max_ts)
+    }
+
+    fn count_unaggregated_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        PostgresStorage::count_unaggregated_raw_rows_outside(self, min_ts, max_ts)
+    }
+
+    fn count_unaggregated_raw_rows_before(&self, before_ts: i64) -> Result<i64> {
+        PostgresStorage::count_unaggregated_raw_rows_before(self, before_ts)
+    }
+
+    fn isolate_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<usize> {
+        PostgresStorage::isolate_raw_rows_outside(self, min_ts, max_ts)
     }
 
     fn raw_stats(&self) -> Result<TierStats> {

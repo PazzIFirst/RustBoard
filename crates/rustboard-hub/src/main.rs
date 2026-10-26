@@ -210,6 +210,40 @@ const MAINTENANCE_MAX_BACKFILL_HOURS: u32 = 6;
 /// M4：`maintenance_state.last_error` 的最大字符数，避免把超长错误写进库。
 const MAX_MAINTENANCE_ERROR_CHARS: usize = 2_000;
 
+/// #50：时间戳超界批次的审计计数（仅进程内，不写库）。
+///
+/// 每批拒绝都 +1；日志按固定间隔采样，避免恶意 agent 用坏批次刷爆日志。
+static INGEST_TS_REJECTED_BATCHES: AtomicU64 = AtomicU64::new(0);
+/// 每拒绝这么多批采样打一条 WARN；首批一定打。
+const INGEST_TS_REJECT_LOG_EVERY: u64 = 100;
+
+/// #50：批内是否有样本时间戳超出 `[ingest]` 准入范围。
+///
+/// 只做比较，不回显任何样本值；`now_ms` 由调用方统一传入，避免同一批
+/// 各样本使用不同边界。
+fn batch_timestamp_out_of_bounds(batch: &SampleBatch, cfg: &HubConfig, now: i64) -> bool {
+    batch
+        .samples
+        .iter()
+        .any(|sample| !cfg.ingest.accepts_ts(sample.ts, now))
+}
+
+/// 记录一次时间戳超界批次拒绝，返回累计拒绝批次数。
+fn note_timestamp_rejected_batch(agent_id: &str, batch: &SampleBatch) -> u64 {
+    let total = INGEST_TS_REJECTED_BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    if total == 1 || total.is_multiple_of(INGEST_TS_REJECT_LOG_EVERY) {
+        tracing::warn!(
+            agent = %agent_id,
+            epoch = batch.epoch,
+            seq = batch.seq,
+            samples = batch.samples.len(),
+            rejected_total = total,
+            "批次样本时间戳超出 ingest 准入范围：整批 ACK 丢弃（不写库、不改水位）"
+        );
+    }
+    total
+}
+
 /// CSR 长度门禁：纳管与续签共用，必须在解析/消费 token 之前调用。
 fn csr_within_limit(csr_pem: &str) -> bool {
     csr_pem.len() <= MAX_CSR_PEM_LEN
@@ -853,18 +887,23 @@ struct MaintenanceStatusOutput {
     retention_1m_days: u32,
     retention_1h_days: u32,
     maintenance_interval_secs: u64,
+    ingest_max_late_days: u32,
+    ingest_max_future_skew_secs: u64,
 }
 
 /// 读取维护状态并返回 JSON（调用方负责打印）。
 fn maintenance_status_json(config: Option<PathBuf>) -> Result<String> {
     let (storage, cfg) = open_maintenance_storage(config)?;
-    let status = downsample::maintenance_status(&*storage).context("读取维护状态失败")?;
+    let status =
+        downsample::maintenance_status(&*storage, &cfg, now_ms()).context("读取维护状态失败")?;
     let output = MaintenanceStatusOutput {
         status,
         retention_raw_days: cfg.retention_raw_days,
         retention_1m_days: cfg.retention_1m_days,
         retention_1h_days: cfg.retention_1h_days,
         maintenance_interval_secs: cfg.maintenance_interval_secs,
+        ingest_max_late_days: cfg.ingest.max_late_days,
+        ingest_max_future_skew_secs: cfg.ingest.max_future_skew_secs,
     };
     Ok(serde_json::to_string_pretty(&output)?)
 }
@@ -1952,6 +1991,23 @@ fn run(cfg: HubConfig) -> Result<()> {
             .context("启动时重置在线状态失败")?;
         if reset > 0 {
             tracing::info!(count = reset, "启动时已将残留的 online 状态重置为 offline");
+        }
+
+        // #50 / R1b：迁移旧库里的超界时间戳 raw 与超过 1m horizon 的未聚合行，
+        // 避免 delta 为这些历史坏数据构造残缺 1m。审计失败不阻塞监听；新的
+        // 超界批次仍会在 ingest 前被 ACK 丢弃。
+        let audit_now = now_ms();
+        let audit_cfg = cfg.clone();
+        match storage_blocking(storage.clone(), move |storage| {
+            downsample::audit_legacy_raw_rows(storage.as_storage(), &audit_cfg, audit_now)
+        })
+        .await
+        {
+            Ok(report) => tracing::debug!(?report, "启动时 legacy raw 时间戳审计完成"),
+            Err(err) => tracing::warn!(
+                error = %err,
+                "启动时 legacy raw 时间戳审计失败；新批次仍受 ingest 准入校验保护"
+            ),
         }
 
         // M3：审计保留 180 天，启动时先清一次过期记录（运行期每 1000 条再清）。
@@ -5533,6 +5589,20 @@ async fn handle_message(
                             .await;
                         return Ok(MessageAction::Close);
                     }
+                    // #50：入库前统一校验 sample.ts。超界整批 ACK 丢弃，不写
+                    // samples、不改维护水位；只记审计计数与采样 WARN（不含值）。
+                    if batch_timestamp_out_of_bounds(&batch, &state.cfg, now_ms()) {
+                        note_timestamp_rejected_batch(agent_id, &batch);
+                        send_frame(
+                            socket,
+                            &Frame::Ack {
+                                epoch: batch.epoch,
+                                seq: batch.seq,
+                            },
+                        )
+                        .await?;
+                        return Ok(MessageAction::Continue);
+                    }
 
                     let batch_for_db = batch.clone();
                     let storage = state.storage.clone();
@@ -6124,14 +6194,19 @@ fn spawn_self_monitor(storage: Arc<StorageHandle>, cfg: HubConfig) {
                     sent_at: ts,
                     samples,
                 };
-                let storage = storage.clone();
-                match tokio::task::spawn_blocking(move || storage.insert_batch(&batch)).await {
-                    Ok(Ok(IngestOutcome::Inserted { .. } | IngestOutcome::Duplicate)) => {}
-                    Ok(Ok(IngestOutcome::Rejected(reason))) => {
-                        tracing::warn!(?reason, "本机采集批次被拒绝");
+                // #50：self-monitor 与 agent 共用同一时间戳准入校验。
+                if batch_timestamp_out_of_bounds(&batch, &cfg, ts) {
+                    note_timestamp_rejected_batch(HUB_SELF_AGENT_ID, &batch);
+                } else {
+                    let storage = storage.clone();
+                    match tokio::task::spawn_blocking(move || storage.insert_batch(&batch)).await {
+                        Ok(Ok(IngestOutcome::Inserted { .. } | IngestOutcome::Duplicate)) => {}
+                        Ok(Ok(IngestOutcome::Rejected(reason))) => {
+                            tracing::warn!(?reason, "本机采集批次被拒绝");
+                        }
+                        Ok(Err(err)) => tracing::error!(error = %err, "本机采集入库失败"),
+                        Err(err) => tracing::error!(error = %err, "本机采集任务失败"),
                     }
-                    Ok(Err(err)) => tracing::error!(error = %err, "本机采集入库失败"),
-                    Err(err) => tracing::error!(error = %err, "本机采集任务失败"),
                 }
             }
             tokio::time::sleep(Duration::from_millis(cfg.sample_interval_ms)).await;
@@ -7933,14 +8008,8 @@ mod tests {
                 samples: vec![Sample::new("cpu.usage", sample_ts, 42.0)],
             })
             .unwrap();
-        state
-            .storage
-            .downsample_1m_range(from, from + 3_600_000)
-            .unwrap();
-        state
-            .storage
-            .downsample_1h_range(from, from + 3_600_000)
-            .unwrap();
+        // R1b：走真实增量聚合，同一事务内标记 raw 并生成 clean 的 1m/1h。
+        downsample::run_downsample(state.storage.as_storage(), now_ms(), None).unwrap();
         state.storage.prune_samples_before(i64::MAX).unwrap();
         state.storage.prune_samples_1m_before(i64::MAX).unwrap();
         assert_eq!(state.storage.raw_stats().unwrap().rows, 0);
@@ -7990,10 +8059,8 @@ mod tests {
         let sample_ts = now - 2 * 3_600_000;
         let minute = sample_ts.div_euclid(60_000) * 60_000;
         seed_cpu_point(&state, sample_ts, 33.0);
-        state
-            .storage
-            .downsample_1m_range(minute, minute + 60_000)
-            .unwrap();
+        // R1b：run_downsample 标记 raw 后才可被 retention 删除。
+        downsample::run_downsample(state.storage.as_storage(), now, None).unwrap();
         state.storage.prune_samples_before(i64::MAX).unwrap();
         assert_eq!(state.storage.raw_stats().unwrap().rows, 0);
         assert_eq!(state.storage.samples_1m_stats().unwrap().rows, 1);
@@ -8022,10 +8089,7 @@ mod tests {
         let sample_ts = from + 1_000;
         let minute = sample_ts.div_euclid(60_000) * 60_000;
         seed_cpu_point(&state, sample_ts, 42.0);
-        state
-            .storage
-            .downsample_1m_range(minute, minute + 60_000)
-            .unwrap();
+        downsample::run_downsample(state.storage.as_storage(), now, None).unwrap();
         state.storage.prune_samples_before(i64::MAX).unwrap();
         assert_eq!(state.storage.raw_stats().unwrap().rows, 0);
         assert_eq!(state.storage.samples_1m_stats().unwrap().rows, 1);
@@ -8061,14 +8125,7 @@ mod tests {
         let from = to - 3_600_000;
         let sample_ts = from + 1_000;
         seed_cpu_point(&state, sample_ts, 7.0);
-        state
-            .storage
-            .downsample_1m_range(from, from + 3_600_000)
-            .unwrap();
-        state
-            .storage
-            .downsample_1h_range(from, from + 3_600_000)
-            .unwrap();
+        downsample::run_downsample(state.storage.as_storage(), now, None).unwrap();
         state.storage.prune_samples_before(i64::MAX).unwrap();
         state.storage.prune_samples_1m_before(i64::MAX).unwrap();
         assert_eq!(state.storage.raw_stats().unwrap().rows, 0);
@@ -11244,7 +11301,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(json["raw"]["deleted"], 0);
-        assert_eq!(json["raw"]["skipped_no_watermark"], true);
+        assert_eq!(json["raw"]["skipped_no_watermark"], false);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11356,13 +11413,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// M4-C1b：`maintenance run --task retention` 必须使用归档门禁：
-    /// 归档已启用但水位缺失时 raw 不删；水位覆盖 cutoff 后才删。
+    /// M4-C1b / R1b：`maintenance run --task retention` 的归档门禁。
+    ///
+    /// 原始水位（`last_archived_ts`）不再单独证明 raw 可删；必须有 uploaded
+    /// 的 v8 claim 对象（`archive_object_id` join）才能删除。
     #[test]
-    fn m4c1b_maintenance_retention_uses_archive_watermark() {
+    fn m4c1b_maintenance_retention_requires_uploaded_claim() {
         use rustboard_common::config::ArchiveWebdavConfig;
         use rustboard_common::model::SampleBatch;
-        use rustboard_core::downsample::STATE_DOWNSAMPLE_1M_WATERMARK;
+        use rustboard_core::archive::{ArchiveObject, ArchiveStatus, LEDGER_VERSION_V8};
 
         let dir = temp_dir("archive-gate-retention");
         std::fs::create_dir_all(&dir).unwrap();
@@ -11376,7 +11435,7 @@ mod tests {
         cfg.archive.enabled = true;
         cfg.archive.after_days = 7;
         cfg.archive.webdav = Some(ArchiveWebdavConfig {
-            // 不需要真实连通：retention 只读水位，不构建后端。
+            // 不需要真实连通：retention 只读 ledger，不构建后端。
             url: "http://127.0.0.1:9/rustboard".to_string(),
             username: "user".to_string(),
             password: "password".to_string(),
@@ -11401,16 +11460,32 @@ mod tests {
             storage.insert_batch(&batch).unwrap(),
             rustboard_core::storage::IngestOutcome::Inserted { inserted: 3 }
         ));
-        storage
-            .set_maintenance_state(STATE_DOWNSAMPLE_1M_WATERMARK, &now.to_string(), now)
-            .unwrap();
+        // R1b：raw 必须先被增量聚合认领，retention 才会考虑删除。
+        downsample::run_downsample(&*storage, now, None).unwrap();
         drop(storage);
 
+        // 归档启用但没有任何 uploaded claim：raw 不删。
         let report: serde_json::Value = serde_json::from_str(
             &maintenance_run_json(Some(cfg_path.clone()), MaintenanceTask::Retention).unwrap(),
         )
         .unwrap();
         assert_eq!(report["raw"]["deleted"], 0);
+        assert_eq!(report["raw"]["blocked_by_archive"], true);
+
+        // 仅写旧归档水位仍然不能删；必须 uploaded join。
+        let storage = StorageHandle::sqlite(&db_path, DEFAULT_READ_POOL_SIZE).unwrap();
+        storage
+            .set_archive_state("last_archived_ts", &now.to_string(), now)
+            .unwrap();
+        drop(storage);
+        let report: serde_json::Value = serde_json::from_str(
+            &maintenance_run_json(Some(cfg_path.clone()), MaintenanceTask::Retention).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            report["raw"]["deleted"], 0,
+            "last_archived_ts 不能单独证明 raw 可删"
+        );
         assert_eq!(report["raw"]["blocked_by_archive"], true);
         assert_eq!(
             StorageHandle::sqlite(&db_path, DEFAULT_READ_POOL_SIZE)
@@ -11419,14 +11494,34 @@ mod tests {
                 .unwrap()
                 .rows,
             3,
-            "无归档水位时 raw 必须保留"
+            "无 uploaded claim 时 raw 必须保留"
         );
 
+        // 构造 v8 claim 并置 uploaded：此时 retention 才可删除。
         let storage = StorageHandle::sqlite(&db_path, DEFAULT_READ_POOL_SIZE).unwrap();
+        let rows = storage.list_unclaimed_archive_rows(0, now + 1, 10).unwrap();
+        assert_eq!(rows.len(), 3);
+        let from_ts = rows.iter().map(|row| row.ts).min().unwrap();
+        let to_ts = rows.iter().map(|row| row.ts).max().unwrap();
+        let object = ArchiveObject {
+            backend: "webdav".to_string(),
+            object_key: "rustboard-test/claim-v8.csv.gz".to_string(),
+            manifest_key: "rustboard-test/claim-v8.csv.gz.manifest.json".to_string(),
+            from_ts,
+            to_ts,
+            rows: rows.len() as u64,
+            ledger_version: LEDGER_VERSION_V8,
+            status: ArchiveStatus::Pending,
+            sha256: "0".repeat(64),
+            created_at: now,
+            ..ArchiveObject::default()
+        };
+        let id = storage.claim_archive_rows(&object, &rows).unwrap();
         storage
-            .set_archive_state("last_archived_ts", &now.to_string(), now)
+            .update_archive_object_status(id, ArchiveStatus::Uploaded, "", Some(now), None)
             .unwrap();
         drop(storage);
+
         let report: serde_json::Value = serde_json::from_str(
             &maintenance_run_json(Some(cfg_path), MaintenanceTask::Retention).unwrap(),
         )
@@ -12504,7 +12599,9 @@ mod tests {
             Some(String::new())
         );
 
-        // 损坏水位：降采样与保留期都失败，错误必须带任务前缀被记录下来。
+        // 损坏 1m 水位：降采样失败并记录前缀。R1b 的保留期只依赖
+        // aggregated_1m / aggregated_1h / 归档 ledger，不再读旧水位，因此
+        // 保留期本轮应成功，不得把 1m 水位错误重复算到 retention 前缀下。
         storage
             .set_maintenance_state(
                 downsample::STATE_DOWNSAMPLE_1M_WATERMARK,
@@ -12522,8 +12619,8 @@ mod tests {
             "缺少降采样错误: {recorded}"
         );
         assert!(
-            recorded.contains("retention:"),
-            "缺少保留期错误: {recorded}"
+            !recorded.contains("retention:"),
+            "R1b retention 不再依赖旧水位，本轮不应失败: {recorded}"
         );
 
         // 修好水位后下一轮恢复并清空错误。

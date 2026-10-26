@@ -848,7 +848,8 @@ mod tests {
     use crate::archive_webdav::test_support::MockDav;
     use crate::archive_webdav::WebdavColdStore;
     use rustboard_common::model::{Sample, SampleBatch};
-    use rustboard_core::downsample::{run_retention, STATE_DOWNSAMPLE_1M_WATERMARK};
+    use rustboard_core::archive::LEDGER_VERSION_V8;
+    use rustboard_core::downsample::{run_downsample, run_retention};
     use rustboard_core::storage::IngestOutcome;
 
     /// 固定测试时间：第 20,000 天 12:00 UTC（与真实日期无关，便于算边界）。
@@ -1119,17 +1120,16 @@ mod tests {
         assert!(storage.list_archive_objects(10, None).unwrap().is_empty());
     }
 
+    /// R1b：归档启用时 raw 只能通过 uploaded claim 删除；旧水位不算证据。
     #[test]
-    fn retention_gate_blocks_raw_until_watermark_covers_cutoff() {
+    fn retention_gate_blocks_raw_until_uploaded_claim() {
         let storage = StorageHandle::sqlite_memory().unwrap();
         let cfg = test_cfg();
         let now = TEST_NOW;
         insert_raw_rows(&storage, now - 10 * TEST_DAY_MS, &[1.0, 2.0, 3.0]);
-        storage
-            .set_maintenance_state(STATE_DOWNSAMPLE_1M_WATERMARK, &now.to_string(), now)
-            .unwrap();
+        run_downsample(&*storage, now, None).unwrap();
 
-        // 归档启用但没有水位：raw 一律不删。
+        // 归档启用但没有 uploaded claim：raw 一律不删。
         let gate = archive_gate(&storage, &cfg);
         assert_eq!(gate, ArchiveGate::Enabled { watermark: None });
         let report = run_retention(&*storage, &cfg, now, gate).unwrap();
@@ -1137,7 +1137,7 @@ mod tests {
         assert!(report.raw.blocked_by_archive);
         assert_eq!(storage.raw_stats().unwrap().rows, 3);
 
-        // 水位覆盖 cutoff 后才允许删除。
+        // 只有旧水位：仍然不能删（必须 uploaded join）。
         storage
             .set_archive_state(STATE_LAST_ARCHIVED_TS, &now.to_string(), now)
             .unwrap();
@@ -1149,6 +1149,34 @@ mod tests {
             }
         );
         let report = run_retention(&*storage, &cfg, now, gate).unwrap();
+        assert_eq!(report.raw.deleted, 0);
+        assert!(report.raw.blocked_by_archive);
+        assert_eq!(storage.raw_stats().unwrap().rows, 3);
+
+        // 构造 v8 claim 并置 uploaded 后才允许删除。
+        let rows = storage.list_unclaimed_archive_rows(0, now + 1, 10).unwrap();
+        assert_eq!(rows.len(), 3);
+        let from_ts = rows.iter().map(|row| row.ts).min().unwrap();
+        let to_ts = rows.iter().map(|row| row.ts).max().unwrap();
+        let object = ArchiveObject {
+            backend: "webdav".to_string(),
+            object_key: "rustboard-test/gate-v8.csv.gz".to_string(),
+            manifest_key: "rustboard-test/gate-v8.csv.gz.manifest.json".to_string(),
+            from_ts,
+            to_ts,
+            rows: rows.len() as u64,
+            ledger_version: LEDGER_VERSION_V8,
+            status: ArchiveStatus::Pending,
+            sha256: "0".repeat(64),
+            created_at: now,
+            ..ArchiveObject::default()
+        };
+        let id = storage.claim_archive_rows(&object, &rows).unwrap();
+        storage
+            .update_archive_object_status(id, ArchiveStatus::Uploaded, "", Some(now), None)
+            .unwrap();
+
+        let report = run_retention(&*storage, &cfg, now, archive_gate(&storage, &cfg)).unwrap();
         assert_eq!(report.raw.deleted, 3);
         assert!(!report.raw.blocked_by_archive);
         assert_eq!(storage.raw_stats().unwrap().rows, 0);
@@ -1160,9 +1188,7 @@ mod tests {
         let cfg = HubConfig::default();
         let now = TEST_NOW;
         insert_raw_rows(&storage, now - 10 * TEST_DAY_MS, &[1.0, 2.0]);
-        storage
-            .set_maintenance_state(STATE_DOWNSAMPLE_1M_WATERMARK, &now.to_string(), now)
-            .unwrap();
+        run_downsample(&*storage, now, None).unwrap();
 
         assert_eq!(archive_gate(&storage, &cfg), ArchiveGate::Disabled);
         let report = run_retention(&*storage, &cfg, now, archive_gate(&storage, &cfg)).unwrap();

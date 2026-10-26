@@ -1624,7 +1624,9 @@ mod tests {
         assert_eq!(firing.state, AlertStateKind::Firing);
 
         // 生成 1m 桶后删除全部 raw：只剩旧桶。
-        storage.downsample_1m_range(sample_ts, now).unwrap();
+        // R1b：run_downsample 会在同一事务里认领并标记 raw；只有聚合后的
+        // raw 才允许被 retention 删除。
+        rustboard_core::downsample::run_downsample(&*storage, now, None).unwrap();
         assert!(
             storage.samples_1m_stats().unwrap().rows > 0,
             "必须先生成 1m 桶"

@@ -40,7 +40,10 @@ use crate::storage::sqlite::{
     validate_archive_claim, validate_archive_sha256, ArchiveRawRow, MAX_ARCHIVE_TS_MS,
     MIN_ARCHIVE_TS_MS, PRUNE_BATCH_ROWS, STATE_RAW_PRUNE_GENERATION,
 };
-use crate::storage::{DownsampleRangeResult, PruneResult, TierStats, BUCKET_1H_MS, BUCKET_1M_MS};
+use crate::storage::{
+    DownsampleDeltaResult, DownsampleHourResult, DownsampleRangeResult, PruneResult, TierStats,
+    BUCKET_1H_MS, BUCKET_1M_MS,
+};
 
 /// `archive_objects` 的 SELECT 列表；列下标与 [`row_to_archive_object`] 一一对应。
 const ARCHIVE_OBJECT_COLUMNS: &str = "id, backend, object_key, manifest_key, from_ts, to_ts, \
@@ -113,12 +116,58 @@ ON CONFLICT (agent_id, metric, labels, bucket_ts) DO UPDATE SET
     count = EXCLUDED.count
 "#;
 
+/// R1b：1m 增量合并。只处理已锁定的 raw `id` 集合（`$1`），按桶计算 delta
+/// 后与已有 1m 行合并；`last_value/last_ts` 仅在 delta 更新时改写。
+const AGGREGATE_1M_DELTA_SQL: &str = r#"
+INSERT INTO samples_1m
+    (agent_id, metric, labels, bucket_ts, min_value, max_value, avg_value,
+     last_value, count, last_ts, aggregated_1h)
+SELECT agent_id, metric, labels, bucket_ts,
+       MIN(value), MAX(value), AVG(value), MAX(last_value), COUNT(*),
+       MAX(last_ts), 0
+FROM (
+    SELECT agent_id, metric, labels,
+           (ts / 60000) * 60000 AS bucket_ts,
+           value, ts AS last_ts,
+           FIRST_VALUE(value) OVER (
+               PARTITION BY agent_id, metric, labels, (ts / 60000) * 60000
+               ORDER BY ts DESC, id DESC
+           ) AS last_value
+    FROM samples
+    WHERE id = ANY($1::BIGINT[])
+) AS aggregated
+GROUP BY agent_id, metric, labels, bucket_ts
+ON CONFLICT (agent_id, metric, labels, bucket_ts) DO UPDATE SET
+    min_value = LEAST(samples_1m.min_value, EXCLUDED.min_value),
+    max_value = GREATEST(samples_1m.max_value, EXCLUDED.max_value),
+    avg_value = (samples_1m.avg_value * samples_1m.count
+                 + EXCLUDED.avg_value * EXCLUDED.count)
+                / (samples_1m.count + EXCLUDED.count),
+    last_value = CASE
+        WHEN EXCLUDED.last_ts > samples_1m.last_ts THEN EXCLUDED.last_value
+        ELSE samples_1m.last_value
+    END,
+    last_ts = GREATEST(samples_1m.last_ts, EXCLUDED.last_ts),
+    count = samples_1m.count + EXCLUDED.count,
+    aggregated_1h = 0
+"#;
+
+/// 把本批 raw 所在的**整小时**全部 1m 行置 `aggregated_1h=0`。
+const MARK_1M_HOURS_DIRTY_SQL: &str = "UPDATE samples_1m SET aggregated_1h = 0 \
+     WHERE (bucket_ts / 3600000) IN ( \
+         SELECT DISTINCT (ts / 3600000) FROM samples WHERE id = ANY($1::BIGINT[]))";
+
+/// 认领本批 raw：只把仍为 0 的行置 1；affected 必须等于锁定行数。
+const CLAIM_RAW_AGGREGATED_SQL: &str = "UPDATE samples SET aggregated_1m = 1 \
+     WHERE id = ANY($1::BIGINT[]) AND aggregated_1m = 0";
+
 /// 保留期删除：每批最多 `$2` 行，`$1` 是排他 cutoff（`< cutoff`）。
 ///
 /// PG 没有 `rowid`，用 `id IN (SELECT id ... LIMIT)` 把单批事务控制在
 /// [`PRUNE_BATCH_ROWS`] 行以内；`ORDER BY` 与 SQLite 基线保持一致。
 const PRUNE_RAW_SQL: &str = "DELETE FROM samples WHERE id IN \
-     (SELECT id FROM samples WHERE ts < $1 ORDER BY ts LIMIT $2)";
+     (SELECT id FROM samples WHERE ts < $1 AND aggregated_1m = 1 \
+      ORDER BY ts LIMIT $2)";
 /// v8 归档启用时的 raw 保留期：只删「已聚合且所属对象已 uploaded」的行。
 ///
 /// 与 SQLite 的 `PRUNE_ARCHIVED_RAW_SQL` 语义一致；R1a-1 只提供原语，
@@ -129,7 +178,15 @@ const PRUNE_ARCHIVED_RAW_SQL: &str = "DELETE FROM samples WHERE id IN \
       WHERE s.ts < $1 AND s.aggregated_1m = 1 AND o.status = 'uploaded' \
       ORDER BY s.ts LIMIT $2)";
 const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE id IN \
-     (SELECT id FROM samples_1m WHERE bucket_ts < $1 ORDER BY bucket_ts LIMIT $2)";
+     (SELECT m.id FROM samples_1m m \
+      WHERE m.bucket_ts < $1 \
+        AND NOT EXISTS ( \
+            SELECT 1 FROM samples_1m d \
+            WHERE d.aggregated_1h = 0 \
+              AND d.bucket_ts >= (m.bucket_ts / 3600000) * 3600000 \
+              AND d.bucket_ts < (m.bucket_ts / 3600000) * 3600000 + 3600000 \
+        ) \
+      ORDER BY m.bucket_ts LIMIT $2)";
 const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE id IN \
      (SELECT id FROM samples_1h WHERE bucket_ts < $1 ORDER BY bucket_ts LIMIT $2)";
 
@@ -144,6 +201,13 @@ const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE id IN \
 /// [`SCHEMA_ADVISORY_LOCK_KEY`]: super::schema::SCHEMA_ADVISORY_LOCK_KEY
 const RAW_MAINTENANCE_ADVISORY_LOCK_KEY: i64 = 0x5242_5047_0000_0012;
 
+/// 降采样 1m delta / 1h 小时重算共用的固定事务级 advisory lock key。
+///
+/// 两者都会读写 `samples_1m.aggregated_1h`：1m delta 把整小时置 0，1h 锁行
+/// 后重算并置 1。用同一把锁把维护写事务串行化，避免「1h 已 SELECT、1m delta
+/// 随后置 0」被 1h 的批量 UPDATE 覆盖；行锁（`FOR UPDATE`）仍按方案要求保留。
+const DOWNSAMPLE_ADVISORY_LOCK_KEY: i64 = 0x5242_5050_0000_0013;
+
 /// raw 删除后收敛 `downsample_1m_last_raw_rowid` 的结果；`new == None`
 /// 表示水位键被删除/失效，只在事务提交后用于日志。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,8 +220,10 @@ struct RowidWatermarkChange {
 ///
 /// 与 SQLite 的 `bucket_floor` 完全一致：使用欧几里得除法，负时间戳也向
 /// 更小的边界取整。
-fn bucket_floor(ts: i64, bucket_ms: i64) -> i64 {
-    ts.div_euclid(bucket_ms) * bucket_ms
+fn bucket_floor(ts: i64, bucket_ms: i64) -> Result<i64> {
+    ts.checked_div_euclid(bucket_ms)
+        .and_then(|quotient| quotient.checked_mul(bucket_ms))
+        .ok_or_else(|| anyhow!("时间戳无法对齐到 {bucket_ms}ms 桶：超出 i64 可表示范围"))
 }
 
 /// 把 `archive_objects.object_key` 的唯一约束冲突翻译成领域错误。
@@ -370,8 +436,8 @@ impl PostgresStorage {
     /// 两端先按整分钟向下取整（不足一分钟的窗口返回空结果），整个区间在
     /// 单个事务内完成「统计源行数 + upsert」；重复执行幂等。
     pub fn downsample_1m_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult> {
-        let from = bucket_floor(from_ts, BUCKET_1M_MS);
-        let to = bucket_floor(to_ts, BUCKET_1M_MS);
+        let from = bucket_floor(from_ts, BUCKET_1M_MS)?;
+        let to = bucket_floor(to_ts, BUCKET_1M_MS)?;
         if to <= from {
             return Ok(DownsampleRangeResult::default());
         }
@@ -400,8 +466,8 @@ impl PostgresStorage {
     ///
     /// 两端先按整点向下取整；`avg_value` 按 `count` 加权。重复执行幂等。
     pub fn downsample_1h_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult> {
-        let from = bucket_floor(from_ts, BUCKET_1H_MS);
-        let to = bucket_floor(to_ts, BUCKET_1H_MS);
+        let from = bucket_floor(from_ts, BUCKET_1H_MS)?;
+        let to = bucket_floor(to_ts, BUCKET_1H_MS)?;
         if to <= from {
             return Ok(DownsampleRangeResult::default());
         }
@@ -428,6 +494,266 @@ impl PostgresStorage {
     }
 
     // ---- 数据层统计与分块 ----
+
+    /// R1b：认领并增量合并一批未聚合 raw 到 1m。
+    ///
+    /// 与 SQLite 基线一致：`FOR UPDATE` 锁定 raw 行 → 按桶 delta 合并 →
+    /// 整小时标脏 → 条件 UPDATE 认领；affected 必须等于锁定行数，否则回滚。
+    pub fn downsample_1m_delta(
+        &self,
+        closed_end: i64,
+        max_rows: usize,
+    ) -> Result<DownsampleDeltaResult> {
+        let closed_end = bucket_floor(closed_end, BUCKET_1M_MS)?;
+        if closed_end <= 0 || max_rows == 0 {
+            return Ok(DownsampleDeltaResult::default());
+        }
+        self.with_client(|client| {
+            let mut tx = client.transaction().context("开启 1m 增量聚合事务失败")?;
+            tx.query_one(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&DOWNSAMPLE_ADVISORY_LOCK_KEY],
+            )
+            .context("获取降采样 advisory lock 失败")?;
+            let offset = i64::try_from(max_rows.saturating_sub(1)).unwrap_or(i64::MAX);
+            let boundary: Option<i64> = tx
+                .query_opt(
+                    "SELECT ts FROM samples
+                     WHERE aggregated_1m = 0 AND ts >= 0 AND ts < $1
+                     ORDER BY ts ASC, id ASC LIMIT 1 OFFSET $2",
+                    &[&closed_end, &offset],
+                )
+                .context("读取 1m delta 分块边界失败")?
+                .map(|row| row.get(0));
+            let chunk_end = match boundary {
+                Some(ts) => bucket_floor(ts, BUCKET_1M_MS)?
+                    .checked_add(BUCKET_1M_MS)
+                    .ok_or_else(|| anyhow!("分钟桶上界溢出"))?
+                    .min(closed_end),
+                None => closed_end,
+            };
+            // 锁住本批 raw 行，按 ts,id 固定顺序，避免与其它维护事务交叉。
+            let locked: Vec<i64> = tx
+                .query(
+                    "SELECT id FROM samples
+                     WHERE aggregated_1m = 0 AND ts >= 0 AND ts < $1
+                     ORDER BY ts ASC, id ASC FOR UPDATE",
+                    &[&chunk_end],
+                )
+                .context("锁定 1m delta 源行失败")?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            if locked.is_empty() {
+                tx.commit().context("提交空 1m delta 事务失败")?;
+                return Ok(DownsampleDeltaResult {
+                    processed_to: chunk_end,
+                    ..DownsampleDeltaResult::default()
+                });
+            }
+            let buckets = tx
+                .execute(AGGREGATE_1M_DELTA_SQL, &[&locked])
+                .context("执行 1m delta 聚合 SQL 失败")?;
+            tx.execute(MARK_1M_HOURS_DIRTY_SQL, &[&locked])
+                .context("标记 1m 整小时为 dirty 失败")?;
+            let claimed = tx
+                .execute(CLAIM_RAW_AGGREGATED_SQL, &[&locked])
+                .context("认领 1m delta 源行失败")?;
+            if usize::try_from(claimed).unwrap_or(usize::MAX) != locked.len() {
+                anyhow::bail!(
+                    "1m 增量认领行数不一致（锁定 {} 行，affected {claimed} 行）：已回滚本批",
+                    locked.len()
+                );
+            }
+            tx.commit().context("提交 1m 增量聚合事务失败")?;
+            Ok(DownsampleDeltaResult {
+                buckets: usize::try_from(buckets).context("1m delta 桶数溢出")?,
+                rows: locked.len(),
+                processed_to: chunk_end,
+            })
+        })
+        .context("downsample_1m_delta")
+    }
+
+    /// R1b：锁定并重算最早一个可重算整点小时的 1h。
+    ///
+    /// 与 SQLite 基线一致：只选 1m 源完整的脏小时；`FOR UPDATE` 锁定整小时
+    /// 1m 行后重算，再按小时范围置 1，affected 必须等于锁定行数。
+    pub fn downsample_1h_hour(&self, closed_hour: i64) -> Result<Option<DownsampleHourResult>> {
+        let closed_hour = bucket_floor(closed_hour, BUCKET_1H_MS)?;
+        if closed_hour <= 0 {
+            return Ok(None);
+        }
+        self.with_client(|client| {
+            let mut tx = client.transaction().context("开启 1h 重算事务失败")?;
+            tx.query_one(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&DOWNSAMPLE_ADVISORY_LOCK_KEY],
+            )
+            .context("获取降采样 advisory lock 失败")?;
+            let hour: Option<i64> = tx
+                .query_one(
+                    "SELECT MIN(hour_start) FROM (
+                         SELECT (m.bucket_ts / 3600000) * 3600000 AS hour_start
+                         FROM samples_1m m
+                         WHERE m.aggregated_1h = 0 AND m.bucket_ts >= 0
+                           AND m.bucket_ts < $1
+                         GROUP BY hour_start
+                     ) h
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM samples s
+                         WHERE s.aggregated_1m = 0 AND s.ts >= 0
+                           AND s.ts < h.hour_start + 3600000
+                     )",
+                    &[&closed_hour],
+                )
+                .context("选择可重算 1h 小时失败")?
+                .get(0);
+            let Some(hour) = hour else {
+                tx.commit().context("提交空 1h 重算事务失败")?;
+                return Ok(None);
+            };
+            let hour_end = hour
+                .checked_add(BUCKET_1H_MS)
+                .ok_or_else(|| anyhow!("整点小时上界溢出"))?;
+            let incomplete: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM samples
+                     WHERE aggregated_1m = 0 AND ts >= 0 AND ts < $1)",
+                    &[&hour_end],
+                )
+                .context("检查 1m 源完整性失败")?
+                .get(0);
+            if incomplete {
+                tx.commit().context("提交跳过 1h 重算事务失败")?;
+                return Ok(None);
+            }
+            let locked: Vec<i64> = tx
+                .query(
+                    "SELECT id FROM samples_1m
+                     WHERE bucket_ts >= $1 AND bucket_ts < $2
+                     ORDER BY id ASC FOR UPDATE",
+                    &[&hour, &hour_end],
+                )
+                .context("锁定 1h 源行失败")?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            if locked.is_empty() {
+                tx.commit().context("提交空 1h 重算事务失败")?;
+                return Ok(None);
+            }
+            let buckets = tx
+                .execute(AGGREGATE_1H_SQL, &[&hour, &hour_end])
+                .context("执行 1h 重算 SQL 失败")?;
+            let marked = tx
+                .execute(
+                    "UPDATE samples_1m SET aggregated_1h = 1
+                     WHERE bucket_ts >= $1 AND bucket_ts < $2",
+                    &[&hour, &hour_end],
+                )
+                .context("标记 1h 源行失败")?;
+            if usize::try_from(marked).unwrap_or(usize::MAX) != locked.len() {
+                anyhow::bail!(
+                    "1h 认领行数不一致（锁定 {} 行，affected {marked} 行）：已回滚本小时",
+                    locked.len()
+                );
+            }
+            tx.commit().context("提交 1h 重算事务失败")?;
+            Ok(Some(DownsampleHourResult {
+                hour_ts: hour,
+                buckets: usize::try_from(buckets).context("1h 桶数溢出")?,
+                rows: locked.len(),
+            }))
+        })
+        .context("downsample_1h_hour")
+    }
+
+    /// `maintenance status`：未聚合 raw 行数。
+    pub fn count_unaggregated_raw_rows(&self) -> Result<i64> {
+        self.with_client(|client| {
+            Ok(client
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT FROM samples WHERE aggregated_1m = 0",
+                    &[],
+                )
+                .context("统计未聚合 raw 失败")?
+                .get(0))
+        })
+        .context("count_unaggregated_raw_rows")
+    }
+
+    /// 旧超界时间戳审计：统计 `ts < min_ts OR ts > max_ts` 的 raw 行数。
+    pub fn count_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        self.with_client(|client| {
+            Ok(client
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT FROM samples WHERE ts < $1 OR ts > $2",
+                    &[&min_ts, &max_ts],
+                )
+                .context("统计超界 raw 失败")?
+                .get(0))
+        })
+        .context("count_raw_rows_outside")
+    }
+
+    /// 旧超界时间戳中仍未聚合的 raw 行数。
+    pub fn count_unaggregated_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        self.with_client(|client| {
+            Ok(client
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT FROM samples
+                     WHERE aggregated_1m = 0 AND (ts < $1 OR ts > $2)",
+                    &[&min_ts, &max_ts],
+                )
+                .context("统计未聚合超界 raw 失败")?
+                .get(0))
+        })
+        .context("count_unaggregated_raw_rows_outside")
+    }
+
+    /// `ts < before_ts` 且未聚合的 raw 行数（legacy 1m horizon）。
+    pub fn count_unaggregated_raw_rows_before(&self, before_ts: i64) -> Result<i64> {
+        self.with_client(|client| {
+            Ok(client
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT FROM samples
+                     WHERE aggregated_1m = 0 AND ts < $1",
+                    &[&before_ts],
+                )
+                .context("统计 legacy 未聚合 raw 失败")?
+                .get(0))
+        })
+        .context("count_unaggregated_raw_rows_before")
+    }
+
+    /// 把超界时间戳的未聚合 raw 分批标记为已隔离（`aggregated_1m=1`）。
+    pub fn isolate_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<usize> {
+        let batch = PRUNE_BATCH_ROWS as i64;
+        let mut total = 0usize;
+        loop {
+            let marked = self.with_client(|client| {
+                client
+                    .execute(
+                        "UPDATE samples SET aggregated_1m = 1 WHERE id IN (
+                         SELECT id FROM samples
+                         WHERE aggregated_1m = 0 AND (ts < $1 OR ts > $2)
+                         ORDER BY ts LIMIT $3)",
+                        &[&min_ts, &max_ts, &batch],
+                    )
+                    .context("隔离超界 raw 失败")
+            })?;
+            if marked == 0 {
+                break;
+            }
+            total += usize::try_from(marked).context("隔离行数溢出")?;
+            if marked < PRUNE_BATCH_ROWS as u64 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        Ok(total)
+    }
 
     /// raw 层的行数与最旧 / 最新时间戳。
     pub fn raw_stats(&self) -> Result<TierStats> {
@@ -572,9 +898,13 @@ impl PostgresStorage {
             .context("prune_archived_samples_before")
     }
 
-    /// 分批删除 1m 中 `bucket_ts < cutoff` 的行。
+    /// 分批删除 1m 中 `bucket_ts < cutoff` 且整小时已聚合的行。
+    ///
+    /// `cutoff` 先向下取整到整点；dirty hour（任一行 `aggregated_1h=0`）
+    /// 整小时跳过。
     pub fn prune_samples_1m_before(&self, cutoff: i64) -> Result<PruneResult> {
-        self.prune_batched(PRUNE_1M_SQL, cutoff)
+        let hour_cutoff = bucket_floor(cutoff, BUCKET_1H_MS)?;
+        self.prune_batched(PRUNE_1M_SQL, hour_cutoff)
             .context("prune_samples_1m_before")
     }
 
@@ -1428,6 +1758,9 @@ mod tests {
         for sql in [
             AGGREGATE_1M_SQL,
             AGGREGATE_1H_SQL,
+            AGGREGATE_1M_DELTA_SQL,
+            MARK_1M_HOURS_DIRTY_SQL,
+            CLAIM_RAW_AGGREGATED_SQL,
             PRUNE_RAW_SQL,
             PRUNE_1M_SQL,
             PRUNE_1H_SQL,
@@ -1437,6 +1770,28 @@ mod tests {
             assert!(sql.contains('$'), "SQL 必须使用 $N 占位符：{sql}");
         }
         assert!(PRUNE_RAW_SQL.contains("samples WHERE id IN"));
+        assert!(
+            PRUNE_RAW_SQL.contains("aggregated_1m = 1"),
+            "raw retention 必须只删已聚合行"
+        );
+        assert!(
+            PRUNE_1M_SQL.contains("aggregated_1h = 0"),
+            "1m retention 必须整小时跳过 dirty hour"
+        );
+        // R1b：delta 必须按桶加权合并而非覆盖，并把整小时标脏。
+        for needle in [
+            "id = ANY($1::BIGINT[])",
+            "aggregated_1h = 0",
+            "samples_1m.count",
+            "EXCLUDED.last_ts > samples_1m.last_ts",
+        ] {
+            assert!(
+                AGGREGATE_1M_DELTA_SQL.contains(needle),
+                "delta SQL 缺少 {needle}: {AGGREGATE_1M_DELTA_SQL}"
+            );
+        }
+        assert!(MARK_1M_HOURS_DIRTY_SQL.contains("(bucket_ts / 3600000)"));
+        assert!(CLAIM_RAW_AGGREGATED_SQL.contains("aggregated_1m = 0"));
     }
 
     #[test]
