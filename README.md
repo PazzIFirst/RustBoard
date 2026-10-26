@@ -12,7 +12,7 @@
 已知问题见 [docs/known-issues.md](docs/known-issues.md)。
 协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面、v0.3.x 硬化、M4 告警/归档、v0.4.x 修复已完成；M5 Phase A/B 已完成，Phase C 已以 `v1.0.0-rc.2` 发布（ACME、agent TLS 三模式、面板/管理端 TLS、Docker/发布门禁），Phase D 已实现 PostgreSQL 显式 opt-in、`migrate`/`backup`/`restore` 与 L-01/L-03 收口，全 workspace 测试 **1364 passed / 0 failed / 5 ignored**，Phase D checkpoint tag 待打。`v1.0.0` 未发布；storage 级 200 agent load 已通过，hub 端真实 200 agent、100/500/1000、24h 长稳与正式发布仍在 Phase E，本文不声称这些已完成。**
+> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面、v0.3.x 硬化、M4 告警/归档、v0.4.x 修复已完成；M5 Phase A/B 已完成，Phase C 已以 `v1.0.0-rc.2` 发布（ACME、agent TLS 三模式、面板/管理端 TLS、Docker/发布门禁），Phase D 已实现 PostgreSQL 显式 opt-in、`migrate`/`backup`/`restore` 与 L-01/L-03 收口，Phase E 已修复 KI-22 并完成 Docker PG e2e、真实 TLS PG e2e 与 hub 级 200/100/500/1000 短档压测；全 workspace 测试 **1386 passed / 0 failed / 5 ignored**，Phase D checkpoint tag 已打。`v1.0.0` 未发布；storage 级 200 agent load 已通过，hub 端 200/100/500/1000 短档已通过；200 agent 24h 长稳运行中、S5 发布演练与正式 `v1.0.0` 发布仍在 Phase E，本文不声称这些已完成。**
 > Phase B 交付静态 musl 离线包、Docker 多架构镜像和 release workflow；Phase C 增加 ACME（域名 / 公网 IP 自动续期）与面板直连 HTTPS；Phase D 增加 PostgreSQL（默认仍 SQLite）与迁移/备份/恢复。PostgreSQL 为单 hub 语义，配置与限制见 [PostgreSQL 文档](docs/install/postgres.md)。
 >
 > 线协议版本为 **2**：hub 与 agent 必须严格一致。版本不符时 hub 回 `bad_protocol`

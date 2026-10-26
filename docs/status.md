@@ -19,7 +19,7 @@
 | M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | v0.4.1 已知问题修复 | 🟢 完成 | KI-29 rowid 竞态、KI-31 64 MiB 配置/下载一致性、KI-28 拒绝日志采样、KI-20 安装命令引用；SFTP 真实环境 29/29，M4 基线渗透无高危；v041 26/26；v0.4.1 发布 |
 | v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
-| M5 安装与交付 | 🟢 Phase E S1/S3/S4 完成；S2 短档完成、24h 长稳待跑；S5/S6 进行中 | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126；Phase C RC `v1.0.0-rc.2`；Phase D PostgreSQL 显式 opt-in、迁移/备份/恢复；S1 KI-22（agent 145、control 102/102、workspace 1386/0/5）；S2 hub 级 200/100/500/1000 各 10min（最低 1000/600：120000 批/360000 点，0 丢点/重复/错误）；S3 真实 TLS PG 27/27；S4 Docker PG overlay 104/104（1 arm64 SKIP）；**24h 长稳、S5 发布演练、v1.0.0 未完成** |
+| M5 安装与交付 | 🟢 Phase E S1/S3/S4 完成；S2 短档完成、24h 长稳运行中；S5/S6 进行中 | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126；Phase C RC `v1.0.0-rc.2`；Phase D PostgreSQL 显式 opt-in、迁移/备份/恢复；S1 KI-22（agent 145、control 102/102、workspace 1386/0/5）；S2 hub 级 200/100/500/1000 各 10min（最低 1000/600：120000 批/360000 点，0 丢点/重复/错误）；S3 真实 TLS PG 27/27；S4 Docker PG overlay 104/104（1 arm64 SKIP）；**24h 长稳、S5 发布演练、v1.0.0 未完成** |
 
 ## 构建产物清理（2026-10-25 Phase C 收尾）
 
@@ -413,14 +413,15 @@ Phase E 仍保留 hub 级真实压测。
 4. **恢复后的文件属主**：root 执行 `restore` 后配置/证书/数据库归 root；
    systemd 部署需交回 hub 运行用户，Docker `--user 10001:10001` 需先
    `chown -R 10001:10001`，否则下次启动会因权限失败。
-5. **TLS verify-full 端到端**：`v100-pg-tls.sh` 24/24 已覆盖真实 PG16 TLS
+5. **TLS verify-full 端到端**：`v100-pg-tls.sh` **27/27** 已覆盖真实 PG16 TLS
    启动、agent 上报、重启持久化，以及错误 CA/主机名/缺失根证书的 fail-closed；
    证据在 `target/pg-tls-e2e/<UTC>-<PID>/evidence/`。仍仅服务端认证 TLS，
    **不支持 PostgreSQL 要求客户端证书**（hub 使用 `with_no_client_auth`）；
    生产启用前按 `docs/install/postgres.md` §3.1 在目标环境复核。
 6. **压力与长稳仍部分在 Phase E**：storage 级 200 agent（`postgres_load`）
-   已通过；hub 端真实 200 agent 端到端、100/500/1000 agent、≥24h 长稳与 RSS
-   门禁尚未执行，storage 级 load 不能替代 hub 端真实压测。
+   已通过；hub 端真实 200/100/500/1000 agent 各 10min 已通过，**200 agent
+   ≥24h 长稳仍运行中，尚无 24h 结论**；storage 级 load 不能替代 hub 端压测。
+   PostgreSQL hub 级压测未实现，只有 SQLite 负载工具。
 7. 备份包含 agent secret、API token 哈希、证书私钥与数据库内容，必须按 secret
    管理；迁移/恢复前必须停 hub。`migrate`/`restore` 在有 systemd 且 unit active
    时拒绝；无 systemd/无法确认时必须显式 `--hub-stopped`（fail-closed），
@@ -430,8 +431,9 @@ Phase E 仍保留 hub 级真实压测。
 
 - [x] KI-22 控制面日志硬链接逃逸：同一 fd fstat 要求 `nlink == 1`，启动/运行期
       fail-closed；6 个独立单测、`control.sh` 102/102、workspace 1386/0/5
-- [ ] hub 端真实 200/100/500/1000 agent 各 10min 已通过（200/100/500/1000：
-      0 丢点/重复/错误，详见安全报告）；**≥24h 长稳与 RSS/FD 门禁待跑**
+- [x] hub 端真实 200/100/500/1000 agent 各 10min 已通过（0 丢点/重复/错误，
+      详见安全报告）；短档 RSS/线程只记录，不作长稳结论
+- [ ] ≥24h 长稳与 RSS/FD 硬门禁：**运行中（10-26 21:33 启动），未签收**
 - [x] 真实 TLS PostgreSQL 的 `verify-full` 启动→真实 agent 读写→重启持久化；
       `v100-pg-tls.sh` **27/27**，错误 CA/主机名/根证书负向均失败且不降级
 - [x] PostgreSQL Docker 镜像内 e2e：`v100-docker-pg.sh` **104/104**（1 项 arm64

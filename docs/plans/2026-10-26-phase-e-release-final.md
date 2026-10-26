@@ -7,10 +7,10 @@
 
 | 项目 | 命令/证据 | 通过条件 |
 |---|---|---|
-| arm64 三步安装 | `tests/e2e/v100-arm64.sh`（`PACKAGE` 指向当前源码 aarch64 包，`SKIP_BUILD=1` 复用前校验 hash） | 包布局/架构/静态链接；qemu 或原生 `--version`；hub install/healthz；无 SKIP 被当成 PASS |
+| arm64 三步安装 | `STRICT=1 SKIP_BUILD=1 tests/e2e/v100-arm64.sh`（`PACKAGE` 指向当前源码 aarch64 包；复用前校验 hash） | 包布局/架构/静态链接；qemu 或原生 `--version`；hub install/healthz；STRICT 下任何 SKIP 都失败 |
 | 离线包 | `tests/e2e/v100-offline.sh`（当前 x86_64 包；`STRICT=1`） | netns 无外网；三角色安装/启动；重复安装幂等；篡改包被拒；生产路径不变 |
 | 升级/卸载/恢复 | `v100-install.sh` 中可在本环境执行的部分 + 手工 `--no-systemd`；systemd 不可用时明确 SKIP，不伪造 | 旧配置/数据保留；uninstall 默认保留 config/data，`--purge` 删除；恢复后点数一致 |
-| Docker/镜像 | S4 104/104；S5 不重复跑 | 已通过 |
+| Docker/镜像 | S4 rc.2 预发布证据 104/104；**版本升 1.0.0 后必须重建 dist/镜像并用 `EXPECTED_VERSION=1.0.0` 重跑 amd64**；arm64 PG overlay 未覆盖时明确记录范围，不能把 arm64 SKIP 写成通过 | v1.0.0 自身证据 |
 | 最终评审/渗透 | 独立只读评审 + 本地渗透清单（认证/传输/注入/资源/泄露/依赖/配置） | 无未修复高危；严重问题修复后换人复审 |
 | 门禁 | fmt/clippy/test/audit、actionlint、shellcheck、CI | 全绿 |
 
@@ -22,14 +22,18 @@ aarch64 包；缺任一则记录 SKIP，不伪造。
 
 1. 确认 24h 长稳通过（RSS ≤10%、FD/线程不泄漏、0 丢点/重复、health 0 失败）；
 2. 全量门禁 + CI 绿；`cargo audit` 无高危；
-3. 更新 `CHANGELOG.md`：`[Unreleased]` 归档为 `[1.0.0] - 2026-10-26`，新开空
-   `[Unreleased]`；保留 Phase D/E 限制与 KI-22 修复说明；
+3. 更新 `CHANGELOG.md`：`[Unreleased]` 归档为 `[1.0.0] - <实际发布日>`，新开空
+   `[Unreleased]`；保留 Phase D/E 限制与 KI-22 修复说明；24h 最早 10-27 结束，
+   不得预写 10-26；
 4. 根 `Cargo.toml` workspace 版本 `1.0.0`，`Cargo.lock` 同步；重新构建 amd64/arm64
    静态产物与 Docker 镜像（不能用 rc.2 旧镜像）；
-5. 打 annotated tag `v1.0.0` 并推送；**不移动 `v1.0.0-rc.2`**；
-6. GitHub Release（notes 取自 CHANGELOG）；多架构镜像 + `latest`、SBOM/attestation；
+5. **在干净的 1.0.0 树重跑 S3/S4**：`EXPECTED_VERSION=1.0.0`、重新生成
+   dist manifest、重建 `:local-s4` 镜像；arm64 PG overlay 若未覆盖，发布 notes
+   必须写“PG overlay 仅 amd64 验证”，不能把 S4 的 arm64 SKIP 当通过；
+6. 打 annotated tag `v1.0.0` 并推送；**不移动 `v1.0.0-rc.2`**；
+7. GitHub Release（notes 取自 CHANGELOG）；多架构镜像 + `latest`、SBOM/attestation；
    记录 digest；
-7. 发布后验证：release 资产、镜像 manifest、`--version`、安装命令；不回写 rc.2。
+8. 发布后验证：release 资产、镜像 manifest、`--version`、安装命令；不回写 rc.2。
 
 ## 3. 停止条件
 

@@ -72,6 +72,22 @@
   多硬链接 fail-closed 拒绝，错误含来源 id/路径但不读取或回显目标内容。使用硬链接
   保留日志、`cp -l` 备份等部署在额外链接存在期间会被拒绝，需改为单链接
 
+### 已知限制
+
+- PostgreSQL TLS 当前只做**服务端认证**（`verify-full` 校验证书链与主机名），
+  使用 `with_no_client_auth`，**不支持 PostgreSQL 要求客户端证书**
+  （`ssl_ca_file`/`clientcert` 场景会握手失败）；需要 mTLS 到数据库时须另立设计。
+- Docker PostgreSQL overlay 示例使用 `sslmode=disable`，只适合本机/受信内网；
+  生产必须给 PostgreSQL 配置证书并改 `verify-full` + 根 CA，不能把示例当生产 TLS。
+- 当前为**单 hub**语义，没有 leader 选举/多活；同一数据库只允许一个 active hub。
+- PostgreSQL hub 级 200/100/500/1000 agent 压测未实现；Phase D 只有 storage 级
+  200 agent 证据，hub 级压力结论仅覆盖 SQLite。
+- Docker PG overlay e2e 只覆盖 `linux/amd64`（104/104，1 项 arm64 SKIP）；
+  arm64 的 PG overlay 未在本地验证，发布说明不得写成“arm64 已通过”。
+- 200 agent 24h 长稳使用 `target/debug` 构建，作为发布前稳定性预检；`v1.0.0`
+  静态包/镜像发布前仍需短档 smoke 并记录版本/hash，不能把 debug 24h 直接当作
+  发布产物 24h。
+
 ## [1.0.0-rc.2] - 2026-10-26
 
 ### Fixed

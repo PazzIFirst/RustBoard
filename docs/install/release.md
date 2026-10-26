@@ -8,8 +8,10 @@ Phase B 新增 `.github/workflows/release.yml`：只由 `v*` tag push 触发。�
 
 > **当前状态**：Phase B/C workflow 已由 `v1.0.0-rc.2` 真实执行并通过
 > `delivery-e2e`、`delivery-docker`、`delivery-arm64`、SBOM 与 attestation；
-> Phase D 已实现 PostgreSQL 与迁移/备份/恢复，全 workspace 测试 **1364 passed /
-> 0 failed / 5 ignored**（含 PG load），本地测试证据已记录。
+> Phase D 已实现 PostgreSQL 与迁移/备份/恢复，Phase E 已修复 KI-22 并完成
+> hub 级 200/100/500/1000 短档压测、真实 TLS PG 与 Docker PG e2e；全 workspace
+> 测试 **1386 passed / 0 failed / 5 ignored**（含 PG load）。release workflow
+> 现在额外依赖 `postgres` 实库 job，PG 用例 SKIP 或红灯都不会进入发布。
 > `Cargo.toml` 为 `1.0.0-rc.2`，版本归档、CHANGELOG `[v1.0.0]` 与正式发布属于
 > Phase E；`v1.0.0-rc.2` 不移动，Phase D checkpoint 不创建/移动 `v1.0.0`。
 
@@ -236,10 +238,11 @@ ACME 是**运行期/安装期**能力，不改变 tag 触发条件、版本一�
 PostgreSQL 是**运行期/安装期**的显式 opt-in，不改变 tag 触发条件、版本一致性、
 main 祖先或 `delivery-*` 门禁；默认 SQLite 路径与发布资产不变。发布前仍需确认：
 
-1. **同一 commit 的 CI `postgres` job 全绿**：覆盖 `postgres_schema`、
-   `postgres_core`、`postgres_parity`、`postgres_migrate`、`postgres_load`，
-   使用 `postgres:16` service。该 job 独立于 release workflow 的 `verify`，
-   不能拿 `verify` 代替 PG job 的结论。
+1. **release workflow 自带 `postgres` 实库 job，且 `release` 依赖它**：覆盖
+   `postgres_schema`、`postgres_core`、`postgres_parity`、`postgres_migrate`、
+   `postgres_load`，以及 `phase_d_backup` 和 `install_cmd::tests`，使用
+   `postgres:16` service。`verify` 的 `cargo test --workspace` 不设
+   `RUSTBOARD_TEST_PG`，PG 用例会 SKIP，不能拿它代替实库 job。
 2. **PG 压力/长稳不在 release workflow**：`postgres_load` 是 storage 级
    200 agent 压测，不等于 hub 端 200 agent 端到端；hub 端真实 200 agent ingest、
    100/500/1000 与 24h 长稳仍按 Phase E 门禁执行，未完成前不发布 `v1.0.0`。

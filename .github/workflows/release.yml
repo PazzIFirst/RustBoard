@@ -247,6 +247,86 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  # verify 里的 `cargo test --workspace` 未设置 RUSTBOARD_TEST_PG，PostgreSQL
+  # 用例会打印 SKIP 并被 cargo 记为 passed；发布必须再依赖这个实库 job，
+  # 不能只靠人工环境审批。
+  postgres:
+    name: postgres / 发布前实库门禁
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: rustboard
+          POSTGRES_PASSWORD: rb-release-pg-9f3a
+          POSTGRES_DB: rustboard
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rustboard -d rustboard"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      RUSTBOARD_TEST_PG: postgres://rustboard:rb-release-pg-9f3a@localhost:5432/rustboard?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: 安装工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: 缓存 cargo 与 target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: 安装 PostgreSQL 16 客户端
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-16
+          echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
+          /usr/lib/postgresql/16/bin/pg_dump --version
+          /usr/lib/postgresql/16/bin/pg_restore --version
+
+      - name: 等待 PostgreSQL 就绪
+        run: |
+          for i in $(seq 1 30); do
+            if timeout 1 bash -c ': > /dev/tcp/127.0.0.1/5432' 2>/dev/null; then
+              echo "PostgreSQL 已就绪（第 ${i} 次探测）"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL 在 30 秒内未就绪" >&2
+          exit 1
+
+      - name: Phase D 实库测试（schema / core / parity / migrate / load）
+        run: >-
+          cargo test -p rustboard-core
+          --test postgres_schema
+          --test postgres_core
+          --test postgres_parity
+          --test postgres_migrate
+          --test postgres_load
+          --locked
+
+      - name: Phase D5b backup/restore + 安装器 PG 探测
+        run: |
+          cargo test -p rustboard-hub --test phase_d_backup --locked
+          cargo test -p rustboard-hub --bin rustboard-hub install_cmd::tests --locked
+
   # 2. 两架构原生构建：静态 musl 二进制 + 离线包 + 包内校验和。
   build:
     name: 构建 ${{ matrix.arch }} 离线包
@@ -737,6 +817,7 @@ jobs:
       attestations: write
     needs:
       - verify
+      - postgres
       - manifest
       - delivery-e2e
       - delivery-docker
