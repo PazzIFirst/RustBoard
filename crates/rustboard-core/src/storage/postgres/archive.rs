@@ -644,6 +644,36 @@ impl PostgresStorage {
                 tx.commit().context("提交跳过 1h 重算事务失败")?;
                 return Ok(None);
             }
+            let source_shrunk: bool = tx
+                .query_one(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM (
+                             SELECT agent_id, metric, labels,
+                                    (bucket_ts / 3600000) * 3600000 AS hour_ts,
+                                    SUM(count)::BIGINT AS source_count
+                             FROM samples_1m
+                             WHERE bucket_ts >= $1 AND bucket_ts < $2
+                             GROUP BY agent_id, metric, labels, hour_ts
+                         ) s
+                         JOIN samples_1h h
+                           ON h.agent_id = s.agent_id AND h.metric = s.metric
+                          AND h.labels = s.labels AND h.bucket_ts = s.hour_ts
+                         WHERE s.source_count < h.count)",
+                    &[&hour, &hour_end],
+                )
+                .context("检查 1h 历史 count 是否会被残缺源覆盖失败")?
+                .get(0);
+            if source_shrunk {
+                tracing::warn!(hour, "1m 源 count 小于已有 1h；保留历史 1h 并冻结该小时");
+                tx.execute(
+                    "UPDATE samples_1m SET aggregated_1h = 1
+                     WHERE bucket_ts >= $1 AND bucket_ts < $2",
+                    &[&hour, &hour_end],
+                )
+                .context("冻结残缺 1h 源失败")?;
+                tx.commit().context("提交冻结历史 1h 事务失败")?;
+                return Ok(None);
+            }
             let locked: Vec<i64> = tx
                 .query(
                     "SELECT id FROM samples_1m

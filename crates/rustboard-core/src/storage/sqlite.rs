@@ -4483,6 +4483,36 @@ impl SqliteStorage {
             tx.commit()?;
             return Ok(None);
         }
+        // 旧 1m 可能已被 retention 删除，只剩部分迟到/backlog 1m；此时重算
+        // 1h 会把历史 1h 覆盖成残缺值。源 count 小于已有 1h count 时冻结该
+        // 小时：保留旧 1h，只把 1m 标记 clean，避免下一轮反复选中。
+        let source_shrunk: i64 = tx.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM ( \
+                     SELECT agent_id, metric, labels, \
+                            (bucket_ts / 3600000) * 3600000 AS hour_ts, \
+                            SUM(count) AS source_count \
+                     FROM samples_1m \
+                     WHERE bucket_ts >= ?1 AND bucket_ts < ?2 \
+                     GROUP BY agent_id, metric, labels, hour_ts \
+                 ) s \
+                 JOIN samples_1h h \
+                   ON h.agent_id = s.agent_id AND h.metric = s.metric \
+                  AND h.labels = s.labels AND h.bucket_ts = s.hour_ts \
+                 WHERE s.source_count < h.count)",
+            params![hour, hour_end],
+            |row| row.get(0),
+        )?;
+        if source_shrunk != 0 {
+            tracing::warn!(hour, "1m 源 count 小于已有 1h；保留历史 1h 并冻结该小时");
+            tx.execute(
+                "UPDATE samples_1m SET aggregated_1h = 1 \
+                 WHERE bucket_ts >= ?1 AND bucket_ts < ?2",
+                params![hour, hour_end],
+            )?;
+            tx.commit()?;
+            return Ok(None);
+        }
         let rows: i64 = tx.query_row(
             "SELECT COUNT(*) FROM samples_1m WHERE bucket_ts >= ?1 AND bucket_ts < ?2",
             params![hour, hour_end],
@@ -7636,6 +7666,51 @@ mod tests {
                 .unwrap(),
             DownsampleRangeResult::default()
         );
+    }
+
+    /// R1b：旧 1m 已被 retention 删除后，迟到 raw 只能形成残缺 1m；
+    /// 1h worker 必须保留历史 1h，不能把 count 2 覆盖成 1。
+    #[test]
+    fn r1b_1h_worker_preserves_history_when_1m_source_shrank() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let hour = 1_699_999_200_000;
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", hour + 1_000, 1.0),
+                ("cpu.usage", "{}", hour + 2_000, 2.0),
+            ],
+        );
+        s.downsample_1m_range(hour, hour + BUCKET_1H_MS).unwrap();
+        s.downsample_1h_range(hour, hour + BUCKET_1H_MS).unwrap();
+        assert_eq!(agg_rows(&s, "samples_1h")[0].count, 2);
+
+        // 模拟旧 retention 已删除该小时 1m，只剩旧 1h 历史。
+        s.lock_write()
+            .execute(
+                "DELETE FROM samples_1m WHERE bucket_ts >= ?1 AND bucket_ts < ?2",
+                rusqlite::params![hour, hour + BUCKET_1H_MS],
+            )
+            .unwrap();
+        insert_samples(&s, "a1", &[("cpu.usage", "{}", hour + 121_000, 30.0)]);
+        s.downsample_1m_delta(hour + BUCKET_1H_MS, 100).unwrap();
+
+        let result = s.downsample_1h_hour(hour + BUCKET_1H_MS).unwrap();
+        assert!(result.is_none(), "残缺 1m 源必须冻结而不是重算");
+        let rows = agg_rows(&s, "samples_1h");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 2, "历史 1h count 不得被部分源覆盖");
+        assert!((rows[0].avg_value - 1.5).abs() < 1e-9);
+        let clean: i64 = s
+            .lock_read()
+            .query_row(
+                "SELECT COUNT(*) FROM samples_1m WHERE bucket_ts >= ?1 AND bucket_ts < ?2 AND aggregated_1h = 0",
+                rusqlite::params![hour, hour + BUCKET_1H_MS],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(clean, 0, "冻结后必须把 1m 标记 clean，避免下一轮反复选中");
     }
 
     /// M4-A2：三层统计与分块探测用的 offset 时间戳。
