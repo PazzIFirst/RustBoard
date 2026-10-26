@@ -556,7 +556,8 @@ max_future_skew_secs = 300  # 默认 5 分钟
 - `tests/e2e/v031.sh` 入 CI。
 - 重跑 `v100-pg-tls.sh`（27/27）、`v100-docker-pg.sh`（104/104）、
   `v100-install.sh`、`v100-arm64.sh`、`v100-load.sh`。
-- 24h：200 agent，RssAnon 1h warmup 后 ≤10%，FD/线程 delta ≤32，
+- 24h：200 agent，RssAnon 基线按 R5 预检确定的 warmup（当前 1h 基线在 2h
+  出现 +11.49% 台阶，见 §8.7；先做 3h/2h warmup 预检），FD/线程 delta ≤32，
   0 丢/重/错，health 0 失败，hub PID 不变；最终二进制。
 
 ### 6.3 门禁
@@ -626,6 +627,13 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 5. 只有全部通过，才归档 CHANGELOG、升版本、打 `v1.0.0`、发 Release/镜像。
 6. 当前 `3f916a0` 的 24h soak 仅作为基线参考，**不能作为修复后最终证据**；
    #27/#32/#33/#50 都在 hub 维护/入库路径，修复后必须重跑。
+7. **1h warmup 尚未被证明足够**：2026-10-27 的静态 musl 200 agent 运行在
+   2h 时 RssAnon 从 1h 中位 46,028 KiB 升到 51,316 KiB（**+11.49%**，超过
+   10% 门禁），但上升是 elapsed≈6739s 的一次 3.5 MiB 台阶，随后基本持平；
+   FD 223、线程 81、0 错误/重试/重连。已停止并保留证据，不能据此判定产品
+   泄漏，也不能让 1h 基线直接进入最终签发。
+   R5 必须先做 **3h 预检**：2h warmup 后 2h→3h RssAnon 平稳则改用 2h
+   warmup；若仍持续上涨，按产品缺陷处理，不得换基线掩盖。
 
 ## 9. 回滚
 
@@ -647,6 +655,7 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 | `max_late_days=30` 对超长离线缓冲是行为收紧 | 默认与 1m 保留留 60d 余量；需要更长补传时同步调大 1m 保留并验证 |
 | `ws://` 默认拒绝是 breaking change | 安全修复；远程用户改 wss 或显式 opt-in；CHANGELOG/升级说明 |
 | 24h 需重跑，发布延后 | 修复路径影响 hub 维护，不能复用旧 soak；按 R5 重跑 |
+| 1h RssAnon 基线过早 | 当前 2h 已有 +11.49% 单台阶；R5 先做 3h/2h warmup 预检，平稳才改基线，否则按产品缺陷处理，不能用调基线掩盖 |
 | #34 双 meta 两者都坏时 fail-closed | 不静默复活 ACK 数据；保留文件并给恢复指引；比丢数据安全 |
 | 全量 22 条周期长 | 先做 R1/R2 硬阻断；R3 可并行；不建议拆到 1.0.1 后再修数据类 |
 
