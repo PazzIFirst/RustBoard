@@ -760,6 +760,17 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 - 尚未关闭或评论任何 issue；修复合并/发布证据齐后只补评论，由用户确认关闭。
 - 24h 长稳不能复用 2026-10-26 的 2h 中止证据。
 
+### 12.8 1m retention 分批修正与 rc.3 最终包（2026-10-27 08:00）
+
+- 复审发现 1m retention 的 5000 行 DELETE 会把同一 series 小时截断，等式门禁在
+  首轮后永久失效（6000 行只删 5000）。已改为按 `(series, 小时)` 整组选择并删除，
+  `LIMIT` 以组计；SQLite/PG 同 SQL，补 6000 行/小时回归测试。
+- 最终代码：`80a43ad`；全 workspace + 真实 PG **rc=0**，fmt/clippy 通过。
+- 最终 amd64 rc.3 包已重建（revision `80a43ad`）：三二进制 `1.0.0-rc.3`。
+- 最终源码/包重跑：offline 122/122、security 9/9；panel/Docker PG/arm64 仍在跑。
+- 3h 预检已在最终 amd64 二进制上重启（200 agent，2h warmup），旧 3h 进程已终止。
+- **仍未 tag rc.3、未跑 24h/1000 agent**。
+
 ### 12.7 rc.3 最终门禁（2026-10-27 07:30）
 
 - 源码/版本：`2ad933a`，`1.0.0-rc.3`；main 文档同步。
