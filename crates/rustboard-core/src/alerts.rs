@@ -981,6 +981,8 @@ pub fn next_alert_state(
         since: now,
         last_eval_at: now,
         last_value: value.is_finite().then_some(value),
+        // 仅为状态机 / 测试保留旧快照；持久化 upsert 的冲突分支不覆盖该列，
+        // 通知时间由 notify_worker 的专用 UPDATE 独占。新序列为 None。
         last_notified_at: existing.and_then(|state| state.last_notified_at),
     };
 

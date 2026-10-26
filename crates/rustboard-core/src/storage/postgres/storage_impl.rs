@@ -9,7 +9,7 @@
 //! 共 97 个；dyn 化的注册只在这里发生，域实现保持不变。
 
 use anyhow::Result;
-use rustboard_common::model::{AgentRecord, SampleBatch, SeriesQuery, SeriesRow};
+use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 
 use super::PostgresStorage;
 use crate::alerts::{AlertEvent, AlertRule, AlertSilence, AlertState};
@@ -276,9 +276,10 @@ impl Storage for PostgresStorage {
         metric: &str,
         since: i64,
         agent: Option<&str>,
+        filter_labels: &Labels,
         limit: usize,
     ) -> Result<AlertSeriesSnapshot> {
-        PostgresStorage::latest_alert_series(self, metric, since, agent, limit)
+        PostgresStorage::latest_alert_series(self, metric, since, agent, filter_labels, limit)
     }
 
     fn apply_alert_transitions(&self, events: &[AlertEvent], states: &[AlertState]) -> Result<()> {

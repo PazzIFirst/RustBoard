@@ -74,7 +74,11 @@ const ALERT_RULE_UPDATE_SQL: &str = "UPDATE alert_rules SET name = $2, enabled =
 const ALERT_STATE_COLUMNS: &str =
     "rule_id, agent_id, series_key, state, since, last_eval_at, last_value, last_notified_at";
 
-/// 插入或整行更新一条状态；单条 upsert 与批量事务共用。
+/// 插入或更新一条状态；单条 upsert 与批量事务共用。
+///
+/// `last_notified_at` 只由新插入行携带（引擎的新序列为 NULL），冲突分支
+/// **绝不覆盖**：通知时间归 `update_alert_state_notified` 独占，避免
+/// “引擎读旧快照 → worker 写通知时间 → 引擎提交”把冷却锚点冲掉。
 const ALERT_STATE_UPSERT_SQL: &str = "INSERT INTO alert_states \
      (rule_id, agent_id, series_key, state, since, last_eval_at, last_value, last_notified_at) \
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
@@ -82,8 +86,7 @@ const ALERT_STATE_UPSERT_SQL: &str = "INSERT INTO alert_states \
         state = EXCLUDED.state, \
         since = EXCLUDED.since, \
         last_eval_at = EXCLUDED.last_eval_at, \
-        last_value = EXCLUDED.last_value, \
-        last_notified_at = EXCLUDED.last_notified_at";
+        last_value = EXCLUDED.last_value";
 
 /// 每规则状态硬上限：保留最近 `keep` 条，非 resolved 优先，其次 `last_eval_at`。
 const ALERT_STATE_PRUNE_FOR_RULE_SQL: &str = "DELETE FROM alert_states \
@@ -460,7 +463,9 @@ impl PostgresStorage {
         .context("get_alert_state")
     }
 
-    /// 插入或整行更新一条告警状态（主键冲突时覆盖状态、时间与值）。
+    /// 插入或更新一条告警状态：冲突时覆盖状态、时间与值，但**保留**
+    /// 库中已有的 `last_notified_at`（由通知 worker 独占；新行按传入值写入，
+    /// 引擎构造的新序列为 NULL）。
     pub fn upsert_alert_state(&self, state: &AlertState) -> Result<()> {
         let state_kind = state.state.as_str();
         self.with_client(|client| {
@@ -784,6 +789,9 @@ impl PostgresStorage {
     /// 语义：
     /// - 只查 `samples` 原始表，**不回退** 1m / 1h（旧桶不能当当前值）；
     /// - 只取 `ts >= since` 的样本；
+    /// - `filter_labels` 是精确子集，SQL 侧用参数化
+    ///   `labels::jsonb @> $n::jsonb` 下推（JSON 由 serde 生成），先过滤再做
+    ///   `ROW_NUMBER` / 排序 / `LIMIT`，因此截断只作用于匹配的序列；
     /// - 每个 `(agent_id, labels)` 取 `ts` 最大的一行，同 `ts` 取 `id` 最大
     ///   （PG 没有 `rowid`，用 `samples.id DESC` 对齐 SQLite）；
     /// - `agent` 为 `Some` 时只查该 agent；
@@ -796,6 +804,7 @@ impl PostgresStorage {
         metric: &str,
         since: i64,
         agent: Option<&str>,
+        filter_labels: &Labels,
         limit: usize,
     ) -> Result<AlertSeriesSnapshot> {
         if limit == 0 {
@@ -805,6 +814,12 @@ impl PostgresStorage {
             });
         }
         let row_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        // labels 列保持 SQLite 的 TEXT + serde_json 格式；只在查询时 cast 成
+        // jsonb 做包含判断，不改写存储格式。空过滤不生成子句。
+        let filter_json = (!filter_labels.is_empty())
+            .then(|| serde_json::to_string(filter_labels))
+            .transpose()
+            .context("序列化 filter_labels 失败")?;
         let rows = self
             .with_client(|client| {
                 let mut sql = String::from(
@@ -820,6 +835,13 @@ impl PostgresStorage {
                 if let Some(agent_id) = agent.as_ref() {
                     sql.push_str(&format!(" AND agent_id = ${}", params.len() + 1));
                     params.push(agent_id);
+                }
+                if let Some(filter_json) = filter_json.as_ref() {
+                    sql.push_str(&format!(
+                        " AND labels::jsonb @> ${}::jsonb",
+                        params.len() + 1
+                    ));
+                    params.push(filter_json);
                 }
                 sql.push_str(&format!(
                     ") series WHERE rn = 1 \
@@ -2541,7 +2563,7 @@ mod tests {
         insert_sample(&storage, "agent-b", r#"{"host":"a"}"#, 80, 7.0);
 
         let snapshot = storage
-            .latest_alert_series("cpu.usage", 0, None, 10)
+            .latest_alert_series("cpu.usage", 0, None, &Labels::new(), 10)
             .unwrap();
         assert!(!snapshot.truncated);
         assert_eq!(
@@ -2563,31 +2585,53 @@ mod tests {
         );
 
         let scoped = storage
-            .latest_alert_series("cpu.usage", 0, Some("agent-a"), 10)
+            .latest_alert_series("cpu.usage", 0, Some("agent-a"), &Labels::new(), 10)
             .unwrap();
         assert_eq!(scoped.rows.len(), 2);
         assert!(scoped.rows.iter().all(|row| row.agent_id == "agent-a"));
 
         let truncated = storage
-            .latest_alert_series("cpu.usage", 0, None, 2)
+            .latest_alert_series("cpu.usage", 0, None, &Labels::new(), 2)
             .unwrap();
         assert!(truncated.truncated);
         assert_eq!(truncated.rows.len(), 2);
 
         let empty = storage
-            .latest_alert_series("cpu.usage", 0, None, 0)
+            .latest_alert_series("cpu.usage", 0, None, &Labels::new(), 0)
             .unwrap();
         assert!(empty.truncated);
         assert!(empty.rows.is_empty());
 
         let windowed = storage
-            .latest_alert_series("cpu.usage", 95, None, 10)
+            .latest_alert_series("cpu.usage", 95, None, &Labels::new(), 10)
             .unwrap();
         assert_eq!(windowed.rows.len(), 1);
         assert_eq!(windowed.rows[0].agent_id, "agent-a");
 
+        // 标签过滤在 LIMIT 之前生效：host=b 只匹配 1 条序列。
+        let mut host_b = Labels::new();
+        host_b.insert("host".into(), "b".into());
+        let filtered = storage
+            .latest_alert_series("cpu.usage", 0, None, &host_b, 1)
+            .unwrap();
+        assert!(!filtered.truncated);
+        assert_eq!(filtered.rows.len(), 1);
+        assert_eq!(
+            filtered.rows[0].labels.get("host").map(String::as_str),
+            Some("b")
+        );
+
+        // 多标签 / 无匹配 / 特殊键都走参数化 JSONB 包含判断。
+        let mut multi = host_b.clone();
+        multi.insert("__proto__".into(), "x".into());
+        let no_match = storage
+            .latest_alert_series("cpu.usage", 0, None, &multi, 10)
+            .unwrap();
+        assert!(!no_match.truncated);
+        assert!(no_match.rows.is_empty());
+
         let missing = storage
-            .latest_alert_series("disk.used_percent", 0, None, 10)
+            .latest_alert_series("disk.used_percent", 0, None, &Labels::new(), 10)
             .unwrap();
         assert!(!missing.truncated);
         assert!(missing.rows.is_empty());
