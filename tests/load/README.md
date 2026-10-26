@@ -26,7 +26,7 @@
 | 依赖 | 说明 |
 |---|---|
 | Linux | `127.0.0.0/8` 回环源 IP、`/proc/<pid>/{stat,status,fd}`；macOS/Windows 不支持 |
-| Python 3.9+ | **仅标准库**，无需 `pip install`；已在 3.13 验证 |
+| Python 3.11+ | **仅标准库**，无需 `pip install`；`tomllib` 用于校验 hub 配置顶层键，已在 3.13 验证 |
 | `openssl` | 生成共享 ECDSA P-256 私钥与每 agent 的 CSR |
 | `curl` / `timeout` | 编排脚本等待 `/healthz`、控制超时 |
 | cargo / rustc | 构建 `rustboard-hub`；`HUB_BIN=...` 可跳过构建 |
@@ -72,7 +72,7 @@ bash tests/e2e/v100-load.sh AGENTS DURATION_SECS [--reconnect-every N] [--backen
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `AGENTS` | 必填 | 虚拟 agent 数，1–5000 |
+| `AGENTS` | 必填 | 虚拟 agent 数，1–2048（hub max_connections 至少 2048；计划档位 1000） |
 | `DURATION_SECS` | 必填 | barrier 后统一运行秒数；24h = 86400 |
 | `--reconnect-every N` | `0` | 仅前 10% agent，每 ACK N 批主动断连重连；`0` 不主动断 |
 | `--backend sqlite` | `sqlite` | 当前只实现 SQLite 校验；其它值直接拒绝 |
@@ -100,7 +100,7 @@ bash tests/e2e/v100-load.sh AGENTS DURATION_SECS [--reconnect-every N] [--backen
   发送 `Hello`（协议 2，epoch=1，无控制面能力），收 `Welcome`。
 - **源 IP 分配**：源 IP 数 = `max(1, ceil(N / 200))`，从 `127.0.0.10` 起；按
   `index % 源IP数` **轮询**分配，每个 IP 严格 ≤200 条会话。1000 agent → 5 个源 IP。
-  hub 的 `max_connections_per_ip` 上限是 256，`max_connections=2048`；轮询同时保证
+  hub 的 `max_connections_per_ip` 上限是 256，`max_connections=max(2048, agents+256)`；轮询同时保证
   “前 10% 主动重连 agent”分散在各 IP 上，避免重连瞬间把单个 IP 推到 256。
   这不是绕过安全限制，而是模拟多台真实主机来源；Enrollment 仍从 `127.0.0.1`
   串行进行，避免与 `agent add` 的 SQLite 写操作撞锁。
@@ -112,8 +112,12 @@ bash tests/e2e/v100-load.sh AGENTS DURATION_SECS [--reconnect-every N] [--backen
   （hub 空闲 45s）。建连失败有上限与指数退避，失败会 `abort()` barrier，不会卡死。
 - **重连**：ACK 超时 / 连接关闭 / `Problem` 后重连，**重发同一 seq 的同一帧**
   （`sent_at`/`ts` 不变），由 hub 的 `(agent_id, epoch, seq)` 判重保证只入库一次；
-  `retries` 记录重发次数，`reconnects` 记录成功的新会话数。主动重连只用于
-  `--reconnect-every` 的受控测试。
+  `retries` 记录连接/重发次数，`reconnects` 记录成功的新会话数。默认档
+  `--reconnect-every 0` 下**任何** retries/reconnects 都会失败；主动重连测试
+  （`--reconnect-every>0`）豁免这两项，但仍要求 0 errors。ACK epoch/seq 不匹配、
+  Hello 返回 `Problem` 一律计入 errors，重试成功也不能洗白。Probe 的 WebSocket
+  构造用 `SafeWebSocket` 包装：TLS 后 HTTP Upgrade 失败时会关闭已建 socket，避免
+  fd 泄漏。
 
 ## 指标与门禁口径
 
@@ -132,27 +136,37 @@ labels 为空，`ts` 每批唯一）；默认 5s，60s 档每 agent 12 批。
 | 吞吐 | `acked / duration`（batch/s）与 ×3（sample/s），按名义运行时长 |
 | RSS | 基线：`warmup` 后 30s 窗口的中位数；结束：最后 10 个样本中位数。增长 >10% **仅对 ≥1h 长稳档**作为失败门禁（默认 `duration_secs >= 3600` 启用，可用 Python `--rss-gate on/off` 覆盖）；10min/短档只记录高水位。60s 短档没有 warmup 后样本时，基线 warmup 夹到 `duration/2`，并在 `resources.rss_kb.baseline_mode` 标注 |
 | FD / 线程 | 同样基线/结束口径；结束值相对基线允许 +32 |
-| health | 每秒 `GET /healthz`，状态必须 200；失败次数必须 0 |
+| health | 每秒 `GET /healthz`，状态必须 200 且 body 去空白后等于 `ok`；失败次数必须 0，样本数必须 >0 |
 | hub 重启 | `/proc/<pid>/stat` 的 starttime 运行前后必须一致，PID 必须存活 |
 | CPU | `/proc/<pid>/stat` utime+stime 增量 / 采样间隔；含所有 tokio 线程，可能 >100% |
 | DB 大小 | SQLite 主库 + `-wal` 字节数（每 1s 采样） |
 | 管理 API | 结束后带 Bearer 请求 `/api/v1/agents`：HTTP 200 且 agent 集合与预期完全一致 |
-| hub 日志 | 结束时扫描 `panicked` / `ERROR`；编排脚本在 hub 停止后会再扫一遍 |
+| hub 日志 | 结束时扫描 `panicked` / `ERROR`；读取失败也算门禁失败；编排脚本在 hub 停止后会再扫一遍 |
 
 `summary.json` 关键顶层字段：`agents`、`duration_secs`、`interval_ms`、
 `source_ips`、`planned/sent/acked/unacked`、`retries/reconnects/errors`、
-`ack_ms`、`throughput`、`resources`、`db`、`hub`、`admin_api`、`hub_log`、
-`failures`、`passed`。`metrics.jsonl` 每秒一行，含 `health_status/health_ms`、
+`retry_gate`、`ack_ms`、`throughput`、`resources`、`db`、`hub`、`admin_api`、
+`hub_log`、`git_head`、`hub_bin_sha256`、`sqlite_db_sha256`、`failures`、`passed`。
+`metrics.jsonl` 每秒一行，含 `health_status/health_body_ok/health_ok/health_ms`、
 `rss_kb`、`threads`、`fds`、`cpu_pct`、`db_main_bytes/db_wal_bytes` 与累计计数。
+`db.snapshot_mode` 记录 SQLite 只读快照口径，`db.snapshot_consistent` 记录查询前后
+`ingest_batches` 计数是否一致。
 
 ### 通过条件（全部满足）
 
 - 0 丢点、0 重复；`db.batches == planned` 且 `db.samples == planned×3`；
+  `db.snapshot_consistent == true`；
 - `unacked == 0`、`sent == planned`、`errors == 0`；
-- `/healthz` 失败 0 次；hub PID/starttime 未变化；
-- FD / 线程增长 ≤32；
-- RSS 增长 ≤10%（**仅 ≥1h 长稳档**；10min/短档只记录，不据此判失败）；
-- 管理 API 检查通过；`hub.log` 无 `panicked`/`ERROR`；
+- 默认档 `retries == 0 && reconnects == 0`；主动重连测试可豁免这两项，但仍要求
+  `errors == 0`（ACK mismatch / Hello Problem 均计入 errors）；
+- metrics 样本数 ≥ `duration×0.9`；`health.samples > 0`；`/healthz` 每次必须
+  200 且 body 为 `ok`，失败 0 次；hub PID/starttime 未变化；
+- FD / 线程增长 ≤32，且 baseline/end 必须非空（读不到 /proc 指标即失败）；
+- RSS 增长 ≤10%（**仅 ≥1h 长稳档**；门禁启用时 baseline/end 必须非空；10min/短档
+  只记录，不据此判失败）；
+- 管理 API 检查通过；`hub.log` 读取成功且无 `panicked`/`ERROR`；
+- `git_head`（40 hex）、`hub_bin_sha256`、`sqlite_db_sha256` 均存在，证据可绑定
+  提交、构建产物与数据库；编排脚本的泄露扫描通过；
 - 所有 agent 线程在 join 时限内退出。
 
 ### RSS 门禁适用范围
@@ -176,8 +190,11 @@ SIGTERM 超时、日志命中写回 `summary.failures`。
 
 - **SQLite（已实现）**：只读连接 `file:<db>?mode=ro`，在所有 agent 关闭会话后
   读取；先等待 `ingest_batches` 计数稳定（最多 10s），再核对总数、每 agent 计数、
-  `samples` 中 `metric LIKE 'load.%'` 的数量与两组重复。数据库文件在
-  `target/load/<run>/data/rustboard.db`。
+  `samples` 中 `metric LIKE 'load.%'` 的数量与两组重复。查询结束后会重新计数并
+  要求与查询前一致，`db.snapshot_mode` 标注为
+  `agents_closed_hub_running_readonly` —— **不是停 hub 后的离线快照**。hub 的维护
+  任务不会改写 load.* 原始样本，但若计数变化仍判失败，避免跨快照假通过。数据库
+  文件在 `target/load/<run>/data/rustboard.db`。
 - **PostgreSQL（后续）**：`hub_scale.py` 已预留 `check_postgres` 接口，目前会
   明确报错而不是静默跳过；编排脚本只接受 `--backend sqlite`。后续要求：
   `psql -Atc` + `PGPASSWORD` 环境变量，密码与完整 DSN 不得进入 argv、日志或证据。
@@ -189,7 +206,8 @@ SIGTERM 超时、日志命中写回 `summary.failures`。
 ```text
 target/load/<UTC>-<N>a/
 ├── config/hub.toml        # 0600；含 hub 必需的 admin_token
-├── data/                  # CA、服务端证书、SQLite（0700）
+├── data/certs/            # 测试 CA 私钥、服务端私钥/证书（hub 运行必需）
+├── data/rustboard.db      # SQLite（0700 目录）
 ├── out/metrics.jsonl      # 每秒指标
 ├── out/summary.json       # 门禁与汇总
 ├── init.log               # hub init 输出（admin token 已替换为 [REDACTED]）
@@ -211,6 +229,10 @@ target/load/<UTC>-<N>a/
 - 24h 运行会积累大量 `samples`（200 agent × 17280 批 × 3 点 ≈ 1037 万行），
   以及约 86400 行 `metrics.jsonl`；归档后再删除对应 run 目录。
 - `target/` 已被 git 忽略；仍不要把任何 run 目录、私钥、token 提交进仓库。
+- **整个 run 目录不可提交**：`data/certs` 含测试 CA 私钥与 hub 服务端私钥，
+  `config/hub.toml`/`config/admin.token` 含管理 token。工具不删除 CA/服务端私钥
+  （hub 运行必需），只删除临时 `admin.token` 与 `out/work` 下的 agent 私钥/证书；
+  归档 `out/summary.json`、`out/metrics.jsonl`、`hub.log` 后按上面的命令删除 rundir。
 
 ## 安全纪律
 
@@ -225,6 +247,10 @@ target/load/<UTC>-<N>a/
   文件，运行结束整体删除；从不打印证书或私钥内容。
 - `config/hub.toml` 为了 hub 运行必须包含 admin_token，权限 0600；整个
   `target/load/` 视为**不可提交的测试材料**，归档证据后按上面的命令清理。
+- 脚本退出时会扫描 `init.log`、`hub.log`、`summary.json`、`metrics.jsonl`、
+  `hub_scale.log`：命中 admin token、PEM 私钥或无解释的 64hex 即失败；公开的
+  服务端证书指纹与 `summary` 里的 hub/db sha256 明确豁免。扫描只输出文件名与
+  类型，不输出秘密本身。
 - 日志只记录 agent UUID、seq、计数、错误类型，不记录 token / secret / 证书。
 
 ## 失败与重跑
@@ -243,10 +269,15 @@ target/load/<UTC>-<N>a/
 
 ```bash
 bash -n tests/e2e/v100-load.sh
-python3 -m py_compile tests/load/hub_scale.py
+# py_compile 显式写字节码，用临时 PYCACHEPREFIX，避免 tests/load/__pycache__ 入库
+PYTHONPYCACHEPREFIX=/tmp/rustboard-pycache python3 -m py_compile tests/load/hub_scale.py
+# 自检：空 metrics 必须失败；默认档 retries/reconnects 门禁；主动重连豁免
+PYTHONDONTWRITEBYTECODE=1 python3 -B tests/load/hub_scale.py --self-check
 bash tests/e2e/v100-load.sh 10 60
 bash tests/e2e/v100-load.sh 200 60
 ```
+
+`tests/load/__pycache__` 只是本地编译产物，不提交。
 
 ## 明确不做
 

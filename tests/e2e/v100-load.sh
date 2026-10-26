@@ -47,7 +47,7 @@ usage() {
   cat >&2 <<'EOF'
 用法: bash tests/e2e/v100-load.sh AGENTS DURATION_SECS [--reconnect-every N] [--backend sqlite]
 
-  AGENTS           虚拟 agent 数（1000 需要 5 个源 IP，工具自动分配）
+  AGENTS           虚拟 agent 数（1–2048；1000 需要 5 个源 IP，工具自动分配）
   DURATION_SECS    barrier 后统一运行秒数；24h 用 86400
   --reconnect-every N  前 10% agent 每 ACK N 批主动断连重连（默认 0，不主动断）
   --backend sqlite     当前仅实现 SQLite；PG 校验接口待后续阶段
@@ -93,7 +93,12 @@ done
 [[ "$DURATION_SECS" =~ ^[0-9]+$ ]] || die "DURATION_SECS 必须是正整数"
 [[ "$RECONNECT_EVERY" =~ ^[0-9]+$ ]] || die "--reconnect-every 必须是非负整数"
 [[ "$INTERVAL_MS" =~ ^[0-9]+$ ]] || die "INTERVAL_MS 必须是正整数"
-(( AGENTS >= 1 && AGENTS <= 5000 )) || die "AGENTS 必须在 1–5000 之间"
+(( AGENTS >= 1 && AGENTS <= 2048 )) || die "AGENTS 必须在 1–2048 之间"
+# hub 的 max_connections 至少 2048；AGENTS 接近上限时留 256 条重连/管理余量。
+MAX_CONNECTIONS=2048
+if (( AGENTS + 256 > MAX_CONNECTIONS )); then
+  MAX_CONNECTIONS=$(( AGENTS + 256 ))
+fi
 (( DURATION_SECS >= 1 )) || die "DURATION_SECS 必须 ≥1"
 (( INTERVAL_MS >= 1000 && INTERVAL_MS <= 40000 )) \
   || die "INTERVAL_MS 必须在 1000–40000（hub 空闲超时 45s）"
@@ -189,6 +194,24 @@ else
 fi
 echo "==> hub 二进制: $HUB_BIN"
 
+# 证据绑定：提交 + 构建产物。两者都必须在 summary.json 里可复核。
+GIT_HEAD=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null) \
+  || die "无法读取 git HEAD（证据无法绑定提交）"
+[[ "$GIT_HEAD" =~ ^[0-9a-f]{40}$ ]] || die "git HEAD 非法: $GIT_HEAD"
+HUB_BIN_SHA256=$("$PYTHON" - "$HUB_BIN" <<'PY'
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+) || die "无法计算 hub 二进制 sha256"
+[[ "$HUB_BIN_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "hub 二进制 sha256 非法"
+echo "==> 证据绑定: git=${GIT_HEAD:0:12} hub_sha256=${HUB_BIN_SHA256:0:12}"
+
 # ---------------------------------------------------------------------------
 # 端口 / 初始化 / 配置
 # ---------------------------------------------------------------------------
@@ -234,25 +257,63 @@ with open(path, "w", encoding="utf-8") as handle:
     handle.write(text)
 PY
 
+# 替换或新增顶层配置。缺失键必须插到第一个 [section] 之前，绝不能 append 到
+# 文件末尾（否则会变成最后一个 [tls] 表的子键，tomllib 校验会失败）。
 set_cfg() {
   local key=$1 value=$2
-  if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$CFG"; then
-    sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" "$CFG"
-  else
-    printf '\n%s = %s\n' "$key" "$value" >> "$CFG"
-  fi
+  "$PYTHON" - "$CFG" "$key" "$value" <<'PY'
+import re
+import sys
+
+path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(path, encoding="utf-8").read()
+pattern = re.compile(r"^[ \t]*" + re.escape(key) + r"[ \t]*=.*$", re.M)
+matches = list(pattern.finditer(text))
+if len(matches) > 1:
+    raise SystemExit(f"{key} 在配置中出现 {len(matches)} 次")
+line = f"{key} = {value}"
+if matches:
+    text = text[: matches[0].start()] + line + text[matches[0].end() :]
+else:
+    section = re.search(r"^[ \t]*\[", text, re.M)
+    if section:
+        text = text[: section.start()] + line + "\n" + text[section.start() :]
+    else:
+        text = text.rstrip() + "\n" + line + "\n"
+open(path, "w", encoding="utf-8").write(text)
+PY
 }
 
 # 与 docs/plans/2026-10-26-phase-e-hub-scale.md 对齐：自监控关闭、5s 采样、
-# 连接上限 2048 / 单 IP 256，管理 API 读写限速关闭（压测脚本要轮询 healthz
-# 与 /api/v1/agents，不能把业务请求打成 429）。
+# 连接上限 max(2048, agents+256) / 单 IP 256，管理 API 读写限速关闭
+# （压测脚本要轮询 healthz 与 /api/v1/agents，不能把业务请求打成 429）。
 set_cfg self_monitor false
 set_cfg sample_interval_ms "$INTERVAL_MS"
-set_cfg max_connections 2048
+set_cfg max_connections "$MAX_CONNECTIONS"
 set_cfg max_connections_per_ip 256
 set_cfg admin_rate_limit_per_min 0
 set_cfg admin_write_rate_limit_per_min 0
 chmod 600 "$CFG"
+
+# 用 tomllib 证明这些键确实在顶层，而不是被插进某个 [section]。
+"$PYTHON" - "$CFG" "$INTERVAL_MS" "$MAX_CONNECTIONS" <<'PY'
+import sys
+import tomllib
+
+cfg = tomllib.load(open(sys.argv[1], "rb"))
+expected = {
+    "self_monitor": False,
+    "sample_interval_ms": int(sys.argv[2]),
+    "max_connections": int(sys.argv[3]),
+    "max_connections_per_ip": 256,
+    "admin_rate_limit_per_min": 0,
+    "admin_write_rate_limit_per_min": 0,
+}
+bad = [f"{key}={cfg.get(key)!r} 期望 {value!r}" for key, value in expected.items()
+       if cfg.get(key) != value]
+if bad:
+    raise SystemExit("顶层配置校验失败: " + "; ".join(bad))
+PY
 [[ -f "$CA" ]] || die "缺少 CA 证书: $CA"
 
 # 从 hub 配置读 admin token 并写入 0600 文件；脚本本身不保存 token 变量。
@@ -304,6 +365,22 @@ wait_health() {
   return 1
 }
 
+summary_passed() {
+  "$PYTHON" - "$1" <<'PY'
+import json
+import sys
+
+try:
+    summary = json.load(open(sys.argv[1], encoding="utf-8"))
+    passed = summary.get("passed")
+except Exception:
+    raise SystemExit(1)
+if not isinstance(passed, bool):
+    raise SystemExit(1)
+print("true" if passed else "false")
+PY
+}
+
 if ! wait_health; then
   echo "---- hub.log（tail）----" >&2
   tail -n 80 "$HUB_LOG" >&2 || true
@@ -334,6 +411,8 @@ PYTHONUNBUFFERED=1 "$PYTHON" "$ROOT/tests/load/hub_scale.py" \
   --interval-ms "$INTERVAL_MS" \
   --warmup-secs "$WARMUP_SECS" \
   --hub-bin "$HUB_BIN" \
+  --git-head "$GIT_HEAD" \
+  --hub-bin-sha256 "$HUB_BIN_SHA256" \
   --config "$CFG" \
   --hub-pid "$HUB_PID" \
   --hub-starttime "$HUB_STARTTIME" \
@@ -350,6 +429,16 @@ PY_RC=${PIPESTATUS[0]}
 set -e
 # 正常路径 Python 已 unlink；这里兜底，确保证据目录不留下 token 文件。
 rm -f -- "$ADMIN_TOKEN_FILE"
+
+# 先读取 Python 写出的 summary.passed，稍后与 PY_RC / shell 门禁交叉校验；
+# 不能只看退出码，否则 wrapper 侧失败或 summary 被截断都可能假通过。
+SUMMARY_PARSE_OK=0
+PY_PASSED=""
+if [[ -f "$SUMMARY" ]]; then
+  if PY_PASSED=$(summary_passed "$SUMMARY"); then
+    SUMMARY_PARSE_OK=1
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # 停止 hub / 日志门禁 / summary
@@ -397,13 +486,117 @@ add_shell_failure() {
     SHELL_FAILURES=$1
   fi
 }
+
+if (( SUMMARY_PARSE_OK == 0 )); then
+  add_shell_failure "out/summary.json 不存在或无法解析"
+else
+  if [[ "$PY_PASSED" == "true" && "$PY_RC" -ne 0 ]]; then
+    add_shell_failure "out/summary.json passed=true 与 hub_scale.py 退出码 $PY_RC 不一致"
+  elif [[ "$PY_PASSED" == "false" && "$PY_RC" -eq 0 ]]; then
+    add_shell_failure "out/summary.json passed=false 与 hub_scale.py 退出码 0 不一致"
+  fi
+fi
 (( HUB_CRASHED == 0 )) || add_shell_failure "压测结束时 hub 进程已退出"
 (( STOP_OK == 1 )) || add_shell_failure "hub 未在 15s 内响应 SIGTERM"
 (( LOG_BAD == 0 )) || add_shell_failure "hub.log 出现 panicked/ERROR（$LOG_MATCHES 行）"
 (( PY_RC == 0 )) || add_shell_failure "hub_scale.py 退出码 $PY_RC"
 
-if [[ -f "$SUMMARY" ]]; then
-  "$PYTHON" - "$SUMMARY" "$SHELL_FAILURES" <<'PY'
+# 证据泄露扫描：admin token、私钥、无法解释的 64hex。公开的服务端证书指纹
+# 与 summary 里的 hub/db sha256 属于公开证据，允许保留。
+scan_evidence_secrets() {
+  local out
+  if out=$("$PYTHON" - "$CFG" "$INIT_LOG" "$HUB_LOG" "$SUMMARY" \
+      "$OUT/metrics.jsonl" "$PY_LOG" <<'PY'
+import json
+import os
+import re
+import sys
+
+config_path, *files = sys.argv[1:]
+summary_path = files[2] if len(files) > 2 else ""
+try:
+    config_text = open(config_path, encoding="utf-8").read()
+except OSError:
+    print("config: 无法读取")
+    raise SystemExit(1)
+match = re.search(r'^admin_token\s*=\s*"([0-9a-f]{64})"', config_text, re.M)
+if not match:
+    print("config: 缺少合法 admin_token")
+    raise SystemExit(1)
+admin_token = match.group(1)
+
+texts = {}
+for path in files:
+    if not path or not os.path.isfile(path):
+        continue
+    try:
+        texts[path] = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        print(f"{os.path.basename(path)}: 读取失败")
+        raise SystemExit(1)
+
+allowed = set()
+fingerprint_re = re.compile(
+    r'(?i)(?:fingerprint\s*=\s*"|证书指纹\s*[:：]\s*)([0-9a-f]{64})'
+)
+for text in texts.values():
+    allowed.update(fingerprint_re.findall(text))
+
+if summary_path and summary_path in texts:
+    try:
+        data = json.loads(texts[summary_path])
+    except Exception:
+        data = None
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if (
+                    isinstance(item, str)
+                    and ("sha256" in key or "fingerprint" in key)
+                    and re.fullmatch(r"[0-9a-f]{64}", item)
+                ):
+                    allowed.add(item)
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    if data is not None:
+        walk(data)
+
+violations = []
+for path, text in texts.items():
+    name = os.path.basename(path)
+    if admin_token in text:
+        violations.append(f"{name}: admin_token")
+    if re.search(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", text):
+        violations.append(f"{name}: private_key")
+    masked = text
+    for digest in allowed:
+        masked = masked.replace(digest, "[public]")
+    if re.search(r"\b[0-9a-f]{64}\b", masked):
+        violations.append(f"{name}: 64hex(可能 secret)")
+
+if violations:
+    print("; ".join(violations))
+    raise SystemExit(1)
+PY
+  ); then
+    return 0
+  fi
+  add_shell_failure "证据泄露扫描失败: ${out:-未知原因}"
+}
+scan_evidence_secrets
+
+if (( SUMMARY_PARSE_OK == 0 )); then
+  echo "FAIL: 未生成可解析 summary: $SUMMARY" >&2
+  echo "证据目录: $RUN_DIR"
+  echo "hub 日志: $HUB_LOG"
+  exit 1
+fi
+
+if ! "$PYTHON" - "$SUMMARY" "$SHELL_FAILURES" <<'PY'
 import json
 import os
 import sys
@@ -425,7 +618,23 @@ with open(tmp, "w", encoding="utf-8") as handle:
 os.chmod(tmp, 0o600)
 os.replace(tmp, path)
 PY
-  "$PYTHON" - "$SUMMARY" <<'PY'
+then
+  add_shell_failure "shell 门禁结果写入 summary 失败"
+fi
+
+FINAL_PARSE_OK=0
+FINAL_PASSED=""
+if FINAL_PASSED=$(summary_passed "$SUMMARY"); then
+  FINAL_PARSE_OK=1
+fi
+if (( FINAL_PARSE_OK == 0 )); then
+  echo "FAIL: 最终 summary 无法解析: $SUMMARY" >&2
+  echo "证据目录: $RUN_DIR"
+  echo "hub 日志: $HUB_LOG"
+  exit 1
+fi
+
+"$PYTHON" - "$SUMMARY" <<'PY'
 import json
 import sys
 
@@ -437,6 +646,7 @@ fd = resources.get("fd", {})
 threads = resources.get("threads", {})
 db = summary.get("db") or {}
 health = resources.get("health", {})
+retry_gate = summary.get("retry_gate", {})
 print("")
 print("========== Phase E S2 结果 ==========")
 print(
@@ -450,7 +660,9 @@ print(
     )
 )
 print(
-    "ack p50={p50}ms p95={p95}ms p99={p99}ms max={max}ms".format(**ack)
+    "ack p50={}ms p95={}ms p99={}ms max={}ms".format(
+        ack.get("p50"), ack.get("p95"), ack.get("p99"), ack.get("max")
+    )
 )
 print(
     "throughput batch/s={b} sample/s={s}".format(
@@ -460,21 +672,23 @@ print(
 )
 print(
     "db batches={batches}/{expected} samples={samples}/{samples_expected} "
-    "dup={dup_b}/{dup_s}".format(
+    "dup={dup_b}/{dup_s} snapshot={snapshot}".format(
         batches=db.get("batches"),
         expected=db.get("batches_expected"),
         samples=db.get("samples"),
         samples_expected=db.get("samples_expected"),
         dup_b=db.get("duplicate_batches"),
         dup_s=db.get("duplicate_samples"),
+        snapshot=db.get("snapshot_mode"),
     )
 )
 print(
-    "rss_kb baseline={b} end={e} growth={g}% | fd {fb}->{fe} | threads {tb}->{te} | "
-    "cpu_avg={cpu}%".format(
+    "rss_kb baseline={b} end={e} growth={g}% gate={gate} | fd {fb}->{fe} | "
+    "threads {tb}->{te} | cpu_avg={cpu}%".format(
         b=rss.get("baseline"),
         e=rss.get("end"),
         g=rss.get("growth_pct"),
+        gate=rss.get("gate_enabled"),
         fb=fd.get("baseline"),
         fe=fd.get("end"),
         tb=threads.get("baseline"),
@@ -483,11 +697,21 @@ print(
     )
 )
 print(
-    "health ok={ok}/{samples} fail={failures} | hub restarted={restarted}".format(
+    "health ok={ok}/{samples} fail={failures} | hub restarted={restarted} | "
+    "retry_gate enforced={enforced} ok={retry_ok}".format(
         ok=health.get("ok"),
         samples=health.get("samples"),
         failures=health.get("failures"),
         restarted=summary.get("hub", {}).get("restarted"),
+        enforced=retry_gate.get("enforced"),
+        retry_ok=retry_gate.get("ok"),
+    )
+)
+print(
+    "evidence git={git} hub_sha256={hub} db_sha256={dbhash}".format(
+        git=summary.get("git_head"),
+        hub=summary.get("hub_bin_sha256"),
+        dbhash=summary.get("sqlite_db_sha256"),
     )
 )
 print("result: {}".format("PASS" if summary.get("passed") else "FAIL"))
@@ -495,10 +719,6 @@ for failure in summary.get("failures", []):
     print(f"  - {failure}")
 print("summary: {}".format(sys.argv[1]))
 PY
-else
-  echo "FAIL: 未生成 summary: $SUMMARY" >&2
-  exit 1
-fi
 
 echo "证据目录: $RUN_DIR"
 echo "hub 日志: $HUB_LOG"
@@ -508,6 +728,9 @@ if (( PY_RC != 0 )); then
   FINAL_RC=$PY_RC
 fi
 if [[ -n "$SHELL_FAILURES" ]]; then
+  FINAL_RC=1
+fi
+if [[ "$FINAL_PASSED" != "true" ]]; then
   FINAL_RC=1
 fi
 if (( FINAL_RC != 0 )); then

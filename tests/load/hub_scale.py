@@ -19,6 +19,7 @@ N 个虚拟 agent，采集 ACK 分位数、吞吐、hub 资源与数据库一致
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -141,6 +142,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="资源基线预热秒数（短档 60；24h 建议 600）",
     )
     parser.add_argument("--hub-bin", required=True, help="rustboard-hub 可执行文件")
+    parser.add_argument("--git-head", default="", help="git rev-parse HEAD（证据绑定提交）")
+    parser.add_argument(
+        "--hub-bin-sha256", default="", help="hub 二进制 sha256（证据绑定构建产物）"
+    )
     parser.add_argument("--config", required=True, help="hub 配置文件（用于 agent add）")
     parser.add_argument("--hub-pid", type=int, required=True, help="已启动 hub 的 PID")
     parser.add_argument(
@@ -236,6 +241,7 @@ class RunContext:
     hub_alive_end: bool = False
     starttime_end: str = ""
     monitor_errors: int = 0
+    sqlite_db_sha256: str | None = None
     db_result: dict | None = None
     admin_result: dict | None = None
     hub_log_result: dict | None = None
@@ -392,6 +398,18 @@ def file_size(path: Path) -> int:
         return 0
 
 
+def sha256_file(path: Path) -> str | None:
+    """流式计算文件 sha256；读取失败返回 None（证据绑定字段会判失败）。"""
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
 def http_get(url: str, headers: dict | None = None, timeout: float = 3.0):
     """返回 (status, body, latency_ms, error)；不走环境代理。"""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -499,9 +517,37 @@ def recv_frame(ws, timeout: float):
     return probe.decode_server_frame(payload)
 
 
+class SafeWebSocket(probe.WebSocket):
+    """probe.WebSocket 的安全包装。
+
+    probe 的构造函数在 TLS 已建立、但 HTTP Upgrade 握手失败时会直接抛异常，
+    此时调用方拿不到对象，也就无法 close。S2 不便修改 probe.py，因此用子类
+    在构造失败时关闭已赋值的 ``self.sock``，并在析构时兜底再关一次。
+    """
+
+    def __init__(self, *args, **kwargs):
+        try:
+            super().__init__(*args, **kwargs)
+        except BaseException:
+            self._close_socket_quietly()
+            raise
+
+    def _close_socket_quietly(self) -> None:
+        sock = getattr(self, "sock", None)
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except Exception:  # noqa: BLE001 - 析构期不能再次抛异常
+            pass
+
+    def __del__(self):
+        self._close_socket_quietly()
+
+
 def enroll_once(ctx: RunContext, index: int, token: str, csr_pem: str) -> AgentIdentity:
     name = f"load-{index}"
-    ws = probe.WebSocket(
+    ws = SafeWebSocket(
         ctx.args.agent_url,
         ctx.args.ca,
         None,
@@ -639,13 +685,14 @@ def generate_key(ctx: RunContext) -> None:
 # ---------------------------------------------------------------------------
 
 
-def connect_session(ctx: RunContext, identity: AgentIdentity):
+def connect_session(ctx: RunContext, state: AgentState):
+    identity = state.identity
     attempts = max(1, ctx.args.connect_attempts)
     last_error: BaseException | None = None
     for attempt in range(1, attempts + 1):
         ws = None
         try:
-            ws = probe.WebSocket(
+            ws = SafeWebSocket(
                 ctx.args.agent_url,
                 ctx.args.ca,
                 str(identity.cert_path),
@@ -658,7 +705,12 @@ def connect_session(ctx: RunContext, identity: AgentIdentity):
             if frame_name != "Welcome":
                 if frame_name == "Problem":
                     code = redact(body.get("code", "unknown"), 64)
-                    raise ScaleError(f"Hello 被拒绝（code={code}）")
+                    message = f"Hello 被拒绝（code={code}）"
+                    # Problem 不是可忽略的瞬时错误：即便之后重连成功，
+                    # 本次跑也必须失败。
+                    ctx.stats.add_error(identity.index, "hello_problem", message)
+                    state.errors += 1
+                    raise ScaleError(message)
                 raise ScaleError(f"Hello 收到非预期帧 {redact(frame_name, 64)}")
             if not isinstance(body, dict) or body.get("agent_id") != identity.agent_id:
                 raise ScaleError("Welcome 的 agent_id 与会话身份不一致")
@@ -673,12 +725,16 @@ def connect_session(ctx: RunContext, identity: AgentIdentity):
                 except Exception:  # noqa: BLE001
                     pass
             if attempt < attempts:
+                # 连接层重试也计入 retries：默认档（未主动断连）任何重试都必须
+                # 使 summary 失败，不能因为最终连上就当作干净运行。
+                state.retries += 1
+                ctx.stats.add_retry()
                 time.sleep(min(4.0, 0.25 * (2 ** (attempt - 1))))
     raise ScaleError(f"agent {identity.index} 建立会话失败（{attempts} 次）: {exc_text(last_error)}")
 
 
 def reconnect_session(ctx: RunContext, state: AgentState) -> object:
-    ws = connect_session(ctx, state.identity)
+    ws = connect_session(ctx, state)
     state.reconnects += 1
     ctx.stats.add_reconnect()
     return ws
@@ -739,10 +795,14 @@ def send_and_wait_ack(
                 if frame_name == "Ack":
                     if body.get("epoch") == EPOCH and body.get("seq") == seq:
                         return ws, (time.monotonic() - sent_mono) * 1000.0
-                    raise ScaleError(
+                    message = (
                         f"ACK 不匹配（期望 epoch={EPOCH} seq={seq}，"
                         f"收到 epoch={body.get('epoch')!r} seq={body.get('seq')!r}）"
                     )
+                    # 即使随后重连/重发拿到正确 ACK，也已经发生协议不一致。
+                    ctx.stats.add_error(state.identity.index, "ack_mismatch", message)
+                    state.errors += 1
+                    raise ScaleError(message)
                 if frame_name == "Ping":
                     ws.send_binary(probe.pack({"Pong": {"ts": body.get("ts", 0)}}))
                     continue
@@ -821,7 +881,7 @@ def agent_thread(ctx: RunContext, state: AgentState, barrier: threading.Barrier)
     ws = None
     barrier_passed = False
     try:
-        ws = connect_session(ctx, state.identity)
+        ws = connect_session(ctx, state)
         barrier.wait(ctx.args.barrier_timeout)
         barrier_passed = True
         if not ctx.start_gate.wait(ctx.args.barrier_timeout + 10):
@@ -862,20 +922,36 @@ def db_sizes(db_path: Path) -> tuple[int, int]:
 def monitor_loop(ctx: RunContext, pid: int) -> None:
     """每秒采样 hub 健康、/proc、DB 大小与累计计数，写 metrics.jsonl。"""
     path = ctx.metrics_path
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.chmod(path, 0o600)
+    fd = None
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.chmod(path, 0o600)
+        handle = os.fdopen(fd, "w", encoding="utf-8", buffering=1)
+        fd = None
+    except Exception:  # noqa: BLE001 - 指标文件打不开必须显式记失败，不能静默退出
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        ctx.monitor_errors += 1
+        return
     previous_ticks = None
     previous_mono = None
     db_path = Path(ctx.args.db) if ctx.args.db else Path("/nonexistent")
     next_tick = time.monotonic()
-    with os.fdopen(fd, "w", encoding="utf-8", buffering=1) as handle:
+    with handle:
         while not ctx.stop_event.is_set():
             try:
                 elapsed = time.monotonic() - ctx.run_start
-                status, _body, latency_ms, health_error = http_get(
+                status, body, latency_ms, health_error = http_get(
                     ctx.args.admin_url.rstrip("/") + "/healthz",
                     timeout=ctx.args.health_timeout,
                 )
+                health_body_ok = (
+                    isinstance(body, (bytes, bytearray)) and body.strip() == b"ok"
+                )
+                health_ok = status == 200 and health_body_ok and health_error is None
                 proc_stat = read_proc_stat(pid)
                 status_fields = read_proc_status(pid)
                 fds = count_fds(pid)
@@ -899,7 +975,8 @@ def monitor_loop(ctx: RunContext, pid: int) -> None:
                     "ts": iso_now(),
                     "elapsed": round(elapsed, 3),
                     "health_status": status,
-                    "health_ok": status == 200,
+                    "health_body_ok": health_body_ok,
+                    "health_ok": health_ok,
                     "health_ms": round(latency_ms, 3),
                     "health_error": health_error,
                     "rss_kb": status_fields["rss_kb"],
@@ -947,6 +1024,8 @@ def read_metrics(path: Path) -> dict[str, list]:
         for key in (
             "elapsed",
             "health_status",
+            "health_body_ok",
+            "health_ok",
             "health_ms",
             "rss_kb",
             "threads",
@@ -1047,9 +1126,11 @@ def check_sqlite(ctx: RunContext) -> dict:
     deadline = time.monotonic() + ctx.args.db_stabilize_secs
     last = -1
     stable = 0
+    stabilized = False
     while time.monotonic() < deadline:
         current = sqlite_count_batches(path)
         if current >= expected:
+            stabilized = True
             break
         if current == last:
             stable += 1
@@ -1057,6 +1138,7 @@ def check_sqlite(ctx: RunContext) -> dict:
             stable = 0
             last = current
         if stable >= 3:
+            stabilized = True
             break
         time.sleep(0.25)
 
@@ -1128,6 +1210,11 @@ def check_sqlite(ctx: RunContext) -> dict:
     unexpected_batches = sorted(set(batch_rows) - set(sent_by_id))
     lost = max(0, ctx.stats.sent - db_batches)
     missing_sends = max(0, expected - ctx.stats.sent)
+    # 无法先停 hub（S2 不改编排两阶段），因此记录只读快照口径，并在查询后
+    # 重新计数确认期间没有新增/回退；维护任务不会改写 load.* 原始样本，但若
+    # 计数变化仍判失败，避免跨快照假通过。
+    batches_after = sqlite_count_batches(path)
+    snapshot_consistent = batches_after == db_batches
     ok = (
         db_batches == expected
         and db_samples == expected * len(AGENT_METRICS)
@@ -1137,9 +1224,15 @@ def check_sqlite(ctx: RunContext) -> dict:
         and not sample_mismatch
         and not unexpected_batches
         and db_agents == len(ctx.states)
+        and snapshot_consistent
     )
     return {
         "ok": ok,
+        "snapshot_mode": "agents_closed_hub_running_readonly",
+        "snapshot_stabilized": stabilized,
+        "snapshot_window_secs": ctx.args.db_stabilize_secs,
+        "batches_after_queries": batches_after,
+        "snapshot_consistent": snapshot_consistent,
         "batches": db_batches,
         "batches_expected": expected,
         "batches_sent": ctx.stats.sent,
@@ -1231,9 +1324,14 @@ def scan_hub_log(path: Path) -> dict:
         "path": str(path) if path else "",
         "error_lines": 0,
         "panicked": 0,
+        "read_error": False,
         "samples": [],
     }
-    if not path or not path.is_file():
+    if not path:
+        return result
+    if not path.is_file():
+        result["read_error"] = True
+        result["samples"].append("hub.log 不存在")
         return result
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -1249,6 +1347,7 @@ def scan_hub_log(path: Path) -> dict:
                 if len(result["samples"]) < 10:
                     result["samples"].append(redact(line, 300))
     except OSError as exc:
+        result["read_error"] = True
         result["samples"].append(f"读取 hub.log 失败: {exc_text(exc)}")
     return result
 
@@ -1287,12 +1386,13 @@ def resource_summary(ctx: RunContext) -> dict:
     rss_end = tail_median(rss_values)
     fd_end = tail_median(fd_values)
     threads_end = tail_median(thread_values)
-    health_ok = sum(1 for value in columns["health_status"] if value == 200)
-    health_total = len(columns["health_status"])
+    health_ok_values = columns["health_ok"]
+    health_samples = sum(1 for value in health_ok_values if value is not None)
+    health_ok = sum(1 for value in health_ok_values if value is True)
     health_latencies = [
         value
-        for status, value in zip(columns["health_status"], columns["health_ms"])
-        if status == 200 and value is not None
+        for ok, value in zip(health_ok_values, columns["health_ms"])
+        if ok is True and value is not None
     ]
     cpu_values = [v for v in columns["cpu_pct"] if v is not None]
     db_main = [v for v in columns["db_main_bytes"] if v is not None]
@@ -1343,9 +1443,10 @@ def resource_summary(ctx: RunContext) -> dict:
             "peak_pct": round(max(cpu_values), 3) if cpu_values else None,
         },
         "health": {
-            "samples": health_total,
+            "samples": health_samples,
+            "metric_lines": len(health_ok_values),
             "ok": health_ok,
-            "failures": health_total - health_ok,
+            "failures": health_samples - health_ok,
             "max_ms": round(max(health_latencies), 3) if health_latencies else None,
             "p95_ms": round(percentile(health_latencies, 95), 3)
             if health_latencies
@@ -1388,12 +1489,30 @@ def build_summary(ctx: RunContext) -> dict:
     total_retries = sum(state.retries for state in ctx.states)
     total_reconnects = sum(state.reconnects for state in ctx.states)
     errors = sum(state.errors for state in ctx.states)
+    retries = total_retries if ctx.states else snapshot["retries"]
+    reconnects = total_reconnects if ctx.states else snapshot["reconnects"]
+    retry_gate = {
+        "reconnect_every": ctx.args.reconnect_every,
+        "active_reconnect_test": ctx.args.reconnect_every > 0,
+        "enforced": ctx.args.reconnect_every == 0,
+        "retries": retries,
+        "reconnects": reconnects,
+    }
+    retry_gate["ok"] = (not retry_gate["enforced"]) or (
+        retries == 0 and reconnects == 0
+    )
 
     failures = list(ctx.failures)
     if not ctx.run_started:
         failures.append("agent 未全部就绪，压测未开始")
     if errors > 0:
         failures.append(f"未处理错误 {errors} 个（详见 error_samples）")
+    if not retry_gate["ok"]:
+        failures.append(
+            "默认档 retries/reconnects 必须为 0，实际 "
+            f"retries={retries} reconnects={reconnects}（主动重连测试需 "
+            "--reconnect-every>0 才豁免）"
+        )
     if unacked > 0:
         failures.append(f"有 {unacked} 个已发送批次未取得 ACK")
     if sent < planned:
@@ -1408,10 +1527,23 @@ def build_summary(ctx: RunContext) -> dict:
         failures.append("hub PID/starttime 变化或进程消失（视为重启）")
     if ctx.run_started and not ctx.hub_alive_end:
         failures.append("运行结束时 hub 进程已不存在")
-    if resources["health"]["failures"] > 0:
-        failures.append(f"healthz 失败 {resources['health']['failures']} 次")
+    metrics_required = max(1, int(duration * 0.9))
+    if resources["metrics_samples"] < metrics_required:
+        failures.append(
+            f"metrics 样本不足：{resources['metrics_samples']} < {metrics_required}"
+            "（要求 ≥ duration×0.9，监控线程可能未运行或写文件失败）"
+        )
+    health_resources = resources["health"]
+    if health_resources["samples"] <= 0:
+        failures.append("healthz 样本为 0（监控线程未运行或 metrics 缺失）")
+    elif health_resources["failures"] > 0:
+        failures.append(f"healthz 失败 {health_resources['failures']} 次")
     rss_resources = resources["rss_kb"]
-    if (
+    if rss_resources["gate_enabled"] and (
+        rss_resources["baseline"] is None or rss_resources["end"] is None
+    ):
+        failures.append("RSS 基线或结束值缺失，无法完成长稳门禁")
+    elif (
         rss_resources["gate_enabled"]
         and rss_resources["growth_pct"] is not None
         and rss_resources["growth_pct"] > rss_resources["gate_threshold_pct"]
@@ -1425,22 +1557,34 @@ def build_summary(ctx: RunContext) -> dict:
             "RSS 10% 硬门禁未启用（duration<3600s 或 --rss-gate off），"
             "本次只记录高水位，不能据此宣称长稳通过"
         )
-    if resources["fd"]["delta"] is not None and resources["fd"]["delta"] > 32:
-        failures.append(f"FD 结束比基线多 {resources['fd']['delta']}，超过 +32")
-    if resources["threads"]["delta"] is not None and resources["threads"]["delta"] > 32:
+    fd_resources = resources["fd"]
+    if fd_resources["baseline"] is None or fd_resources["end"] is None:
+        failures.append("FD 基线或结束值缺失，无法完成资源门禁")
+    elif fd_resources["delta"] is not None and fd_resources["delta"] > 32:
+        failures.append(f"FD 结束比基线多 {fd_resources['delta']}，超过 +32")
+    thread_resources = resources["threads"]
+    if thread_resources["baseline"] is None or thread_resources["end"] is None:
+        failures.append("线程基线或结束值缺失，无法完成资源门禁")
+    elif (
+        thread_resources["delta"] is not None
+        and thread_resources["delta"] > 32
+    ):
         failures.append(
-            f"线程结束比基线多 {resources['threads']['delta']}，超过 +32"
+            f"线程结束比基线多 {thread_resources['delta']}，超过 +32"
         )
     if ctx.db_result is None:
         failures.append("数据库校验未执行")
-    elif not ctx.db_result.get("ok"):
-        failures.append(
-            "数据库校验失败："
-            f"batches={ctx.db_result.get('batches')}/{planned}, "
-            f"samples={ctx.db_result.get('samples')}/{planned * len(AGENT_METRICS)}, "
-            f"重复={ctx.db_result.get('duplicate_batches')}/"
-            f"{ctx.db_result.get('duplicate_samples')}"
-        )
+    else:
+        if not ctx.db_result.get("ok"):
+            failures.append(
+                "数据库校验失败："
+                f"batches={ctx.db_result.get('batches')}/{planned}, "
+                f"samples={ctx.db_result.get('samples')}/{planned * len(AGENT_METRICS)}, "
+                f"重复={ctx.db_result.get('duplicate_batches')}/"
+                f"{ctx.db_result.get('duplicate_samples')}"
+            )
+        if ctx.db_result.get("snapshot_consistent") is False:
+            failures.append("数据库校验期间 ingest_batches 计数发生变化（快照不一致）")
     if ctx.admin_result is None:
         failures.append("管理 API 检查未执行")
     elif not ctx.admin_result.get("ok"):
@@ -1450,17 +1594,38 @@ def build_summary(ctx: RunContext) -> dict:
             f"agents={ctx.admin_result.get('agents')}/"
             f"{ctx.admin_result.get('expected')}, error={ctx.admin_result.get('error')}"
         )
-    if ctx.hub_log_result is not None and (
-        ctx.hub_log_result.get("panicked", 0) > 0
-        or ctx.hub_log_result.get("error_lines", 0) > 0
-    ):
-        failures.append(
-            "hub.log 出现 panicked/ERROR："
-            f"panicked={ctx.hub_log_result.get('panicked', 0)}, "
-            f"error_lines={ctx.hub_log_result.get('error_lines', 0)}"
-        )
+    if ctx.args.hub_log:
+        if ctx.hub_log_result is None:
+            failures.append("hub.log 扫描未执行")
+        elif ctx.hub_log_result.get("read_error"):
+            failures.append("hub.log 读取失败，无法完成日志门禁")
+        elif (
+            ctx.hub_log_result.get("panicked", 0) > 0
+            or ctx.hub_log_result.get("error_lines", 0) > 0
+        ):
+            failures.append(
+                "hub.log 出现 panicked/ERROR："
+                f"panicked={ctx.hub_log_result.get('panicked', 0)}, "
+                f"error_lines={ctx.hub_log_result.get('error_lines', 0)}"
+            )
     if planned == 0:
         failures.append("计划批次为 0（检查 duration/interval）")
+
+    git_head = (ctx.args.git_head or "").strip().lower()
+    hub_bin_sha = (ctx.args.hub_bin_sha256 or "").strip().lower()
+    if ctx.args.hub_bin_sha256 and not re.fullmatch(r"[0-9a-f]{64}", hub_bin_sha):
+        failures.append("--hub-bin-sha256 不是合法的 64 hex")
+        hub_bin_sha = ""
+    if not hub_bin_sha:
+        computed = sha256_file(Path(ctx.args.hub_bin))
+        if computed:
+            hub_bin_sha = computed
+    if not re.fullmatch(r"[0-9a-f]{64}", hub_bin_sha):
+        failures.append("hub_bin_sha256 缺失或无法计算（证据无法绑定构建产物）")
+    if not re.fullmatch(r"[0-9a-f]{40}", git_head):
+        failures.append("git_head 缺失或非法（证据无法绑定提交）")
+    if ctx.args.backend == "sqlite" and not ctx.sqlite_db_sha256:
+        failures.append("sqlite_db_sha256 缺失（证据无法绑定数据库）")
 
     return {
         "schema": 1,
@@ -1485,6 +1650,10 @@ def build_summary(ctx: RunContext) -> dict:
         "errors": errors if ctx.states else snapshot["errors"],
         "prep_secs": round(ctx.prep_secs, 3),
         "barrier_secs": round(ctx.barrier_secs, 3),
+        "git_head": git_head or None,
+        "hub_bin_sha256": hub_bin_sha or None,
+        "sqlite_db_sha256": ctx.sqlite_db_sha256,
+        "retry_gate": retry_gate,
         "ack_ms": {
             "count": len(ack_values),
             "p50": None if not ack_values else round(percentile_sorted(ack_values, 50), 3),
@@ -1662,8 +1831,8 @@ def load_admin_token(args: argparse.Namespace) -> str:
 
 def validate_inputs(ctx: RunContext) -> None:
     args = ctx.args
-    if args.agents < 1 or args.agents > 5000:
-        raise ScaleError("--agents 必须在 1–5000 之间")
+    if args.agents < 1 or args.agents > 2048:
+        raise ScaleError("--agents 必须在 1–2048 之间（hub max_connections 基线 2048）")
     if args.duration_secs < 1:
         raise ScaleError("--duration-secs 必须 ≥1")
     if args.interval_ms < 1000 or args.interval_ms > 40000:
@@ -1768,6 +1937,9 @@ def collect_evidence(ctx: RunContext) -> None:
     try:
         if ctx.args.backend == "sqlite":
             ctx.db_result = check_sqlite(ctx)
+            db_path = Path(ctx.args.db)
+            if db_path.is_file():
+                ctx.sqlite_db_sha256 = sha256_file(db_path)
         else:
             ctx.db_result = check_postgres(ctx)
     except Exception as exc:  # noqa: BLE001
@@ -1777,7 +1949,11 @@ def collect_evidence(ctx: RunContext) -> None:
         try:
             ctx.hub_log_result = scan_hub_log(Path(ctx.args.hub_log))
         except Exception as exc:  # noqa: BLE001
-            ctx.hub_log_result = {"ok": False, "error": exc_text(exc)}
+            ctx.hub_log_result = {
+                "ok": False,
+                "read_error": True,
+                "error": exc_text(exc),
+            }
 
 
 def run(ctx: RunContext) -> None:
@@ -1842,6 +2018,86 @@ def run(ctx: RunContext) -> None:
     collect_evidence(ctx)
 
 
+def self_check() -> int:
+    """无外部依赖的自检：空 metrics 必须让门禁失败。
+
+    覆盖评审要求的“metrics 缺失可跳过门禁”回归：空 metrics 时
+    metrics 样本数、healthz 样本、RSS 基线必须产生 failures；同时验证默认档
+    retries/reconnects 门禁与主动重连豁免。
+    """
+    args = argparse.Namespace(
+        agents=1,
+        duration_secs=60,
+        interval_ms=5000,
+        warmup_secs=10,
+        backend="sqlite",
+        db="/nonexistent/self-check.db",
+        hub_pid=1,
+        hub_log="/nonexistent/self-check-hub.log",
+        rss_gate="on",
+        reconnect_every=0,
+        hub_bin="/bin/true",
+        hub_bin_sha256="0" * 64,
+        git_head="a" * 40,
+    )
+    ctx = RunContext(
+        args=args,
+        out_dir=Path("/tmp/rustboard-load-self-check"),
+        work_dir=Path("/tmp/rustboard-load-self-check/work"),
+        metrics_path=Path("/tmp/rustboard-load-self-check/metrics.jsonl"),
+        summary_path=Path("/tmp/rustboard-load-self-check/summary.json"),
+        key_path=Path("/tmp/rustboard-load-self-check/key.pem"),
+        source_ips=["127.0.0.10"],
+        per_agent_slots=1,
+        scheduled_batches=0,
+        hub_starttime="1",
+        stats=Stats(),
+    )
+    ctx.run_started = True
+    ctx.wall_start = "self-check"
+    ctx.finished_at = "self-check"
+    ctx.hub_alive_end = True
+    ctx.sqlite_db_sha256 = "2" * 64
+    ctx.db_result = {"ok": True, "snapshot_consistent": True}
+    ctx.admin_result = {"ok": True}
+    ctx.hub_log_result = {"panicked": 0, "error_lines": 0, "read_error": False}
+
+    issues = []
+    summary = build_summary(ctx)
+    failures = summary["failures"]
+    for needle in ("metrics 样本不足", "healthz 样本为 0", "RSS 基线或结束值缺失"):
+        if not any(needle in failure for failure in failures):
+            issues.append(f"空 metrics 未触发: {needle}")
+
+    # 默认档 retries>0 必须失败；--reconnect-every>0 时同一状态可豁免。
+    args.reconnect_every = 0
+    ctx.states = [
+        argparse.Namespace(
+            identity=argparse.Namespace(agent_id="self-check-agent", index=0),
+            sent=0,
+            acked=0,
+            retries=1,
+            reconnects=1,
+            errors=0,
+        )
+    ]
+    retry_failures = build_summary(ctx)["failures"]
+    if not any("retries/reconnects 必须为 0" in failure for failure in retry_failures):
+        issues.append("默认档 retries/reconnects 未触发门禁")
+
+    args.reconnect_every = 1
+    active_failures = build_summary(ctx)["failures"]
+    if any("retries/reconnects 必须为 0" in failure for failure in active_failures):
+        issues.append("主动重连测试仍被 retries/reconnects 门禁误杀")
+
+    if issues:
+        for issue in issues:
+            print(f"SELF_CHECK_FAIL: {issue}")
+        return 1
+    print("SELF_CHECK_OK: empty metrics fails; retry gate enforced; active reconnect exempt")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -1903,4 +2159,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    if "--self-check" in sys.argv[1:]:
+        sys.exit(self_check())
     sys.exit(main())
