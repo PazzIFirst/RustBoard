@@ -1871,7 +1871,9 @@ backup_restore_checks() {
     return 1
   fi
 
-  if ! docker exec -u postgres "$PG_CT" psql -X -q -v ON_ERROR_STOP=1 -U postgres -d postgres \
+  # compose 只创建 POSTGRES_USER=rustboard（superuser），容器内没有 postgres
+  # 角色；用 rustboard 连默认 postgres 维护库（local socket trust）。
+  if ! docker exec -u postgres "$PG_CT" psql -X -q -v ON_ERROR_STOP=1 -U rustboard -d postgres \
     -c 'CREATE DATABASE rustboard_restore OWNER rustboard' >"$LOG_DIR/pg-restore-create.log" 2>&1; then
     fail "K.3" "创建 rustboard_restore 新库失败"
     dump_file "$LOG_DIR/pg-restore-create.log" 40
@@ -1914,7 +1916,7 @@ backup_restore_checks() {
     fail "K.6" "恢复后原库计数变化（samples $s0→$s2，batches $b0→$b2，agents $a0→$a2）"
   fi
 
-  if docker exec -u postgres "$PG_CT" psql -X -q -v ON_ERROR_STOP=1 -U postgres -d postgres \
+  if docker exec -u postgres "$PG_CT" psql -X -q -v ON_ERROR_STOP=1 -U rustboard -d postgres \
     -c 'DROP DATABASE rustboard_restore' >"$LOG_DIR/pg-restore-drop.log" 2>&1; then
     pass "K.7" "删除测试恢复库 rustboard_restore，原库继续保留"
   else
