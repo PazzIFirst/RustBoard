@@ -464,6 +464,8 @@ fn archive_object(key: &str, from_ts: i64, to_ts: i64, status: ArchiveStatus) ->
         created_at: 1_000,
         uploaded_at: None,
         deleted_at: None,
+        ledger_version: 0,
+        attempts: 0,
     }
 }
 

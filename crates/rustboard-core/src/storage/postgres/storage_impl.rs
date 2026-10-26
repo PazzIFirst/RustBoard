@@ -435,6 +435,10 @@ impl Storage for PostgresStorage {
         PostgresStorage::prune_samples_before(self, cutoff)
     }
 
+    fn prune_archived_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
+        PostgresStorage::prune_archived_samples_before(self, cutoff)
+    }
+
     fn prune_samples_1m_before(&self, cutoff: i64) -> Result<PruneResult> {
         PostgresStorage::prune_samples_1m_before(self, cutoff)
     }
@@ -519,6 +523,31 @@ impl Storage for PostgresStorage {
         limit: usize,
     ) -> Result<Vec<ArchiveRawRow>> {
         PostgresStorage::scan_archive_rows(self, from_ts, to_ts, after_rowid, limit)
+    }
+
+    fn list_unclaimed_archive_rows(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        limit: usize,
+    ) -> Result<Vec<ArchiveRawRow>> {
+        PostgresStorage::list_unclaimed_archive_rows(self, from_ts, to_ts, limit)
+    }
+
+    fn claim_archive_rows(&self, object: &ArchiveObject, rows: &[ArchiveRawRow]) -> Result<i64> {
+        PostgresStorage::claim_archive_rows(self, object, rows)
+    }
+
+    fn archive_rows_for_object(&self, object_id: i64) -> Result<Vec<ArchiveRawRow>> {
+        PostgresStorage::archive_rows_for_object(self, object_id)
+    }
+
+    fn update_archive_object_metadata(&self, id: i64, bytes: u64, sha256: &str) -> Result<()> {
+        PostgresStorage::update_archive_object_metadata(self, id, bytes, sha256)
+    }
+
+    fn count_invalid_archive_raw_rows(&self) -> Result<i64> {
+        PostgresStorage::count_invalid_archive_raw_rows(self)
     }
 
     fn count_archive_objects(&self) -> Result<i64> {

@@ -665,6 +665,8 @@ async fn upload_shard(
                     created_at: now,
                     uploaded_at: None,
                     deleted_at: None,
+                    ledger_version: 0,
+                    attempts: 0,
                 };
                 let insert_storage = storage.clone();
                 let insert_result = storage_blocking(insert_storage, move |storage| {
@@ -898,6 +900,8 @@ mod tests {
             created_at: 1,
             uploaded_at: None,
             deleted_at: None,
+            ledger_version: 0,
+            attempts: 0,
         }
     }
 

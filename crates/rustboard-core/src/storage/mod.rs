@@ -632,6 +632,13 @@ pub trait Storage: Send + Sync {
     /// 分批删除 raw 中 `ts < cutoff` 的行。
     fn prune_samples_before(&self, cutoff: i64) -> Result<PruneResult>;
 
+    /// v8 归档启用时的 raw 保留期：只删已聚合且所属对象 `uploaded` 的行。
+    ///
+    /// R1a-1 只提供原语，不改现有 [`Storage::prune_samples_before`] 的行为；
+    /// R1b 在 `archive.enabled` 分支接入，并在 ledger pending 时跳过删除。
+    /// 未认领行、pending / failed 对象、未聚合行一律保留。
+    fn prune_archived_samples_before(&self, cutoff: i64) -> Result<PruneResult>;
+
     /// 分批删除 1m 中 `bucket_ts < cutoff` 的行。
     fn prune_samples_1m_before(&self, cutoff: i64) -> Result<PruneResult>;
 
@@ -692,6 +699,49 @@ pub trait Storage: Send + Sync {
         after_rowid: Option<i64>,
         limit: usize,
     ) -> Result<Vec<ArchiveRawRow>>;
+
+    /// 按 `ts, rowid`（PG 为 `ts, id`）升序扫描 `archive_object_id IS NULL`
+    /// 的 raw，供归档 claim。
+    ///
+    /// 时间范围左闭右开 `[from_ts, to_ts)`，`limit == 0` 返回空列表。
+    fn list_unclaimed_archive_rows(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        limit: usize,
+    ) -> Result<Vec<ArchiveRawRow>>;
+
+    /// 插入归档对象并在同一事务内原子认领 `rows`。
+    ///
+    /// claim 是**短事务**：只插入对象（`bytes`/`sha256` 可先留占位）并
+    /// `UPDATE` 行集，CSV.GZ 生成与上传必须在事务外完成，避免阻塞 ingest。
+    /// 调用方可按 `max_object_bytes` 把候选行切成多个对象、多次调用本方法。
+    ///
+    /// 返回新对象 id。`object.rows/from_ts/to_ts` 必须与行集一致，
+    /// `ledger_version` 必须为 [`crate::archive::LEDGER_VERSION_V8`]，
+    /// 状态必须为 `pending`；affected 行数不等于选中数时整事务回滚并返回
+    /// [`crate::archive::ArchiveStoreError::ClaimConflict`]（可重试）。
+    fn claim_archive_rows(&self, object: &ArchiveObject, rows: &[ArchiveRawRow]) -> Result<i64>;
+
+    /// 按 `archive_object_id` 读回 claim 行集（重试重建 CSV/manifest 用）。
+    ///
+    /// 按行键升序返回；对象不存在或行已删除返回空列表。
+    fn archive_rows_for_object(&self, object_id: i64) -> Result<Vec<ArchiveRawRow>>;
+
+    /// CSV.GZ 在 claim 事务外生成后，补对象的 `bytes` / `sha256` 元数据。
+    ///
+    /// claim 只做「插入对象 + UPDATE 行集」，`bytes`/`sha256` 可先留占位；
+    /// 大对象编码与上传不得占用 claim 事务，避免阻塞 ingest。`sha256` 必须
+    /// 是 64 位小写十六进制；对象不存在返回
+    /// [`crate::archive::ArchiveStoreError::NotFound`]。
+    fn update_archive_object_metadata(&self, id: i64, bytes: u64, sha256: &str) -> Result<()>;
+
+    /// 统计不可归档的 raw 行数：`ts < 0` 或 `ts > now`。
+    ///
+    /// 只计数，不修改/删除；R1b 会在 `maintenance status invalid_timestamp_rows`
+    /// 暴露给运维。归档 claim 扫描已排除这些行，避免 `archive_day_for` 在
+    /// `i64::MIN` / 未来时间戳上整轮报错。
+    fn count_invalid_archive_raw_rows(&self) -> Result<i64>;
 
     /// 归档对象总数。
     fn count_archive_objects(&self) -> Result<i64>;

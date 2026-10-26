@@ -30,8 +30,8 @@ const V7_TABLES: [&str; 10] = [
     "archive_state",
 ];
 
-/// 方案 §4 规定的 9 个索引 + B1b 新增的通知 / 状态清理 / 静默 / metric 索引，共 13 个。
-const V7_INDEXES: [(&str, &str); 13] = [
+/// v7 的 13 个索引 + v8 的 3 个 partial index，共 16 个。
+const V7_INDEXES: [(&str, &str); 16] = [
     ("idx_samples_1m_lookup", "samples_1m"),
     ("idx_samples_1m_ts", "samples_1m"),
     ("idx_samples_1h_lookup", "samples_1h"),
@@ -45,12 +45,32 @@ const V7_INDEXES: [(&str, &str); 13] = [
     ("idx_alert_silences_until", "alert_silences"),
     ("idx_archive_objects_range", "archive_objects"),
     ("idx_archive_objects_status", "archive_objects"),
+    ("idx_samples_unarchived", "samples"),
+    ("idx_samples_unaggregated", "samples"),
+    ("idx_samples_1m_unaggregated", "samples_1m"),
 ];
 
 /// v6 的全部真实表；迁移测试以它们为基线检查「旧表不被改写」。
+///
+/// v8 会 `ALTER TABLE samples` 补列，因此 samples 的建表 SQL 不在快照比对范围，
+/// 其旧数据仍由 [`read_old_samples`] 逐字段校验。
 const V6_TABLES: [&str; 11] = [
     "agents",
     "samples",
+    "enroll_tokens",
+    "agent_secrets",
+    "revoked_agents",
+    "agent_settings",
+    "ingest_state",
+    "ingest_batches",
+    "agent_control",
+    "audit_log",
+    "api_tokens",
+];
+
+/// 不因 v8 补列而变化建表 SQL 的 v6 表（从 [`V6_TABLES`] 排除 samples）。
+const V6_SCHEMA_UNCHANGED_TABLES: [&str; 10] = [
+    "agents",
     "enroll_tokens",
     "agent_secrets",
     "revoked_agents",
@@ -588,7 +608,7 @@ fn create_v6_database(path: &Path) -> (TableSqlSnapshot, TableCountSnapshot) {
     conn.pragma_update(None, "user_version", 6)
         .expect("设置 user_version=6 失败");
 
-    let sql = table_sql(&conn, &V6_TABLES);
+    let sql = table_sql(&conn, &V6_SCHEMA_UNCHANGED_TABLES);
     let counts = table_counts(&conn, &V6_TABLES);
     (sql, counts)
 }
@@ -605,14 +625,14 @@ fn v7_fresh_database_has_version_tables_and_indexes() {
     }
 
     let conn = Connection::open(dir.db_path()).expect("打开 fresh 库失败");
-    assert_eq!(user_version(&conn), 7, "fresh 库的 user_version 必须是 7");
+    assert_eq!(user_version(&conn), 8, "fresh 库的 user_version 必须是 8");
     assert_v7_objects(&conn);
     drop(conn);
 
     // 关闭再打开一次：建表必须幂等，不能报错或产生同名重复对象。
     let storage = open_storage(&dir);
     let conn = Connection::open(dir.db_path()).expect("第二次打开 fresh 库失败");
-    assert_eq!(user_version(&conn), 7, "重复打开后 user_version 仍应为 7");
+    assert_eq!(user_version(&conn), 8, "重复打开后 user_version 仍应为 8");
     assert_v7_objects(&conn);
     for table in V7_TABLES {
         assert_eq!(
@@ -637,27 +657,57 @@ fn v7_key_columns_primary_keys_and_unique_constraints() {
     }
     let conn = Connection::open(dir.db_path()).expect("打开测试库失败");
 
-    // 降采样表：9 列、4 列复合主键、全部 NOT NULL。
-    for table in ["samples_1m", "samples_1h"] {
-        assert_columns(
-            &conn,
-            table,
-            &[
-                ("agent_id", "TEXT", true),
-                ("metric", "TEXT", true),
-                ("labels", "TEXT", true),
-                ("bucket_ts", "INTEGER", true),
-                ("min_value", "REAL", true),
-                ("max_value", "REAL", true),
-                ("avg_value", "REAL", true),
-                ("last_value", "REAL", true),
-                ("count", "INTEGER", true),
-            ],
-        );
-        assert_primary_key(&conn, table, &["agent_id", "metric", "labels", "bucket_ts"]);
-        let cols = columns(&conn, table);
-        assert_default(&cols, "labels", "{}");
-    }
+    // samples_1m：v7 的 9 列 + v8 的 last_ts / aggregated_1h。
+    assert_columns(
+        &conn,
+        "samples_1m",
+        &[
+            ("agent_id", "TEXT", true),
+            ("metric", "TEXT", true),
+            ("labels", "TEXT", true),
+            ("bucket_ts", "INTEGER", true),
+            ("min_value", "REAL", true),
+            ("max_value", "REAL", true),
+            ("avg_value", "REAL", true),
+            ("last_value", "REAL", true),
+            ("count", "INTEGER", true),
+            ("last_ts", "INTEGER", true),
+            ("aggregated_1h", "INTEGER", true),
+        ],
+    );
+    assert_primary_key(
+        &conn,
+        "samples_1m",
+        &["agent_id", "metric", "labels", "bucket_ts"],
+    );
+    let cols = columns(&conn, "samples_1m");
+    assert_default(&cols, "labels", "{}");
+    assert_default(&cols, "last_ts", "0");
+    assert_default(&cols, "aggregated_1h", "0");
+
+    // samples_1h：v8 不新增列，保持 9 列。
+    assert_columns(
+        &conn,
+        "samples_1h",
+        &[
+            ("agent_id", "TEXT", true),
+            ("metric", "TEXT", true),
+            ("labels", "TEXT", true),
+            ("bucket_ts", "INTEGER", true),
+            ("min_value", "REAL", true),
+            ("max_value", "REAL", true),
+            ("avg_value", "REAL", true),
+            ("last_value", "REAL", true),
+            ("count", "INTEGER", true),
+        ],
+    );
+    assert_primary_key(
+        &conn,
+        "samples_1h",
+        &["agent_id", "metric", "labels", "bucket_ts"],
+    );
+    let cols = columns(&conn, "samples_1h");
+    assert_default(&cols, "labels", "{}");
 
     // 告警规则表：方案 §4.2 的全部 17 列。
     //
@@ -724,7 +774,8 @@ fn v7_key_columns_primary_keys_and_unique_constraints() {
     let event_cols = columns(&conn, "alert_events");
     assert_default(&event_cols, "series_key", "");
 
-    // 归档对象表：方案 §4.3 的全部 14 列（id 同样是未显式 NOT NULL 的主键）。
+    // 归档对象表：方案 §4.3 的 14 列 + v8 ledger_version / attempts
+    // （id 同样是未显式 NOT NULL 的主键）。
     assert_columns(
         &conn,
         "archive_objects",
@@ -743,9 +794,14 @@ fn v7_key_columns_primary_keys_and_unique_constraints() {
             ("created_at", "INTEGER", true),
             ("uploaded_at", "INTEGER", false),
             ("deleted_at", "INTEGER", false),
+            ("ledger_version", "INTEGER", true),
+            ("attempts", "INTEGER", true),
         ],
     );
     assert_primary_key(&conn, "archive_objects", &["id"]);
+    let archive_cols = columns(&conn, "archive_objects");
+    assert_default(&archive_cols, "ledger_version", "0");
+    assert_default(&archive_cols, "attempts", "0");
 
     // 维护水位表主键为 key。
     assert_primary_key(&conn, "maintenance_state", &["key"]);
@@ -864,10 +920,10 @@ fn v7_migrates_real_v6_database_and_reopen_is_idempotent() {
         assert_eq!(read_old_api_tokens(&conn), expected_api_tokens());
     }
 
-    // 第一次由 v6 打开：迁移到 v7。
+    // 第一次由 v6 打开：迁移到 v8。
     let storage = open_storage(&dir);
     let conn = Connection::open(dir.db_path()).expect("迁移后打开数据库失败");
-    assert_eq!(user_version(&conn), 7, "v6→v7 迁移后 user_version 必须是 7");
+    assert_eq!(user_version(&conn), 8, "v6→v8 迁移后 user_version 必须是 8");
     assert_v7_objects(&conn);
     assert_eq!(
         read_old_agent(&conn),
@@ -885,9 +941,9 @@ fn v7_migrates_real_v6_database_and_reopen_is_idempotent() {
         "迁移后旧 api_tokens 行必须逐字段不变"
     );
     assert_eq!(
-        table_sql(&conn, &V6_TABLES),
+        table_sql(&conn, &V6_SCHEMA_UNCHANGED_TABLES),
         old_sql,
-        "迁移不得改写任何旧表 SQL"
+        "迁移不得改写除 samples（v8 补列）外任何旧表 SQL"
     );
     assert_eq!(
         table_counts(&conn, &V6_TABLES),
@@ -913,10 +969,10 @@ fn v7_migrates_real_v6_database_and_reopen_is_idempotent() {
     // 第二次打开：幂等，旧表 SQL 与行数仍与 v6 基线完全一致。
     let storage = open_storage(&dir);
     let conn = Connection::open(dir.db_path()).expect("第二次打开迁移后数据库失败");
-    assert_eq!(user_version(&conn), 7, "重复打开后 user_version 必须仍是 7");
+    assert_eq!(user_version(&conn), 8, "重复打开后 user_version 必须仍是 8");
     assert_v7_objects(&conn);
     assert_eq!(
-        table_sql(&conn, &V6_TABLES),
+        table_sql(&conn, &V6_SCHEMA_UNCHANGED_TABLES),
         old_sql,
         "重复打开不得改写旧表 SQL"
     );
@@ -1222,7 +1278,7 @@ fn v7_alert_events_gains_series_key_on_existing_database() {
     drop(storage);
 
     let conn = Connection::open(dir.db_path()).expect("打开迁移后库失败");
-    assert_eq!(user_version(&conn), 7, "补列不得提升 schema 版本");
+    assert_eq!(user_version(&conn), 8, "v7 库打开后必须升级到 v8");
     let event_cols = columns(&conn, "alert_events");
     assert!(
         event_cols.iter().any(|column| column.name == "series_key"),

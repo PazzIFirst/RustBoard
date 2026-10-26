@@ -1,4 +1,4 @@
-//! SQLite v7 → PostgreSQL 离线迁移与校验（M5 Phase D5 核心）。
+//! SQLite v8 → PostgreSQL 离线迁移与校验（M5 Phase D5 核心）。
 //!
 //! 本模块只实现「读 SQLite、写 PostgreSQL、校验、回滚」的核心逻辑；CLI
 //! （`hub migrate --to ... --dry-run/--force/--yes`）、迁移前 `VACUUM INTO`
@@ -24,7 +24,7 @@
 //!
 //! # 单事务导入
 //!
-//! 1. 先调用 [`PostgresStorage::apply_schema`] 幂等补齐 schema v7；
+//! 1. 先调用 [`PostgresStorage::apply_schema`] 幂等补齐 schema v8；
 //! 2. 在一个 PostgreSQL 事务内取固定 key 的**事务级 advisory lock**，再对 21
 //!    张业务表取 `SHARE` 表锁，阻止其他实例在导入期间写入；
 //! 3. 再次校验目标为空（防止 `apply_schema` 与导入之间的竞态）；
@@ -78,7 +78,7 @@ use super::postgres::schema::{POSTGRES_SCHEMA_VERSION, SCHEMA_ADVISORY_LOCK_KEY}
 use super::postgres::PostgresStorage;
 
 /// 本模块支持的 SQLite schema 版本；必须与 `sqlite.rs` 的 `SCHEMA_VERSION` 对齐。
-pub const SQLITE_SCHEMA_VERSION: i64 = 7;
+pub const SQLITE_SCHEMA_VERSION: i64 = 8;
 
 /// 单批最多导出的行数。
 ///
@@ -231,6 +231,8 @@ const SAMPLES_COLUMNS: &[Column] = &[
     text("labels"),
     int("ts"),
     real("value"),
+    int_null("archive_object_id"),
+    int("aggregated_1m"),
 ];
 
 const ENROLL_TOKENS_COLUMNS: &[Column] = &[
@@ -300,6 +302,8 @@ const SAMPLES_1M_COLUMNS: &[Column] = &[
     real("avg_value"),
     real("last_value"),
     int("count"),
+    int("last_ts"),
+    int("aggregated_1h"),
 ];
 
 const SAMPLES_1H_COLUMNS: &[Column] = &[
@@ -399,6 +403,8 @@ const ARCHIVE_OBJECTS_COLUMNS: &[Column] = &[
     int("created_at"),
     int_null("uploaded_at"),
     int_null("deleted_at"),
+    int("ledger_version"),
+    int("attempts"),
 ];
 
 const ARCHIVE_STATE_COLUMNS: &[Column] = &[text("key"), text("value"), int("updated_at")];
@@ -629,7 +635,7 @@ pub fn validate_target_empty(storage: &PostgresStorage) -> Result<()> {
         .context("校验目标 PostgreSQL 是否为空失败")
 }
 
-/// SQLite v7 → PostgreSQL 离线迁移。
+/// SQLite v8 → PostgreSQL 离线迁移。
 ///
 /// 调用方必须保证 hub 已停止（离线迁移）且目标库为空；本函数会在导入事务内
 /// 再次校验空库并加表锁，防止导入期间其他实例写入。非空目标直接报错，
@@ -1323,6 +1329,9 @@ fn verify_migration(tx: &mut Transaction<'_>, source: &SqliteConnection) -> Resu
         }
     }
 
+    // v8 列必须真的搬过去：只校验行数/id/ts 会漏掉 claim 与聚合标记。
+    verify_v8_columns(tx, source)?;
+
     // api_tokens 只存哈希：去重数量必须等于行数（UNIQUE 约束之外的二次检查）。
     let source_hashes: i64 = source
         .query_row(
@@ -1350,6 +1359,57 @@ fn verify_migration(tx: &mut Transaction<'_>, source: &SqliteConnection) -> Resu
     verify_maintenance_state(tx, source)?;
 
     Ok(target_hashes)
+}
+
+/// 校验 v8 新增列在源/目标的一致性（计数/求和，不回显行内容）。
+fn verify_v8_columns(tx: &mut Transaction<'_>, source: &SqliteConnection) -> Result<()> {
+    let checks = [
+        (
+            "samples.aggregated_1m=1 行数",
+            "SELECT COUNT(*) FROM samples WHERE aggregated_1m = 1",
+            "SELECT COUNT(*)::BIGINT FROM samples WHERE aggregated_1m = 1",
+        ),
+        (
+            "samples.archive_object_id 非空行数",
+            "SELECT COUNT(*) FROM samples WHERE archive_object_id IS NOT NULL",
+            "SELECT COUNT(*)::BIGINT FROM samples WHERE archive_object_id IS NOT NULL",
+        ),
+        (
+            "samples_1m.aggregated_1h=1 行数",
+            "SELECT COUNT(*) FROM samples_1m WHERE aggregated_1h = 1",
+            "SELECT COUNT(*)::BIGINT FROM samples_1m WHERE aggregated_1h = 1",
+        ),
+        (
+            "samples_1m.last_ts 求和",
+            "SELECT COALESCE(SUM(last_ts), 0) FROM samples_1m",
+            "SELECT COALESCE(SUM(last_ts), 0)::BIGINT FROM samples_1m",
+        ),
+        (
+            "archive_objects.ledger_version 求和",
+            "SELECT COALESCE(SUM(ledger_version), 0) FROM archive_objects",
+            "SELECT COALESCE(SUM(ledger_version), 0)::BIGINT FROM archive_objects",
+        ),
+        (
+            "archive_objects.attempts 求和",
+            "SELECT COALESCE(SUM(attempts), 0) FROM archive_objects",
+            "SELECT COALESCE(SUM(attempts), 0)::BIGINT FROM archive_objects",
+        ),
+    ];
+    for (label, source_sql, target_sql) in checks {
+        let source_value: i64 = source
+            .query_row(source_sql, [], |row| row.get(0))
+            .with_context(|| format!("读取 SQLite v8 列校验值失败：{label}"))?;
+        let target_value: i64 = tx
+            .query_one(target_sql, &[])
+            .with_context(|| format!("读取目标 PostgreSQL v8 列校验值失败：{label}"))?
+            .get(0);
+        if source_value != target_value {
+            bail!(
+                "迁移校验失败：{label} 不一致（源 {source_value}，目标 {target_value}）；                 具体行值未输出，避免泄露源库内容"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn verify_maintenance_state(tx: &mut Transaction<'_>, source: &SqliteConnection) -> Result<()> {
@@ -1507,8 +1567,8 @@ mod tests {
             assert_eq!(actual.name, expected);
             assert!(!actual.columns.is_empty());
         }
-        assert_eq!(SQLITE_SCHEMA_VERSION, 7);
-        assert_eq!(POSTGRES_SCHEMA_VERSION, 7);
+        assert_eq!(SQLITE_SCHEMA_VERSION, 8);
+        assert_eq!(POSTGRES_SCHEMA_VERSION, 8);
         assert_eq!(BATCH_ROWS, 500);
     }
 
@@ -1561,9 +1621,9 @@ mod tests {
     fn insert_sql_is_fully_parameterized() {
         let samples = spec("samples");
         let sql = build_insert_sql(samples.name, samples.columns, 2);
-        assert_eq!(sql.matches('$').count(), 12, "{sql}");
+        assert_eq!(sql.matches('$').count(), 16, "{sql}");
         assert!(sql.contains("$1"), "{sql}");
-        assert!(sql.contains("$12"), "{sql}");
+        assert!(sql.contains("$16"), "{sql}");
         assert!(!sql.contains('\''), "SQL 不应包含字面值：{sql}");
         assert!(!sql.contains("cpu"), "SQL 不应包含用户值：{sql}");
     }

@@ -36,12 +36,16 @@ use rustboard_common::util::now_ms;
 use super::PostgresStorage;
 use crate::archive::{ArchiveObject, ArchiveStatus, ArchiveStoreError};
 use crate::downsample::STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID;
-use crate::storage::sqlite::{ArchiveRawRow, PRUNE_BATCH_ROWS, STATE_RAW_PRUNE_GENERATION};
+use crate::storage::sqlite::{
+    validate_archive_claim, validate_archive_sha256, ArchiveRawRow, MAX_ARCHIVE_TS_MS,
+    MIN_ARCHIVE_TS_MS, PRUNE_BATCH_ROWS, STATE_RAW_PRUNE_GENERATION,
+};
 use crate::storage::{DownsampleRangeResult, PruneResult, TierStats, BUCKET_1H_MS, BUCKET_1M_MS};
 
 /// `archive_objects` 的 SELECT 列表；列下标与 [`row_to_archive_object`] 一一对应。
 const ARCHIVE_OBJECT_COLUMNS: &str = "id, backend, object_key, manifest_key, from_ts, to_ts, \
-     rows, bytes, sha256, status, error, created_at, uploaded_at, deleted_at";
+     rows, bytes, sha256, status, error, created_at, uploaded_at, deleted_at, ledger_version, \
+     attempts";
 
 /// 1m 聚合：`[from, to)` 内 raw 行按「整分钟」聚合后 upsert。
 ///
@@ -115,6 +119,15 @@ ON CONFLICT (agent_id, metric, labels, bucket_ts) DO UPDATE SET
 /// [`PRUNE_BATCH_ROWS`] 行以内；`ORDER BY` 与 SQLite 基线保持一致。
 const PRUNE_RAW_SQL: &str = "DELETE FROM samples WHERE id IN \
      (SELECT id FROM samples WHERE ts < $1 ORDER BY ts LIMIT $2)";
+/// v8 归档启用时的 raw 保留期：只删「已聚合且所属对象已 uploaded」的行。
+///
+/// 与 SQLite 的 `PRUNE_ARCHIVED_RAW_SQL` 语义一致；R1a-1 只提供原语，
+/// 现有 [`PRUNE_RAW_SQL`] 的行为不变。
+const PRUNE_ARCHIVED_RAW_SQL: &str = "DELETE FROM samples WHERE id IN \
+     (SELECT s.id FROM samples s \
+        JOIN archive_objects o ON o.id = s.archive_object_id \
+      WHERE s.ts < $1 AND s.aggregated_1m = 1 AND o.status = 'uploaded' \
+      ORDER BY s.ts LIMIT $2)";
 const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE id IN \
      (SELECT id FROM samples_1m WHERE bucket_ts < $1 ORDER BY bucket_ts LIMIT $2)";
 const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE id IN \
@@ -165,6 +178,46 @@ fn map_archive_object_insert_error(err: postgres::Error) -> anyhow::Error {
     anyhow!("写入归档对象失败（数据库错误，详见日志）")
 }
 
+/// 在调用方事务内插入归档对象并返回 `id`。
+///
+/// claim 必须与对象插入同事务，不能复用会自动提交的
+/// [`PostgresStorage::insert_archive_object`]。
+fn insert_archive_object_tx(
+    tx: &mut postgres::Transaction<'_>,
+    object: &ArchiveObject,
+) -> Result<i64> {
+    let rows = i64::try_from(object.rows).context("归档对象行数超出 BIGINT 范围")?;
+    let bytes = i64::try_from(object.bytes).context("归档对象字节数超出 BIGINT 范围")?;
+    let row = tx
+        .query_one(
+            "INSERT INTO archive_objects
+                (backend, object_key, manifest_key, from_ts, to_ts, rows, bytes,
+                 sha256, status, error, created_at, uploaded_at, deleted_at,
+                 ledger_version, attempts)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+             RETURNING id",
+            &[
+                &object.backend,
+                &object.object_key,
+                &object.manifest_key,
+                &object.from_ts,
+                &object.to_ts,
+                &rows,
+                &bytes,
+                &object.sha256,
+                &object.status.as_str(),
+                &object.error,
+                &object.created_at,
+                &object.uploaded_at,
+                &object.deleted_at,
+                &object.ledger_version,
+                &object.attempts,
+            ],
+        )
+        .map_err(map_archive_object_insert_error)?;
+    Ok(row.get::<_, i64>(0))
+}
+
 /// 一行 `archive_objects` 映射成 [`ArchiveObject`]。
 ///
 /// 非法状态/负数计数不静默降级，读取直接失败（与 SQLite 基线一致）。
@@ -188,6 +241,8 @@ fn row_to_archive_object(row: &Row) -> Result<ArchiveObject> {
         created_at: row.get(11),
         uploaded_at: row.get(12),
         deleted_at: row.get(13),
+        ledger_version: row.get(14),
+        attempts: row.get(15),
     })
 }
 
@@ -504,8 +559,17 @@ impl PostgresStorage {
     /// `prune_raw_batched` 一致。即使本批删除 0 行也收敛一次水位，可修复残留
     /// 的高水位。
     pub fn prune_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
-        self.prune_raw_batched(cutoff)
+        self.prune_raw_batched(PRUNE_RAW_SQL, cutoff)
             .context("prune_samples_before")
+    }
+
+    /// v8 归档启用时的 raw 保留期：只删「已聚合且对象已 uploaded」的行。
+    ///
+    /// R1a-1 只提供原语，不改变 [`Self::prune_samples_before`] 的行为；
+    /// R1b 在 `archive.enabled` 分支接入，并在 ledger pending 时跳过。
+    pub fn prune_archived_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
+        self.prune_raw_batched(PRUNE_ARCHIVED_RAW_SQL, cutoff)
+            .context("prune_archived_samples_before")
     }
 
     /// 分批删除 1m 中 `bucket_ts < cutoff` 的行。
@@ -545,7 +609,9 @@ impl PostgresStorage {
     }
 
     /// raw 专属分批删除，见 [`Self::prune_samples_before`]。
-    fn prune_raw_batched(&self, cutoff: i64) -> Result<PruneResult> {
+    ///
+    /// `sql` 只来自本文件的编译期常量（普通 raw 删除 / 归档 uploaded join）。
+    fn prune_raw_batched(&self, sql: &'static str, cutoff: i64) -> Result<PruneResult> {
         let batch = PRUNE_BATCH_ROWS as i64;
         let mut result = PruneResult::default();
         loop {
@@ -564,7 +630,7 @@ impl PostgresStorage {
                     .context("读取删除前 samples.MAX(id) 失败")?
                     .get(0);
                 let deleted = tx
-                    .execute(PRUNE_RAW_SQL, &[&cutoff, &batch])
+                    .execute(sql, &[&cutoff, &batch])
                     .context("执行 raw 保留期删除 SQL 失败")?;
                 let max_after: Option<i64> = tx
                     .query_one("SELECT MAX(id) FROM samples", &[])
@@ -690,34 +756,11 @@ impl PostgresStorage {
     /// `object.id` 被忽略；`object_key` 重复返回
     /// [`ArchiveStoreError::ObjectExists`]，不会覆盖已有记录。
     pub fn insert_archive_object(&self, object: &ArchiveObject) -> Result<i64> {
-        let rows = i64::try_from(object.rows).context("归档对象行数超出 BIGINT 范围")?;
-        let bytes = i64::try_from(object.bytes).context("归档对象字节数超出 BIGINT 范围")?;
         self.with_client(|client| {
-            let row = client
-                .query_one(
-                    "INSERT INTO archive_objects
-                        (backend, object_key, manifest_key, from_ts, to_ts, rows, bytes,
-                         sha256, status, error, created_at, uploaded_at, deleted_at)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                     RETURNING id",
-                    &[
-                        &object.backend,
-                        &object.object_key,
-                        &object.manifest_key,
-                        &object.from_ts,
-                        &object.to_ts,
-                        &rows,
-                        &bytes,
-                        &object.sha256,
-                        &object.status.as_str(),
-                        &object.error,
-                        &object.created_at,
-                        &object.uploaded_at,
-                        &object.deleted_at,
-                    ],
-                )
-                .map_err(map_archive_object_insert_error)?;
-            Ok(row.get::<_, i64>(0))
+            let mut tx = client.transaction().context("开启归档对象插入事务失败")?;
+            let id = insert_archive_object_tx(&mut tx, object)?;
+            tx.commit().context("提交归档对象插入事务失败")?;
+            Ok(id)
         })
         .context("insert_archive_object")
     }
@@ -922,6 +965,158 @@ impl PostgresStorage {
                 .collect())
         })
         .context("scan_archive_rows")
+    }
+
+    /// 按 `ts, samples.id` 升序扫描尚未被任何归档对象认领的 raw 行。
+    ///
+    /// 时间范围左闭右开 `[from_ts, to_ts)`；谓词与
+    /// `idx_samples_unarchived` partial index 一致。`limit == 0` 返回空列表。
+    pub fn list_unclaimed_archive_rows(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        limit: usize,
+    ) -> Result<Vec<ArchiveRawRow>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "SELECT id, agent_id, metric, labels, ts, value FROM samples \
+                     WHERE archive_object_id IS NULL AND ts >= $1 AND ts < $2 \
+                       AND ts >= $4 AND ts <= $5 \
+                     ORDER BY ts ASC, id ASC LIMIT $3",
+                    &[
+                        &from_ts,
+                        &to_ts,
+                        &limit,
+                        &MIN_ARCHIVE_TS_MS,
+                        &now_ms().min(MAX_ARCHIVE_TS_MS),
+                    ],
+                )
+                .context("执行 list_unclaimed_archive_rows SQL 失败")?;
+            Ok(rows
+                .iter()
+                .map(|row| ArchiveRawRow {
+                    rowid: row.get(0),
+                    agent_id: row.get(1),
+                    metric: row.get(2),
+                    labels: row.get(3),
+                    ts: row.get(4),
+                    value: row.get(5),
+                })
+                .collect())
+        })
+        .context("list_unclaimed_archive_rows")
+    }
+
+    /// 插入归档对象并原子认领 `rows`，返回新对象 id。
+    ///
+    /// `UPDATE ... WHERE id = ANY(...) AND archive_object_id IS NULL` 的
+    /// affected 行数必须等于选中数；否则整事务回滚并返回可重试的
+    /// [`ArchiveStoreError::ClaimConflict`]。并发 claim 由行级锁串行化，
+    /// 后提交者会看到已认领行并失败。
+    pub fn claim_archive_rows(
+        &self,
+        object: &ArchiveObject,
+        rows: &[ArchiveRawRow],
+    ) -> Result<i64> {
+        validate_archive_claim(object, rows)?;
+        let rowids: Vec<i64> = rows.iter().map(|row| row.rowid).collect();
+        self.with_client(|client| {
+            let mut tx = client.transaction().context("开启归档 claim 事务失败")?;
+            let object_id = insert_archive_object_tx(&mut tx, object)?;
+            let updated = tx
+                .execute(
+                    "UPDATE samples SET archive_object_id = $1 \
+                     WHERE id = ANY($2::BIGINT[]) AND archive_object_id IS NULL",
+                    &[&object_id, &rowids],
+                )
+                .context("执行归档 claim 更新失败")?;
+            let updated = usize::try_from(updated).context("归档 claim 返回了超出 usize 的行数")?;
+            if updated != rows.len() {
+                tx.rollback().context("回滚归档 claim 事务失败")?;
+                tracing::warn!(
+                    object_id,
+                    selected = rows.len(),
+                    claimed = updated,
+                    "归档 claim 行集与扫描结果不一致，整事务回滚"
+                );
+                return Err(ArchiveStoreError::ClaimConflict.into());
+            }
+            tx.commit().context("提交归档 claim 事务失败")?;
+            Ok(object_id)
+        })
+        .context("claim_archive_rows")
+    }
+
+    /// 更新归档对象的压缩后字节数与 SHA-256。
+    ///
+    /// 短事务 claim 只插入对象并把 bytes/sha256 留作占位；CSV.GZ 在事务外
+    /// 生成后调用本方法补元数据。`sha256` 必须是 64 位小写十六进制；对象
+    /// 不存在返回 [`ArchiveStoreError::NotFound`]。
+    pub fn update_archive_object_metadata(&self, id: i64, bytes: u64, sha256: &str) -> Result<()> {
+        validate_archive_sha256(sha256)?;
+        let bytes = i64::try_from(bytes).context("归档对象字节数超出 BIGINT 范围")?;
+        self.with_client(|client| {
+            let updated = client
+                .execute(
+                    "UPDATE archive_objects SET bytes = $2, sha256 = $3 WHERE id = $1",
+                    &[&id, &bytes, &sha256],
+                )
+                .context("执行 update_archive_object_metadata SQL 失败")?;
+            if updated == 0 {
+                return Err(ArchiveStoreError::NotFound.into());
+            }
+            Ok(())
+        })
+        .context("update_archive_object_metadata")
+    }
+
+    /// 统计不可归档 raw 行数（`ts < 0` 或 `ts > now`）；只计数不修改。
+    ///
+    /// 与 SQLite 语义一致，供 R1b 的 `invalid_timestamp_rows` 使用。
+    pub fn count_invalid_archive_raw_rows(&self) -> Result<i64> {
+        self.with_client(|client| {
+            Ok(client
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT FROM samples WHERE ts < $1 OR ts > $2",
+                    &[&MIN_ARCHIVE_TS_MS, &now_ms().min(MAX_ARCHIVE_TS_MS)],
+                )
+                .context("统计不可归档 raw 行数失败")?
+                .get(0))
+        })
+        .context("count_invalid_archive_raw_rows")
+    }
+
+    /// 按 `archive_object_id` 读回 claim 行集，按 `samples.id` 升序。
+    ///
+    /// 上传失败 / 崩溃后的重试必须用同一行集重建 CSV 与 manifest；
+    /// 对象不存在或行已删除时返回空列表。
+    pub fn archive_rows_for_object(&self, object_id: i64) -> Result<Vec<ArchiveRawRow>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "SELECT id, agent_id, metric, labels, ts, value FROM samples \
+                     WHERE archive_object_id = $1 ORDER BY id ASC",
+                    &[&object_id],
+                )
+                .context("执行 archive_rows_for_object SQL 失败")?;
+            Ok(rows
+                .iter()
+                .map(|row| ArchiveRawRow {
+                    rowid: row.get(0),
+                    agent_id: row.get(1),
+                    metric: row.get(2),
+                    labels: row.get(3),
+                    ts: row.get(4),
+                    value: row.get(5),
+                })
+                .collect())
+        })
+        .context("archive_rows_for_object")
     }
 
     /// `archive_objects` 的总行数。
@@ -1155,6 +1350,8 @@ mod tests {
             created_at: 1_000,
             uploaded_at: None,
             deleted_at: None,
+            ledger_version: 0,
+            attempts: 0,
         }
     }
 
@@ -1809,6 +2006,89 @@ mod tests {
             "单点范围也要包含跨过该点的对象"
         );
         assert_eq!(storage.count_archive_objects().expect("对象计数失败"), 4);
+    }
+
+    #[test]
+    fn pg_claim_rows_readback_and_metadata_update_use_sample_ids() {
+        const NAME: &str = "pg_claim_rows_readback_and_metadata_update_use_sample_ids";
+        let Some(pg) = TestPg::create(NAME, "claim") else {
+            return;
+        };
+        let storage = pg.storage();
+        for ts in [1_000_i64, 2_000] {
+            execute(
+                storage,
+                "INSERT INTO samples (agent_id, metric, labels, ts, value)
+                 VALUES ('a', 'cpu.usage', '{}', $1, 1.0)",
+                &[&ts],
+            );
+        }
+        let rows = storage
+            .list_unclaimed_archive_rows(0, 10_000, 100)
+            .expect("读取未认领行失败");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().map(|row| row.rowid).collect::<Vec<_>>(),
+            {
+                let ids: Vec<i64> = fetch(storage, "SELECT id FROM samples ORDER BY id", &[])
+                    .into_iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                ids
+            },
+            "ArchiveRawRow.rowid 必须来自 samples.id"
+        );
+
+        let mut object = archive_object(
+            "v8/part-00001-v8.csv.gz",
+            1_000,
+            2_000,
+            ArchiveStatus::Pending,
+        );
+        object.rows = 2;
+        object.ledger_version = crate::archive::LEDGER_VERSION_V8;
+        object.bytes = 0;
+        object.sha256.clear();
+        let object_id = storage
+            .claim_archive_rows(&object, &rows)
+            .expect("PG claim 失败");
+        let readback = storage
+            .archive_rows_for_object(object_id)
+            .expect("PG 读回 claim 行集失败");
+        assert_eq!(readback, rows);
+
+        let digest = "e".repeat(64);
+        storage
+            .update_archive_object_metadata(object_id, 321, &digest)
+            .expect("PG 元数据更新失败");
+        let stored = storage.get_archive_object(object_id).unwrap().unwrap();
+        assert_eq!(stored.bytes, 321);
+        assert_eq!(stored.sha256, digest);
+        assert_eq!(stored.attempts, 0);
+
+        // 同一批行再次 claim 必须整事务回滚并返回可重试冲突。
+        let mut again = archive_object(
+            "v8/part-00002-v8.csv.gz",
+            1_000,
+            2_000,
+            ArchiveStatus::Pending,
+        );
+        again.rows = 2;
+        again.ledger_version = crate::archive::LEDGER_VERSION_V8;
+        let err = storage
+            .claim_archive_rows(&again, &rows)
+            .expect_err("重复 claim 必须失败");
+        assert_eq!(
+            err.downcast_ref::<ArchiveStoreError>(),
+            Some(&ArchiveStoreError::ClaimConflict)
+        );
+        assert!(
+            storage
+                .find_archive_object_by_key("v8/part-00002-v8.csv.gz")
+                .unwrap()
+                .is_none(),
+            "冲突 claim 的对象插入必须回滚"
+        );
     }
 
     #[test]

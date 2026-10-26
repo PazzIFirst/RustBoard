@@ -630,7 +630,7 @@ fn ensure_sqlite_empty_before_postgres_switch(
 /// 顺序固定：
 /// 1. [`PostgresStorage::open_from_config`] 解析 DSN、建立连接池；构造器自身会
 ///    做一次 `SELECT 1` 探活（D3 行为），连接不可达/认证失败在这里失败；
-/// 2. [`PostgresStorage::apply_schema`] 幂等应用 schema v7，事务级 advisory lock
+/// 2. [`PostgresStorage::apply_schema`] 幂等应用 schema v8，事务级 advisory lock
 ///    串行化多实例并发迁移；
 /// 3. [`PostgresStorage::ping`] 确认 schema 应用后连接仍可用。
 ///

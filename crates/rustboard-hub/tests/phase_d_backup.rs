@@ -274,6 +274,8 @@ fn seed_sqlite(db_path: &Path) {
             created_at: 1_000,
             uploaded_at: Some(1_000),
             deleted_at: None,
+            ledger_version: 0,
+            attempts: 0,
         })
         .expect("写归档对象");
 }
@@ -329,7 +331,7 @@ fn assert_manifest_hashes(backup: &Path) {
     let manifest = manifest_of(backup);
     assert_eq!(manifest["manifest_version"], 1);
     assert_eq!(manifest["backend"], "sqlite");
-    assert_eq!(manifest["schema"], 7);
+    assert_eq!(manifest["schema"], 8);
     assert!(!manifest["files"].as_array().unwrap().is_empty());
     for file in manifest["files"].as_array().unwrap() {
         let rel = file["path"].as_str().unwrap();
@@ -759,6 +761,8 @@ fn seed_pg(dsn: &str) {
             created_at: 1_000,
             uploaded_at: Some(1_000),
             deleted_at: None,
+            ledger_version: 0,
+            attempts: 0,
         })
         .expect("PG 写归档对象");
 }
@@ -1060,7 +1064,7 @@ fn pg_backup_restore_requires_real_client_tools() {
     let backup = backup_dirs(&out).remove(0);
     let manifest = manifest_of(&backup);
     assert_eq!(manifest["backend"], "postgres");
-    assert_eq!(manifest["schema"], 7);
+    assert_eq!(manifest["schema"], 8);
     assert!(backup.join("rustboard.dump").is_file());
     assert_eq!(mode_of(&backup.join("rustboard.dump")), 0o600);
 
@@ -1255,7 +1259,7 @@ fn restore_pg_without_config_requires_data_dir_and_db() {
     let manifest = serde_json::json!({
         "manifest_version": 1,
         "version": "test",
-        "schema": 7,
+        "schema": 8,
         "backend": "postgres",
         "created_at": "2026-01-01T00:00:00.000Z",
         "created_at_ms": 0,
@@ -1737,7 +1741,7 @@ fn migrate_dry_run_reads_uncheckpointed_wal_source() {
         combined(&output)
     );
     let text = combined(&output);
-    assert!(text.contains("schema v7"), "{text}");
+    assert!(text.contains("schema v8"), "{text}");
     assert!(
         text.contains("samples 4 行"),
         "必须读到 WAL 中的新增行: {text}"

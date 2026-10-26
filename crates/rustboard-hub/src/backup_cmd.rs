@@ -37,11 +37,11 @@ use sha2::{Digest, Sha256};
 /// manifest 格式版本；恢复只接受完全匹配的版本，避免未来格式被旧二进制误读。
 const MANIFEST_VERSION: u32 = 1;
 /// 本程序支持的 SQLite schema 版本（与 core 的 `SQLITE_SCHEMA_VERSION` 对齐）。
-pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 7;
+pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 8;
 /// 备份/恢复时单个外部命令输出的最大收集长度，避免故障时把巨量日志读入内存。
 const MAX_TOOL_OUTPUT: usize = 8 * 1024;
 
-/// hub schema v7 的 21 张业务表。
+/// hub schema v8 的 21 张业务表。
 ///
 /// 与 `rustboard-core/src/storage/postgres/schema.rs` 的 `TABLES` 保持一致；
 /// 只用于 `--force` 前确认目标库没有未知表，以及在迁移 CLIs 中展示。若核心

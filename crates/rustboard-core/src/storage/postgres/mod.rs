@@ -270,7 +270,7 @@ impl PostgresStorage {
         })
     }
 
-    /// 在池内连接上幂等应用 schema v7。
+    /// 在池内连接上幂等应用 schema v8。
     ///
     /// 与 [`schema::apply_schema`] 相同，只是复用连接池；必须在 tokio runtime
     /// 外的 blocking 线程调用（启动路径）。

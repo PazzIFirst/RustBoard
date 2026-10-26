@@ -41,6 +41,13 @@ pub const MAX_ARCHIVE_PREFIX_BYTES: usize = 64;
 /// 分片最大编号（`part-00001` ..= `part-99999`）。
 pub const MAX_ARCHIVE_SHARD: u32 = 99_999;
 
+/// v7 旧归档对象的 ledger 版本：没有 claim 行集，只能作为历史对象保留。
+pub const LEDGER_VERSION_V7: i64 = 0;
+
+/// v8 claim 对象的 ledger 版本：`archive_objects` 必须能通过
+/// `samples.archive_object_id` 找到同一行集。
+pub const LEDGER_VERSION_V8: i64 = 1;
+
 // ---------------------------------------------------------------------------
 // 领域错误
 // ---------------------------------------------------------------------------
@@ -86,7 +93,7 @@ pub type ArchiveResult<T> = std::result::Result<T, ArchiveError>;
 
 /// `archive_objects` 的领域错误。
 ///
-/// 存储层只返回这三类错误；HTTP 状态码映射由 C1b / C4 的 API 层负责。
+/// 存储层只返回这四类错误；HTTP 状态码映射由 C1b / C4 的 API 层负责。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveStoreError {
     /// `object_key` 已存在（UNIQUE 冲突），不得重复上传同一 key。
@@ -95,6 +102,10 @@ pub enum ArchiveStoreError {
     NotFound,
     /// 状态迁移非法，例如 `local_deleted -> uploaded` 回退。
     InvalidTransition,
+    /// claim 行集与扫描结果不一致（并发 claim / 行已被删除）。
+    ///
+    /// 可重试：调用方必须整事务回滚，重新扫描未认领行后生成新对象。
+    ClaimConflict,
 }
 
 impl fmt::Display for ArchiveStoreError {
@@ -103,6 +114,7 @@ impl fmt::Display for ArchiveStoreError {
             Self::ObjectExists => "归档对象已存在",
             Self::NotFound => "归档对象不存在",
             Self::InvalidTransition => "归档对象状态迁移非法",
+            Self::ClaimConflict => "归档行集已被其他任务认领或删除，请重试",
         };
         f.write_str(message)
     }
@@ -183,7 +195,10 @@ impl FromStr for ArchiveStatus {
 /// 一条归档对象记录，与 `archive_objects` 表一一对应。
 ///
 /// `id` 在插入时由数据库生成（插入 API 会忽略传入值并返回新 id）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `ledger_version` 区分 v7 旧对象（[`LEDGER_VERSION_V7`]）与 v8 claim
+/// 对象（[`LEDGER_VERSION_V8`]）；旧构造代码可用 `..Default::default()`
+/// 得到默认的 v7 语义。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ArchiveObject {
     pub id: i64,
     /// 后端标识：`webdav` / `s3` / `sftp`。
@@ -210,6 +225,10 @@ pub struct ArchiveObject {
     pub uploaded_at: Option<i64>,
     /// 本地 raw 删除完成时间；未删除为 `None`。
     pub deleted_at: Option<i64>,
+    /// ledger 版本：0 = v7 旧对象，1 = v8 claim 对象。
+    pub ledger_version: i64,
+    /// failed 重试次数（仅 v8 claim 对象使用；旧对象默认 0）。
+    pub attempts: i64,
 }
 
 /// 归档对象的 manifest；与 `.csv.gz` 同目录、同 basename。

@@ -11473,6 +11473,8 @@ mod tests {
             created_at: 1_700_000_000_000,
             uploaded_at: Some(1_700_000_000_000),
             deleted_at: None,
+            ledger_version: 0,
+            attempts: 0,
         }
     }
 
