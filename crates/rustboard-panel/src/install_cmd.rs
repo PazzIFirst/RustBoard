@@ -3851,7 +3851,9 @@ mod tests {
                                       Connection: close\r\n\r\nok",
                                 );
                                 let _ = stream.flush();
-                                return;
+                                // 健康检查可能因信任库尝试而重试；服务端必须继续
+                                // accept，直到测试显式 stop，否则重试会 Connection refused。
+                                continue;
                             }
                             _ => continue,
                         }
@@ -3868,9 +3870,10 @@ mod tests {
             (port, stop, handle)
         };
 
-        let (port, _stop, handle) = spawn_server();
+        let (port, stop, handle) = spawn_server();
         wait_panel_https_health(port, "panel.test", &cert_pem, Duration::from_secs(5))
             .expect("正确 SNI + 私有 CA 的 HTTPS 健康检查必须通过");
+        stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
         // 证书只有 panel.test，使用错误 SNI 时必须失败（不得跳过验证）。
