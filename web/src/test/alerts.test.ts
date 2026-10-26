@@ -7,6 +7,7 @@ import {
   MAX_SILENCE_SECS,
   alertSourceLabel,
   buildChannelInput,
+  buildFilterLabels,
   buildRuleCreatePayload,
   buildRuleUpdatePayload,
   buildSilenceInput,
@@ -311,6 +312,111 @@ describe("规则 payload", () => {
     });
   });
 });
+
+describe("filter_labels 的原型键 (#41)", () => {
+  // 后端允许 `__proto__` / `constructor` 作为标签键；对象字面量里的
+  // `__proto__` 是原型 setter，必须用 JSON.parse 生成“自带属性”的规则。
+  const specialLabels = (): Record<string, string> =>
+    JSON.parse('{"__proto__":"sentinel","constructor":"ctor","mount":"/data"}');
+
+  it("buildFilterLabels 保留 __proto__ / constructor 的自有属性", () => {
+    const labels = buildFilterLabels([
+      { key: "__proto__", value: "sentinel" },
+      { key: "constructor", value: "ctor" },
+      { key: "mount", value: "/data" },
+    ]);
+    expect(Object.keys(labels).sort()).toEqual([
+      "__proto__",
+      "constructor",
+      "mount",
+    ]);
+    expect(Object.prototype.hasOwnProperty.call(labels, "__proto__")).toBe(true);
+    expect(labels["__proto__"]).toBe("sentinel");
+    expect(labels["constructor"]).toBe("ctor");
+    expect(labels["mount"]).toBe("/data");
+
+    const roundtrip = JSON.parse(JSON.stringify(labels)) as Record<string, string>;
+    expect(Object.keys(roundtrip).sort()).toEqual([
+      "__proto__",
+      "constructor",
+      "mount",
+    ]);
+    expect(roundtrip["__proto__"]).toBe("sentinel");
+    expect(roundtrip["constructor"]).toBe("ctor");
+  });
+
+  it("创建规则时特殊标签完整进入 JSON 请求体", () => {
+    const payload = buildRuleCreatePayload(
+      ruleForm({
+        labels: [
+          { key: "__proto__", value: "sentinel" },
+          { key: "constructor", value: "ctor" },
+          { key: "env", value: "prod" },
+        ],
+      }),
+    );
+    const json = JSON.parse(JSON.stringify(payload.filter_labels)) as Record<
+      string,
+      string
+    >;
+    expect(json).toEqual(specialLabelsWithEnv());
+    expect(json["__proto__"]).toBe("sentinel");
+    expect(json["constructor"]).toBe("ctor");
+  });
+
+  it("编辑规则时未修改标签不发送 filter_labels（不会清空特殊键）", () => {
+    const original = alertRule({ filter_labels: specialLabels() });
+    const form = ruleFormFromRule(original);
+    expect(form.labels).toEqual([
+      { key: "__proto__", value: "sentinel" },
+      { key: "constructor", value: "ctor" },
+      { key: "mount", value: "/data" },
+    ]);
+
+    expect(buildRuleUpdatePayload(original, { ...form, name: "新名称" })).toEqual({
+      name: "新名称",
+    });
+    // 普通键顺序变化也不应触发 PUT。
+    expect(
+      buildRuleUpdatePayload(original, {
+        ...form,
+        labels: [
+          { key: "mount", value: "/data" },
+          { key: "constructor", value: "ctor" },
+          { key: "__proto__", value: "sentinel" },
+        ],
+      }),
+    ).toEqual({});
+  });
+
+  it("编辑特殊标签值时仍保留其它键并序列化完整", () => {
+    const original = alertRule({ filter_labels: specialLabels() });
+    const payload = buildRuleUpdatePayload(original, {
+      ...ruleFormFromRule(original),
+      labels: [
+        { key: "__proto__", value: "sentinel" },
+        { key: "constructor", value: "ctor" },
+        { key: "mount", value: "/srv" },
+      ],
+    });
+    const labels = payload.filter_labels as Record<string, string>;
+    expect(Object.keys(labels).sort()).toEqual([
+      "__proto__",
+      "constructor",
+      "mount",
+    ]);
+    const json = JSON.parse(JSON.stringify(labels)) as Record<string, string>;
+    expect(json["__proto__"]).toBe("sentinel");
+    expect(json["constructor"]).toBe("ctor");
+    expect(json["mount"]).toBe("/srv");
+  });
+});
+
+function specialLabelsWithEnv(): Record<string, string> {
+  return JSON.parse(
+    '{"__proto__":"sentinel","constructor":"ctor","env":"prod"}',
+  ) as Record<string, string>;
+}
 
 describe("事件格式化", () => {
   it("状态、agent 与规则名都有稳定中文展示", () => {
