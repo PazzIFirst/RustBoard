@@ -666,7 +666,7 @@ fn m4_a2_retention_minute_cutoff_rounds_down_to_hour_boundary() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn issue50_legacy_audit_isolates_out_of_horizon_rows_and_handles_i64() {
+fn issue50_legacy_audit_isolates_only_invalid_timestamps_and_handles_i64() {
     let dir = TempDbDir::new("audit");
     let storage = open_storage(&dir);
     let agent = "agent-audit";
@@ -694,27 +694,34 @@ fn issue50_legacy_audit_isolates_out_of_horizon_rows_and_handles_i64() {
 
     let cfg = HubConfig::default(); // max_late_days=30, max_future_skew_secs=300
     let audit = audit_legacy_raw_rows(&storage, &cfg, NOW).expect("legacy 审计失败");
+    // too_old 仍是合法历史数据，留给 delta；只有 too_new / i64 极值被隔离。
     assert_eq!(
-        audit.invalid_timestamp_rows, 4,
-        "too_old / too_new / i64::MIN / i64::MAX 都是超界行"
+        audit.invalid_timestamp_rows, 3,
+        "too_new / i64::MIN / i64::MAX 是非法时间戳"
     );
     assert_eq!(
-        audit.unaggregated_invalid_rows, 4,
-        "审计前 4 条超界行都未聚合"
+        audit.unaggregated_invalid_rows, 3,
+        "审计前 3 条非法行都未聚合"
     );
-    assert_eq!(audit.isolated_rows, 4);
-    assert_eq!(audit.legacy_unaggregated_rows, 1);
+    assert_eq!(audit.isolated_rows, 3);
+    assert_eq!(
+        audit.legacy_unaggregated_rows, 1,
+        "31 天前的 too_old 超过默认 30 天 1m horizon"
+    );
 
     let status = maintenance_status(&storage, &cfg, NOW).expect("maintenance_status 失败");
     assert_eq!(status.raw.rows, 5);
-    assert_eq!(status.unaggregated_rows, 1, "只有 valid 行仍待聚合");
-    assert_eq!(status.invalid_timestamp_rows, 4);
+    assert_eq!(
+        status.unaggregated_rows, 2,
+        "valid 与 too_old 都仍待聚合"
+    );
+    assert_eq!(status.invalid_timestamp_rows, 3);
     assert_eq!(
         status.legacy_unaggregated_rows, 0,
-        "审计后不再有遗留未聚合行"
+        "i64::MIN 已隔离；too_old 未到 90 天 1m horizon"
     );
 
-    // 审计已把 4 条超界行隔离为 aggregated_1m=1，但仍保留在 raw。
+    // 审计已把 3 条非法行隔离为 aggregated_1m=1，但仍保留在 raw。
     let conn = readonly_conn(&dir);
     let isolated: i64 = conn
         .query_row(
@@ -723,10 +730,10 @@ fn issue50_legacy_audit_isolates_out_of_horizon_rows_and_handles_i64() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(isolated, 4, "审计必须隔离 4 条超界行");
-    // delta 只能聚合 valid 行；i64 极值不得 panic / 回绕。
+    assert_eq!(isolated, 3, "审计必须只隔离 3 条非法时间戳");
+    // delta 聚合 valid 与 too_old；i64 极值不得 panic / 回绕。
     let report = run_downsample(&storage, NOW, None).expect("审计后的 run_downsample 失败");
-    assert_eq!(report.one_minute.rows, 1);
+    assert_eq!(report.one_minute.rows, 2);
     assert_aggregate(
         &conn,
         SAMPLES_1M,
@@ -744,7 +751,7 @@ fn issue50_legacy_audit_isolates_out_of_horizon_rows_and_handles_i64() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(aggregated, 5, "审计隔离 4 行 + valid 行聚合 1 行");
+    assert_eq!(aggregated, 5, "审计隔离 3 行 + valid/too_old 聚合 2 行");
 }
 
 // ---------------------------------------------------------------------------

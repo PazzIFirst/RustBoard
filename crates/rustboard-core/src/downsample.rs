@@ -462,7 +462,8 @@ pub fn maintenance_status(
     let last_error = db
         .get_maintenance_state(STATE_LAST_ERROR)?
         .filter(|value| !value.trim().is_empty());
-    let min_ts = cfg.ingest.min_sample_ts(now);
+    // 与 audit 一致：只有负值/未来真正非法；old backlog 不是 invalid。
+    let invalid_min_ts = 0;
     let max_ts = cfg.ingest.max_sample_ts(now);
     let legacy_unaggregated_rows = if cfg.retention_1m_days == 0 {
         0
@@ -480,7 +481,7 @@ pub fn maintenance_status(
         retention_last_run: read_state_i64(db, STATE_RETENTION_LAST_RUN)?,
         last_error,
         unaggregated_rows: db.count_unaggregated_raw_rows()?,
-        invalid_timestamp_rows: db.count_raw_rows_outside(min_ts, max_ts)?,
+        invalid_timestamp_rows: db.count_raw_rows_outside(invalid_min_ts, max_ts)?,
         legacy_unaggregated_rows,
         archive_ledger_pending: archive_ledger_pending(db)?,
     })
