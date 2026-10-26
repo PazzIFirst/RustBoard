@@ -837,7 +837,7 @@ fn half_migration_keeps_existing_rows_and_completes_schema() {
 #[test]
 fn v7_database_is_altered_to_v8_without_losing_rows() {
     const NAME: &str = "v7_database_is_altered_to_v8_without_losing_rows";
-    let Some(db) = TestDatabase::create("v7-alter") else {
+    let Some(db) = TestDatabase::create("v7_alter") else {
         skip(NAME);
         return;
     };

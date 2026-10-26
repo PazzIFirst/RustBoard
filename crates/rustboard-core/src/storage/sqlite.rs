@@ -4361,6 +4361,12 @@ impl SqliteStorage {
             |row| row.get(0),
         )?;
         let buckets = tx.execute(AGGREGATE_1M_SQL, params![from, to])?;
+        // v8：该范围已被本次聚合覆盖，raw 必须标记为已聚合，否则会被
+        // delta 再算一次，且 retention 无法安全删除。
+        tx.execute(
+            "UPDATE samples SET aggregated_1m = 1 WHERE ts >= ?1 AND ts < ?2",
+            params![from, to],
+        )?;
         tx.commit()?;
         Ok(DownsampleRangeResult {
             buckets,
@@ -4386,6 +4392,10 @@ impl SqliteStorage {
             |row| row.get(0),
         )?;
         let buckets = tx.execute(AGGREGATE_1H_SQL, params![from, to])?;
+        tx.execute(
+            "UPDATE samples_1m SET aggregated_1h = 1 WHERE bucket_ts >= ?1 AND bucket_ts < ?2",
+            params![from, to],
+        )?;
         tx.commit()?;
         Ok(DownsampleRangeResult {
             buckets,

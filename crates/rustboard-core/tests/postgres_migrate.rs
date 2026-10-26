@@ -1488,7 +1488,11 @@ fn bool_failure_rolls_back_target_and_second_migration_succeeds() {
         .query_one("SELECT MAX(version) FROM schema_migrations", &[])
         .unwrap()
         .get(0);
-    assert_eq!(version, Some(7), "schema 版本行应保留（DDL 不是业务数据）");
+    assert_eq!(
+        version,
+        Some(8),
+        "v8 DDL 已提交；数据导入失败只回滚业务数据，schema 版本保持 8"
+    );
     assert_eq!(
         hash_source(&fixture.path),
         source_hash_before,

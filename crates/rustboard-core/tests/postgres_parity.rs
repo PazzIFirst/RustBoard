@@ -1226,7 +1226,10 @@ fn alert_states_roundtrip_prune_and_cap_parity() {
     });
     assert_eq!(pg_upsert, sq_upsert);
     assert_eq!(pg_upsert.0, 5, "同主键 upsert 不得新增行");
-    assert_eq!(pg_upsert.1, Some(updated.clone()));
+    let mut persisted = updated.clone();
+    // #30：last_notified_at 归通知 worker 独占，评估 upsert 不得覆盖。
+    persisted.last_notified_at = a1.last_notified_at;
+    assert_eq!(pg_upsert.1, Some(persisted));
 
     // delete 返回受影响行数。
     let (pg_delete, sq_delete) = both(&fx, |s| {
@@ -3200,8 +3203,9 @@ fn retention_prune_boundary_and_claim_cas_parity() {
     let (pg_prune, sq_prune) = both(&fx, |s| {
         let raw = s.prune_samples_before(3_000).unwrap();
         let raw_repeat = s.prune_samples_before(3_000).unwrap();
-        let one_minute = s.prune_samples_1m_before(3_000).unwrap();
-        let one_minute_repeat = s.prune_samples_1m_before(3_000).unwrap();
+        // 1m retention 以整小时为边界；cutoff=3_600_000 才能删除 bucket 0。
+        let one_minute = s.prune_samples_1m_before(3_600_000).unwrap();
+        let one_minute_repeat = s.prune_samples_1m_before(3_600_000).unwrap();
         let one_hour = s.prune_samples_1h_before(3_600_000).unwrap();
         let one_hour_repeat = s.prune_samples_1h_before(3_600_000).unwrap();
         (

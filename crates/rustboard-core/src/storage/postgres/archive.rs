@@ -453,6 +453,11 @@ impl PostgresStorage {
             let buckets = tx
                 .execute(AGGREGATE_1M_SQL, &[&from, &to])
                 .context("执行 1m 聚合 SQL 失败")?;
+            tx.execute(
+                "UPDATE samples SET aggregated_1m = 1 WHERE ts >= $1 AND ts < $2",
+                &[&from, &to],
+            )
+            .context("标记 1m 源 raw 已聚合失败")?;
             tx.commit().context("提交 1m 降采样事务失败")?;
             Ok(DownsampleRangeResult {
                 buckets: usize::try_from(buckets).context("1m 聚合返回了超出 usize 的桶数")?,
@@ -484,6 +489,11 @@ impl PostgresStorage {
             let buckets = tx
                 .execute(AGGREGATE_1H_SQL, &[&from, &to])
                 .context("执行 1h 聚合 SQL 失败")?;
+            tx.execute(
+                "UPDATE samples_1m SET aggregated_1h = 1 WHERE bucket_ts >= $1 AND bucket_ts < $2",
+                &[&from, &to],
+            )
+            .context("标记 1h 源 1m 已聚合失败")?;
             tx.commit().context("提交 1h 降采样事务失败")?;
             Ok(DownsampleRangeResult {
                 buckets: usize::try_from(buckets).context("1h 聚合返回了超出 usize 的桶数")?,
@@ -2139,15 +2149,15 @@ mod tests {
         // 5003 条 `ts < cutoff` 的过期 raw + 1 条恰好等于 cutoff 的边界行。
         execute(
             storage,
-            "INSERT INTO samples (agent_id, metric, labels, ts, value)
-             SELECT 'a', 'cpu.usage', '{}', $1::BIGINT - 1 - g, 0.5
+            "INSERT INTO samples (agent_id, metric, labels, ts, value, aggregated_1m)
+             SELECT 'a', 'cpu.usage', '{}', $1::BIGINT - 1 - g, 0.5, 1
              FROM generate_series(0, $2::BIGINT) AS g",
             &[&cutoff, &(expired_rows as i64 - 1)],
         );
         execute(
             storage,
-            "INSERT INTO samples (agent_id, metric, labels, ts, value)
-             VALUES ('a', 'cpu.usage', '{}', $1, 1.0)",
+            "INSERT INTO samples (agent_id, metric, labels, ts, value, aggregated_1m)
+             VALUES ('a', 'cpu.usage', '{}', $1, 1.0, 1)",
             &[&cutoff],
         );
 
@@ -2175,12 +2185,14 @@ mod tests {
                     "INSERT INTO {table}
                          (agent_id, metric, labels, bucket_ts, min_value, max_value,
                           avg_value, last_value, count)
-                     VALUES ('a', 'cpu.usage', '{{}}', $1::BIGINT - 1, 1, 1, 1, 1, 1),
+                     VALUES ('a', 'cpu.usage', '{{}}', $1::BIGINT - 3600001, 1, 1, 1, 1, 1),
                             ('a', 'cpu.usage', '{{}}', $1::BIGINT, 2, 2, 2, 2, 2)"
                 ),
                 &[&cutoff],
             );
         }
+        // v8 1m retention 只删除整小时 aggregated_1h=1 的行。
+        execute(storage, "UPDATE samples_1m SET aggregated_1h = 1", &[]);
         let pruned_1m = storage
             .prune_samples_1m_before(cutoff)
             .expect("1m 保留期删除失败");
@@ -2220,8 +2232,8 @@ mod tests {
         for ts in [1_000_i64, 2_000, 3_000] {
             execute(
                 storage,
-                "INSERT INTO samples (agent_id, metric, labels, ts, value)
-                 VALUES ('a', 'cpu.usage', '{}', $1, 1.0)",
+                "INSERT INTO samples (agent_id, metric, labels, ts, value, aggregated_1m)
+                 VALUES ('a', 'cpu.usage', '{}', $1, 1.0, 1)",
                 &[&ts],
             );
         }
@@ -2934,8 +2946,8 @@ mod tests {
             let start = base + cycle * 100;
             execute(
                 &storage,
-                "INSERT INTO samples (agent_id, metric, labels, ts, value)
-                 SELECT 'a', 'cpu.usage', '{}', $1::BIGINT + g, 1.0
+                "INSERT INTO samples (agent_id, metric, labels, ts, value, aggregated_1m)
+                 SELECT 'a', 'cpu.usage', '{}', $1::BIGINT + g, 1.0, 1
                  FROM generate_series(0, 7) AS g",
                 &[&start],
             );
@@ -3007,8 +3019,8 @@ mod tests {
         let start = base + 10_000;
         execute(
             &storage,
-            "INSERT INTO samples (agent_id, metric, labels, ts, value)
-             SELECT 'a', 'cpu.usage', '{}', $1::BIGINT + g, 1.0
+            "INSERT INTO samples (agent_id, metric, labels, ts, value, aggregated_1m)
+             SELECT 'a', 'cpu.usage', '{}', $1::BIGINT + g, 1.0, 1
              FROM generate_series(0, 2) AS g",
             &[&start],
         );

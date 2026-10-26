@@ -838,7 +838,7 @@ impl PostgresStorage {
                 }
                 if let Some(filter_json) = filter_json.as_ref() {
                     sql.push_str(&format!(
-                        " AND labels::jsonb @> ${}::jsonb",
+                        " AND labels::jsonb @> ${}::text::jsonb",
                         params.len() + 1
                     ));
                     params.push(filter_json);
