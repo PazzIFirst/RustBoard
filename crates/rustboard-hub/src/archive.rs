@@ -1550,10 +1550,11 @@ mod tests {
         let a_id = claim_pending_for_test(&storage, &rows[..2], "part-00001", TEST_NOW - 20);
         let b_id = claim_pending_for_test(&storage, &rows[2..], "part-00002", TEST_NOW - 10);
 
-        // 模拟已 claim 的 A 行被误删；旧 retention 直接按 ts 删除。
-        let pruned = storage
-            .prune_samples_before(ARCHIVE_DAY_START + 3 * HOUR_MS)
-            .unwrap();
+        // 模拟已 claim 的 A 行被误删：先走一次真实降采样把 raw 标记为已聚合，
+        // 再用保留期只删除 A（cutoff 严格排除 B 的 +3h）。
+        let cutoff = ARCHIVE_DAY_START + 3 * HOUR_MS;
+        run_downsample(storage.as_storage(), cutoff, None).expect("标记 raw 聚合失败");
+        let pruned = storage.prune_samples_before(cutoff).unwrap();
         assert_eq!(pruned.deleted, 2, "只删除 A 的两行");
         insert_raw_rows_with_seq(&storage, ARCHIVE_DAY_START + 5 * HOUR_MS, &[5.0], 3);
 
