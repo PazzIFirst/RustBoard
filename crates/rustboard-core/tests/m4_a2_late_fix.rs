@@ -711,10 +711,7 @@ fn issue50_legacy_audit_isolates_only_invalid_timestamps_and_handles_i64() {
 
     let status = maintenance_status(&storage, &cfg, NOW).expect("maintenance_status 失败");
     assert_eq!(status.raw.rows, 5);
-    assert_eq!(
-        status.unaggregated_rows, 2,
-        "valid 与 too_old 都仍待聚合"
-    );
+    assert_eq!(status.unaggregated_rows, 2, "valid 与 too_old 都仍待聚合");
     assert_eq!(status.invalid_timestamp_rows, 3);
     assert_eq!(
         status.legacy_unaggregated_rows, 0,
