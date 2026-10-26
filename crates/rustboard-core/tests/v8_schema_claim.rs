@@ -294,9 +294,9 @@ fn v7_to_v8_migration_reconciles_count_order_and_keeps_old_data() {
     );
 }
 
-/// 迁移后的旧 raw 不得被 R1b delta 重复计数：已有 1m 桶的 raw 已标记
-/// `aggregated_1m=1`，只聚合真正未聚合的 180000 桶；1h 由 1m 重算后
-/// count 必须等于各 1m 行 count 之和，而不是把旧 raw 再加一遍。
+/// 迁移后的旧 raw 不得被 R1b delta 重复计数：迁移按 1m.count 只认领最早
+/// 的 raw，bucket 0 中迟到的 59000 保持未聚合；delta 只把它增量合并进
+/// bucket 0，1h 由 1m 重算后 count 包含迟到行且不重复计算 30000。
 #[test]
 fn v7_migration_then_downsample_does_not_double_count() {
     let dir = TempDb::new("migrate-no-double");
@@ -316,13 +316,13 @@ fn v7_migration_then_downsample_does_not_double_count() {
     assert_eq!(
         buckets,
         vec![
-            (0, 1),
+            (0, 2),
             (60_000, 2),
             (120_000, 3),
             (180_000, 1),
             (3_660_000, 1),
         ],
-        "已标记 raw 不得再合并；只有 180000 桶新增 1 行"
+        "迁移只标最早 count 条 raw（30000），迟到 59000 必须由 delta 合并进 bucket 0"
     );
 
     let hour: (i64, f64, f64, f64) = conn
@@ -333,10 +333,15 @@ fn v7_migration_then_downsample_does_not_double_count() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
-    assert_eq!(hour.0, 7, "1h count = 各 1m count 之和（1+2+3+1）");
+    // 1h 由整小时 1m 重算：bucket0 count2(1+4)、bucket60000 count2、
+    // bucket120000 count3、bucket180000 count1 → count8、min1、max4。
+    assert_eq!(
+        hour.0, 8,
+        "1h count = 各 1m count 之和（2+2+3+1），含迟到 59000"
+    );
     assert_eq!(hour.1, 1.0);
-    assert_eq!(hour.2, 3.0);
-    assert!((hour.3 - 16.0 / 7.0).abs() < 1e-9);
+    assert_eq!(hour.2, 4.0);
+    assert_eq!(hour.3, 2.5, "加权 avg=(2.5*2+1.5*2+3*3+3*1)/8=2.5");
 }
 
 #[test]
@@ -781,6 +786,8 @@ fn claim_rejects_reused_rowid_after_max_row_deleted() {
     assert_eq!(stale.len(), 1);
     let stale_rowid = stale[0].rowid;
 
+    // R1b：retention 只删已聚合 raw；先跑一轮真实降采样把 raw 认领。
+    run_downsample(&storage, 60_000, None).expect("claim 用例的降采样失败");
     // 删除最大 rowid 行后再插入，SQLite 会复用同一个 rowid。
     assert_eq!(storage.prune_samples_before(2_000).unwrap().deleted, 1);
     insert_batch(&storage, 1, vec![Sample::new("metric-new", 1_500, 9.0)]);
