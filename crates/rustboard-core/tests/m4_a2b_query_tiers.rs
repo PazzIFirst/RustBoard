@@ -67,6 +67,21 @@ fn readonly_conn(dir: &TempDbDir) -> Connection {
         .expect("以只读方式打开测试库失败")
 }
 
+/// R1b：retention 只删 `aggregated_1m=1` 的 raw；本用例只验证查询选层，
+/// 直接补上真实聚合后应有的标记（不改变任何行内容/计数）。
+fn mark_raw_aggregated_for_test(dir: &TempDbDir) {
+    let conn = Connection::open(dir.db_path()).expect("打开可写测试库失败");
+    conn.execute("UPDATE samples SET aggregated_1m = 1", [])
+        .expect("标记 raw 已聚合失败");
+}
+
+/// R1b：1m retention 只删整小时 clean 行；补上 1h 认领标记。
+fn mark_one_minute_clean_for_test(dir: &TempDbDir) {
+    let conn = Connection::open(dir.db_path()).expect("打开可写测试库失败");
+    conn.execute("UPDATE samples_1m SET aggregated_1h = 1", [])
+        .expect("标记 1m 已聚合失败");
+}
+
 fn ensure_agent(storage: &SqliteStorage, agent_id: &str) {
     let record = AgentRecord {
         agent_id: agent_id.to_string(),
@@ -698,6 +713,7 @@ fn m4_a2b_latest_samples_falls_back_from_raw_to_1m_to_1h() {
     assert_eq!(b_only[0].agent_id, "agent-b");
 
     // ---- 删除 raw：回退 1m，ts=bucket_ts，value=last_value ----
+    mark_raw_aggregated_for_test(&dir);
     let pruned = storage
         .prune_samples_before(HOUR + 10_000_000)
         .expect("删除 raw 失败");
@@ -781,8 +797,9 @@ fn m4_a2b_latest_samples_falls_back_from_raw_to_1m_to_1h() {
         "latest/1h",
     );
 
+    mark_one_minute_clean_for_test(&dir);
     let pruned_1m = storage
-        .prune_samples_1m_before(HOUR + BUCKET_1M_MS)
+        .prune_samples_1m_before(HOUR + BUCKET_1H_MS)
         .expect("删除 1m 失败");
     assert_eq!(pruned_1m.deleted, 1, "应删除 1 条 1m");
     assert_eq!(table_count(&conn, SAMPLES_1M), 0);

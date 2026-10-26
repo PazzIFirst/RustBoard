@@ -48,6 +48,9 @@ pub const LEDGER_VERSION_V7: i64 = 0;
 /// `samples.archive_object_id` 找到同一行集。
 pub const LEDGER_VERSION_V8: i64 = 1;
 
+/// `archive_state` 中的 v8 ledger 重建待办标记：为 `1` 时 raw 保留期必须跳过。
+pub const STATE_ARCHIVE_LEDGER_PENDING: &str = "archive_ledger_pending";
+
 // ---------------------------------------------------------------------------
 // 领域错误
 // ---------------------------------------------------------------------------

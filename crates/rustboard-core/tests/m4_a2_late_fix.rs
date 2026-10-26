@@ -1,8 +1,8 @@
-//! M4-A2 迟到重放、归档门禁与保留期水位夹紧的独立集成测试。
+//! R1b：迟到增量合并、归档保留门禁与 dirty hour 的独立集成测试。
 //!
-//! 只依据 `docs/plans/2026-10-24-m4-alerting-archive.md` §5.1 / §5.3 与
-//! `crates/rustboard-core/src/downsample.rs` 的公开类型 / 函数文档 / 签名编写；
-//! 不参考 `downsample.rs` 的内部算法，也不修改生产代码。
+//! 只依据 `docs/plans/2026-10-27-open-issues-remediation.md` §4.2 的验收标准
+//! 与 `crates/rustboard-core/src/downsample.rs` 的公开类型 / 函数文档 / 签名
+//! 编写；不参考内部算法，也不修改生产代码。
 //!
 //! 数据全部通过公开接口构造：`SqliteStorage::open`、`Storage::insert_batch`、
 //! `run_downsample`、`run_retention`。`rusqlite::Connection` 只以只读方式打开
@@ -17,7 +17,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use rustboard_common::config::HubConfig;
 use rustboard_common::model::{AgentRecord, Labels, Sample, SampleBatch};
 use rustboard_core::downsample::{
-    maintenance_status, run_downsample, run_retention, ArchiveGate, STATE_DOWNSAMPLE_1H_WATERMARK,
+    audit_legacy_raw_rows, maintenance_status, run_downsample, run_retention, ArchiveGate,
 };
 use rustboard_core::storage::sqlite::SqliteStorage;
 use rustboard_core::storage::{IngestOutcome, Storage, BUCKET_1H_MS, BUCKET_1M_MS};
@@ -211,16 +211,23 @@ fn raw_has_ts(conn: &Connection, agent_id: &str, ts: i64) -> bool {
     count == 1
 }
 
+fn tier_count(conn: &Connection, table: &'static str, hour_start: i64) -> i64 {
+    let sql = format!("SELECT COUNT(*) FROM {table} WHERE bucket_ts >= ?1 AND bucket_ts < ?2");
+    conn.query_row(&sql, params![hour_start, hour_start + HOUR_MS], |row| {
+        row.get(0)
+    })
+    .unwrap_or_else(|err| panic!("统计 {table} 小时行数失败：{err}"))
+}
+
 // ---------------------------------------------------------------------------
-// 用例 1：10h 迟到重放。
+// 用例 1：10h 迟到增量合并。
 //
-// 旧实现只重算最近 2 个已关闭桶，10h 前桶里的迟到 raw 会被永久漏掉；
-// 修复后必须通过 raw rowid 水位发现「新行但旧 ts」，回拨水位并重算 1m/1h，
-// 最后把水位恢复到 now（1m / 1h 均不得停留在被回拨的旧桶）。
+// R1b 取消回拨：迟到行由 `aggregated_1m=0` 直接认领，水位只前进；1m 从
+// count=2/avg=15 合并到 3/20，1h 随整小时重算。
 // ---------------------------------------------------------------------------
 
 #[test]
-fn m4_a2_late_raw_ten_hours_replay_recomputes_one_minute_and_one_hour() {
+fn m4_a2_late_raw_ten_hours_replay_uses_incremental_delta() {
     let dir = TempDbDir::new("replay");
     let storage = open_storage(&dir);
     let agent = "agent-late";
@@ -229,10 +236,9 @@ fn m4_a2_late_raw_ten_hours_replay_recomputes_one_minute_and_one_hour() {
     const NOW: i64 = BASE + 13 * HOUR_MS;
     let old_hour = NOW - 10 * HOUR_MS;
     let old_bucket = old_hour + 2 * MINUTE_MS;
-    // 该桶远早于「最近 2 个桶」的重算窗口，只有回拨水位才能覆盖。
     assert!(
         old_bucket < NOW - 2 * HOUR_MS,
-        "测试前提：迟到桶必须早于最近 2 小时"
+        "测试前提：迟到桶必须早于旧实现「最近 2 小时」窗口"
     );
 
     let label = [("host", "late")];
@@ -259,16 +265,8 @@ fn m4_a2_late_raw_ten_hours_replay_recomputes_one_minute_and_one_hour() {
     );
 
     let first = run_downsample(&storage, NOW, None).expect("首次 run_downsample 失败");
-    assert_eq!(
-        first.one_minute.watermark,
-        Some(NOW),
-        "首次运行后 1m 水位应推进到 now"
-    );
-    assert_eq!(
-        first.one_hour.watermark,
-        Some(NOW),
-        "首次运行后 1h 水位应推进到整点 NOW"
-    );
+    assert_eq!(first.one_minute.watermark, Some(NOW));
+    assert_eq!(first.one_hour.watermark, Some(NOW));
 
     let conn = readonly_conn(&dir);
     assert_aggregate(
@@ -290,7 +288,7 @@ fn m4_a2_late_raw_ten_hours_replay_recomputes_one_minute_and_one_hour() {
         "迟到前 1h 旧桶",
     );
 
-    // 新批次 seq：同一旧桶、ts 早于 now 10h 的迟到 raw。
+    // 同一旧桶的迟到 raw（ts 早于 now 10h，seq 更新）。
     insert(
         &storage,
         &batch(
@@ -309,24 +307,16 @@ fn m4_a2_late_raw_ten_hours_replay_recomputes_one_minute_and_one_hour() {
     let second = run_downsample(&storage, NOW, None).expect("迟到重放后的 run_downsample 失败");
     assert_eq!(
         second.one_minute.watermark, first.one_minute.watermark,
-        "迟到重放后 1m 水位必须回到重放前的 now 边界"
+        "R1b 不得因迟到回拨 1m 水位"
     );
     assert_eq!(
         second.one_hour.watermark, first.one_hour.watermark,
-        "迟到重放后 1h 水位必须回到重放前的 now 边界"
+        "R1b 不得因迟到回拨 1h 水位"
     );
-    assert_eq!(
-        second.one_minute.watermark,
-        Some(NOW),
-        "迟到重放后 1m 水位不得停留在被回拨的旧桶"
-    );
-    assert_eq!(
-        second.one_hour.watermark,
-        Some(NOW),
-        "迟到重放后 1h 水位不得停留在被回拨的旧桶"
-    );
+    assert_eq!(second.one_minute.watermark, Some(NOW));
+    assert_eq!(second.one_hour.watermark, Some(NOW));
 
-    // 1m 必须按 raw 重算：count 2 -> 3，avg 15 -> 20，last 20 -> 30。
+    // 1m：10/20/30 → count=3、avg=20、min=10、max=30、last=30。
     assert_aggregate(
         &conn,
         SAMPLES_1M,
@@ -336,7 +326,7 @@ fn m4_a2_late_raw_ten_hours_replay_recomputes_one_minute_and_one_hour() {
         (3, 20.0, 30.0),
         "迟到重放后的 1m 旧桶",
     );
-    // 1h 依赖 1m 重算：同样被修正，而不是停留在旧值。
+    // 1h 由整小时 1m 重算：同一旧桶，val 同样 3/20/30。
     assert_aggregate(
         &conn,
         SAMPLES_1H,
@@ -347,30 +337,46 @@ fn m4_a2_late_raw_ten_hours_replay_recomputes_one_minute_and_one_hour() {
         "迟到重放后的 1h 旧桶",
     );
 
-    let status = maintenance_status(&storage).expect("maintenance_status 失败");
+    // 重放幂等：再跑一轮不得重复计数。
+    let third = run_downsample(&storage, NOW, None).expect("重放幂等 run_downsample 失败");
     assert_eq!(
-        status.downsample_1m_watermark,
-        Some(NOW),
-        "持久化的 1m 水位必须恢复"
+        third.one_minute.rows, 0,
+        "没有新的未聚合 raw 时不得再次合并"
     );
-    assert_eq!(
-        status.downsample_1h_watermark,
-        Some(NOW),
-        "持久化的 1h 水位必须恢复"
+    assert_aggregate(
+        &conn,
+        SAMPLES_1M,
+        agent,
+        "cpu.usage",
+        old_bucket,
+        (3, 20.0, 30.0),
+        "幂等重跑后的 1m 旧桶",
     );
+    assert_aggregate(
+        &conn,
+        SAMPLES_1H,
+        agent,
+        "cpu.usage",
+        old_hour,
+        (3, 20.0, 30.0),
+        "幂等重跑后的 1h 旧桶",
+    );
+
+    let status =
+        maintenance_status(&storage, &HubConfig::default(), NOW).expect("maintenance_status 失败");
+    assert_eq!(status.unaggregated_rows, 0);
+    assert_eq!(status.invalid_timestamp_rows, 0);
 }
 
 // ---------------------------------------------------------------------------
 // 用例 2：归档门禁。
 //
-// 归档未启用与「已启用但还没有任何成功归档」必须区分：
-// - Enabled { watermark: None }：raw 一行不删，blocked_by_archive=true；
-// - Enabled { watermark: Some(w) }：raw 只删 ts < w 的部分；
-// - Disabled：才按 retention_raw_days 删除。
+// 归档启用时 raw 只能通过 `archive_object_id` → `uploaded` 的 join 删除；
+// 仅有一个 last_archived_ts 水位不能证明可删。ledger pending 时完全跳过。
 // ---------------------------------------------------------------------------
 
 #[test]
-fn m4_a2_archive_gate_blocks_raw_until_watermark() {
+fn m4_a2_archive_gate_requires_uploaded_claim_not_watermark() {
     let dir = TempDbDir::new("archive");
     let storage = open_storage(&dir);
     let agent = "agent-archive";
@@ -399,11 +405,7 @@ fn m4_a2_archive_gate_blocks_raw_until_watermark() {
     );
 
     let downsample = run_downsample(&storage, NOW, None).expect("run_downsample 失败");
-    assert_eq!(
-        downsample.one_minute.watermark,
-        Some(NOW),
-        "构造的 1m 水位应推进到 now"
-    );
+    assert_eq!(downsample.one_minute.watermark, Some(NOW));
 
     let cfg = HubConfig {
         retention_raw_days: 7,
@@ -414,7 +416,7 @@ fn m4_a2_archive_gate_blocks_raw_until_watermark() {
     let conn = readonly_conn(&dir);
     assert_eq!(raw_count(&conn, agent), 4, "造数后 raw 行数");
 
-    // 已启用但还没有成功归档：raw 一律不删。
+    // 归档已启用但还没有成功归档：raw 一律不删。
     let enabled_none = run_retention(
         &storage,
         &cfg,
@@ -424,290 +426,409 @@ fn m4_a2_archive_gate_blocks_raw_until_watermark() {
     .expect("Enabled{None} 的 run_retention 失败");
     assert_eq!(
         enabled_none.raw.deleted, 0,
-        "归档已启用但无水位时 raw 必须一行不删"
+        "归档已启用但无 uploaded 对象时 raw 必须一行不删"
     );
     assert!(
         enabled_none.raw.blocked_by_archive,
-        "归档已启用但无水位时必须标记 blocked_by_archive"
+        "归档已启用但无可删对象时必须标记 blocked_by_archive"
     );
-    assert_eq!(
-        raw_count(&conn, agent),
-        4,
-        "归档门禁阻止后 raw 行数必须不变"
-    );
-    for ts in [oldest, middle, newest_expired, fresh] {
-        assert!(raw_has_ts(&conn, agent, ts), "raw ts={ts} 不应被删除");
-    }
+    assert_eq!(raw_count(&conn, agent), 4);
 
-    // 已启用且有旧水位：只删 ts < watermark 的部分。
-    let archive_watermark = NOW - 9 * DAY_MS;
+    // 只有旧水位（没有任何 uploaded claim）：仍然一行不删。
     let enabled_some = run_retention(
         &storage,
         &cfg,
         NOW,
         ArchiveGate::Enabled {
-            watermark: Some(archive_watermark),
+            watermark: Some(NOW),
         },
     )
     .expect("Enabled{Some} 的 run_retention 失败");
     assert_eq!(
-        enabled_some.raw.deleted, 1,
-        "只应删除归档水位之前的 1 行 raw"
-    );
-    assert!(
-        enabled_some.raw.blocked_by_archive,
-        "归档水位早于保留期 cutoff 时仍应标记 blocked_by_archive"
+        enabled_some.raw.deleted, 0,
+        "last_archived_ts 水位不能单独证明 raw 可删；必须 uploaded join"
     );
     assert_eq!(
         enabled_some.raw.effective_cutoff,
-        Some(archive_watermark),
-        "raw 的实际删除边界必须夹紧到归档水位"
+        Some(NOW - 7 * DAY_MS),
+        "effective_cutoff 是保留期边界，不再夹紧到旧归档水位"
     );
-    assert_eq!(raw_count(&conn, agent), 3, "删除后 raw 行数");
-    assert!(
-        !raw_has_ts(&conn, agent, oldest),
-        "归档水位前的 raw 应被删除"
-    );
-    for ts in [middle, newest_expired, fresh] {
-        assert!(
-            raw_has_ts(&conn, agent, ts),
-            "归档水位之后（含未过期）的 raw ts={ts} 必须保留"
-        );
-    }
+    assert_eq!(raw_count(&conn, agent), 4, "raw 必须保持不变");
 
-    // 只有归档未启用时，才完全按 retention_raw_days 删除。
+    // ledger pending：即使有旧归档水位也必须完全跳过 raw 删除。
+    storage
+        .set_archive_state("archive_ledger_pending", "1", NOW)
+        .unwrap();
+    let pending = run_retention(
+        &storage,
+        &cfg,
+        NOW,
+        ArchiveGate::Enabled {
+            watermark: Some(NOW),
+        },
+    )
+    .expect("ledger pending 的 run_retention 失败");
+    assert_eq!(pending.raw.deleted, 0);
+    assert!(pending.raw.skipped_archive_ledger_pending);
+    assert_eq!(raw_count(&conn, agent), 4);
+
+    // 清掉 pending、关闭归档后，只删已聚合且过期的 3 行。
+    storage
+        .set_archive_state("archive_ledger_pending", "0", NOW)
+        .unwrap();
     let disabled = run_retention(&storage, &cfg, NOW, ArchiveGate::Disabled)
         .expect("Disabled 的 run_retention 失败");
     assert_eq!(
-        disabled.raw.deleted, 2,
-        "归档未启用时应按保留期删除剩余 2 行过期 raw"
+        disabled.raw.deleted, 3,
+        "归档未启用时应按保留期删除 3 行已聚合过期 raw"
     );
-    assert!(
-        !disabled.raw.blocked_by_archive,
-        "归档未启用时不得标记 blocked_by_archive"
-    );
+    assert!(!disabled.raw.blocked_by_archive);
     assert_eq!(
         disabled.raw.effective_cutoff,
         Some(NOW - 7 * DAY_MS),
-        "无归档门禁时 raw 的实际删除边界应为保留期 cutoff"
+        "无归档门禁时 raw 的删除边界应为保留期 cutoff"
     );
     assert_eq!(raw_count(&conn, agent), 1, "只剩未过期的 fresh raw");
-    assert!(
-        raw_has_ts(&conn, agent, fresh),
-        "未过期 raw 必须保留，实际被删"
-    );
+    assert!(raw_has_ts(&conn, agent, fresh), "未过期 raw 必须保留");
 }
 
 // ---------------------------------------------------------------------------
-// 用例 3：保留期水位夹紧。
-//
-// - raw 的水位（1m 水位）早于 cutoff 时，raw 只能删到水位；
-// - 1m 层受 1h 水位夹紧，且没有 1h 水位时该层一行不删。
+// 用例 3：1m 保留只删整小时 clean 行；dirty hour 整小时跳过。
 // ---------------------------------------------------------------------------
 
 #[test]
-fn m4_a2_retention_clamps_to_tier_watermarks() {
-    let dir = TempDbDir::new("clamp");
+fn m4_a2_retention_skips_dirty_hour_and_only_deletes_whole_clean_hours() {
+    let dir = TempDbDir::new("dirty-hour");
     let storage = open_storage(&dir);
-    let agent = "agent-clamp";
+    let agent = "agent-dirty";
     ensure_agent(&storage, agent);
 
-    // first_now：产生一个远早于保留期 cutoff 的 1m 水位。
-    const NOW_BASE: i64 = BASE + 8 * HOUR_MS;
-    let t0 = NOW_BASE - 10 * DAY_MS;
-    let first_now = t0 + 2 * HOUR_MS;
-    let now = first_now + 10 * DAY_MS;
+    const NOW: i64 = BASE + 8 * HOUR_MS;
+    // 1m 保留 10 天；max_late_days=8 与该配置自洽（10 >= 8 + 2）。
+    let cutoff = NOW - 10 * DAY_MS;
+    let hour_a = cutoff - 3 * HOUR_MS;
+    let hour_b = cutoff - 2 * HOUR_MS;
+    let label = [("host", "dirty")];
 
-    let raw_before_watermark = t0 + 10 * MINUTE_MS;
-    // 水位之前最后一个 1m 桶内的 raw，用于让 1m 层出现一个可被夹紧删除的旧桶。
-    let raw_pin_watermark = first_now - 90_000;
-    // 水位之后（相对首次 downsample 的 now）、但远早于保留期 cutoff 的 raw，必须保留。
-    let raw_after_watermark = first_now + 30_000;
-    // 1m 层中晚于 1h 水位、但早于 1m cutoff 的桶，必须保留。
-    let raw_after_tier = first_now + DAY_MS + 10 * MINUTE_MS;
-
-    let watermark_1m = first_now;
-    let cutoff = now - 7 * DAY_MS;
-    assert!(
-        watermark_1m < cutoff,
-        "测试前提：1m 水位必须早于保留期 cutoff"
-    );
-    assert!(
-        raw_after_watermark < cutoff && raw_after_tier < cutoff,
-        "测试前提：水位之后的 raw 必须仍早于保留期 cutoff"
-    );
-
-    let label = [("host", "clamp")];
     insert(
         &storage,
         &batch(
             agent,
             1,
-            first_now,
+            NOW,
             vec![
-                sample("disk.used", labels(&label), raw_before_watermark, 1.0),
-                sample("disk.used", labels(&label), raw_pin_watermark, 2.0),
+                sample("cpu.usage", labels(&label), hour_a + MINUTE_MS, 1.0),
+                sample("cpu.usage", labels(&label), hour_a + 2 * MINUTE_MS, 2.0),
+                sample("cpu.usage", labels(&label), hour_b + MINUTE_MS, 3.0),
             ],
         ),
     );
+    run_downsample(&storage, NOW, None).expect("首次 run_downsample 失败");
+    let conn = readonly_conn(&dir);
+    assert_eq!(tier_count(&conn, SAMPLES_1M, hour_a), 2);
+    assert_eq!(tier_count(&conn, SAMPLES_1M, hour_b), 1);
 
-    let first = run_downsample(&storage, first_now, None).expect("首次 run_downsample 失败");
-    assert_eq!(
-        first.one_minute.watermark,
-        Some(watermark_1m),
-        "1m 水位应推进到 first_now"
-    );
-    assert_eq!(
-        first.one_hour.watermark,
-        Some(first_now),
-        "1h 水位应推进到 first_now 整点"
-    );
-
-    // 首次 downsample 之后才写入、且 ts 晚于水位的 raw。
+    // 两个旧小时各来一条迟到 raw；后台块上限 1 令 1h 只重算其中一小时。
     insert(
         &storage,
         &batch(
             agent,
             2,
-            first_now,
-            vec![sample(
-                "disk.used",
-                labels(&label),
-                raw_after_watermark,
-                3.0,
-            )],
+            NOW,
+            vec![
+                sample(
+                    "cpu.usage",
+                    labels(&label),
+                    hour_a + 3 * MINUTE_MS + 30_000,
+                    10.0,
+                ),
+                sample(
+                    "cpu.usage",
+                    labels(&label),
+                    hour_b + 3 * MINUTE_MS + 30_000,
+                    20.0,
+                ),
+            ],
         ),
     );
-    // 用公开的单层聚合接口造一个晚于 1h 水位、早于 1m cutoff 的 1m 桶；
-    // 这里不运行完整 downsample，避免把水位继续推进。
+    let downsample =
+        run_downsample(&storage, NOW, Some(1)).expect("块上限 1 的 run_downsample 失败");
+    assert_eq!(downsample.one_minute.chunks, 1, "1m 块上限 1");
+    assert_eq!(downsample.one_hour.chunks, 1, "1h 块上限 1，只清理一小时");
+
+    // hour_a 已被 1h 认领（clean），hour_b 仍 dirty。
+    let conn = readonly_conn(&dir);
+    let dirty_hours: Vec<i64> = conn
+        .prepare("SELECT DISTINCT (bucket_ts / 3600000) * 3600000 FROM samples_1m WHERE aggregated_1h = 0 ORDER BY 1")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(dirty_hours, vec![hour_b], "只应剩 hour_b 为 dirty");
+
+    let cfg = HubConfig {
+        retention_raw_days: 0,
+        retention_1m_days: 10,
+        retention_1h_days: 0,
+        ingest: rustboard_common::config::HubIngestConfig {
+            max_late_days: 8,
+            max_future_skew_secs: 300,
+        },
+        ..HubConfig::default()
+    };
+    let retention = run_retention(&storage, &cfg, NOW, ArchiveGate::Disabled)
+        .expect("dirty hour retention 失败");
+    assert_eq!(retention.one_minute.cutoff, Some(cutoff));
+    assert_eq!(retention.one_minute.effective_cutoff, Some(cutoff));
+    assert_eq!(
+        retention.one_minute.deleted, 3,
+        "只应删除 hour_a 的 3 个 clean 1m 行，dirty hour_b 整小时保留"
+    );
+    assert!(
+        retention.one_minute.blocked_by_downsample,
+        "dirty hour 未删必须标记 blocked_by_downsample"
+    );
+    assert_eq!(tier_count(&conn, SAMPLES_1M, hour_a), 0);
+    assert_eq!(tier_count(&conn, SAMPLES_1M, hour_b), 2);
+
+    // 下一轮降采样清理 hour_b 后，保留期才能删除整小时。
+    run_downsample(&storage, NOW, None).expect("追平 dirty hour 失败");
+    let retention =
+        run_retention(&storage, &cfg, NOW, ArchiveGate::Disabled).expect("清理后的 retention 失败");
+    assert_eq!(retention.one_minute.deleted, 2);
+    assert!(!retention.one_minute.blocked_by_downsample);
+    assert_eq!(tier_count(&conn, SAMPLES_1M, hour_b), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 用例 4：1m 保留边界按整点向下取整（半个小时的 cutoff 不删该小时）。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m4_a2_retention_minute_cutoff_rounds_down_to_hour_boundary() {
+    let dir = TempDbDir::new("minute-cutoff");
+    let storage = open_storage(&dir);
+    let agent = "agent-cutoff";
+    ensure_agent(&storage, agent);
+
+    const NOW: i64 = BASE + 8 * HOUR_MS + 30 * MINUTE_MS;
+    let cutoff = NOW - 10 * DAY_MS; // 落在半小时点，不是整点
+    let hour_before = (cutoff / HOUR_MS) * HOUR_MS - HOUR_MS;
+    let hour_at_cutoff = (cutoff / HOUR_MS) * HOUR_MS;
+    let label = [("host", "cutoff")];
+
     insert(
         &storage,
         &batch(
             agent,
-            3,
-            first_now,
-            vec![sample("disk.used", labels(&label), raw_after_tier, 4.0)],
+            1,
+            NOW,
+            vec![
+                sample("cpu.usage", labels(&label), hour_before + MINUTE_MS, 1.0),
+                sample("cpu.usage", labels(&label), hour_at_cutoff + MINUTE_MS, 2.0),
+            ],
         ),
     );
-    let direct = storage
-        .downsample_1m_range(raw_after_tier, raw_after_tier + HOUR_MS)
-        .expect("downsample_1m_range 失败");
-    assert_eq!(direct.buckets, 1, "应生成 1 个用于夹紧测试的 1m 桶");
-
+    run_downsample(&storage, NOW, None).expect("run_downsample 失败");
     let conn = readonly_conn(&dir);
+    assert_eq!(tier_count(&conn, SAMPLES_1M, hour_before), 1);
+    assert_eq!(tier_count(&conn, SAMPLES_1M, hour_at_cutoff), 1);
 
-    // raw 层：1m 水位早于 cutoff，只能删到水位。
-    let cfg_raw = HubConfig {
-        retention_raw_days: 7,
+    let cfg = HubConfig {
+        retention_raw_days: 0,
+        retention_1m_days: 10,
+        retention_1h_days: 0,
+        ingest: rustboard_common::config::HubIngestConfig {
+            max_late_days: 8,
+            max_future_skew_secs: 300,
+        },
+        ..HubConfig::default()
+    };
+    let retention =
+        run_retention(&storage, &cfg, NOW, ArchiveGate::Disabled).expect("run_retention 失败");
+    assert_eq!(retention.one_minute.cutoff, Some(cutoff));
+    assert_eq!(
+        retention.one_minute.effective_cutoff,
+        Some(hour_at_cutoff),
+        "1m cutoff 必须向下取整到整点"
+    );
+    assert_eq!(
+        retention.one_minute.deleted, 1,
+        "只删 cutoff 之前的完整小时，cutoff 所在小时整小时保留"
+    );
+    assert_eq!(tier_count(&conn, SAMPLES_1M, hour_before), 0);
+    assert_eq!(tier_count(&conn, SAMPLES_1M, hour_at_cutoff), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 用例 5：#50 旧库超界时间戳审计与 i64 边界。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn issue50_legacy_audit_isolates_out_of_horizon_rows_and_handles_i64() {
+    let dir = TempDbDir::new("audit");
+    let storage = open_storage(&dir);
+    let agent = "agent-audit";
+    ensure_agent(&storage, agent);
+
+    const NOW: i64 = BASE + 8 * HOUR_MS;
+    let valid = NOW - 2 * DAY_MS;
+    let too_old = NOW - 31 * DAY_MS;
+    let too_new = NOW + 301_000;
+    insert(
+        &storage,
+        &batch(
+            agent,
+            1,
+            NOW,
+            vec![
+                sample("cpu.usage", Labels::new(), valid, 1.0),
+                sample("cpu.usage", Labels::new(), too_old, 2.0),
+                sample("cpu.usage", Labels::new(), too_new, 3.0),
+                sample("cpu.usage", Labels::new(), i64::MIN, 4.0),
+                sample("cpu.usage", Labels::new(), i64::MAX, 5.0),
+            ],
+        ),
+    );
+
+    let cfg = HubConfig::default(); // max_late_days=30, max_future_skew_secs=300
+    let audit = audit_legacy_raw_rows(&storage, &cfg, NOW).expect("legacy 审计失败");
+    assert_eq!(
+        audit.invalid_timestamp_rows, 4,
+        "too_old / too_new / i64::MIN / i64::MAX 都是超界行"
+    );
+    assert_eq!(
+        audit.unaggregated_invalid_rows, 4,
+        "审计前 4 条超界行都未聚合"
+    );
+    assert_eq!(audit.isolated_rows, 4);
+    assert_eq!(audit.legacy_unaggregated_rows, 1);
+
+    let status = maintenance_status(&storage, &cfg, NOW).expect("maintenance_status 失败");
+    assert_eq!(status.raw.rows, 5);
+    assert_eq!(status.unaggregated_rows, 1, "只有 valid 行仍待聚合");
+    assert_eq!(status.invalid_timestamp_rows, 4);
+    assert_eq!(
+        status.legacy_unaggregated_rows, 0,
+        "审计后不再有遗留未聚合行"
+    );
+
+    // 审计已把 4 条超界行隔离为 aggregated_1m=1，但仍保留在 raw。
+    let conn = readonly_conn(&dir);
+    let isolated: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM samples WHERE aggregated_1m = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(isolated, 4, "审计必须隔离 4 条超界行");
+    // delta 只能聚合 valid 行；i64 极值不得 panic / 回绕。
+    let report = run_downsample(&storage, NOW, None).expect("审计后的 run_downsample 失败");
+    assert_eq!(report.one_minute.rows, 1);
+    assert_aggregate(
+        &conn,
+        SAMPLES_1M,
+        agent,
+        "cpu.usage",
+        (valid / MINUTE_MS) * MINUTE_MS,
+        (1, 1.0, 1.0),
+        "只有 valid 行进入 1m",
+    );
+    assert_eq!(raw_count(&conn, agent), 5);
+    let aggregated: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM samples WHERE aggregated_1m = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(aggregated, 5, "审计隔离 4 行 + valid 行聚合 1 行");
+}
+
+// ---------------------------------------------------------------------------
+// 用例 6：late 行在 downsample 之后、retention 之前到达时不得被删除；
+// 下一轮增量聚合完成后才允许按保留期删除。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m4_a2_late_raw_arriving_between_downsample_and_retention_is_not_deleted_first() {
+    let dir = TempDbDir::new("late-retention");
+    let storage = open_storage(&dir);
+    let agent = "agent-late-retention";
+    ensure_agent(&storage, agent);
+
+    const NOW: i64 = BASE + 12 * HOUR_MS;
+    let late_bucket = NOW - 40 * DAY_MS;
+    let cfg = HubConfig {
+        retention_raw_days: 30,
         retention_1m_days: 90,
         retention_1h_days: 730,
+        ingest: rustboard_common::config::HubIngestConfig {
+            max_late_days: 60,
+            max_future_skew_secs: 300,
+        },
         ..HubConfig::default()
     };
-    let raw_run = run_retention(&storage, &cfg_raw, now, ArchiveGate::Disabled)
-        .expect("raw 夹紧的 run_retention 失败");
-    assert_eq!(
-        raw_run.raw.deleted, 2,
-        "raw 只应删除水位之前的 2 行（含旧 1m 桶对应的 raw）"
-    );
-    assert!(
-        raw_run.raw.blocked_by_downsample,
-        "1m 水位早于 cutoff 时必须标记 blocked_by_downsample"
-    );
-    assert_eq!(
-        raw_run.raw.effective_cutoff,
-        Some(watermark_1m),
-        "raw 的实际删除边界必须夹紧到 1m 水位"
-    );
-    assert_eq!(
-        raw_run.one_minute.deleted, 0,
-        "1m 保留期 90 天时这批 1m 桶不应被删除"
-    );
-    assert_eq!(raw_count(&conn, agent), 2, "raw 只能删到水位，之后保留");
-    assert!(
-        !raw_has_ts(&conn, agent, raw_before_watermark),
-        "水位之前的 raw 应被删除"
-    );
-    assert!(
-        !raw_has_ts(&conn, agent, raw_pin_watermark),
-        "水位之前旧 1m 桶对应的 raw 应被删除"
-    );
-    assert!(
-        raw_has_ts(&conn, agent, raw_after_watermark),
-        "水位之后的 raw 必须保留"
-    );
-    assert!(
-        raw_has_ts(&conn, agent, raw_after_tier),
-        "水位之后的 raw（即使早于 cutoff）必须保留"
-    );
-    assert_aggregate(
-        &conn,
-        SAMPLES_1M,
-        agent,
-        "disk.used",
-        raw_before_watermark,
-        (1, 1.0, 1.0),
-        "1m 90 天保留期内的旧桶",
-    );
+    let label = [("host", "late-retention")];
 
-    // 1m 层：受 1h 水位（first_now）夹紧，只删 first_now 之前的桶。
-    let cfg_1m = HubConfig {
-        retention_raw_days: 7,
-        retention_1m_days: 7,
-        retention_1h_days: 730,
-        ..HubConfig::default()
-    };
-    let tier_run = run_retention(&storage, &cfg_1m, now, ArchiveGate::Disabled)
-        .expect("1m 夹紧的 run_retention 失败");
-    assert_eq!(
-        tier_run.one_minute.deleted, 2,
-        "1m 只应删除 1h 水位之前的 2 个桶"
+    // 首次聚合：桶内 10/20。
+    insert(
+        &storage,
+        &batch(
+            agent,
+            1,
+            NOW,
+            vec![
+                sample("cpu.usage", labels(&label), late_bucket, 10.0),
+                sample("cpu.usage", labels(&label), late_bucket + 20_000, 20.0),
+            ],
+        ),
     );
-    assert!(
-        tier_run.one_minute.blocked_by_downsample,
-        "1h 水位早于 1m cutoff 时必须标记 blocked_by_downsample"
-    );
-    assert_eq!(
-        tier_run.one_minute.effective_cutoff,
-        Some(first_now),
-        "1m 的实际删除边界必须夹紧到 1h 水位"
-    );
-    assert_eq!(tier_run.raw.deleted, 0, "该轮不应再删除 raw");
-    assert!(
-        tier_row(&conn, SAMPLES_1M, agent, "disk.used", raw_before_watermark).is_none(),
-        "1h 水位之前的 1m 桶应被删除"
-    );
-    assert_aggregate(
-        &conn,
-        SAMPLES_1M,
-        agent,
-        "disk.used",
-        raw_after_tier,
-        (1, 4.0, 4.0),
-        "1h 水位之后的 1m 桶即使早于 1m cutoff 也必须保留",
-    );
+    run_downsample(&storage, NOW, None).expect("首次 run_downsample 失败");
 
-    // 没有 1h 水位：1m 层一行不删（即使 cutoff 已越过这些桶）。
-    storage
-        .set_maintenance_state(STATE_DOWNSAMPLE_1H_WATERMARK, "", now)
-        .expect("清空 1h 水位失败");
-    let skipped = run_retention(&storage, &cfg_1m, now, ArchiveGate::Disabled)
-        .expect("无 1h 水位的 run_retention 失败");
+    // 迟到 30 在 downsample 之后到达；此时 raw 仍是 aggregated_1m=0。
+    insert(
+        &storage,
+        &batch(
+            agent,
+            2,
+            NOW,
+            vec![sample(
+                "cpu.usage",
+                labels(&label),
+                late_bucket + 40_000,
+                30.0,
+            )],
+        ),
+    );
+    let retention = run_retention(&storage, &cfg, NOW, ArchiveGate::Disabled)
+        .expect("downsample 后 retention 失败");
     assert_eq!(
-        skipped.one_minute.deleted, 0,
-        "缺少 1h 水位时 1m 层必须跳过删除"
+        retention.raw.deleted, 2,
+        "只应删除已聚合的 2 行；新迟到行未聚合，不能删"
     );
     assert!(
-        skipped.one_minute.skipped_no_watermark,
-        "缺少 1h 水位时必须标记 skipped_no_watermark"
+        retention.raw.blocked_by_downsample,
+        "存在未聚合 raw 时必须标记 blocked_by_downsample"
     );
+    let conn = readonly_conn(&dir);
+    assert!(raw_has_ts(&conn, agent, late_bucket + 40_000));
+
+    let report = run_downsample(&storage, NOW, None).expect("迟到行合并失败");
+    assert_eq!(report.one_minute.rows, 1);
     assert_aggregate(
         &conn,
         SAMPLES_1M,
         agent,
-        "disk.used",
-        raw_after_tier,
-        (1, 4.0, 4.0),
-        "无 1h 水位时 1m 桶不得被删除",
+        "cpu.usage",
+        late_bucket,
+        (3, 20.0, 30.0),
+        "迟到行合并后的 1m 桶",
     );
-    assert_eq!(skipped.raw.deleted, 0, "该轮不应再删除 raw");
+    let retention = run_retention(&storage, &cfg, NOW, ArchiveGate::Disabled)
+        .expect("增量聚合后的 retention 失败");
+    assert_eq!(retention.raw.deleted, 1, "迟到 raw 聚合后才可删除");
+    assert_eq!(raw_count(&conn, agent), 0);
 }

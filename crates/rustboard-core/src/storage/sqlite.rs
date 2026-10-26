@@ -21,9 +21,9 @@ use crate::channels::{ChannelConfig, ChannelKind, NotificationChannel};
 
 use super::{
     invalid_batch, AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry,
-    DownsampleRangeResult, IngestOutcome, MaintenanceStateEntry, NewAuditEntry, PruneResult,
-    QueryTooLarge, RejectReason, SampleTier, Storage, TierStats, AUDIT_RETENTION_MS, BUCKET_1H_MS,
-    BUCKET_1M_MS,
+    DownsampleDeltaResult, DownsampleHourResult, DownsampleRangeResult, IngestOutcome,
+    MaintenanceStateEntry, NewAuditEntry, PruneResult, QueryTooLarge, RejectReason, SampleTier,
+    Storage, TierStats, AUDIT_RETENTION_MS, BUCKET_1H_MS, BUCKET_1M_MS,
 };
 
 /// 默认只读连接池大小（与 `HubConfig::read_pool_size` 默认值一致）。
@@ -477,24 +477,92 @@ ON CONFLICT(agent_id, metric, labels, bucket_ts) DO UPDATE SET
     count = excluded.count
 "#;
 
+/// R1b：1m 增量合并。只认领 `aggregated_1m=0` 的 raw，按桶计算 delta 后与
+/// 已有 1m 行合并：
+///
+/// - `count += delta.count`；`min/max` 取两边极值；
+/// - `avg` 按两边 count 加权，不能覆盖为 delta 的简单平均；
+/// - `last_value/last_ts` 仅在 `delta.last_ts > samples_1m.last_ts` 时改写；
+/// - 新桶 `aggregated_1h=0`；已有桶同样置 0，保证 1h 源完整。
+///
+/// 下标 60000 与 [`BUCKET_1M_MS`] 必须一致（单测断言）。
+const AGGREGATE_1M_DELTA_SQL: &str = r#"
+INSERT INTO samples_1m
+    (agent_id, metric, labels, bucket_ts, min_value, max_value, avg_value,
+     last_value, count, last_ts, aggregated_1h)
+SELECT agent_id, metric, labels, bucket_ts,
+       MIN(value), MAX(value), AVG(value), MAX(last_value), COUNT(*),
+       MAX(last_ts), 0
+FROM (
+    SELECT agent_id, metric, labels,
+           (ts / 60000) * 60000 AS bucket_ts,
+           value, ts AS last_ts,
+           FIRST_VALUE(value) OVER (
+               PARTITION BY agent_id, metric, labels, (ts / 60000) * 60000
+               ORDER BY ts DESC, rowid DESC
+           ) AS last_value
+    FROM samples
+    WHERE aggregated_1m = 0 AND ts >= 0 AND ts < ?1
+)
+GROUP BY agent_id, metric, labels, bucket_ts
+ON CONFLICT(agent_id, metric, labels, bucket_ts) DO UPDATE SET
+    min_value = MIN(samples_1m.min_value, excluded.min_value),
+    max_value = MAX(samples_1m.max_value, excluded.max_value),
+    avg_value = (samples_1m.avg_value * samples_1m.count
+                 + excluded.avg_value * excluded.count)
+                / (samples_1m.count + excluded.count),
+    last_value = CASE
+        WHEN excluded.last_ts > samples_1m.last_ts THEN excluded.last_value
+        ELSE samples_1m.last_value
+    END,
+    last_ts = MAX(samples_1m.last_ts, excluded.last_ts),
+    count = samples_1m.count + excluded.count,
+    aggregated_1h = 0
+"#;
+
+/// 把本批 raw 所在的**整小时**全部 1m 行置 `aggregated_1h=0`。
+///
+/// 只重置当前桶所在分钟不够：1h 由整点小时内所有 1m 行重算，同一小时其它
+/// 分钟/序列的 1m 行也属于同一份源，必须一起标脏。
+const MARK_1M_HOURS_DIRTY_SQL: &str = "UPDATE samples_1m SET aggregated_1h = 0 \
+     WHERE (bucket_ts / 3600000) IN ( \
+         SELECT DISTINCT (ts / 3600000) FROM samples \
+         WHERE aggregated_1m = 0 AND ts >= 0 AND ts < ?1)";
+
+/// 认领本批 raw：只把仍为 0 的行置 1；affected 必须等于选中行数。
+const CLAIM_RAW_AGGREGATED_SQL: &str = "UPDATE samples SET aggregated_1m = 1 \
+     WHERE aggregated_1m = 0 AND ts >= 0 AND ts < ?1";
+
 /// 保留期删除 SQL：每批最多 `?2` 行，`?1` 是排他 cutoff（`< cutoff`）。
 ///
 /// 用 `rowid IN (SELECT ... LIMIT)` 而不是全表 DELETE，保证单批事务短、批间
 /// 可以释放写锁；`rowid` 对三张表都可用（均非 WITHOUT ROWID）。
 const PRUNE_RAW_SQL: &str = "DELETE FROM samples WHERE rowid IN \
-     (SELECT rowid FROM samples WHERE ts < ?1 ORDER BY ts LIMIT ?2)";
+     (SELECT rowid FROM samples \
+      WHERE ts < ?1 AND aggregated_1m = 1 ORDER BY ts LIMIT ?2)";
 /// v8 归档启用时的 raw 保留期：只删「已聚合且所属对象已 uploaded」的行。
 ///
 /// 未认领行（`archive_object_id IS NULL`）与 pending / failed 对象必须保留；
 /// 本常量只在 [`SqliteStorage::prune_archived_samples_before`] 中使用，
-/// R1a-1 不改动现有 [`PRUNE_RAW_SQL`] 的行为。
+/// [`PRUNE_RAW_SQL`] 仅供归档关闭路径。
 const PRUNE_ARCHIVED_RAW_SQL: &str = "DELETE FROM samples WHERE rowid IN \
      (SELECT s.rowid FROM samples s \
         JOIN archive_objects o ON o.id = s.archive_object_id \
       WHERE s.ts < ?1 AND s.aggregated_1m = 1 AND o.status = 'uploaded' \
       ORDER BY s.ts LIMIT ?2)";
+/// 1m 保留期：只删**整小时都已 `aggregated_1h=1`** 的行。
+///
+/// 调用方已把 `?1` 向下取整到整点；dirty hour 只要有一行未聚合，整小时跳过。
 const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE rowid IN \
-     (SELECT rowid FROM samples_1m WHERE bucket_ts < ?1 ORDER BY bucket_ts LIMIT ?2)";
+     (SELECT m.rowid FROM samples_1m m \
+      WHERE m.bucket_ts < ?1 \
+        AND NOT EXISTS ( \
+            SELECT 1 FROM samples_1m d \
+            WHERE d.aggregated_1h = 0 \
+              AND d.bucket_ts >= (m.bucket_ts / 3600000) * 3600000 \
+              AND d.bucket_ts < (m.bucket_ts / 3600000) * 3600000 + 3600000 \
+        ) \
+      ORDER BY m.bucket_ts LIMIT ?2)";
 const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE rowid IN \
      (SELECT rowid FROM samples_1h WHERE bucket_ts < ?1 ORDER BY bucket_ts LIMIT ?2)";
 
@@ -2347,6 +2415,38 @@ impl Storage for SqliteStorage {
         SqliteStorage::downsample_1h_range(self, from_ts, to_ts)
     }
 
+    fn downsample_1m_delta(
+        &self,
+        closed_end: i64,
+        max_rows: usize,
+    ) -> Result<DownsampleDeltaResult> {
+        SqliteStorage::downsample_1m_delta(self, closed_end, max_rows)
+    }
+
+    fn downsample_1h_hour(&self, closed_hour: i64) -> Result<Option<DownsampleHourResult>> {
+        SqliteStorage::downsample_1h_hour(self, closed_hour)
+    }
+
+    fn count_unaggregated_raw_rows(&self) -> Result<i64> {
+        SqliteStorage::count_unaggregated_raw_rows(self)
+    }
+
+    fn count_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        SqliteStorage::count_raw_rows_outside(self, min_ts, max_ts)
+    }
+
+    fn count_unaggregated_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        SqliteStorage::count_unaggregated_raw_rows_outside(self, min_ts, max_ts)
+    }
+
+    fn count_unaggregated_raw_rows_before(&self, before_ts: i64) -> Result<i64> {
+        SqliteStorage::count_unaggregated_raw_rows_before(self, before_ts)
+    }
+
+    fn isolate_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<usize> {
+        SqliteStorage::isolate_raw_rows_outside(self, min_ts, max_ts)
+    }
+
     fn raw_stats(&self) -> Result<TierStats> {
         SqliteStorage::raw_stats(self)
     }
@@ -4091,9 +4191,66 @@ impl SqliteStorage {
 // M4：降采样与保留期（schema v7 的 samples_1m / samples_1h / maintenance_state）
 // ---------------------------------------------------------------------------
 
-/// 把时间戳向下取整到 `bucket_ms` 边界（UTC 毫秒，非负）。
-fn bucket_floor(ts: i64, bucket_ms: i64) -> i64 {
-    ts.div_euclid(bucket_ms) * bucket_ms
+/// 把时间戳向下取整到 `bucket_ms` 边界（UTC 毫秒）。
+///
+/// #50：除法与乘法都走 checked，`i64::MIN` 等极端值只返回显式错误，
+/// 不 panic、不回绕。
+fn bucket_floor(ts: i64, bucket_ms: i64) -> Result<i64> {
+    ts.checked_div_euclid(bucket_ms)
+        .and_then(|quotient| quotient.checked_mul(bucket_ms))
+        .ok_or_else(|| anyhow::anyhow!("时间戳无法对齐到 {bucket_ms}ms 桶：超出 i64 可表示范围"))
+}
+
+/// 计算一批 1m delta 的排他上界：第 `max_rows` 条 raw 所在分钟桶的结束点。
+///
+/// 找不到第 `max_rows` 条时整段剩余行都纳入；桶不可拆分，所以返回上界可能
+/// 包含超过 `max_rows` 的行（整桶）。
+fn delta_chunk_end(tx: &Transaction<'_>, closed_end: i64, max_rows: usize) -> Result<i64> {
+    let offset = i64::try_from(max_rows.saturating_sub(1)).unwrap_or(i64::MAX);
+    let boundary: Option<i64> = tx
+        .query_row(
+            "SELECT ts FROM samples \
+             WHERE aggregated_1m = 0 AND ts >= 0 AND ts < ?1 \
+             ORDER BY ts ASC, rowid ASC LIMIT 1 OFFSET ?2",
+            params![closed_end, offset],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match boundary {
+        Some(ts) => {
+            let bucket = bucket_floor(ts, BUCKET_1M_MS)?;
+            let end = bucket
+                .checked_add(BUCKET_1M_MS)
+                .ok_or_else(|| anyhow::anyhow!("分钟桶上界溢出"))?;
+            Ok(end.min(closed_end))
+        }
+        None => Ok(closed_end),
+    }
+}
+
+/// 选最早一个「1m 源已完整」的脏整点小时。
+///
+/// 候选：`aggregated_1h=0 AND bucket_ts < closed_hour`；只接受该小时结束前
+/// 不再有未聚合 raw 的小时，避免用残缺 1m 源生成 1h。
+fn next_recomputable_hour(tx: &Transaction<'_>, closed_hour: i64) -> Result<Option<i64>> {
+    Ok(tx
+        .query_row(
+            "SELECT MIN(hour_start) FROM ( \
+                 SELECT (m.bucket_ts / 3600000) * 3600000 AS hour_start \
+                 FROM samples_1m m \
+                 WHERE m.aggregated_1h = 0 AND m.bucket_ts >= 0 AND m.bucket_ts < ?1 \
+                 GROUP BY hour_start \
+             ) h \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM samples s \
+                 WHERE s.aggregated_1m = 0 AND s.ts >= 0 \
+                   AND s.ts < h.hour_start + 3600000 \
+             )",
+            params![closed_hour],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 impl SqliteStorage {
@@ -4107,8 +4264,8 @@ impl SqliteStorage {
     ///
     /// 返回本次 upsert 的桶数与参与聚合的 raw 行数。
     pub fn downsample_1m_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult> {
-        let from = bucket_floor(from_ts, BUCKET_1M_MS);
-        let to = bucket_floor(to_ts, BUCKET_1M_MS);
+        let from = bucket_floor(from_ts, BUCKET_1M_MS)?;
+        let to = bucket_floor(to_ts, BUCKET_1M_MS)?;
         if to <= from {
             return Ok(DownsampleRangeResult::default());
         }
@@ -4132,8 +4289,8 @@ impl SqliteStorage {
     /// `avg_value` 使用按 `count` 加权的平均值；`last_value` 取最新 1m 桶；
     /// 两端向下取整到整点，保证不聚合半个小时的残缺数据；upsert 幂等。
     pub fn downsample_1h_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult> {
-        let from = bucket_floor(from_ts, BUCKET_1H_MS);
-        let to = bucket_floor(to_ts, BUCKET_1H_MS);
+        let from = bucket_floor(from_ts, BUCKET_1H_MS)?;
+        let to = bucket_floor(to_ts, BUCKET_1H_MS)?;
         if to <= from {
             return Ok(DownsampleRangeResult::default());
         }
@@ -4150,6 +4307,176 @@ impl SqliteStorage {
             buckets,
             rows: rows as usize,
         })
+    }
+
+    /// R1b：认领并增量合并一批未聚合 raw 到 1m。
+    ///
+    /// 选择、聚合、标脏 1h 源、标记 raw 全部在同一个 `BEGIN IMMEDIATE` 事务内，
+    /// 并在提交前校验 `UPDATE ... aggregated_1m=0` 的 affected 等于选中行数。
+    pub fn downsample_1m_delta(
+        &self,
+        closed_end: i64,
+        max_rows: usize,
+    ) -> Result<DownsampleDeltaResult> {
+        let closed_end = bucket_floor(closed_end, BUCKET_1M_MS)?;
+        if closed_end <= 0 || max_rows == 0 {
+            return Ok(DownsampleDeltaResult::default());
+        }
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let chunk_end = delta_chunk_end(&tx, closed_end, max_rows)?;
+        let rows: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM samples \
+             WHERE aggregated_1m = 0 AND ts >= 0 AND ts < ?1",
+            params![chunk_end],
+            |row| row.get(0),
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(DownsampleDeltaResult {
+                processed_to: chunk_end,
+                ..DownsampleDeltaResult::default()
+            });
+        }
+        let buckets = tx.execute(AGGREGATE_1M_DELTA_SQL, params![chunk_end])?;
+        tx.execute(MARK_1M_HOURS_DIRTY_SQL, params![chunk_end])?;
+        let claimed = tx.execute(CLAIM_RAW_AGGREGATED_SQL, params![chunk_end])?;
+        if i64::try_from(claimed).unwrap_or(i64::MAX) != rows {
+            anyhow::bail!(
+                "1m 增量认领行数不一致（选中 {rows} 行，affected {claimed} 行）：\
+                 已回滚本批，避免重复计数或漏标记"
+            );
+        }
+        tx.commit()?;
+        Ok(DownsampleDeltaResult {
+            buckets,
+            rows: usize::try_from(rows).context("1m delta 源行数溢出")?,
+            processed_to: chunk_end,
+        })
+    }
+
+    /// R1b：锁定并重算最早一个可重算整点小时的 1h。
+    ///
+    /// SQLite 的写事务本身就是小时锁；affected 与行数不一致时 drop 事务回滚。
+    pub fn downsample_1h_hour(&self, closed_hour: i64) -> Result<Option<DownsampleHourResult>> {
+        let closed_hour = bucket_floor(closed_hour, BUCKET_1H_MS)?;
+        if closed_hour <= 0 {
+            return Ok(None);
+        }
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(hour) = next_recomputable_hour(&tx, closed_hour)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let hour_end = hour
+            .checked_add(BUCKET_1H_MS)
+            .ok_or_else(|| anyhow::anyhow!("整点小时上界溢出"))?;
+        let incomplete: i64 = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM samples \
+             WHERE aggregated_1m = 0 AND ts >= 0 AND ts < ?1)",
+            params![hour_end],
+            |row| row.get(0),
+        )?;
+        if incomplete != 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let rows: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM samples_1m WHERE bucket_ts >= ?1 AND bucket_ts < ?2",
+            params![hour, hour_end],
+            |row| row.get(0),
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let buckets = tx.execute(AGGREGATE_1H_SQL, params![hour, hour_end])?;
+        let marked = tx.execute(
+            "UPDATE samples_1m SET aggregated_1h = 1 \
+             WHERE bucket_ts >= ?1 AND bucket_ts < ?2",
+            params![hour, hour_end],
+        )?;
+        if i64::try_from(marked).unwrap_or(i64::MAX) != rows {
+            anyhow::bail!(
+                "1h 认领行数不一致（锁定 {rows} 行，affected {marked} 行）：\
+                 已回滚本小时"
+            );
+        }
+        tx.commit()?;
+        Ok(Some(DownsampleHourResult {
+            hour_ts: hour,
+            buckets,
+            rows: usize::try_from(rows).context("1h 源行数溢出")?,
+        }))
+    }
+
+    /// `maintenance status`：未聚合 raw 行数。
+    pub fn count_unaggregated_raw_rows(&self) -> Result<i64> {
+        let conn = self.lock_read();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM samples WHERE aggregated_1m = 0",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// 旧超界时间戳审计：统计 `ts < min_ts OR ts > max_ts` 的 raw 行数。
+    pub fn count_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        let conn = self.lock_read();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM samples WHERE ts < ?1 OR ts > ?2",
+            params![min_ts, max_ts],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// 旧超界时间戳中仍未聚合的 raw 行数。
+    pub fn count_unaggregated_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        let conn = self.lock_read();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM samples \
+             WHERE aggregated_1m = 0 AND (ts < ?1 OR ts > ?2)",
+            params![min_ts, max_ts],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// `ts < before_ts` 且未聚合的 raw 行数（legacy 1m horizon）。
+    pub fn count_unaggregated_raw_rows_before(&self, before_ts: i64) -> Result<i64> {
+        let conn = self.lock_read();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM samples WHERE aggregated_1m = 0 AND ts < ?1",
+            params![before_ts],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// 把超界时间戳的未聚合 raw 分批标记为已隔离（`aggregated_1m=1`）。
+    pub fn isolate_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<usize> {
+        let mut total = 0usize;
+        loop {
+            let marked = {
+                let conn = self.lock_write();
+                conn.execute(
+                    "UPDATE samples SET aggregated_1m = 1 WHERE rowid IN (\
+                     SELECT rowid FROM samples \
+                     WHERE aggregated_1m = 0 AND (ts < ?1 OR ts > ?2) \
+                     ORDER BY ts LIMIT ?3)",
+                    params![min_ts, max_ts, PRUNE_BATCH_ROWS as i64],
+                )?
+            };
+            if marked == 0 {
+                break;
+            }
+            total += marked;
+            if marked < PRUNE_BATCH_ROWS {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        Ok(total)
     }
 
     /// raw 层的行数与最旧/最新时间戳。
@@ -4283,9 +4610,13 @@ impl SqliteStorage {
         self.prune_raw_batched(PRUNE_ARCHIVED_RAW_SQL, cutoff)
     }
 
-    /// 分批删除 1m 中 `bucket_ts < cutoff` 的行。
+    /// 分批删除 1m 中 `bucket_ts < cutoff` 且整小时已聚合的行。
+    ///
+    /// `cutoff` 先向下取整到整点：只删完整小时，避免在 dirty/clean 边界留下
+    /// 半小时间隔；dirty hour（任一行 `aggregated_1h=0`）整小时跳过。
     pub fn prune_samples_1m_before(&self, cutoff: i64) -> Result<PruneResult> {
-        self.prune_batched(PRUNE_1M_SQL, cutoff)
+        let hour_cutoff = bucket_floor(cutoff, BUCKET_1H_MS)?;
+        self.prune_batched(PRUNE_1M_SQL, hour_cutoff)
     }
 
     /// 分批删除 1h 中 `bucket_ts < cutoff` 的行。
@@ -5533,6 +5864,20 @@ mod tests {
             stmt.execute(params![agent_id, metric, labels, ts, value])
                 .unwrap();
         }
+    }
+
+    /// R1b：retention 只删已聚合 raw；测试要构造可删行时先标记。
+    fn mark_all_raw_aggregated(s: &SqliteStorage) {
+        s.lock_write()
+            .execute("UPDATE samples SET aggregated_1m = 1", [])
+            .unwrap();
+    }
+
+    /// R1b：1m retention 只删整小时 clean 行；旧 API 直接造桶时显式标 clean。
+    fn mark_all_1m_aggregated(s: &SqliteStorage) {
+        s.lock_write()
+            .execute("UPDATE samples_1m SET aggregated_1h = 1", [])
+            .unwrap();
     }
 
     /// v4：`agent_settings` 按 agent 覆盖写入，列表按 agent_id 稳定排序。
@@ -7122,6 +7467,27 @@ mod tests {
         assert_eq!(hour.newest_ts, Some(1_699_999_200_000));
     }
 
+    /// R1b：静态自检 SQL 常量必须坚持增量合并 / 整小时标脏 / 只删已聚合行。
+    #[test]
+    fn r1b_sql_constants_enforce_delta_and_retention_semantics() {
+        assert!(AGGREGATE_1M_DELTA_SQL.contains("aggregated_1m = 0"));
+        assert!(AGGREGATE_1M_DELTA_SQL.contains("ts >= 0"));
+        assert!(AGGREGATE_1M_DELTA_SQL.contains("samples_1m.count"));
+        assert!(AGGREGATE_1M_DELTA_SQL.contains("excluded.last_ts"));
+        assert!(AGGREGATE_1M_DELTA_SQL.contains("aggregated_1h = 0"));
+        assert!(MARK_1M_HOURS_DIRTY_SQL.contains("(bucket_ts / 3600000)"));
+        assert!(CLAIM_RAW_AGGREGATED_SQL.contains("aggregated_1m = 0"));
+        assert!(
+            PRUNE_RAW_SQL.contains("aggregated_1m = 1"),
+            "raw retention 必须只删已聚合行"
+        );
+        assert!(
+            PRUNE_1M_SQL.contains("aggregated_1h = 0"),
+            "1m retention 必须整小时跳过 dirty hour"
+        );
+        assert!(PRUNE_1M_SQL.contains("3600000"));
+    }
+
     /// M4-A2：rowid 扫描能发现增量行、无新行不误报、整表删除后 rowid 回退可恢复。
     #[test]
     fn m4a_raw_new_rows_detects_incremental_and_rowid_reset() {
@@ -7151,6 +7517,8 @@ mod tests {
         assert_eq!(min_ts2, Some(base - 5_000));
 
         // 整表删除后重新插入：rowid 回退，旧 rowid 水位必须失效并重新扫描。
+        // R1b：retention 只删已聚合 raw，先标记再删除。
+        mark_all_raw_aggregated(&s);
         assert_eq!(s.prune_samples_before(i64::MAX).unwrap().deleted, 3);
         insert_samples(&s, "a1", &[("cpu.usage", "{}", base + 10_000, 3.0)]);
         let (max3, min_ts3) = s.raw_new_rows(Some(max2)).unwrap();
@@ -7178,6 +7546,7 @@ mod tests {
         rows.push(("cpu.usage", "{}", cutoff, 1.0));
         rows.push(("cpu.usage", "{}", cutoff + 1_000, 2.0));
         insert_samples(&s, "a1", &rows);
+        mark_all_raw_aggregated(&s);
 
         let pruned = s.prune_samples_before(cutoff).unwrap();
         assert_eq!(pruned.deleted, 12_000);
@@ -7192,28 +7561,42 @@ mod tests {
             PruneResult::default()
         );
 
-        // 1m：bucket_ts 严格小于 cutoff 才删除。
+        // 1m：cutoff 向下取整到整点；只删整小时且该小时全部 clean。
+        let hour = 1_699_999_200_000;
         insert_samples(
             &s,
             "a1",
             &[
-                ("cpu.usage", "{}", cutoff - 60_000 + 1_000, 1.0),
-                ("cpu.usage", "{}", cutoff + 1_000, 2.0),
+                ("cpu.usage", "{}", hour - 60_000 + 1_000, 1.0),
+                ("cpu.usage", "{}", hour + 1_000, 2.0),
             ],
         );
-        s.downsample_1m_range(cutoff - 60_000, cutoff + 60_000)
-            .unwrap();
+        s.downsample_1m_range(hour - 60_000, hour + 60_000).unwrap();
+        mark_all_1m_aggregated(&s);
         assert_eq!(s.samples_1m_stats().unwrap().rows, 2);
-        assert_eq!(s.prune_samples_1m_before(cutoff).unwrap().deleted, 1);
+        assert_eq!(s.prune_samples_1m_before(hour).unwrap().deleted, 1);
         let minute = s.samples_1m_stats().unwrap();
         assert_eq!(minute.rows, 1);
-        assert_eq!(minute.oldest_ts, Some(cutoff));
+        assert_eq!(minute.oldest_ts, Some(hour));
 
-        // 1h：整点边界同样是严格小于。
-        let hour = 1_699_999_200_000;
-        insert_samples(&s, "a1", &[("cpu.usage", "{}", hour - 1_800_000, 5.0)]);
-        s.downsample_1m_range(hour - BUCKET_1H_MS, hour + BUCKET_1H_MS)
+        // dirty hour 整小时跳过：独立旧小时里的桶未标记 clean 时不得删除。
+        let dirty_hour = hour - 10 * BUCKET_1H_MS;
+        insert_samples(&s, "a1", &[("cpu.usage", "{}", dirty_hour + 1_000, 5.0)]);
+        s.downsample_1m_range(dirty_hour, dirty_hour + BUCKET_1H_MS)
             .unwrap();
+        assert_eq!(
+            s.prune_samples_1m_before(hour).unwrap().deleted,
+            0,
+            "dirty hour 必须整小时跳过"
+        );
+        mark_all_1m_aggregated(&s);
+        assert_eq!(s.prune_samples_1m_before(hour).unwrap().deleted, 1);
+
+        // 清空 raw 后单独构造 1h 边界数据：整点边界同样是严格小于。
+        mark_all_raw_aggregated(&s);
+        s.prune_samples_before(i64::MAX).unwrap();
+        insert_samples(&s, "a1", &[("cpu.usage", "{}", hour - 2_000_000, 5.0)]);
+        s.downsample_1m_range(hour - BUCKET_1H_MS, hour).unwrap();
         s.downsample_1h_range(hour - BUCKET_1H_MS, hour + BUCKET_1H_MS)
             .unwrap();
         assert_eq!(s.samples_1h_stats().unwrap().rows, 2);
@@ -7237,6 +7620,7 @@ mod tests {
         );
         s.set_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, "3", 1)
             .unwrap();
+        mark_all_raw_aggregated(&s);
 
         let pruned = s.prune_samples_before(5_000).unwrap();
         assert_eq!(pruned.deleted, 2);
@@ -7266,6 +7650,7 @@ mod tests {
         );
         s.set_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, "1", 1)
             .unwrap();
+        mark_all_raw_aggregated(&s);
 
         // 删掉 rowid 1/2，MAX 仍是 3：旧水位更低，不得抬高。
         assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 2);
@@ -7295,6 +7680,7 @@ mod tests {
                 ("cpu.usage", "{}", 9_000, 2.0),
             ],
         );
+        mark_all_raw_aggregated(&s);
         assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 1);
         assert_eq!(
             s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
@@ -7307,6 +7693,7 @@ mod tests {
         s.set_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, "bogus", 1)
             .unwrap();
         insert_samples(&s, "a1", &[("cpu.usage", "{}", 2_000, 4.0)]);
+        mark_all_raw_aggregated(&s);
         assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 1);
         assert_eq!(
             s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
@@ -7352,6 +7739,7 @@ mod tests {
         // 仍会成功并把 max_before=10 写回，因此必须删键。
         s.set_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, "5", 1)
             .unwrap();
+        mark_all_raw_aggregated(&s);
 
         let pruned = s.prune_samples_before(5_000).unwrap();
         assert_eq!(pruned.deleted, 1);
@@ -7380,6 +7768,7 @@ mod tests {
             ],
         );
 
+        mark_all_raw_aggregated(&s);
         // 删 rowid 1：MAX 保持 3，不推进 generation（缺失保持缺失）。
         assert_eq!(s.prune_samples_before(1_500).unwrap().deleted, 1);
         assert_eq!(
@@ -7400,6 +7789,7 @@ mod tests {
 
         // 新迟到行复用 rowid 3，再删一次最大行：1 -> 2。
         insert_samples(&s, "a1", &[("cpu.usage", "{}", 3_000, 4.0)]);
+        mark_all_raw_aggregated(&s);
         assert_eq!(s.raw_new_rows(None).unwrap().0, Some(3));
         assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 1);
         assert_eq!(
@@ -7414,6 +7804,7 @@ mod tests {
         s.set_maintenance_state(STATE_RAW_PRUNE_GENERATION, "bogus", 1)
             .unwrap();
         insert_samples(&s, "a1", &[("cpu.usage", "{}", 3_000, 5.0)]);
+        mark_all_raw_aggregated(&s);
         assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 1);
         assert_eq!(
             s.get_maintenance_state(STATE_RAW_PRUNE_GENERATION)
@@ -7810,6 +8201,8 @@ mod tests {
         assert!((rows[0].value - 9.0).abs() < 1e-9);
 
         // 删除 raw：回退 1m，ts 用 bucket_ts、value 用 last_value。
+        // R1b：先标记已聚合，retention 才会删除。
+        mark_all_raw_aggregated(&s);
         s.prune_samples_before(i64::MAX).unwrap();
         assert_eq!(s.raw_stats().unwrap().rows, 0);
         let rows = s.latest_samples(0, &[], Some("a1")).unwrap();
@@ -7843,6 +8236,7 @@ mod tests {
         assert!((rows[0].value - 99.0).abs() < 1e-9);
 
         // 1m 也为空：再回退 1h。
+        mark_all_1m_aggregated(&s);
         s.prune_samples_1m_before(i64::MAX).unwrap();
         assert_eq!(s.samples_1m_stats().unwrap().rows, 0);
         let rows = s.latest_samples(0, &[], None).unwrap();
@@ -8557,6 +8951,7 @@ mod tests {
         // 只有 1m 聚合桶、raw 已删除：raw-only 查询必须为空。
         seed_metric_sample(&s, "a4", 8, Labels::new(), 100_000, 88.0);
         s.downsample_1m_range(100_000, 200_000).unwrap();
+        mark_all_raw_aggregated(&s);
         s.prune_samples_before(200_000).unwrap();
         let raw_only = s
             .latest_alert_series("disk.used_percent", 0, None, 10)

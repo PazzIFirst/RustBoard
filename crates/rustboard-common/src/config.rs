@@ -1010,6 +1010,72 @@ impl HubAlertsConfig {
     }
 }
 
+/// #50：agent 上报样本的时间戳准入策略。对应 `hub.toml` 的 `[ingest]`。
+///
+/// 旧配置完全没有 `[ingest]` 时使用默认值（30 天 / 5 分钟）；`max_late_days = 0`
+/// 表示只接受未来偏差内的样本。超界批次在 hub 入库前整批拒绝并以 ACK 丢弃，
+/// 不写库、不改维护水位。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HubIngestConfig {
+    /// 允许的迟到天数（0–3650）。0 表示只接受 `ts <= now + skew` 的样本。
+    ///
+    /// 非 0 的 `retention_1m_days` 必须至少比本值大 2 天，保证受迟到影响的
+    /// 1m 小时仍有完整源数据可供 1h 重算。
+    pub max_late_days: u32,
+    /// 允许的未来时钟偏差（秒，0–3600）。
+    pub max_future_skew_secs: u64,
+}
+
+impl Default for HubIngestConfig {
+    fn default() -> Self {
+        Self {
+            max_late_days: DEFAULT_INGEST_MAX_LATE_DAYS,
+            max_future_skew_secs: DEFAULT_INGEST_MAX_FUTURE_SKEW_SECS,
+        }
+    }
+}
+
+impl HubIngestConfig {
+    /// 早于该时间戳（不含）的样本视为超界。使用饱和运算，极端配置也不会回绕。
+    pub fn min_sample_ts(&self, now: i64) -> i64 {
+        now.saturating_sub(i64::from(self.max_late_days).saturating_mul(DAY_MS))
+    }
+
+    /// 晚于该时间戳（不含）的样本视为超界。使用饱和运算，极端配置也不会回绕。
+    pub fn max_sample_ts(&self, now: i64) -> i64 {
+        now.saturating_add(
+            i64::try_from(self.max_future_skew_secs)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000),
+        )
+    }
+
+    /// 时间戳是否在准入范围内（闭区间 `[min, max]`）。
+    pub fn accepts_ts(&self, ts: i64, now: i64) -> bool {
+        (self.min_sample_ts(now)..=self.max_sample_ts(now)).contains(&ts)
+    }
+
+    /// 配置自洽性校验；错误信息点名字段与实际值。
+    pub fn validate(&self) -> Result<()> {
+        if self.max_late_days > MAX_INGEST_MAX_LATE_DAYS {
+            return Err(Error::InvalidConfig(format!(
+                "ingest.max_late_days 不能超过 {MAX_INGEST_MAX_LATE_DAYS} 天，\
+                 实际 {}；0 表示只接受未来偏差内的样本",
+                self.max_late_days
+            )));
+        }
+        if self.max_future_skew_secs > MAX_INGEST_MAX_FUTURE_SKEW_SECS {
+            return Err(Error::InvalidConfig(format!(
+                "ingest.max_future_skew_secs 必须在 0–{MAX_INGEST_MAX_FUTURE_SKEW_SECS} 秒之间，\
+                 实际 {}",
+                self.max_future_skew_secs
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// 归档后端类型。对应 `archive.backend`，字符串稳定为 `webdav` / `s3` / `sftp`。
 ///
 /// 该字符串同时写入 `archive_objects.backend` 与 API 响应，不能随意改名。
@@ -1913,6 +1979,9 @@ pub struct HubConfig {
     /// M4 冷归档配置；旧配置缺 `[archive]` 时使用默认值（归档关闭）。
     #[serde(default)]
     pub archive: ArchiveConfig,
+    /// #50：agent 上报样本的时间戳准入策略；旧配置缺 `[ingest]` 时使用默认值。
+    #[serde(default)]
+    pub ingest: HubIngestConfig,
     /// M5 Phase C：服务端证书来源与 ACME 参数。
     ///
     /// 旧配置没有 `[tls]` 时为 `mode = "self-signed"`，不需要新增任何字段。
@@ -1968,6 +2037,7 @@ impl fmt::Debug for HubConfig {
             .field("control", &self.control)
             .field("alerts", &self.alerts)
             .field("archive", &self.archive)
+            .field("ingest", &self.ingest)
             .field("tls", &self.tls)
             .finish()
     }
@@ -2056,6 +2126,7 @@ impl Default for HubConfig {
             control: HubControlConfig::default(),
             alerts: HubAlertsConfig::default(),
             archive: ArchiveConfig::default(),
+            ingest: HubIngestConfig::default(),
             tls: TlsConfig::default(),
         }
     }
@@ -2184,6 +2255,8 @@ impl HubConfig {
         self.validate_maintenance_interval()?;
         self.control.validate()?;
         self.alerts.validate()?;
+        self.ingest.validate()?;
+        self.validate_ingest_retention_consistency()?;
         self.archive
             .validate_against_retention(self.retention_raw_days)?;
         Ok(())
@@ -2316,6 +2389,27 @@ impl HubConfig {
                  1h 层必须先于或同时于 1m 保留；请调大 retention_1h_days，\
                  或把 retention_1m_days 调小到不超过它",
                 self.retention_1h_days, self.retention_1m_days
+            )));
+        }
+        Ok(())
+    }
+
+    /// #50：`[ingest]` 与 1m 保留期的一致性校验。
+    ///
+    /// 非 0 的 1m 保留期至少要比允许的迟到窗口多 2 天：迟到 raw 会增量修改
+    /// 对应 1m 小时并把该小时标脏，1h 重算必须仍能读到完整的 1m 源；若 1m 层
+    /// 比迟到窗口短，1m 行可能先被保留期删除，1h 只能得到残缺结果。
+    fn validate_ingest_retention_consistency(&self) -> Result<()> {
+        if self.retention_1m_days == 0 {
+            return Ok(());
+        }
+        let required = self.ingest.max_late_days.saturating_add(2);
+        if self.retention_1m_days < required {
+            return Err(Error::InvalidConfig(format!(
+                "retention_1m_days（{}）必须至少为 ingest.max_late_days + 2（{}）：\
+                 否则迟到样本影响的 1m 小时可能在 1h 重算前被保留期删除；\
+                 请调大 retention_1m_days 或调小 ingest.max_late_days",
+                self.retention_1m_days, required
             )));
         }
         Ok(())
@@ -2639,6 +2733,13 @@ const MAX_CERT_CHECK_INTERVAL_HOURS: u64 = 168;
 /// agent 主动重连周期上限（1 年）；0 表示不主动重连。
 const MAX_SESSION_MAX_HOURS: u64 = 24 * 365;
 
+/// #50：样本时间戳准入策略的默认值与硬上限。
+const DAY_MS: i64 = 86_400_000;
+const DEFAULT_INGEST_MAX_LATE_DAYS: u32 = 30;
+const DEFAULT_INGEST_MAX_FUTURE_SKEW_SECS: u64 = 300;
+const MAX_INGEST_MAX_LATE_DAYS: u32 = 3_650;
+const MAX_INGEST_MAX_FUTURE_SKEW_SECS: u64 = 3_600;
+
 /// M4：保留期天数硬上限（raw / 1m 十年，1h 二十年）。
 const MAX_RETENTION_RAW_DAYS: u32 = 3_650;
 const MAX_RETENTION_1M_DAYS: u32 = 3_650;
@@ -2868,7 +2969,8 @@ mod tests {
         let cfg = |raw: u32, one_minute: u32, one_hour: u32| -> HubConfig {
             toml::from_str(&format!(
                 "retention_raw_days = {raw}\nretention_1m_days = {one_minute}\n\
-                 retention_1h_days = {one_hour}\n"
+                 retention_1h_days = {one_hour}\n\
+                 [ingest]\nmax_late_days = 0\n"
             ))
             .unwrap()
         };
@@ -2916,6 +3018,78 @@ mod tests {
                 .to_string();
             assert!(err.contains(field), "错误信息必须点名 {field}: {err}");
             assert!(err.contains("不能小于"), "错误信息应说明倒挂: {err}");
+        }
+    }
+
+    /// #50：`[ingest]` 默认值、旧配置兼容、边界和与 1m 保留期的耦合校验。
+    #[test]
+    fn issue50_ingest_defaults_bounds_and_retention_consistency() {
+        let hub: HubConfig = toml::from_str("").unwrap();
+        assert_eq!(hub.ingest, HubIngestConfig::default());
+        assert_eq!(hub.ingest.max_late_days, 30);
+        assert_eq!(hub.ingest.max_future_skew_secs, 300);
+        hub.validate().expect("默认 ingest 配置必须合法");
+
+        // 边界值必须接受。
+        for (late, skew) in [(0u32, 0u64), (3_650, 3_600), (30, 300)] {
+            // 该用例只验证 ingest 自身边界；1m 保留置 0 避免与
+            // max_late_days + 2 的耦合约束互相干扰（另有用例覆盖耦合）。
+            let hub: HubConfig = toml::from_str(&format!(
+                "retention_1m_days = 0\n\
+                 [ingest]\nmax_late_days = {late}\nmax_future_skew_secs = {skew}\n"
+            ))
+            .unwrap();
+            hub.validate()
+                .unwrap_or_else(|err| panic!("late={late} skew={skew} 应合法: {err}"));
+            assert_eq!(hub.ingest.max_late_days, late);
+            assert_eq!(hub.ingest.max_future_skew_secs, skew);
+        }
+
+        // 越界必须拒绝并点名字段。
+        for (field, toml) in [
+            ("ingest.max_late_days", "[ingest]\nmax_late_days = 3651\n"),
+            (
+                "ingest.max_future_skew_secs",
+                "[ingest]\nmax_future_skew_secs = 3601\n",
+            ),
+        ] {
+            let hub: HubConfig = toml::from_str(toml).unwrap();
+            let err = hub
+                .validate()
+                .expect_err("越界 ingest 配置必须拒绝")
+                .to_string();
+            assert!(err.contains(field), "错误必须点名 {field}: {err}");
+        }
+
+        // 非 0 的 1m 保留期必须 >= max_late_days + 2；0 表示不删，不受限。
+        for (retention_1m, late, ok) in [
+            (90u32, 30u32, true),
+            (32, 30, true),
+            (31, 30, false),
+            (0, 3_650, true),
+        ] {
+            let hub: HubConfig = toml::from_str(&format!(
+                "retention_1m_days = {retention_1m}\n\
+                 [ingest]\nmax_late_days = {late}\n"
+            ))
+            .unwrap();
+            let result = hub.validate();
+            assert_eq!(
+                result.is_ok(),
+                ok,
+                "retention_1m_days={retention_1m} max_late_days={late} 预期 ok={ok}: {result:?}"
+            );
+            if !ok {
+                let err = result.unwrap_err().to_string();
+                assert!(
+                    err.contains("retention_1m_days") && err.contains("ingest.max_late_days"),
+                    "错误必须同时点名两个字段: {err}"
+                );
+                assert!(
+                    err.contains("at least") || err.contains("至少"),
+                    "错误必须说明修正方向: {err}"
+                );
+            }
         }
     }
 

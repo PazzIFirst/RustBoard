@@ -134,6 +134,28 @@ pub struct DownsampleRangeResult {
     pub rows: usize,
 }
 
+/// R1b：一批 1m 增量聚合（raw → samples_1m）的结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct DownsampleDeltaResult {
+    /// 本次写入/合并的 1m 聚合桶数。
+    pub buckets: usize,
+    /// 本次认领并标记 `aggregated_1m=1` 的 raw 行数。
+    pub rows: usize,
+    /// 本批处理的排他上界（整分钟，且不晚于调用方传入的 `closed_end`）。
+    pub processed_to: i64,
+}
+
+/// R1b：一个整点小时的 1h 重算结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct DownsampleHourResult {
+    /// 被重算的整点小时起点。
+    pub hour_ts: i64,
+    /// 写入/更新的 1h 聚合桶数。
+    pub buckets: usize,
+    /// 锁定并参与重算的 1m 源行数。
+    pub rows: usize,
+}
+
 /// 某一数据层（raw / 1m / 1h）的时间范围与总行数。
 ///
 /// `oldest_ts` / `newest_ts` 为 `None` 表示该层没有数据；供维护状态与
@@ -598,10 +620,58 @@ pub trait Storage: Send + Sync {
     // ---- M4 降采样 / 保留期 / 维护水位（schema v7） ----
 
     /// 把 `[from_ts, to_ts)` 内已关闭分钟的 raw 聚合进 1m，按主键 upsert 幂等。
+    ///
+    /// **R1b 起只供既有测试/工具构造聚合行使用**；维护 worker 使用增量认领的
+    /// [`Storage::downsample_1m_delta`]，不会走这里，避免与 delta 重复计数。
     fn downsample_1m_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult>;
 
     /// 把完整整点的 1m 聚合进 1h（按 `count` 加权平均），幂等。
+    ///
+    /// **R1b 起只供既有测试/工具构造聚合行使用**；维护 worker 使用带锁的
+    /// [`Storage::downsample_1h_hour`]。
     fn downsample_1h_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult>;
+
+    /// R1b：认领并增量合并一批未聚合 raw 到 1m。
+    ///
+    /// 选 `aggregated_1m=0 AND ts >= 0 AND ts < closed_end` 的 raw，按
+    /// `(ts, rowid/id)` 升序取至多 `max_rows` 行；若第 `max_rows` 行落在某个
+    /// 分钟桶内，则该桶整桶纳入（桶不可拆分），因此实际行数可能略超上限。
+    ///
+    /// 单写事务内完成：delta 合并进已有 1m 桶、把源 raw 所在**整小时**的
+    /// 所有 1m 行置 `aggregated_1h=0`、再以
+    /// `UPDATE ... WHERE 行键 IN (...) AND aggregated_1m=0` 标记 raw；affected
+    /// 必须等于选中行数，否则回滚。返回 `processed_to` 是本批的分钟对齐上界。
+    fn downsample_1m_delta(
+        &self,
+        closed_end: i64,
+        max_rows: usize,
+    ) -> Result<DownsampleDeltaResult>;
+
+    /// R1b：锁定并重算最早一个可重算整点小时的 1h。
+    ///
+    /// 只选 `aggregated_1h=0`、`bucket_ts < closed_hour`、且该小时之前没有
+    /// 未聚合 raw（`aggregated_1m=0`）的整点。单写事务内锁定该小时全部 1m
+    /// 行（PG 用 `SELECT ... FOR UPDATE`），按 `count` 加权重算整小时，再把
+    /// 该小时所有 1m 行置 `aggregated_1h=1`；affected 必须等于锁定行数，否则
+    /// 回滚。没有可重算小时返回 `None`。
+    fn downsample_1h_hour(&self, closed_hour: i64) -> Result<Option<DownsampleHourResult>>;
+
+    /// 未聚合 raw 行数（`aggregated_1m=0`），供 `maintenance status` 使用。
+    fn count_unaggregated_raw_rows(&self) -> Result<i64>;
+
+    /// `ts < min_ts OR ts > max_ts` 的 raw 行数（旧超界时间戳审计）。
+    fn count_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64>;
+
+    /// `ts < min_ts OR ts > max_ts` 且仍未聚合的 raw 行数。
+    fn count_unaggregated_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64>;
+
+    /// `ts < before_ts` 且仍未聚合的 raw 行数（legacy 1m horizon 审计）。
+    fn count_unaggregated_raw_rows_before(&self, before_ts: i64) -> Result<i64>;
+
+    /// 把超界时间戳的未聚合 raw 标记为 `aggregated_1m=1` 隔离，返回标记行数。
+    ///
+    /// 分批执行，不删除任何行；隔离后 delta 不会再为这些行构造残缺 1m。
+    fn isolate_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<usize>;
 
     /// raw 层行数与最旧 / 最新时间戳。
     fn raw_stats(&self) -> Result<TierStats>;
@@ -629,7 +699,9 @@ pub trait Storage: Send + Sync {
     /// 1m 层最旧桶时间；`None` 表示该层没有数据。
     fn samples_1m_oldest_ts(&self) -> Result<Option<i64>>;
 
-    /// 分批删除 raw 中 `ts < cutoff` 的行。
+    /// 分批删除 raw 中 `ts < cutoff` 且 `aggregated_1m=1` 的行。
+    ///
+    /// R1b 起未聚合 raw 一律不删；维护水位不再单独作为可删证明。
     fn prune_samples_before(&self, cutoff: i64) -> Result<PruneResult>;
 
     /// v8 归档启用时的 raw 保留期：只删已聚合且所属对象 `uploaded` 的行。
@@ -639,7 +711,10 @@ pub trait Storage: Send + Sync {
     /// 未认领行、pending / failed 对象、未聚合行一律保留。
     fn prune_archived_samples_before(&self, cutoff: i64) -> Result<PruneResult>;
 
-    /// 分批删除 1m 中 `bucket_ts < cutoff` 的行。
+    /// 分批删除 1m 中 `bucket_ts < cutoff` 且整小时 `aggregated_1h=1` 的行。
+    ///
+    /// `cutoff` 会先向下取整到整点；只要该小时有一行 `aggregated_1h=0`，
+    /// 整小时都跳过（dirty hour）。维护水位不再单独作为可删证明。
     fn prune_samples_1m_before(&self, cutoff: i64) -> Result<PruneResult>;
 
     /// 分批删除 1h 中 `bucket_ts < cutoff` 的行。

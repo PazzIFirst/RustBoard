@@ -17,6 +17,7 @@ use rustboard_common::model::{Sample, SampleBatch};
 use rustboard_core::archive::{
     ArchiveObject, ArchiveStatus, ArchiveStoreError, LEDGER_VERSION_V7, LEDGER_VERSION_V8,
 };
+use rustboard_core::downsample::run_downsample;
 use rustboard_core::storage::sqlite::{ArchiveRawRow, SqliteStorage};
 use rustboard_core::storage::Storage;
 
@@ -281,6 +282,51 @@ fn v7_to_v8_migration_backfills_columns_and_keeps_old_data() {
         ],
         "last_ts 必须统一回填 bucket_ts+59999；1h 只按整点小时已有 1h 行标记"
     );
+}
+
+/// 迁移后的旧 raw 不得被 R1b delta 重复计数：已有 1m 桶的 raw 已标记
+/// `aggregated_1m=1`，只聚合真正未聚合的 180000 桶；1h 由 1m 重算后
+/// count 必须等于各 1m 行 count 之和，而不是把旧 raw 再加一遍。
+#[test]
+fn v7_migration_then_downsample_does_not_double_count() {
+    let dir = TempDb::new("migrate-no-double");
+    build_v7_fixture(&dir.db_path(), true, false);
+    let storage = SqliteStorage::open(&dir.db_path()).expect("v7→v8 迁移失败");
+
+    run_downsample(&storage, 4_000_000, None).expect("迁移后的增量降采样失败");
+
+    let conn = Connection::open(dir.db_path()).unwrap();
+    let buckets: Vec<(i64, i64)> = conn
+        .prepare("SELECT bucket_ts, count FROM samples_1m ORDER BY bucket_ts")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        buckets,
+        vec![
+            (0, 1),
+            (60_000, 2),
+            (120_000, 3),
+            (180_000, 1),
+            (3_660_000, 1),
+        ],
+        "已标记 raw 不得再合并；只有 180000 桶新增 1 行"
+    );
+
+    let hour: (i64, f64, f64, f64) = conn
+        .query_row(
+            "SELECT count, min_value, max_value, avg_value FROM samples_1h
+             WHERE agent_id = 'a' AND metric = 'm' AND labels = '{}' AND bucket_ts = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(hour.0, 7, "1h count = 各 1m count 之和（1+2+3+1）");
+    assert_eq!(hour.1, 1.0);
+    assert_eq!(hour.2, 3.0);
+    assert!((hour.3 - 16.0 / 7.0).abs() < 1e-9);
 }
 
 #[test]
