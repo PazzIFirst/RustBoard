@@ -36,6 +36,8 @@
   `troubleshooting` 文档给出三种可用部署路径
 - `docs/install/postgres.md`：PostgreSQL 安装、TLS/`sslmode`、迁移、备份/恢复、
   Docker 与限制说明
+- agent 新增 `connect_timeout_secs`（默认 10，范围 1–60，覆盖 DNS/TCP/TLS/101）
+  与 `allow_insecure_ws`（默认 false，非回环明文必须显式开启）
 
 ### Changed
 
@@ -51,6 +53,9 @@
 - `migrate`/`restore` 要求先停 hub；`migrate` 目标非空必须 `--force`，当前清空
   路径仅支持 `sslmode=disable` 目标，`verify-full` 非空目标需手工备份并清空后
   再迁移
+- agent 建连改为共享绝对 deadline，`run_async`/`try_enroll`/`renew_once` 超时后
+  进入既有退避；同会话证书续签从「永久一次」改为 10 分钟冷却（成功仅记录
+  `last_success_ms`）；持续 backlog 时每批 ACK 后检查证书 deadline，避免续签饥饿
 
 ### Fixed
 
@@ -74,6 +79,10 @@
 - KI-22：控制面日志白名单文件在单次 `openat2` 后按同一 fd 校验 `nlink == 1`；
   多硬链接 fail-closed 拒绝，错误含来源 id/路径但不读取或回显目标内容。使用硬链接
   保留日志、`cp -l` 备份等部署在额外链接存在期间会被拒绝，需改为单链接
+- **breaking**：agent `ws://` 默认只允许回环（`127.0.0.0/8`、`::1`、`localhost`）；
+  远程明文连接必须在 `agent.toml` 显式设置 `allow_insecure_ws = true`（启动 WARN，
+  日志只输出 host:port）。生产环境请改用 `wss://`；`ws://` + custom-ca/system-roots
+  仍被拒绝。明文会暴露 enrollment token、agent secret 与采样数据
 
 ### 已知限制
 

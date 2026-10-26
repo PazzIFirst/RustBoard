@@ -382,7 +382,10 @@ fn validate_absolute_config_path(field: &str, value: &str) -> Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
-    /// hub 的 WebSocket 入口，例如 `ws://10.0.0.1:8443/agent/ws`。
+    /// hub 的 WebSocket 入口，例如 `wss://10.0.0.1:8443/agent/ws`。
+    ///
+    /// 明文 `ws://` 默认只允许回环地址；非回环必须显式设置
+    /// `allow_insecure_ws = true`（见下方字段说明）。
     pub hub_url: String,
     /// 纳管时由 `rustboard-hub agent add` 生成的一次性 token。
     pub token: String,

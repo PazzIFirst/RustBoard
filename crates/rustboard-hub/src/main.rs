@@ -5337,19 +5337,17 @@ impl RenewGuard {
             let cutoff = now_ms.saturating_sub(RENEW_COOLDOWN_MS);
             self.last_attempt_ms.retain(|_, ts| *ts > cutoff);
 
-            // 仍在窗口内的条目占满表时，淘汰最早的一条，保证内存有硬上界。
-            // 合法 agent 数远小于上限，被淘汰的只会是极久未活跃的身份。
+            // 清理过期项后仍然满表：拒绝新身份，绝不淘汰仍在冷却窗口内的记录。
+            // 否则攻击者可以用 ≥ 上限数量的新 agent_id 轮换，把任意身份的冷却
+            // 记录挤掉，从而绕过 10 分钟限流。已在表中的身份仍可正常更新。
             if self.last_attempt_ms.len() >= RENEW_GUARD_MAX_ENTRIES
                 && !self.last_attempt_ms.contains_key(agent_id)
             {
-                if let Some(oldest) = self
-                    .last_attempt_ms
-                    .iter()
-                    .min_by_key(|(_, ts)| **ts)
-                    .map(|(id, _)| id.clone())
-                {
-                    self.last_attempt_ms.remove(&oldest);
-                }
+                tracing::warn!(
+                    capacity = RENEW_GUARD_MAX_ENTRIES,
+                    "续签冷却表已满，拒绝新身份的续签尝试"
+                );
+                return false;
             }
         }
         self.last_attempt_ms.insert(agent_id.to_string(), now_ms);
@@ -6781,6 +6779,9 @@ mod tests {
     }
 
     /// 冷却表：窗口内拒绝、窗口后放行、不同 agent 互不影响，且表大小有硬上界。
+    ///
+    /// 满表且条目仍在冷却窗口内时必须拒绝新身份：若淘汰旧条目，攻击者可用
+    /// ≥ 上限数量的新 agent_id 轮流挤掉任意身份的冷却记录，从而绕过 10 分钟限流。
     #[test]
     fn renew_guard_cooldown_and_memory_bound() {
         let mut guard = RenewGuard::new();
@@ -6797,14 +6798,40 @@ mod tests {
         );
         assert!(guard.begin_attempt("b", now), "不同 agent 的冷却互不影响");
 
-        // 塞入远多于上限的身份，表长度必须始终不超过上限（内存有硬上界）。
-        for i in 0..(RENEW_GUARD_MAX_ENTRIES + 32) {
-            assert!(guard.begin_attempt(&format!("agent-{i}"), now + i as i64));
+        // 独立表精确填满容量，所有条目都处于冷却窗口内。
+        let mut full = RenewGuard::new();
+        for i in 0..RENEW_GUARD_MAX_ENTRIES {
+            assert!(
+                full.begin_attempt(&format!("agent-{i}"), now),
+                "第 {i} 个身份在未满表时必须放行"
+            );
         }
+        assert_eq!(full.last_attempt_ms.len(), RENEW_GUARD_MAX_ENTRIES);
+
+        // 满表且全在冷却窗口：新身份拒绝，表大小不变，旧身份的冷却不被挤掉。
         assert!(
-            guard.last_attempt_ms.len() <= RENEW_GUARD_MAX_ENTRIES,
+            !full.begin_attempt("agent-overflow", now + 1),
+            "满表时不得淘汰冷却中的记录来放行新身份"
+        );
+        assert_eq!(
+            full.last_attempt_ms.len(),
+            RENEW_GUARD_MAX_ENTRIES,
+            "拒绝新身份后表大小必须保持上限"
+        );
+        assert!(
+            !full.begin_attempt("agent-0", now + 1),
+            "已有身份仍必须受冷却窗口约束"
+        );
+
+        // 冷却结束后：只清理过期项即可放行新身份，表仍不超过上限。
+        assert!(
+            full.begin_attempt("agent-overflow", now + RENEW_COOLDOWN_MS),
+            "冷却结束并清理过期项后必须放行新身份"
+        );
+        assert!(
+            full.last_attempt_ms.len() <= RENEW_GUARD_MAX_ENTRIES,
             "冷却表不得无限增长，实际 {}",
-            guard.last_attempt_ms.len()
+            full.last_attempt_ms.len()
         );
     }
 

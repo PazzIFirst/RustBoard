@@ -139,6 +139,19 @@ where
     write_with_timeout(sink.close(), "Close", timeout).await
 }
 
+/// 日志 / CLI 展示用的 hub 端点：只保留 `host:port`。
+///
+/// `hub_url` 可能包含 userinfo（`user:password@host`）；原样打印会把凭据写进
+/// 日志或终端历史。IPv6 主机加方括号避免端口歧义；无法解析时返回固定占位符，
+/// 同样不回显原 URL。
+fn hub_endpoint_for_display(hub_url: &str) -> String {
+    match ws_url_host_port(hub_url) {
+        Ok((host, port)) if host.contains(':') => format!("[{host}]:{port}"),
+        Ok((host, port)) => format!("{host}:{port}"),
+        Err(_) => "(invalid hub_url)".to_string(),
+    }
+}
+
 /// H1：hub 明确拒绝协议版本。重试不会自愈，必须退出让运维升级。
 #[derive(Debug)]
 struct BadProtocolError {
@@ -278,7 +291,7 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|_| "未纳管".to_string());
             let enrolled = is_enrolled(&cfg);
             println!("配置文件: {}", path.display());
-            println!("hub: {}", cfg.hub_url);
+            println!("hub: {}", hub_endpoint_for_display(&cfg.hub_url));
             println!("agent_id: {agent_id}");
             println!("纳管状态: {}", if enrolled { "已纳管" } else { "未纳管" });
             println!("采样间隔: {}ms", cfg.sample_interval_ms);
@@ -378,7 +391,7 @@ fn init_agent(
         .context("init 参数校验失败（检查 --data-dir、--hub 等）")?;
     cfg.save(path)?;
     println!("已写入配置: {}", path.display());
-    println!("hub 地址: {}", cfg.hub_url);
+    println!("hub 地址: {}", hub_endpoint_for_display(&cfg.hub_url));
     println!("\n下一步: rustboard-agent run --config {}", path.display());
     Ok(())
 }
@@ -539,7 +552,7 @@ async fn run_async(cfg: AgentConfig) -> Result<()> {
         match connect(&cfg, true).await {
             Ok(ws) => {
                 backoff_secs = 1;
-                tracing::info!(url = %cfg.hub_url, "已连接 hub");
+                tracing::info!(endpoint = %hub_endpoint_for_display(&cfg.hub_url), "已连接 hub");
                 let session_result =
                     run_session_with_deadline(ws, &session_ctx, &buffer, &notify).await;
                 if let Err(err) = session_result {
@@ -1230,13 +1243,36 @@ where
     renew_client_cert(sink, stream, cfg, agent_id).await
 }
 
+/// 把已经完成、但还排在 channel 里的控制应答写回 hub（不等待新结果）。
+///
+/// 续签最多会占用 stream 20s，而 hub 侧控制命令有 15s 超时；进入续签前先 drain，
+/// 避免已经执行完的应答被压在 channel 里直到超时。发送失败说明连接不可用，
+/// 向上传播由会话结束处理。
+async fn drain_control_responses<Si>(
+    sink: &mut Si,
+    control_rx: &mut tokio::sync::mpsc::Receiver<ControlResponse>,
+    cfg: &AgentConfig,
+) -> Result<()>
+where
+    Si: Sink<Message, Error = WsError> + Unpin,
+{
+    while let Ok(response) = control_rx.try_recv() {
+        send_frame_with_config(sink, &Frame::ControlResponse(response), cfg).await?;
+    }
+    Ok(())
+}
+
 /// 周期证书检查 deadline 到点时执行一次检查（#44）。
 ///
 /// 空闲分支与「每批 ACK 之后」共用；检查失败只 WARN，不影响会话，也不丢
 /// 已经完成 ACK 的批次。只有写超时说明连接可能已半死，必须向上传播重连。
+///
+/// 进入续签前先 drain 已完成控制应答：续签会长时间占用 stream，不能让 hub 的
+/// 控制命令因等待写回而超时。
 async fn run_cert_check_if_due<Si, St>(
     sink: &mut Si,
     stream: &mut St,
+    control_rx: &mut tokio::sync::mpsc::Receiver<ControlResponse>,
     cfg: &AgentConfig,
     agent_id: &str,
     cert_check: &mut CertCheckState,
@@ -1248,6 +1284,7 @@ where
     if !cert_check.take_if_due(tokio::time::Instant::now()) {
         return Ok(());
     }
+    drain_control_responses(sink, control_rx, cfg).await?;
     match client_cert_days_left(cfg) {
         Ok(days_left) => {
             let now = now_ms();
@@ -1570,7 +1607,7 @@ where
         .await?;
         buffer.lock().await.ack(batch_epoch, batch_seq)?;
         // 此刻没有在途 ACK，可以安全地在同一个 stream 上做周期证书检查。
-        run_cert_check_if_due(sink, stream, cfg, agent_id, cert_check).await?;
+        run_cert_check_if_due(sink, stream, control_rx, cfg, agent_id, cert_check).await?;
     }
     Ok(count)
 }
@@ -1653,6 +1690,7 @@ async fn session(
                 run_cert_check_if_due(
                     &mut sink,
                     &mut stream,
+                    &mut control_rx,
                     ctx.cfg,
                     ctx.agent_id,
                     &mut cert_check,
@@ -3440,6 +3478,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #48 复审：日志 / CLI 只展示 host:port，绝不回显 URL userinfo。
+    #[test]
+    fn v100_hub_endpoint_display_redacts_userinfo() {
+        assert_eq!(
+            hub_endpoint_for_display("wss://user:pass@hub.example.com:8443/agent/ws"),
+            "hub.example.com:8443"
+        );
+        assert_eq!(
+            hub_endpoint_for_display("ws://127.0.0.1:8080/agent/ws"),
+            "127.0.0.1:8080"
+        );
+        assert_eq!(
+            hub_endpoint_for_display("wss://[::1]:8443/agent/ws"),
+            "[::1]:8443"
+        );
+
+        for url in [
+            "wss://user:pass@hub.example.com:8443/agent/ws",
+            "ws://token@127.0.0.1:1/agent/ws",
+        ] {
+            let shown = hub_endpoint_for_display(url);
+            assert!(!shown.contains("user"), "不得回显 userinfo: {shown}");
+            assert!(!shown.contains("pass"), "不得回显密码: {shown}");
+            assert!(!shown.contains("token"), "不得回显 token: {shown}");
+            assert!(!shown.contains('@'), "不得回显 userinfo 分隔符: {shown}");
+        }
+
+        // 非法 URL 也不能回显原文（其中可能带凭据）。
+        let shown = hub_endpoint_for_display("not-a-url://user:pass@host/x");
+        assert_eq!(shown, "(invalid hub_url)");
+        assert!(!shown.contains("pass"));
+    }
+
     // ===== v1.0.0 R2：#44 证书检查饥饿 =====
 
     type DelayedStream =
@@ -3615,6 +3686,83 @@ mod tests {
             tls::days_left(&on_disk, now_ms()).unwrap(),
             90,
             "续签证书必须落盘"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #44 复审：续签前必须先 drain 已完成的控制应答。
+    ///
+    /// 续签最多占用 stream 20s，而 hub 的控制命令超时是 15s；不 drain 会让已经
+    /// 执行完的应答被压在 channel 里直到超时。
+    #[tokio::test]
+    async fn v100_due_cert_check_drains_control_before_renew() {
+        let dir = temp_dir("cert-drain-control");
+        let cfg = enrolled_config(&dir, 1);
+        let key_pem = std::fs::read_to_string(dir.join(AGENT_KEY)).unwrap();
+        let new_cert = hub_sign(&dir, &tls::make_csr_with_key(&key_pem).unwrap(), 90);
+        let renewed = Message::Binary(
+            Frame::CertRenewed { cert_pem: new_cert }
+                .encode()
+                .expect("CertRenewed 编码失败"),
+        );
+        let mut stream = futures_util::stream::iter(vec![Ok(renewed)]);
+
+        let (mut sink, sent) = RecordingSink::new();
+        let (dispatcher, mut control_rx) = control::ControlDispatcher::new(cfg.control.clone());
+        // 模拟控制任务已完成、应答还在 channel 里排队，尚未来得及写回 hub。
+        dispatcher.unsupported(4243, "queued-before-renew");
+
+        let mut cert_check = CertCheckState::new(cert_check_period(cfg.cert_check_interval_hours));
+        cert_check.force_due();
+        run_cert_check_if_due(
+            &mut sink,
+            &mut stream,
+            &mut control_rx,
+            &cfg,
+            "agent-test",
+            &mut cert_check,
+        )
+        .await
+        .expect("到期证书检查必须成功");
+
+        let frames: Vec<Frame> = sent
+            .lock()
+            .expect("测试记录锁不应中毒")
+            .iter()
+            .map(|message| match message {
+                Message::Binary(bytes) => {
+                    Frame::decode(bytes.as_ref()).expect("发出的帧必须可解码")
+                }
+                other => panic!("只应发送二进制帧，实际: {other:?}"),
+            })
+            .collect();
+        let control_pos = frames
+            .iter()
+            .position(|frame| {
+                matches!(
+                    frame,
+                    Frame::ControlResponse(response) if response.id == 4243
+                )
+            })
+            .expect("排队的控制应答必须先写回");
+        let renew_pos = frames
+            .iter()
+            .position(|frame| matches!(frame, Frame::RenewCert { .. }))
+            .expect("证书到期必须触发续签");
+        assert!(
+            control_pos < renew_pos,
+            "控制应答必须先于续签写回: {frames:?}"
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "进入续签前 channel 必须已经 drain 空"
+        );
+
+        let on_disk = std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap();
+        assert_eq!(
+            tls::days_left(&on_disk, now_ms()).unwrap(),
+            90,
+            "续签必须完成并落盘"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
