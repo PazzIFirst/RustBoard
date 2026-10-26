@@ -68,10 +68,26 @@ interface Range {
   to: number;
 }
 
-function presetRange(key: PresetKey): Range {
+/** 预设范围的当前时间窗口；`now` 参数只用于测试固定时钟。 */
+export function presetRange(key: PresetKey, now: number = Date.now()): Range {
   const preset = PRESET_RANGES.find((row) => row.key === key) ?? PRESET_RANGES[0];
-  const to = Date.now();
-  return { from: to - preset.ms, to };
+  return { from: now - preset.ms, to: now };
+}
+
+/**
+ * 刷新 / 重试时的时间窗口。
+ *
+ * 预设范围是相对当前时间的窗口，每次都按 `now` 重新计算，不能沿用旧的
+ * `from/to`（否则刷新后仍看不到新样本）；自定义范围是用户显式选择的时间段，
+ * 必须原样保留。实现用 `now - 预设跨度` 而不是 `旧 from + 偏移`，多次刷新
+ * 不会累积偏移。#37
+ */
+export function refreshRange(
+  key: RangeKey,
+  current: Range,
+  now: number = Date.now(),
+): Range {
+  return key === "custom" ? current : presetRange(key, now);
 }
 
 function colorize(rows: NamedSeries[], palette: readonly string[]): ChartSeries[] {
@@ -198,6 +214,17 @@ export default function AgentDetailPage() {
     applyPreset(key);
   }, [applyPreset, rangeKey]);
 
+  /** 刷新按钮与加载失败后的重试共用：预设按当前时间重算，自定义保持原范围。 */
+  const reloadRange = useCallback(() => {
+    const next = refreshRange(rangeKey, queryRange);
+    if (rangeKey !== "custom") {
+      setCustomFrom(toDateTimeLocal(next.from));
+      setCustomTo(toDateTimeLocal(next.to));
+    }
+    setQueryRange(next);
+    setReloadKey((value) => value + 1);
+  }, [queryRange, rangeKey]);
+
   const cpuSeries = useMemo(
     () => colorize(buildCpuSeries(data?.series ?? []), CPU_COLORS),
     [data],
@@ -277,7 +304,7 @@ export default function AgentDetailPage() {
           <button
             type="button"
             className="button"
-            onClick={() => setReloadKey((value) => value + 1)}
+            onClick={reloadRange}
             disabled={loading}
           >
             {loading ? "加载中…" : "刷新"}
@@ -348,7 +375,7 @@ export default function AgentDetailPage() {
       {error ? (
         <div className="banner error" role="alert">
           <span>{error}</span>
-          <button type="button" className="button small" onClick={() => setReloadKey((k) => k + 1)}>
+          <button type="button" className="button small" onClick={reloadRange}>
             重试
           </button>
         </div>

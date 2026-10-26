@@ -33,7 +33,7 @@ use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
-use rustboard_common::config::{CookieSecure, HubConfig, PanelConfig};
+use rustboard_common::config::{AdminTlsMode, CookieSecure, HubConfig, PanelConfig, ServerTlsMode};
 use rustboard_common::util::{now_ms, pick_free_port, port_of};
 use rustboard_common::{
     fsutil, tls, DEFAULT_ADMIN_PORT, DEFAULT_HUB_CONFIG, DEFAULT_PANEL_CONFIG, DEFAULT_PANEL_PORT,
@@ -153,6 +153,9 @@ enum Cmd {
         hub: Option<String>,
         #[arg(long)]
         hub_token: Option<String>,
+        /// Hub 的私有 CA（PEM）；只在 https hub 时使用，复制到配置文件旁。
+        #[arg(long)]
+        hub_ca: Option<PathBuf>,
         #[arg(long)]
         password: Option<String>,
         #[arg(long)]
@@ -189,10 +192,13 @@ fn main() -> Result<()> {
             listen,
             hub,
             hub_token,
+            hub_ca,
             password,
             static_dir,
             force,
-        } => init(config, listen, hub, hub_token, password, static_dir, force),
+        } => init(
+            config, listen, hub, hub_token, hub_ca, password, static_dir, force,
+        ),
         Cmd::Ports { config } => ports(config),
         Cmd::ResetPassword { config, password } => reset_password(config, password),
         Cmd::Install(args) => install_cmd::install(args),
@@ -2320,6 +2326,7 @@ fn init(
     listen: Option<String>,
     hub: Option<String>,
     hub_token: Option<String>,
+    hub_ca: Option<PathBuf>,
     password: Option<String>,
     static_dir: Option<String>,
     force: bool,
@@ -2336,27 +2343,58 @@ fn init(
 
     let hub_overridden = hub.is_some();
 
-    // hub 地址 / token 缺省时尝试复用 hub 的配置，避免用户在两份文件间抄 token。
-    let hub_cfg = if hub.is_none() || hub_token.is_none() {
+    // hub 地址 / token / CA 缺省时尝试复用 hub 的配置，避免用户在两份文件间抄 token。
+    // 只要 hub 地址不是显式给出，就必须读取 admin_tls / tls.mode 才能选对 scheme；
+    // 显式 https 且未给 --hub-ca 时也读一次，用于从本机 Hub 配置推导自签 CA。
+    let explicit_https = hub
+        .as_deref()
+        .is_some_and(|raw| raw.trim().starts_with("https://"));
+    let hub_cfg = if hub.is_none() || hub_token.is_none() || (hub_ca.is_none() && explicit_https) {
         load_hub_config_hint()
     } else {
         None
     };
 
-    match hub {
-        Some(hub) => cfg.hub_url = normalize_hub_url(&hub)?,
-        None => {
-            if let Some(hub_cfg) = &hub_cfg {
-                cfg.hub_url = hub_url_from_admin_listen(&hub_cfg.admin_listen);
-                println!("已从 {DEFAULT_HUB_CONFIG} 读取 hub 管理地址");
-            } else {
-                cfg.hub_url = format!("http://127.0.0.1:{DEFAULT_ADMIN_PORT}");
-                eprintln!(
-                    "提示: 未找到可读的 {DEFAULT_HUB_CONFIG}，hub 地址使用默认 {}；请用 --hub 指定实际地址",
-                    cfg.hub_url
-                );
-            }
-        }
+    // #39：没有 --hub 时以 hub.toml 的 admin_tls 决定 http/https；admin_tls=required
+    // 且证书来源是 self-signed 时，CA 取 <hub data_dir>/certs/ca.crt，由
+    // prepare_hub_ca 复制到面板配置目录（ACME 则使用系统根）。
+    let hub_plan = match (&hub_cfg, hub.as_deref()) {
+        (Some(hub_cfg), explicit) => plan_hub_connection(hub_cfg, explicit, hub_ca.as_deref())?,
+        (None, Some(explicit)) => HubInitPlan {
+            hub_url: normalize_hub_url(explicit)?,
+            ca_source: None,
+        },
+        (None, None) => HubInitPlan {
+            hub_url: format!("http://127.0.0.1:{DEFAULT_ADMIN_PORT}"),
+            ca_source: None,
+        },
+    };
+    cfg.hub_url = hub_plan.hub_url.clone();
+    if hub_overridden {
+        println!(
+            "hub API: {}（来自 --hub；scheme 以显式参数为准）",
+            cfg.hub_url
+        );
+    } else if let Some(hub_cfg) = &hub_cfg {
+        println!(
+            "已从 {DEFAULT_HUB_CONFIG} 读取 hub 管理地址（admin_tls={}, tls.mode={}）",
+            match hub_cfg.admin_tls {
+                AdminTlsMode::Off => "off",
+                AdminTlsMode::Required => "required",
+            },
+            server_tls_mode_name(hub_cfg.tls.mode)
+        );
+    } else {
+        eprintln!(
+            "提示: 未找到可读的 {DEFAULT_HUB_CONFIG}，hub 地址使用默认 {}；请用 --hub 指定实际地址",
+            cfg.hub_url
+        );
+    }
+    if cfg.hub_url.starts_with("https://") && hub_plan.ca_source.is_none() && hub_ca.is_none() {
+        eprintln!(
+            "提示: hub_url 使用 https，面板将使用系统根证书；若 Hub 使用自签/私有 CA，\
+             请用 --hub-ca 指定 CA（PEM）"
+        );
     }
 
     let (token, token_source) = resolve_hub_token(hub_token, hub_cfg.as_ref());
@@ -2378,6 +2416,13 @@ fn init(
     }
     cfg.token = token;
 
+    // 只读取/校验 CA，不落盘：等密码哈希与配置写入全部成功后再写 CA，
+    // 避免 --force 先覆盖旧 CA、后续失败留下坏配置。
+    let prepared_ca = prepare_hub_ca(&hub_plan, hub_ca.as_deref(), &path)?;
+    if let Some(ca) = &prepared_ca {
+        cfg.hub_ca = ca.config_path()?;
+    }
+
     if let Some(static_dir) = static_dir {
         cfg.static_dir = static_dir;
     }
@@ -2394,7 +2439,13 @@ fn init(
     };
     cfg.admin_password_hash =
         auth::hash_password(&password).context("生成 Argon2id 密码哈希失败")?;
-    cfg.save(&path)?;
+
+    // 事务：CA 先落盘，配置后落盘；配置失败回滚 CA。密码打印在事务成功之后。
+    write_init_artifacts(prepared_ca.as_ref(), || Ok(cfg.save(&path)?))?;
+
+    if let Some(_ca) = &prepared_ca {
+        println!("hub CA: {}", cfg.hub_ca);
+    }
 
     println!("已写入配置: {}", path.display());
     println!("面板监听: {}", cfg.listen);
@@ -2606,6 +2657,433 @@ fn listen_host(listen: &str) -> Option<&str> {
         None if !listen.is_empty() => Some(listen),
         None => None,
     }
+}
+
+/// `panel init` 推导出的 hub 连接计划。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HubInitPlan {
+    hub_url: String,
+    /// 需要复制进面板配置目录的私有 CA 源文件；`None` 表示使用系统根证书。
+    ca_source: Option<PathBuf>,
+}
+
+/// 已读取并校验、待写入的 hub CA（含旧文件备份）。
+///
+/// #39 的失败语义：CA 必须先于配置文件落盘；CA 写失败时配置完全不动，配置
+/// 写失败时恢复旧 CA / 删除新 CA。这样 `--force` 不会先覆盖旧 CA 再失败，
+/// 也不会出现“配置已换、CA 还是旧的”这种半更新状态。
+struct PreparedHubCa {
+    dest: PathBuf,
+    bytes: Vec<u8>,
+    /// 旧 CA 内容；`None` 表示目标原本不存在。回滚时写回或删除。
+    previous: Option<Vec<u8>>,
+    /// 测试注入：模拟 CA 写失败（生产构建中不存在）。
+    #[cfg(test)]
+    fail_write: bool,
+}
+
+impl PreparedHubCa {
+    /// 写入新 CA；任何失败都立即回滚旧 CA。
+    fn install(&self) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_write {
+            self.rollback();
+            bail!("注入的 hub CA 写入失败");
+        }
+        if let Some(parent) = self.dest.parent() {
+            fsutil::ensure_dir(parent, 0o700)
+                .with_context(|| format!("创建 hub CA 目录失败: {}", parent.display()))?;
+        }
+        if let Err(error) = fsutil::atomic_write(&self.dest, &self.bytes, 0o644) {
+            // 理论上 atomic_write 失败不会改旧文件；仍显式回滚，保证“旧 CA
+            // 字节不变 / 无新 CA 残留”。
+            self.rollback();
+            return Err(error)
+                .with_context(|| format!("写入 hub CA 失败: {}", self.dest.display()));
+        }
+        Ok(())
+    }
+
+    /// 恢复旧 CA；原本不存在则删除新 CA。失败也不覆盖原始错误。
+    fn rollback(&self) {
+        match &self.previous {
+            Some(bytes) => {
+                let _ = fsutil::atomic_write(&self.dest, bytes, 0o644);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.dest);
+            }
+        }
+    }
+
+    fn config_path(&self) -> Result<String> {
+        self.dest
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("hub CA 路径不是有效 UTF-8: {}", self.dest.display()))
+    }
+}
+
+/// 事务顺序：先写 CA，再保存配置；配置保存失败时恢复旧 CA / 删除新 CA。
+///
+/// 密码只在本函数成功返回后打印，因此失败路径不会输出密码。
+fn write_init_artifacts(
+    ca: Option<&PreparedHubCa>,
+    save_config: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if let Some(ca) = ca {
+        ca.install()?;
+    }
+    if let Err(error) = save_config() {
+        if let Some(ca) = ca {
+            ca.rollback();
+        }
+        return Err(error).context("写入面板配置失败");
+    }
+    Ok(())
+}
+
+/// `admin_tls=off` 时的回环 authority：`0.0.0.0` / `[::]` 转成回环地址。
+fn admin_listen_authority(admin_listen: &str) -> String {
+    let listen = admin_listen.trim();
+    if listen.is_empty() {
+        return format!("127.0.0.1:{DEFAULT_ADMIN_PORT}");
+    }
+    let forwarded = hub_url_from_admin_listen(listen);
+    forwarded
+        .strip_prefix("http://")
+        .or_else(|| forwarded.strip_prefix("https://"))
+        .unwrap_or(&forwarded)
+        .to_string()
+}
+
+/// 从 `admin_listen` 取端口；IP:port 用 `SocketAddr`，其余（hostname:port）按
+/// 最后一个冒号解析，失败时回退默认管理端口。
+fn admin_listen_port(admin_listen: &str) -> u16 {
+    let listen = admin_listen.trim();
+    let listen = listen
+        .strip_prefix("http://")
+        .or_else(|| listen.strip_prefix("https://"))
+        .unwrap_or(listen);
+    if let Ok(address) = listen.parse::<SocketAddr>() {
+        return address.port();
+    }
+    listen
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(DEFAULT_ADMIN_PORT)
+}
+
+/// 证书 SAN 名称是否回环 / 通配：这些名字不能作为自动推导的 https 主机。
+fn is_loopback_or_unspecified_name(name: &str) -> bool {
+    let name = name.trim().trim_matches(['[', ']']);
+    if let Ok(ip) = name.parse::<std::net::IpAddr>() {
+        return ip.is_loopback() || ip.is_unspecified();
+    }
+    let lower = name.to_ascii_lowercase();
+    lower == "localhost" || lower.ends_with(".localhost")
+}
+
+/// 把配置里的 SAN 名称转成可放进 URL 的 host（IPv6 加方括号）。
+fn san_url_host(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let san = tls::parse_server_sans(&[name.to_string()])
+        .ok()?
+        .into_iter()
+        .next()?;
+    match san {
+        tls::ServerSan::Ip(ip) => Some(if ip.is_ipv6() {
+            format!("[{ip}]")
+        } else {
+            ip.to_string()
+        }),
+        tls::ServerSan::Dns(dns) => Some(dns),
+    }
+}
+
+/// 从证书名字（self-signed 的 `server_names` / ACME 的 `tls.domains`）里挑
+/// 第一个非回环、非通配的 DNS/IP。
+///
+/// 不能回落到 `127.0.0.1`：ACME 证书只覆盖 `tls.domains`，self-signed 也可能
+/// 只含 DNS SAN；生成 `https://127.0.0.1` 会“初始化成功但握手失败”。
+fn non_loopback_san_host(names: &[String]) -> Option<String> {
+    names.iter().find_map(|name| {
+        if is_loopback_or_unspecified_name(name) {
+            return None;
+        }
+        san_url_host(name)
+    })
+}
+
+fn server_tls_mode_name(mode: ServerTlsMode) -> &'static str {
+    match mode {
+        ServerTlsMode::SelfSigned => "self-signed",
+        ServerTlsMode::AcmeDomain => "acme-domain",
+        ServerTlsMode::AcmeIp => "acme-ip",
+    }
+}
+
+/// 由 hub.toml 的 `admin_listen` + `admin_tls` 推导出面板要连的地址。
+///
+/// `admin_tls=off` 只允许回环明文；`admin_tls=required` 时必须从证书名字里
+/// 选一个非回环 DNS/IP，避免 ACME 证书或仅含 DNS SAN 的自签证书连不上。
+fn hub_admin_url(hub: &HubConfig) -> Result<String> {
+    match hub.admin_tls {
+        AdminTlsMode::Off => Ok(format!(
+            "http://{}",
+            admin_listen_authority(&hub.admin_listen)
+        )),
+        AdminTlsMode::Required => {
+            let names = hub.effective_server_names();
+            let host = non_loopback_san_host(&names).ok_or_else(|| {
+                anyhow!(
+                    "本机 Hub 配置 admin_tls=\"required\"（tls.mode={}），但证书名字（{}）中\
+                     没有可用的非回环 DNS/IP；回环地址无法被 ACME / 仅 DNS SAN 的证书覆盖，\
+                     不能自动生成 Panel 可连接的 https URL。请用 --hub 指定 Panel 实际访问\
+                     Hub 的地址，自签/私有 CA 同时用 --hub-ca 指定 CA；未写入面板配置",
+                    server_tls_mode_name(hub.tls.mode),
+                    if hub.tls.mode == ServerTlsMode::SelfSigned {
+                        "server_names"
+                    } else {
+                        "tls.domains"
+                    }
+                )
+            })?;
+            Ok(format!(
+                "https://{host}:{}",
+                admin_listen_port(&hub.admin_listen)
+            ))
+        }
+    }
+}
+
+/// 显式 `--hub` 的 host（IPv6 去掉方括号、统一小写）。
+fn explicit_hub_host(hub_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(hub_url).ok()?;
+    url.host_str().map(|host| {
+        host.trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase()
+    })
+}
+
+/// 主机名是否回环（含 localhost / *.localhost）。
+fn is_loopback_host_name(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or_else(|_| {
+            let lower = host.to_ascii_lowercase();
+            lower == "localhost" || lower.ends_with(".localhost")
+        })
+}
+
+/// 本机管理口是否允许通过回环地址访问（回环绑定或通配绑定）。
+fn local_admin_allows_loopback(hub: &HubConfig) -> bool {
+    match listen_host(hub.admin_listen.trim()) {
+        Some(host) => {
+            let host = host.trim_matches(['[', ']']);
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+        }
+        // 无法判断时按本机回环兼容处理；真正的 CA 仍需能读到才会复制。
+        None => true,
+    }
+}
+
+/// 显式 `--hub` 的 host 是否指向本机 Hub。
+///
+/// 只用于判断能否复用本机 Hub 的自签 CA：host 与本机 `admin_listen` 或证书
+/// 名字一致，或者本机绑回环/通配时显式使用 loopback 别名。远端 host 不允许
+/// 自动复制本机 CA。
+fn explicit_hub_matches_local(hub_url: &str, hub: &HubConfig) -> bool {
+    let Some(host) = explicit_hub_host(hub_url) else {
+        return false;
+    };
+    let mut local_hosts: Vec<String> = hub
+        .effective_server_names()
+        .into_iter()
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect();
+    if let Some(listen_host) = listen_host(hub.admin_listen.trim()) {
+        local_hosts.push(
+            listen_host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_ascii_lowercase(),
+        );
+    }
+    if local_hosts.contains(&host) {
+        return true;
+    }
+    is_loopback_host_name(&host) && local_admin_allows_loopback(hub)
+}
+
+/// 规划 `panel init` 的 hub_url 与 CA 来源。
+///
+/// - `--hub` 显式给出时 scheme 以参数为准，不被本机 hub 配置覆盖；
+/// - 本机 `admin_tls=required` 且 `tls.mode=self-signed` 时，只有显式 host
+///   指向本机 Hub 才自动复制 `<hub data_dir>/certs/ca.crt`；指向远端且未给
+///   `--hub-ca` 时直接失败，避免把本机 CA 用于远端 Hub（反之亦然）；
+/// - ACME（`acme-domain` / `acme-ip`）使用系统根，`hub_ca` 留空。
+fn plan_hub_connection(
+    hub: &HubConfig,
+    explicit_hub: Option<&str>,
+    explicit_ca: Option<&Path>,
+) -> Result<HubInitPlan> {
+    let hub_url = match explicit_hub {
+        Some(raw) => normalize_hub_url(raw)?,
+        None => hub_admin_url(hub)?,
+    };
+    let local_self_signed =
+        hub.admin_tls == AdminTlsMode::Required && hub.tls.mode == ServerTlsMode::SelfSigned;
+    let ca_source = if hub_url.starts_with("https://") && local_self_signed {
+        if explicit_hub.is_some() && !explicit_hub_matches_local(&hub_url, hub) {
+            if explicit_ca.is_some() {
+                None
+            } else {
+                bail!(
+                    "显式 --hub 指向 {}，与本机 Hub 管理地址（{}）不一致；本机 Hub 使用\
+                     自签证书，无法确定远端 Hub 的 CA；请用 --hub-ca 指定远端 Hub 的 CA\
+                     证书；未写入面板配置",
+                    hub_url,
+                    hub.admin_listen
+                );
+            }
+        } else {
+            Some(tls::cert_dir(&hub.data_dir).join(tls::CA_CERT_FILE))
+        }
+    } else {
+        None
+    };
+    Ok(HubInitPlan { hub_url, ca_source })
+}
+
+/// 读取并校验待复制的 hub CA，但不落盘；返回 `None` 表示使用系统根。
+///
+/// 显式 `--hub-ca` 优先；否则只在 [`HubInitPlan::ca_source`]（本机 Hub 自签）
+/// 存在时自动复制。复制前校验 PEM 仅含 CERTIFICATE 区块，避免把私钥误当
+/// 公开 CA 复制；CA 文件缺失 / 非法时明确失败并提示 `--hub-ca`。
+fn prepare_hub_ca(
+    plan: &HubInitPlan,
+    explicit_ca: Option<&Path>,
+    config_path: &Path,
+) -> Result<Option<PreparedHubCa>> {
+    let ca_source = explicit_ca.or(plan.ca_source.as_deref());
+    let Some(ca_source) = ca_source else {
+        return Ok(None);
+    };
+    if !plan.hub_url.starts_with("https://") {
+        bail!(
+            "--hub-ca 只能与 https:// 的 hub 地址一起使用（当前 {}）；\
+             明文 http 配置 CA 不会加密，请先把 hub_url 改成 https://",
+            plan.hub_url
+        );
+    }
+    let bytes = read_hub_ca_pem(ca_source).map_err(|error| {
+        if explicit_ca.is_some() {
+            error
+        } else {
+            anyhow!(
+                "本机 Hub 配置为 admin_tls=\"required\" + tls.mode=\"self-signed\"，\
+                 但无法读取 hub CA：{error:#}；请用 --hub-ca 指定 Hub 的 CA 证书\
+                 （通常为 {}），或修正 Hub 配置；未写入面板配置",
+                ca_source.display()
+            )
+        }
+    })?;
+    let dest = hub_ca_destination(config_path)?;
+    let previous = match std::fs::symlink_metadata(&dest) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!(
+                "hub CA 目标 {} 是符号链接，拒绝覆盖；请先人工处理",
+                dest.display()
+            );
+        }
+        Ok(meta) if !meta.is_file() => {
+            bail!("hub CA 目标 {} 不是普通文件，拒绝覆盖", dest.display());
+        }
+        Ok(meta) => {
+            if meta.len() > MAX_TLS_FILE_BYTES {
+                bail!(
+                    "旧 hub CA 超过 1 MiB 上限（{} 字节）: {}",
+                    meta.len(),
+                    dest.display()
+                );
+            }
+            Some(
+                std::fs::read(&dest)
+                    .with_context(|| format!("备份旧 hub CA 失败: {}", dest.display()))?,
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("检查 hub CA 目标失败: {}", dest.display()))
+        }
+    };
+    Ok(Some(PreparedHubCa {
+        dest,
+        bytes,
+        previous,
+        #[cfg(test)]
+        fail_write: false,
+    }))
+}
+
+/// 读取并校验 hub 私有 CA（PEM，至少一张证书）。
+fn read_hub_ca_pem(path: &Path) -> Result<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("读取 hub CA {} 失败", path.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!("hub CA {} 是符号链接，拒绝使用", path.display());
+    }
+    if !meta.is_file() {
+        bail!("hub CA {} 不是普通文件", path.display());
+    }
+    if meta.len() > MAX_TLS_FILE_BYTES {
+        bail!(
+            "hub CA 超过 1 MiB 上限（{} 字节）: {}",
+            meta.len(),
+            path.display()
+        );
+    }
+    let bytes =
+        std::fs::read(path).with_context(|| format!("读取 hub CA {} 失败", path.display()))?;
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("hub CA {} 不是 UTF-8 PEM 文本", path.display()))?;
+    tls::ensure_certificate_only_pem(text).with_context(|| {
+        format!(
+            "hub CA {} 只允许 CERTIFICATE 区块（发现私钥/公钥/CSR 等非证书内容）",
+            path.display()
+        )
+    })?;
+    tls::load_certs(text)
+        .with_context(|| format!("hub CA {} 不是有效的 PEM 证书", path.display()))?;
+    Ok(bytes)
+}
+
+/// 面板 `hub_ca` 的落盘位置：与配置文件同目录的 `hub-ca.pem`。
+///
+/// 配置路径可能是相对的；转成绝对路径后再写入 `hub_ca`，避免面板以不同
+/// 工作目录启动时找不到 CA。
+fn hub_ca_destination(config_path: &Path) -> Result<PathBuf> {
+    let dir = match config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(parent) if parent.is_absolute() => parent.to_path_buf(),
+        Some(parent) => std::env::current_dir()
+            .context("获取当前目录失败")?
+            .join(parent),
+        None => std::env::current_dir().context("获取当前目录失败")?,
+    };
+    Ok(dir.join("hub-ca.pem"))
 }
 
 /// 监听地址是否只绑回环。
@@ -3723,10 +4201,6 @@ mod tests {
         for (hub_status, hub_body) in [
             (400, r#"{"error":"bad_request","message":"规则名称非法"}"#),
             (
-                401,
-                r#"{"error":{"code":"invalid_token","message":"token 无效"}}"#,
-            ),
-            (
                 403,
                 r#"{"error":"builtin_rule","message":"内置规则不能删除"}"#,
             ),
@@ -3763,6 +4237,95 @@ mod tests {
                 !String::from_utf8_lossy(&body).contains(TEST_HUB_TOKEN),
                 "响应不得出现 hub token"
             );
+        }
+    }
+
+    /// #38：告警 / 归档透传路由的 hub 401 必须统一改写为 502 hub_auth_failed。
+    ///
+    /// 前端只对 401 触发全局登出；这些路由的 401 是面板 → hub 的 token 故障，
+    /// 不是管理员会话失效。响应不得带上游 body（可能含 token / 认证细节），
+    /// 也不能清除 Panel Cookie。
+    #[tokio::test]
+    async fn alert_and_archive_routes_map_hub_401_to_502_hub_auth_failed() {
+        let upstream_body =
+            r#"{"error":{"code":"invalid_token","message":"hub token secret must not leak"}}"#;
+        let cases: [(Method, &str, bool); 16] = [
+            (Method::GET, "/api/alerts/rules", false),
+            (Method::POST, "/api/alerts/rules", true),
+            (Method::PUT, "/api/alerts/rules/rule-1", true),
+            (Method::DELETE, "/api/alerts/rules/rule-1", true),
+            (Method::GET, "/api/alerts/events?limit=50", false),
+            (Method::GET, "/api/alerts/silences", false),
+            (Method::POST, "/api/alerts/silences", true),
+            (Method::DELETE, "/api/alerts/silences/1", true),
+            (Method::GET, "/api/alerts/channels", false),
+            (Method::POST, "/api/alerts/channels", true),
+            (Method::PUT, "/api/alerts/channels/ch-1", true),
+            (Method::DELETE, "/api/alerts/channels/ch-1", true),
+            (Method::POST, "/api/alerts/channels/ch-1/test", true),
+            (Method::GET, "/api/archive/status", false),
+            (Method::GET, "/api/archive/objects?limit=50", false),
+            (Method::GET, "/api/archive/objects/42/download", false),
+        ];
+        for (method, uri, with_body) in cases {
+            let (hub_url, seen) = spawn_mock_hub(401, upstream_body);
+            let state = test_state_with_hub(&hub_url);
+            let cookie = session_cookie(&state);
+            let mut headers = vec![("cookie", cookie.as_str())];
+            if with_body || method != Method::GET {
+                headers.push(("content-type", "application/json"));
+            }
+            let body = if with_body {
+                Body::from("{}")
+            } else {
+                Body::empty()
+            };
+            let (status, response_headers, response_body) =
+                call(&state, method.clone(), uri, &headers, body, None).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "{method} {uri} 必须把 hub 401 映射为 502"
+            );
+            assert_eq!(
+                response_headers.get(header::CONTENT_TYPE).unwrap(),
+                "application/json",
+                "{method} {uri}"
+            );
+            assert_eq!(
+                response_headers.get(header::CACHE_CONTROL).unwrap(),
+                "no-store",
+                "{method} {uri}"
+            );
+            assert!(
+                response_headers.get(header::SET_COOKIE).is_none(),
+                "{method} {uri} 不得清除仍然有效的 Panel Cookie"
+            );
+            assert_eq!(
+                json_body(&response_body)["error"],
+                "hub_auth_failed",
+                "{method} {uri}"
+            );
+            let text = String::from_utf8_lossy(&response_body).to_string();
+            assert!(
+                !text.contains("invalid_token")
+                    && !text.contains("hub token secret")
+                    && !text.contains(TEST_HUB_TOKEN),
+                "{method} {uri} 不得泄露上游 body/token: {text}"
+            );
+            // 路由确实转发到了 hub（而不是被本地校验 / 405 拦截）。
+            assert!(
+                !seen_request(&seen).0.is_empty(),
+                "{method} {uri} 必须转发到 hub"
+            );
+        }
+
+        // 真正失效的 Panel Cookie 仍由面板返回 401 unauthorized，前端照常登出。
+        let (state, _site) = test_state();
+        for uri in ["/api/alerts/rules", "/api/archive/status"] {
+            let (status, _, body) = call(&state, Method::GET, uri, &[], Body::empty(), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+            assert_eq!(json_body(&body)["error"], "unauthorized", "{uri}");
         }
     }
 
@@ -4834,6 +5397,449 @@ mod tests {
             hub_url_from_admin_listen("127.0.0.1:9000"),
             "http://127.0.0.1:9000"
         );
+    }
+
+    fn init_hub_config(
+        admin_listen: &str,
+        admin_tls: AdminTlsMode,
+        mode: ServerTlsMode,
+        data_dir: &Path,
+    ) -> HubConfig {
+        HubConfig {
+            admin_listen: admin_listen.to_string(),
+            admin_tls,
+            data_dir: data_dir.to_path_buf(),
+            tls: rustboard_common::config::TlsConfig {
+                mode,
+                ..Default::default()
+            },
+            ..HubConfig::default()
+        }
+    }
+
+    fn init_hub_config_with_names(
+        admin_listen: &str,
+        admin_tls: AdminTlsMode,
+        mode: ServerTlsMode,
+        data_dir: &Path,
+        names: &[&str],
+    ) -> HubConfig {
+        let mut hub = init_hub_config(admin_listen, admin_tls, mode, data_dir);
+        hub.server_names = names.iter().map(|name| (*name).to_string()).collect();
+        hub.tls.domains = names.iter().map(|name| (*name).to_string()).collect();
+        hub
+    }
+
+    /// #39：admin_tls=off → http，通配监听仍连回环地址。
+    #[test]
+    fn init_hub_url_off_uses_loopback_authority() {
+        let dir = TempSite::new();
+        for (listen, authority) in [
+            ("127.0.0.1:8444", "127.0.0.1:8444"),
+            ("0.0.0.0:8444", "127.0.0.1:8444"),
+            ("[::]:8444", "[::1]:8444"),
+            ("localhost:8444", "localhost:8444"),
+        ] {
+            let hub = init_hub_config(
+                listen,
+                AdminTlsMode::Off,
+                ServerTlsMode::SelfSigned,
+                &dir.dir,
+            );
+            assert_eq!(
+                hub_admin_url(&hub).unwrap(),
+                format!("http://{authority}"),
+                "listen={listen}"
+            );
+        }
+    }
+
+    /// #39：required 时必须从证书 SAN 选非回环 DNS/IP，不能回落到 127.0.0.1。
+    #[test]
+    fn init_hub_url_requires_non_loopback_certificate_name() {
+        let dir = TempSite::new();
+
+        // self-signed：server_names 里同时有 DNS/回环 IP，必须选 DNS。
+        let hub = init_hub_config_with_names(
+            "0.0.0.0:8444",
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+            &["127.0.0.1", "localhost", "hub.example.com"],
+        );
+        assert_eq!(hub_admin_url(&hub).unwrap(), "https://hub.example.com:8444");
+
+        // ACME domain：SAN 来自 tls.domains。
+        let hub = init_hub_config_with_names(
+            "0.0.0.0:8444",
+            AdminTlsMode::Required,
+            ServerTlsMode::AcmeDomain,
+            &dir.dir,
+            &["panel.example.com"],
+        );
+        let plan = plan_hub_connection(&hub, None, None).unwrap();
+        assert_eq!(plan.hub_url, "https://panel.example.com:8444");
+        assert_eq!(plan.ca_source, None, "ACME 域名证书使用系统根");
+
+        // ACME IP：选第一个非回环 IP；IPv6 必须加方括号。
+        let hub = init_hub_config_with_names(
+            "[::]:8444",
+            AdminTlsMode::Required,
+            ServerTlsMode::AcmeIp,
+            &dir.dir,
+            &["203.0.113.5"],
+        );
+        assert_eq!(hub_admin_url(&hub).unwrap(), "https://203.0.113.5:8444");
+        let hub = init_hub_config_with_names(
+            "[::]:8444",
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+            &["2001:db8::5"],
+        );
+        assert_eq!(hub_admin_url(&hub).unwrap(), "https://[2001:db8::5]:8444");
+
+        // 只有回环 SAN：无法推导可连接的 https，必须提示 --hub / --hub-ca。
+        let hub = init_hub_config_with_names(
+            "0.0.0.0:8444",
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+            &["localhost", "127.0.0.1", "::1"],
+        );
+        let error = plan_hub_connection(&hub, None, None).expect_err("回环 SAN 必须失败");
+        let text = format!("{error:#}");
+        assert!(text.contains("--hub"), "错误必须提示 --hub: {text}");
+        assert!(text.contains("--hub-ca"), "错误必须提示 --hub-ca: {text}");
+        assert!(text.contains("未写入面板配置"), "{text}");
+    }
+
+    /// #39：required+self-signed 取 Hub 的 ca.crt；ACME 使用系统根；Off 用 http。
+    #[test]
+    fn init_plan_chooses_private_ca_only_for_self_signed() {
+        let dir = TempSite::new();
+        let hub = init_hub_config_with_names(
+            "0.0.0.0:8444",
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+            &["hub.example.com"],
+        );
+        let plan = plan_hub_connection(&hub, None, None).unwrap();
+        assert_eq!(plan.hub_url, "https://hub.example.com:8444");
+        assert_eq!(
+            plan.ca_source,
+            Some(tls::cert_dir(&dir.dir).join(tls::CA_CERT_FILE))
+        );
+
+        for mode in [ServerTlsMode::AcmeDomain, ServerTlsMode::AcmeIp] {
+            let names = if mode == ServerTlsMode::AcmeIp {
+                &["198.51.100.7"][..]
+            } else {
+                &["panel.example.com"][..]
+            };
+            let hub = init_hub_config_with_names(
+                "0.0.0.0:8444",
+                AdminTlsMode::Required,
+                mode,
+                &dir.dir,
+                names,
+            );
+            let plan = plan_hub_connection(&hub, None, None).unwrap();
+            assert_eq!(plan.ca_source, None, "ACME 必须使用系统根: {mode:?}");
+        }
+
+        let hub = init_hub_config(
+            "127.0.0.1:8444",
+            AdminTlsMode::Off,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+        );
+        let plan = plan_hub_connection(&hub, None, None).unwrap();
+        assert_eq!(plan.hub_url, "http://127.0.0.1:8444");
+        assert_eq!(plan.ca_source, None, "admin_tls=off 不得配置 hub_ca");
+    }
+
+    /// #39：显式 --hub 的 scheme 优先；仅当 host 指向本机 Hub 时才复用自签 CA。
+    #[test]
+    fn init_plan_honors_explicit_hub_scheme_and_host() {
+        let dir = TempSite::new();
+        let hub = init_hub_config_with_names(
+            "0.0.0.0:8444",
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+            &["hub.example.com", "localhost", "127.0.0.1"],
+        );
+
+        let plan = plan_hub_connection(&hub, Some("http://127.0.0.1:9000"), None).unwrap();
+        assert_eq!(plan.hub_url, "http://127.0.0.1:9000");
+        assert_eq!(plan.ca_source, None, "http 显式覆盖时不能写 hub_ca");
+
+        // 本机 loopback / 本机 DNS 名：允许复制本机 CA。
+        for url in [
+            "https://127.0.0.1:8444",
+            "https://localhost:8444",
+            "https://hub.example.com:8444/",
+        ] {
+            let plan = plan_hub_connection(&hub, Some(url), None).unwrap();
+            assert_eq!(
+                plan.ca_source,
+                Some(tls::cert_dir(&dir.dir).join(tls::CA_CERT_FILE)),
+                "本机地址必须能复用自签 CA: {url}"
+            );
+        }
+
+        // 远端 host：没有 --hub-ca 时必须失败，不能把本机 CA 复制给远端。
+        let error = plan_hub_connection(&hub, Some("https://remote.example.net:8444"), None)
+            .expect_err("远端自签 Hub 缺少 --hub-ca 必须失败");
+        let text = format!("{error:#}");
+        assert!(text.contains("--hub-ca"), "错误必须提示 --hub-ca: {text}");
+        assert!(text.contains("未写入面板配置"), "{text}");
+
+        // 给了 --hub-ca 时不再推导本机 CA，交由 prepare_hub_ca 校验显式文件。
+        let explicit = Path::new("/tmp/remote-ca.pem");
+        let plan = plan_hub_connection(
+            &hub,
+            Some("https://remote.example.net:8444"),
+            Some(explicit),
+        )
+        .unwrap();
+        assert_eq!(plan.hub_url, "https://remote.example.net:8444");
+        assert_eq!(plan.ca_source, None);
+
+        let plan = plan_hub_connection(&hub, Some("127.0.0.1:9444"), None).unwrap();
+        assert_eq!(
+            plan.hub_url, "http://127.0.0.1:9444",
+            "无 scheme 的显式 --hub 保留旧行为：默认 http"
+        );
+    }
+
+    /// #39：CA 先读取校验、cfg.save 成功后才落盘；缺失/非法时失败并提示 --hub-ca。
+    #[test]
+    fn init_prepares_hub_ca_and_fails_closed() {
+        let hub_dir = TempSite::new();
+        tls::ensure_hub_material(
+            &hub_dir.dir,
+            &["hub.example.com".to_string()],
+            tls::CertPolicy::default(),
+        )
+        .unwrap();
+        let source = tls::cert_dir(&hub_dir.dir).join(tls::CA_CERT_FILE);
+        let plan = plan_hub_connection(
+            &init_hub_config_with_names(
+                "0.0.0.0:8444",
+                AdminTlsMode::Required,
+                ServerTlsMode::SelfSigned,
+                &hub_dir.dir,
+                &["hub.example.com"],
+            ),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let config_dir = TempSite::new();
+        let config_path = config_dir.dir.join("panel.toml");
+        let prepared = prepare_hub_ca(&plan, None, &config_path)
+            .unwrap()
+            .expect("自签 Hub 必须准备 CA");
+        let copied_path = config_dir.dir.join("hub-ca.pem");
+        assert_eq!(
+            prepared.config_path().unwrap(),
+            copied_path.to_str().unwrap()
+        );
+        assert!(
+            !copied_path.exists(),
+            "prepare 阶段只读取校验，不能在 cfg.save 前写 CA"
+        );
+
+        prepared.install().unwrap();
+        assert_eq!(
+            std::fs::read(&copied_path).unwrap(),
+            std::fs::read(&source).unwrap(),
+            "hub_ca 必须是 Hub CA 的逐字节副本"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&copied_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o644, "CA 是公开信息，使用 0644");
+        }
+        // 复制出的 CA 能被 ProxyClient 接受（不是空 PEM / 私钥 / 系统根回退）。
+        proxy::ProxyClient::new(&plan.hub_url, "test-token", copied_path.to_str().unwrap())
+            .expect("合法的 hub CA 必须能构造 ProxyClient");
+
+        // 缺失自签 CA：必须提示 --hub-ca，不能生成指向系统根的配置。
+        let missing_dir = TempSite::new();
+        let missing_plan = plan_hub_connection(
+            &init_hub_config_with_names(
+                "0.0.0.0:8444",
+                AdminTlsMode::Required,
+                ServerTlsMode::SelfSigned,
+                &missing_dir.dir,
+                &["hub.example.com"],
+            ),
+            None,
+            None,
+        )
+        .unwrap();
+        let error = prepare_hub_ca(&missing_plan, None, &missing_dir.dir.join("panel.toml"))
+            .err()
+            .expect("缺失自签 CA 必须失败");
+        let text = format!("{error:#}");
+        assert!(text.contains("--hub-ca"), "错误必须提示 --hub-ca: {text}");
+        assert!(
+            !missing_dir.dir.join("hub-ca.pem").exists(),
+            "失败时不得留下看似可用的 hub_ca"
+        );
+
+        // 显式 --hub-ca 与 http 是矛盾配置，必须拒绝。
+        let http_plan = HubInitPlan {
+            hub_url: "http://127.0.0.1:8444".to_string(),
+            ca_source: None,
+        };
+        let error = prepare_hub_ca(&http_plan, Some(&source), &config_path)
+            .err()
+            .expect("http + --hub-ca 必须拒绝");
+        assert!(format!("{error:#}").contains("https://"));
+    }
+
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// #39：注入 CA 写失败——旧 CA / 旧配置字节不变，且不保存新配置。
+    #[test]
+    fn init_ca_write_failure_keeps_old_ca_and_config() {
+        let dir = TempSite::new();
+        let dest = dir.dir.join("hub-ca.pem");
+        let config_path = dir.dir.join("panel.toml");
+        std::fs::write(&dest, b"old-ca-bytes").unwrap();
+        std::fs::write(&config_path, b"old-config-bytes").unwrap();
+        let prepared = PreparedHubCa {
+            dest: dest.clone(),
+            bytes: b"new-ca-bytes".to_vec(),
+            previous: Some(b"old-ca-bytes".to_vec()),
+            fail_write: true,
+        };
+
+        let mut saved = false;
+        let error = write_init_artifacts(Some(&prepared), || {
+            saved = true;
+            std::fs::write(&config_path, b"new-config-bytes").unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!saved, "CA 写失败时不得保存配置");
+        assert!(format!("{error:#}").contains("注入"), "{error:#}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old-ca-bytes");
+        assert_eq!(std::fs::read(&config_path).unwrap(), b"old-config-bytes");
+        assert!(
+            file_names(&dir.dir)
+                .iter()
+                .all(|name| !name.starts_with('.')),
+            "失败后不得残留临时文件"
+        );
+    }
+
+    /// #39：注入 cfg.save 失败——恢复旧 CA 字节，旧配置不变。
+    #[test]
+    fn init_config_save_failure_restores_old_ca() {
+        let dir = TempSite::new();
+        let dest = dir.dir.join("hub-ca.pem");
+        let config_path = dir.dir.join("panel.toml");
+        std::fs::write(&dest, b"old-ca-bytes").unwrap();
+        std::fs::write(&config_path, b"old-config-bytes").unwrap();
+        let prepared = PreparedHubCa {
+            dest: dest.clone(),
+            bytes: b"new-ca-bytes".to_vec(),
+            previous: Some(b"old-ca-bytes".to_vec()),
+            fail_write: false,
+        };
+
+        let error = write_init_artifacts(Some(&prepared), || Err(anyhow!("注入的配置保存失败")))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("配置保存失败"), "{error:#}");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"old-ca-bytes",
+            "cfg.save 失败必须恢复旧 CA 字节"
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), b"old-config-bytes");
+        assert!(
+            file_names(&dir.dir)
+                .iter()
+                .all(|name| !name.starts_with('.')),
+            "失败后不得残留临时文件"
+        );
+    }
+
+    /// #39：原本没有 CA 时 cfg.save 失败——删除新 CA，无残留。
+    #[test]
+    fn init_config_save_failure_removes_new_ca() {
+        let dir = TempSite::new();
+        let dest = dir.dir.join("hub-ca.pem");
+        let prepared = PreparedHubCa {
+            dest: dest.clone(),
+            bytes: b"new-ca-bytes".to_vec(),
+            previous: None,
+            fail_write: false,
+        };
+
+        assert!(
+            write_init_artifacts(Some(&prepared), || Err(anyhow!("注入的配置保存失败"))).is_err()
+        );
+        assert!(!dest.exists(), "cfg.save 失败必须删除新 CA");
+        assert!(
+            file_names(&dir.dir)
+                .iter()
+                .all(|name| !name.starts_with('.')),
+            "失败后不得残留临时文件"
+        );
+    }
+
+    /// #39：无效 CA 在写配置前失败；--force 场景下不得覆盖旧 CA。
+    #[test]
+    fn init_rejects_invalid_hub_ca_without_overwriting_existing() {
+        let dir = TempSite::new();
+        let bogus = dir.dir.join("bogus.pem");
+        std::fs::write(&bogus, "not a certificate\n").unwrap();
+        let plan = HubInitPlan {
+            hub_url: "https://127.0.0.1:8444".to_string(),
+            ca_source: None,
+        };
+        let config_path = dir.dir.join("panel.toml");
+        let dest = dir.dir.join("hub-ca.pem");
+        std::fs::write(&dest, "old-ca-bytes").unwrap();
+
+        let error = prepare_hub_ca(&plan, Some(&bogus), &config_path)
+            .err()
+            .expect("非法 PEM 必须失败");
+        let text = format!("{error:#}");
+        assert!(text.contains("PEM"), "错误必须点名 PEM: {text}");
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "old-ca-bytes",
+            "校验失败时不得覆盖旧 CA"
+        );
+        assert!(!config_path.exists(), "失败时不得写面板配置");
+    }
+
+    #[test]
+    fn init_hub_ca_destination_is_absolute() {
+        let dest = hub_ca_destination(Path::new("panel.toml")).unwrap();
+        assert!(dest.is_absolute(), "相对配置路径也必须落绝对 hub_ca");
+        assert_eq!(dest.file_name().unwrap(), "hub-ca.pem");
     }
 
     #[test]

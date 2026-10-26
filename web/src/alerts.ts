@@ -206,15 +206,21 @@ export function validateRuleLabels(labels: RuleLabelForm[]): string | null {
   return null;
 }
 
-/** 把表单的 labels 行转成对象；完全空白的行忽略。 */
+/**
+ * 把表单的 labels 行转成对象；完全空白的行忽略。
+ *
+ * 用 `Object.fromEntries` 而不是 `{}` + `out[key] = value`：`__proto__` 是
+ * 普通对象上的原型 setter，字符串值会被静默丢弃，导致后端允许的
+ * `__proto__` 标签在创建 / 编辑时消失、筛选范围被扩大。#41
+ */
 export function buildFilterLabels(labels: RuleLabelForm[]): Record<string, string> {
-  const out: Record<string, string> = {};
+  const entries: Array<[string, string]> = [];
   for (const row of labels) {
     const key = row.key.trim();
     if (key === "") continue;
-    out[key] = row.value;
+    entries.push([key, row.value]);
   }
-  return out;
+  return Object.fromEntries(entries);
 }
 
 /** 创建 / PUT 的完整字段集合；PUT 由 {@link buildRuleUpdatePayload} 做差集。 */

@@ -240,7 +240,8 @@ impl ProxyClient {
     ///   `Content-Disposition` 与 `Content-Length`，并强制 `private, no-store`；
     /// - 超过 1 GiB（响应头或流式累计）→ [`ProxyError::DownloadTooLarge`]；
     /// - hub 的 4xx/5xx（404 / 409 / 502 等）按原状态码与 JSON body 透传，
-    ///   前端 `<a href>` 下载失败时仍能看到固定错误码。
+    ///   前端 `<a href>` 下载失败时仍能看到固定错误码；401 与告警接口一致，
+    ///   改写为 502 `hub_auth_failed`（服务间认证失败不能触发浏览器登出）。
     pub async fn download(&self, path: &str) -> std::result::Result<Response, ProxyError> {
         let url = self
             .endpoint(path, &[])
@@ -636,19 +637,24 @@ pub fn hub_reply_to_response(reply: HubReply) -> Response {
     response
 }
 
-/// 把 hub 的告警 API 响应原样映射给浏览器，**包括 401**。
+/// 把 hub 的告警 / 归档 API 响应原样映射给浏览器，但 **401 例外**。
 ///
-/// 告警接口需要把 hub 的 400/401/403/404/409/502 状态码与错误码原样交给前端，
-/// 便于页面展示 `code`；因此这里不复用 [`hub_reply_to_response`] 的 401 → 502
-/// 改写。响应体仍逐字节透传，但 Content-Type 固定为 JSON、禁止缓存，避免上游
-/// HTML 在面板 origin 下执行。
+/// 这两类接口需要把 hub 的 400/403/404/409/502 状态码与错误码原样交给前端，
+/// 便于页面展示 `code`；但 hub 的 401 是**面板 → hub** 的服务间认证失败，
+/// 不是浏览器会话失效。若原样透传，前端全局 401 处理器会把仍有效的管理员
+/// 登出，且重新登录也无法恢复。因此这里与普通代理一致，把 401 改写为
+/// `502 hub_auth_failed`，并且不保留上游 body（可能含 token / 认证细节）。
+/// 响应体逐字节透传，Content-Type 固定为 JSON、禁止缓存，避免上游 HTML
+/// 在面板 origin 下执行。
 pub fn hub_reply_to_response_verbatim(reply: HubReply) -> Response {
     if reply.status == StatusCode::UNAUTHORIZED {
-        // 只记录状态码与固定提示，绝不记录 token / Authorization 头。
-        tracing::warn!(
+        // 只记录状态码与固定提示，绝不记录 token / Authorization 头 / 上游 body。
+        tracing::error!(
             status = 401,
-            "hub 告警 API 返回 401；请检查 panel.toml 的 token 与 hub 的 admin_token 是否一致"
+            "hub 告警/归档 API 返回 401，已映射为 502 hub_auth_failed；\
+             请检查 panel.toml 的 token 与 hub 的 admin_token 是否一致"
         );
+        return json_error(StatusCode::BAD_GATEWAY, "hub_auth_failed");
     }
     let mut response = Response::new(Body::from(reply.body));
     *response.status_mut() = reply.status;
@@ -1075,6 +1081,59 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "application/json"
         );
+    }
+
+    #[tokio::test]
+    async fn verbatim_maps_hub_401_to_502_without_leaking_upstream_body() {
+        // 告警 / 归档接口收到 hub 401 时必须是 502 hub_auth_failed：前端只对
+        // 401 触发全局登出，透传会让有效的 Panel 会话被反复踢出。
+        let response = hub_reply_to_response_verbatim(HubReply {
+            status: StatusCode::UNAUTHORIZED,
+            body: br#"{"error":{"code":"invalid_token","message":"token secret"}}"#.to_vec(),
+        });
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("hub_auth_failed"), "{text}");
+        assert!(!text.contains("invalid_token"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn verbatim_preserves_business_statuses_and_bodies() {
+        // 400/403/404/409/502 是 hub 的业务错误，面板必须原样保留状态码与 body。
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            let body = format!(
+                r#"{{"error":"business_{}","message":"上游业务错误"}}"#,
+                status.as_u16()
+            );
+            let response = hub_reply_to_response_verbatim(HubReply {
+                status,
+                body: body.clone().into_bytes(),
+            });
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/json"
+            );
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(&bytes[..], body.as_bytes(), "status={status}");
+        }
     }
 
     #[tokio::test]
