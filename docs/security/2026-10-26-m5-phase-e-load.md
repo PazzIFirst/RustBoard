@@ -10,13 +10,28 @@
 | 项 | 值 |
 |---|---|
 | 主机 | 16 vCPU / 17 GiB RAM / Linux 6.12（x86_64），根分区约 55 GiB 可用 |
-| hub | 当前源码 `target/debug/rustboard-hub`，SQLite/WAL，`self_monitor=false`，`max_connections=2048`，`max_connections_per_ip=256`，管理限速关闭 |
+| hub | 短档排查用 `target/debug/rustboard-hub`（glibc）；**24h 用当前源码重建的静态 musl `dist/amd64/bin/rustboard-hub`**，SQLite/WAL，`self_monitor=false`，`max_connections=2048`，`max_connections_per_ip=256`，管理限速关闭 |
 | 协议 | 真实 TLS Enrollment → Hello → Batch/Ack；协议 v2；每批 3 点（`load.cpu/mem/disk`），5s/agent |
 | 源 IP | 100/200 用 1 个回环源 IP；500 用 3 个；1000 用 5 个（`127.0.0.10..`，每 IP ≤200），不绕过 per-IP 上限 |
 | 证据 | `target/load/<UTC>-<N>a/`（`metrics.jsonl`/`summary.json`/`hub.log`），不入库 |
 | 数据校验 | `ingest_batches`/`samples` 总数、每 agent 计数、两组重复；agents 关闭会话后只读快照，前后计数一致 |
 
-## 2. 短档结果（每档 10min）
+## 1.1 构建差异与 RSS 修复（重要）
+
+- 首轮 24h 使用 **debug/glibc** 二进制；21min 时 RSS 从 10min 基线 113MiB 涨到
+  157MiB，趋势不可接受，已提前停止，未签收。
+- 同一 200/300 档：默认 glibc `MALLOC_ARENA_MAX` 为 +13.5%，`MALLOC_ARENA_MAX=2`
+  仅 **+2.9%**；确认主要是数百个 spawn_blocking 线程各自的 glibc arena 高水位。
+- 修复：hub 主 runtime `.max_blocking_threads(64)`（提交 `3f916a0`），把
+  200/1000 agent 的 blocking 线程从约 200/529 收敛到 **81** 总线程（含 worker）。
+- 重新构建静态 **musl** 发布产物后复验：
+  - 200/300：RSS 49.4→50.4MiB（**+2.06%**），线程 81，ACK p95 99ms；
+  - 1000/300：RSS 175.1→182.4MiB（**+4.16%**），线程 81、FD 1023，
+    120000 批/360000 点 0 丢/重/错，ACK p95 468ms。
+- 因此 24h 改为在 **静态 musl 发布产物**上运行，而不是 debug 构建；短档表中的
+  10min 数字是修复前 debug 基线，保留用于对照，不能替代 24h 结论。
+
+## 2. 短档结果（修复前 debug，每档 10min）
 
 | agent | 计划/ACK 批 | 点数 | ACK p50/p95/p99 (ms) | FD 基线→结束 | 线程 基线→结束 | RSS 基线→结束 (KiB) | 错误/重试/重连 |
 |---:|---:|---:|---|---|---|---|---|
@@ -38,13 +53,16 @@
   - 500：`target/load/20261026T130712Z-500a/`
   - 1000：`target/load/20261026T131809Z-1000a/`
 
-## 3. 200 agent 24h 长稳（运行中）
+## 3. 200 agent 24h 长稳（静态 musl，运行中）
 
-- 启动：2026-10-26 21:33（本地），计划 86400s；200 agent、5s/agent、3 点/批；
+- 启动：**2026-10-26 22:31（本地）**，计划 86400s（最早 10-27 22:31 结束）；
+  200 agent、5s/agent、3 点/批；静态 musl 发布二进制，git `3f916a0`，
+  hub sha256 `62dd9b7e…`；证据 `target/load/20261026T143119Z-200a/`。
 - 硬门禁：0 丢点/重复、0 未处理错误、`/healthz` 0 失败、hub 未重启、
-  RSS ≤10%、FD/线程相对基线 +≤32、`hub.log` 无 panic/ERROR；
+  RSS ≤10%、FD/线程相对 600s 基线 +≤32、`hub.log` 无 panic/ERROR；
 - 状态：**运行中，尚无最终结论**。1h 与结束时检查 RSS/FD/线程曲线；若 RSS
   仍持续单边上涨或 24h >10%，按缺陷处理，不发布 `v1.0.0`。
+- 首轮 debug/glibc 24h 已因 21min RSS 趋势提前停止，**不作为通过证据**。
 - 结束后在本文件补：`summary.json` 关键字段、RSS/FD/线程起点/终点、ACK
   p50/p95/p99、DB 点数/重复、health 次数、证据路径。
 
