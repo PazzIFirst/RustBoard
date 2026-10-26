@@ -1308,12 +1308,14 @@ fn ensure_v8_columns(tx: &Transaction<'_>) -> Result<()> {
 /// 窗口里会有「1m 已写、水位未推进」的桶。若按水位标记 `aggregated_1m`，
 /// 这些桶的 raw 会被再次聚合（双计）；反过来水位先行也会漏计。因此：
 ///
-/// 1. `samples.aggregated_1m`：同一 `(agent_id, metric, labels, 分钟桶)` 已有
-///    1m 行的 raw 一律置 1，没有 1m 行的桶保持 0；
-/// 2. `samples_1m.last_ts`：legacy 桶一律回填 `bucket_ts + 59999`；
-///    不从可能未聚合的 raw 取 `MAX(ts)`，避免迟到行错误改写 `last_value`；
-/// 3. `samples_1m.aggregated_1h`：只有同一 `(agent_id, metric, labels, 整点小时)`
-///    存在 1h 行时，该小时所有 1m 行置 1，否则保持 0；不读 1h 水位（v7 水位
+/// 1. `samples.aggregated_1m`：同一分钟桶的 raw 按 `rowid` 升序编号，
+///    编号 `<= 1m.count` 的置 1；raw 少于 count 全置 1，无 1m 行保持 0。
+///    仅凭「桶已有 1m 行」会把崩溃窗口后到达的 late raw 误标，造成永久漏计；
+/// 2. `samples_1m.last_ts`：按 `rowid` 升序取最早 `1m.count` 条 raw 的
+///    `MAX(ts)`；raw 已删（无现存 raw）才回填 `bucket_ts + 59999`，避免迟到行
+///    被错误当成已聚合的 last；
+/// 3. `samples_1m.aggregated_1h`：同小时 1m 行按 `(bucket_ts, rowid)` 累计
+///    `count`，累计值 `<= 1h.count` 的置 1，其余保持 0；不读 1h 水位（v7 水位
 ///    可能落在非整点）；
 /// 4. `archive_objects.ledger_version` / `attempts`：DB 默认 0，不需要额外更新；
 /// 5. 归档水位存在时写 `archive_state.archive_ledger_pending=1`，交给 R1a-2
@@ -1338,43 +1340,82 @@ fn apply_v8_data_migration(tx: &Transaction<'_>, version: i64) -> Result<()> {
         "UPDATE samples SET aggregated_1m = 0 WHERE aggregated_1m != 0",
         [],
     )?;
+    // 只认领每个 1m 桶「最早 1m.count 条 raw」（按 rowid 排序）；raw 少于
+    // count 时全部认领。不能仅凭桶存在就把所有 raw 标 1，否则崩溃窗口后
+    // 才到的 late raw 会被永久漏聚合。
     let aggregated = tx.execute(
         "UPDATE samples SET aggregated_1m = 1
-         WHERE ts >= ?1 AND ts <= ?2
-           AND EXISTS (
-             SELECT 1 FROM samples_1m m
-             WHERE m.agent_id = samples.agent_id
-               AND m.metric = samples.metric
-               AND m.labels = samples.labels
-               AND m.bucket_ts = (samples.ts / 60000) * 60000
+         WHERE rowid IN (
+             SELECT s.rowid FROM (
+                 SELECT rowid, agent_id, metric, labels, ts,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY agent_id, metric, labels, (ts / 60000) * 60000
+                            ORDER BY rowid ASC
+                        ) AS rn
+                 FROM samples
+                 WHERE ts >= ?1 AND ts <= ?2
+             ) s
+             JOIN samples_1m m
+               ON m.agent_id = s.agent_id
+              AND m.metric = s.metric
+              AND m.labels = s.labels
+              AND m.bucket_ts = (s.ts / 60000) * 60000
+             WHERE s.rn <= m.count
          )",
         params![MIN_ARCHIVE_TS_MS, now],
     )?;
     tracing::info!(aggregated, "v8 迁移：按已存在的 1m 桶标记已聚合 raw");
 
-    // legacy 1m 桶统一用保守的 last_ts；不再从 raw 取 MAX(ts)。
+    // last_ts 取「该桶最早 count 条 raw」的 MAX(ts)；raw 已删的桶才回填
+    // bucket_ts+59999。这样 late raw 不会被错误当成已聚合的 last。
     tx.execute("UPDATE samples_1m SET last_ts = 0 WHERE last_ts != 0", [])?;
     let backfilled = tx.execute(
-        "UPDATE samples_1m SET last_ts = bucket_ts + 59999
+        "UPDATE samples_1m SET last_ts = COALESCE(
+             (SELECT MAX(s.ts) FROM samples s
+              WHERE s.agent_id = samples_1m.agent_id
+                AND s.metric = samples_1m.metric
+                AND s.labels = samples_1m.labels
+                AND s.ts >= samples_1m.bucket_ts
+                AND s.ts < samples_1m.bucket_ts + 60000
+                AND (SELECT COUNT(*) FROM samples s2
+                     WHERE s2.agent_id = samples_1m.agent_id
+                       AND s2.metric = samples_1m.metric
+                       AND s2.labels = samples_1m.labels
+                       AND s2.ts >= samples_1m.bucket_ts
+                       AND s2.ts < samples_1m.bucket_ts + 60000
+                       AND s2.rowid <= s.rowid) <= samples_1m.count),
+             samples_1m.bucket_ts + 59999)
          WHERE bucket_ts >= ?1 AND bucket_ts <= ?2",
         params![MIN_ARCHIVE_TS_MS, now],
     )?;
     tracing::info!(backfilled, "v8 迁移：回填 legacy 1m last_ts");
 
-    // 1h 按整点小时对账：只有该小时确实存在 1h 行时才认领 1m。
+    // 1h 按 (bucket_ts, rowid) 累计 count 对账：累计值 <= 1h.count 的 1m
+    // 行才算已并入；崩溃窗口后的 late 1m 行保持 0，交给 R1b 重算。
     tx.execute(
         "UPDATE samples_1m SET aggregated_1h = 0 WHERE aggregated_1h != 0",
         [],
     )?;
     let aggregated_hour = tx.execute(
         "UPDATE samples_1m SET aggregated_1h = 1
-         WHERE bucket_ts >= ?1 AND bucket_ts <= ?2
-           AND EXISTS (
-             SELECT 1 FROM samples_1h h
-             WHERE h.agent_id = samples_1m.agent_id
-               AND h.metric = samples_1m.metric
-               AND h.labels = samples_1m.labels
-               AND h.bucket_ts = (samples_1m.bucket_ts / 3600000) * 3600000
+         WHERE rowid IN (
+             SELECT m.rowid FROM (
+                 SELECT rowid, agent_id, metric, labels, bucket_ts, count,
+                        SUM(count) OVER (
+                            PARTITION BY agent_id, metric, labels,
+                                         (bucket_ts / 3600000) * 3600000
+                            ORDER BY bucket_ts ASC, rowid ASC
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                        ) AS cumulative_count
+                 FROM samples_1m
+                 WHERE bucket_ts >= ?1 AND bucket_ts <= ?2
+             ) m
+             JOIN samples_1h h
+               ON h.agent_id = m.agent_id
+              AND h.metric = m.metric
+              AND h.labels = m.labels
+              AND h.bucket_ts = (m.bucket_ts / 3600000) * 3600000
+             WHERE m.cumulative_count <= h.count
          )",
         params![MIN_ARCHIVE_TS_MS, now],
     )?;
@@ -2509,6 +2550,10 @@ impl Storage for SqliteStorage {
 
     fn count_invalid_archive_raw_rows(&self) -> Result<i64> {
         SqliteStorage::count_invalid_archive_raw_rows(self)
+    }
+
+    fn record_archive_attempt(&self, id: i64) -> Result<i64> {
+        SqliteStorage::record_archive_attempt(self, id)
     }
 
     fn count_archive_objects(&self) -> Result<i64> {
@@ -5023,12 +5068,24 @@ impl SqliteStorage {
         let object_id = insert_archive_object_on(&tx, object)?;
         let mut claimed = 0usize;
         {
+            // rowid 在 scan→claim 之间可能因删除最大行而被复用；必须同时比对
+            // 行身份（agent/metric/labels/ts/value），否则会把新行误认领。
             let mut stmt = tx.prepare(
                 "UPDATE samples SET archive_object_id = ?1 \
-                 WHERE rowid = ?2 AND archive_object_id IS NULL",
+                 WHERE rowid = ?2 AND archive_object_id IS NULL \
+                   AND agent_id = ?3 AND metric = ?4 AND labels = ?5 \
+                   AND ts = ?6 AND value = ?7",
             )?;
             for row in rows {
-                claimed += stmt.execute(params![object_id, row.rowid])?;
+                claimed += stmt.execute(params![
+                    object_id,
+                    row.rowid,
+                    row.agent_id,
+                    row.metric,
+                    row.labels,
+                    row.ts,
+                    row.value,
+                ])?;
             }
         }
         if claimed != rows.len() {
@@ -5054,23 +5111,70 @@ impl SqliteStorage {
     pub fn update_archive_object_metadata(&self, id: i64, bytes: u64, sha256: &str) -> Result<()> {
         validate_archive_sha256(sha256)?;
         let bytes = i64::try_from(bytes).context("归档对象字节数超出 SQLite INTEGER 范围")?;
-        let conn = self.lock_write();
-        let updated = conn.execute(
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM archive_objects WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(status) = status else {
+            return Err(ArchiveStoreError::NotFound.into());
+        };
+        let status = ArchiveStatus::parse(&status)
+            .ok_or_else(|| anyhow::anyhow!("archive_objects.status 字段值非法"))?;
+        if !matches!(status, ArchiveStatus::Pending | ArchiveStatus::Failed) {
+            return Err(ArchiveStoreError::InvalidTransition.into());
+        }
+        tx.execute(
             "UPDATE archive_objects SET bytes = ?2, sha256 = ?3 WHERE id = ?1",
             params![id, bytes, sha256],
         )?;
-        if updated == 0 {
-            return Err(ArchiveStoreError::NotFound.into());
-        }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// 记录一次上传尝试：仅 pending / failed 对象允许，`attempts += 1`。
+    ///
+    /// 返回递增后的 attempts。对象不存在返回 `NotFound`，uploaded /
+    /// local_deleted 返回 `InvalidTransition`。
+    pub fn record_archive_attempt(&self, id: i64) -> Result<i64> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM archive_objects WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(status) = status else {
+            return Err(ArchiveStoreError::NotFound.into());
+        };
+        let status = ArchiveStatus::parse(&status)
+            .ok_or_else(|| anyhow::anyhow!("archive_objects.status 字段值非法"))?;
+        if !matches!(status, ArchiveStatus::Pending | ArchiveStatus::Failed) {
+            return Err(ArchiveStoreError::InvalidTransition.into());
+        }
+        tx.execute(
+            "UPDATE archive_objects SET attempts = attempts + 1 WHERE id = ?1",
+            params![id],
+        )?;
+        let attempts: i64 = tx.query_row(
+            "SELECT attempts FROM archive_objects WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(attempts)
     }
 
     /// 按 `archive_object_id` 读回 claim 行集，按 `ts, rowid` 升序。
     ///
-    /// 上传失败 / 崩溃后的重试必须用同一行集重建 CSV 与 manifest，不能重扫 raw；
-    /// 排序必须与 claim 扫描（`list_unclaimed_archive_rows` 的 `ts, rowid`）一致，
-    /// 否则重试会输出不同的行顺序，导致 SHA-256 与已记录对象不一致。
-    /// 对象不存在或行已被删除时返回空列表（由调用方判定为数据缺失）。
+    /// 排序必须与 claim/scan 的 `(ts, rowid)` 一致，重试才能重建字节级相同的
+    /// CSV；上传失败 / 崩溃后不得重扫 raw。对象不存在或行已删除返回空列表。
     pub fn archive_rows_for_object(&self, object_id: i64) -> Result<Vec<ArchiveRawRow>> {
         let conn = self.lock_read();
         let mut stmt = conn.prepare(

@@ -120,8 +120,9 @@ ALTER TABLE samples_1m ADD COLUMN aggregated_1h INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX idx_samples_1m_unaggregated ON samples_1m(bucket_ts)
   WHERE aggregated_1h = 0;
 
--- 归档对象：区分 v7 旧对象与 v8 claim 对象
+-- 归档对象：区分 v7 旧对象与 v8 claim 对象，并记录 failed 重试次数
 ALTER TABLE archive_objects ADD COLUMN ledger_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE archive_objects ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
 ```
 
 - SQLite 使用 `rowid` 作为 raw 稳定行键；PG 使用 `samples.id`。Storage 新增
@@ -140,15 +141,19 @@ ALTER TABLE archive_objects ADD COLUMN ledger_version INTEGER NOT NULL DEFAULT 0
    门禁。**注意：已发布的 v7 二进制无法被追溯修改**，它不会拒绝 v8；因此升级
    文档必须写明 v8 单向、回退恢复备份，安装器/升级脚本检查版本并阻止旧二进制
    启动。
-2. `archive_object_id` 初始为 NULL；`ledger_version=0` 表示 v7 旧对象。
-3. `aggregated_1m`：
-   - 有 1m 水位：`ts < 水位` 的旧 raw 标记为 1（沿用 v7 已聚合事实），其余为 0。
-   - 无水位/空库：全部 0。
-   - `ts` 超出新时间策略的旧行单独计数并以 1 隔离（见 §4.2），避免维护循环
-     被历史坏数据卡住。
-4. `samples_1m.last_ts`：优先回填该桶现存 raw 的 `MAX(ts)`；raw 已删的桶回填
-   `bucket_ts + 59999`（保守值，避免迟到行错误改写 last）。
-5. `samples_1m.aggregated_1h`：`bucket_ts < 1h 水位` 的旧桶置 1，其余 0。
+2. `archive_object_id` 初始为 NULL；`ledger_version=0`、`attempts=0` 表示 v7 旧对象。
+3. `aggregated_1m`：**按 1m 桶 count/rowid 顺序对账，不读维护水位**（v7
+   先写 1m 再推进水位，崩溃窗口会双计/漏计）：
+   - 同一 `(agent_id, metric, labels, 分钟桶)` 的 raw 按 `rowid` 升序编号；
+     编号 `<= 1m.count` 的 raw 置 1，其余（含崩溃窗口后才到的 late raw）置 0；
+   - raw 少于 `1m.count` 时全部置 1；无 1m 行的桶全部 0；
+   - `ts` 超出可归档范围的旧行单独计数并保持 0（见 §4.2），不参与对账。
+4. `samples_1m.last_ts`：每个桶按 `rowid` 升序取最早 `1m.count` 条 raw 的
+   `MAX(ts)`；raw 已删（无现存 raw）的桶才回填 `bucket_ts + 59999`，不得直接
+   用全部现存 raw 或桶尾，避免迟到行被错误当成已聚合的 last。
+5. `samples_1m.aggregated_1h`：**按整点小时累计 count 对账，不读 1h 水位**：
+   同小时 1m 行按 `(bucket_ts, rowid)` 排序累计 `count`，累计值 `<= 1h.count`
+   的行置 1，其余（崩溃窗口后的 late 1m）置 0；无 1h 行全部 0。
 6. **归档账本迁移**：
    - `archive.enabled=false` 或水位为空：不进入 ledger 重建。
    - `archive.enabled=true` 且已有水位：写 `archive_state.archive_ledger_pending=1`，
@@ -170,8 +175,8 @@ ALTER TABLE archive_objects ADD COLUMN ledger_version INTEGER NOT NULL DEFAULT 0
   维护查询。
 - 1h 调度只查 `samples_1m.aggregated_1h=0` 的小时；retention 只删
   `aggregated_1h=1`。
-- PG 的 `samples.id` 与 SQLite `rowid` 在 claim 事务内固定；不使用可能复用的
-  裸 rowid 做跨事务唯一标识。
+- PG 的 `samples.id` 与 SQLite `rowid` 在 claim 事务内固定；跨事务 claim 必须
+  同时校验行身份（agent/metric/labels/ts/value），不得只用可能复用的裸 rowid。
 
 ## 4. 分阶段设计
 
@@ -180,18 +185,27 @@ ALTER TABLE archive_objects ADD COLUMN ledger_version INTEGER NOT NULL DEFAULT 0
 **目标**：每条被 retention 删除的 raw 都能指向一个已成功上传的归档对象；
 迟到行、重试、崩溃都不能绕过。
 
-**claim 流程（单事务）**：
+**claim 短事务 + 事务外编码/上传**：
 
-1. 选 `archive_object_id IS NULL`、`ts` 在可归档日内的 raw，按 `ts,rowid` 排序，
-   限制 `max_shard_rows`。
-2. 生成 CSV.GZ（gzip mtime=0，确定性）与 manifest；`created_at=now` 固定。
-3. 插入 `archive_objects`：`ledger_version=1`、key 加 `-v8`、status=pending、
-   rows/bytes/sha256/from_ts/to_ts 来自该行集。
-4. `UPDATE samples SET archive_object_id=? WHERE rowid IN (...) AND
-   archive_object_id IS NULL`；受影响行数必须等于选中行数，否则回滚重试。
-5. 提交后上传对象 + manifest；成功置 uploaded，失败置 failed。
-6. 失败/崩溃后的重试：按 `archive_object_id` 读取**同一行集**，用对象
-   `created_at` 重建完全相同的 CSV/manifest；不重新扫描 raw，不纳入新 late 行。
+1. 选 `archive_object_id IS NULL`、`ts` 在可归档日内且未超界的 raw，按
+   `ts,rowid`（PG 为 `ts,id`）排序，按 `max_shard_rows` / `max_object_bytes`
+   预切分为一个或多个对象。
+2. 单事务插入 `archive_objects`：`ledger_version=1`、key 加 `-v8`、
+   status=pending、rows/from_ts/to_ts 来自行集；bytes/sha256 先留占位。
+3. 同一事务内 `UPDATE samples SET archive_object_id=? WHERE rowid=? AND
+   archive_object_id IS NULL AND agent_id=? AND metric=? AND labels=? AND ts=?
+   AND value=?`（PG 用 `id`）；**必须带行身份条件**，否则 rowid 被删除复用后
+   会误认领新行。affected 行数必须等于选中数，否则整事务回滚并返回可重试
+   `ClaimConflict`。
+4. 提交后在事务外生成 CSV.GZ（gzip mtime=0，确定性）与 manifest；
+   `created_at=now` 固定；生成完成后由 `update_archive_object_metadata`
+   补 `bytes/sha256`（仅 pending/failed 允许）。
+5. 上传对象 + manifest；开始每次尝试前 `record_archive_attempt` 递增
+   `attempts`（仅 pending/failed）；成功置 uploaded，失败置 failed。
+6. 失败/崩溃后的重试：按 `archive_object_id` 读取**同一行集**（按 `ts,rowid`
+   排序，与 claim/scan 一致），用对象 `created_at` 重建完全相同的
+   CSV/manifest；不重新扫描 raw，不纳入新 late 行；元数据只允许在
+   pending/failed 状态更新。
 7. 新 late 行仍是 NULL，下一轮生成**新对象**（`part-00002-v8`），不需要重扫
    已归档日。
 

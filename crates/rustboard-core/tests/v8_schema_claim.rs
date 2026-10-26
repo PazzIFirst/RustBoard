@@ -82,7 +82,6 @@ fn build_v7_fixture(path: &PathBuf, with_1h_row: bool, archived_watermark: bool)
         );
         INSERT INTO samples VALUES ('a', 'm', '{}', 30000, 1.0);
         INSERT INTO samples VALUES ('a', 'm', '{}', 90000, 2.0);
-        -- 该分钟桶没有 1m 行，v8 迁移后必须保持 aggregated_1m=0。
         INSERT INTO samples VALUES ('a', 'm', '{}', 180000, 3.0);
 
         CREATE TABLE samples_1m (
@@ -103,9 +102,16 @@ fn build_v7_fixture(path: &PathBuf, with_1h_row: bool, archived_watermark: bool)
             ('a', 'm', '{}', 60000, 1.0, 2.0, 1.5, 2.0, 2);
         INSERT INTO samples_1m VALUES
             ('a', 'm', '{}', 120000, 3.0, 3.0, 3.0, 3.0, 3);
+        -- hour=0 的末尾 1m 行（180000）与 1h.count 对账后应保持 0。
+        INSERT INTO samples_1m VALUES
+            ('a', 'm', '{}', 180000, 3.0, 3.0, 3.0, 3.0, 1);
         -- hour=3600000 没有 1h 行，1m 行必须保持 aggregated_1h=0。
         INSERT INTO samples_1m VALUES
             ('a', 'm', '{}', 3660000, 4.0, 4.0, 4.0, 4.0, 1);
+
+        -- 迟到 raw：rowid 比原 1m 行更晚，但仍在 bucket 0；1m.count=1
+        -- 只应认领最早一条 raw（30000），不能把 59000 误标为已聚合。
+        INSERT INTO samples VALUES ('a', 'm', '{}', 59000, 4.0);
 
         CREATE TABLE archive_objects (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -211,7 +217,7 @@ fn index_exists(conn: &Connection, name: &str) -> bool {
 }
 
 #[test]
-fn v7_to_v8_migration_backfills_columns_and_keeps_old_data() {
+fn v7_to_v8_migration_reconciles_count_order_and_keeps_old_data() {
     let dir = TempDb::new("migrate");
     build_v7_fixture(&dir.db_path(), true, true);
 
@@ -232,7 +238,7 @@ fn v7_to_v8_migration_backfills_columns_and_keeps_old_data() {
         assert_eq!(object.ledger_version, LEDGER_VERSION_V7);
         assert_eq!(object.object_key, "v7/old.csv.gz");
         assert_eq!(storage.count_archive_objects().unwrap(), 1);
-        assert_eq!(storage.sample_count("a").unwrap(), 3, "旧 raw 行不得丢失");
+        assert_eq!(storage.sample_count("a").unwrap(), 4, "旧 raw 行不得丢失");
     }
 
     let conn = Connection::open(dir.db_path()).expect("重新打开迁移后库失败");
@@ -258,10 +264,12 @@ fn v7_to_v8_migration_backfills_columns_and_keeps_old_data() {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
+    // 迟到/崩溃窗口：59000 的 rowid 晚于原 1m 行，bucket 0 的 1m.count=1，
+    // 只能认领最早一条 raw（30000）；59000 必须保持 0，否则永久漏聚合。
     assert_eq!(
         raw,
-        vec![(30_000, 1), (90_000, 1), (180_000, 0)],
-        "raw 必须按已有 1m 桶对账：有 1m 行的桶置 1，无 1m 行的桶保持 0"
+        vec![(30_000, 1), (59_000, 0), (90_000, 1), (180_000, 1)],
+        "raw 按 1m count/rowid 对账：只标最早 count 条，late raw 保持 0"
     );
 
     let buckets: Vec<(i64, i64, i64)> = conn
@@ -274,12 +282,14 @@ fn v7_to_v8_migration_backfills_columns_and_keeps_old_data() {
     assert_eq!(
         buckets,
         vec![
-            (0, 59_999, 1),
-            (60_000, 119_999, 1),
+            (0, 30_000, 1),
+            (60_000, 90_000, 1),
             (120_000, 179_999, 1),
+            (180_000, 180_000, 0),
             (3_660_000, 3_719_999, 0),
         ],
-        "last_ts 必须统一回填 bucket_ts+59999；1h 只按整点小时已有 1h 行标记"
+        "last_ts 取最早 count 条 raw 的 MAX(ts)，无 raw 才用桶尾；\
+         1h 按累计 count 对账，180000 的累计 7 > 1h.count 6 必须为 0"
     );
 }
 
@@ -311,7 +321,10 @@ fn v7_migration_without_1h_rows_does_not_mark_1h_or_pending() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(raw_flagged, 2, "raw 仍按已有 1m 桶对账（与维护水位无关）");
+    assert_eq!(
+        raw_flagged, 3,
+        "raw 按 1m count/rowid 对账（与维护水位无关）"
+    );
     assert_eq!(m_flagged, 0, "没有 1h 行时 1m 必须全部保持 0");
 }
 
@@ -681,6 +694,32 @@ fn claim_can_defer_csv_metadata_and_update_it_outside_transaction() {
     assert_eq!(stored.sha256, digest);
     assert_eq!(stored.rows, 2);
 
+    // attempts 写入路径：pending / failed 可累加，uploaded 后拒绝。
+    assert_eq!(storage.record_archive_attempt(object_id).unwrap(), 1);
+    assert_eq!(storage.record_archive_attempt(object_id).unwrap(), 2);
+    storage
+        .update_archive_object_status(object_id, ArchiveStatus::Failed, "boom", None, None)
+        .expect("pending→failed 合法");
+    assert_eq!(storage.record_archive_attempt(object_id).unwrap(), 3);
+    // 上传完成后既不能再重试，也不能改元数据。
+    storage
+        .update_archive_object_status(object_id, ArchiveStatus::Uploaded, "", Some(9_000), None)
+        .expect("failed→uploaded 合法");
+    let err = storage
+        .record_archive_attempt(object_id)
+        .expect_err("uploaded 后不得再记录尝试");
+    assert_eq!(
+        err.downcast_ref::<ArchiveStoreError>(),
+        Some(&ArchiveStoreError::InvalidTransition)
+    );
+    let err = storage
+        .update_archive_object_metadata(object_id, 999, &"e".repeat(64))
+        .expect_err("uploaded 后不得改元数据");
+    assert_eq!(
+        err.downcast_ref::<ArchiveStoreError>(),
+        Some(&ArchiveStoreError::InvalidTransition)
+    );
+
     let err = storage
         .update_archive_object_metadata(object_id, 1, "not-a-sha")
         .expect_err("非法 sha256 必须拒绝");
@@ -780,4 +819,75 @@ fn claims_can_split_candidate_rows_into_multiple_objects() {
     assert_eq!(storage.count_archive_objects().unwrap(), 2);
     assert_eq!(storage.archive_rows_for_object(first_id).unwrap().len(), 2);
     assert_eq!(storage.archive_rows_for_object(second_id).unwrap().len(), 1);
+}
+
+#[test]
+fn claim_rejects_reused_rowid_after_max_row_deleted() {
+    let dir = TempDb::new("rowid-reuse");
+    let storage = SqliteStorage::open(&dir.db_path()).unwrap();
+    insert_batch(&storage, 0, vec![Sample::new("metric-old", 1_000, 1.0)]);
+    let stale = storage
+        .list_unclaimed_archive_rows(0, 10_000, 100)
+        .expect("读取未认领行失败");
+    assert_eq!(stale.len(), 1);
+    let stale_rowid = stale[0].rowid;
+
+    // 删除最大 rowid 行后再插入，SQLite 会复用同一个 rowid。
+    assert_eq!(storage.prune_samples_before(2_000).unwrap().deleted, 1);
+    insert_batch(&storage, 1, vec![Sample::new("metric-new", 1_500, 9.0)]);
+    let reused = storage
+        .list_unclaimed_archive_rows(0, 10_000, 100)
+        .expect("读取复用的未认领行失败");
+    assert_eq!(reused.len(), 1);
+    assert_eq!(
+        reused[0].rowid, stale_rowid,
+        "本用例必须真的触发 rowid 复用，否则覆盖不到身份校验"
+    );
+    assert_ne!(reused[0].metric, stale[0].metric);
+
+    let err = storage
+        .claim_archive_rows(&claim_object("v8/part-00001-v8.csv.gz", &stale), &stale)
+        .expect_err("rowid 复用后旧行集 claim 必须失败");
+    assert_eq!(
+        err.downcast_ref::<ArchiveStoreError>(),
+        Some(&ArchiveStoreError::ClaimConflict),
+        "身份不匹配必须回滚并返回 ClaimConflict：{err:#}"
+    );
+    assert_eq!(
+        storage.count_archive_objects().unwrap(),
+        0,
+        "冲突 claim 的对象插入必须回滚"
+    );
+    // 新行不得被旧 claim 占走。
+    assert_eq!(
+        storage.list_unclaimed_archive_rows(0, 10_000, 100).unwrap(),
+        reused
+    );
+}
+
+#[test]
+fn claim_and_readback_preserve_ts_rowid_order() {
+    let dir = TempDb::new("claim-order");
+    let storage = SqliteStorage::open(&dir.db_path()).unwrap();
+    // 插入顺序与 ts 顺序相反：scan 按 ts,rowid 排序，readback 必须一致。
+    insert_batch(
+        &storage,
+        0,
+        vec![Sample::new("m", 3_000, 3.0), Sample::new("m", 1_000, 1.0)],
+    );
+    let rows = storage
+        .list_unclaimed_archive_rows(0, 10_000, 100)
+        .expect("读取未认领行失败");
+    assert_eq!(
+        rows.iter().map(|row| row.ts).collect::<Vec<_>>(),
+        vec![1_000, 3_000]
+    );
+    let object_id = storage
+        .claim_archive_rows(&claim_object("v8/part-00001-v8.csv.gz", &rows), &rows)
+        .expect("claim 失败");
+    assert_eq!(
+        storage.archive_rows_for_object(object_id).unwrap(),
+        rows,
+        "readback 必须与 claim/scan 使用相同的 ts,rowid 排序"
+    );
 }

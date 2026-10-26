@@ -1090,18 +1090,32 @@ impl PostgresStorage {
         rows: &[ArchiveRawRow],
     ) -> Result<i64> {
         validate_archive_claim(object, rows)?;
-        let rowids: Vec<i64> = rows.iter().map(|row| row.rowid).collect();
         self.with_client(|client| {
             let mut tx = client.transaction().context("开启归档 claim 事务失败")?;
             let object_id = insert_archive_object_tx(&mut tx, object)?;
-            let updated = tx
-                .execute(
-                    "UPDATE samples SET archive_object_id = $1 \
-                     WHERE id = ANY($2::BIGINT[]) AND archive_object_id IS NULL",
-                    &[&object_id, &rowids],
-                )
-                .context("执行归档 claim 更新失败")?;
-            let updated = usize::try_from(updated).context("归档 claim 返回了超出 usize 的行数")?;
+            // 与 SQLite 一样做行身份比对：即使 id 理论上不复用，也不把
+            // 「同 id 但内容已变」的行算作同一 claim 目标。
+            let mut updated = 0usize;
+            for row in rows {
+                let affected = tx
+                    .execute(
+                        "UPDATE samples SET archive_object_id = $1 \
+                         WHERE id = $2 AND archive_object_id IS NULL \
+                           AND agent_id = $3 AND metric = $4 AND labels = $5 \
+                           AND ts = $6 AND value = $7",
+                        &[
+                            &object_id,
+                            &row.rowid,
+                            &row.agent_id,
+                            &row.metric,
+                            &row.labels,
+                            &row.ts,
+                            &row.value,
+                        ],
+                    )
+                    .context("执行归档 claim 更新失败")?;
+                updated += usize::try_from(affected).context("归档 claim 返回行数溢出")?;
+            }
             if updated != rows.len() {
                 tx.rollback().context("回滚归档 claim 事务失败")?;
                 tracing::warn!(
@@ -1127,18 +1141,67 @@ impl PostgresStorage {
         validate_archive_sha256(sha256)?;
         let bytes = i64::try_from(bytes).context("归档对象字节数超出 BIGINT 范围")?;
         self.with_client(|client| {
-            let updated = client
-                .execute(
-                    "UPDATE archive_objects SET bytes = $2, sha256 = $3 WHERE id = $1",
-                    &[&id, &bytes, &sha256],
+            let mut tx = client.transaction().context("开启归档元数据更新事务失败")?;
+            let status: Option<String> = tx
+                .query_opt(
+                    "SELECT status FROM archive_objects WHERE id = $1 FOR UPDATE",
+                    &[&id],
                 )
-                .context("执行 update_archive_object_metadata SQL 失败")?;
-            if updated == 0 {
+                .context("读取归档对象状态失败")?
+                .map(|row| row.get(0));
+            let Some(status) = status else {
                 return Err(ArchiveStoreError::NotFound.into());
+            };
+            let status = ArchiveStatus::parse(&status)
+                .ok_or_else(|| anyhow!("archive_objects.status 字段值非法"))?;
+            if !matches!(status, ArchiveStatus::Pending | ArchiveStatus::Failed) {
+                return Err(ArchiveStoreError::InvalidTransition.into());
             }
+            tx.execute(
+                "UPDATE archive_objects SET bytes = $2, sha256 = $3 WHERE id = $1",
+                &[&id, &bytes, &sha256],
+            )
+            .context("执行 update_archive_object_metadata SQL 失败")?;
+            tx.commit().context("提交归档元数据更新事务失败")?;
             Ok(())
         })
         .context("update_archive_object_metadata")
+    }
+
+    /// 记录一次上传尝试：仅 pending / failed 对象允许，`attempts += 1`。
+    ///
+    /// 返回递增后的 attempts。对象不存在返回 `NotFound`，uploaded /
+    /// local_deleted 返回 `InvalidTransition`。
+    pub fn record_archive_attempt(&self, id: i64) -> Result<i64> {
+        self.with_client(|client| {
+            let mut tx = client.transaction().context("开启归档尝试计数事务失败")?;
+            let status: Option<String> = tx
+                .query_opt(
+                    "SELECT status FROM archive_objects WHERE id = $1 FOR UPDATE",
+                    &[&id],
+                )
+                .context("读取归档对象状态失败")?
+                .map(|row| row.get(0));
+            let Some(status) = status else {
+                return Err(ArchiveStoreError::NotFound.into());
+            };
+            let status = ArchiveStatus::parse(&status)
+                .ok_or_else(|| anyhow!("archive_objects.status 字段值非法"))?;
+            if !matches!(status, ArchiveStatus::Pending | ArchiveStatus::Failed) {
+                return Err(ArchiveStoreError::InvalidTransition.into());
+            }
+            let attempts: i64 = tx
+                .query_one(
+                    "UPDATE archive_objects SET attempts = attempts + 1 \
+                     WHERE id = $1 RETURNING attempts",
+                    &[&id],
+                )
+                .context("执行归档尝试计数 SQL 失败")?
+                .get(0);
+            tx.commit().context("提交归档尝试计数事务失败")?;
+            Ok(attempts)
+        })
+        .context("record_archive_attempt")
     }
 
     /// 统计不可归档 raw 行数（`ts < 0` 或 `ts > now`）；只计数不修改。
@@ -2083,7 +2146,8 @@ mod tests {
             return;
         };
         let storage = pg.storage();
-        for ts in [1_000_i64, 2_000] {
+        // 插入顺序与 ts 顺序相反，验证 scan/readback 都按 (ts, id) 排序。
+        for ts in [2_000_i64, 1_000] {
             execute(
                 storage,
                 "INSERT INTO samples (agent_id, metric, labels, ts, value)
@@ -2096,14 +2160,18 @@ mod tests {
             .expect("读取未认领行失败");
         assert_eq!(rows.len(), 2);
         assert_eq!(
-            rows.iter().map(|row| row.rowid).collect::<Vec<_>>(),
-            {
-                let ids: Vec<i64> = fetch(storage, "SELECT id FROM samples ORDER BY id", &[])
-                    .into_iter()
-                    .map(|row| row.get(0))
-                    .collect();
-                ids
-            },
+            rows.iter().map(|row| row.ts).collect::<Vec<_>>(),
+            vec![1_000, 2_000],
+            "scan 必须按 (ts, id) 排序"
+        );
+        let mut row_ids: Vec<i64> = rows.iter().map(|row| row.rowid).collect();
+        row_ids.sort_unstable();
+        let sample_ids: Vec<i64> = fetch(storage, "SELECT id FROM samples ORDER BY id", &[])
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            row_ids, sample_ids,
             "ArchiveRawRow.rowid 必须来自 samples.id"
         );
 
@@ -2133,6 +2201,25 @@ mod tests {
         assert_eq!(stored.bytes, 321);
         assert_eq!(stored.sha256, digest);
         assert_eq!(stored.attempts, 0);
+        assert_eq!(storage.record_archive_attempt(object_id).unwrap(), 1);
+        assert_eq!(storage.record_archive_attempt(object_id).unwrap(), 2);
+        storage
+            .update_archive_object_status(object_id, ArchiveStatus::Uploaded, "", Some(2_000), None)
+            .expect("pending→uploaded 合法");
+        let err = storage
+            .update_archive_object_metadata(object_id, 1, &"f".repeat(64))
+            .expect_err("uploaded 后不得再改元数据");
+        assert_eq!(
+            err.downcast_ref::<ArchiveStoreError>(),
+            Some(&ArchiveStoreError::InvalidTransition)
+        );
+        let err = storage
+            .record_archive_attempt(object_id)
+            .expect_err("uploaded 后不得再记录尝试");
+        assert_eq!(
+            err.downcast_ref::<ArchiveStoreError>(),
+            Some(&ArchiveStoreError::InvalidTransition)
+        );
 
         // 同一批行再次 claim 必须整事务回滚并返回可重试冲突。
         let mut again = archive_object(
