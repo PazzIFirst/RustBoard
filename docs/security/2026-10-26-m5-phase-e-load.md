@@ -30,6 +30,11 @@
     120000 批/360000 点 0 丢/重/错，ACK p95 468ms。
 - 因此 24h 改为在 **静态 musl 发布产物**上运行，而不是 debug 构建；短档表中的
   10min 数字是修复前 debug 基线，保留用于对照，不能替代 24h 结论。
+- 静态 24h 首次仍以 600s 为 RSS 基线：RssAnon 在约 40min 内从 39.5MiB 升到
+  49.7MiB 后**持平**，对应 SQLite 连接页缓存/线程栈预热，而不是持续泄漏；
+  600s 基线会把预热误判为增长。工具已改为采 `RssAnon`/`RssFile`，长稳 10%
+  硬门禁用 **RssAnon**（静态 musl 的代码页 demand paging 不计入）；24h 采用
+  **1h warmup 基线**，并在 2h 检查趋势。
 
 ## 2. 短档结果（修复前 debug，每档 10min）
 
@@ -55,16 +60,19 @@
 
 ## 3. 200 agent 24h 长稳（静态 musl，运行中）
 
-- 启动：**2026-10-26 22:31（本地）**，计划 86400s（最早 10-27 22:31 结束）；
+- 启动：**2026-10-26 23:58（本地）**，计划 86400s（最早 10-27 23:58 结束）；
   200 agent、5s/agent、3 点/批；静态 musl 发布二进制，git `3f916a0`，
-  hub sha256 `62dd9b7e…`；证据 `target/load/20261026T143119Z-200a/`。
+  hub sha256 `62dd9b7e…`；**WARMUP_SECS=3600**；证据
+  `target/load/20261026T155852Z-200a/`。
 - 硬门禁：0 丢点/重复、0 未处理错误、`/healthz` 0 失败、hub 未重启、
-  RSS ≤10%、FD/线程相对 600s 基线 +≤32、`hub.log` 无 panic/ERROR；
-- 状态：**运行中，尚无最终结论**。1h 与结束时检查 RSS/FD/线程曲线；若 RSS
-  仍持续单边上涨或 24h >10%，按缺陷处理，不发布 `v1.0.0`。
-- 首轮 debug/glibc 24h 已因 21min RSS 趋势提前停止，**不作为通过证据**。
-- 结束后在本文件补：`summary.json` 关键字段、RSS/FD/线程起点/终点、ACK
-  p50/p95/p99、DB 点数/重复、health 次数、证据路径。
+  **RssAnon 增长 ≤10%**、FD/线程相对 1h 基线 +≤32、`hub.log` 无 panic/ERROR；
+  总 RSS/RssFile 仅报告（静态二进制代码页 demand paging 不是堆泄漏）。
+- 状态：**运行中，尚无最终结论**。2h 与结束时检查 RssAnon/FD/线程曲线；若
+  RssAnon 仍持续单边上涨或 24h >10%，按缺陷处理，不发布 `v1.0.0`。
+- 前两次 24h 已提前停止（debug/glibc 21min RSS 趋势；600s 基线把 SQLite 页
+  缓存预热当增长），**均不作为通过证据**。
+- 结束后在本文件补：`summary.json` 关键字段、RssAnon/总 RSS/FD/线程起点/终点、
+  ACK p50/p95/p99、DB 点数/重复、health 次数、证据路径。
 
 ## 4. 工具与门禁可信度
 
