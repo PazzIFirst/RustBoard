@@ -203,6 +203,17 @@ def build_parser() -> argparse.ArgumentParser:
             "on/--rss-gate=强制启用；off=短档只记录"
         ),
     )
+    parser.add_argument(
+        "--leak-gate",
+        nargs="?",
+        const="on",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help=(
+            "FD/线程 +32 泄漏门禁：auto=仅 duration>=3600 启用（默认）；"
+            "on/--leak-gate=强制启用；off=短档只记录"
+        ),
+    )
     parser.add_argument("--db-stabilize-secs", type=float, default=10.0, help="等待 SQLite 计数稳定上限")
     return parser
 
@@ -1366,11 +1377,27 @@ def rss_gate_enabled(args: argparse.Namespace) -> bool:
     return args.duration_secs >= 3600
 
 
+def resource_leak_gate_enabled(args: argparse.Namespace) -> bool:
+    """FD/线程 +32 硬门禁只适用于长稳档。
+
+    方案 §1.2 只对 ≥24h 长稳要求 FD/线程不泄漏；100/500/1000 的 10min 档只要求
+    0 丢点/重复/错误/panic 并记录资源。tokio blocking pool 在高并发下线程数会
+    在 60s 基线后继续升到高水位，短档据此判失败是误判。默认 duration>=3600 才
+    启用，也可用 `--leak-gate on/off` 覆盖（bare `--leak-gate` 等价 on）。
+    """
+    if args.leak_gate == "on":
+        return True
+    if args.leak_gate == "off":
+        return False
+    return args.duration_secs >= 3600
+
+
 def resource_summary(ctx: RunContext) -> dict:
     columns = read_metrics(ctx.metrics_path)
     elapsed = columns["elapsed"]
     warmup = ctx.args.warmup_secs
     rss_gate = rss_gate_enabled(ctx.args)
+    leak_gate = resource_leak_gate_enabled(ctx.args)
     rss_baseline, rss_mode, rss_count, rss_warmup = baseline_window(
         elapsed, columns["rss_kb"], warmup, ctx.args.duration_secs
     )
@@ -1426,6 +1453,9 @@ def resource_summary(ctx: RunContext) -> dict:
             "end": fd_end,
             "max": max(fd_values) if fd_values else None,
             "delta": None if fd_end is None or fd_baseline is None else fd_end - fd_baseline,
+            "gate_enabled": leak_gate,
+            "gate_threshold_delta": 32,
+            "gate_mode": ctx.args.leak_gate,
         },
         "threads": {
             "baseline": thread_baseline,
@@ -1437,6 +1467,14 @@ def resource_summary(ctx: RunContext) -> dict:
             "delta": None
             if threads_end is None or thread_baseline is None
             else threads_end - thread_baseline,
+            "gate_enabled": leak_gate,
+            "gate_threshold_delta": 32,
+            "gate_mode": ctx.args.leak_gate,
+        },
+        "resource_leak_gate": {
+            "enabled": leak_gate,
+            "threshold_delta": 32,
+            "mode": ctx.args.leak_gate,
         },
         "cpu": {
             "avg_pct": round(sum(cpu_values) / len(cpu_values), 3) if cpu_values else None,
@@ -1560,17 +1598,31 @@ def build_summary(ctx: RunContext) -> dict:
     fd_resources = resources["fd"]
     if fd_resources["baseline"] is None or fd_resources["end"] is None:
         failures.append("FD 基线或结束值缺失，无法完成资源门禁")
-    elif fd_resources["delta"] is not None and fd_resources["delta"] > 32:
-        failures.append(f"FD 结束比基线多 {fd_resources['delta']}，超过 +32")
+    elif (
+        fd_resources["gate_enabled"]
+        and fd_resources["delta"] is not None
+        and fd_resources["delta"] > fd_resources["gate_threshold_delta"]
+    ):
+        failures.append(
+            f"FD 结束比基线多 {fd_resources['delta']}，"
+            f"超过 +{fd_resources['gate_threshold_delta']}（长稳门禁）"
+        )
     thread_resources = resources["threads"]
     if thread_resources["baseline"] is None or thread_resources["end"] is None:
         failures.append("线程基线或结束值缺失，无法完成资源门禁")
     elif (
-        thread_resources["delta"] is not None
-        and thread_resources["delta"] > 32
+        thread_resources["gate_enabled"]
+        and thread_resources["delta"] is not None
+        and thread_resources["delta"] > thread_resources["gate_threshold_delta"]
     ):
         failures.append(
-            f"线程结束比基线多 {thread_resources['delta']}，超过 +32"
+            f"线程结束比基线多 {thread_resources['delta']}，"
+            f"超过 +{thread_resources['gate_threshold_delta']}（长稳门禁）"
+        )
+    if not resources["resource_leak_gate"]["enabled"] and resources["metrics_samples"] > 0:
+        ctx.notes.append(
+            "FD/线程 +32 硬门禁未启用（duration<3600s 或 --leak-gate off），"
+            "短档只记录资源高水位，不能据此宣称长稳通过"
         )
     if ctx.db_result is None:
         failures.append("数据库校验未执行")
@@ -2035,6 +2087,7 @@ def self_check() -> int:
         hub_pid=1,
         hub_log="/nonexistent/self-check-hub.log",
         rss_gate="on",
+        leak_gate="on",
         reconnect_every=0,
         hub_bin="/bin/true",
         hub_bin_sha256="0" * 64,

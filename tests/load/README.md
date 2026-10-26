@@ -135,7 +135,7 @@ labels 为空，`ts` 每批唯一）；默认 5s，60s 档每 agent 12 批。
 | ACK 延迟 | 从 `send_binary` 返回到收到匹配 ACK 的毫秒数；输出 p50/p95/p99/min/max/mean |
 | 吞吐 | `acked / duration`（batch/s）与 ×3（sample/s），按名义运行时长 |
 | RSS | 基线：`warmup` 后 30s 窗口的中位数；结束：最后 10 个样本中位数。增长 >10% **仅对 ≥1h 长稳档**作为失败门禁（默认 `duration_secs >= 3600` 启用，可用 Python `--rss-gate on/off` 覆盖）；10min/短档只记录高水位。60s 短档没有 warmup 后样本时，基线 warmup 夹到 `duration/2`，并在 `resources.rss_kb.baseline_mode` 标注 |
-| FD / 线程 | 同样基线/结束口径；结束值相对基线允许 +32 |
+| FD / 线程 | 同样基线/结束口径；结束值相对基线 +32 的硬门禁**仅对 ≥1h 长稳档**生效（默认 `duration_secs >= 3600`，可用 Python `--leak-gate on/off` 覆盖）。短档记录 `baseline/end/delta/max`，不因 tokio blocking pool 高水位判失败 |
 | health | 每秒 `GET /healthz`，状态必须 200 且 body 去空白后等于 `ok`；失败次数必须 0，样本数必须 >0 |
 | hub 重启 | `/proc/<pid>/stat` 的 starttime 运行前后必须一致，PID 必须存活 |
 | CPU | `/proc/<pid>/stat` utime+stime 增量 / 采样间隔；含所有 tokio 线程，可能 >100% |
@@ -150,7 +150,9 @@ labels 为空，`ts` 每批唯一）；默认 5s，60s 档每 agent 12 批。
 `metrics.jsonl` 每秒一行，含 `health_status/health_body_ok/health_ok/health_ms`、
 `rss_kb`、`threads`、`fds`、`cpu_pct`、`db_main_bytes/db_wal_bytes` 与累计计数。
 `db.snapshot_mode` 记录 SQLite 只读快照口径，`db.snapshot_consistent` 记录查询前后
-`ingest_batches` 计数是否一致。
+`ingest_batches` 计数是否一致。`resources.fd.gate_enabled` /
+`resources.threads.gate_enabled` / `resources.resource_leak_gate` 记录 FD/线程
++32 门禁是否仅对长稳档启用。
 
 ### 通过条件（全部满足）
 
@@ -161,7 +163,8 @@ labels 为空，`ts` 每批唯一）；默认 5s，60s 档每 agent 12 批。
   `errors == 0`（ACK mismatch / Hello Problem 均计入 errors）；
 - metrics 样本数 ≥ `duration×0.9`；`health.samples > 0`；`/healthz` 每次必须
   200 且 body 为 `ok`，失败 0 次；hub PID/starttime 未变化；
-- FD / 线程增长 ≤32，且 baseline/end 必须非空（读不到 /proc 指标即失败）；
+- FD / 线程增长 ≤32，且 baseline/end 必须非空（读不到 /proc 指标即失败）——
+  该 +32 门禁**仅 ≥1h 长稳档**启用；10min/短档只记录，不据此判失败；
 - RSS 增长 ≤10%（**仅 ≥1h 长稳档**；门禁启用时 baseline/end 必须非空；10min/短档
   只记录，不据此判失败）；
 - 管理 API 检查通过；`hub.log` 读取成功且无 `panicked`/`ERROR`；
@@ -182,6 +185,22 @@ labels 为空，`ts` 每批唯一）；默认 5s，60s 档每 agent 12 批。
   并额外记录 `gate_enabled`、`gate_threshold_pct=10`、`gate_mode`；
 - 门禁关闭时 `summary.notes` 会注明“只记录高水位”，短档结果**不能**用来宣称
   24h 长稳通过；24h 若 RSS 仍 >10%，必须按缺陷处理。
+
+### FD / 线程泄漏门禁适用范围
+
+方案 §1.2 只对 **≥24h 长稳**要求 FD/线程不泄漏；10min 档只记录资源曲线。
+tokio blocking pool 在 60s 基线后仍可能继续扩容（实测 500/600：线程 484→518，
++34；200/600：206→218；1000/300：529），这是并发高水位而非 24h 泄漏。因此：
+
+- 默认只有 `duration_secs >= 3600` 才把 `fd.delta > 32` 或 `threads.delta > 32`
+  加入 `failures`；
+- Python 可用 `--leak-gate on` 显式启用、`--leak-gate off` 显式关闭（bare
+  `--leak-gate` 等价于 `on`）；
+- `summary.resources.fd` / `threads` 始终记录 `baseline`、`end`、`delta`、`max`，
+  并记录 `gate_enabled`、`gate_threshold_delta=32`、`gate_mode`；
+  `resources.resource_leak_gate` 汇总同一口径；
+- 短档资源高水位不判失败，但**不能**据此宣称 24h 长稳通过；24h 若 FD/线程仍
+  持续增长，必须按缺陷处理。
 
 任一失败都会写 `summary.json` 并以非零码退出；编排脚本另外把 hub 崩溃、
 SIGTERM 超时、日志命中写回 `summary.failures`。
