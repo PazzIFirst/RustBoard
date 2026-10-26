@@ -716,31 +716,48 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 - PG claim 单测要进 CI 实库；pending 需 config-aware；
 - 归档 metadata 更新要守卫状态/ledger；attempts 必须有写入路径。
 
-### 12.2 已提交分支（尚未合入 main）
+### 12.2 分支与集成
 
-| 分支 | 提交 | 内容 | 验证 |
+| 分支 | 最新提交 | 内容 | 状态 |
 |---|---|---|---|
-| `feat/v100-data` | `0147a29` | schema v8、迁移、归档 claim 原语、离线迁移 v8 | core+hub 全绿；9 个 v8 测试 |
-| `feat/v100-webdav` | `f607e6d` | #29 逐级 MKCOL、严格 DAV 测试 | hub 全绿；严格 DAV 黑盒 `archive test` 通过 |
-| `feat/v100-ci` | `a4ecea9` | #40 v031 入 CI + cryptography | actionlint/yaml/bash -n 通过 |
-| `feat/v100-collectors` | `dbd1b05` | #35/#36 字节路径/CPU ID + 回退保护 | core collect 21/21；clippy |
-| `feat/v100-agent` | `308e525` + `8aa99fe` | #42/#43/#44/#48 + 复审整改 | agent 153、hub 全绿；Guard/URL/drain 已修 |
-| `feat/v100-panel` | `5df03f3` | #37/#38/#39/#41 | panel 184+14、web 93；#39 严重项修复中 |
-| `feat/v100-buffer` | `b5c8e7c` | #34 双 meta/中间损坏重同步/repair CLI | core buffer 29；复审发现 3 严重，整改中 |
+| `feat/v100-data` | `1174425` | schema v8、count/行序迁移、claim 行身份 | 已合入集成 |
+| `feat/v100-archive` | `dfbd2dc` | #27/#28 worker claim、rows_missing、状态守卫 | 已合入集成 |
+| `feat/v100-downsample` | `614ad23` | #32/#33/#50、delta 1m/1h、retention | 已合入集成；复审整改在集成 |
+| `feat/v100-alerts` | `fe0e7d8` | #30/#31 | 已合入集成 |
+| `feat/v100-agent` | `8aa99fe` | #42/#43/#44/#48 | 已合入集成 |
+| `feat/v100-agent2` | `aa5ed19` | #45/#46 | 已合入集成 |
+| `feat/v100-panel` | `7504a66` | #37/#38/#39/#41 + CA 事务 | 已合入集成 |
+| `feat/v100-buffer` | `5156b32` | #34 + 复审修复 | 已合入集成 |
+| `feat/v100-collectors` | `dbd1b05` | #35/#36 | 已合入集成 |
+| `feat/v100-webdav` | `f607e6d` | #29 | 已合入集成 |
+| `feat/v100-ci` | `a4ecea9` | #40 | 已合入集成 |
+| `feat/v100-integration` | `ce6790a` | 全部修复 + PG/复审整改 | 待最终门禁/E2E |
 
-### 12.3 进行中
+集成验证（`v100-integration`，本机 SQLite + 真实 PostgreSQL 16）：
 
-- `feat/v100-archive`：R1a-2 worker claim/重试/拆分（#27/#28）。
-- `feat/v100-downsample`：R1b 增量 1m/1h、retention、#50（#32/#33/#50）。
-- `feat/v100-alerts`：#30/#31 告警状态与标签过滤下推。
-- `feat/v100-agent2`：#45 enrollment marker、#46 进程组。
-- `feat/v100-panel` 复审整改：ACME/DNS SAN 推导、CA 写入顺序（评审发现 1 严重）。
-- `feat/v100-buffer` 整改 3 严重：offset=0 边界、重同步预算、空 pending 压实。
-- `feat/v100-data` 复审整改：claim 行身份、count/行序迁移、last_ts、PG claim CI。
-- `feat/v100-collectors` 已补非法 UTF-8 label 转义与 CPU 汇总回退保护。
+- `cargo test --workspace --locked`（无 PG）通过；`fmt`、`clippy --workspace --all-targets -D warnings` 通过；`cargo audit` 0 高危。
+- 真实 PG（`RUSTBOARD_TEST_PG`，端口 55435）core 全绿；修复了 PG `jsonb` 参数、v8 迁移版本期望、prune/parity fixture。
+- web `pnpm test` 93、`typecheck`、`build` 通过。
+- 面板 188+14、agent 170、buffer 34、core 263、hub 449 测试通过。
+
+### 12.3 复审发现与处理
+
+- 数据：claim 跨事务只凭 rowid、迁移整桶全标、legacy last_ts 错误 → 行身份 + count/行序对账，已修。
+- 归档：claim 身份/rows_missing 卡死/状态守卫/attempts → 身份校验、failed+continue、Pending|Failed、metadata ledger 守卫；与 R1b 同批后 uploaded join + ledger pending 生效。
+- 降采样：1m clean 小时仍有未聚合 raw 时被删、启动审计误隔离旧 backlog、downsample 失败仍跑 retention → 加 raw NOT EXISTS、只隔离负值/未来、失败跳过 retention；已加回归测试。
+- Buffer：offset=0、重同步预算、空 pending 压实 → 修复；push/recover 8MiB 一致。
+- 面板：CA 写入与配置 save 原子性、非回环 SAN、远端 CA 边界 → 事务化 CA/配置，写失败回滚；无严重复审项。
+- Agent：#45 marker/身份、#46 进程组/输出截断 → 修复；无严重复审项。
 
 ### 12.4 未做/待做
 
-- 以上分支独立测试/复审完成后，建集成分支合并并跑全量门禁。
-- 尚未关闭或评论任何 issue；修复合并后按用户要求只补证据评论。
-- 24h 长稳需在最终二进制上重跑，不能复用 2026-10-26 的 2h 中止证据。
+- 最终全 workspace + PG + E2E（install/offline/Docker PG/arm64/security/panel）在集成提交上重跑。
+- fuzz、故障注入、渗透整份清单；修复后 24h 长稳（3h/2h warmup 预检）与 100/500/1000 agent。
+- 尚未关闭或评论任何 issue；修复合并/发布证据齐后只补评论，由用户确认关闭。
+- 24h 长稳不能复用 2026-10-26 的 2h 中止证据。
+
+### 12.5 磁盘清理（2026-10-27）
+
+- 清理前根分区 100%（0 可用），/tmp tmpfs 96%；清理 `/root/code/serverdashboard/target/debug`、已完成分支的 `target/v100-*`、`.worktrees/*/target` 及 `/tmp` 旧 `rb-*`/review 临时目录后，根分区约 77%、/tmp 约 61%。
+- 保留 `target/baseline-bin/`、`target/load/` 证据、源码/.git/vendor/tests/pentest 证据。
+- 清理前用 `ps` 确认无 cargo/rustc/rustboard/vite/pnpm 写目标目录。
