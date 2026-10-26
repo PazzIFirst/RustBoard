@@ -4,7 +4,7 @@
 > 修复后在条目里补「修复版本 + 提交/PR + 回归测试」，状态改为 `已修复`；不要删除历史条目。
 > 设计取舍与部署限制单独放在 [status.md](status.md#已知限制)，本文件只跟踪**可修复的缺陷**。
 >
-> 最后更新：2026-10-24
+> 最后更新：2026-10-26
 
 ## 状态与级别
 
@@ -39,7 +39,7 @@
 | KI-19 | 低 | hub Hello | 已修复 | v0.3.4 | `name` / `os` / `arch` / `version` / `boot_id` 未做长度与控制字符校验；v0.3.4 起统一 `bad_frame` 拒绝 |
 | KI-20 | 低 | 安装命令 | 已修复 | v0.4.1 | `agent add --name` 打印的安装命令未对 name 做 shell 转义；v0.4.1 起统一 POSIX 引用并拒绝控制字符 |
 | KI-21 | 低 | 文件权限 | 已修复 | v0.3.4 | SQLite 数据库默认 0644、数据目录 0755；v0.3.4 起数据目录 0700、DB/WAL/SHM 0600 |
-| KI-22 | 低 | 控制面日志 | 待修复 | v0.5.0 | 白名单日志文件的硬链接不会被 openat2 拦截（需目录写权限） |
+| KI-22 | 低 | 控制面日志 | 已修复 | v1.0.0 | 白名单日志文件的硬链接不会被 openat2 拦截；v1.0.0 起 fstat 要求 nlink==1，多硬链接 fail-closed（需目录写权限） |
 | KI-23 | 低 | 控制面白名单 | 不修复 | 文档 | `nginx*` 前缀会匹配 `nginx-evil`；这是前缀通配语义，部署时需写更精确的模式 |
 | KI-24 | 低 | 控制面能力 | 已修复 | v0.3.4 | 同 agent 多连接时能力缓存可被新 Hello 覆盖；v0.3.4 起以最新连接为准并支持断开回退 |
 | KI-26 | 中 | 管理 API 认证 | 已修复 | v0.3.4 | 未认证 401 不受管理限速；v0.3.4 起按来源 IP 失败限速，超限 429 且不查库 |
@@ -310,6 +310,39 @@
   下载仍保持 64 MiB 内存、1 主体并发、120s 期限与 SHA/长度校验。
 - **关联**：C4 下载内存修复、`archive.max_object_bytes` 配置、面板 `/archive`。
 
+### KI-22 控制面日志硬链接逃逸
+
+- **现象**：控制面日志白名单文件按配置路径 `openat2` 打开后只检查是否普通文件；
+  `openat2` 不拦截硬链接。能写日志目录的人可把白名单路径换成指向其他文件的硬链接，
+  读取本不应读取的内容（需要日志目录写权限，且受 `fs.protected_hardlinks` 等系统策略影响）。
+- **影响**：低；泄露范围取决于可被链接的文件与 agent 运行用户权限。原始登记为 v0.5.0，
+  本次随 v1.0.0 提前修复。
+- **复现**：在同一文件系统创建 `victim.log` 与硬链接 `app.log`，把 agent
+  `[[control.log_sources]] target` 指向 `app.log`；旧实现启动校验和 tail 均成功并返回
+  victim 内容。
+- **根因**：`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` 只覆盖
+  路径解析中的符号链接/magic link/`..`，硬链接是普通目录项，路径解析不会拒绝。
+- **修复（v1.0.0，`1553514`）**：
+  - `open_log_path_absolute` 在单次 `openat2` 后用**同一 fd** `fstat`，普通文件之外
+    要求 `nlink == 1`；`nlink != 1` 返回 `InvalidInput`，不返回可读 `File`、不执行
+    read/seek，fd 随错误返回析构；
+  - 启动校验与运行期 tail 共用该 helper；启动错误含 `日志来源 <id>（<path>）`，
+    运行期 `control_failed` 含 source id 与 target，均不读取/回显目标内容；
+  - `control.sh` 5.18/5.19 覆盖启动 fail-closed、未注册 agent 与 sentinel 不泄露；
+  - 独立单测 6 个：硬链接拒绝/不泄露、单链接允许、运行期新增链接后拒绝并可恢复、
+    启动错误可定位、`nlink=3` 边界、rename/recreate 轮转兼容。
+- **边界（fail-closed 取舍）**：使用硬链接保留日志、`cp -l` 备份等部署，在额外链接
+  存在期间会被拒绝；需改为单链接。`nlink == 1` 不是完整的路径替换防护：能 rename
+  敏感文件到白名单路径（需要 victim 所在目录写权限），或依赖 FUSE/网络文件系统
+  失真的 `nlink`，仍属部署边界。检查发生在读取前由代码审查保证，单测通过“拒绝且
+  不泄露”做行为验证，无法直接观测 syscall 顺序。
+- **验收标准**：`nlink != 1`（多硬链接，及并发 unlink 导致 nlink=0 的 fail-closed 误拒）
+  一律拒绝且不读取内容；
+  单链接普通文件、轮转、跨挂载、符号链接/FIFO/设备/目录回归不破坏；启动与运行期
+  错误均可定位且不含文件内容。
+- **关联**：[status.md](status.md#已知限制) 已知限制 10；`tests/e2e/control.sh` 5.18/5.19；
+  CHANGELOG `[Unreleased]` Security。
+
 ### KI-13 ~ KI-16 设计/部署限制（不修复）
 
 - **KI-13**：v0.1 agent 仍用指纹钉扎，服务端证书轮换后失联。升级到 v0.2+ 或重新纳管；发布说明与 status.md 保留。
@@ -327,3 +360,4 @@
 | 2026-10-24 | v0.3.5 | KI-27 | `c6baf4f`/`e9ebe51` | 单元 569；v035 48/48；既有 9 套 e2e 全绿；audit 0 |
 | 2026-10-24 | v0.4.0 | KI-30 | `45a0332`/`d9dad97` | workspace/clippy/audit 0（418 deps）；v040 27/27；panel 159/159；security 9/9 |
 | 2026-10-24 | v0.4.1 | KI-20/28/29/31 | `8d42d03` | workspace 全绿；v041 26/26；v040 27/27；panel 159/159；security 9/9；web 80/80；audit 418 deps/0；SFTP 29/29 |
+| 2026-10-26 | v1.0.0 | KI-22 | `1553514` | agent 145；control 102/102；workspace 1386/0/5；fmt/clippy/audit 通过 |

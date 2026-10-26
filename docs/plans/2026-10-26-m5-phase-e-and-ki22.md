@@ -1,7 +1,7 @@
 # M5 收尾：KI-22 + Phase E 执行计划
 
 > 日期：2026-10-26｜基线：`main` `6bb3fb0`（与 origin 同步，CI 全绿）
-> 状态：**执行中**。S0 计划已确认，从 S1（KI-22）开始；其余阶段按顺序推进。
+> 状态：**执行中**。S1（KI-22）已完成并提交（`1553514`）；下一步 S2。
 >
 > 关联：[M5 总计划](2026-10-24-m5-install-delivery.md)、
 > [Phase D 计划](2026-10-26-m5-phase-d-postgres-backup-l01-l03.md)、
@@ -30,20 +30,25 @@
 
 **验收**：
 
-- [ ] `open_log_path_absolute` 在 `openat2` 打开后检查 `nlink == 1`；多硬链接
+- [x] `open_log_path_absolute` 在 `openat2` 打开后检查 `nlink == 1`；多硬链接
       一律拒绝，错误信息明确，不读取内容。
-- [ ] `validate_file_source` 启动校验与运行期 tail 使用同一拒绝逻辑；启动时
+- [x] `validate_file_source` 启动校验与运行期 tail 使用同一拒绝逻辑；启动时
       对硬链接来源 fail-closed，错误包含 `日志来源 <id>` 与路径。
-- [ ] 单链接普通日志、日志轮转（rename/recreate）、跨挂载点、现有符号链接/
+- [x] 单链接普通日志、日志轮转（rename/recreate）、跨挂载点、现有符号链接/
       父目录/设备/FIFO/目录拒绝测试不回归。
-- [ ] 新增单测：临时文件 + 硬链接 → 拒绝；单链接 → 允许；`nlink` 检查发生
-      在读取前；不泄露目标文件内容。
-- [ ] 可选 e2e：`tests/e2e/control.sh` 增加硬链接白名单拒绝断言。
-- [ ] 文档：`docs/known-issues.md` 增加 KI-22 详情并标记已修复；`status.md`
-      的已知限制 10 更新；若兼容性需要，`docs/install/control.md`/agent 日志
-      白名单文档说明“硬链接日志文件会被拒绝”。
-- [ ] 版本归属：修完后把目标版本从 v0.5.0 改为 `v1.0.0`（本次提前修复），
-      不留下“已修复但仍列在待修复”的状态。
+- [x] 新增单测：临时文件 + 硬链接 → 拒绝；单链接 → 允许；`nlink` 检查发生
+      在读取前（由代码审查保证，测试验证拒绝且不泄露）；不泄露目标文件内容。
+- [x] 可选 e2e：`tests/e2e/control.sh` 5.18/5.19 增加硬链接白名单启动拒绝断言，
+      运行期路径由单元测试覆盖。
+- [x] 文档：`docs/known-issues.md` 增加 KI-22 详情并标记已修复；`status.md`
+      的已知限制 10 更新；CHANGELOG `[Unreleased]` Security 记录。未新增
+      `docs/install/control.md`（仓库当前无该文档，已知问题与 status 已覆盖
+      兼容性说明）。
+- [x] 版本归属：目标版本从 v0.5.0 改为 `v1.0.0`，无“已修复但仍列待修复”状态。
+
+**S1 证据**：agent 145 passed；control e2e 102/102（5.18 nlink=2/rc=1、
+5.19 无 sentinel 泄露）；全 workspace 1386 passed / 0 failed / 5 ignored；
+fmt/clippy/audit 通过；独立评审无严重问题，建议项已收口。
 
 ### 1.2 Phase E-1：hub 级压力与长稳
 
@@ -166,7 +171,7 @@
 ### 4.1 顺序
 
 1. **S0 计划确认**（本文件；当前停止点）。
-2. **S1 KI-22**：修复 + 单测 + e2e + 文档；全量门禁；独立复审；提交。
+2. **S1 KI-22**：✅ 修复 + 单测 + e2e + 文档；全量门禁；独立评审（无严重问题）。
 3. **S2 负载工具**：先 200 agent 基线；修任何产品问题；再 100/500/1000；
    最后 24h。每档记录证据。
 4. **S3 TLS PG**：真实 TLS 实例 smoke；失败修复后重跑。
@@ -236,4 +241,4 @@ cargo audit
 - 最终独立评审/渗透无未修复高危；全量门禁与 CI 全绿；
 - `v1.0.0` CHANGELOG/tag/Release/多架构镜像完成，`v1.0.0-rc.2` 未移动。
 
-> **当前动作：S1（KI-22）执行中。**
+> **当前动作：S1（KI-22）已完成并提交；下一步 S2 hub 级压测与长稳。**
