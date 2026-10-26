@@ -741,7 +741,7 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 - 面板 188+14、agent 170、buffer 34（含 100k push 单独 8.62s）、core 264 lib、hub 449 测试通过。
 - `tests/e2e/security.sh`：9/9 通过（无证书、CN/secret 错配、Batch 身份伪造、吊销、协议版本、双连接）。
 - `tests/e2e/panel.sh`：159/159 通过（登录/CSRF/设置/日志脱敏/健康检查）。
-- 1h 历史保护：修复后全 workspace+PG 再次 rc=0（`5fbc91b`）。
+- 1h 历史保护：修复后全 workspace+PG 再次 rc=0（`5fbc91b`）；security 9/9、panel 159/159 在最终提交重跑通过。
 - 已知环境注意：全 workspace 若把 `TMPDIR` 放在 ext4 会令 100k buffer 测试极慢；CI 使用默认 tmpfs。
 
 ### 12.3 复审发现与处理
