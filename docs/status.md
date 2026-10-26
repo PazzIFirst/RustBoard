@@ -19,7 +19,7 @@
 | M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | v0.4.1 已知问题修复 | 🟢 完成 | KI-29 rowid 竞态、KI-31 64 MiB 配置/下载一致性、KI-28 拒绝日志采样、KI-20 安装命令引用；SFTP 真实环境 29/29，M4 基线渗透无高危；v041 26/26；v0.4.1 发布 |
 | v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
-| M5 安装与交付 | 🟢 Phase D 完成；Phase E S1/S3 完成，S2/S4–S6 进行中 | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126；Phase C RC `v1.0.0-rc.2`（ACME/LE staging/评审/渗透/hosted RC 全绿）；Phase D PostgreSQL 显式 opt-in、迁移/备份/恢复 CLI、L-01/L-03；S1 KI-22 已修复（agent 145、control 102/102、workspace 1386/0/5）；S3 真实 TLS PG 24/24；hub 端 200 agent/100-1000/24h、Docker PG 在 S2/S4；`v1.0.0` 未发布 |
+| M5 安装与交付 | 🟢 Phase E S1/S3/S4 完成；S2 短档完成、24h 长稳待跑；S5/S6 进行中 | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126；Phase C RC `v1.0.0-rc.2`；Phase D PostgreSQL 显式 opt-in、迁移/备份/恢复；S1 KI-22（agent 145、control 102/102、workspace 1386/0/5）；S2 hub 级 200/100/500/1000 各 10min（最低 1000/600：120000 批/360000 点，0 丢点/重复/错误）；S3 真实 TLS PG 27/27；S4 Docker PG overlay 104/104（1 arm64 SKIP）；**24h 长稳、S5 发布演练、v1.0.0 未完成** |
 
 ## 构建产物清理（2026-10-25 Phase C 收尾）
 
@@ -430,11 +430,12 @@ Phase E 仍保留 hub 级真实压测。
 
 - [x] KI-22 控制面日志硬链接逃逸：同一 fd fstat 要求 `nlink == 1`，启动/运行期
       fail-closed；6 个独立单测、`control.sh` 102/102、workspace 1386/0/5
-- [ ] hub 端真实 200 agent 端到端（storage 级 200 已通过，不等同）；
-      100/500/1000 agent 三档压力与 ≥24h 长稳（RSS 增长 >10% 视为不通过）
+- [ ] hub 端真实 200/100/500/1000 agent 各 10min 已通过（200/100/500/1000：
+      0 丢点/重复/错误，详见安全报告）；**≥24h 长稳与 RSS/FD 门禁待跑**
 - [x] 真实 TLS PostgreSQL 的 `verify-full` 启动→真实 agent 读写→重启持久化；
-      `v100-pg-tls.sh` 24/24，错误 CA/主机名/根证书负向均失败且不降级
-- [ ] PostgreSQL Docker 镜像内 e2e：真实容器启动 hub、PG、backup/restore
+      `v100-pg-tls.sh` **27/27**，错误 CA/主机名/根证书负向均失败且不降级
+- [x] PostgreSQL Docker 镜像内 e2e：`v100-docker-pg.sh` **104/104**（1 项 arm64
+      SKIP），真实 hub/PG/agent、重启、`--user`、外部备份恢复均通过
 - [ ] `v1.0.0`：CHANGELOG 归档、tag、GitHub Release、镜像与 `latest`；
       **不移动 `v1.0.0-rc.2`**，未完成上述门禁前不发布
 
@@ -666,12 +667,10 @@ Phase E 仍保留 hub 级真实压测。
 
 ## 下一步建议
 
-Phase D 已完成 PostgreSQL 显式 opt-in、`migrate`/`backup`/`restore` CLI 与
-L-01/L-03 收口。Phase E S1 已修复 KI-22（控制面日志硬链接），全 workspace 测试
-**1386 passed / 0 failed / 5 ignored**，`control.sh` 102/102；默认 SQLite 不变，
-`v1.0.0-rc.2` 不移动。下一步进入 S2：hub 端真实 200 agent、100/500/1000 与 24h
-长稳；随后真实 TLS PG smoke、PostgreSQL 镜像内 e2e；门禁全绿后归档 CHANGELOG、
-发布 `v1.0.0`。计划见
+Phase E S1/S3/S4 已完成；S2 hub 级 200/100/500/1000 各 10min 已通过
+（0 丢点/重复/错误、无 hub 重启；短档 RSS 仅记录，长稳硬门禁不适用）。下一步：
+200 agent ≥24h 长稳（RSS ≤10%、FD/线程不泄漏），随后 S5 arm64/离线/升级/卸载/
+恢复演练与最终评审/渗透，再归档 CHANGELOG、发布 `v1.0.0`。计划见
 [M5 计划](plans/2026-10-24-m5-install-delivery.md)、
 [Phase A 设计](plans/2026-10-24-m5-phase-a-installer.md) 与
 [Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)、

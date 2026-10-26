@@ -457,9 +457,10 @@ docker compose -f docker/compose.example.yml \
 
 ### 7.1 Docker PG overlay e2e（Phase E S4）
 
-> **状态**：脚本与本节已落盘，截至 2026-10-26 编写环境**尚未执行**（只做静态
-> 检查）。以下为脚本的判定标准与已知限制，不是运行结果；Phase E 主 Agent
-> 运行后回填，运行前不要写“已通过”。
+> **状态**：2026-10-26 已运行通过：**PASS=104 / FAIL=0 / SKIP=1（arm64 由 S5
+> 覆盖）**，退出码 0。证据：
+> `target/docker-pg-e2e/20261026t133124z-3736044/`。以下为脚本判定标准、已知
+> 限制与本次结果。
 
 脚本必须带 dist 来源绑定运行；仅校验 `--version`/revision 不能排除同名旧
 rc.2 dist，因此 S4 运行前要重建 dist 并生成 manifest（重建后必须重新生成）：

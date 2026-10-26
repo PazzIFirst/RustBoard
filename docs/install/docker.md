@@ -253,10 +253,11 @@ docker compose -f docker/compose.example.yml \
 
 ## 8. Phase E S4：PostgreSQL overlay e2e
 
-> **状态**：脚本与本章已落盘，截至 2026-10-26 编写环境**尚未执行**（只做了
-> `bash -n` / `shellcheck` / `git diff --check`）。下面的 PASS 条件是脚本的
-> 判定标准，不是运行结果；实际结果由 Phase E 主 Agent 在独立环境运行后回填。
-> 在拿到运行输出前，不要对外声称 S4 已通过。
+> **状态**：2026-10-26 已运行通过：**PASS=104 / FAIL=0 / SKIP=1（arm64 由 S5
+> 覆盖）**，退出码 0。证据：
+> `target/docker-pg-e2e/20261026t133124z-3736044/`（含 provenance、日志、PG 计数）。
+> 使用的是当前 dist（manifest 绑定，hub sha256 `1a23fa5e…`），不是旧 rc.2 镜像。
+> 下面的 PASS 条件是脚本判定标准，结果已由本次运行回填。
 
 脚本必须带 dist 来源绑定运行（**验证码版本号不够**，同名旧 rc.2 dist 也可能
 通过 `--version`；manifest 把本次源码产物与 e2e 强绑定）：
