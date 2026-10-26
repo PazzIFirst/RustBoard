@@ -739,6 +739,8 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 - 修复了 PG `jsonb` 参数、v8 迁移版本期望、prune/parity fixture、测试库名/`TMPDIR` 空间问题；PG claim/prune/advisory lock 实库执行。
 - web `pnpm test` 93、`typecheck`、`build` 通过。
 - 面板 188+14、agent 170、buffer 34（含 100k push 单独 8.62s）、core 264 lib、hub 449 测试通过。
+- `tests/e2e/security.sh`：9/9 通过（无证书、CN/secret 错配、Batch 身份伪造、吊销、协议版本、双连接）。
+- `tests/e2e/panel.sh`：159/159 通过（登录/CSRF/设置/日志脱敏/健康检查）。
 - 已知环境注意：全 workspace 若把 `TMPDIR` 放在 ext4 会令 100k buffer 测试极慢；CI 使用默认 tmpfs。
 
 ### 12.3 复审发现与处理
@@ -752,13 +754,13 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 
 ### 12.4 未做/待做
 
-- E2E（install/offline/Docker PG/arm64/security/panel）在集成提交上重跑；目前尚未做。
+- E2E install/offline/Docker PG/arm64 尚未在集成提交上重做；security/panel 已通过。
 - fuzz、故障注入、渗透整份清单；修复后 24h 长稳（3h/2h warmup 预检）与 100/500/1000 agent。
 - 尚未关闭或评论任何 issue；修复合并/发布证据齐后只补评论，由用户确认关闭。
 - 24h 长稳不能复用 2026-10-26 的 2h 中止证据。
 
 ### 12.5 磁盘清理（2026-10-27）
 
-- 清理前根分区 100%（0 可用），/tmp tmpfs 96%；清理 `/root/code/serverdashboard/target/debug`、已完成分支的 `target/v100-*`、`.worktrees/*/target` 及 `/tmp` 旧 `rb-*`/review 临时目录后，根分区约 78%、/tmp 约 58%。
+- 清理前根分区 100%（0 可用），/tmp tmpfs 96%；清理 `/root/code/serverdashboard/target/debug`、已完成分支的 `target/v100-*`、`.worktrees/*/target` 及 `/tmp` 旧 `rb-*`/review 临时目录后，根分区约 66%、/tmp 约 58%。
 - 保留 `target/baseline-bin/`、`target/load/` 证据、源码/.git/vendor/tests/pentest 证据。
 - 清理前用 `ps` 确认无 cargo/rustc/rustboard/vite/pnpm 写目标目录。
