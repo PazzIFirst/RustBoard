@@ -731,14 +731,15 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 | `feat/v100-collectors` | `dbd1b05` | #35/#36 | 已合入集成 |
 | `feat/v100-webdav` | `f607e6d` | #29 | 已合入集成 |
 | `feat/v100-ci` | `a4ecea9` | #40 | 已合入集成 |
-| `feat/v100-integration` | `ce6790a` | 全部修复 + PG/复审整改 | 待最终门禁/E2E |
+| `feat/v100-integration` | `80cb61a` | 全部修复 + PG/复审整改 | 全 workspace+PG 绿；待 E2E/长稳 |
 
 集成验证（`v100-integration`，本机 SQLite + 真实 PostgreSQL 16）：
 
-- `cargo test --workspace --locked`（无 PG）通过；`fmt`、`clippy --workspace --all-targets -D warnings` 通过；`cargo audit` 0 高危。
-- 真实 PG（`RUSTBOARD_TEST_PG`，端口 55435）core 全绿；修复了 PG `jsonb` 参数、v8 迁移版本期望、prune/parity fixture。
+- `cargo test --workspace --locked`（真实 PG 16，`RUSTBOARD_TEST_PG` 55435，`TMPDIR=/tmp`）rc=0；`fmt`、`clippy --workspace --all-targets -D warnings` 通过；`cargo audit` 0 高危（仅 1 个 yanked allowed warning）。
+- 修复了 PG `jsonb` 参数、v8 迁移版本期望、prune/parity fixture、测试库名/`TMPDIR` 空间问题；PG claim/prune/advisory lock 实库执行。
 - web `pnpm test` 93、`typecheck`、`build` 通过。
-- 面板 188+14、agent 170、buffer 34、core 263、hub 449 测试通过。
+- 面板 188+14、agent 170、buffer 34（含 100k push 单独 8.62s）、core 264 lib、hub 449 测试通过。
+- 已知环境注意：全 workspace 若把 `TMPDIR` 放在 ext4 会令 100k buffer 测试极慢；CI 使用默认 tmpfs。
 
 ### 12.3 复审发现与处理
 
@@ -751,13 +752,13 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 
 ### 12.4 未做/待做
 
-- 最终全 workspace + PG + E2E（install/offline/Docker PG/arm64/security/panel）在集成提交上重跑。
+- E2E（install/offline/Docker PG/arm64/security/panel）在集成提交上重跑；目前尚未做。
 - fuzz、故障注入、渗透整份清单；修复后 24h 长稳（3h/2h warmup 预检）与 100/500/1000 agent。
 - 尚未关闭或评论任何 issue；修复合并/发布证据齐后只补评论，由用户确认关闭。
 - 24h 长稳不能复用 2026-10-26 的 2h 中止证据。
 
 ### 12.5 磁盘清理（2026-10-27）
 
-- 清理前根分区 100%（0 可用），/tmp tmpfs 96%；清理 `/root/code/serverdashboard/target/debug`、已完成分支的 `target/v100-*`、`.worktrees/*/target` 及 `/tmp` 旧 `rb-*`/review 临时目录后，根分区约 77%、/tmp 约 61%。
+- 清理前根分区 100%（0 可用），/tmp tmpfs 96%；清理 `/root/code/serverdashboard/target/debug`、已完成分支的 `target/v100-*`、`.worktrees/*/target` 及 `/tmp` 旧 `rb-*`/review 临时目录后，根分区约 78%、/tmp 约 58%。
 - 保留 `target/baseline-bin/`、`target/load/` 证据、源码/.git/vendor/tests/pentest 证据。
 - 清理前用 `ps` 确认无 cargo/rustc/rustboard/vite/pnpm 写目标目录。
