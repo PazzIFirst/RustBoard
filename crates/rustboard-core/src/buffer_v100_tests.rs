@@ -592,7 +592,7 @@ fn acked_all_is_compacted_and_meta_loss_does_not_replay() {
     // 模拟两条 meta 都丢失（磁盘损坏 / 人为删除）。
     let _ = std::fs::remove_file(&primary);
     let _ = std::fs::remove_file(&backup);
-    let mut buf = DiskBuffer::open(dir.path(), MIB, 0).expect("日志已清空时 meta 丢失不得重放 ACK");
+    let buf = DiskBuffer::open(dir.path(), MIB, 0).expect("日志已清空时 meta 丢失不得重放 ACK");
     assert_eq!(buf.pending_len(), 0);
     assert_eq!(buf.pending_bytes(), 0);
 }
