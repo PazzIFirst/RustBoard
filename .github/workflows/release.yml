@@ -936,6 +936,13 @@ jobs:
           test -f tests/e2e/v100-docker.sh
           SKIP_ARM64=1 DOCKER_ARCH=amd64 bash tests/e2e/v100-docker.sh
 
+      # v100-docker-pg.sh 明确不联网拉取；runner 需先具备 postgres 镜像。
+      - name: 准备 Docker PG e2e 镜像
+        run: |
+          set -euo pipefail
+          docker pull postgres:16
+          docker pull postgres:16-alpine
+
       # #87/#88：真实 agent 在 PG overlay 下落库、Compose 8080 回环发布。
       # 该脚本需要固定宿主端口 8080/8443，hosted runner 默认空闲。
       - name: Docker + PostgreSQL overlay e2e（#87/#88）

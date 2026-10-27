@@ -3185,6 +3185,66 @@ mod tests {
         );
     }
 
+    /// 回归：密码等于用户名/库名/`postgres` 时不得误杀，argv 仍无密码字段。
+    #[test]
+    fn pg_dump_argv_allows_password_equal_to_identity_parts() {
+        let _guard = env_lock();
+        let root = TestRoot::new("password-equals-identity");
+        let fake_bin = root.path().join("bin");
+        let argv_file = root.path().join("argv.txt");
+        let env_file = root.path().join("env.txt");
+        install_fake_pg_tool(&fake_bin, "pg_dump", &argv_file, &env_file);
+
+        let _restore = EnvRestore::capture(&["PATH", "PGPASSWORD"]);
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = OsString::from(fake_bin.display().to_string());
+        new_path.push(":");
+        new_path.push(old_path);
+        std::env::set_var("PATH", new_path);
+
+        for (dsn, password, expected_dbname) in [
+            (
+                "postgres://rb_user:postgres@db.example.com/db?sslmode=disable",
+                "postgres",
+                "postgres://rb_user@db.example.com/db",
+            ),
+            (
+                "postgres://rb_user:rb_user@db.example.com/db?sslmode=disable",
+                "rb_user",
+                "postgres://rb_user@db.example.com/db",
+            ),
+            (
+                "postgres://rb_user:rustboard@db.example.com/rustboard?sslmode=disable",
+                "rustboard",
+                "postgres://rb_user@db.example.com/rustboard",
+            ),
+        ] {
+            let destination = root.path().join("rustboard.dump");
+            let _ = fs::remove_file(&destination);
+            pg_dump_to(&HubConfig::default(), dsn, &destination)
+                .unwrap_or_else(|err| panic!("合法 DSN 不得误杀 ({dsn}): {err:#}"));
+            let argv = fs::read_to_string(&argv_file).unwrap();
+            assert!(
+                argv.lines().any(|line| line == expected_dbname),
+                "argv 缺少剥离后的 --dbname ({dsn}): {argv}"
+            );
+            assert!(
+                !argv.contains(&format!(":{password}@")),
+                "argv 仍含 userinfo 密码 ({dsn}): {argv}"
+            );
+            assert!(
+                !argv.contains("password="),
+                "argv 含 query password: {argv}"
+            );
+            let env = fs::read_to_string(&env_file).unwrap();
+            assert_eq!(
+                env_value(&env, "PGPASSWORD").as_deref(),
+                Some(password),
+                "PGPASSWORD 必须是原密码 ({dsn})"
+            );
+        }
+    }
+
     /// #67：显式 disable 与 DSN sslrootcert 的处理；fake pg_restore 捕获 env。
     #[test]
     fn pg_restore_honours_disable_and_dsn_rootcert() {

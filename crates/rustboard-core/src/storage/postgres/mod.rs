@@ -669,12 +669,9 @@ fn resolve_external_tool_dsn_with_env(
     // 纵深防御：即使畸形 authority 未被上面的解析覆盖，argv 里也不能出现密码。
     // 对合法 DSN（已无密码）该函数原样返回。
     let sanitized = redact_database_url(&sanitized);
-    // spawn 前断言：驱动不能再解析出 password，且已知长密码不以明文残留。
-    ensure_sanitized_has_no_password(
-        &sanitized,
-        url_password.as_deref(),
-        effective_password.as_deref(),
-    )?;
+    // spawn 前断言：驱动不能再解析出 password 字段（不做密码子串搜索，
+    // 密码可能等于用户名/库名/主机名）。
+    ensure_sanitized_has_no_password(&sanitized)?;
 
     Ok(PgExternalToolDsn {
         sanitized,
@@ -807,25 +804,16 @@ fn strip_url_passwords(dsn: &str) -> Result<String> {
     Ok(sanitized)
 }
 
-/// 生成 argv DSN 后的最后一道断言：驱动不能再从中解析出密码，且已知密码
-/// 不应以明文片段残留。失败时拒绝 spawn 外部工具。
-fn ensure_sanitized_has_no_password(
-    sanitized: &str,
-    url_password: Option<&str>,
-    effective_password: Option<&str>,
-) -> Result<()> {
+/// 生成 argv DSN 后的最后一道断言：驱动不能再从中解析出 password 字段。
+///
+/// 只做驱动级断言，**不做密码子串搜索**：密码可能恰好等于用户名、数据库名
+/// 或主机名（如 `user:postgres@host/db`），子串搜索会误杀合法 DSN。
+fn ensure_sanitized_has_no_password(sanitized: &str) -> Result<()> {
     let reparsed: postgres::Config = sanitized
         .parse()
         .map_err(|_| anyhow!("内部错误：脱敏后的 PostgreSQL DSN 无法被驱动解析，已拒绝"))?;
     if reparsed.get_password().is_some() {
         bail!("内部错误：脱敏后的 PostgreSQL DSN 仍含密码，拒绝传给外部工具");
-    }
-    for secret in [url_password, effective_password].into_iter().flatten() {
-        // 极短密码可能天然出现在用户名/主机名中；驱动级“无 password 字段”
-        // 已覆盖语义，这里只对可判定的长密码做明文包含检查。
-        if secret.len() >= 6 && sanitized.contains(secret) {
-            bail!("内部错误：脱敏后的 PostgreSQL DSN 仍包含密码，拒绝传给外部工具");
-        }
     }
     Ok(())
 }
@@ -1409,6 +1397,48 @@ mod tests {
         };
         assert!(format!("{err:#}").contains("多个裸 @"));
         assert!(!format!("{err:#}").contains("pa"));
+    }
+
+    /// 回归：密码等于用户名/库名/`postgres` 时不能被“密码子串”断言误杀。
+    #[test]
+    fn external_tool_allows_password_equal_to_identity_parts() {
+        for (dsn, password, expected) in [
+            (
+                "postgres://rb_user:rb_user@h/db?sslmode=disable",
+                "rb_user",
+                "postgres://rb_user@h/db",
+            ),
+            (
+                "postgres://rb_user:rustboard@h/rustboard?sslmode=disable",
+                "rustboard",
+                "postgres://rb_user@h/rustboard",
+            ),
+            (
+                "postgres://rb_user:postgres@h/db?sslmode=disable",
+                "postgres",
+                "postgres://rb_user@h/db",
+            ),
+            (
+                "postgres://rb_user@h/db?password=postgres&sslmode=disable",
+                "postgres",
+                "postgres://rb_user@h/db",
+            ),
+        ] {
+            let resolved = resolve_external_tool_dsn_with_env(dsn, None, None)
+                .unwrap_or_else(|err| panic!("合法 DSN 不得误杀 ({dsn}): {err:#}"));
+            assert_eq!(resolved.sanitized, expected, "dsn={dsn}");
+            assert_eq!(
+                resolved.effective_password.as_deref(),
+                Some(password),
+                "dsn={dsn}"
+            );
+            let reparsed: postgres::Config =
+                resolved.sanitized.parse().expect("sanitized 必须可解析");
+            assert!(
+                reparsed.get_password().is_none(),
+                "sanitized 仍可解析出密码: {dsn}"
+            );
+        }
     }
 
     /// #67：外部工具 TLS 策略与运行连接一致：缺省 verify-full、显式 disable、
