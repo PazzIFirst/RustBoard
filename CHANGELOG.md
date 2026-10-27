@@ -28,7 +28,7 @@
 ### Changed
 
 - **v1.0.0 只支持全新安装**：SQLite/PostgreSQL schema <9 一律 fail closed，
-  不执行旧数据迁移/回填；`#51`/`#58`/`#59` 的旧数据兼容推迟到首个正式版本之后，
+  不执行旧数据迁移/回填；`#51` 的 v7→v8 兼容推迟到首个正式版本之后，
   发布说明必须写明 fresh install only。
 - PostgreSQL 备份/恢复/迁移的外部工具继承 Hub TLS 策略（默认 `verify-full`，
   仅显式 `sslmode=disable` 才关闭；私有 CA 通过 `PGSSLROOTCERT`），并清理会
@@ -45,6 +45,14 @@
 
 ### Fixed
 
+- `#33` 1m 保留期删除后 legacy raw 不再用残缺源覆盖完整 1h；按小时
+  prune marker + raw quarantine + 1h 源完整性门禁，旧 1h 保留并可见。
+- `#39` `panel init` 自动选择“监听可达 ∩ 证书 SAN 覆盖”的 Hub 地址；
+  `[::]` 双栈回退与显式 `--hub` userinfo 泄露一并修复。
+- `#58` SQLite→PostgreSQL 迁移保留 `sqlite_sequence` 与通知游标高水位，
+  清理事件后新告警 id 仍大于旧游标。
+- `#59` 迁移校验不再用 SQL `SUM(last_ts)`，改分块 i128 精确累计，
+  大库不再因 i64 溢出回滚。
 - `#52` 备份证书与 CertLock/轮换互斥，复制后校验 cert/key 与 CA 配套；恢复前
   同样校验，避免备份/恢复不配套材料。
 - `#53` Hub 安装确认回答 n 时在任何写入前取消。
@@ -112,8 +120,9 @@
 
 - **v1.0.0 只支持全新安装**：schema <9 的旧 SQLite/PostgreSQL 数据库会在
   启动/备份/恢复/迁移时明确拒绝，不执行 v7/v8 回填或旧数据迁移。
-- `#51`/`#58`/`#59` 的旧数据兼容（v7/v8 迁移、序列高水位、聚合时间戳溢出）
-  不在本版本修复范围，将在 v1.0.0 之后处理；这些 issue 仍保持 OPEN。
+- `#51` 的 v7→v8 旧数据迁移缺陷不在本版本修复范围，将在 v1.0.0 之后处理；
+  该 issue 仍保持 OPEN。`#58`/`#59` 属于 v1.0.0 仍可用的 SQLite→PostgreSQL
+  迁移路径，已在本版本修复。
 - 已发布 tag `v1.0.0-rc.2`、`v1.0.0-rc.3` 不移动；`v1.0.0` 只在本版本全部门禁
   （含 24h 长稳、100/500/1000、Docker PG/安装、arm64、评审/渗透）通过后发布。
 

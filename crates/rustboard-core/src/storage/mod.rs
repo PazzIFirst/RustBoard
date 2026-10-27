@@ -81,6 +81,54 @@ pub const BUCKET_1M_MS: i64 = 60_000;
 /// 1h 聚合桶宽度（毫秒）：按 UTC 对齐的整点小时。
 pub const BUCKET_1H_MS: i64 = 3_600_000;
 
+/// `maintenance_state` 键前缀：某个整点的 1m 源已被保留期整组删除。
+///
+/// 每删除一个整点的 1m 组写入一条 `downsample_1m_pruned_hour:<hour_start>`，
+/// 值为 `"1"`。它与「该 series-hour 已无 1m 行」共同证明：已有 1h 桶的整点
+/// 源不再完整，后续 legacy raw 只能隔离，不能重算覆盖 1h。
+///
+/// 1h 保留期删除该小时的 1h 行后，对应标记一并清理；因此标记数量与 1h 层
+/// 保留范围同阶，不会无限增长。
+///
+/// **保证范围**：只覆盖本版本 prune 写入的 marker，以及“该 series-hour 已无
+/// 任何 1m 行”的旧库/外部删除场景。旧库若既没有 marker、又残留 partial 1m
+/// （旧版本残缺重建），数据本身无法证明其残缺，不在本保证内。
+pub const STATE_PRUNE_1M_HOUR_PREFIX: &str = "downsample_1m_pruned_hour:";
+
+/// 1m prune 小时标记的完整 key。
+pub fn prune_1m_hour_key(hour_start: i64) -> String {
+    format!("{STATE_PRUNE_1M_HOUR_PREFIX}{hour_start}")
+}
+
+/// `maintenance_state` 键：因 1m 源完整性不可证明而被隔离的 raw 行累计数。
+pub const STATE_QUARANTINED_RAW_ROWS: &str = "quarantined_legacy_raw_rows";
+
+/// `maintenance_state` 键：因 1m 源完整性不可证明而保留旧 1h 的
+/// `(series, hour)` 组累计数。
+///
+/// 这是**累计运维计数，不是严格幂等**：组被标记 clean 后不会重复计入，
+/// 但后续新的 dirty 1m、手工删除或再次出现不可证明状态时可能再次累加。
+pub const STATE_QUARANTINED_1H_GROUPS: &str = "quarantined_1h_groups";
+
+/// 解析 `maintenance_state` 中的十进制整数水位。
+///
+/// - 缺失 / 空串 → `None`（与 downsample 的 `read_state_i64` 一致，把被清空的
+///   水位当作缺失）；
+/// - 非法值 → `Err`，不静默跳过损坏的完整性证据。
+pub fn parse_state_i64(key: &str, raw: Option<&str>) -> Result<Option<i64>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<i64>()
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("maintenance_state.{key} 不是合法的十进制整数: {raw:?}"))
+}
+
 /// 查询选中的数据层（M4-A2b）。
 ///
 /// 上层的选层规则见方案 §5.2：短跨度查 raw，中跨度查 1m，长跨度查 1h。
@@ -139,8 +187,10 @@ pub struct DownsampleRangeResult {
 pub struct DownsampleDeltaResult {
     /// 本次写入/合并的 1m 聚合桶数。
     pub buckets: usize,
-    /// 本次认领并标记 `aggregated_1m=1` 的 raw 行数。
+    /// 本次认领并标记 `aggregated_1m=1` 的 raw 行数（正常聚合）。
     pub rows: usize,
+    /// 本次因 1m 源完整性不可证明而隔离的 raw 行数（不进入 1m）。
+    pub quarantined: usize,
     /// 本批处理的排他上界（整分钟，且不晚于调用方传入的 `closed_end`）。
     pub processed_to: i64,
 }
@@ -154,6 +204,8 @@ pub struct DownsampleHourResult {
     pub buckets: usize,
     /// 锁定并参与重算的 1m 源行数。
     pub rows: usize,
+    /// 因源完整性不可证明而保留旧 1h、仅隔离 1m 的 `(series, hour)` 组数。
+    pub quarantined: usize,
 }
 
 /// 某一数据层（raw / 1m / 1h）的时间范围与总行数。
@@ -658,15 +710,37 @@ pub trait Storage: Send + Sync {
     /// `(ts, rowid/id)` 升序取至多 `max_rows` 行；若第 `max_rows` 行落在某个
     /// 分钟桶内，则该桶整桶纳入（桶不可拆分），因此实际行数可能略超上限。
     ///
-    /// 单写事务内完成：delta 合并进已有 1m 桶、把源 raw 所在**整小时**的
-    /// 所有 1m 行置 `aggregated_1h=0`、再以
+    /// **源完整性门禁**：该 `(series, hour)` 已有 1h 桶，且整点有 1m prune
+    /// 标记（[`STATE_PRUNE_1M_HOUR_PREFIX`]）或该 series-hour 已无任何 1m
+    /// 行时，剩余源无法证明完整。这些 raw 只标记 `aggregated_1m=1` 隔离、
+    /// 不进入 1m，计数写入 [`STATE_QUARANTINED_RAW_ROWS`]；不会用残缺源
+    /// 覆盖 1h。
+    ///
+    /// 隔离只是**标记**：被隔离 raw 仍受 raw 保留期 / 归档门禁清理，不代表
+    /// 永久保留；运维可在 raw 被清理前检查这些行。旧库无 marker 且残留
+    /// partial 1m 的残缺桶不在本门禁的证明范围内。
+    ///
+    /// 其余行仍在单写事务内完成：delta 合并进已有 1m 桶、把源 raw 所在
+    /// **整小时**的所有 1m 行置 `aggregated_1h=0`、再以
     /// `UPDATE ... WHERE 行键 IN (...) AND aggregated_1m=0` 标记 raw；affected
-    /// 必须等于选中行数，否则回滚。返回 `processed_to` 是本批的分钟对齐上界。
+    /// 必须等于正常聚合行数，否则回滚。返回 `processed_to` 是本批的分钟对齐上界。
     fn downsample_1m_delta(
         &self,
         closed_end: i64,
         max_rows: usize,
     ) -> Result<DownsampleDeltaResult>;
+
+    /// 只把「1m 源完整性无法证明」的遗留 raw 隔离（`aggregated_1m=1`）。
+    ///
+    /// 判定与 [`Storage::downsample_1m_delta`] 相同：该 `(series, hour)` 已有
+    /// 1h 桶，且整点有 1m prune 标记或该 series-hour 已无 1m 行。用于启动
+    /// 审计在 delta 之前一次性处理旧 backlog；返回本次隔离的 raw 行数
+    /// （累计计数同时写入 [`STATE_QUARANTINED_RAW_ROWS`]）。
+    ///
+    /// 隔离仅写 `aggregated_1m=1` 标记，**不保证永久保留**：这些 raw 仍会
+    /// 被 raw 保留期（归档启用时还要求 uploaded claim）正常清理。旧库无
+    /// marker 且残留 partial 1m 的残缺桶不在保证范围内。
+    fn quarantine_incomplete_legacy_raw_rows(&self) -> Result<usize>;
 
     /// R1b：锁定并重算最早一个可重算整点小时的 1h。
     ///
@@ -675,6 +749,16 @@ pub trait Storage: Send + Sync {
     /// 行（PG 用 `SELECT ... FOR UPDATE`），按 `count` 加权重算整小时，再把
     /// 该小时所有 1m 行置 `aggregated_1h=1`；affected 必须等于锁定行数，否则
     /// 回滚。没有可重算小时返回 `None`。
+    ///
+    /// **源完整性门禁**：已有 1h 桶的 `(series, hour)` 若整点有 1m prune
+    /// 标记，或当前 1m 源 count 小于旧 1h count（确定残缺），该组不参与
+    /// 重算、旧 1h 保留；其 1m 行标记 clean 并计入
+    /// [`STATE_QUARANTINED_1H_GROUPS`]。
+    ///
+    /// `count` 比较只用于**反证**：更小 ⇒ 确定残缺；更大**不能**证明完整。
+    /// 因此本门禁只保证“新版本写下的 prune marker + count 减少”两类场景。
+    /// 旧库无 marker、且 partial 1m 的 count >= 旧 1h count 时无法证明残缺，
+    /// 不在保证范围内；这类旧数据由升级策略（v1.0.0 只支持全新安装）排除。
     fn downsample_1h_hour(&self, closed_hour: i64) -> Result<Option<DownsampleHourResult>>;
 
     /// 未聚合 raw 行数（`aggregated_1m=0`），供 `maintenance status` 使用。

@@ -32,7 +32,8 @@
 //!    张业务表取 `SHARE` 表锁，阻止其他实例在导入期间写入；
 //! 3. 再次校验目标为空（防止 `apply_schema` 与导入之间的竞态）；
 //! 4. 按 [`TABLE_SPECS`] 的固定顺序逐表导入，每张表先读源库行数/范围；
-//! 5. 恢复 9 个 `BIGSERIAL` 序列到 `MAX(id)`；
+//! 5. 恢复 9 个 `BIGSERIAL` 序列到**源库高水位**（`MAX(id)`、`sqlite_sequence`、
+//!    持久化 id 游标三者的最大值）；
 //! 6. 在**同一事务**内校验行数、samples/1m/1h 的 id 与时间范围、
 //!    alert_states/alert_events 数量、api_tokens 哈希数量、archive_objects
 //!    数量以及 `maintenance_state` 的 rowid 水位；
@@ -48,10 +49,13 @@
 //! 用 `rowid AS id` 导出并显式写入 PG 的 `id`；`audit_log` / `api_tokens` /
 //! `alert_events` / `alert_silences` / `archive_objects` 的
 //! `INTEGER PRIMARY KEY AUTOINCREMENT` 也按原值写入。最后对 9 个
-//! `BIGSERIAL` 序列执行 `setval(MAX(id))`，保证后续插入不会撞主键。
+//! `BIGSERIAL` 序列执行 `setval(源库高水位)`，保证后续插入不会撞主键；高水位
+//! 同时取 `MAX(id)`、`sqlite_sequence.seq` 与相关持久化游标（见
+//! [`SERIAL_ID_CURSORS`]），因此清理事件后新 id 仍大于通知游标。
 //!
 //! 这样 `maintenance_state.downsample_1m_last_raw_rowid` 里的 rowid 水位仍指向
-//! 同一行（D4b/D3 的 `ORDER BY ts DESC, id DESC` 与删除游标语义不变）。
+//! 同一行（D4b/D3 的 `ORDER BY ts DESC, id DESC` 与删除游标语义不变）；新
+//! raw 行的 id 也一定越过该水位。
 //!
 //! # 类型映射
 //!
@@ -74,7 +78,7 @@ use std::time::Instant;
 use anyhow::{anyhow, bail, Context, Result};
 use postgres::types::ToSql;
 use postgres::Transaction;
-use rusqlite::types::ValueRef;
+use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection as SqliteConnection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 
@@ -98,6 +102,33 @@ const DOWNSAMPLE_ROWID_KEY: &str = "downsample_1m_last_raw_rowid";
 
 /// `maintenance_state` 中记录 raw prune 代际的键。
 const RAW_PRUNE_GENERATION_KEY: &str = "raw_prune_generation";
+
+/// `maintenance_state` 中记录通知 worker 事件 id 游标的键。
+///
+/// 必须与 `rustboard-hub::notify_worker::NOTIFY_CURSOR_KEY` 保持一致；迁移后新
+/// 事件的 id 必须越过它，否则 worker 只查 `id > cursor`，会永远跳过新告警。
+const NOTIFY_CURSOR_KEY: &str = "notify_started_event_id";
+
+/// 自增表在源库中除 `MAX(id)`、`sqlite_sequence.seq` 之外还要参与序列高水位
+/// 计算的持久化水位。
+///
+/// - `alert_events.notify_started_event_id`：事件清理不会回退或删除该游标，
+///   新事件 id 必须越过它，否则通知 worker 的 `id > cursor` 会永远跳过新告警；
+/// - `samples.downsample_1m_last_raw_rowid`：raw 保留期删除会把它下调到新的
+///   `MAX(rowid)`，raw 全空时删除；但历史遗留或崩溃竞态下仍可能残留高于当前
+///   `MAX(rowid)` 的值。迁移按**当前持久值**取 max，保证新 raw 的 id 也越过它，
+///   降采样不会因为 rowid 回退而漏掉新行。
+const SERIAL_ID_CURSORS: [(&str, &str); 2] = [
+    ("samples", DOWNSAMPLE_ROWID_KEY),
+    ("alert_events", NOTIFY_CURSOR_KEY),
+];
+
+/// 精确求和的分块大小：每块最多读取 1 万行，逐行在 Rust 用 i128 累加。
+///
+/// 不能用 SQL `SUM(BIGINT)` 校验 `samples_1m.last_ts`：合法的大库（约 515 万
+/// 个毫秒时间戳）总和就会超过 `i64::MAX`，SQLite 报 integer overflow、PG 报
+/// bigint out of range，导致合法迁移回滚。i128 累加不随总行数溢出。
+const EXACT_SUM_CHUNK_ROWS: usize = 10_000;
 
 /// PostgreSQL 列类型（只覆盖迁移需要的四种）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -782,20 +813,25 @@ fn source_schema_version(conn: &SqliteConnection) -> Result<i64> {
         .context("读取 SQLite 源库 PRAGMA user_version 失败")
 }
 
+/// SQLite 源库中是否存在指定表。
+fn sqlite_table_exists(conn: &SqliteConnection, table: &str) -> Result<bool> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+             )",
+            [table],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("检查 SQLite 源表 {} 是否存在失败", table))?;
+    Ok(exists != 0)
+}
+
 /// 迁移前确认源库 22 张表都存在；缺表时给出明确列表，不进入导入阶段。
 fn ensure_source_tables(conn: &SqliteConnection) -> Result<()> {
     let mut missing = Vec::new();
     for spec in TABLE_SPECS {
-        let exists: i64 = conn
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
-                 )",
-                [spec.name],
-                |row| row.get(0),
-            )
-            .with_context(|| format!("检查 SQLite 源表 {} 是否存在失败", spec.name))?;
-        if exists == 0 {
+        if !sqlite_table_exists(conn, spec.name)? {
             missing.push(spec.name);
         }
     }
@@ -889,7 +925,8 @@ fn import_all_inner(
     let api_token_hashes = verify_migration(tx, source)?;
 
     // 显式 id 不会推进序列；数据确认无误后统一 setval，避免后续写入撞主键。
-    reset_sequences(tx)?;
+    // 高水位取源库 MAX(id)、sqlite_sequence 与持久化游标，清理后也不会回退。
+    reset_sequences(tx, source)?;
 
     Ok(build_report(
         sqlite_schema_version,
@@ -1296,9 +1333,68 @@ fn target_stats(tx: &mut Transaction<'_>, spec: &TableSpec) -> Result<RangeStats
     })
 }
 
-/// 把 9 个 `BIGSERIAL` 序列推进到 `MAX(id)`（空表设为 1，`is_called=false`）。
-fn reset_sequences(tx: &mut Transaction<'_>) -> Result<()> {
+/// 按名称取表规格；`SERIAL_TABLES` 是编译期常量，缺失属于内部错误。
+fn table_spec(name: &str) -> Result<&'static TableSpec> {
+    TABLE_SPECS
+        .iter()
+        .find(|spec| spec.name == name)
+        .ok_or_else(|| anyhow!("内部错误：序列表 {name} 不在 TABLE_SPECS 中"))
+}
+
+/// 读取 `maintenance_state` 里的持久化 id 水位。
+///
+/// 语义与使用方对齐：
+/// - 缺失 / 空串 → 没有水位；
+/// - `"0"` → **健康值**（通知 worker 接受非负数，表示没有历史事件），不作为
+///   高水位，也不告警；下一个 id 从 1 或 `sqlite_sequence.seq` 继续；
+/// - 正整数 → 参与高水位计算；
+/// - 负数 / 非法值 → 忽略并 WARN（通知 worker 会按首次上线重建，降采样把非法
+///   rowid 水位当作缺失）。错误/日志中不输出原始值。
+fn read_cursor_high_water(source: &SqliteConnection, key: &str) -> Result<Option<i64>> {
+    let raw: Option<String> = source
+        .query_row(
+            "SELECT value FROM maintenance_state WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .optional()
+        .with_context(|| format!("读取 SQLite maintenance_state.{key} 失败"))?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<i64>() {
+        Ok(0) => Ok(None),
+        Ok(value) if value > 0 => Ok(Some(value)),
+        Ok(_) => {
+            tracing::warn!(key, "maintenance_state 水位为负数，序列高水位忽略该值");
+            Ok(None)
+        }
+        Err(_) => {
+            tracing::warn!(
+                key,
+                "maintenance_state 水位不是合法整数，序列高水位忽略该值"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// 把 9 个 `BIGSERIAL` 序列推进到源库高水位，保证下一个 id 越过所有旧 id 和
+/// 持久化游标。
+///
+/// 高水位取以下三者的最大值：
+/// 1. 源表 `MAX(id)`（rowid 表用 `MAX(rowid)`）；
+/// 2. `sqlite_sequence.seq`（表使用 AUTOINCREMENT 且存在记录时）。清理事件
+///    不会删除该行，它是 `MAX(id)` 丢失后的历史高水位；
+/// 3. 相关持久化游标（[`SERIAL_ID_CURSORS`]，例如
+///    `maintenance_state.notify_started_event_id`）。
+///
+/// 三个来源都没有（新库 / 从未写入）时设为 1 且 `is_called=false`，下一个 id
+/// 为 1；否则 `setval(high, true)`，下一个 id 为 `high + 1`。
+fn reset_sequences(tx: &mut Transaction<'_>, source: &SqliteConnection) -> Result<()> {
+    let has_sqlite_sequence = sqlite_table_exists(source, "sqlite_sequence")?;
     for table in SERIAL_TABLES {
+        let spec = table_spec(table)?;
         let sequence: Option<String> = tx
             .query_one("SELECT pg_get_serial_sequence($1, 'id')", &[&table])
             .with_context(|| format!("读取表 {table}.id 的序列名失败"))?
@@ -1307,20 +1403,63 @@ fn reset_sequences(tx: &mut Transaction<'_>) -> Result<()> {
             anyhow!("表 {table}.id 没有关联的 BIGSERIAL 序列；目标 schema 可能不完整")
         })?;
 
-        let max_id: Option<i64> = tx
-            .query_one(&format!("SELECT MAX(id) FROM {table}"), &[])
-            .with_context(|| format!("读取表 {table} 的最大 id 失败"))?
-            .get(0);
+        let id_expr = spec
+            .source_id_expr()
+            .ok_or_else(|| anyhow!("内部错误：序列表 {table} 没有源 id 列（rowid 或 id）"))?;
+        let source_max: Option<i64> = source
+            .query_row(
+                &format!("SELECT MAX({id_expr}) FROM {}", spec.name),
+                [],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("读取源库表 {} 的最大 {id_expr} 失败", spec.name))?;
 
-        match max_id {
-            Some(max_id) => {
+        let sqlite_sequence = if spec.id_source == IdSource::Column && has_sqlite_sequence {
+            source
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = ?1",
+                    [spec.name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .with_context(|| format!("读取源库 sqlite_sequence.{} 失败", spec.name))?
+        } else {
+            None
+        };
+
+        let mut cursor_high: Option<i64> = None;
+        for (cursor_table, key) in SERIAL_ID_CURSORS {
+            if cursor_table != table {
+                continue;
+            }
+            if let Some(value) = read_cursor_high_water(source, key)? {
+                cursor_high = Some(cursor_high.map_or(value, |current| current.max(value)));
+            }
+        }
+
+        let high_water = [source_max, sqlite_sequence, cursor_high]
+            .into_iter()
+            .flatten()
+            .max();
+
+        match high_water {
+            Some(high) if high > 0 => {
+                if high == i64::MAX {
+                    bail!(
+                        "源库表 {table} 的 id/游标高水位已达到 i64::MAX，\
+                         PostgreSQL 无法为该表分配更大的 id；拒绝迁移"
+                    );
+                }
                 tx.query_one(
                     "SELECT setval($1::text::regclass, $2, true)",
-                    &[&sequence, &max_id],
+                    &[&sequence, &high],
                 )
-                .with_context(|| format!("把序列 {sequence} 推进到 {max_id} 失败（表 {table}）"))?;
+                .with_context(|| {
+                    format!("把序列 {sequence} 推进到源库高水位 {high} 失败（表 {table}）")
+                })?;
             }
-            None => {
+            _ => {
+                // 空表且没有历史：与 SQLite 新表一致，从 1 开始。
                 tx.query_one("SELECT setval($1::text::regclass, 1, false)", &[&sequence])
                     .with_context(|| format!("把空表 {table} 的序列设为 1 失败"))?;
             }
@@ -1396,9 +1535,162 @@ fn verify_migration(tx: &mut Transaction<'_>, source: &SqliteConnection) -> Resu
     Ok(target_hashes)
 }
 
-/// 校验 v8/v9 新增列在源/目标的一致性（计数/求和，不回显行内容）。
+/// 用 i128 精确求和，不随总行数溢出。
+fn exact_sum(values: impl IntoIterator<Item = i64>) -> i128 {
+    values.into_iter().map(i128::from).sum()
+}
+
+/// 按 `key` 键集分块读取 SQLite 的一列并精确求和。
+///
+/// `key` / `table` / `column` 只来自本文件常量，不拼接用户输入。
+fn sqlite_chunked_sum(
+    source: &SqliteConnection,
+    table: &'static str,
+    key: &'static str,
+    column: &'static str,
+) -> Result<i128> {
+    let chunk_rows = i64::try_from(EXACT_SUM_CHUNK_ROWS).expect("分块大小必须能放进 i64");
+    let mut total = 0i128;
+    let mut after: Option<i64> = None;
+    loop {
+        let (sql, params): (String, Vec<Value>) = match after {
+            Some(after) => (
+                format!(
+                    "SELECT {key}, {column} FROM {table} \
+                     WHERE {key} > ?1 ORDER BY {key} ASC LIMIT ?2"
+                ),
+                vec![Value::Integer(after), Value::Integer(chunk_rows)],
+            ),
+            None => (
+                format!("SELECT {key}, {column} FROM {table} ORDER BY {key} ASC LIMIT ?1"),
+                vec![Value::Integer(chunk_rows)],
+            ),
+        };
+        let mut statement = source
+            .prepare(&sql)
+            .with_context(|| format!("准备 SQLite 表 {table} 的精确求和查询失败"))?;
+        let mut rows = statement
+            .query(rusqlite::params_from_iter(params))
+            .with_context(|| format!("执行 SQLite 表 {table} 的精确求和查询失败"))?;
+
+        let mut values = Vec::with_capacity(EXACT_SUM_CHUNK_ROWS);
+        let mut last_key: Option<i64> = None;
+        while let Some(row) = rows
+            .next()
+            .with_context(|| format!("读取 SQLite 表 {table}.{column} 的行失败"))?
+        {
+            let key_value: i64 = row
+                .get(0)
+                .with_context(|| format!("读取 SQLite 表 {table}.{key} 失败"))?;
+            if last_key.is_some_and(|previous| key_value <= previous) {
+                bail!("SQLite 表 {table} 的 {key} 未严格递增，拒绝继续精确求和");
+            }
+            last_key = Some(key_value);
+            values.push(
+                row.get(1)
+                    .with_context(|| format!("读取 SQLite 表 {table}.{column} 失败"))?,
+            );
+        }
+        let read = values.len();
+        total += exact_sum(values);
+        match last_key {
+            Some(key_value) if read == EXACT_SUM_CHUNK_ROWS => after = Some(key_value),
+            _ => break,
+        }
+    }
+    Ok(total)
+}
+
+/// 按 `key` 键集分块读取 PostgreSQL 的一列并精确求和。
+///
+/// `key` / `table` / `column` 只来自本文件常量，不拼接用户输入。
+fn pg_chunked_sum(
+    tx: &mut Transaction<'_>,
+    table: &'static str,
+    key: &'static str,
+    column: &'static str,
+) -> Result<i128> {
+    let chunk_rows = i64::try_from(EXACT_SUM_CHUNK_ROWS).expect("分块大小必须能放进 i64");
+    let mut total = 0i128;
+    let mut after: Option<i64> = None;
+    loop {
+        let rows = match after {
+            Some(after) => tx.query(
+                &format!(
+                    "SELECT {key}, {column} FROM {table} \
+                     WHERE {key} > $1 ORDER BY {key} ASC LIMIT $2"
+                ),
+                &[&after, &chunk_rows],
+            ),
+            None => tx.query(
+                &format!("SELECT {key}, {column} FROM {table} ORDER BY {key} ASC LIMIT $1"),
+                &[&chunk_rows],
+            ),
+        }
+        .with_context(|| format!("执行目标 PostgreSQL 表 {table} 的精确求和查询失败"))?;
+
+        let mut values = Vec::with_capacity(rows.len());
+        let mut last_key: Option<i64> = None;
+        for row in &rows {
+            let key_value: i64 = row.get(0);
+            if last_key.is_some_and(|previous| key_value <= previous) {
+                bail!("目标 PostgreSQL 表 {table} 的 {key} 未严格递增，拒绝继续精确求和");
+            }
+            last_key = Some(key_value);
+            values.push(row.get(1));
+        }
+        let read = values.len();
+        total += exact_sum(values);
+        match last_key {
+            Some(key_value) if read == EXACT_SUM_CHUNK_ROWS => after = Some(key_value),
+            _ => break,
+        }
+    }
+    Ok(total)
+}
+
+/// 读取 SQLite 整表一列并精确求和；只用于行数有硬上限的 `alert_rules`。
+fn sqlite_sum_all(
+    source: &SqliteConnection,
+    table: &'static str,
+    column: &'static str,
+) -> Result<i128> {
+    let sql = format!("SELECT {column} FROM {table}");
+    let mut statement = source
+        .prepare(&sql)
+        .with_context(|| format!("准备 SQLite 表 {table} 的全表求和查询失败"))?;
+    let values = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .with_context(|| format!("执行 SQLite 表 {table} 的全表求和查询失败"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .with_context(|| format!("读取 SQLite 表 {table}.{column} 失败"))?;
+    Ok(exact_sum(values))
+}
+
+/// 读取 PostgreSQL 整表一列并精确求和；只用于行数有硬上限的 `alert_rules`。
+fn pg_sum_all(tx: &mut Transaction<'_>, table: &'static str, column: &'static str) -> Result<i128> {
+    let rows = tx
+        .query(&format!("SELECT {column} FROM {table}"), &[])
+        .with_context(|| format!("执行目标 PostgreSQL 表 {table} 的全表求和查询失败"))?;
+    Ok(exact_sum(rows.iter().map(|row| row.get::<_, i64>(0))))
+}
+
+/// 一次精确求和校验：两侧按各自的键分块扫描同一列。
+struct ExactSumCheck {
+    label: &'static str,
+    table: &'static str,
+    source_key: &'static str,
+    target_key: &'static str,
+    column: &'static str,
+}
+
+/// 校验 v8/v9 新增列在源/目标的一致性（计数/精确求和，不回显行内容）。
+///
+/// 求和一律在 Rust 里用 i128 累加，**不用 SQL `SUM`**：`samples_1m.last_ts`
+/// 约 515 万行就会超过 `i64::MAX`，SQLite 会报 integer overflow、PG 会报
+/// bigint out of range，让合法大库迁移整体回滚。
 fn verify_extra_columns(tx: &mut Transaction<'_>, source: &SqliteConnection) -> Result<()> {
-    let checks = [
+    let count_checks = [
         (
             "samples.aggregated_1m=1 行数",
             "SELECT COUNT(*) FROM samples WHERE aggregated_1m = 1",
@@ -1414,28 +1706,8 @@ fn verify_extra_columns(tx: &mut Transaction<'_>, source: &SqliteConnection) -> 
             "SELECT COUNT(*) FROM samples_1m WHERE aggregated_1h = 1",
             "SELECT COUNT(*)::BIGINT FROM samples_1m WHERE aggregated_1h = 1",
         ),
-        (
-            "samples_1m.last_ts 求和",
-            "SELECT COALESCE(SUM(last_ts), 0) FROM samples_1m",
-            "SELECT COALESCE(SUM(last_ts), 0)::BIGINT FROM samples_1m",
-        ),
-        (
-            "archive_objects.ledger_version 求和",
-            "SELECT COALESCE(SUM(ledger_version), 0) FROM archive_objects",
-            "SELECT COALESCE(SUM(ledger_version), 0)::BIGINT FROM archive_objects",
-        ),
-        (
-            "archive_objects.attempts 求和",
-            "SELECT COALESCE(SUM(attempts), 0) FROM archive_objects",
-            "SELECT COALESCE(SUM(attempts), 0)::BIGINT FROM archive_objects",
-        ),
-        (
-            "alert_rules.revision 求和",
-            "SELECT COALESCE(SUM(revision), 0) FROM alert_rules",
-            "SELECT COALESCE(SUM(revision), 0)::BIGINT FROM alert_rules",
-        ),
     ];
-    for (label, source_sql, target_sql) in checks {
+    for (label, source_sql, target_sql) in count_checks {
         let source_value: i64 = source
             .query_row(source_sql, [], |row| row.get(0))
             .with_context(|| format!("读取 SQLite 扩展列校验值失败：{label}"))?;
@@ -1445,15 +1717,74 @@ fn verify_extra_columns(tx: &mut Transaction<'_>, source: &SqliteConnection) -> 
             .get(0);
         if source_value != target_value {
             bail!(
-                "迁移校验失败：{label} 不一致（源 {source_value}，目标 {target_value}）；                 具体行值未输出，避免泄露源库内容"
+                "迁移校验失败：{label} 不一致（源 {source_value}，目标 {target_value}）；\
+                 具体行值未输出，避免泄露源库内容"
             );
         }
+    }
+
+    const SUM_CHECKS: [ExactSumCheck; 3] = [
+        ExactSumCheck {
+            label: "samples_1m.last_ts 求和",
+            table: "samples_1m",
+            source_key: "rowid",
+            target_key: "id",
+            column: "last_ts",
+        },
+        ExactSumCheck {
+            label: "archive_objects.ledger_version 求和",
+            table: "archive_objects",
+            source_key: "id",
+            target_key: "id",
+            column: "ledger_version",
+        },
+        ExactSumCheck {
+            label: "archive_objects.attempts 求和",
+            table: "archive_objects",
+            source_key: "id",
+            target_key: "id",
+            column: "attempts",
+        },
+    ];
+    for check in SUM_CHECKS {
+        let source_total = sqlite_chunked_sum(source, check.table, check.source_key, check.column)
+            .with_context(|| format!("读取 SQLite 扩展列精确校验值失败：{}", check.label))?;
+        let target_total = pg_chunked_sum(tx, check.table, check.target_key, check.column)
+            .with_context(|| {
+                format!("读取目标 PostgreSQL 扩展列精确校验值失败：{}", check.label)
+            })?;
+        if source_total != target_total {
+            bail!(
+                "迁移校验失败：{} 不一致（源 {source_total}，目标 {target_total}）；\
+                 具体行值未输出，避免泄露源库内容",
+                check.label
+            );
+        }
+    }
+
+    // alert_rules 行数受 MAX_ALERT_RULES（200）硬限制，整表读取后 i128 累加。
+    let source_revision = sqlite_sum_all(source, "alert_rules", "revision")
+        .context("读取 SQLite 扩展列精确校验值失败：alert_rules.revision 求和")?;
+    let target_revision = pg_sum_all(tx, "alert_rules", "revision")
+        .context("读取目标 PostgreSQL 扩展列精确校验值失败：alert_rules.revision 求和")?;
+    if source_revision != target_revision {
+        bail!(
+            "迁移校验失败：alert_rules.revision 求和 不一致\
+             （源 {source_revision}，目标 {target_revision}）；\
+             具体行值未输出，避免泄露源库内容"
+        );
     }
     Ok(())
 }
 
 fn verify_maintenance_state(tx: &mut Transaction<'_>, source: &SqliteConnection) -> Result<()> {
-    for key in [DOWNSAMPLE_ROWID_KEY, RAW_PRUNE_GENERATION_KEY] {
+    // 通知游标与 rowid 水位都必须原样迁移：前者丢失/被重置会让新事件永远不被
+    // 通知 worker 看到，后者错位会让降采样重复或漏处理 raw。
+    for key in [
+        DOWNSAMPLE_ROWID_KEY,
+        RAW_PRUNE_GENERATION_KEY,
+        NOTIFY_CURSOR_KEY,
+    ] {
         let source_value: Option<String> = source
             .query_row(
                 "SELECT value FROM maintenance_state WHERE key = ?1",
@@ -1768,5 +2099,145 @@ mod tests {
         assert_eq!(value["samples_range"]["id_max"], 3);
         assert_eq!(value["duration_ms"], 9);
         assert_eq!(value["api_token_hashes"], 3);
+    }
+
+    #[test]
+    fn serial_high_water_sources_are_well_formed() {
+        for (table, key) in SERIAL_ID_CURSORS {
+            assert!(
+                SERIAL_TABLES.contains(&table),
+                "游标表 {table} 不在 SERIAL_TABLES 中"
+            );
+            assert!(!key.is_empty(), "游标键不能为空");
+            assert!(table_spec(table).is_ok(), "缺少表规格 {table}");
+        }
+        // 这两个 key 与 hub / downsample 的持久化键必须一致，否则迁移读不到游标。
+        assert_eq!(NOTIFY_CURSOR_KEY, "notify_started_event_id");
+        assert_eq!(DOWNSAMPLE_ROWID_KEY, "downsample_1m_last_raw_rowid");
+        assert!(SERIAL_TABLES.contains(&"alert_events"));
+        assert!(SERIAL_TABLES.contains(&"samples"));
+    }
+
+    #[test]
+    fn cursor_high_water_accepts_only_positive_integers() {
+        // 与通知 worker 对齐：0 是健康值，负数/非法值忽略。
+        let conn = SqliteConnection::open_in_memory().expect("打开内存 SQLite 失败");
+        conn.execute_batch(
+            "CREATE TABLE maintenance_state (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );",
+        )
+        .expect("创建 maintenance_state 失败");
+        conn.execute(
+            "INSERT INTO maintenance_state (key, value, updated_at) VALUES
+                 ('missing-placeholder', '', 0)",
+            [],
+        )
+        .expect("插入占位行失败");
+        let cases = [
+            ("zero", "0", None),
+            ("negative", "-1", None),
+            ("invalid", "not-a-number", None),
+            ("empty", "", None),
+            ("padded", " 150 ", Some(150)),
+            ("positive", "7", Some(7)),
+        ];
+        for (key, raw, expected) in cases {
+            conn.execute(
+                "INSERT OR REPLACE INTO maintenance_state (key, value, updated_at)
+                 VALUES (?1, ?2, 0)",
+                rusqlite::params![key, raw],
+            )
+            .expect("写入水位失败");
+            assert_eq!(
+                read_cursor_high_water(&conn, key).expect("读取水位失败"),
+                expected,
+                "maintenance_state.{key} 的高水位语义不符合预期"
+            );
+        }
+        assert_eq!(
+            read_cursor_high_water(&conn, "missing-placeholder").expect("读取缺失水位失败"),
+            None,
+            "空串必须视为没有水位"
+        );
+        assert_eq!(
+            read_cursor_high_water(&conn, "absent").expect("读取不存在的 key 失败"),
+            None,
+            "缺失 key 必须视为没有水位"
+        );
+    }
+
+    #[test]
+    fn exact_sum_handles_five_million_realistic_timestamps() {
+        // 5.2M × 2026 年的合法毫秒时间戳 ≈ 9.32e18 > i64::MAX (9.22e18)。
+        const ROWS: usize = 5_200_000;
+        const LAST_TS: i64 = 1_793_000_000_000;
+
+        let total = exact_sum(std::iter::repeat_n(LAST_TS, ROWS));
+        let expected = i128::from(LAST_TS) * i128::try_from(ROWS).expect("行数必须能放进 i128");
+        assert_eq!(total, expected);
+        assert!(
+            total > i128::from(i64::MAX),
+            "反例总和必须超过 i64::MAX，才能覆盖旧 SUM 的溢出"
+        );
+
+        // 旧实现把它读成 i64：PG 报 bigint out of range，i64 累加在校验阶段即失败。
+        let legacy = (0..ROWS).try_fold(0i64, |acc, _| acc.checked_add(LAST_TS));
+        assert_eq!(legacy, None, "旧 i64 SUM 必须溢出，否则反例无效");
+    }
+
+    #[test]
+    fn exact_sum_handles_empty_and_zero_values() {
+        assert_eq!(exact_sum(std::iter::empty()), 0);
+        assert_eq!(exact_sum([0i64, 0, 0]), 0);
+        // 正负抵消也必须在 i128 中精确计算，而不是先溢出再回绕。
+        assert_eq!(exact_sum([i64::MAX, i64::MIN]), -1);
+        assert_eq!(exact_sum([i64::MAX, i64::MAX]), i128::from(i64::MAX) * 2);
+    }
+
+    #[test]
+    fn sqlite_chunked_sum_handles_overflow_and_chunk_boundaries() {
+        // 10 个完整分块 + 1 行，覆盖分块边界、空表、0 值与总和超 i64::MAX。
+        const ROWS: usize = EXACT_SUM_CHUNK_ROWS * 10 + 1;
+        const LAST_TS: i64 = 100_000_000_000_000;
+
+        let conn = SqliteConnection::open_in_memory().expect("打开内存 SQLite 失败");
+        conn.execute_batch(
+            "CREATE TABLE samples_1m (id INTEGER PRIMARY KEY, last_ts INTEGER NOT NULL);
+             CREATE TABLE empty_sum (id INTEGER PRIMARY KEY, last_ts INTEGER NOT NULL);",
+        )
+        .expect("创建内存表失败");
+        {
+            let tx = conn.unchecked_transaction().expect("开启内存事务失败");
+            {
+                let mut statement = tx
+                    .prepare("INSERT INTO samples_1m (last_ts) VALUES (?1)")
+                    .expect("准备插入失败");
+                for index in 0..ROWS {
+                    // 首行为 0：总和恰好由其余 ROWS-1 行构成。
+                    let value = if index == 0 { 0 } else { LAST_TS };
+                    statement.execute([value]).expect("插入内存行失败");
+                }
+            }
+            tx.commit().expect("提交内存事务失败");
+        }
+
+        let total =
+            sqlite_chunked_sum(&conn, "samples_1m", "id", "last_ts").expect("分块精确求和失败");
+        let expected = i128::from(LAST_TS) * i128::try_from(ROWS - 1).expect("行数必须能放进 i128");
+        assert_eq!(total, expected);
+        assert!(total > i128::from(i64::MAX), "反例总和必须超过 i64::MAX");
+
+        // 反证旧 SQL 在同一份数据上会失败（SQLite integer overflow）。
+        let legacy = conn.query_row("SELECT SUM(last_ts) FROM samples_1m", [], |row| {
+            row.get::<_, i64>(0)
+        });
+        assert!(legacy.is_err(), "旧 SQL SUM 必须溢出报错，否则反例无效");
+
+        let empty =
+            sqlite_chunked_sum(&conn, "empty_sum", "id", "last_ts").expect("空表精确求和失败");
+        assert_eq!(empty, 0, "空表精确求和必须为 0");
     }
 }

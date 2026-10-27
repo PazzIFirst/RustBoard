@@ -36,6 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use postgres::config::SslMode;
 use postgres::NoTls;
+use rustboard_common::config::HubConfig;
 use rustboard_common::model::{AgentRecord, Labels, Sample, SampleBatch, SeriesQuery, SeriesRow};
 use rustboard_core::alerts::{
     builtin_rules, AlertEvaluationOutcome, AlertEvent, AlertRule, AlertRuleStoreError,
@@ -44,7 +45,9 @@ use rustboard_core::alerts::{
 };
 use rustboard_core::archive::{ArchiveObject, ArchiveStatus, ArchiveStoreError};
 use rustboard_core::channels::{ChannelConfig, ChannelKind, NotificationChannel, Secret};
-use rustboard_core::downsample::STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID;
+use rustboard_core::downsample::{
+    maintenance_status, run_downsample, STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID,
+};
 use rustboard_core::storage::postgres::{PostgresOptions, PostgresStorage};
 use rustboard_core::storage::sqlite::{
     ChannelStoreError, MAX_NOTIFICATION_CHANNELS, STATE_RAW_PRUNE_GENERATION,
@@ -4122,6 +4125,115 @@ fn query_boundaries_and_special_values_parity() {
     assert_eq!(pg_intact.1, 8, "注入字符串不得改变表结构或丢数据");
     assert_eq!(pg_intact.2, 1);
     assert_eq!(pg_intact.3, 1);
+}
+
+// ---------------------------------------------------------------------------
+// 14. #33：1m prune 后的 legacy backlog 不得覆盖完整 1h（PG/SQLite parity）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn issue33_legacy_1m_prune_does_not_overwrite_1h_parity() {
+    const NAME: &str = "issue33_legacy_1m_prune_does_not_overwrite_1h_parity";
+    let Some(fx) = ParityFixture::new("issue33") else {
+        skip(NAME);
+        return;
+    };
+
+    let (pg, sq) = both(&fx, |s| {
+        let first = sample_batch(
+            "legacy-agent",
+            1,
+            0,
+            vec![
+                Sample::new("cpu.usage", 1_000, 10.0),
+                Sample::new("cpu.usage", 2_000, 20.0),
+            ],
+        );
+        let inserted = s.insert_batch(&first).unwrap();
+        let first_ds = run_downsample(s, 7_200_000, None).unwrap();
+        let before_1h = s.samples_1h_stats().unwrap();
+
+        // 真实 1m 保留期删除 + 旧 raw 删除；旧 1h 保留。
+        let pruned_1m = s.prune_samples_1m_before(3_600_000).unwrap();
+        let pruned_raw = s.prune_samples_before(3_600_000).unwrap();
+
+        // 1m 删除后才补传的 legacy raw：count=3 > 旧 1h count=2。
+        let late = sample_batch(
+            "legacy-agent",
+            2,
+            7_200_000,
+            vec![
+                Sample::new("cpu.usage", 121_000, 30.0),
+                Sample::new("cpu.usage", 122_000, 40.0),
+                Sample::new("cpu.usage", 123_000, 50.0),
+            ],
+        );
+        let inserted_late = s.insert_batch(&late).unwrap();
+        let second_ds = run_downsample(s, 7_200_000, None).unwrap();
+        let after_1h = s.samples_1h_stats().unwrap();
+        let after_1m = s.samples_1m_stats().unwrap();
+        let rows = s
+            .query_series_tiered(
+                &series_query("legacy-agent", &["cpu.usage"], 0, 3_600_000, 10),
+                BUCKET_1H_MS,
+                SampleTier::OneHour,
+            )
+            .unwrap();
+        let hour_value = rows.first().map(|row| row.value);
+        let status = maintenance_status(s, &HubConfig::default(), 7_200_000).unwrap();
+        (
+            inserted,
+            first_ds,
+            before_1h,
+            pruned_1m,
+            pruned_raw,
+            inserted_late,
+            second_ds,
+            after_1h,
+            after_1m,
+            hour_value,
+            status,
+        )
+    });
+
+    assert_eq!(pg, sq, "PG 与 SQLite 的 #33 隔离行为必须一致");
+    assert_eq!(pg.0, IngestOutcome::Inserted { inserted: 2 });
+    assert_eq!(pg.1.one_minute.rows, 2, "首次降采样必须处理两点 raw");
+    assert_eq!(
+        pg.2,
+        TierStats {
+            rows: 1,
+            oldest_ts: Some(0),
+            newest_ts: Some(0)
+        }
+    );
+    assert_eq!(
+        pg.3,
+        PruneResult {
+            deleted: 1,
+            batches: 1
+        }
+    );
+    assert_eq!(
+        pg.4,
+        PruneResult {
+            deleted: 2,
+            batches: 1
+        }
+    );
+    assert_eq!(pg.5, IngestOutcome::Inserted { inserted: 3 });
+    assert_eq!(pg.6.one_minute.quarantined, 3);
+    assert_eq!(pg.6.one_minute.rows, 0);
+    assert_eq!(pg.7.rows, 1, "旧 1h 行必须保留");
+    assert_eq!(pg.8, TierStats::default(), "不得生成残缺 1m");
+    assert_eq!(
+        pg.9,
+        Some(15.0),
+        "旧 1h avg 必须保留为 15，不能被 3/40 覆盖"
+    );
+    assert_eq!(pg.10.quarantined_legacy_raw_rows, 3);
+    assert_eq!(pg.10.last_pruned_1m_hour, Some(0));
+    assert_eq!(pg.10.pruned_1m_hours, 1);
 }
 
 // __PARITY_TEST_APPEND__

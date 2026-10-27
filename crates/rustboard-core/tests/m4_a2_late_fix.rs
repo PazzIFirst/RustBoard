@@ -836,3 +836,213 @@ fn m4_a2_late_raw_arriving_between_downsample_and_retention_is_not_deleted_first
     assert_eq!(retention.raw.deleted, 1, "迟到 raw 聚合后才可删除");
     assert_eq!(raw_count(&conn, agent), 0);
 }
+
+// ---------------------------------------------------------------------------
+// 用例 7：#33 legacy backlog 不得用残缺 1m 覆盖完整 1h。
+//
+// 旧 1h 由 10/20 生成 count=2/avg=15；1m 已按保留期整组删除；之后补传的
+// legacy raw 30/40/50 只能被隔离，不能重算成 count=3/avg=40 覆盖旧桶。
+// ---------------------------------------------------------------------------
+
+/// 只构造「旧 1h + 已删 1m」的公共前置，返回小时起点。
+fn seed_complete_1h_then_prune_1m(
+    storage: &SqliteStorage,
+    dir: &TempDbDir,
+    agent: &str,
+    label: &Labels,
+) -> i64 {
+    let hour = BASE;
+    let build_now = BASE + 5 * DAY_MS;
+    insert(
+        storage,
+        &batch(
+            agent,
+            1,
+            build_now,
+            vec![
+                sample("cpu.usage", label.clone(), hour + 1_000, 10.0),
+                sample("cpu.usage", label.clone(), hour + 2_000, 20.0),
+            ],
+        ),
+    );
+    run_downsample(storage, build_now, None).expect("首次 run_downsample 失败");
+    let conn = readonly_conn(dir);
+    assert_aggregate(
+        &conn,
+        SAMPLES_1H,
+        agent,
+        "cpu.usage",
+        hour,
+        (2, 15.0, 20.0),
+        "前置：完整旧 1h",
+    );
+    // 真实 retention：整组删 1m，并删已聚合旧 raw，只剩旧 1h。
+    assert_eq!(
+        storage
+            .prune_samples_1m_before(hour + HOUR_MS)
+            .unwrap()
+            .deleted,
+        1,
+        "前置：1m 必须整组删除"
+    );
+    assert_eq!(
+        storage
+            .prune_samples_before(hour + HOUR_MS)
+            .unwrap()
+            .deleted,
+        2,
+        "前置：已聚合旧 raw 删除"
+    );
+    hour
+}
+
+fn issue33_cfg() -> HubConfig {
+    HubConfig {
+        retention_raw_days: 7,
+        retention_1m_days: 90,
+        retention_1h_days: 730,
+        ..HubConfig::default()
+    }
+}
+
+/// 启动审计路径：真实 prune 后，审计必须在 delta 之前隔离 legacy raw。
+#[test]
+fn issue33_audit_quarantines_legacy_backlog_instead_of_overwriting_1h() {
+    let dir = TempDbDir::new("issue33-audit");
+    let storage = open_storage(&dir);
+    let agent = "agent-issue33-audit";
+    ensure_agent(&storage, agent);
+
+    const NOW: i64 = BASE + 100 * DAY_MS + 5 * HOUR_MS;
+    let label = labels(&[("host", "legacy")]);
+    let hour = seed_complete_1h_then_prune_1m(&storage, &dir, agent, &label);
+
+    insert(
+        &storage,
+        &batch(
+            agent,
+            2,
+            NOW,
+            vec![
+                sample("cpu.usage", label.clone(), hour + 3_000, 30.0),
+                sample("cpu.usage", label.clone(), hour + 4_000, 40.0),
+                sample("cpu.usage", label.clone(), hour + 5_000, 50.0),
+            ],
+        ),
+    );
+
+    let cfg = issue33_cfg();
+    let audit = audit_legacy_raw_rows(&storage, &cfg, NOW).expect("legacy 审计失败");
+    assert_eq!(audit.invalid_timestamp_rows, 0);
+    assert_eq!(audit.legacy_unaggregated_rows, 3);
+    assert_eq!(
+        audit.quarantined_legacy_rows, 3,
+        "旧于 1m horizon 且已有 1h 的 legacy raw 必须隔离"
+    );
+
+    let report = run_downsample(&storage, NOW, None).expect("审计后的 run_downsample 失败");
+    assert_eq!(report.one_minute.quarantined, 0, "审计已完成隔离");
+
+    let conn = readonly_conn(&dir);
+    assert_aggregate(
+        &conn,
+        SAMPLES_1H,
+        agent,
+        "cpu.usage",
+        hour,
+        (2, 15.0, 20.0),
+        "legacy raw 不得覆盖完整 1h",
+    );
+    assert_eq!(tier_count(&conn, SAMPLES_1M, hour), 0, "不得生成残缺 1m");
+    assert_eq!(raw_count(&conn, agent), 3, "隔离只标记、不删 raw");
+    let unaggregated: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM samples WHERE agent_id = ?1 AND aggregated_1m = 0",
+            params![agent],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unaggregated, 0, "legacy raw 必须被隔离为 aggregated_1m=1");
+
+    let status = maintenance_status(&storage, &cfg, NOW).expect("maintenance_status 失败");
+    assert_eq!(status.legacy_unaggregated_rows, 0);
+    assert_eq!(status.quarantined_legacy_raw_rows, 3);
+    assert_eq!(status.quarantined_1h_groups, 0);
+    assert_eq!(status.last_pruned_1m_hour, Some(hour));
+    assert_eq!(status.pruned_1m_hours, 1);
+}
+
+/// worker 路径：没有启动审计时，真实 prune 标记也必须阻止残缺源覆盖。
+#[test]
+fn issue33_delta_quarantines_after_1m_prune_without_audit() {
+    let dir = TempDbDir::new("issue33-delta");
+    let storage = open_storage(&dir);
+    let agent = "agent-issue33-delta";
+    ensure_agent(&storage, agent);
+
+    const NOW: i64 = BASE + 100 * DAY_MS + 5 * HOUR_MS;
+    let label = labels(&[("host", "legacy-delta")]);
+    let hour = seed_complete_1h_then_prune_1m(&storage, &dir, agent, &label);
+
+    insert(
+        &storage,
+        &batch(
+            agent,
+            2,
+            NOW,
+            vec![
+                sample("cpu.usage", label.clone(), hour + 3_000, 30.0),
+                sample("cpu.usage", label.clone(), hour + 4_000, 40.0),
+                sample("cpu.usage", label.clone(), hour + 5_000, 50.0),
+            ],
+        ),
+    );
+
+    // 不调用 audit：delta 直接读 prune 标记并隔离。
+    let report = run_downsample(&storage, NOW, None).expect("run_downsample 失败");
+    assert_eq!(report.one_minute.quarantined, 3);
+    assert_eq!(report.one_minute.rows, 0);
+
+    let conn = readonly_conn(&dir);
+    assert_aggregate(
+        &conn,
+        SAMPLES_1H,
+        agent,
+        "cpu.usage",
+        hour,
+        (2, 15.0, 20.0),
+        "prune 后的旧 1h 必须保留",
+    );
+    assert_eq!(tier_count(&conn, SAMPLES_1M, hour), 0);
+    assert_eq!(raw_count(&conn, agent), 3);
+    let unaggregated: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM samples WHERE agent_id = ?1 AND aggregated_1m = 0",
+            params![agent],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unaggregated, 0);
+
+    let status =
+        maintenance_status(&storage, &issue33_cfg(), NOW).expect("maintenance_status 失败");
+    assert_eq!(status.quarantined_legacy_raw_rows, 3);
+    assert_eq!(status.last_pruned_1m_hour, Some(hour));
+    assert_eq!(status.pruned_1m_hours, 1);
+
+    // 再来一轮：隔离计数不重复增长，旧 1h 不变。
+    let again = run_downsample(&storage, NOW, None).expect("幂等重跑失败");
+    assert_eq!(again.one_minute.quarantined, 0);
+    let status =
+        maintenance_status(&storage, &issue33_cfg(), NOW).expect("maintenance_status 失败");
+    assert_eq!(status.quarantined_legacy_raw_rows, 3);
+    assert_aggregate(
+        &conn,
+        SAMPLES_1H,
+        agent,
+        "cpu.usage",
+        hour,
+        (2, 15.0, 20.0),
+        "幂等重跑后旧 1h 仍保留",
+    );
+}

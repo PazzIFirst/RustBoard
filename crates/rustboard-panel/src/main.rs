@@ -11,7 +11,7 @@ mod web;
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
@@ -2381,6 +2381,35 @@ fn init(
     static_dir: Option<String>,
     force: bool,
 ) -> Result<()> {
+    init_with_hub_hint(
+        config,
+        listen,
+        hub,
+        hub_token,
+        hub_ca,
+        password,
+        static_dir,
+        force,
+        load_hub_config_hint,
+    )
+}
+
+/// [`init`] 的可注入实现。
+///
+/// hub.toml 的探测通过参数注入而不是写死 `DEFAULT_HUB_CONFIG`，测试可以在不读
+/// `/etc/rustboard/hub.toml`、不写系统目录的前提下覆盖“自动读取本机 Hub”的完整路径。
+#[allow(clippy::too_many_arguments)]
+fn init_with_hub_hint(
+    config: Option<PathBuf>,
+    listen: Option<String>,
+    hub: Option<String>,
+    hub_token: Option<String>,
+    hub_ca: Option<PathBuf>,
+    password: Option<String>,
+    static_dir: Option<String>,
+    force: bool,
+    load_hub_hint: impl FnOnce() -> Option<HubConfig>,
+) -> Result<()> {
     let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_PANEL_CONFIG));
     if path.exists() && !force {
         bail!("{} 已存在，使用 --force 覆盖", path.display());
@@ -2400,7 +2429,7 @@ fn init(
         .as_deref()
         .is_some_and(|raw| raw.trim().starts_with("https://"));
     let hub_cfg = if hub.is_none() || hub_token.is_none() || (hub_ca.is_none() && explicit_https) {
-        load_hub_config_hint()
+        load_hub_hint()
     } else {
         None
     };
@@ -2653,16 +2682,43 @@ fn load_hub_config_hint() -> Option<HubConfig> {
     }
 }
 
+/// hub 地址的 authority 是否带 `user:pass@`（userinfo）。
+///
+/// 只检查 scheme 后、首个 `/` / `?` / `#` 之前的 authority；不解析整条 URL，
+/// 也不返回原串，避免调用方把密码写进错误或日志。scheme 大小写不敏感。
+fn hub_url_has_userinfo(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    let rest = if lower.starts_with("http://") {
+        &raw[7..]
+    } else if lower.starts_with("https://") {
+        &raw[8..]
+    } else {
+        raw
+    };
+    rest.split(['/', '?', '#'])
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
+}
+
 /// 把 `127.0.0.1:8444` / `0.0.0.0:8444` / `http://...` / `https://...` 统一成面板可用的 hub 地址。
 ///
 /// 无 scheme 时仍默认 `http://`（兼容旧 CLI 用法与同机回环部署）；
 /// `https://` 原样保留。是否允许明文 http 由 [`proxy::ProxyClient::new`] 在启动时按
 /// host 是否为回环裁决——这样 `panel init` 可以先把远程地址写进配置，
 /// 由运行时给出统一的安全错误。
+///
+/// 地址里带 `user:pass@` 时直接拒绝且不回显原串：面板的凭据只走 `--hub-token`，
+/// URL userinfo 会被 `println`/错误链带进终端或日志。
 fn normalize_hub_url(raw: &str) -> Result<String> {
     let raw = raw.trim().trim_end_matches('/');
     if raw.is_empty() {
         bail!("hub 地址不能为空");
+    }
+    if hub_url_has_userinfo(raw) {
+        bail!(
+            "hub 地址不能包含用户名或密码（userinfo）；请用 --hub-token 传递凭据，\
+             不要在 --hub 中写 userinfo；原始地址不会被回显，未写入面板配置"
+        );
     }
     let normalized = if raw.starts_with("http://") || raw.starts_with("https://") {
         raw.to_string()
@@ -2689,9 +2745,13 @@ fn hub_url_from_admin_listen(admin_listen: &str) -> String {
 }
 
 /// 从监听地址中取主机部分：`127.0.0.1:8080`、`[::1]:8080`、`localhost:8080`。
-/// 不做 DNS 解析，也不接受空主机名。
+/// 允许前面带 `http://` / `https://`；不做 DNS 解析，也不接受空主机名。
 fn listen_host(listen: &str) -> Option<&str> {
     let listen = listen.trim();
+    let listen = listen
+        .strip_prefix("http://")
+        .or_else(|| listen.strip_prefix("https://"))
+        .unwrap_or(listen);
     if let Some(rest) = listen.strip_prefix('[') {
         return rest.split(']').next().filter(|host| !host.is_empty());
     }
@@ -2825,14 +2885,82 @@ fn admin_listen_port(admin_listen: &str) -> u16 {
         .unwrap_or(DEFAULT_ADMIN_PORT)
 }
 
-/// 证书 SAN 名称是否回环 / 通配：这些名字不能作为自动推导的 https 主机。
-fn is_loopback_or_unspecified_name(name: &str) -> bool {
-    let name = name.trim().trim_matches(['[', ']']);
-    if let Ok(ip) = name.parse::<std::net::IpAddr>() {
-        return ip.is_loopback() || ip.is_unspecified();
+/// 证书名字（SAN）里可放进 URL 的主机。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HubSanHost {
+    /// 已格式化的 URL host（IPv6 带方括号）。
+    host: String,
+    /// IP SAN 的地址；DNS SAN 为 `None`。
+    ip: Option<IpAddr>,
+}
+
+impl HubSanHost {
+    /// 解析单个 SAN；非法条目返回 `None`，由调用方决定是否整体失败。
+    fn parse(name: &str) -> Option<Self> {
+        let host = san_url_host(name)?;
+        let ip = host
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(&host)
+            .parse::<IpAddr>()
+            .ok();
+        Some(Self { host, ip })
     }
-    let lower = name.to_ascii_lowercase();
-    lower == "localhost" || lower.ends_with(".localhost")
+
+    fn is_unspecified(&self) -> bool {
+        self.ip.is_some_and(|ip| ip.is_unspecified())
+    }
+
+    fn is_loopback(&self) -> bool {
+        match self.ip {
+            Some(ip) => ip.is_loopback(),
+            None => is_loopback_host_name(&self.host),
+        }
+    }
+
+    fn is_localhost_name(&self) -> bool {
+        self.ip.is_none() && self.host.eq_ignore_ascii_case("localhost")
+    }
+}
+
+/// `admin_listen` 的 host 分类；只看字面量与 `localhost`，不做 DNS 解析。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdminListenKind {
+    /// 具体回环 IP（127.0.0.0/8 或 ::1）。
+    LoopbackIp(IpAddr),
+    /// `localhost` / `*.localhost` 这类回环主机名。
+    LoopbackName(String),
+    /// `0.0.0.0` / `[::]`：监听所有接口。
+    Wildcard { ipv6: bool },
+    /// 具体非回环 IP。
+    SpecificIp(IpAddr),
+    /// 具体主机名（非 localhost）。
+    SpecificName(String),
+}
+
+fn classify_admin_listen(admin_listen: &str) -> AdminListenKind {
+    // 空 / 无法解析的 host 与 Hub 默认监听一致，按回环处理；仍要求证书覆盖回环，
+    // 不会因为缺字段就退到某个非回环 SAN。
+    let Some(host) = listen_host(admin_listen) else {
+        return AdminListenKind::LoopbackIp(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    };
+    let host = host.trim_matches(['[', ']']);
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if ip.is_loopback() {
+            AdminListenKind::LoopbackIp(ip)
+        } else if ip.is_unspecified() {
+            AdminListenKind::Wildcard { ipv6: ip.is_ipv6() }
+        } else {
+            AdminListenKind::SpecificIp(ip)
+        }
+    } else {
+        let lower = host.to_ascii_lowercase();
+        if lower == "localhost" || lower.ends_with(".localhost") {
+            AdminListenKind::LoopbackName(host.to_string())
+        } else {
+            AdminListenKind::SpecificName(host.to_string())
+        }
+    }
 }
 
 /// 把配置里的 SAN 名称转成可放进 URL 的 host（IPv6 加方括号）。
@@ -2855,18 +2983,98 @@ fn san_url_host(name: &str) -> Option<String> {
     }
 }
 
-/// 从证书名字（self-signed 的 `server_names` / ACME 的 `tls.domains`）里挑
-/// 第一个非回环、非通配的 DNS/IP。
+fn san_for_ip(sans: &[HubSanHost], ip: IpAddr) -> Option<String> {
+    sans.iter()
+        .find(|san| san.ip == Some(ip))
+        .map(|san| san.host.clone())
+}
+
+fn san_for_name(sans: &[HubSanHost], name: &str) -> Option<String> {
+    let name = name.trim_matches(['[', ']']);
+    sans.iter()
+        .find(|san| san.ip.is_none() && san.host.eq_ignore_ascii_case(name))
+        .map(|san| san.host.clone())
+}
+
+fn localhost_san(sans: &[HubSanHost]) -> Option<String> {
+    sans.iter()
+        .find(|san| san.is_localhost_name())
+        .map(|san| san.host.clone())
+}
+
+/// 回环监听只有一个可达地址：监听 IP 本身（或规范化回环的 `localhost` 别名）。
+fn loopback_san_for_listen(sans: &[HubSanHost], listen_ip: IpAddr) -> Option<String> {
+    if let Some(host) = san_for_ip(sans, listen_ip) {
+        return Some(host);
+    }
+    let canonical = listen_ip == IpAddr::V4(Ipv4Addr::LOCALHOST)
+        || listen_ip == IpAddr::V6(Ipv6Addr::LOCALHOST);
+    if canonical {
+        localhost_san(sans)
+    } else {
+        None
+    }
+}
+
+/// 通配监听优先选回环 SAN；`0.0.0.0` 只接受 IPv4 回环，`[::]` 同时接受
+/// `::1` 与 `127.0.0.1`。
 ///
-/// 不能回落到 `127.0.0.1`：ACME 证书只覆盖 `tls.domains`，self-signed 也可能
-/// 只含 DNS SAN；生成 `https://127.0.0.1` 会“初始化成功但握手失败”。
-fn non_loopback_san_host(names: &[String]) -> Option<String> {
-    names.iter().find_map(|name| {
-        if is_loopback_or_unspecified_name(name) {
-            return None;
+/// Linux 默认 `net.ipv6.bindv6only=0`（dual-stack），`[::]` 也能接 IPv4 回环，
+/// 所以只含 `127.0.0.1` SAN 时仍应生成回环 URL，而不是猜一个可能不在本机的
+/// 非回环地址。若系统显式开启 `bindv6only=1`，IPv4 回环不可达，此时应改用
+/// `--hub` 显式指定可达地址（或把监听改为 `0.0.0.0` / 配置 `::1` SAN）。
+/// 自动推导仍优先 `::1` 与 `localhost`，其次才回退到 IPv4 回环。
+fn loopback_san_for_wildcard(sans: &[HubSanHost], listen_ipv6: bool) -> Option<String> {
+    let canonical = if listen_ipv6 {
+        IpAddr::V6(Ipv6Addr::LOCALHOST)
+    } else {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    };
+    if let Some(host) = san_for_ip(sans, canonical) {
+        return Some(host);
+    }
+    if let Some(host) = localhost_san(sans) {
+        return Some(host);
+    }
+    // dual-stack：`[::]` 也可用 IPv4 回环，优先规范地址 127.0.0.1。
+    if listen_ipv6 {
+        if let Some(host) = san_for_ip(sans, IpAddr::V4(Ipv4Addr::LOCALHOST)) {
+            return Some(host);
         }
-        san_url_host(name)
-    })
+    }
+    let same_family_loopback = sans
+        .iter()
+        .find(|san| {
+            san.ip
+                .is_some_and(|ip| ip.is_loopback() && ip.is_ipv6() == listen_ipv6)
+        })
+        .map(|san| san.host.clone());
+    if same_family_loopback.is_some() {
+        return same_family_loopback;
+    }
+    // `[::]` + dual-stack 下，127.0.0.0/8 的其他回环地址也可达。
+    if listen_ipv6 {
+        return sans
+            .iter()
+            .find(|san| san.ip.is_some_and(|ip| ip.is_loopback() && ip.is_ipv4()))
+            .map(|san| san.host.clone());
+    }
+    None
+}
+
+/// 通配监听下证书覆盖的非回环 SAN。
+///
+/// `0.0.0.0` 不接 IPv6，因此跳过 IPv6 IP SAN；`[::]` 在 Linux 默认双栈，
+/// 保留 IPv4 SAN 以兼容既有的 ACME IP 部署。DNS 名不预判解析结果。
+fn first_non_loopback_san(sans: &[HubSanHost], listen_ipv6: bool) -> Option<String> {
+    sans.iter()
+        .find(|san| {
+            if san.is_loopback() || san.is_unspecified() {
+                return false;
+            }
+            listen_ipv6 || san.ip.is_none_or(|ip| ip.is_ipv4())
+        })
+        .map(|san| san.host.clone())
 }
 
 fn server_tls_mode_name(mode: ServerTlsMode) -> &'static str {
@@ -2879,8 +3087,20 @@ fn server_tls_mode_name(mode: ServerTlsMode) -> &'static str {
 
 /// 由 hub.toml 的 `admin_listen` + `admin_tls` 推导出面板要连的地址。
 ///
-/// `admin_tls=off` 只允许回环明文；`admin_tls=required` 时必须从证书名字里
-/// 选一个非回环 DNS/IP，避免 ACME 证书或仅含 DNS SAN 的自签证书连不上。
+/// `admin_tls=off` 只允许回环明文。`admin_tls=required` 时只在“实际监听可达”
+/// 与“证书 SAN 覆盖”的交集里选 host：
+/// - 回环监听：只接受同一监听地址的回环 IP 或规范化 `localhost` SAN；
+/// - 通配监听：优先同地址族的 `127.0.0.1` / `::1` / `localhost`，没有再回退
+///   到证书覆盖的非回环 SAN（通配确实接在该地址上）；
+/// - 具体 IP / 主机名监听：必须由 SAN 覆盖同一地址，否则不再猜非回环名；
+///   仅 DNS SAN 时无法静态确认它是否路由到该监听，因此要求显式 `--hub`；
+/// - 推不出来时明确失败并提示 `--hub` / `--hub-ca`，不生成“能初始化但连不上”的 URL。
+///
+/// 注意：这里只读配置声明的 SAN（`server_names` / `tls.domains`），不解析磁盘上
+/// 的实际证书。若实际证书与配置不一致（手工替换、轮换窗口等），自动推导仍以配置
+/// 为准；此时请用 `--hub` 显式指定 Panel 实际访问的地址。
+///
+/// 显式 `--hub` 不经过这里，scheme 仍以用户参数为准。
 fn hub_admin_url(hub: &HubConfig) -> Result<String> {
     match hub.admin_tls {
         AdminTlsMode::Off => Ok(format!(
@@ -2889,20 +3109,42 @@ fn hub_admin_url(hub: &HubConfig) -> Result<String> {
         )),
         AdminTlsMode::Required => {
             let names = hub.effective_server_names();
-            let host = non_loopback_san_host(&names).ok_or_else(|| {
-                anyhow!(
-                    "本机 Hub 配置 admin_tls=\"required\"（tls.mode={}），但证书名字（{}）中\
-                     没有可用的非回环 DNS/IP；回环地址无法被 ACME / 仅 DNS SAN 的证书覆盖，\
-                     不能自动生成 Panel 可连接的 https URL。请用 --hub 指定 Panel 实际访问\
-                     Hub 的地址，自签/私有 CA 同时用 --hub-ca 指定 CA；未写入面板配置",
+            let sans: Vec<HubSanHost> = names
+                .iter()
+                .filter_map(|name| HubSanHost::parse(name))
+                .collect();
+            let host = match classify_admin_listen(&hub.admin_listen) {
+                AdminListenKind::LoopbackIp(ip) => loopback_san_for_listen(&sans, ip),
+                AdminListenKind::LoopbackName(name) => san_for_name(&sans, &name),
+                AdminListenKind::Wildcard { ipv6 } => loopback_san_for_wildcard(&sans, ipv6)
+                    .or_else(|| first_non_loopback_san(&sans, ipv6)),
+                AdminListenKind::SpecificIp(ip) => san_for_ip(&sans, ip),
+                AdminListenKind::SpecificName(name) => san_for_name(&sans, &name),
+            };
+            let Some(host) = host else {
+                let shown_names = if names.is_empty() {
+                    "（空）".to_string()
+                } else {
+                    names.join(", ")
+                };
+                let cert_field = if hub.tls.mode == ServerTlsMode::SelfSigned {
+                    "server_names"
+                } else {
+                    "tls.domains"
+                };
+                return Err(anyhow!(
+                    "本机 Hub 配置 admin_tls=\"required\"（tls.mode={}，admin_listen={}），\
+                     但 {} 中的证书名字（{}）没有既能路由到该监听、又被证书覆盖的地址；\
+                     不会生成连接不上的 https URL。回环监听只能使用对应的 127.0.0.1 / \
+                     ::1 / localhost SAN；具体 IP / 主机名监听必须由证书覆盖同一地址。\
+                     请用 --hub 指定 Panel 实际访问 Hub 的地址，自签/私有 CA 同时用 \
+                     --hub-ca 指定 CA；未写入面板配置",
                     server_tls_mode_name(hub.tls.mode),
-                    if hub.tls.mode == ServerTlsMode::SelfSigned {
-                        "server_names"
-                    } else {
-                        "tls.domains"
-                    }
-                )
-            })?;
+                    hub.admin_listen.trim(),
+                    cert_field,
+                    shown_names
+                ));
+            };
             Ok(format!(
                 "https://{host}:{}",
                 admin_listen_port(&hub.admin_listen)
@@ -2977,6 +3219,8 @@ fn explicit_hub_matches_local(hub_url: &str, hub: &HubConfig) -> bool {
 
 /// 规划 `panel init` 的 hub_url 与 CA 来源。
 ///
+/// - 自动推导（未给 `--hub`）先由 [`hub_admin_url`] 在“监听可达 + SAN 覆盖”的
+///   交集里选主机；推导不出来时失败并提示显式参数，不生成连不上的地址；
 /// - `--hub` 显式给出时 scheme 以参数为准，不被本机 hub 配置覆盖；
 /// - 本机 `admin_tls=required` 且 `tls.mode=self-signed` 时，只有显式 host
 ///   指向本机 Hub 才自动复制 `<hub data_dir>/certs/ca.crt`；指向远端且未给
@@ -5449,6 +5693,38 @@ mod tests {
         );
     }
 
+    /// #39 复审：--hub 的 userinfo（user:pass@）必须拒绝，错误不得回显凭据。
+    #[test]
+    fn rejects_hub_url_userinfo_without_echoing_credentials() {
+        let secret = "hub-top-secret-password";
+        for raw in [
+            format!("https://admin:{secret}@hub.example.com:8444"),
+            format!("http://admin:{secret}@127.0.0.1:8444"),
+            format!("admin:{secret}@hub.example.com:8444"),
+            format!("https://admin:{secret}@hub.example.com:8444/"),
+            "https://admin@hub.example.com:8444".to_string(),
+            format!("https://:{secret}@hub.example.com:8444"),
+            format!("HTTPS://admin:{secret}@hub.example.com:8444"),
+        ] {
+            let error = normalize_hub_url(&raw).expect_err("带 userinfo 的 hub 地址必须拒绝");
+            let text = format!("{error:#}");
+            assert!(text.contains("userinfo"), "错误必须说明 userinfo: {text}");
+            assert!(!text.contains(secret), "错误不得回显密码: {text}");
+            assert!(!text.contains("admin:"), "错误不得回显 user:pass: {text}");
+            assert!(
+                !text.contains("user:pass"),
+                "错误不得出现 user:pass: {text}"
+            );
+        }
+
+        // 非 authority（路径）里的 @ 不是 userinfo，不改变既有 URL 规范化行为；
+        // 查询串/片段仍由 ProxyClient 在启动时拒绝。
+        assert_eq!(
+            normalize_hub_url("https://hub.example.com/path@x/").unwrap(),
+            "https://hub.example.com/path@x"
+        );
+    }
+
     fn init_hub_config(
         admin_listen: &str,
         admin_tls: AdminTlsMode,
@@ -5504,34 +5780,147 @@ mod tests {
         }
     }
 
-    /// #39：required 时必须从证书 SAN 选非回环 DNS/IP，不能回落到 127.0.0.1。
+    /// #39：required 时只在“监听实际可达 + 证书 SAN 覆盖”的交集里选地址。
     #[test]
-    fn init_hub_url_requires_non_loopback_certificate_name() {
+    fn init_hub_url_required_prefers_listen_covered_address() {
         let dir = TempSite::new();
+        let mixed = ["127.0.0.1", "203.0.113.10"];
 
-        // self-signed：server_names 里同时有 DNS/回环 IP，必须选 DNS。
+        // 反例：回环监听 + 混合 SAN 必须选回环，不能生成 203.0.113.10。
+        for listen in ["127.0.0.1:8444", "0.0.0.0:8444"] {
+            let hub = init_hub_config_with_names(
+                listen,
+                AdminTlsMode::Required,
+                ServerTlsMode::SelfSigned,
+                &dir.dir,
+                &mixed,
+            );
+            assert_eq!(
+                hub_admin_url(&hub).unwrap(),
+                "https://127.0.0.1:8444",
+                "listen={listen}"
+            );
+        }
+
+        // 规范化回环 IP 优先于 localhost，避免测试/部署因 SAN 顺序不同而漂移。
         let hub = init_hub_config_with_names(
             "0.0.0.0:8444",
             AdminTlsMode::Required,
             ServerTlsMode::SelfSigned,
             &dir.dir,
-            &["127.0.0.1", "localhost", "hub.example.com"],
+            &["localhost", "127.0.0.1", "203.0.113.10"],
         );
-        assert_eq!(hub_admin_url(&hub).unwrap(), "https://hub.example.com:8444");
+        assert_eq!(hub_admin_url(&hub).unwrap(), "https://127.0.0.1:8444");
 
-        // ACME domain：SAN 来自 tls.domains。
+        // 只有 localhost SAN 时用 localhost；证书校验仍按名字进行。
         let hub = init_hub_config_with_names(
-            "0.0.0.0:8444",
+            "127.0.0.1:8444",
             AdminTlsMode::Required,
-            ServerTlsMode::AcmeDomain,
+            ServerTlsMode::SelfSigned,
             &dir.dir,
-            &["panel.example.com"],
+            &["localhost", "203.0.113.10"],
         );
-        let plan = plan_hub_connection(&hub, None, None).unwrap();
-        assert_eq!(plan.hub_url, "https://panel.example.com:8444");
-        assert_eq!(plan.ca_source, None, "ACME 域名证书使用系统根");
+        assert_eq!(hub_admin_url(&hub).unwrap(), "https://localhost:8444");
 
-        // ACME IP：选第一个非回环 IP；IPv6 必须加方括号。
+        // IPv6 通配监听优先 ::1，IPv6 URL 必须带方括号。
+        let hub = init_hub_config_with_names(
+            "[::]:8444",
+            AdminTlsMode::Required,
+            ServerTlsMode::AcmeIp,
+            &dir.dir,
+            &["::1", "203.0.113.10"],
+        );
+        assert_eq!(hub_admin_url(&hub).unwrap(), "https://[::1]:8444");
+
+        // 没有 ::1 时，localhost 可作为 IPv6 通配监听的回环名。
+        let hub = init_hub_config_with_names(
+            "[::]:8444",
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+            &["localhost", "203.0.113.10"],
+        );
+        assert_eq!(hub_admin_url(&hub).unwrap(), "https://localhost:8444");
+
+        // Linux 默认 dual-stack：`[::]` 也能接 IPv4 回环。混合 SAN 必须优先
+        // 回环 127.0.0.1，不能选一个可能不在本机上的 203.0.113.10。
+        let hub = init_hub_config_with_names(
+            "[::]:8444",
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+            &["127.0.0.1", "203.0.113.10"],
+        );
+        assert_eq!(hub_admin_url(&hub).unwrap(), "https://127.0.0.1:8444");
+
+        // 只有 127.0.0.1 SAN 时也应可用（bindv6only=1 的例外见函数注释）。
+        let hub = init_hub_config_with_names(
+            "[::]:8444",
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+            &["127.0.0.1"],
+        );
+        assert_eq!(hub_admin_url(&hub).unwrap(), "https://127.0.0.1:8444");
+
+        // 同时有 ::1 与 127.0.0.1 时优先同地址族的 ::1。
+        let hub = init_hub_config_with_names(
+            "[::]:8444",
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+            &["127.0.0.1", "::1"],
+        );
+        assert_eq!(hub_admin_url(&hub).unwrap(), "https://[::1]:8444");
+
+        // 具体非回环 IP 监听：即使其他非回环 SAN 排在前面，也优先监听 IP 本身。
+        let hub = init_hub_config_with_names(
+            "192.0.2.10:9444",
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+            &["203.0.113.10", "192.0.2.10"],
+        );
+        assert_eq!(hub_admin_url(&hub).unwrap(), "https://192.0.2.10:9444");
+
+        // 具体 IPv6 监听同理；URL host 必须带方括号。
+        let hub = init_hub_config_with_names(
+            "[2001:db8::5]:9444",
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+            &["203.0.113.10", "2001:db8::5"],
+        );
+        assert_eq!(hub_admin_url(&hub).unwrap(), "https://[2001:db8::5]:9444");
+
+        // 具体主机名监听：SAN 覆盖同名主机时可用。
+        let hub = init_hub_config_with_names(
+            "hub.internal:9444",
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+            &["other.example.com", "hub.internal"],
+        );
+        assert_eq!(hub_admin_url(&hub).unwrap(), "https://hub.internal:9444");
+
+        // 通配监听 + 仅 DNS SAN（ACME domain / self-signed DNS）：证书覆盖且通配
+        // 监听确实接在该名字上，保留自动推导；`localhost` 不能回落到非回环名。
+        for mode in [ServerTlsMode::SelfSigned, ServerTlsMode::AcmeDomain] {
+            let hub = init_hub_config_with_names(
+                "0.0.0.0:8444",
+                AdminTlsMode::Required,
+                mode,
+                &dir.dir,
+                &["panel.example.com"],
+            );
+            assert_eq!(
+                hub_admin_url(&hub).unwrap(),
+                "https://panel.example.com:8444",
+                "mode={mode:?}"
+            );
+        }
+
+        // ACME IP / IPv6 SAN：非回环 IP 仍可作为通配监听的访问地址。
         let hub = init_hub_config_with_names(
             "[::]:8444",
             AdminTlsMode::Required,
@@ -5548,20 +5937,108 @@ mod tests {
             &["2001:db8::5"],
         );
         assert_eq!(hub_admin_url(&hub).unwrap(), "https://[2001:db8::5]:8444");
+    }
 
-        // 只有回环 SAN：无法推导可连接的 https，必须提示 --hub / --hub-ca。
+    /// #39：无法从“监听 + SAN”交集推导时必须失败，不能猜一个连不上的地址。
+    #[test]
+    fn init_hub_url_required_fails_without_listen_san_intersection() {
+        let dir = TempSite::new();
+        let cases: [(&str, &[&str]); 5] = [
+            ("127.0.0.1:8444", &["hub.example.com", "203.0.113.10"]),
+            ("0.0.0.0:8444", &["::1"]),
+            ("192.0.2.10:8444", &["hub.example.com", "203.0.113.10"]),
+            ("hub.internal:8444", &["other.example.com", "203.0.113.10"]),
+            ("127.0.0.1:8444", &["203.0.113.10"]),
+        ];
+        for (listen, names) in cases {
+            let hub = init_hub_config_with_names(
+                listen,
+                AdminTlsMode::Required,
+                ServerTlsMode::SelfSigned,
+                &dir.dir,
+                names,
+            );
+            let error =
+                plan_hub_connection(&hub, None, None).expect_err("没有监听/SAN 交集时必须失败");
+            let text = format!("{error:#}");
+            assert!(text.contains("--hub"), "错误必须提示 --hub: {text}");
+            assert!(text.contains("--hub-ca"), "错误必须提示 --hub-ca: {text}");
+            assert!(
+                text.contains("server_names"),
+                "错误必须指明 SAN 字段: {text}"
+            );
+            assert!(text.contains("未写入面板配置"), "{text}");
+            assert!(
+                !text.contains("https://"),
+                "失败路径不能输出一个看似可用的 URL: {text}"
+            );
+        }
+
         let hub = init_hub_config_with_names(
-            "0.0.0.0:8444",
+            "127.0.0.1:8444",
             AdminTlsMode::Required,
-            ServerTlsMode::SelfSigned,
+            ServerTlsMode::AcmeDomain,
             &dir.dir,
-            &["localhost", "127.0.0.1", "::1"],
+            &[],
         );
-        let error = plan_hub_connection(&hub, None, None).expect_err("回环 SAN 必须失败");
-        let text = format!("{error:#}");
-        assert!(text.contains("--hub"), "错误必须提示 --hub: {text}");
-        assert!(text.contains("--hub-ca"), "错误必须提示 --hub-ca: {text}");
-        assert!(text.contains("未写入面板配置"), "{text}");
+        let text = format!("{:#}", plan_hub_connection(&hub, None, None).unwrap_err());
+        assert!(text.contains("（空）"), "空 SAN 必须明确说明: {text}");
+        assert!(
+            text.contains("tls.domains"),
+            "ACME 错误必须指明 tls.domains: {text}"
+        );
+    }
+
+    /// cargo test 会同时构建真实二进制；从测试可执行文件所在目录推出它。
+    fn panel_binary_path() -> PathBuf {
+        let mut path = std::env::current_exe().expect("current_exe");
+        path.pop(); // 测试可执行文件本身
+        path.pop(); // deps/
+        path.push(format!("rustboard-panel{}", std::env::consts::EXE_SUFFIX));
+        path
+    }
+
+    /// #39 复审：真实 `panel init --hub https://user:pass@...` 失败时，
+    /// stdout/stderr 都不得出现密码或 `user:pass`，也不得写配置。
+    #[test]
+    fn panel_init_userinfo_error_does_not_leak_to_stderr() {
+        let panel = panel_binary_path();
+        assert!(panel.is_file(), "缺少 panel 二进制: {}", panel.display());
+        let dir = TempSite::new();
+        let config_path = dir.dir.join("panel.toml");
+        let secret = "init-top-secret-password";
+        let output = std::process::Command::new(&panel)
+            .arg("init")
+            .arg("--config")
+            .arg(&config_path)
+            .arg("--hub")
+            .arg(format!("https://admin:{secret}@hub.example.com:8444"))
+            .arg("--hub-token")
+            .arg("test-hub-token")
+            // 显式给 CA 可避免 init 读取 /etc/rustboard/hub.toml；normalize 会更早失败。
+            .arg("--hub-ca")
+            .arg(dir.dir.join("unused-ca.pem"))
+            .arg("--password")
+            .arg(TEST_PASSWORD)
+            .output()
+            .expect("运行 panel init");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "带 userinfo 的 --hub 必须失败: stdout={stdout} stderr={stderr}"
+        );
+        for text in [&stdout[..], &stderr[..]] {
+            assert!(!text.contains(secret), "不得回显密码: {text}");
+            assert!(!text.contains("admin:"), "不得回显 user:pass: {text}");
+            assert!(!text.contains("user:pass"), "不得出现 user:pass: {text}");
+        }
+        assert!(
+            stderr.contains("userinfo") || stderr.contains("用户名或密码"),
+            "stderr 必须给出明确错误: {stderr}"
+        );
+        assert!(!config_path.exists(), "失败时不得写配置");
     }
 
     /// #39：required+self-signed 取 Hub 的 ca.crt；ACME 使用系统根；Off 用 http。
@@ -5577,6 +6054,21 @@ mod tests {
         );
         let plan = plan_hub_connection(&hub, None, None).unwrap();
         assert_eq!(plan.hub_url, "https://hub.example.com:8444");
+        assert_eq!(
+            plan.ca_source,
+            Some(tls::cert_dir(&dir.dir).join(tls::CA_CERT_FILE))
+        );
+
+        // 回环监听 + 混合 SAN：自动地址走回环，CA 仍取本机 Hub 的自签 CA。
+        let hub = init_hub_config_with_names(
+            "127.0.0.1:8444",
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+            &["127.0.0.1", "203.0.113.10"],
+        );
+        let plan = plan_hub_connection(&hub, None, None).unwrap();
+        assert_eq!(plan.hub_url, "https://127.0.0.1:8444");
         assert_eq!(
             plan.ca_source,
             Some(tls::cert_dir(&dir.dir).join(tls::CA_CERT_FILE))
@@ -5663,6 +6155,123 @@ mod tests {
             plan.hub_url, "http://127.0.0.1:9444",
             "无 scheme 的显式 --hub 保留旧行为：默认 http"
         );
+
+        // 自动推导失败时，显式 --hub 仍按用户给出的地址工作；用户对路由负责，
+        // 这里只验证不会因为 SAN 没覆盖回环就拒绝显式覆盖。
+        let unreachable_auto = init_hub_config_with_names(
+            "127.0.0.1:8444",
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &dir.dir,
+            &["203.0.113.10"],
+        );
+        assert!(
+            hub_admin_url(&unreachable_auto).is_err(),
+            "自动推导不得猜一个只监听回环却用 203.0.113.10 的地址"
+        );
+        let plan =
+            plan_hub_connection(&unreachable_auto, Some("https://127.0.0.1:8444"), None).unwrap();
+        assert_eq!(plan.hub_url, "https://127.0.0.1:8444");
+        assert_eq!(
+            plan.ca_source,
+            Some(tls::cert_dir(&dir.dir).join(tls::CA_CERT_FILE))
+        );
+    }
+
+    /// #39 端到端：真实本地 HTTPS Hub（只监听回环、证书混合 SAN）+ `panel init`
+    /// 自动读取 Hub 配置后，生成的 https 地址与复制的 CA 必须能完成 overview 请求。
+    #[tokio::test]
+    async fn init_auto_derived_loopback_hub_serves_overview_with_copied_ca() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let hub_dir = TempSite::new();
+        tls::ensure_hub_material(
+            &hub_dir.dir,
+            &["127.0.0.1".to_string(), "203.0.113.10".to_string()],
+            tls::CertPolicy::default(),
+        )
+        .unwrap();
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls::server_config(&hub_dir.dir).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hub_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("接受 panel 请求");
+            let mut tls = acceptor.accept(stream).await.expect("完成 TLS 握手");
+            let mut request = Vec::new();
+            let mut scratch = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match tls.read(&mut scratch).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&scratch[..read]),
+                }
+            }
+            assert!(
+                String::from_utf8_lossy(&request).contains("/api/v1/overview"),
+                "panel 必须请求 overview: {:?}",
+                String::from_utf8_lossy(&request)
+            );
+            tls.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                  Content-Length: 17\r\nConnection: close\r\n\r\n\
+                  {\"hub-self\":true}",
+            )
+            .await
+            .expect("写入 overview 响应");
+            tls.flush().await.expect("刷新 overview 响应");
+            let _ = tls.shutdown().await;
+        });
+
+        // 管理口只监听 127.0.0.1，证书同时覆盖回环与一个示例公网 IP。
+        let hub = init_hub_config_with_names(
+            &format!("127.0.0.1:{port}"),
+            AdminTlsMode::Required,
+            ServerTlsMode::SelfSigned,
+            &hub_dir.dir,
+            &["127.0.0.1", "203.0.113.10"],
+        );
+        let panel_dir = TempSite::new();
+        let panel_config = panel_dir.dir.join("panel.toml");
+        let hub_hint = hub.clone();
+        init_with_hub_hint(
+            Some(panel_config.clone()),
+            None,
+            None,
+            Some("e2e-hub-token".to_string()),
+            None,
+            Some(TEST_PASSWORD.to_string()),
+            None,
+            false,
+            move || Some(hub_hint),
+        )
+        .unwrap();
+
+        let cfg = PanelConfig::load(&panel_config).unwrap();
+        assert_eq!(cfg.hub_url, format!("https://127.0.0.1:{port}"));
+        assert!(
+            !cfg.hub_url.contains("203.0.113.10"),
+            "不得生成只监听 127.0.0.1 时连不上的地址: {}",
+            cfg.hub_url
+        );
+        assert!(
+            cfg.hub_ca.ends_with("hub-ca.pem"),
+            "自签 Hub 必须复制 CA: {}",
+            cfg.hub_ca
+        );
+
+        let client = proxy::ProxyClient::new(&cfg.hub_url, &cfg.token, &cfg.hub_ca)
+            .expect("自动生成的 https + hub_ca 必须能构造客户端");
+        let reply = client
+            .get("/api/v1/overview", &[])
+            .await
+            .expect("overview 请求必须成功（证书校验不能关闭）");
+        assert_eq!(reply.status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&reply.body).contains("hub-self"),
+            "overview 响应异常: {:?}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        hub_handle.await.expect("TLS Hub 任务退出");
     }
 
     /// #39：CA 先读取校验、cfg.save 成功后才落盘；缺失/非法时失败并提示 --hub-ca。

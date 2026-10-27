@@ -6,9 +6,11 @@
 //! - 22 张表全量迁移、每表行数、samples/1m/1h 范围、token/alert/archive 数量；
 //! - samples/1m/1h/alert_states 的 SQLite rowid 与 PG `id` 一一对应；
 //! - 5 张 SQLite `AUTOINCREMENT` 表的 id 保留；
-//! - 9 个 `BIGSERIAL` 序列 setval 后不会撞主键；
+//! - 9 个 `BIGSERIAL` 序列 setval 后不会撞主键；清理事件/raw 后仍按
+//!   `sqlite_sequence` 与持久化游标推进，新 id 越过旧游标；
 //! - 目标非空拒绝、失败注入后事务回滚、SQLite 文件/WAL 哈希不变、再次迁移成功；
-//! - 空库、schema 已 apply 但全空、5000 行 samples 批量迁移。
+//! - 空库、schema 已 apply 但全空、5000 行 samples 批量迁移；
+//! - `samples_1m.last_ts` 总和超过 `i64::MAX` 时仍用分块 i128 校验完成迁移。
 //!
 //! # 运行方式
 //!
@@ -73,6 +75,19 @@ const TABLES: [&str; 22] = [
     "alert_rule_channels",
     "archive_objects",
     "archive_state",
+];
+
+/// 与 migrate.rs 一致的 9 张 `BIGSERIAL` 表；序列状态必须逐张核对。
+const SERIAL_TABLES: [&str; 9] = [
+    "samples",
+    "audit_log",
+    "api_tokens",
+    "samples_1m",
+    "samples_1h",
+    "alert_states",
+    "alert_events",
+    "alert_silences",
+    "archive_objects",
 ];
 
 /// 与 fixture 一致的时间基点（整分钟对齐）。
@@ -393,6 +408,23 @@ fn alert_event(
     }
 }
 
+/// 审计写入的最小合法记录；id 由 SQLite/PG 自增分配。
+fn audit_entry(ts: i64) -> NewAuditEntry {
+    NewAuditEntry {
+        ts,
+        actor: "admin".to_string(),
+        agent_id: String::new(),
+        capability: "systemd".to_string(),
+        action: "restart".to_string(),
+        target: "rb-hub".to_string(),
+        params: "{}".to_string(),
+        result: "ok".to_string(),
+        error_code: String::new(),
+        error_message: String::new(),
+        duration_ms: 1,
+    }
+}
+
 fn notification_channel() -> NotificationChannel {
     NotificationChannel {
         id: "chan-1".to_string(),
@@ -706,6 +738,21 @@ fn pg_count(client: &mut postgres::Client, table: &str) -> i64 {
         .get(0)
 }
 
+/// 读取 `table.id` 关联序列的 `(last_value, is_called)`。
+fn pg_sequence_state(client: &mut postgres::Client, table: &str) -> (i64, bool) {
+    let sequence: String = client
+        .query_one("SELECT pg_get_serial_sequence($1, 'id')", &[&table])
+        .unwrap_or_else(|e| panic!("读取 {table} 序列名失败：{e}"))
+        .get(0);
+    let row = client
+        .query_one(
+            &format!("SELECT last_value, is_called FROM {sequence}"),
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("读取序列 {sequence} 状态失败：{e}"));
+    (row.get(0), row.get(1))
+}
+
 /// 构建只有 agent + `count` 条 samples 的源库，用于批量/并发测试。
 fn build_bulk_fixture(tag: &str, count: usize) -> (TempDir, PathBuf) {
     let temp = TempDir::new(tag);
@@ -730,6 +777,42 @@ fn build_bulk_fixture(tag: &str, count: usize) -> (TempDir, PathBuf) {
                 .unwrap(),
             IngestOutcome::Inserted { inserted } if inserted == count
         ));
+    }
+    (temp, path)
+}
+
+/// 构造只有 `alert_events` 历史高水位与 notify 游标的 SQLite v9 源库：
+/// 写入 `event_count` 条已通知事件 → 保存任意字符串游标 → prune 清空。
+///
+/// 这样 `sqlite_sequence.seq = event_count`，而 `maintenance_state` 里的游标
+/// 可以是更大值（验证游标分支）、0、负数或非法值（验证忽略语义）。
+fn build_pruned_event_fixture(tag: &str, event_count: i64, cursor: &str) -> (TempDir, PathBuf) {
+    let temp = TempDir::new(tag);
+    let path = temp.0.join("events.db");
+    {
+        let storage = SqliteStorage::open(&path).expect("创建事件 SQLite 源库失败");
+        for index in 0..event_count {
+            let event = alert_event(
+                BASE_TS + index,
+                AlertStateKind::Firing,
+                Some(90.0),
+                true,
+                false,
+            );
+            let id = storage
+                .insert_alert_event(&event)
+                .expect("写入告警事件失败");
+            assert_eq!(id, index + 1, "alert_events 自增 id 应从 1 开始");
+        }
+        storage
+            .set_maintenance_state("notify_started_event_id", cursor, NOW)
+            .expect("保存通知游标失败");
+        assert_eq!(
+            storage
+                .prune_alert_events(i64::MAX, 0)
+                .expect("清空告警事件失败"),
+            usize::try_from(event_count).expect("事件数必须能放进 usize")
+        );
     }
     (temp, path)
 }
@@ -1449,6 +1532,22 @@ fn migrates_all_tables_and_preserves_ids() {
         "samples_id_seq 未推进到 MAX(id)"
     );
 
+    // 9 张 SERIAL 表逐张核对：序列 last_value 必须等于迁移后 MAX(id) 且已
+    // is_called，保证每张表的下一个 id 都是 MAX(id)+1，没有漏设任何一张。
+    // 该 fixture 的 9 张表都非空，因此可以用 MAX(id) 作为精确期望。
+    for table in SERIAL_TABLES {
+        let (last_value, is_called) = pg_sequence_state(&mut client, table);
+        let max_id: i64 = client
+            .query_one(&format!("SELECT MAX(id) FROM {table}"), &[])
+            .unwrap_or_else(|e| panic!("读取 {table} 最大 id 失败：{e}"))
+            .get(0);
+        assert_eq!(
+            last_value, max_id,
+            "{table} 序列 last_value 必须等于迁移后的 MAX(id)"
+        );
+        assert!(is_called, "{table} 序列必须 setval(is_called=true)");
+    }
+
     // 报告 JSON 必须可序列化，且带每表行数/范围/耗时。
     let json = serde_json::to_value(&report).expect("MigrateReport 必须可序列化");
     assert_eq!(json["tables"].as_array().map(Vec::len), Some(TABLES.len()));
@@ -1640,6 +1739,406 @@ fn empty_source_migrates_and_sequences_start_at_one() {
         .unwrap()
         .get(0);
     assert_eq!(audit_id, 1, "空表 audit_log 序列应从 1 开始");
+}
+
+// ---------------------------------------------------------------------------
+// 4b. 清理后的历史高水位：sqlite_sequence + 持久化游标必须一起迁移
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pruned_tables_keep_high_water_and_event_cursor() {
+    const NAME: &str = "pruned_tables_keep_high_water_and_event_cursor";
+    let Some(db) = TestDatabase::create("highwater") else {
+        skip(NAME);
+        return;
+    };
+    let temp = TempDir::new("highwater");
+    let path = temp.0.join("highwater.db");
+
+    const EVENT_COUNT: i64 = 100;
+    const AUDIT_COUNT: i64 = 7;
+    const SAMPLE_COUNT: i64 = 5;
+
+    {
+        let storage = SqliteStorage::open(&path).expect("创建高水位 SQLite 源库失败");
+        storage
+            .upsert_agent(&agent_record("agent-highwater", "High Water", "online"))
+            .unwrap();
+
+        // alert_events：100 条已通知事件 + 游标 100，随后 prune 清空。
+        for index in 0..EVENT_COUNT {
+            let event = alert_event(
+                BASE_TS + index,
+                AlertStateKind::Firing,
+                Some(90.0),
+                true,
+                false,
+            );
+            let id = storage
+                .insert_alert_event(&event)
+                .expect("写入告警事件失败");
+            assert_eq!(id, index + 1, "alert_events 自增 id 应从 1 开始");
+        }
+        storage
+            .set_maintenance_state("notify_started_event_id", &EVENT_COUNT.to_string(), NOW)
+            .unwrap();
+        assert_eq!(
+            storage
+                .prune_alert_events(i64::MAX, 0)
+                .expect("清空告警事件失败"),
+            usize::try_from(EVENT_COUNT).expect("事件数必须能放进 usize")
+        );
+
+        // audit_log：7 条后清空，验证 sqlite_sequence 高水位（AUTOINCREMENT）。
+        for index in 0..AUDIT_COUNT {
+            let id = storage
+                .insert_audit(&audit_entry(BASE_TS + index))
+                .expect("写入审计失败");
+            assert_eq!(id, index + 1, "audit_log 自增 id 应从 1 开始");
+        }
+        assert_eq!(
+            storage.prune_audit(i64::MAX).expect("清空审计失败"),
+            usize::try_from(AUDIT_COUNT).expect("审计数必须能放进 usize")
+        );
+
+        // samples：5 条 raw + rowid 游标 5，随后清空 raw（rowid 表没有
+        // sqlite_sequence，历史高水位只能来自持久化游标）。
+        let samples = (0..SAMPLE_COUNT)
+            .map(|index| {
+                Sample::new("cpu.usage", BASE_TS + index, index as f64)
+                    .with_label("host", "highwater")
+            })
+            .collect();
+        assert!(matches!(
+            storage
+                .insert_batch(&sample_batch("agent-highwater", 1, 0, samples))
+                .expect("写入 raw samples 失败"),
+            IngestOutcome::Inserted { inserted }
+                if inserted == usize::try_from(SAMPLE_COUNT).expect("样本数必须能放进 usize")
+        ));
+        storage
+            .set_maintenance_state(
+                "downsample_1m_last_raw_rowid",
+                &SAMPLE_COUNT.to_string(),
+                NOW,
+            )
+            .unwrap();
+    }
+
+    // 直接清空 samples，保留 rowid 游标 = 5（模拟旧版本遗留 / 崩溃残留的高水位）。
+    {
+        let conn = Connection::open(&path).expect("打开高水位 SQLite 写连接失败");
+        conn.execute("DELETE FROM samples", [])
+            .expect("清空 raw samples 失败");
+    }
+
+    // 源库侧确认：表已空，但 sqlite_sequence 与游标都还在。
+    {
+        let conn = open_readonly(&path);
+        let event_seq: i64 = conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'alert_events'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("读取 alert_events sqlite_sequence 失败");
+        assert_eq!(event_seq, EVENT_COUNT);
+        let cursor: String = conn
+            .query_row(
+                "SELECT value FROM maintenance_state WHERE key = 'notify_started_event_id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("读取通知游标失败");
+        assert_eq!(cursor, EVENT_COUNT.to_string());
+        for table in ["alert_events", "audit_log", "samples"] {
+            assert_eq!(read_source_count(&conn, table), 0, "{table} 应已清空");
+        }
+    }
+
+    let storage = db.open_raw_storage();
+    let report = migrate_sqlite_to_postgres(&path, &storage)
+        .unwrap_or_else(|e| panic!("清理后的高水位迁移失败：{e:#}"));
+    assert_eq!(report.alert_events, 0);
+    assert_eq!(report.samples_range, Default::default());
+    // agents + ingest_state + ingest_batches + 2 条 maintenance_state 游标；
+    // 三张被清空的表不得复活。
+    assert_eq!(report.total_rows, 5);
+
+    let mut client = db.client();
+    assert_eq!(
+        pg_sequence_state(&mut client, "alert_events"),
+        (EVENT_COUNT, true),
+        "alert_events 序列必须推进到 sqlite_sequence/通知游标高水位"
+    );
+    assert_eq!(
+        pg_sequence_state(&mut client, "audit_log"),
+        (AUDIT_COUNT, true),
+        "audit_log 序列必须推进到 sqlite_sequence 高水位"
+    );
+    assert_eq!(
+        pg_sequence_state(&mut client, "samples"),
+        (SAMPLE_COUNT, true),
+        "samples 序列必须推进到 rowid 游标高水位"
+    );
+
+    // 通知 worker 的游标原样迁移；新事件 id 必须越过它，pending 查询可读。
+    let cursor: i64 = storage
+        .get_maintenance_state("notify_started_event_id")
+        .expect("读取目标通知游标失败")
+        .expect("目标通知游标丢失")
+        .trim()
+        .parse()
+        .expect("目标通知游标不是整数");
+    assert_eq!(cursor, EVENT_COUNT);
+
+    let mut new_event = alert_event(NOW, AlertStateKind::Firing, Some(99.0), false, false);
+    new_event.notify_error = String::new();
+    let new_event_id = storage
+        .insert_alert_event(&new_event)
+        .expect("迁移后写入新告警事件失败");
+    assert!(
+        new_event_id > EVENT_COUNT,
+        "迁移后新事件 id（{new_event_id}）必须大于通知游标（{EVENT_COUNT}）"
+    );
+    let pending = storage
+        .list_pending_notification_events_after(cursor, 10)
+        .expect("读取 pending 事件失败");
+    assert_eq!(pending.len(), 1, "新事件必须能被通知 worker 读到");
+    assert_eq!(pending[0].id, new_event_id);
+
+    // audit_log / samples 的新 id 也必须越过各自的历史高水位。
+    let audit_id = storage
+        .insert_audit(&audit_entry(NOW))
+        .expect("迁移后写入审计失败");
+    assert_eq!(audit_id, AUDIT_COUNT + 1);
+
+    let sample_id: i64 = client
+        .query_one(
+            "INSERT INTO samples (agent_id, metric, labels, ts, value)
+             VALUES ('agent-highwater', 'cpu.usage', '{}', $1, 1.0)
+             RETURNING id",
+            &[&(BASE_TS + 10)],
+        )
+        .expect("迁移后写入 raw sample 失败")
+        .get(0);
+    assert_eq!(sample_id, SAMPLE_COUNT + 1);
+    assert_eq!(pg_count(&mut client, "samples"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 4c. 通知游标单独决定高水位：cursor > sqlite_sequence.seq
+// ---------------------------------------------------------------------------
+
+#[test]
+fn notify_cursor_ahead_of_sqlite_sequence_wins() {
+    const NAME: &str = "notify_cursor_ahead_of_sqlite_sequence_wins";
+    const EVENT_COUNT: i64 = 100;
+    const CURSOR: i64 = 150;
+    let Some(db) = TestDatabase::create("cursor_ahead") else {
+        skip(NAME);
+        return;
+    };
+    let (_temp, path) =
+        build_pruned_event_fixture("cursor_ahead", EVENT_COUNT, &CURSOR.to_string());
+
+    // 源库历史高水位是 100，但游标已被推进到 150；忽略游标就会错误地回到 101。
+    {
+        let conn = open_readonly(&path);
+        let seq: i64 = conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'alert_events'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("读取 alert_events sqlite_sequence 失败");
+        assert_eq!(seq, EVENT_COUNT, "sqlite_sequence 历史高水位应为 100");
+        assert_eq!(read_source_count(&conn, "alert_events"), 0, "事件应已清空");
+    }
+
+    let storage = db.open_raw_storage();
+    migrate_sqlite_to_postgres(&path, &storage)
+        .unwrap_or_else(|e| panic!("cursor > sqlite_sequence 的迁移失败：{e:#}"));
+
+    let migrated_cursor = storage
+        .get_maintenance_state("notify_started_event_id")
+        .expect("读取目标通知游标失败")
+        .expect("目标通知游标丢失");
+    assert_eq!(migrated_cursor, CURSOR.to_string(), "游标必须原样迁移");
+
+    let mut client = db.client();
+    assert_eq!(
+        pg_sequence_state(&mut client, "alert_events"),
+        (CURSOR, true),
+        "序列必须越过游标 150，而不是 sqlite_sequence 的 100"
+    );
+
+    let mut new_event = alert_event(NOW, AlertStateKind::Firing, Some(99.0), false, false);
+    new_event.notify_error = String::new();
+    let new_event_id = storage
+        .insert_alert_event(&new_event)
+        .expect("迁移后写入新告警事件失败");
+    assert_eq!(
+        new_event_id,
+        CURSOR + 1,
+        "新事件 id 必须是 151（越过游标），而不是 101（只按 sqlite_sequence）"
+    );
+    let pending = storage
+        .list_pending_notification_events_after(CURSOR, 10)
+        .expect("读取 pending 事件失败");
+    assert_eq!(pending.len(), 1, "新事件必须能被通知 worker 读到");
+    assert_eq!(pending[0].id, new_event_id);
+}
+
+// ---------------------------------------------------------------------------
+// 4d. 通知游标 0 / 负数 / 非法值：不参与高水位，由 sqlite_sequence 兜底
+// ---------------------------------------------------------------------------
+
+#[test]
+fn non_positive_or_invalid_notify_cursor_falls_back_to_sequence() {
+    const NAME: &str = "non_positive_or_invalid_notify_cursor_falls_back_to_sequence";
+    const EVENT_COUNT: i64 = 100;
+    for (tag, raw_cursor) in [
+        ("cursor_zero", "0"),
+        ("cursor_negative", "-3"),
+        ("cursor_invalid", "not-a-number"),
+    ] {
+        let Some(db) = TestDatabase::create(tag) else {
+            skip(NAME);
+            return;
+        };
+        let (_temp, path) = build_pruned_event_fixture(tag, EVENT_COUNT, raw_cursor);
+
+        let storage = db.open_raw_storage();
+        migrate_sqlite_to_postgres(&path, &storage).unwrap_or_else(|e| {
+            panic!("游标 {raw_cursor:?} 的迁移失败（0/负数/非法值不得阻断迁移）：{e:#}")
+        });
+
+        // verify_maintenance_state 要求游标原样迁移，即使值是 0/负数/非法串。
+        let migrated_cursor = storage
+            .get_maintenance_state("notify_started_event_id")
+            .expect("读取目标通知游标失败")
+            .expect("目标通知游标丢失");
+        assert_eq!(
+            migrated_cursor, raw_cursor,
+            "游标 {raw_cursor:?} 必须原样迁移"
+        );
+
+        let mut client = db.client();
+        assert_eq!(
+            pg_sequence_state(&mut client, "alert_events"),
+            (EVENT_COUNT, true),
+            "游标 {raw_cursor:?} 不得抬高序列；必须由 sqlite_sequence={EVENT_COUNT} 兜底"
+        );
+
+        let mut new_event = alert_event(NOW, AlertStateKind::Firing, Some(99.0), false, false);
+        new_event.notify_error = String::new();
+        let new_event_id = storage
+            .insert_alert_event(&new_event)
+            .expect("迁移后写入新告警事件失败");
+        assert_eq!(
+            new_event_id,
+            EVENT_COUNT + 1,
+            "游标 {raw_cursor:?} 时新事件 id 应由 sqlite_sequence 决定"
+        );
+
+        // 通知 worker 对游标 0 直接使用，对负数/非法值会在启动时重建为
+        // MAX(alert_events.id)=0；两种情况下 after_id=0 都能读到新事件。
+        let pending = storage
+            .list_pending_notification_events_after(0, 10)
+            .expect("读取 pending 事件失败");
+        assert_eq!(
+            pending.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![new_event_id],
+            "游标 {raw_cursor:?} 时 after_id=0 必须能读到新事件"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4e. samples_1m.last_ts 总和超过 i64::MAX：分块 i128 校验必须通过
+// ---------------------------------------------------------------------------
+
+#[test]
+fn samples_1m_sum_above_i64_max_migrates_across_chunks() {
+    const NAME: &str = "samples_1m_sum_above_i64_max_migrates_across_chunks";
+    let Some(db) = TestDatabase::create("sum_overflow") else {
+        skip(NAME);
+        return;
+    };
+    // 10 个完整分块 + 1 行：覆盖 10k 分块边界；总和 ≈ 1.0e19 > i64::MAX。
+    const ROWS: usize = 100_001;
+    const LAST_TS: i64 = 100_000_000_000_000; // < MAX_ARCHIVE_TS_MS，合法毫秒时间戳
+
+    let temp = TempDir::new("sum_overflow");
+    let path = temp.0.join("sum.db");
+    {
+        let storage = SqliteStorage::open(&path).expect("创建求和 SQLite 源库失败");
+        drop(storage);
+    }
+    {
+        let mut conn = Connection::open(&path).expect("打开 SQLite 写连接失败");
+        let tx = conn.transaction().expect("开启 SQLite 事务失败");
+        {
+            let mut statement = tx
+                .prepare(
+                    "INSERT INTO samples_1m
+                        (agent_id, metric, labels, bucket_ts, min_value, max_value,
+                         avg_value, last_value, count, last_ts, aggregated_1h)
+                     VALUES ('agent-sum', 'cpu.usage', '{}', ?1,
+                             1.0, 1.0, 1.0, 1.0, 1, ?2, 0)",
+                )
+                .expect("准备 samples_1m 插入失败");
+            for index in 0..ROWS {
+                let bucket_ts =
+                    BASE_TS + i64::try_from(index).expect("行号必须能放进 i64") * 60_000;
+                statement
+                    .execute(rusqlite::params![bucket_ts, LAST_TS])
+                    .expect("插入 samples_1m 失败");
+            }
+        }
+        tx.commit().expect("提交 samples_1m 写事务失败");
+    }
+
+    let expected = i128::from(LAST_TS) * i128::try_from(ROWS).expect("行数必须能放进 i128");
+    assert!(
+        expected > i128::from(i64::MAX),
+        "反例总和必须超过 i64::MAX，才能覆盖旧 SUM 的溢出"
+    );
+
+    // 旧实现会在这一步 integer overflow；新检查必须不依赖 SQL SUM。
+    {
+        let conn = open_readonly(&path);
+        assert_eq!(read_source_count(&conn, "samples_1m"), ROWS as i64);
+        let legacy = conn.query_row("SELECT SUM(last_ts) FROM samples_1m", [], |row| {
+            row.get::<_, i64>(0)
+        });
+        assert!(legacy.is_err(), "旧 SQL SUM(last_ts) 必须溢出失败");
+    }
+
+    let storage = db.open_raw_storage();
+    let report = migrate_sqlite_to_postgres(&path, &storage)
+        .unwrap_or_else(|e| panic!("总和超过 i64::MAX 的合法 samples_1m 迁移失败：{e:#}"));
+    assert_eq!(report.samples_1m_range.id_min, Some(1));
+    assert_eq!(report.samples_1m_range.id_max, Some(ROWS as i64));
+    assert_eq!(
+        report.samples_1m_range.ts_max,
+        Some(BASE_TS + (ROWS as i64 - 1) * 60_000)
+    );
+
+    let mut client = db.client();
+    assert_eq!(pg_count(&mut client, "samples_1m"), ROWS as i64);
+    let target_sum: String = client
+        .query_one("SELECT SUM(last_ts::NUMERIC)::TEXT FROM samples_1m", &[])
+        .expect("读取目标 1m 精确总和失败")
+        .get(0);
+    assert_eq!(
+        target_sum
+            .parse::<i128>()
+            .expect("目标总和必须是十进制整数"),
+        expected,
+        "目标 samples_1m.last_ts 精确总和与原值不一致"
+    );
 }
 
 // ---------------------------------------------------------------------------

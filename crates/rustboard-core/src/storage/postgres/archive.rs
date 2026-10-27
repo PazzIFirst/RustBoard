@@ -28,9 +28,11 @@
 //! 不接受外部输入。所有方法通过 [`PostgresStorage::with_client`] 取连接，
 //! 调用方必须位于 blocking 线程（同步 PG 驱动不能在 tokio worker 内直接调用）。
 
+use std::collections::BTreeSet;
+
 use anyhow::{anyhow, Context, Result};
 use postgres::error::SqlState;
-use postgres::Row;
+use postgres::{Row, Transaction};
 use rustboard_common::util::now_ms;
 
 use super::PostgresStorage;
@@ -41,8 +43,9 @@ use crate::storage::sqlite::{
     MIN_ARCHIVE_TS_MS, PRUNE_BATCH_ROWS, STATE_RAW_PRUNE_GENERATION,
 };
 use crate::storage::{
-    DownsampleDeltaResult, DownsampleHourResult, DownsampleRangeResult, PruneResult, TierStats,
-    BUCKET_1H_MS, BUCKET_1M_MS,
+    parse_state_i64, prune_1m_hour_key, DownsampleDeltaResult, DownsampleHourResult,
+    DownsampleRangeResult, PruneResult, TierStats, BUCKET_1H_MS, BUCKET_1M_MS,
+    STATE_PRUNE_1M_HOUR_PREFIX, STATE_QUARANTINED_1H_GROUPS, STATE_QUARANTINED_RAW_ROWS,
 };
 
 /// `archive_objects` 的 SELECT 列表；列下标与 [`row_to_archive_object`] 一一对应。
@@ -87,6 +90,14 @@ ON CONFLICT (agent_id, metric, labels, bucket_ts) DO UPDATE SET
 /// - `last_value` 取最新 1m 桶（`bucket_ts` 最大）的 `last_value`；唯一约束
 ///   保证同一桶只有一行，窗口排序不需要再加 `id`；
 /// - `3600000` 必须等于 [`BUCKET_1H_MS`]（单测断言）。
+///
+/// **不再用 `EXCLUDED.count >= samples_1h.count` 充当源完整性证明**：数量更
+/// 大不代表包含旧贡献。维护 worker 走 [`AGGREGATE_1H_SAFE_SQL`]，只重算源
+/// 完整性可证明的 `(series, hour)`；本 SQL 只供显式 range 工具/测试在**完整
+/// 源**上使用，自身没有 marker / count 门禁。
+///
+/// 保证范围仅限调用方确认源完整；误在残缺源上调用会覆盖旧桶，调用方需自行
+/// 承担。
 const AGGREGATE_1H_SQL: &str = r#"
 INSERT INTO samples_1h
     (agent_id, metric, labels, bucket_ts, min_value, max_value, avg_value, last_value, count)
@@ -114,7 +125,73 @@ ON CONFLICT (agent_id, metric, labels, bucket_ts) DO UPDATE SET
     avg_value = EXCLUDED.avg_value,
     last_value = EXCLUDED.last_value,
     count = EXCLUDED.count
-WHERE EXCLUDED.count >= samples_1h.count
+"#;
+
+/// 1h worker 的安全聚合 SQL：只重算源完整性可证明的 `(series, hour)`。
+///
+/// 参数：`$1` = 整点小时起点，`$2` = 下界（不含），`$3` = 1m prune 小时标记
+/// 的 key 前缀。判定与 SQLite 的 `AGGREGATE_1H_SAFE_SQL` 逐字对应：已有本
+/// 小时 1h 桶且该整点有 prune 标记、或 `SUM(1m.count) < h.count` 的组保留
+/// 旧 1h，不参与重算。
+///
+/// **保证范围**：本版本 1m prune 写入的小时 marker，以及 `1m count < 旧 1h
+/// count` 的确定残缺场景。`count` 只用于反证（更小 ⇒ 确定残缺），不能证明
+/// “更大就完整”。旧库无 marker 且 partial 1m 的 count >= 旧 1h count 时无法
+/// 从数据证明，**不在保证内**（v1.0.0 只支持全新安装）。
+///
+/// marker 清理与 1h 删除不是同一事务；orphan marker 不影响本 SQL 的正确性，
+/// 因为 sealed 组仍必须有匹配的 1h 桶，详见 `prune_samples_1h_before`。
+const AGGREGATE_1H_SAFE_SQL: &str = r#"
+WITH groups AS (
+    SELECT m.agent_id, m.metric, m.labels, SUM(m.count) AS source_count
+    FROM samples_1m m
+    WHERE m.bucket_ts >= $1::BIGINT AND m.bucket_ts < $2::BIGINT
+    GROUP BY m.agent_id, m.metric, m.labels
+),
+sealed AS (
+    SELECT g.agent_id, g.metric, g.labels
+    FROM groups g
+    JOIN samples_1h h
+      ON h.agent_id = g.agent_id AND h.metric = g.metric
+     AND h.labels = g.labels AND h.bucket_ts = $1::BIGINT
+    WHERE EXISTS (
+              SELECT 1 FROM maintenance_state k
+              WHERE k.key = $3 || $1::text
+          )
+       OR h.count > g.source_count
+)
+INSERT INTO samples_1h
+    (agent_id, metric, labels, bucket_ts, min_value, max_value, avg_value, last_value, count)
+SELECT agent_id, metric, labels, bucket_ts,
+       MIN(min_value), MAX(max_value),
+       CAST(SUM(avg_value * count) AS DOUBLE PRECISION)
+           / CAST(SUM(count) AS DOUBLE PRECISION),
+       MAX(last_value),
+       SUM(count)
+FROM (
+    SELECT m.agent_id, m.metric, m.labels,
+           (m.bucket_ts / 3600000) * 3600000 AS bucket_ts,
+           m.min_value, m.max_value, m.avg_value, m.count,
+           FIRST_VALUE(m.last_value) OVER (
+               PARTITION BY m.agent_id, m.metric, m.labels,
+                            (m.bucket_ts / 3600000) * 3600000
+               ORDER BY m.bucket_ts DESC
+           ) AS last_value
+    FROM samples_1m m
+    WHERE m.bucket_ts >= $1::BIGINT AND m.bucket_ts < $2::BIGINT
+      AND NOT EXISTS (
+          SELECT 1 FROM sealed s
+          WHERE s.agent_id = m.agent_id AND s.metric = m.metric
+            AND s.labels = m.labels
+      )
+) AS aggregated
+GROUP BY agent_id, metric, labels, bucket_ts
+ON CONFLICT (agent_id, metric, labels, bucket_ts) DO UPDATE SET
+    min_value = EXCLUDED.min_value,
+    max_value = EXCLUDED.max_value,
+    avg_value = EXCLUDED.avg_value,
+    last_value = EXCLUDED.last_value,
+    count = EXCLUDED.count
 "#;
 
 /// R1b：1m 增量合并。只处理已锁定的 raw `id` 集合（`$1`），按桶计算 delta
@@ -238,6 +315,128 @@ fn bucket_floor(ts: i64, bucket_ms: i64) -> Result<i64> {
     ts.checked_div_euclid(bucket_ms)
         .and_then(|quotient| quotient.checked_mul(bucket_ms))
         .ok_or_else(|| anyhow!("时间戳无法对齐到 {bucket_ms}ms 桶：超出 i64 可表示范围"))
+}
+
+/// 读取并解析单个 `maintenance_state` 整数值（事务内）。
+fn read_state_value_tx(tx: &mut Transaction<'_>, key: &str) -> Result<Option<i64>> {
+    let raw: Option<String> = tx
+        .query_opt(
+            "SELECT value FROM maintenance_state WHERE key = $1",
+            &[&key],
+        )
+        .context("读取 maintenance_state 整数值失败")?
+        .map(|row| row.get(0));
+    parse_state_i64(key, raw.as_deref())
+}
+
+/// 只增不减地累加隔离计数。
+fn bump_state_counter_tx(tx: &mut Transaction<'_>, key: &str, delta: usize) -> Result<()> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let current = read_state_value_tx(tx, key)?.unwrap_or(0);
+    let next = current.saturating_add(i64::try_from(delta).unwrap_or(i64::MAX));
+    tx.execute(
+        "INSERT INTO maintenance_state (key, value, updated_at) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (key) DO UPDATE SET \
+             value = EXCLUDED.value, updated_at = EXCLUDED.updated_at",
+        &[&key, &next.to_string(), &now_ms()],
+    )
+    .context("写入 maintenance_state 隔离计数失败")?;
+    Ok(())
+}
+
+/// 把「1m 源完整性不可证明」的遗留 raw 标记为已隔离（`aggregated_1m = 1`）。
+///
+/// 判定与 SQLite 的 `quarantine_incomplete_raw_tx` 一致：`ts < before_ts`、
+/// `ts >= 0`，该 `(series, 整点)` 已有 1h 桶，且该整点有 1m prune 标记或该
+/// series-hour 当前没有任何 1m 行。返回隔离行数；调用方在同一事务内累加
+/// `STATE_QUARANTINED_RAW_ROWS`。隔离只是 `aggregated_1m=1` 标记：这些 raw
+/// 仍受 raw 保留期 / 归档门禁清理，**不是永久保留**。旧库无 marker 且残留
+/// partial 1m 的残缺桶不在本函数保证范围内。
+fn quarantine_incomplete_raw_tx(tx: &mut Transaction<'_>, before_ts: i64) -> Result<usize> {
+    let mut total = 0usize;
+    loop {
+        let quarantined = tx
+            .execute(
+                "UPDATE samples SET aggregated_1m = 1 WHERE id IN ( \
+                     SELECT s.id FROM samples s \
+                     WHERE s.aggregated_1m = 0 AND s.ts >= 0 AND s.ts < $1::BIGINT \
+                       AND EXISTS ( \
+                           SELECT 1 FROM samples_1h h \
+                           WHERE h.agent_id = s.agent_id AND h.metric = s.metric \
+                             AND h.labels = s.labels \
+                             AND h.bucket_ts = (s.ts / 3600000) * 3600000 \
+                       ) \
+                       AND ( \
+                           EXISTS ( \
+                               SELECT 1 FROM maintenance_state k \
+                               WHERE k.key = $2 || ((s.ts / 3600000) * 3600000)::text \
+                           ) \
+                           OR NOT EXISTS ( \
+                               SELECT 1 FROM samples_1m m \
+                               WHERE m.agent_id = s.agent_id AND m.metric = s.metric \
+                                 AND m.labels = s.labels \
+                                 AND m.bucket_ts >= (s.ts / 3600000) * 3600000 \
+                                 AND m.bucket_ts < (s.ts / 3600000) * 3600000 + 3600000 \
+                           ) \
+                       ) \
+                     ORDER BY s.ts, s.id LIMIT $3::BIGINT \
+                 )",
+                &[
+                    &before_ts,
+                    &STATE_PRUNE_1M_HOUR_PREFIX,
+                    &(PRUNE_BATCH_ROWS as i64),
+                ],
+            )
+            .context("隔离源完整性不可证明的 raw 失败")?;
+        let quarantined = usize::try_from(quarantined).context("隔离 raw 行数溢出")?;
+        if quarantined == 0 {
+            break;
+        }
+        total = total.saturating_add(quarantined);
+        if quarantined < PRUNE_BATCH_ROWS {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    if total > 0 {
+        bump_state_counter_tx(tx, STATE_QUARANTINED_RAW_ROWS, total)?;
+    }
+    Ok(total)
+}
+
+/// 统计本小时中「已有 1h 桶、但源完整性不可证明」的 series 组数。
+///
+/// 该计数用于累计诊断，**非严格幂等**：sealed 组随后被标记 clean，不会每轮
+/// 重复计入；但新的 dirty 1m / 手工删除可能让它再次累加。
+fn count_sealed_1h_groups_tx(tx: &mut Transaction<'_>, hour: i64, hour_end: i64) -> Result<usize> {
+    let count: i64 = tx
+        .query_one(
+            "WITH groups AS ( \
+                 SELECT m.agent_id, m.metric, m.labels, SUM(m.count) AS source_count \
+                 FROM samples_1m m \
+                 WHERE m.bucket_ts >= $1::BIGINT AND m.bucket_ts < $2::BIGINT \
+                 GROUP BY m.agent_id, m.metric, m.labels \
+             ), sealed AS ( \
+                 SELECT g.agent_id, g.metric, g.labels \
+                 FROM groups g \
+                 JOIN samples_1h h \
+                   ON h.agent_id = g.agent_id AND h.metric = g.metric \
+                  AND h.labels = g.labels AND h.bucket_ts = $1::BIGINT \
+                 WHERE EXISTS ( \
+                           SELECT 1 FROM maintenance_state k \
+                           WHERE k.key = $3 || $1::text \
+                       ) \
+                    OR h.count > g.source_count \
+             ) \
+             SELECT COUNT(*)::BIGINT FROM sealed",
+            &[&hour, &hour_end, &STATE_PRUNE_1M_HOUR_PREFIX],
+        )
+        .context("统计源完整性不可证明的 1h 组失败")?
+        .get(0);
+    usize::try_from(count).context("隔离 1h 组数溢出")
 }
 
 /// 把 `archive_objects.object_key` 的唯一约束冲突翻译成领域错误。
@@ -556,6 +755,9 @@ impl PostgresStorage {
                     .min(closed_end),
                 None => closed_end,
             };
+            // 源完整性门禁：先隔离本批「已有 1h 桶、但 1m 源已被 prune 或
+            // 缺失」的遗留 raw；它们不进入 1m，也不会把小时标脏。
+            let quarantined = quarantine_incomplete_raw_tx(&mut tx, chunk_end)?;
             // 锁住本批 raw 行，按 ts,id 固定顺序，避免与其它维护事务交叉。
             let locked: Vec<i64> = tx
                 .query(
@@ -571,6 +773,7 @@ impl PostgresStorage {
             if locked.is_empty() {
                 tx.commit().context("提交空 1m delta 事务失败")?;
                 return Ok(DownsampleDeltaResult {
+                    quarantined,
                     processed_to: chunk_end,
                     ..DownsampleDeltaResult::default()
                 });
@@ -593,6 +796,7 @@ impl PostgresStorage {
             Ok(DownsampleDeltaResult {
                 buckets: usize::try_from(buckets).context("1m delta 桶数溢出")?,
                 rows: locked.len(),
+                quarantined,
                 processed_to: chunk_end,
             })
         })
@@ -667,8 +871,14 @@ impl PostgresStorage {
                 tx.commit().context("提交空 1h 重算事务失败")?;
                 return Ok(None);
             }
+            // 源完整性门禁：本整点有 1m prune 标记、或当前源 count 小于旧
+            // 1h count 的 series 组保留旧 1h，不参与重算；其 1m 行仍会置 clean。
+            let quarantined = count_sealed_1h_groups_tx(&mut tx, hour, hour_end)?;
             let buckets = tx
-                .execute(AGGREGATE_1H_SQL, &[&hour, &hour_end])
+                .execute(
+                    AGGREGATE_1H_SAFE_SQL,
+                    &[&hour, &hour_end, &STATE_PRUNE_1M_HOUR_PREFIX],
+                )
                 .context("执行 1h 重算 SQL 失败")?;
             let marked = tx
                 .execute(
@@ -683,14 +893,50 @@ impl PostgresStorage {
                     locked.len()
                 );
             }
+            if quarantined > 0 {
+                bump_state_counter_tx(&mut tx, STATE_QUARANTINED_1H_GROUPS, quarantined)?;
+                tracing::warn!(
+                    hour_ts = hour,
+                    quarantined_groups = quarantined,
+                    "1h 重算跳过 1m 源完整性不可证明的 series 组：保留旧 1h，不用残缺源覆盖"
+                );
+            }
             tx.commit().context("提交 1h 重算事务失败")?;
             Ok(Some(DownsampleHourResult {
                 hour_ts: hour,
                 buckets: usize::try_from(buckets).context("1h 桶数溢出")?,
                 rows: locked.len(),
+                quarantined,
             }))
         })
         .context("downsample_1h_hour")
+    }
+
+    /// 只隔离「1m 源完整性无法证明」的遗留 raw（`aggregated_1m = 1`）。
+    ///
+    /// 判定与 SQLite 基线一致；用于启动审计在 delta 之前一次性处理旧 backlog。
+    /// 返回隔离行数并累加 [`STATE_QUARANTINED_RAW_ROWS`]。
+    pub fn quarantine_incomplete_legacy_raw_rows(&self) -> Result<usize> {
+        self.with_client(|client| {
+            let mut tx = client
+                .transaction()
+                .context("开启 legacy raw 隔离事务失败")?;
+            tx.query_one(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&DOWNSAMPLE_ADVISORY_LOCK_KEY],
+            )
+            .context("获取降采样 advisory lock 失败")?;
+            let quarantined = quarantine_incomplete_raw_tx(&mut tx, i64::MAX)?;
+            tx.commit().context("提交 legacy raw 隔离事务失败")?;
+            if quarantined > 0 {
+                tracing::warn!(
+                    quarantined_rows = quarantined,
+                    "legacy raw 隔离：该 series-hour 的 1m 源已被 prune 或缺失，保留旧 1h"
+                );
+            }
+            Ok(quarantined)
+        })
+        .context("quarantine_incomplete_legacy_raw_rows")
     }
 
     /// `maintenance status`：未聚合 raw 行数。
@@ -925,17 +1171,89 @@ impl PostgresStorage {
     /// 分批删除 1m 中 `bucket_ts < cutoff` 且整小时已聚合的行。
     ///
     /// `cutoff` 先向下取整到整点；dirty hour（任一行 `aggregated_1h=0`）
-    /// 整小时跳过。
+    /// 整小时跳过。每个被删除的整点在同一事务内写入 1m prune 标记，后续
+    /// legacy raw / 残缺 1m 不能把该整点当作完整源重算 1h。
     pub fn prune_samples_1m_before(&self, cutoff: i64) -> Result<PruneResult> {
         let hour_cutoff = bucket_floor(cutoff, BUCKET_1H_MS)?;
-        self.prune_batched(PRUNE_1M_SQL, hour_cutoff)
+        self.prune_1m_with_markers(hour_cutoff)
             .context("prune_samples_1m_before")
     }
 
-    /// 分批删除 1h 中 `bucket_ts < cutoff` 的行。
+    /// 1m 分批删除 + prune 小时标记，删除与标记同一事务提交。
+    ///
+    /// 每批持有降采样 advisory lock，与 delta / 1h 的「读标记 → 聚合」串行。
+    fn prune_1m_with_markers(&self, cutoff: i64) -> Result<PruneResult> {
+        let sql = format!("{PRUNE_1M_SQL} RETURNING (bucket_ts / 3600000) * 3600000");
+        let batch = PRUNE_BATCH_ROWS as i64;
+        let mut result = PruneResult::default();
+        loop {
+            let deleted = self.with_client(|client| {
+                let mut tx = client.transaction().context("开启 1m prune 事务失败")?;
+                tx.query_one(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    &[&DOWNSAMPLE_ADVISORY_LOCK_KEY],
+                )
+                .context("获取降采样 advisory lock 失败")?;
+                let mut hours = BTreeSet::new();
+                let mut deleted = 0usize;
+                for row in tx
+                    .query(&sql, &[&cutoff, &batch])
+                    .context("执行 1m prune SQL 失败")?
+                {
+                    let hour: i64 = row.get(0);
+                    hours.insert(hour);
+                    deleted += 1;
+                }
+                for hour in &hours {
+                    tx.execute(
+                        "INSERT INTO maintenance_state (key, value, updated_at) \
+                         VALUES ($1, '1', $2) \
+                         ON CONFLICT (key) DO NOTHING",
+                        &[&prune_1m_hour_key(*hour), &now_ms()],
+                    )
+                    .context("写入 1m prune 小时标记失败")?;
+                }
+                tx.commit().context("提交 1m prune 事务失败")?;
+                Ok(deleted)
+            })?;
+            if deleted == 0 {
+                break;
+            }
+            result.deleted += deleted;
+            result.batches += 1;
+            if deleted < PRUNE_BATCH_ROWS {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        Ok(result)
+    }
+
+    /// 分批删除 1h 中 `bucket_ts < cutoff` 的行，并清理对应整点的 1m prune
+    /// 标记：1h 行已删除后，该整点不再有可被覆盖的完整桶。
+    ///
+    /// **非原子说明**：1h 删除沿用分批自动提交，marker 清理是随后独立语句，
+    /// 两者不在同一事务。若清理失败/进程崩溃，会残留 orphan marker；orphan
+    /// marker 不影响正确性（quarantine/1h worker 都要求存在匹配的 1h 桶），
+    /// 只会让 `pruned_1m_hours` 暂时偏大并占用 `maintenance_state`。下一次
+    /// 1h retention 调用（即使删除 0 行）会重试清理；清理失败会返回 Err，
+    /// 由维护轮次记录并重试。
     pub fn prune_samples_1h_before(&self, cutoff: i64) -> Result<PruneResult> {
-        self.prune_batched(PRUNE_1H_SQL, cutoff)
-            .context("prune_samples_1h_before")
+        let pruned = self
+            .prune_batched(PRUNE_1H_SQL, cutoff)
+            .context("prune_samples_1h_before")?;
+        self.with_client(|client| {
+            client
+                .execute(
+                    "DELETE FROM maintenance_state \
+                     WHERE left(key, length($1)) = $1 \
+                       AND substring(key from length($1) + 1)::BIGINT < $2",
+                    &[&STATE_PRUNE_1M_HOUR_PREFIX, &cutoff],
+                )
+                .context("清理 1m prune 小时标记失败")?;
+            Ok(())
+        })?;
+        Ok(pruned)
     }
 
     /// 每批 [`PRUNE_BATCH_ROWS`] 行；每条 `DELETE` 自动提交，批间让出 CPU。

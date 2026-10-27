@@ -21,7 +21,10 @@ use serde::Serialize;
 
 use crate::archive::STATE_ARCHIVE_LEDGER_PENDING;
 use crate::storage::sqlite::DOWNSAMPLE_MAX_CHUNK_ROWS;
-use crate::storage::{Storage, TierStats, BUCKET_1H_MS, BUCKET_1M_MS};
+use crate::storage::{
+    Storage, TierStats, BUCKET_1H_MS, BUCKET_1M_MS, STATE_PRUNE_1M_HOUR_PREFIX,
+    STATE_QUARANTINED_1H_GROUPS, STATE_QUARANTINED_RAW_ROWS,
+};
 
 /// `maintenance_state` 键：1m 层已处理到（不含）该时间戳；**只前进**。
 pub const STATE_DOWNSAMPLE_1M_WATERMARK: &str = "downsample_1m_watermark";
@@ -63,6 +66,11 @@ pub struct DownsampleTierReport {
     pub rows: usize,
     /// 本次处理的块数（后台模式受 `max_backfill_hours` 限制）。
     pub chunks: usize,
+    /// 本轮因 1m 源完整性不可证明而隔离的 raw 行数 / 保留旧 1h 的组数。
+    ///
+    /// 这是本轮动作计数；跨轮累计见 `maintenance status` 的
+    /// `quarantined_legacy_raw_rows` / `quarantined_1h_groups`。
+    pub quarantined: usize,
     /// 任务结束时该层持久化的水位（无数据且从未写过时为 `None`）。
     pub watermark: Option<i64>,
 }
@@ -139,6 +147,26 @@ pub struct MaintenanceStatus {
     pub invalid_timestamp_rows: i64,
     /// 早于 1m 保留期 horizon 且仍未聚合的 raw 行数（启动审计后应为 0）。
     pub legacy_unaggregated_rows: i64,
+    /// 最近一个「1m 源已被整组 prune」的整点；`None` 表示从未 prune 过。
+    ///
+    /// 1h 删除与 marker 清理不是同一事务；若清理失败/崩溃，可能短暂包含
+    /// orphan marker。orphan marker 不影响正确性，下一次 1h retention 会重试
+    /// 清理，仅使该值暂时偏大。
+    pub last_pruned_1m_hour: Option<i64>,
+    /// 当前仍保留的 1m prune 小时标记数（随 1h 保留期清理）。
+    ///
+    /// 同上：清理失败时可能短暂偏大；不影响正确性，下一次清理会收敛。
+    pub pruned_1m_hours: i64,
+    /// 因 1m 源完整性不可证明而被隔离的 raw 行累计数。
+    ///
+    /// 隔离只是 `aggregated_1m=1` 标记：这些 raw 仍受 raw 保留期 / 归档门禁
+    /// 清理，不是永久保留。计数累计，不随 raw 被删而回退。
+    pub quarantined_legacy_raw_rows: i64,
+    /// 因 1m 源完整性不可证明而保留旧 1h 的 `(series, hour)` 组累计数。
+    ///
+    /// **非严格幂等**：组被标记 clean 后不会重复计入，但后续新的 dirty 1m、
+    /// 手工删除或再次出现不可证明状态时可能再次累加；仅作运维诊断。
+    pub quarantined_1h_groups: i64,
     /// 归档 ledger 重建待办标记。
     pub archive_ledger_pending: bool,
 }
@@ -152,8 +180,13 @@ pub struct LegacyAuditReport {
     pub unaggregated_invalid_rows: i64,
     /// 早于 1m 保留期 horizon 且未聚合的行数。
     pub legacy_unaggregated_rows: i64,
-    /// 本次实际标记为 `aggregated_1m=1` 隔离的行数。
+    /// 本次实际标记为 `aggregated_1m=1` 隔离的非法时间戳行数。
     pub isolated_rows: usize,
+    /// 本次因 1m 源完整性不可证明而隔离的遗留 raw 行数。
+    ///
+    /// 隔离只是标记，被隔离 raw 仍受 raw 保留期 / 归档门禁正常清理，不代表
+    /// 永久保留；旧库无 marker 且残留 partial 1m 的残缺桶不在保证范围内。
+    pub quarantined_legacy_rows: usize,
 }
 
 /// 把时间戳向下取整到 `bucket_ms` 边界（UTC 毫秒）。
@@ -213,11 +246,13 @@ fn run_one_minute_tier(
             break;
         }
         let result = db.downsample_1m_delta(closed_end, DOWNSAMPLE_MAX_CHUNK_ROWS)?;
-        if result.rows == 0 {
+        // 只有隔离（无正常聚合）也是有效进展：水位必须前进，否则会卡在同一批。
+        if result.rows == 0 && result.quarantined == 0 {
             break;
         }
         report.buckets += result.buckets;
         report.rows += result.rows;
+        report.quarantined += result.quarantined;
         report.chunks += 1;
         chunks += 1;
         // 数据已在本批事务内提交；这里只前进水位。崩溃只会重做本批（幂等）。
@@ -245,6 +280,7 @@ fn run_one_hour_tier(
         };
         report.buckets += result.buckets;
         report.rows += result.rows;
+        report.quarantined += result.quarantined;
         report.chunks += 1;
         chunks += 1;
         let hour_end = result
@@ -263,7 +299,12 @@ fn run_one_hour_tier(
 /// - `Some(n)`：后台模式，每轮 1m / 1h 各最多处理 n 块，避免长时间占用写锁。
 ///
 /// 无 raw 数据时不写水位；失败返回 `Err`（不 panic），由调用方记录 WARN 与
-/// `maintenance_state.last_error`，下一轮重试。
+/// `maintenance_state.last_error`，下一轮重试。1m 源完整性无法证明的遗留
+/// raw / 1h 组只隔离并计数，不会覆盖已有 1h。
+///
+/// 源完整性保证范围：新版本 1m prune 写入的 marker，或该 series-hour 已无
+/// 任何 1m 行；旧库无 marker 且 partial 1m 的 count 未减少时不在保证内。
+/// 隔离 raw 仍受 raw 保留期 / 归档门禁清理，不是永久保留。
 pub fn run_downsample(
     db: &dyn Storage,
     now: i64,
@@ -271,6 +312,14 @@ pub fn run_downsample(
 ) -> Result<DownsampleReport> {
     let one_minute = run_one_minute_tier(db, now, max_backfill_hours)?;
     let one_hour = run_one_hour_tier(db, now, max_backfill_hours)?;
+    if one_minute.quarantined > 0 || one_hour.quarantined > 0 {
+        tracing::warn!(
+            quarantined_raw_rows = one_minute.quarantined,
+            quarantined_1h_groups = one_hour.quarantined,
+            "降采样隔离了 1m 源完整性不可证明的数据：保留旧 1h，未用残缺源覆盖；\
+             详见 maintenance status 的隔离计数"
+        );
+    }
     Ok(DownsampleReport {
         one_minute,
         one_hour,
@@ -403,14 +452,20 @@ pub fn run_retention(
     })
 }
 
-/// 启动时审计 legacy raw 时间戳。
+/// 启动时审计 legacy raw 时间戳与 1m 源完整性。
 ///
 /// 1. 超出 `[ingest]` 准入范围的 raw 计数（`invalid_timestamp_rows`）；
 /// 2. 其中仍未聚合的行单独计数（这些行本来会被 delta 选中）；
-/// 3. 早于 1m 保留期 horizon 的未聚合行计数（配置校验保证它是第 1 类的
-///    子集；单独记录便于排障）；
-/// 4. 把超界且未聚合的行分批标记为 `aggregated_1m=1` 隔离：delta 不会再为
-///    这些旧数据构造残缺 1m，保留期/归档可以按正常路径处理它们。
+/// 3. 早于 1m 保留期 horizon 的未聚合行计数（排障用）；
+/// 4. 把超界且未聚合的非法行标记为 `aggregated_1m=1` 隔离；
+/// 5. 把「该 `(series, hour)` 已有 1h 桶，且整点有 1m prune 标记或该
+///    series-hour 已无 1m 行」的遗留 raw 隔离，并保留旧 1h：用剩余 1m
+///    重算会得到残缺桶。
+///
+/// **保证范围**：新版本 prune 写入的 marker，以及 1m 行整体缺失的场景。
+/// 旧库无 marker 且残留 partial 1m 的残缺桶无法从数据证明，不在保证内。
+/// 隔离 raw 只是 `aggregated_1m=1` 标记，仍受 raw 保留期 / 归档门禁清理，
+/// 不是永久保留。
 ///
 /// 不打印任何样本值；只输出行数。
 pub fn audit_legacy_raw_rows(
@@ -436,13 +491,17 @@ pub fn audit_legacy_raw_rows(
     } else {
         0
     };
-    if invalid_timestamp_rows > 0 || legacy_unaggregated_rows > 0 {
+    // 隔离「已有 1h 桶，但该 series-hour 的 1m 源已被整组 prune 或已不存在」
+    // 的遗留 raw：这些整点不能再用剩余 1m 重算 1h。
+    let quarantined_legacy_rows = db.quarantine_incomplete_legacy_raw_rows()?;
+    if invalid_timestamp_rows > 0 || legacy_unaggregated_rows > 0 || quarantined_legacy_rows > 0 {
         tracing::warn!(
             invalid_timestamp_rows,
             unaggregated_invalid_rows,
             legacy_unaggregated_rows,
             isolated_rows,
-            "legacy raw 时间戳审计：负值/未来超界样本已隔离；早于 1m horizon 的未聚合行保留给 delta"
+            quarantined_legacy_rows,
+            "legacy raw 审计：非法时间戳已隔离；1m 源完整性不可证明的遗留 raw 已隔离并保留旧 1h"
         );
     }
     Ok(LegacyAuditReport {
@@ -450,6 +509,7 @@ pub fn audit_legacy_raw_rows(
         unaggregated_invalid_rows,
         legacy_unaggregated_rows,
         isolated_rows,
+        quarantined_legacy_rows,
     })
 }
 
@@ -471,6 +531,19 @@ pub fn maintenance_status(
         let horizon = now.saturating_sub(i64::from(cfg.retention_1m_days).saturating_mul(DAY_MS));
         db.count_unaggregated_raw_rows_before(horizon)?
     };
+    // 1m prune 小时标记只用于证明源完整性；状态里汇总数量与最近整点，
+    // 便于确认「旧桶保留 + 隔离」确实生效。
+    let mut last_pruned_1m_hour: Option<i64> = None;
+    let mut pruned_1m_hours = 0i64;
+    for entry in db.list_maintenance_state()? {
+        if let Some(raw) = entry.key.strip_prefix(STATE_PRUNE_1M_HOUR_PREFIX) {
+            if let Ok(hour) = raw.parse::<i64>() {
+                pruned_1m_hours += 1;
+                last_pruned_1m_hour =
+                    Some(last_pruned_1m_hour.map_or(hour, |current: i64| current.max(hour)));
+            }
+        }
+    }
     Ok(MaintenanceStatus {
         raw: db.raw_stats()?,
         one_minute: db.samples_1m_stats()?,
@@ -483,6 +556,10 @@ pub fn maintenance_status(
         unaggregated_rows: db.count_unaggregated_raw_rows()?,
         invalid_timestamp_rows: db.count_raw_rows_outside(invalid_min_ts, max_ts)?,
         legacy_unaggregated_rows,
+        last_pruned_1m_hour,
+        pruned_1m_hours,
+        quarantined_legacy_raw_rows: read_state_i64(db, STATE_QUARANTINED_RAW_ROWS)?.unwrap_or(0),
+        quarantined_1h_groups: read_state_i64(db, STATE_QUARANTINED_1H_GROUPS)?.unwrap_or(0),
         archive_ledger_pending: archive_ledger_pending(db)?,
     })
 }
@@ -1042,5 +1119,225 @@ mod tests {
         run_downsample(&db, NOW, None).unwrap();
         let report = run_downsample(&db, NOW - BUCKET_1H_MS, None).unwrap();
         assert_eq!(report.one_minute.watermark, Some(closed), "1m 水位只前进");
+    }
+
+    /// #33：1m 已被保留期整组删除后，同小时的 legacy raw 不得用残缺源覆盖
+    /// 完整 1h。旧 1h 必须原样保留，legacy raw 隔离并计数可见。
+    #[test]
+    fn issue33_pruned_1m_legacy_backlog_preserves_complete_1h() {
+        let db = SqliteStorage::open_in_memory().unwrap();
+        let hour = bucket_floor(NOW - 5 * DAY_MS, BUCKET_1H_MS).unwrap();
+        seed(
+            &db,
+            "a1",
+            vec![
+                Sample::new("cpu.usage", hour + 1_000, 10.0),
+                Sample::new("cpu.usage", hour + 2_000, 20.0),
+            ],
+        );
+        run_downsample(&db, NOW, None).unwrap();
+        let rows = db.aggregate_rows_for_test("1h");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 2);
+        assert!((rows[0].avg_value - 15.0).abs() < 1e-9);
+
+        // 真实保留期路径：整组删除 1m，并写入该整点的 prune 标记。
+        assert_eq!(
+            db.prune_samples_1m_before(hour + BUCKET_1H_MS)
+                .unwrap()
+                .deleted,
+            1
+        );
+        assert_eq!(db.samples_1m_stats().unwrap().rows, 0);
+
+        // 1m 删除后才补传的 legacy raw：count=3 也绝不覆盖 count=2 的旧 1h。
+        seed(
+            &db,
+            "a1",
+            vec![
+                Sample::new("cpu.usage", hour + 3_000, 30.0),
+                Sample::new("cpu.usage", hour + 3_001, 40.0),
+                Sample::new("cpu.usage", hour + 3_002, 50.0),
+            ],
+        );
+        let report = run_downsample(&db, NOW, None).unwrap();
+        assert_eq!(report.one_minute.quarantined, 3);
+        assert_eq!(report.one_minute.rows, 0, "隔离行不得计入正常聚合");
+        assert_eq!(
+            db.samples_1m_stats().unwrap().rows,
+            0,
+            "残缺 legacy raw 不得生成 1m 桶"
+        );
+
+        let rows = db.aggregate_rows_for_test("1h");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 2, "旧 1h count 必须保留");
+        assert!((rows[0].avg_value - 15.0).abs() < 1e-9);
+        assert_eq!(rows[0].min_value, 10.0);
+        assert_eq!(rows[0].max_value, 20.0);
+        assert_eq!(rows[0].last_value, 20.0);
+
+        let cfg = cfg_with_retention(7, 90, 730);
+        let status = maintenance_status(&db, &cfg, NOW).unwrap();
+        assert_eq!(status.quarantined_legacy_raw_rows, 3);
+        assert_eq!(status.last_pruned_1m_hour, Some(hour));
+        assert_eq!(status.pruned_1m_hours, 1);
+        assert_eq!(db.count_unaggregated_raw_rows().unwrap(), 0);
+        assert_eq!(db.raw_stats().unwrap().rows, 5, "隔离是标记，不删行");
+
+        // 幂等重跑：不重复计数，也不再次隔离。
+        let again = run_downsample(&db, NOW, None).unwrap();
+        assert_eq!(again.one_minute.quarantined, 0);
+        let status = maintenance_status(&db, &cfg, NOW).unwrap();
+        assert_eq!(status.quarantined_legacy_raw_rows, 3);
+        assert_eq!(db.aggregate_rows_for_test("1h")[0].count, 2);
+
+        // 1h 层按保留期删除该小时后，prune 小时标记也必须清理，避免无限增长。
+        assert_eq!(
+            db.prune_samples_1h_before(hour + BUCKET_1H_MS)
+                .unwrap()
+                .deleted,
+            1
+        );
+        let status = maintenance_status(&db, &cfg, NOW).unwrap();
+        assert_eq!(status.pruned_1m_hours, 0);
+        assert_eq!(status.last_pruned_1m_hour, None);
+    }
+
+    /// #33：旧库升级时 1m 已被旧版本删除、但没有 prune 标记；启动审计
+    /// 必须靠「已有 1h 且该 series-hour 无 1m 行」识别并隔离，已有 1h 的
+    /// 系列保桶，新系列仍可聚合。
+    #[test]
+    fn issue33_audit_quarantines_old_backlog_without_prune_marker_and_keeps_new_series() {
+        let db = SqliteStorage::open_in_memory().unwrap();
+        let hour = bucket_floor(NOW - 100 * DAY_MS, BUCKET_1H_MS).unwrap();
+        seed(
+            &db,
+            "a1",
+            vec![
+                Sample::new("cpu.usage", hour + 1_000, 10.0),
+                Sample::new("cpu.usage", hour + 2_000, 20.0),
+            ],
+        );
+        run_downsample(&db, NOW, None).unwrap();
+        assert_eq!(db.aggregate_rows_for_test("1h")[0].count, 2);
+        // 旧版本已删除 1m，但没有本版本的 prune 标记：删除标记以模拟升级前的库。
+        assert_eq!(
+            db.prune_samples_1m_before(hour + BUCKET_1H_MS)
+                .unwrap()
+                .deleted,
+            1
+        );
+        db.delete_maintenance_key_for_test(&crate::storage::prune_1m_hour_key(hour));
+
+        // a1 同小时 legacy backlog（已有 1h）；a2 是同一小时的新系列（没有 1h）。
+        seed(
+            &db,
+            "a1",
+            vec![
+                Sample::new("cpu.usage", hour + 3_000, 30.0),
+                Sample::new("cpu.usage", hour + 3_001, 40.0),
+                Sample::new("cpu.usage", hour + 3_002, 50.0),
+            ],
+        );
+        seed(
+            &db,
+            "a2",
+            vec![Sample::new("cpu.usage", hour + 5_000, 99.0)],
+        );
+
+        let cfg = cfg_with_retention(7, 90, 730);
+        let audit = audit_legacy_raw_rows(&db, &cfg, NOW).unwrap();
+        assert_eq!(
+            audit.legacy_unaggregated_rows, 4,
+            "审计前 4 行都早于 1m horizon"
+        );
+        assert_eq!(audit.quarantined_legacy_rows, 3, "只隔离已有 1h 的 a1");
+        assert_eq!(
+            db.aggregate_rows_for_test("1h")[0].count,
+            2,
+            "旧 1h 未被覆盖"
+        );
+        assert_eq!(db.count_unaggregated_raw_rows().unwrap(), 1, "a2 仍待聚合");
+
+        let report = run_downsample(&db, NOW, None).unwrap();
+        assert_eq!(
+            report.one_minute.quarantined, 0,
+            "审计已隔离 a1，delta 不再处理"
+        );
+        let hour_rows = db.aggregate_rows_for_test("1h");
+        assert_eq!(hour_rows.len(), 2);
+        let a1 = hour_rows
+            .iter()
+            .find(|row| row.agent_id == "a1")
+            .expect("缺少 a1 的 1h");
+        assert_eq!(a1.count, 2, "a1 旧桶保持");
+        let a2 = hour_rows
+            .iter()
+            .find(|row| row.agent_id == "a2")
+            .expect("缺少 a2 的 1h");
+        assert_eq!(a2.count, 1);
+        assert_eq!(db.count_unaggregated_raw_rows().unwrap(), 0);
+        let status = maintenance_status(&db, &cfg, NOW).unwrap();
+        assert_eq!(status.quarantined_legacy_raw_rows, 3);
+        assert_eq!(status.last_pruned_1m_hour, None);
+        assert_eq!(status.pruned_1m_hours, 0);
+    }
+
+    /// #33：raw 全删 / 部分删但 1m 源完整时，迟到增量必须正常合并，
+    /// 不能被误隔离；重复运行不重复计数。
+    #[test]
+    fn issue33_raw_prune_with_intact_1m_source_still_merges_late_data() {
+        let db = SqliteStorage::open_in_memory().unwrap();
+        let hour = bucket_floor(NOW - 2 * BUCKET_1H_MS, BUCKET_1H_MS).unwrap();
+        seed(
+            &db,
+            "a1",
+            vec![
+                Sample::new("cpu.usage", hour + 1_000, 10.0),
+                Sample::new("cpu.usage", hour + 2_000, 20.0),
+                Sample::new("cpu.usage", hour + 2 * BUCKET_1M_MS, 5.0),
+            ],
+        );
+        run_downsample(&db, NOW, None).unwrap();
+
+        // 部分删 raw：只删 ts < hour+2m 的两行，第三行保留；1m 完整。
+        assert_eq!(
+            db.prune_samples_before(hour + 2 * BUCKET_1M_MS)
+                .unwrap()
+                .deleted,
+            2
+        );
+        seed(
+            &db,
+            "a1",
+            vec![Sample::new("cpu.usage", hour + 1_500, 30.0)],
+        );
+        let report = run_downsample(&db, NOW, None).unwrap();
+        assert_eq!(report.one_minute.quarantined, 0);
+        let rows = db.aggregate_rows_for_test("1h");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 4);
+        assert!((rows[0].avg_value - 16.25).abs() < 1e-9);
+        assert_eq!(rows[0].max_value, 30.0);
+
+        // 全删 raw：1m/1h 仍在；再迟到 40 必须继续正常合并。
+        db.prune_samples_before(i64::MAX).unwrap();
+        assert_eq!(db.raw_stats().unwrap().rows, 0);
+        seed(
+            &db,
+            "a1",
+            vec![Sample::new("cpu.usage", hour + 1_600, 40.0)],
+        );
+        let report = run_downsample(&db, NOW, None).unwrap();
+        assert_eq!(report.one_minute.quarantined, 0);
+        let rows = db.aggregate_rows_for_test("1h");
+        assert_eq!(rows[0].count, 5);
+        assert!((rows[0].avg_value - 21.0).abs() < 1e-9);
+
+        // 幂等：没有新 raw 时不得重复计数。
+        run_downsample(&db, NOW, None).unwrap();
+        let rows = db.aggregate_rows_for_test("1h");
+        assert_eq!(rows[0].count, 5);
     }
 }

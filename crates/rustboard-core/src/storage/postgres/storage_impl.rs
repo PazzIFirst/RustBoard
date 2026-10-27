@@ -439,6 +439,10 @@ impl Storage for PostgresStorage {
         PostgresStorage::isolate_raw_rows_outside(self, min_ts, max_ts)
     }
 
+    fn quarantine_incomplete_legacy_raw_rows(&self) -> Result<usize> {
+        PostgresStorage::quarantine_incomplete_legacy_raw_rows(self)
+    }
+
     fn raw_stats(&self) -> Result<TierStats> {
         PostgresStorage::raw_stats(self)
     }
