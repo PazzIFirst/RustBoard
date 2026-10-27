@@ -1,4 +1,4 @@
-//! PostgreSQL schema v7：21 张业务表、索引与迁移入口。
+//! PostgreSQL schema v8：21 张业务表、索引与迁移入口。
 //!
 //! 这是 Phase D2 的落地：只负责「建表/索引 + 版本记录」，不实现任何
 //! [`Storage`](crate::storage::Storage) 方法（D3 才做 `PostgresStorage`）。
@@ -6,10 +6,10 @@
 //! [`connect_for_schema`] 只支持 `sslmode=disable`，供 `hub migrate` 前的
 //! schema 初始化与测试使用；生产连接（verify-full + r2d2）在 D3/D4 接线。
 //!
-//! # 与 SQLite v7 的对应关系
+//! # 与 SQLite v8 的对应关系
 //!
-//! 基线是 `crates/rustboard-core/src/storage/sqlite.rs` 的 `SCHEMA_VERSION = 7`
-//! （21 张表、19 个显式命名索引）。PG 使用独立的版本表，不复用
+//! 基线是 `crates/rustboard-core/src/storage/sqlite.rs` 的 `SCHEMA_VERSION = 8`
+//! （21 张表、22 个显式命名索引）。PG 使用独立的版本表，不复用
 //! `PRAGMA user_version`：
 //!
 //! - `INTEGER`（时间戳/计数）→ `BIGINT`；
@@ -41,8 +41,8 @@
 //! [`apply_schema`] 在**单个事务**内完成：
 //!
 //! 1. 先取固定 key 的事务级 advisory lock，多实例同时启动时只有一个能迁移；
-//! 2. 读 `schema_migrations` 最大版本：`> 7` 明确拒绝（防止旧二进制写坏新库）；
-//! 3. 已是 7：只校验 21 张表与 19 个索引存在，然后提交（幂等、零 DDL）；
+//! 2. 读 `schema_migrations` 最大版本：`> 8` 明确拒绝（防止旧二进制写坏新库）；
+//! 3. 已是 8：只校验 21 张表与 22 个索引存在，然后提交（幂等、零 DDL）；
 //! 4. 空库 / 半迁移（表存在但没有版本行）/ 旧版本：执行全部
 //!    `CREATE TABLE/INDEX IF NOT EXISTS` 补齐，校验后写入 version 7；
 //! 5. 任何一步失败都回滚整个事务，不留半套表。
@@ -53,14 +53,19 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::storage::sqlite::{MAX_ARCHIVE_TS_MS, MIN_ARCHIVE_TS_MS};
+
 use anyhow::{bail, Context, Result};
 use postgres::config::SslMode;
 use postgres::NoTls;
 
-/// PostgreSQL schema 版本；与 SQLite 的 `PRAGMA user_version = 7` 对齐。
-pub const POSTGRES_SCHEMA_VERSION: i64 = 7;
+/// PostgreSQL schema 版本；与 SQLite 的 `PRAGMA user_version = 8` 对齐。
+pub const POSTGRES_SCHEMA_VERSION: i64 = 8;
 
-/// schema 迁移的固定 advisory lock key（hex 语义：`RB` + `PG` + 版本 7）。
+/// schema 迁移的固定 advisory lock key（hex 语义：`RB` + `PG`）。
+///
+/// **固定不随 schema 版本变化**：v7 与 v8 二进制必须争用同一把锁，
+/// 避免升级窗口内两个进程各自迁移；值中的 `0007` 是历史编码。
 ///
 /// 事务级锁（`pg_advisory_xact_lock`）随事务提交/回滚自动释放，不需要
 /// 显式 unlock；固定成常量以保证所有 hub 实例争用同一把锁。
@@ -91,10 +96,10 @@ const TABLES: [&str; 21] = [
     "archive_state",
 ];
 
-/// SQLite v7 的 19 个显式命名索引；PG 侧名字与列顺序完全一致。
+/// SQLite v8 的 22 个显式命名索引；PG 侧名字与列顺序完全一致。
 ///
 /// 主键/唯一约束产生的隐式索引（`*_pkey`、`*_key`、`*_unique`）不计入这里。
-const INDEXES: [&str; 19] = [
+const INDEXES: [&str; 22] = [
     "idx_samples_lookup",
     "idx_samples_ts",
     "idx_ingest_batches_ts",
@@ -114,6 +119,9 @@ const INDEXES: [&str; 19] = [
     "idx_alert_silences_until",
     "idx_archive_objects_range",
     "idx_archive_objects_status",
+    "idx_samples_unarchived",
+    "idx_samples_unaggregated",
+    "idx_samples_1m_unaggregated",
 ];
 
 /// 版本表。SQLite 用 `PRAGMA user_version`，PG 独立维护，避免两套后端语义混淆。
@@ -150,7 +158,9 @@ CREATE TABLE IF NOT EXISTS samples (
     metric   TEXT NOT NULL,
     labels   TEXT NOT NULL DEFAULT '{}',
     ts       BIGINT NOT NULL,
-    value    DOUBLE PRECISION NOT NULL
+    value    DOUBLE PRECISION NOT NULL,
+    archive_object_id BIGINT,
+    aggregated_1m BIGINT NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_samples_lookup ON samples(agent_id, metric, ts);
 CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
@@ -247,6 +257,8 @@ CREATE TABLE IF NOT EXISTS samples_1m (
     avg_value  DOUBLE PRECISION NOT NULL,
     last_value DOUBLE PRECISION NOT NULL,
     count      BIGINT NOT NULL,
+    last_ts    BIGINT NOT NULL DEFAULT 0,
+    aggregated_1h BIGINT NOT NULL DEFAULT 0,
     CONSTRAINT samples_1m_unique UNIQUE (agent_id, metric, labels, bucket_ts)
 );
 CREATE INDEX IF NOT EXISTS idx_samples_1m_lookup ON samples_1m(agent_id, metric, bucket_ts);
@@ -367,7 +379,9 @@ CREATE TABLE IF NOT EXISTS archive_objects (
     error        TEXT NOT NULL DEFAULT '',
     created_at   BIGINT NOT NULL,
     uploaded_at  BIGINT,
-    deleted_at   BIGINT
+    deleted_at   BIGINT,
+    ledger_version BIGINT NOT NULL DEFAULT 0,
+    attempts     BIGINT NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_archive_objects_range ON archive_objects(from_ts, to_ts);
 CREATE INDEX IF NOT EXISTS idx_archive_objects_status ON archive_objects(status);
@@ -377,6 +391,28 @@ CREATE TABLE IF NOT EXISTS archive_state (
     value      TEXT NOT NULL,
     updated_at BIGINT NOT NULL
 );
+"#;
+
+/// v8 增量 DDL：旧 v7 库补列 + partial index。
+///
+/// 必须与 [`POSTGRES_SCHEMA_DDL`] 分开：旧 v7 库的 `CREATE TABLE IF NOT EXISTS`
+/// 不会补列，若索引与建表放在一起，建索引会因列不存在而失败。执行顺序固定为
+/// 基础 DDL → 本常量 → [`apply_v8_data_migration`]。
+const POSTGRES_SCHEMA_V8_DDL: &str = r#"
+-- v8：归档归属 / 聚合认领 / ledger 版本；全部是新增列，不改既有类型。
+ALTER TABLE samples ADD COLUMN IF NOT EXISTS archive_object_id BIGINT;
+ALTER TABLE samples ADD COLUMN IF NOT EXISTS aggregated_1m BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE samples_1m ADD COLUMN IF NOT EXISTS last_ts BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE samples_1m ADD COLUMN IF NOT EXISTS aggregated_1h BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE archive_objects ADD COLUMN IF NOT EXISTS ledger_version BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE archive_objects ADD COLUMN IF NOT EXISTS attempts BIGINT NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_samples_unarchived ON samples(ts)
+    WHERE archive_object_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_samples_unaggregated ON samples(ts)
+    WHERE aggregated_1m = 0;
+CREATE INDEX IF NOT EXISTS idx_samples_1m_unaggregated ON samples_1m(bucket_ts)
+    WHERE aggregated_1h = 0;
 "#;
 
 /// 解析 DSN、叠加环境变量密码，返回 schema 初始化用的连接配置。
@@ -414,7 +450,7 @@ pub fn connect_for_schema(dsn: &str) -> Result<postgres::Client> {
         .context("连接 PostgreSQL 失败（D2 schema 连接只支持 sslmode=disable）")
 }
 
-/// 在给定连接上应用/校验 PostgreSQL schema v7。
+/// 在给定连接上应用/校验 PostgreSQL schema v8。
 ///
 /// 幂等：可重复调用。整个迁移在单事务内完成，失败自动回滚。调用方负责
 /// 串行化以外的生命周期（D2 测试直接调用；D3 启动时在 blocking 线程调用）。
@@ -463,16 +499,20 @@ fn apply_schema_inner(client: &mut postgres::Client) -> Result<()> {
     }
 
     if current == POSTGRES_SCHEMA_VERSION {
-        // 已是 v7：只校验对象存在，不执行 DDL（幂等路径）。
+        // 已是 v8：只校验对象存在，不执行 DDL（幂等路径）。
         ensure_schema_objects(&mut tx)?;
         tx.commit().context("提交 PostgreSQL schema 校验事务失败")?;
         tracing::debug!(version = current, "PostgreSQL schema 已是最新，跳过迁移");
         return Ok(());
     }
 
-    // 空库 / 半迁移 / 旧版本：全部 IF NOT EXISTS，已有数据原样保留。
+    // 空库 / 半迁移 / 旧版本：基础 DDL 全部 IF NOT EXISTS，已有数据原样保留。
     tx.batch_execute(POSTGRES_SCHEMA_DDL)
-        .context("执行 PostgreSQL schema v7 DDL 失败")?;
+        .context("执行 PostgreSQL schema 基础 DDL 失败")?;
+    // v8：旧 v7 库的 CREATE TABLE IF NOT EXISTS 不补列，必须显式 ALTER。
+    tx.batch_execute(POSTGRES_SCHEMA_V8_DDL)
+        .context("执行 PostgreSQL schema v8 增量 DDL 失败")?;
+    apply_v8_data_migration(&mut tx)?;
     ensure_schema_objects(&mut tx)?;
 
     tx.execute(
@@ -486,12 +526,142 @@ fn apply_schema_inner(client: &mut postgres::Client) -> Result<()> {
     tracing::info!(
         from = current,
         to = POSTGRES_SCHEMA_VERSION,
-        "PostgreSQL schema v7 已创建/补齐"
+        "PostgreSQL schema v8 已创建/补齐"
     );
     Ok(())
 }
 
-/// 校验 21 张业务表与 19 个命名索引都已存在。
+/// v7→v8 数据回填（与 SQLite 语义一致）。
+///
+/// **按桶对账，不按维护水位**：v7 先写 1m 行再推进水位，崩溃窗口里存在
+/// 「1m 已写、水位未推进」的桶；按水位标记会双计/漏计。因此：
+///
+/// - `aggregated_1m`：同一分钟桶 raw 按 `id` 升序编号，编号 `<= 1m.count`
+///   的置 1；raw 少于 count 全置 1，无 1m 行保持 0；
+/// - `last_ts`：按 `id` 升序取最早 `1m.count` 条 raw 的 `MAX(ts)`；无现存
+///   raw 才回填 `bucket_ts + 59999`；
+/// - `aggregated_1h`：同小时 1m 行按 `(bucket_ts, id)` 累计 `count`，
+///   累计值 `<= 1h.count` 的置 1，其余 0；不读 1h 水位；
+/// - `ledger_version` / `attempts`：DDL 默认 0，不额外更新；
+/// - 归档水位存在时写 `archive_state.archive_ledger_pending=1`，只写状态，
+///   重新导出由 R1a-2 worker 负责。
+///
+/// TODO(R1b): 超界旧 `ts` 的隔离/计数与聚合查询过滤不在本切片；这里不修改
+/// 任何 raw 的 `ts`。
+fn apply_v8_data_migration(tx: &mut postgres::Transaction<'_>) -> Result<()> {
+    // 超界时间戳（i64::MIN / 未来）不参与认领，留给 R1b 计数/隔离。
+    let now = now_ms().min(MAX_ARCHIVE_TS_MS);
+    // 先清掉非 0 残留，保证「无 1m 桶」严格为 0。
+    tx.execute(
+        "UPDATE samples SET aggregated_1m = 0 WHERE aggregated_1m != 0",
+        &[],
+    )
+    .context("v8 迁移：清理残留 raw 聚合标记失败")?;
+    let aggregated = tx
+        .execute(
+            "UPDATE samples SET aggregated_1m = 1
+             WHERE id IN (
+                 SELECT s.id FROM (
+                     SELECT id, agent_id, metric, labels, ts,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY agent_id, metric, labels, (ts / 60000) * 60000
+                                ORDER BY id ASC
+                            ) AS rn
+                     FROM samples
+                     WHERE ts >= $1 AND ts <= $2
+                 ) s
+                 JOIN samples_1m m
+                   ON m.agent_id = s.agent_id
+                  AND m.metric = s.metric
+                  AND m.labels = s.labels
+                  AND m.bucket_ts = (s.ts / 60000) * 60000
+                 WHERE s.rn <= m.count
+             )",
+            &[&MIN_ARCHIVE_TS_MS, &now],
+        )
+        .context("v8 迁移：按 1m count/rowid 顺序标记 raw 失败")?;
+    tracing::info!(aggregated, "v8 迁移：按已存在的 1m 桶标记已聚合 raw");
+
+    tx.execute("UPDATE samples_1m SET last_ts = 0 WHERE last_ts != 0", &[])
+        .context("v8 迁移：清理残留 1m last_ts 失败")?;
+    let backfilled = tx
+        .execute(
+            "UPDATE samples_1m SET last_ts = COALESCE(
+                 (SELECT MAX(s.ts) FROM samples s
+                  WHERE s.agent_id = samples_1m.agent_id
+                    AND s.metric = samples_1m.metric
+                    AND s.labels = samples_1m.labels
+                    AND s.ts >= samples_1m.bucket_ts
+                    AND s.ts < samples_1m.bucket_ts + 60000
+                    AND (SELECT COUNT(*) FROM samples s2
+                         WHERE s2.agent_id = samples_1m.agent_id
+                           AND s2.metric = samples_1m.metric
+                           AND s2.labels = samples_1m.labels
+                           AND s2.ts >= samples_1m.bucket_ts
+                           AND s2.ts < samples_1m.bucket_ts + 60000
+                           AND s2.id <= s.id) <= samples_1m.count),
+                 samples_1m.bucket_ts + 59999)
+             WHERE bucket_ts >= $1 AND bucket_ts <= $2",
+            &[&MIN_ARCHIVE_TS_MS, &now],
+        )
+        .context("v8 迁移：按 1m count/顺序回填 last_ts 失败")?;
+    tracing::info!(backfilled, "v8 迁移：回填 legacy 1m last_ts");
+
+    tx.execute(
+        "UPDATE samples_1m SET aggregated_1h = 0 WHERE aggregated_1h != 0",
+        &[],
+    )
+    .context("v8 迁移：清理残留 1m 1h 聚合标记失败")?;
+    let aggregated_hour = tx
+        .execute(
+            "UPDATE samples_1m SET aggregated_1h = 1
+             WHERE id IN (
+                 SELECT m.id FROM (
+                     SELECT id, agent_id, metric, labels, bucket_ts, count,
+                            SUM(count) OVER (
+                                PARTITION BY agent_id, metric, labels,
+                                             (bucket_ts / 3600000) * 3600000
+                                ORDER BY bucket_ts ASC, id ASC
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                            ) AS cumulative_count
+                     FROM samples_1m
+                     WHERE bucket_ts >= $1 AND bucket_ts <= $2
+                 ) m
+                 JOIN samples_1h h
+                   ON h.agent_id = m.agent_id
+                  AND h.metric = m.metric
+                  AND h.labels = m.labels
+                  AND h.bucket_ts = (m.bucket_ts / 3600000) * 3600000
+                 WHERE m.cumulative_count <= h.count
+             )",
+            &[&MIN_ARCHIVE_TS_MS, &now],
+        )
+        .context("v8 迁移：按 1h count/顺序标记 1m 失败")?;
+    tracing::info!(aggregated_hour, "v8 迁移：按已存在的 1h 桶标记已聚合 1m");
+
+    let archived_watermark: Option<String> = tx
+        .query_opt(
+            "SELECT value FROM archive_state WHERE key = 'last_archived_ts'",
+            &[],
+        )
+        .context("v8 迁移：读取 archive_state.last_archived_ts 失败")?
+        .map(|row| row.get(0));
+    if archived_watermark.is_some_and(|value: String| !value.trim().is_empty()) {
+        tx.execute(
+            "INSERT INTO archive_state (key, value, updated_at)
+             VALUES ('archive_ledger_pending', '1', $1)
+             ON CONFLICT (key) DO UPDATE SET
+                 value = EXCLUDED.value,
+                 updated_at = EXCLUDED.updated_at",
+            &[&now_ms()],
+        )
+        .context("v8 迁移：写入 archive_ledger_pending 失败")?;
+        tracing::info!("v8 迁移：archive_ledger_pending=1（等待 R1a-2 重建 ledger）");
+    }
+    Ok(())
+}
+
+/// 校验 21 张业务表与 22 个命名索引都已存在。
 ///
 /// 只查目录表，不锁表、不触碰数据；在迁移事务内调用，失败会连同 DDL 一起回滚。
 fn ensure_schema_objects(tx: &mut postgres::Transaction<'_>) -> Result<()> {
@@ -550,11 +720,11 @@ mod tests {
 
     use super::*;
 
-    /// 表/索引清单必须与 SQLite v7 基线一一对应，防止后续改 DDL 时漏项。
+    /// 表/索引清单必须与 SQLite v8 基线一一对应，防止后续改 DDL 时漏项。
     #[test]
     fn table_and_index_lists_are_distinct_and_match_baseline() {
         assert_eq!(TABLES.len(), 21);
-        assert_eq!(INDEXES.len(), 19);
+        assert_eq!(INDEXES.len(), 22);
 
         let mut tables = TABLES.to_vec();
         tables.sort_unstable();
@@ -564,13 +734,13 @@ mod tests {
         let mut indexes = INDEXES.to_vec();
         indexes.sort_unstable();
         indexes.dedup();
-        assert_eq!(indexes.len(), 19, "INDEXES 有重复项");
+        assert_eq!(indexes.len(), 22, "INDEXES 有重复项");
     }
 
-    /// 版本号固定 7，advisory lock 固定且不与版本号混淆。
+    /// 版本号固定 8；advisory lock 固定且不随版本变化。
     #[test]
     fn version_and_lock_key_are_stable() {
-        assert_eq!(POSTGRES_SCHEMA_VERSION, 7);
+        assert_eq!(POSTGRES_SCHEMA_VERSION, 8);
         assert_eq!(SCHEMA_ADVISORY_LOCK_KEY, 0x5242_5047_0000_0007);
     }
 
@@ -583,11 +753,23 @@ mod tests {
                 "DDL 缺少表 {table}"
             );
         }
+        // v8 的三个 partial index 在增量 DDL 里，旧 v7 库必须先补列再建索引。
+        let all_ddl = format!("{POSTGRES_SCHEMA_DDL}\n{POSTGRES_SCHEMA_V8_DDL}");
         for index in INDEXES {
             assert!(
-                POSTGRES_SCHEMA_DDL.contains(&format!("CREATE INDEX IF NOT EXISTS {index} ON ")),
+                all_ddl.contains(&format!("CREATE INDEX IF NOT EXISTS {index} ON ")),
                 "DDL 缺少索引 {index}"
             );
+        }
+        for column in [
+            "archive_object_id BIGINT",
+            "aggregated_1m BIGINT NOT NULL DEFAULT 0",
+            "last_ts BIGINT NOT NULL DEFAULT 0",
+            "aggregated_1h BIGINT NOT NULL DEFAULT 0",
+            "ledger_version BIGINT NOT NULL DEFAULT 0",
+            "attempts BIGINT NOT NULL DEFAULT 0",
+        ] {
+            assert!(all_ddl.contains(column), "v8 DDL 缺少列定义：{column}");
         }
     }
 

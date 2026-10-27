@@ -1,18 +1,15 @@
-//! v0.4.1 KI-29：raw 删除后 rowid 水位复用边界的独立回归测试。
+//! R1b：raw 删除后 rowid 复用边界的独立回归测试。
 //!
-//! 只依据 `docs/plans/2026-10-24-known-issues-fix.md` §3.1 的验收标准编写：
+//! v0.4.1 KI-29 依赖 `downsample_1m_last_raw_rowid` 发现迟到行；R1b 改为
+//! `samples.aggregated_1m=0` 增量认领后，迟到行不再依赖 rowid 水位。本文件
+//! 继续覆盖两个仍然重要的事实：
 //!
-//! - retention 删除“最大 rowid 的迟到 raw 行”后，`maintenance_state` 里的
-//!   `downsample_1m_last_raw_rowid` 不得高于新的 `MAX(rowid)`；表空时应清除；
-//! - 新迟到行复用被删除的 rowid 后，下一轮 `run_downsample` 必须通过 rowid
-//!   水位发现它，并重算对应的 1m / 1h 桶。
+//! - retention 只删 `aggregated_1m=1` 的 raw，删除后新迟到行仍会被 delta
+//!   发现并修正 1m / 1h（即使它复用了刚被删除的 rowid）；
+//! - raw 表清空后，历史遗留的 `downsample_1m_last_raw_rowid` 由保留期路径
+//!   收敛/清除（兼容旧库，不再由降采样写入）。
 //!
-//! 数据全部通过公开接口构造：`SqliteStorage::open_in_memory`、
-//! `Storage::insert_batch`、`run_downsample`、`run_retention`、
-//! `prune_samples_before`、`maintenance_status`。读取聚合结果也只走
-//! `Storage::query_series_tiered`，不直接碰内部表结构。
-//!
-//! 这些用例在 v0.4.0 基线上应当失败；修复 KI-29 后应当通过。
+//! 数据全部通过公开接口构造；聚合结果只走 `Storage::query_series_tiered`。
 
 use rustboard_common::config::HubConfig;
 use rustboard_common::model::{AgentRecord, Labels, Sample, SampleBatch, SeriesQuery};
@@ -25,7 +22,7 @@ use rustboard_core::storage::{IngestOutcome, SampleTier, Storage, BUCKET_1H_MS, 
 
 /// 整小时对齐的测试基准时间（UTC 毫秒）。
 const BASE: i64 = 1_699_999_200_000;
-/// 固定的“当前时间”：对齐到整点，避免测试依赖真实时钟。
+/// 固定的「当前时间」：对齐到整点，避免测试依赖真实时钟。
 const NOW: i64 = BASE + 13 * BUCKET_1H_MS;
 const DAY_MS: i64 = 86_400_000;
 const AGENT: &str = "agent-v041-ki29";
@@ -70,11 +67,9 @@ fn insert(storage: &SqliteStorage, seq: u64, samples: Vec<Sample>) {
     }
 }
 
-/// 造数并跑第一轮降采样：最近行 rowid=1，迟到旧行 rowid=2（最大）。
-/// 返回 (old_ts, old_bucket, old_hour)。
+/// 造数并跑第一轮降采样：返回 (old_ts, old_bucket, old_hour)。
 fn seed_and_downsample(storage: &SqliteStorage) -> (i64, i64, i64) {
-    // 旧行 1 天 2 分钟前：配置 retention_raw_days=1 时会被 retention 删除，
-    // 同时只产生约 1440 个分钟桶，测试不会因跨 7 天而变慢。
+    // 旧行 1 天 2 分钟前：retention_raw_days=1 时会被 retention 删除。
     let old_ts = NOW - DAY_MS - 2 * BUCKET_1M_MS;
     let recent_ts = NOW - 90_000;
     insert(
@@ -141,50 +136,30 @@ fn assert_close(actual: f64, expected: f64, context: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// 用例 1：prune 后水位不得高于新的 MAX(rowid)。
+// 用例 1：R1b 不再写 rowid 水位；retention 只删已聚合 raw。
 // ---------------------------------------------------------------------------
 
 #[test]
-fn v041_ki29_retention_lowers_rowid_watermark_below_new_max() {
+fn v041_ki29_retention_deletes_only_aggregated_raw_and_does_not_claim_rowid() {
     let storage = setup();
     let _ = seed_and_downsample(&storage);
 
-    let conn_max_before = storage.raw_new_rows(None).expect("raw_new_rows 失败").0;
+    let status =
+        maintenance_status(&storage, &HubConfig::default(), NOW).expect("maintenance_status 失败");
     assert_eq!(
-        conn_max_before,
-        Some(2),
-        "造数后最大 rowid 应为 2（旧行最后插入）"
+        status.downsample_1m_last_raw_rowid, None,
+        "R1b 增量认领不再写 downsample_1m_last_raw_rowid；旧字段只作兼容展示"
     );
-
-    let before = maintenance_status(&storage).expect("maintenance_status 失败");
-    assert_eq!(
-        before.downsample_1m_last_raw_rowid,
-        Some(2),
-        "首次降采样应认领到最大 rowid=2"
-    );
+    assert_eq!(status.unaggregated_rows, 0, "首轮降采样后 raw 应全部已聚合");
 
     let retention = run_retention(&storage, &retention_config(), NOW, ArchiveGate::Disabled)
         .expect("run_retention 失败");
-    assert_eq!(retention.raw.deleted, 1, "retention 应删除 1 条过期 raw");
-
-    let max_after = storage.raw_new_rows(None).expect("raw_new_rows 失败").0;
-    assert_eq!(max_after, Some(1), "删除后 raw 仅剩 rowid=1");
-
-    let status = maintenance_status(&storage).expect("maintenance_status 失败");
-    let watermark = status.downsample_1m_last_raw_rowid.expect(
-        "retention 后 raw 表仍非空（MAX(rowid)=1），downsample_1m_last_raw_rowid \
-         不得被清除，必须保留有效整数水位",
-    );
-    let max_rowid = max_after.expect("已断言删除后 raw 仅剩 rowid=1");
-    assert!(
-        watermark <= max_rowid,
-        "retention 删除最大 rowid 行后，downsample_1m_last_raw_rowid={watermark} \
-         不得高于新的 MAX(rowid)={max_rowid}；否则复用 rowid 的迟到行会被误判为已认领"
-    );
+    assert_eq!(retention.raw.deleted, 1, "retention 应删除已聚合的旧 raw");
+    assert_eq!(storage.raw_stats().unwrap().rows, 1, "未过期 raw 保留");
 }
 
 // ---------------------------------------------------------------------------
-// 用例 2：新迟到行复用被删除的 rowid，必须触发 1m / 1h 重算。
+// 用例 2：迟到行复用被删除的 rowid，仍必须被 delta 发现并修正 1m / 1h。
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -192,7 +167,6 @@ fn v041_ki29_late_row_reusing_deleted_rowid_recomputes_one_minute_and_one_hour()
     let storage = setup();
     let (old_ts, old_bucket, old_hour) = seed_and_downsample(&storage);
 
-    // 首次降采样已把旧桶聚合为 100.0；修复前该值会在下面被错误地保留。
     assert_close(
         bucket_value(&storage, SampleTier::OneMinute, BUCKET_1M_MS, old_bucket),
         100.0,
@@ -225,40 +199,40 @@ fn v041_ki29_late_row_reusing_deleted_rowid_recomputes_one_minute_and_one_hour()
     assert_eq!(
         second.one_minute.watermark,
         Some(NOW),
-        "迟到重算后 1m 水位应恢复到 now"
+        "迟到行不得回拨 1m 水位"
     );
     assert_eq!(
         second.one_hour.watermark,
         Some(NOW),
-        "迟到重算后 1h 水位应恢复到整点 NOW"
+        "迟到行不得回拨 1h 水位"
     );
 
-    // 修复前：rowid 水位仍是 2，扫描区间为空，旧桶停留在 100.0。
-    // 修复后：水位被降到 1，rowid=2 被视为新行，按 raw 重算为 5.0。
+    // 1m 旧桶由 100.0 增量合并 5.0：count=2、avg=(100+5)/2=52.5。
     assert_close(
         bucket_value(&storage, SampleTier::OneMinute, BUCKET_1M_MS, old_bucket),
-        5.0,
-        "复用 rowid 的迟到行必须触发 1m 旧桶重算",
+        52.5,
+        "复用 rowid 的迟到行必须被 delta 合并进 1m 旧桶",
     );
     assert_close(
         bucket_value(&storage, SampleTier::OneHour, BUCKET_1H_MS, old_hour),
-        5.0,
+        52.5,
         "1h 旧桶必须随 1m 重算（不能停留在旧值 100.0）",
     );
 }
 
 // ---------------------------------------------------------------------------
-// 用例 3：raw 表被清空时必须清除 rowid 水位。
+// 用例 3：raw 表被清空时，历史遗留的 rowid 水位应被收敛/清除。
 // ---------------------------------------------------------------------------
 
 #[test]
-fn v041_ki29_pruning_last_raw_row_clears_rowid_watermark() {
+fn v041_ki29_pruning_last_raw_row_clears_legacy_rowid_watermark() {
     let storage = setup();
     let old_ts = NOW - 2 * DAY_MS;
     insert(&storage, 1, vec![sample(old_ts, 1.0)]);
+    run_downsample(&storage, NOW, None).expect("run_downsample 失败");
 
-    // 模拟上一轮降采样已认领 rowid=1（这里故意写一个高于实际 MAX 的值，
-    // 同时覆盖“水位高于新 MAX 时只降低/清除”的方向）。
+    // 模拟旧版本遗留的 rowid 水位（故意写一个高于实际 MAX 的值，覆盖
+    // 「水位高于新 MAX 时只降低/清除」的方向）。
     storage
         .set_maintenance_state(STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID, "7", NOW)
         .expect("set_maintenance_state 失败");
@@ -266,17 +240,17 @@ fn v041_ki29_pruning_last_raw_row_clears_rowid_watermark() {
     let pruned = storage
         .prune_samples_before(i64::MAX)
         .expect("prune_samples_before 失败");
-    assert_eq!(pruned.deleted, 1, "应删除唯一一条 raw");
+    assert_eq!(pruned.deleted, 1, "应删除唯一一条已聚合 raw");
     assert_eq!(
         storage.raw_new_rows(None).expect("raw_new_rows 失败").0,
         None,
         "raw 表应为空"
     );
 
-    let status = maintenance_status(&storage).expect("maintenance_status 失败");
+    let status =
+        maintenance_status(&storage, &HubConfig::default(), NOW).expect("maintenance_status 失败");
     assert_eq!(
         status.downsample_1m_last_raw_rowid, None,
-        "raw 表为空时必须清除 downsample_1m_last_raw_rowid；\
-         残留旧水位会让复用的 rowid 永远无法被扫描"
+        "raw 表为空时必须清除历史 rowid 水位"
     );
 }

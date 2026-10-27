@@ -354,7 +354,8 @@ async fn session_send_timeout_exits_when_server_stops_reading_with_session_max_h
     let _guard = TempDirGuard(data_dir.clone());
     std::fs::write(data_dir.join("agent.secret"), b"test-secret").expect("写入 agent.secret 失败");
 
-    // 单帧 16MiB，远大于回环内核发送/接收缓冲，保证服务端停读后写操作真的阻塞。
+    // 单帧 4MiB，超过回环内核缓冲且低于 DiskBuffer 8MiB 单记录上限；
+    // 保证服务端停读后写操作真的阻塞。
     let mut buffer =
         DiskBuffer::open(&data_dir, 64 * 1024 * 1024, 0).expect("打开 DiskBuffer 失败");
     let batch = SampleBatch {
@@ -363,7 +364,7 @@ async fn session_send_timeout_exits_when_server_stops_reading_with_session_max_h
         seq: 1,
         boot_id: "b".into(),
         sent_at: now_ms(),
-        samples: vec![Sample::new("m".repeat(16 * 1024 * 1024), now_ms(), 1.0)],
+        samples: vec![Sample::new("m".repeat(4 * 1024 * 1024), now_ms(), 1.0)],
     };
     buffer.push(&batch).expect("写入超大 Batch 失败");
     let buffer = Arc::new(Mutex::new(buffer));

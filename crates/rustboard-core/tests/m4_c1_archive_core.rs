@@ -13,9 +13,10 @@ use std::task::{Context, Poll, Waker};
 
 use flate2::read::GzDecoder;
 use rustboard_core::archive::{
-    build_object_keys, format_csv_value, manifest_json, sha256_hex, ArchiveDay, ArchiveError,
-    ArchiveManifest, ArchiveObject, ArchiveStatus, ArchiveStoreError, ColdObjectMeta, ColdStore,
-    CsvArchiveWriter, CSV_HEADER, MANIFEST_FORMAT_VERSION, MAX_ARCHIVE_SHARD,
+    build_object_keys, build_v8_object_keys, format_csv_value, is_v8_object_key, manifest_json,
+    parse_object_key_shard, sha256_hex, ArchiveDay, ArchiveError, ArchiveManifest, ArchiveObject,
+    ArchiveStatus, ArchiveStoreError, ColdObjectMeta, ColdStore, CsvArchiveWriter, CSV_HEADER,
+    MANIFEST_FORMAT_VERSION, MAX_ARCHIVE_SHARD, V8_OBJECT_KEY_SUFFIX,
 };
 use rustboard_core::storage::sqlite::SqliteStorage;
 
@@ -291,6 +292,52 @@ fn manifest_json_is_stable_and_roundtrips() {
 }
 
 #[test]
+fn v8_archive_object_keys_add_suffix_and_parse_shard_roundtrip() {
+    assert_eq!(V8_OBJECT_KEY_SUFFIX, "-v8");
+    let day = ArchiveDay::new(2026, 10, 24).unwrap();
+    let keys = build_v8_object_keys("rustboard", day, "part-00002").unwrap();
+    assert_eq!(keys.object_key, "rustboard/2026/10/24/part-00002-v8.csv.gz");
+    assert_eq!(
+        keys.manifest_key,
+        "rustboard/2026/10/24/part-00002-v8.manifest.json"
+    );
+    assert!(is_v8_object_key(&keys.object_key));
+    assert!(is_v8_object_key(&keys.manifest_key));
+    assert!(!is_v8_object_key("rustboard/2026/10/24/part-00002.csv.gz"));
+    assert_eq!(parse_object_key_shard(&keys.object_key), Some(2));
+    assert_eq!(parse_object_key_shard(&keys.manifest_key), Some(2));
+
+    // 旧 v7 key 仍可解析；v8 与 v7 key 永不相等。
+    let v7 = build_object_keys("rustboard", day, "part-00002").unwrap();
+    assert_eq!(parse_object_key_shard(&v7.object_key), Some(2));
+    assert_ne!(v7.object_key, keys.object_key);
+    assert_ne!(v7.manifest_key, keys.manifest_key);
+    assert!(!is_v8_object_key(&v7.object_key));
+
+    for key in [
+        "",
+        "rustboard/2026/10/24/part-00002-v8.csv",
+        "rustboard/2026/10/24/part-00002-v9.csv.gz",
+        "rustboard/2026/10/24/part-00002-v8-v8.csv.gz",
+        "rustboard/2026/10/24/part-0000-v8.csv.gz",
+        "part-00002-v8.csv.gz/extra",
+    ] {
+        assert_eq!(parse_object_key_shard(key), None, "key={key:?}");
+        assert!(!is_v8_object_key(key), "key={key:?}");
+    }
+
+    // v8 与 v7 共用同一套 prefix / 日期 / 分片校验，非法输入一律拒绝。
+    assert_eq!(
+        build_v8_object_keys("../evil", day, "part-00001"),
+        Err(ArchiveError::InvalidKey)
+    );
+    assert_eq!(
+        build_v8_object_keys("rustboard", day, "part-00000"),
+        Err(ArchiveError::InvalidKey)
+    );
+}
+
+#[test]
 fn object_keys_only_accept_valid_utc_day_and_shard() {
     let day = ArchiveDay::new(2026, 10, 24).unwrap();
     assert_eq!((day.year(), day.month(), day.day()), (2026, 10, 24));
@@ -430,6 +477,8 @@ fn archive_object(key: &str, from_ts: i64, to_ts: i64, status: ArchiveStatus) ->
         created_at: 1_000,
         uploaded_at: None,
         deleted_at: None,
+        ledger_version: 0,
+        attempts: 0,
     }
 }
 

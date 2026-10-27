@@ -535,12 +535,15 @@ fn alert_state_storage_roundtrip_and_30_day_resolved_prune() {
         4,
         "upsert 同一主键不得新增行"
     );
+    let mut persisted = updated.clone();
+    // #30：last_notified_at 归通知 worker 独占，评估 upsert 不得覆盖。
+    persisted.last_notified_at = firing.last_notified_at;
     assert_eq!(
         storage
             .get_alert_state("rule-a", "agent-01", "series-1")
             .expect("读取失败"),
-        Some(updated.clone()),
-        "upsert 必须覆盖 state / since / last_eval_at / last_value / last_notified_at"
+        Some(persisted.clone()),
+        "upsert 必须覆盖 state / since / last_eval_at / last_value，保留 last_notified_at"
     );
 
     // delete 返回受影响行数：存在 1、再次 0。
@@ -573,7 +576,7 @@ fn alert_state_storage_roundtrip_and_30_day_resolved_prune() {
         storage
             .get_alert_state("rule-a", "agent-01", "series-1")
             .expect("读取失败"),
-        Some(updated.clone()),
+        Some(persisted),
         "重启后状态必须持久化"
     );
     assert_eq!(storage.list_alert_states().expect("列表失败").len(), 3);

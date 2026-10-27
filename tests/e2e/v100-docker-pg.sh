@@ -10,7 +10,7 @@
 #
 # 覆盖：
 #   1) 用当前源码 dist/amd64 构建三个本地镜像（tag :local-s4），断言 hub
-#      --version = 1.0.0-rc.2（当前源码），且 hub 镜像内没有 pg_dump/pg_restore；
+#      --version = 1.0.0-rc.3（当前源码），且 hub 镜像内没有 pg_dump/pg_restore；
 #   2) 默认 compose 配置无 postgres/5432/8444，实跑 hub+panel 为 SQLite，
 #      hub_data volume 内 rustboard.db 有 schema/迁移数据；
 #   3) PostgreSQL overlay：postgres:16（本地缺 alpine 时用本地 postgres:16 覆盖
@@ -39,7 +39,7 @@
 #   - Linux amd64、Docker 24+、docker compose v2+（优先 buildx）、curl、python3；
 #   - dist/amd64/bin/{rustboard-hub,panel,agent} 与 web/dist 已由
 #     `packaging/build-release.sh --arch amd64` 生成，Cargo.toml 版本为
-#     EXPECTED_VERSION（默认 1.0.0-rc.2）；
+#     EXPECTED_VERSION（默认 1.0.0-rc.3）；
 #   - 本机已有 debian:bookworm-slim（Dockerfile 基础镜像）、postgres:16（PG
 #     服务端/客户端兜底）；若已有 postgres:16-alpine 则优先用 overlay 默认；
 #   - 宿主 8443/8080 空闲。脚本不会自动停止无关容器/服务。
@@ -55,7 +55,7 @@
 #                                二者都没有时 FATAL（拒绝未知 dist）
 #   EXPECTED_DIST_SHA256=...      hub=<sha> panel=<sha> agent=<sha> web=<sha>
 #                                来源绑定；web 指 web/dist/index.html
-#   EXPECTED_VERSION=1.0.0-rc.2  当前源码期望版本（默认值；与 Cargo.toml 不一致
+#   EXPECTED_VERSION=1.0.0-rc.3  当前源码期望版本（默认值；与 Cargo.toml 不一致
 #                                时 fail-fast，防止误用旧镜像）
 #   HEALTH_TIMEOUT=240           postgres/hub healthcheck 等待秒数
 #   AGENT_TIMEOUT=180            agent enrollment/health 等待秒数
@@ -78,7 +78,7 @@ cd "$ROOT" || {
 }
 
 PYTHON=${PYTHON:-python3}
-EXPECTED_VERSION=${EXPECTED_VERSION:-1.0.0-rc.2}
+EXPECTED_VERSION=${EXPECTED_VERSION:-1.0.0-rc.3}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-240}
 AGENT_TIMEOUT=${AGENT_TIMEOUT:-180}
 DATA_TIMEOUT=${DATA_TIMEOUT:-120}
@@ -209,7 +209,7 @@ Phase E S4 Docker + PostgreSQL overlay e2e。构建当前 dist 的三个 :local-
   --dist-manifest FILE         来源绑定文件，格式 hub=<64hex> panel=<64hex>
                                agent=<64hex> web=<64hex>（web=index.html）
   EXPECTED_DIST_SHA256=...     同上的环境变量形式（与 --dist-manifest 二选一）
-  EXPECTED_VERSION=1.0.0-rc.2  期望源码版本，默认 1.0.0-rc.2
+  EXPECTED_VERSION=1.0.0-rc.3  期望源码版本，默认 1.0.0-rc.3
   HEALTH_TIMEOUT=240           postgres/hub healthcheck 等待秒数
   AGENT_TIMEOUT=180            agent enrollment/health 等待秒数
   DATA_TIMEOUT=120             等待 PG 样本/agent 计数的秒数

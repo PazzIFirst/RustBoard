@@ -134,6 +134,28 @@ pub struct DownsampleRangeResult {
     pub rows: usize,
 }
 
+/// R1b：一批 1m 增量聚合（raw → samples_1m）的结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct DownsampleDeltaResult {
+    /// 本次写入/合并的 1m 聚合桶数。
+    pub buckets: usize,
+    /// 本次认领并标记 `aggregated_1m=1` 的 raw 行数。
+    pub rows: usize,
+    /// 本批处理的排他上界（整分钟，且不晚于调用方传入的 `closed_end`）。
+    pub processed_to: i64,
+}
+
+/// R1b：一个整点小时的 1h 重算结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct DownsampleHourResult {
+    /// 被重算的整点小时起点。
+    pub hour_ts: i64,
+    /// 写入/更新的 1h 聚合桶数。
+    pub buckets: usize,
+    /// 锁定并参与重算的 1m 源行数。
+    pub rows: usize,
+}
+
 /// 某一数据层（raw / 1m / 1h）的时间范围与总行数。
 ///
 /// `oldest_ts` / `newest_ts` 为 `None` 表示该层没有数据；供维护状态与
@@ -503,11 +525,16 @@ pub trait Storage: Send + Sync {
     fn prune_alert_states_for_rule(&self, rule_id: &str, keep: usize) -> Result<usize>;
 
     /// 告警评估专用的 raw-only 最新序列快照；达到 `limit` 时截断并标记。
+    ///
+    /// `filter_labels` 是精确子集：序列的 labels 必须包含其中每一对。过滤在
+    /// `ROW_NUMBER` / 排序 / `LIMIT` **之前**完成，因此截断只作用于匹配的序列，
+    /// 不会因为大量不相关序列先占满上限而漏掉目标序列。
     fn latest_alert_series(
         &self,
         metric: &str,
         since: i64,
         agent: Option<&str>,
+        filter_labels: &Labels,
         limit: usize,
     ) -> Result<AlertSeriesSnapshot>;
 
@@ -598,10 +625,58 @@ pub trait Storage: Send + Sync {
     // ---- M4 降采样 / 保留期 / 维护水位（schema v7） ----
 
     /// 把 `[from_ts, to_ts)` 内已关闭分钟的 raw 聚合进 1m，按主键 upsert 幂等。
+    ///
+    /// **R1b 起只供既有测试/工具构造聚合行使用**；维护 worker 使用增量认领的
+    /// [`Storage::downsample_1m_delta`]，不会走这里，避免与 delta 重复计数。
     fn downsample_1m_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult>;
 
     /// 把完整整点的 1m 聚合进 1h（按 `count` 加权平均），幂等。
+    ///
+    /// **R1b 起只供既有测试/工具构造聚合行使用**；维护 worker 使用带锁的
+    /// [`Storage::downsample_1h_hour`]。
     fn downsample_1h_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult>;
+
+    /// R1b：认领并增量合并一批未聚合 raw 到 1m。
+    ///
+    /// 选 `aggregated_1m=0 AND ts >= 0 AND ts < closed_end` 的 raw，按
+    /// `(ts, rowid/id)` 升序取至多 `max_rows` 行；若第 `max_rows` 行落在某个
+    /// 分钟桶内，则该桶整桶纳入（桶不可拆分），因此实际行数可能略超上限。
+    ///
+    /// 单写事务内完成：delta 合并进已有 1m 桶、把源 raw 所在**整小时**的
+    /// 所有 1m 行置 `aggregated_1h=0`、再以
+    /// `UPDATE ... WHERE 行键 IN (...) AND aggregated_1m=0` 标记 raw；affected
+    /// 必须等于选中行数，否则回滚。返回 `processed_to` 是本批的分钟对齐上界。
+    fn downsample_1m_delta(
+        &self,
+        closed_end: i64,
+        max_rows: usize,
+    ) -> Result<DownsampleDeltaResult>;
+
+    /// R1b：锁定并重算最早一个可重算整点小时的 1h。
+    ///
+    /// 只选 `aggregated_1h=0`、`bucket_ts < closed_hour`、且该小时之前没有
+    /// 未聚合 raw（`aggregated_1m=0`）的整点。单写事务内锁定该小时全部 1m
+    /// 行（PG 用 `SELECT ... FOR UPDATE`），按 `count` 加权重算整小时，再把
+    /// 该小时所有 1m 行置 `aggregated_1h=1`；affected 必须等于锁定行数，否则
+    /// 回滚。没有可重算小时返回 `None`。
+    fn downsample_1h_hour(&self, closed_hour: i64) -> Result<Option<DownsampleHourResult>>;
+
+    /// 未聚合 raw 行数（`aggregated_1m=0`），供 `maintenance status` 使用。
+    fn count_unaggregated_raw_rows(&self) -> Result<i64>;
+
+    /// `ts < min_ts OR ts > max_ts` 的 raw 行数（旧超界时间戳审计）。
+    fn count_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64>;
+
+    /// `ts < min_ts OR ts > max_ts` 且仍未聚合的 raw 行数。
+    fn count_unaggregated_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64>;
+
+    /// `ts < before_ts` 且仍未聚合的 raw 行数（legacy 1m horizon 审计）。
+    fn count_unaggregated_raw_rows_before(&self, before_ts: i64) -> Result<i64>;
+
+    /// 把超界时间戳的未聚合 raw 标记为 `aggregated_1m=1` 隔离，返回标记行数。
+    ///
+    /// 分批执行，不删除任何行；隔离后 delta 不会再为这些行构造残缺 1m。
+    fn isolate_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<usize>;
 
     /// raw 层行数与最旧 / 最新时间戳。
     fn raw_stats(&self) -> Result<TierStats>;
@@ -629,10 +704,22 @@ pub trait Storage: Send + Sync {
     /// 1m 层最旧桶时间；`None` 表示该层没有数据。
     fn samples_1m_oldest_ts(&self) -> Result<Option<i64>>;
 
-    /// 分批删除 raw 中 `ts < cutoff` 的行。
+    /// 分批删除 raw 中 `ts < cutoff` 且 `aggregated_1m=1` 的行。
+    ///
+    /// R1b 起未聚合 raw 一律不删；维护水位不再单独作为可删证明。
     fn prune_samples_before(&self, cutoff: i64) -> Result<PruneResult>;
 
-    /// 分批删除 1m 中 `bucket_ts < cutoff` 的行。
+    /// v8 归档启用时的 raw 保留期：只删已聚合且所属对象 `uploaded` 的行。
+    ///
+    /// R1a-1 只提供原语，不改现有 [`Storage::prune_samples_before`] 的行为；
+    /// R1b 在 `archive.enabled` 分支接入，并在 ledger pending 时跳过删除。
+    /// 未认领行、pending / failed 对象、未聚合行一律保留。
+    fn prune_archived_samples_before(&self, cutoff: i64) -> Result<PruneResult>;
+
+    /// 分批删除 1m 中 `bucket_ts < cutoff` 且整小时 `aggregated_1h=1` 的行。
+    ///
+    /// `cutoff` 会先向下取整到整点；只要该小时有一行 `aggregated_1h=0`，
+    /// 整小时都跳过（dirty hour）。维护水位不再单独作为可删证明。
     fn prune_samples_1m_before(&self, cutoff: i64) -> Result<PruneResult>;
 
     /// 分批删除 1h 中 `bucket_ts < cutoff` 的行。
@@ -664,6 +751,17 @@ pub trait Storage: Send + Sync {
         before_id: Option<i64>,
     ) -> Result<Vec<ArchiveObject>>;
 
+    /// 按 id 升序分页列出**待重试**的 v8 归档对象（`pending` / `failed`）。
+    ///
+    /// 只返回 `ledger_version = LEDGER_VERSION_V8` 的对象：旧 v7 对象没有
+    /// claim 行集，不能按行重建，也不得复用其 key。`after_id` 是上一页最后
+    /// 一条的 id（排他）。worker 用它做崩溃恢复与失败重试。
+    fn list_retryable_archive_objects(
+        &self,
+        limit: usize,
+        after_id: Option<i64>,
+    ) -> Result<Vec<ArchiveObject>>;
+
     /// 更新归档对象状态，并校验合法的状态迁移。
     fn update_archive_object_status(
         &self,
@@ -692,6 +790,68 @@ pub trait Storage: Send + Sync {
         after_rowid: Option<i64>,
         limit: usize,
     ) -> Result<Vec<ArchiveRawRow>>;
+
+    /// 按 `ts, rowid`（PG 为 `ts, id`）升序扫描 `archive_object_id IS NULL`
+    /// 的 raw，供归档 claim。
+    ///
+    /// 时间范围左闭右开 `[from_ts, to_ts)`，`limit == 0` 返回空列表。
+    fn list_unclaimed_archive_rows(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        limit: usize,
+    ) -> Result<Vec<ArchiveRawRow>>;
+
+    /// 插入归档对象并在同一事务内原子认领 `rows`。
+    ///
+    /// claim 是**短事务**：只插入对象（`bytes`/`sha256` 可先留占位）并
+    /// `UPDATE` 行集，CSV.GZ 生成与上传必须在事务外完成，避免阻塞 ingest。
+    /// 调用方可按 `max_object_bytes` 把候选行切成多个对象、多次调用本方法。
+    ///
+    /// 返回新对象 id。`object.rows/from_ts/to_ts` 必须与行集一致，
+    /// `ledger_version` 必须为 [`crate::archive::LEDGER_VERSION_V8`]，
+    /// 状态必须为 `pending`；affected 行数不等于选中数时整事务回滚并返回
+    /// [`crate::archive::ArchiveStoreError::ClaimConflict`]（可重试）。
+    fn claim_archive_rows(&self, object: &ArchiveObject, rows: &[ArchiveRawRow]) -> Result<i64>;
+
+    /// 按 `archive_object_id` 读回 claim 行集（重试重建 CSV/manifest 用）。
+    ///
+    /// 按 `ts, rowid`（PG 为 `ts, id`）升序返回，与 claim 扫描顺序一致；
+    /// 只有同一顺序才能在第 3 步重试时重建字节级一致的 CSV。对象不存在或行
+    /// 已删除返回空列表。
+    fn archive_rows_for_object(&self, object_id: i64) -> Result<Vec<ArchiveRawRow>>;
+
+    /// 记录一次上传失败：状态置 `failed`、覆盖 `error`，`attempts` 加一。
+    ///
+    /// 只允许 `pending` / `failed` 迁移到 `failed`；已 `uploaded` /
+    /// `local_deleted` 的对象返回 [`crate::archive::ArchiveStoreError::InvalidTransition`]，
+    /// 不得回退。id 不存在返回
+    /// [`crate::archive::ArchiveStoreError::NotFound`]。
+    fn record_archive_object_failure(&self, id: i64, error: &str) -> Result<()>;
+
+    /// CSV.GZ 在 claim 事务外生成后，补对象的 `bytes` / `sha256` 元数据。
+    ///
+    /// claim 只做「插入对象 + UPDATE 行集」，`bytes`/`sha256` 可先留占位；
+    /// 大对象编码与上传不得占用 claim 事务，避免阻塞 ingest。`sha256` 必须
+    /// 是 64 位小写十六进制；仅 v8（`ledger_version=1`）且 `pending` /
+    /// `failed` 的对象允许更新，对象不存在返回
+    /// [`crate::archive::ArchiveStoreError::NotFound`]，
+    /// 其它 ledger 版本 / 状态返回 `InvalidTransition`。
+    fn update_archive_object_metadata(&self, id: i64, bytes: u64, sha256: &str) -> Result<()>;
+
+    /// 记录一次上传尝试：仅 `pending` / `failed` 对象允许，`attempts += 1`。
+    ///
+    /// 返回递增后的 attempts；对象不存在返回
+    /// [`crate::archive::ArchiveStoreError::NotFound`]，uploaded /
+    /// local_deleted 返回 `InvalidTransition`。
+    fn record_archive_attempt(&self, id: i64) -> Result<i64>;
+
+    /// 统计不可归档的 raw 行数：`ts < 0` 或 `ts > now`。
+    ///
+    /// 只计数，不修改/删除；R1b 会在 `maintenance status invalid_timestamp_rows`
+    /// 暴露给运维。归档 claim 扫描已排除这些行，避免 `archive_day_for` 在
+    /// `i64::MIN` / 未来时间戳上整轮报错。
+    fn count_invalid_archive_raw_rows(&self) -> Result<i64>;
 
     /// 归档对象总数。
     fn count_archive_objects(&self) -> Result<i64>;

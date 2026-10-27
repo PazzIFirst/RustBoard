@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use rustboard_common::config::{AgentConfig, AgentTlsMode};
+use rustboard_common::config::{is_loopback_host, ws_url_host_port, AgentConfig, AgentTlsMode};
 use rustboard_common::control::{codes as control_codes, ControlError, ControlResponse};
 use rustboard_common::fsutil;
 use rustboard_common::model::{Sample, SampleBatch};
@@ -27,6 +27,7 @@ use rustboard_common::{DEFAULT_AGENT_CONFIG, PROTOCOL_VERSION, VERSION};
 use rustboard_core::buffer::DiskBuffer;
 use rustboard_core::collect::default_collectors;
 use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 const AGENT_CERT: &str = "agent.crt";
@@ -34,6 +35,23 @@ const AGENT_KEY: &str = "agent.key";
 const AGENT_SECRET: &str = "agent.secret";
 const AGENT_CA: &str = "ca.crt";
 const AGENT_ID: &str = "agent_id";
+/// enrollment 完成标记：五个身份文件全部落盘后**最后**原子写入。
+///
+/// 只含公开身份材料（agent_id / 证书 DER 的 SHA-256 / 完成时间），不含 secret、
+/// CSR 或私钥；缺失它就把身份视为半完成，绝不重新纳管或随机补 agent_id。
+const ENROLLMENT_MARKER: &str = "enrollment.complete";
+/// 已纳管的五个身份文件（marker 不计入；marker 是它们全部写完后的完成信号）。
+const ENROLLED_FILES: [&str; 5] = [AGENT_CERT, AGENT_KEY, AGENT_SECRET, AGENT_CA, AGENT_ID];
+
+/// `enrollment.complete` 的内容。字段只用公开信息，禁止加入 secret / 私钥。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EnrollmentMarker {
+    agent_id: String,
+    /// 客户端证书 DER 的 SHA-256（小写 hex）；续签后随证书一起更新。
+    cert_sha256: String,
+    /// 纳管完成时间（Unix 毫秒）。
+    created_at: i64,
+}
 
 /// 运行时 `server_ca` 文件大小上限（PEM 证书 bundle）。
 const SERVER_CA_MAX_BYTES: u64 = 1024 * 1024;
@@ -138,6 +156,19 @@ where
     write_with_timeout(sink.close(), "Close", timeout).await
 }
 
+/// 日志 / CLI 展示用的 hub 端点：只保留 `host:port`。
+///
+/// `hub_url` 可能包含 userinfo（`user:password@host`）；原样打印会把凭据写进
+/// 日志或终端历史。IPv6 主机加方括号避免端口歧义；无法解析时返回固定占位符，
+/// 同样不回显原 URL。
+fn hub_endpoint_for_display(hub_url: &str) -> String {
+    match ws_url_host_port(hub_url) {
+        Ok((host, port)) if host.contains(':') => format!("[{host}]:{port}"),
+        Ok((host, port)) => format!("{host}:{port}"),
+        Err(_) => "(invalid hub_url)".to_string(),
+    }
+}
+
 /// H1：hub 明确拒绝协议版本。重试不会自愈，必须退出让运维升级。
 #[derive(Debug)]
 struct BadProtocolError {
@@ -233,6 +264,11 @@ enum Cmd {
     Install(install_cmd::InstallArgs),
     /// 卸载本机 agent（默认保留配置与数据）。
     Uninstall(install_cmd::UninstallArgs),
+    /// 本地磁盘缓冲的运维操作（必须停止 agent 后执行）。
+    Buffer {
+        #[command(subcommand)]
+        cmd: BufferCmd,
+    },
     Init {
         #[arg(short, long)]
         config: Option<PathBuf>,
@@ -258,6 +294,22 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum BufferCmd {
+    /// 显式把缓冲读偏移重置到日志开头（恢复入口）。
+    ///
+    /// 会重发已 ACK 的批次，依赖 hub 按 (agent_id, epoch, seq) 判重；
+    /// 启动流程不会自动执行，必须由运维显式指定 --from-start。
+    Repair {
+        /// agent 配置文件路径（默认 /etc/rustboard/agent.toml）。
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// 必须显式确认：允许重发已 ACK 前缀。
+        #[arg(long)]
+        from_start: bool,
+    },
+}
+
 fn main() -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "rustboard_agent=info".into());
@@ -273,13 +325,14 @@ fn main() -> Result<()> {
                 )
             })?;
             let agent_id = std::fs::read_to_string(cfg.data_dir.join(AGENT_ID))
+                .ok()
                 .map(|s| s.trim().to_string())
-                .unwrap_or_else(|_| "未纳管".to_string());
-            let enrolled = is_enrolled(&cfg);
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| "未纳管".to_string());
             println!("配置文件: {}", path.display());
-            println!("hub: {}", cfg.hub_url);
+            println!("hub: {}", hub_endpoint_for_display(&cfg.hub_url));
             println!("agent_id: {agent_id}");
-            println!("纳管状态: {}", if enrolled { "已纳管" } else { "未纳管" });
+            println!("纳管状态: {}", enrollment_status(&cfg));
             println!("采样间隔: {}ms", cfg.sample_interval_ms);
             println!("数据目录: {}", cfg.data_dir.display());
             Ok(())
@@ -323,7 +376,55 @@ fn main() -> Result<()> {
         Cmd::Renew { config } => renew(config),
         Cmd::Install(args) => install_cmd::install(args),
         Cmd::Uninstall(args) => install_cmd::uninstall(args),
+        Cmd::Buffer { cmd } => match cmd {
+            BufferCmd::Repair { config, from_start } => buffer_repair(config, from_start),
+        },
     }
+}
+
+/// `buffer repair --from-start`：显式重置读偏移，允许重发已 ACK 前缀。
+///
+/// 不做任何自动判断：必须传 `--from-start`。真正的磁盘操作在
+/// `rustboard_core::buffer::repair_from_start`，它只改两条 meta，不改日志。
+fn buffer_repair(config: Option<PathBuf>, from_start: bool) -> Result<()> {
+    if !from_start {
+        bail!(
+            "拒绝执行：必须显式指定 --from-start。该操作会把缓冲读偏移重置到 0，\
+             重发已 ACK 的批次，依赖 hub 按 (agent_id, epoch, seq) 判重。"
+        );
+    }
+    let path = config.unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_CONFIG));
+    let cfg = AgentConfig::load(&path).with_context(|| {
+        format!(
+            "读取配置失败: {}（先执行 rustboard-agent init）",
+            path.display()
+        )
+    })?;
+    cfg.validate().context("缓冲修复前配置校验失败")?;
+    let report = rustboard_core::buffer::repair_from_start(&cfg.data_dir)
+        .with_context(|| format!("修复本地缓冲失败: {}", cfg.data_dir.display()))?;
+    println!("缓冲目录: {}", cfg.data_dir.display());
+    println!("buffer.log: {} 字节（未被修改）", report.log_bytes);
+    println!(
+        "修复前 meta: primary {}，backup {}",
+        if report.had_primary {
+            "存在"
+        } else {
+            "不存在"
+        },
+        if report.had_backup {
+            "存在"
+        } else {
+            "不存在"
+        }
+    );
+    println!("已将读偏移重置为 0（primary 与 backup 均为 0）。");
+    println!("请确认 agent 已停止后再继续：本命令不获取运行锁。");
+    println!(
+        "下次启动会从日志开头恢复；已 ACK 批次可能重发，由 hub 按 \
+         (agent_id, epoch, seq) 判重，不会重复入库。"
+    );
+    Ok(())
 }
 
 /// 实现 `agent init`：组装默认配置 → 校验 → 落盘。
@@ -377,12 +478,31 @@ fn init_agent(
         .context("init 参数校验失败（检查 --data-dir、--hub 等）")?;
     cfg.save(path)?;
     println!("已写入配置: {}", path.display());
-    println!("hub 地址: {}", cfg.hub_url);
+    println!("hub 地址: {}", hub_endpoint_for_display(&cfg.hub_url));
     println!("\n下一步: rustboard-agent run --config {}", path.display());
     Ok(())
 }
 
 fn run(cfg: AgentConfig) -> Result<()> {
+    // #48：显式 opt-in 的非回环明文连接在启动时告警。只记录主机名与端口，
+    // 不打印 hub_url（可能含 userinfo）或 token。
+    if cfg.hub_url.starts_with("ws://") && cfg.allow_insecure_ws {
+        match ws_url_host_port(&cfg.hub_url) {
+            Ok((host, port)) if !is_loopback_host(&host) => {
+                tracing::warn!(
+                    host = %host,
+                    port,
+                    "allow_insecure_ws=true：正在用明文 ws:// 连接非回环 hub，\
+                     token 与采样数据将以明文传输（仅限开发 / 隔离网络）"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                // 配置校验已保证 URL 合法；这里只防御性记录，不回显 URL。
+                tracing::warn!(error = %err, "解析 hub_url 失败，无法检查明文连接范围");
+            }
+        }
+    }
     // config.rs 只校验下界；这里补上限，避免本地配置本身就忙采/形同停采。
     validate_sample_interval_config(cfg.sample_interval_ms)?;
     // M3：文件日志来源的父目录 / 符号链接必须在启动前检查，坏配置直接拒绝启动。
@@ -409,13 +529,22 @@ fn prepare_data_dir(data_dir: &Path) -> Result<()> {
 async fn run_async(cfg: AgentConfig) -> Result<()> {
     prepare_data_dir(&cfg.data_dir)?;
 
-    // 没纳管过就先走 enrollment；拿到证书后再开始采集，避免用临时 agent_id 产生脏数据。
-    if !is_enrolled(&cfg) {
-        tracing::info!("尚未纳管，开始 enrollment");
-        ensure_enrolled(&cfg).await?;
-    }
-
-    let agent_id = load_or_create_agent_id(&cfg.data_dir)?;
+    // 先解析纳管状态：旧安装补 marker、缺 ID 从证书恢复；半完成状态 fail-closed。
+    // 绝不在仅缺 marker/ID 时重新 enrollment（那会消耗新 token 并产生错误身份）。
+    let state = resolve_enrollment(&cfg)?;
+    let agent_id = match state {
+        EnrollmentState::Fresh => {
+            tracing::info!("尚未纳管，开始 enrollment");
+            ensure_enrolled(&cfg).await?;
+            match resolve_enrollment(&cfg)? {
+                EnrollmentState::Ready { agent_id } => agent_id,
+                EnrollmentState::Fresh => {
+                    bail!("enrollment 完成后仍未检测到完整身份（缺少证书/secret/完成标记）")
+                }
+            }
+        }
+        EnrollmentState::Ready { agent_id } => agent_id,
+    };
     let boot = boot_id();
     let epoch = now_ms() as u64;
     // 会话最长存活时间的抖动种子：启动时刻派生，进程生命周期内固定。
@@ -519,7 +648,7 @@ async fn run_async(cfg: AgentConfig) -> Result<()> {
         match connect(&cfg, true).await {
             Ok(ws) => {
                 backoff_secs = 1;
-                tracing::info!(url = %cfg.hub_url, "已连接 hub");
+                tracing::info!(endpoint = %hub_endpoint_for_display(&cfg.hub_url), "已连接 hub");
                 let session_result =
                     run_session_with_deadline(ws, &session_ctx, &buffer, &notify).await;
                 if let Err(err) = session_result {
@@ -594,6 +723,46 @@ fn cert_check_due(days_left: i64, threshold: i64, now_ms: i64, last_attempt_ms: 
     now_ms.saturating_sub(last_attempt_ms) >= CERT_RENEW_RETRY_MS
 }
 
+/// 会话内周期证书检查的 deadline 与退避状态（#44）。
+///
+/// 旧实现只在「本地缓冲为空」分支检查证书：持续有 pending 批次时，
+/// `cert_timer` 分支永远抢不到执行机会，超长 backlog 会把续签窗口饿死。
+/// 现在同一个 deadline 既供空闲分支等待，也在每批 ACK 后、下一批发送前检查。
+struct CertCheckState {
+    period: Duration,
+    next_check: tokio::time::Instant,
+    /// 上次尝试续签的时间；失败后由 [`cert_check_due`] 做 1 小时退避。
+    last_attempt_ms: i64,
+}
+
+impl CertCheckState {
+    fn new(period: Duration) -> Self {
+        Self {
+            period,
+            next_check: tokio::time::Instant::now() + period,
+            last_attempt_ms: 0,
+        }
+    }
+
+    fn next_deadline(&self) -> tokio::time::Instant {
+        self.next_check
+    }
+
+    /// deadline 到期时推进到下一周期并返回 true；未到期返回 false。
+    fn take_if_due(&mut self, now: tokio::time::Instant) -> bool {
+        if now < self.next_check {
+            return false;
+        }
+        self.next_check = now + self.period;
+        true
+    }
+
+    #[cfg(test)]
+    fn force_due(&mut self) {
+        self.next_check = tokio::time::Instant::now();
+    }
+}
+
 /// 读取本地客户端证书剩余寿命（天 + 小时），同一份 PEM 只读一次。
 ///
 /// `cert.days_left` 保留给旧面板 / 旧规则；`cert.hours_left` 供按小时配置的
@@ -649,10 +818,326 @@ async fn run_session_with_deadline(
     }
 }
 
+/// 便宜的纳管状态检查：marker + 五个身份文件都存在且非空。
+///
+/// 只用于 `info` 等展示路径；启动路径必须走 [`resolve_enrollment`] 校验内容。
 fn is_enrolled(cfg: &AgentConfig) -> bool {
-    cfg.data_dir.join(AGENT_CERT).exists()
-        && cfg.data_dir.join(AGENT_KEY).exists()
-        && cfg.data_dir.join(AGENT_SECRET).exists()
+    ENROLLED_FILES
+        .iter()
+        .all(|name| file_is_nonempty(&cfg.data_dir.join(name)))
+        && file_is_nonempty(&cfg.data_dir.join(ENROLLMENT_MARKER))
+}
+
+/// `info` 展示用的只读状态：旧安装缺 marker 时不能误报“未纳管”。
+///
+/// 该函数绝不写盘；真正的迁移/恢复由 [`resolve_enrollment`] 在启动时执行。
+fn enrollment_status(cfg: &AgentConfig) -> &'static str {
+    let identity = ENROLLED_FILES
+        .iter()
+        .all(|name| file_is_nonempty(&cfg.data_dir.join(name)));
+    let marker = file_is_nonempty(&cfg.data_dir.join(ENROLLMENT_MARKER));
+    let any_credential = [AGENT_CERT, AGENT_KEY, AGENT_SECRET]
+        .iter()
+        .any(|name| file_is_nonempty(&cfg.data_dir.join(name)));
+    if is_enrolled(cfg) {
+        "已纳管"
+    } else if identity {
+        "已纳管（旧安装缺少 enrollment.complete，启动 run 时会校验并补齐）"
+    } else if !any_credential && !marker {
+        "未纳管"
+    } else {
+        "未完成（身份文件不完整，启动会 fail-closed；请恢复备份或重新纳管）"
+    }
+}
+
+/// 文件存在、是普通文件且非空（符号链接一律不算）。
+fn file_is_nonempty(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.file_type().is_file() && meta.len() > 0,
+        Err(_) => false,
+    }
+}
+
+/// 读取可选文本文件；缺失或只有空白时返回 `None`，其他 I/O 错误上抛。
+fn read_identity_text(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => Ok(Some(text)),
+        Ok(_) => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("读取 {} 失败", path.display())),
+    }
+}
+
+fn read_required_identity_text(path: &Path) -> Result<String> {
+    read_identity_text(path)?.with_context(|| format!("{} 缺失或为空", path.display()))
+}
+
+fn join_names(names: &[&str]) -> String {
+    if names.is_empty() {
+        "无".to_string()
+    } else {
+        names.join("、")
+    }
+}
+
+/// 半完成 / 损坏身份的统一错误：只给可操作指引，不读取也不回显 secret。
+fn incomplete_enrollment_error(dir: &Path, present: &[&str], missing: &[&str]) -> anyhow::Error {
+    anyhow!(
+        "enrollment 未完成：{} 已存在，但 {} 缺失或为空。为防身份错乱，agent 不会重新纳管、\
+         不会生成随机 agent_id、也不会覆盖现有文件；请从备份恢复数据目录 {}，\
+         或删除全部残留凭据后使用新的 enrollment token 重新纳管",
+        join_names(present),
+        join_names(missing),
+        dir.display()
+    )
+}
+
+fn parse_enrollment_marker(dir: &Path, raw: &str) -> Result<EnrollmentMarker> {
+    let path = dir.join(ENROLLMENT_MARKER);
+    let marker: EnrollmentMarker = serde_json::from_str(raw).with_context(|| {
+        format!(
+            "{} 内容损坏，无法确认纳管状态；请从备份恢复该文件，\
+             不要删除其他身份文件（agent 不会重新纳管）",
+            path.display()
+        )
+    })?;
+    if marker.agent_id.trim().is_empty() {
+        bail!("{} 的 agent_id 为空；请从备份恢复", path.display());
+    }
+    let digest = marker.cert_sha256.trim();
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!(
+            "{} 的 cert_sha256 不是合法 SHA-256 hex；请从备份恢复",
+            path.display()
+        );
+    }
+    Ok(marker)
+}
+
+fn read_enrollment_marker(dir: &Path) -> Result<Option<EnrollmentMarker>> {
+    let path = dir.join(ENROLLMENT_MARKER);
+    match read_identity_text(&path)? {
+        Some(raw) => Ok(Some(parse_enrollment_marker(dir, &raw)?)),
+        None => Ok(None),
+    }
+}
+
+fn cert_sha256(cert_pem: &str) -> Result<String> {
+    tls::fingerprint_of_pem(cert_pem).context("计算客户端证书 SHA-256 失败")
+}
+
+/// 原子写完成标记（0600）。调用方必须已经写完 cert/key/secret/CA/agent_id。
+fn write_enrollment_marker(
+    dir: &Path,
+    agent_id: &str,
+    cert_pem: &str,
+    created_at: i64,
+) -> Result<()> {
+    let marker = EnrollmentMarker {
+        agent_id: agent_id.trim().to_string(),
+        cert_sha256: cert_sha256(cert_pem)?,
+        created_at,
+    };
+    let encoded = serde_json::to_vec(&marker).context("编码 enrollment.complete 失败")?;
+    let path = dir.join(ENROLLMENT_MARKER);
+    fsutil::atomic_write(&path, &encoded, 0o600)
+        .with_context(|| format!("写入 {} 失败（完成标记必须最后落盘）", path.display()))?;
+    Ok(())
+}
+
+/// 证书续签后刷新 marker 的证书指纹，保留原 `created_at`（纳管完成时间）。
+fn refresh_enrollment_marker(dir: &Path, agent_id: &str, cert_pem: &str) -> Result<()> {
+    let created_at = read_enrollment_marker(dir)?
+        .map(|marker| marker.created_at)
+        .unwrap_or_else(now_ms);
+    write_enrollment_marker(dir, agent_id, cert_pem, created_at)
+}
+
+/// 已纳管时只读 marker / agent_id 并校验身份，**绝不再生成随机 UUID**。
+///
+/// 历史名称保留（调用点与测试沿用）；半完成或损坏状态返回可操作错误，
+/// 调用方必须先经过 [`resolve_enrollment`] 的恢复 / 迁移流程。
+fn load_or_create_agent_id(dir: &Path) -> Result<String> {
+    let marker_path = dir.join(ENROLLMENT_MARKER);
+    let raw = read_identity_text(&marker_path)?.with_context(|| {
+        format!(
+            "尚未纳管：缺少 {}；请先执行 rustboard-agent run（不会生成随机 agent_id）",
+            marker_path.display()
+        )
+    })?;
+    let marker = parse_enrollment_marker(dir, &raw)?;
+
+    let id_path = dir.join(AGENT_ID);
+    let agent_id = read_identity_text(&id_path)?
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .with_context(|| {
+            format!(
+                "enrollment.complete 存在但 {} 缺失或为空；请从备份恢复（不会生成随机 agent_id）",
+                id_path.display()
+            )
+        })?;
+    if marker.agent_id != agent_id {
+        bail!(
+            "agent_id（{agent_id}）与 enrollment.complete 记录的 {} 不一致；请从备份恢复",
+            marker.agent_id
+        );
+    }
+
+    for name in ENROLLED_FILES {
+        if !file_is_nonempty(&dir.join(name)) {
+            bail!("已纳管状态缺少 {name}；请从备份恢复数据目录，agent 不会重新纳管");
+        }
+    }
+    let cert = read_required_identity_text(&dir.join(AGENT_CERT))?;
+    let key = read_required_identity_text(&dir.join(AGENT_KEY))?;
+    let ca = read_required_identity_text(&dir.join(AGENT_CA))?;
+    let summary = tls::cert_summary(&cert).context("解析 agent.crt 失败")?;
+    if summary.common_name.as_deref() != Some(agent_id.as_str()) {
+        bail!(
+            "agent.crt 的 CN（{}）与 agent_id（{agent_id}）不一致；请从备份恢复",
+            summary.common_name.as_deref().unwrap_or("(无)")
+        );
+    }
+    if !tls::cert_matches_key(&cert, &key).context("校验 agent.crt 与 agent.key 失败")? {
+        bail!("agent.crt 与 agent.key 不配套；请从备份恢复");
+    }
+    tls::load_certs(&ca).context("解析 ca.crt 失败；请从备份恢复")?;
+    let expected = cert_sha256(&cert)?;
+    if !marker.cert_sha256.eq_ignore_ascii_case(&expected) {
+        bail!(
+            "enrollment.complete 与 agent.crt 不一致；请从备份恢复，\
+             或执行 rustboard-agent run 按当前证书修复"
+        );
+    }
+    Ok(agent_id)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EnrollmentState {
+    /// 没有任何客户端凭据，可以安全地走 enrollment。
+    Fresh,
+    /// 身份完整（必要时已补齐 marker / 恢复 agent_id）。
+    Ready { agent_id: String },
+}
+
+/// 启动时解析纳管状态：补 marker、恢复缺失 ID，或对半完成状态 fail-closed。
+///
+/// 判定顺序：
+/// 1. marker 存在 / 任一客户端凭据存在 → 按「已纳管或半完成」处理，绝不重新纳管；
+/// 2. cert/key/secret/CA 缺任一 → 报错并保留现场；
+/// 3. agent_id 缺失 → 用 marker 记录或证书 CN 恢复，不生成随机 UUID；
+/// 4. marker 缺失 → 全部身份校验通过后最后补写；
+/// 5. marker 指纹与当前证书不一致 → 仅在 cert/key/CN 全部一致时按当前证书修复。
+fn resolve_enrollment(cfg: &AgentConfig) -> Result<EnrollmentState> {
+    let dir = &cfg.data_dir;
+    let marker = read_enrollment_marker(dir)?;
+    let has_credential = [AGENT_CERT, AGENT_KEY, AGENT_SECRET]
+        .iter()
+        .any(|name| file_is_nonempty(&dir.join(name)));
+
+    let mut present: Vec<&str> = ENROLLED_FILES
+        .iter()
+        .copied()
+        .filter(|name| file_is_nonempty(&dir.join(name)))
+        .collect();
+    if marker.is_some() {
+        present.push(ENROLLMENT_MARKER);
+    }
+
+    if marker.is_none() && !has_credential {
+        // 没有任何客户端凭据：全新安装。残留的 ca.crt / agent_id 不构成可用身份，
+        // 正常 enrollment 会用新值覆盖它们，因此这里不阻止。
+        return Ok(EnrollmentState::Fresh);
+    }
+
+    let missing: Vec<&str> = [AGENT_CERT, AGENT_KEY, AGENT_SECRET, AGENT_CA]
+        .into_iter()
+        .filter(|name| !file_is_nonempty(&dir.join(name)))
+        .collect();
+    if !missing.is_empty() {
+        return Err(incomplete_enrollment_error(dir, &present, &missing));
+    }
+
+    let cert = read_required_identity_text(&dir.join(AGENT_CERT))?;
+    let key = read_required_identity_text(&dir.join(AGENT_KEY))?;
+    let ca = read_required_identity_text(&dir.join(AGENT_CA))?;
+    let agent_id_on_disk = read_identity_text(&dir.join(AGENT_ID))?
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+
+    let summary = tls::cert_summary(&cert).context(
+        "解析 agent.crt 失败；无法确认已纳管身份，拒绝重新纳管或覆盖现有文件（请从备份恢复）",
+    )?;
+    let common_name = summary.common_name.filter(|name| !name.trim().is_empty()).context(
+        "agent.crt 没有可解析的 CN；无法恢复 agent_id，也不会生成随机身份（请从备份恢复或重新纳管）",
+    )?;
+    if !tls::cert_matches_key(&cert, &key).context("校验 agent.crt 与 agent.key 配套关系失败")?
+    {
+        bail!("agent.crt 与 agent.key 不配套；拒绝覆盖现有身份（请从备份恢复或重新纳管）");
+    }
+    tls::load_certs(&ca).context("解析 ca.crt 失败；CA 缺失或损坏时不会猜测信任模型")?;
+
+    let (agent_id, marker) = match (agent_id_on_disk, marker) {
+        (Some(agent_id), marker) => {
+            if common_name != agent_id {
+                bail!(
+                    "agent.crt 的 CN（{common_name}）与 agent_id（{agent_id}）不一致；\
+                     拒绝重新纳管或覆盖现有身份（请从备份恢复）"
+                );
+            }
+            (agent_id, marker)
+        }
+        (None, marker) => {
+            // 只缺 agent_id：优先用 marker 记录的 ID，其次从证书 CN 恢复。
+            // 两条路径都不生成随机 UUID。
+            let recovered = match &marker {
+                Some(marker) => marker.agent_id.clone(),
+                None => common_name.clone(),
+            };
+            if common_name != recovered {
+                bail!(
+                    "agent.crt 的 CN（{common_name}）与待恢复的 agent_id（{recovered}）不一致；\
+                     拒绝生成新身份（请从备份恢复）"
+                );
+            }
+            let id_path = dir.join(AGENT_ID);
+            fsutil::atomic_write(&id_path, recovered.as_bytes(), 0o644)
+                .with_context(|| format!("恢复 agent_id 失败: {}", id_path.display()))?;
+            tracing::info!(agent = %recovered, "agent_id 缺失，已从证书 CN / 完成标记恢复");
+            (recovered, marker)
+        }
+    };
+
+    match marker {
+        Some(marker) => {
+            if marker.agent_id != agent_id {
+                bail!(
+                    "enrollment.complete 记录的 agent_id（{}）与 agent_id 文件（{agent_id}）不一致；\
+                     拒绝覆盖现有身份（请从备份恢复）",
+                    marker.agent_id
+                );
+            }
+            let expected = cert_sha256(&cert)?;
+            if !marker.cert_sha256.eq_ignore_ascii_case(&expected) {
+                // 证书续签在「证书已落盘、marker 未更新」之间崩溃会走到这里。
+                // cert/key/CN 已全部校验，按当前证书修复 marker，不覆盖身份文件。
+                tracing::warn!(
+                    agent = %agent_id,
+                    "enrollment.complete 的证书指纹与当前 agent.crt 不一致，按当前证书修复标记"
+                );
+                write_enrollment_marker(dir, &agent_id, &cert, marker.created_at)?;
+            }
+        }
+        None => {
+            write_enrollment_marker(dir, &agent_id, &cert, now_ms())?;
+            tracing::info!(agent = %agent_id, "enrollment 缺少完成标记，已校验身份并补齐");
+        }
+    }
+
+    // 统一走只读加载器做最终校验：marker + 五个文件 + 身份一致。
+    let agent_id = load_or_create_agent_id(dir)?;
+    Ok(EnrollmentState::Ready { agent_id })
 }
 
 /// 读取已纳管 agent 的客户端证书与私钥。
@@ -846,16 +1331,76 @@ fn tls_connector(
 }
 
 async fn connect(cfg: &AgentConfig, with_client_cert: bool) -> Result<WsStream> {
-    let connector = tls_connector(cfg, with_client_cert)?;
+    // #48：非回环明文连接必须在发出任何网络请求之前失败。配置校验之外
+    // 再加一道闸，避免调用方绕过 `AgentConfig::validate()`。
+    cfg.validate_plaintext_ws_policy()
+        .context("拒绝明文 ws:// 连接")?;
 
-    let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
-        cfg.hub_url.as_str(),
-        None,
-        false,
-        connector,
-    )
-    .await?;
-    Ok(ws)
+    let connector = tls_connector(cfg, with_client_cert)?;
+    let (host, port) =
+        ws_url_host_port(&cfg.hub_url).map_err(|err| anyhow!("hub_url 无效: {err}"))?;
+    let request = cfg
+        .hub_url
+        .as_str()
+        .into_client_request()
+        .context("hub_url 不是合法的 WebSocket URL")?;
+
+    // #42：DNS / TCP / TLS / HTTP 101 共用一个绝对 deadline；任一步超时都
+    // 返回可重试错误，由 run_async 的指数退避接管。
+    let timeout = Duration::from_secs(cfg.connect_timeout_secs);
+    let deadline = tokio::time::Instant::now() + timeout;
+    // 错误只展示 host:port，不回显完整 hub_url（可能含 userinfo）。
+    let endpoint = format!("{host}:{port}");
+    let timeout_message = || {
+        anyhow!(
+            "连接 hub 超时（{} 秒，覆盖 DNS/TCP/TLS/101）: {endpoint}",
+            cfg.connect_timeout_secs
+        )
+    };
+
+    let attempt = async move {
+        // DNS 必须在 deadline 内完成：`lookup_host` 把 getaddrinfo 交给 blocking
+        // 线程，但等待本身可被取消，不会在 timeout 内同步阻塞 runtime。
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .with_context(|| format!("解析 hub 主机失败: {host}:{port}"))?
+            .collect();
+        if addrs.is_empty() {
+            bail!("hub 主机没有可用地址: {host}:{port}");
+        }
+
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut tcp = None;
+        for addr in addrs {
+            match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => {
+                    tcp = Some(stream);
+                    break;
+                }
+                Ok(Err(err)) => {
+                    last_error =
+                        Some(anyhow::Error::new(err).context(format!("TCP 连接 {addr} 失败")));
+                }
+                // deadline 已到：不再尝试后续地址，交给外层统一报超时。
+                Err(_) => break,
+            }
+        }
+        let Some(tcp) = tcp else {
+            return Err(last_error.unwrap_or_else(|| anyhow!("连接 hub 超时（{host}:{port}）")));
+        };
+
+        // TLS 握手与 HTTP 101 仍受同一个 deadline 约束。
+        let (ws, _resp) =
+            tokio_tungstenite::client_async_tls_with_config(request, tcp, None, connector)
+                .await
+                .context("WebSocket（TLS/101）握手失败")?;
+        Ok::<WsStream, anyhow::Error>(ws)
+    };
+
+    match tokio::time::timeout_at(deadline, attempt).await {
+        Ok(result) => result,
+        Err(_) => Err(timeout_message()),
+    }
 }
 
 enum EnrollError {
@@ -909,6 +1454,31 @@ async fn try_enroll(cfg: &AgentConfig) -> std::result::Result<(), EnrollError> {
 
     match frame {
         Frame::Enrolled(resp) => {
+            // #45：先把 hub 返回的全部材料校验一遍。任何校验失败都在写盘之前
+            // 返回，不能留下“有 cert/key/secret 无 marker”的半完成身份。
+            if resp.agent_secret.trim().is_empty() {
+                return Err(EnrollError::Fatal(anyhow!(
+                    "hub 返回的 agent secret 为空，拒绝写入身份"
+                )));
+            }
+            if !tls::cert_matches_key(&resp.cert_pem, &key_pem)
+                .map_err(|e| EnrollError::Fatal(anyhow!("校验纳管证书与私钥失败: {e}")))?
+            {
+                return Err(EnrollError::Fatal(anyhow!(
+                    "hub 返回的证书与本机私钥不配套，拒绝写入身份"
+                )));
+            }
+            let cn = tls::cert_summary(&resp.cert_pem)
+                .map_err(|e| EnrollError::Fatal(anyhow!("解析纳管证书失败: {e}")))?
+                .common_name;
+            if cn.as_deref() != Some(resp.agent_id.as_str()) {
+                return Err(EnrollError::Fatal(anyhow!(
+                    "hub 返回的证书 CN 与分配的 agent_id 不一致，拒绝写入身份"
+                )));
+            }
+            tls::load_certs(&resp.ca_pem)
+                .map_err(|e| EnrollError::Fatal(anyhow!("解析 hub 下发的 CA 证书失败: {e}")))?;
+
             // 证书是公开材料；私钥与 agent secret 从创建起就是 0600。
             fsutil::atomic_write(
                 &cfg.data_dir.join(AGENT_CERT),
@@ -932,6 +1502,10 @@ async fn try_enroll(cfg: &AgentConfig) -> std::result::Result<(), EnrollError> {
                 0o644,
             )
             .map_err(|e| EnrollError::Fatal(anyhow!("写入 agent_id 失败: {e}")))?;
+            // 五个身份文件写完后再最后原子写完成标记。marker 缺失时下次启动会走
+            // 「旧安装校验后补 marker」，不会重新 enrollment / 换身份。
+            write_enrollment_marker(&cfg.data_dir, &resp.agent_id, &resp.cert_pem, now_ms())
+                .map_err(|e| EnrollError::Fatal(anyhow!("写入 enrollment.complete 失败: {e}")))?;
             tracing::info!(agent = %resp.agent_id, "纳管成功");
             Ok(())
         }
@@ -1110,6 +1684,72 @@ where
     renew_client_cert(sink, stream, cfg, agent_id).await
 }
 
+/// 把已经完成、但还排在 channel 里的控制应答写回 hub（不等待新结果）。
+///
+/// 续签最多会占用 stream 20s，而 hub 侧控制命令有 15s 超时；进入续签前先 drain，
+/// 避免已经执行完的应答被压在 channel 里直到超时。发送失败说明连接不可用，
+/// 向上传播由会话结束处理。
+async fn drain_control_responses<Si>(
+    sink: &mut Si,
+    control_rx: &mut tokio::sync::mpsc::Receiver<ControlResponse>,
+    cfg: &AgentConfig,
+) -> Result<()>
+where
+    Si: Sink<Message, Error = WsError> + Unpin,
+{
+    while let Ok(response) = control_rx.try_recv() {
+        send_frame_with_config(sink, &Frame::ControlResponse(response), cfg).await?;
+    }
+    Ok(())
+}
+
+/// 周期证书检查 deadline 到点时执行一次检查（#44）。
+///
+/// 空闲分支与「每批 ACK 之后」共用；检查失败只 WARN，不影响会话，也不丢
+/// 已经完成 ACK 的批次。只有写超时说明连接可能已半死，必须向上传播重连。
+///
+/// 进入续签前先 drain 已完成控制应答：续签会长时间占用 stream，不能让 hub 的
+/// 控制命令因等待写回而超时。
+async fn run_cert_check_if_due<Si, St>(
+    sink: &mut Si,
+    stream: &mut St,
+    control_rx: &mut tokio::sync::mpsc::Receiver<ControlResponse>,
+    cfg: &AgentConfig,
+    agent_id: &str,
+    cert_check: &mut CertCheckState,
+) -> Result<()>
+where
+    Si: Sink<Message, Error = WsError> + Unpin,
+    St: Stream<Item = std::result::Result<Message, WsError>> + Unpin,
+{
+    if !cert_check.take_if_due(tokio::time::Instant::now()) {
+        return Ok(());
+    }
+    drain_control_responses(sink, control_rx, cfg).await?;
+    match client_cert_days_left(cfg) {
+        Ok(days_left) => {
+            let now = now_ms();
+            let threshold = i64::from(cfg.cert_renew_before_days);
+            if cert_check_due(days_left, threshold, now, cert_check.last_attempt_ms) {
+                cert_check.last_attempt_ms = now;
+                tracing::info!(days_left, threshold, "周期证书检查：进入续签窗口");
+                if let Err(err) = maybe_renew_client_cert(sink, stream, cfg, agent_id).await {
+                    if is_send_timeout_error(&err) {
+                        return Err(err);
+                    }
+                    tracing::warn!(error = %err, "周期证书续签失败，本次会话继续");
+                }
+            } else {
+                tracing::debug!(days_left, threshold, "周期证书检查：尚未进入续签窗口");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "周期证书检查读取本地证书失败");
+        }
+    }
+    Ok(())
+}
+
 /// 校验 hub 返回的新证书，确认它可以真的用来连接。
 ///
 /// 五项检查（任一不满足都不覆盖旧证书）：
@@ -1230,6 +1870,15 @@ where
     let cert_path = cfg.data_dir.join(AGENT_CERT);
     fsutil::atomic_write(&cert_path, cert_pem.as_bytes(), 0o644)
         .with_context(|| format!("写入客户端证书失败: {}", cert_path.display()))?;
+
+    // #45：marker 绑定证书指纹；续签后必须同步更新。即使这里失败，证书本身
+    // 已校验并落盘，下次启动会按当前证书修复 marker（只改标记，不覆盖身份）。
+    if let Err(err) = refresh_enrollment_marker(&cfg.data_dir, agent_id, &cert_pem) {
+        tracing::warn!(
+            error = %err,
+            "更新 enrollment.complete 失败；下次启动会按当前证书修复完成标记"
+        );
+    }
 
     let days_left = tls::days_left(&cert_pem, now_ms())?;
     tracing::info!(
@@ -1367,6 +2016,52 @@ where
     }
 }
 
+/// 发送本地缓冲里的 pending 批次，逐批等待 ACK。
+///
+/// 每批 ACK 完成、下一批发送之前检查一次证书 deadline（#44）：持续有 backlog
+/// 时也不会饿死周期续签，同时不丢当前批 ACK。返回本轮处理的批次数。
+#[allow(clippy::too_many_arguments)]
+async fn upload_pending_batches<Si, St>(
+    sink: &mut Si,
+    stream: &mut St,
+    buffer: &Arc<Mutex<DiskBuffer>>,
+    control_rx: &mut tokio::sync::mpsc::Receiver<ControlResponse>,
+    dispatcher: &control::ControlDispatcher,
+    cfg: &AgentConfig,
+    agent_id: &str,
+    cert_check: &mut CertCheckState,
+) -> Result<usize>
+where
+    Si: Sink<Message, Error = WsError> + Unpin,
+    St: Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let send_timeout = Duration::from_secs(cfg.send_timeout_secs);
+    let batches = {
+        let mut guard = buffer.lock().await;
+        guard.read_next(16)?
+    };
+    let count = batches.len();
+    for batch in batches {
+        let (batch_epoch, batch_seq) = (batch.epoch, batch.seq);
+        send_frame_with_config(sink, &Frame::Batch(batch), cfg).await?;
+        // ACK 的 20s 预算从 Batch 写成功之后开始，不受发送超时影响。
+        wait_for_ack(
+            sink,
+            stream,
+            control_rx,
+            dispatcher,
+            send_timeout,
+            batch_epoch,
+            batch_seq,
+        )
+        .await?;
+        buffer.lock().await.ack(batch_epoch, batch_seq)?;
+        // 此刻没有在途 ACK，可以安全地在同一个 stream 上做周期证书检查。
+        run_cert_check_if_due(sink, stream, control_rx, cfg, agent_id, cert_check).await?;
+    }
+    Ok(count)
+}
+
 async fn session(
     ws: WsStream,
     ctx: &SessionContext<'_>,
@@ -1411,104 +2106,72 @@ async fn session(
     ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // KI-12：会话空闲时也要周期检查客户端证书。`session_max_hours = 0` 只表示
-    // 不主动重连，不能跳过续签窗口；定时器与 session_deadline 相互独立。
-    let mut cert_timer =
-        tokio::time::interval(cert_check_period(ctx.cfg.cert_check_interval_hours));
-    cert_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // 第一次 tick 立即完成：握手后已经检查过一次，跳过这次立即检查。
-    cert_timer.tick().await;
-    let mut last_cert_attempt_ms = 0i64;
+    // 不主动重连，不能跳过续签窗口；deadline 与 session_deadline 相互独立。
+    // #44：同一个 deadline 还会在每批 ACK 后检查，避免持续 backlog 饿死续签。
+    let mut cert_check = CertCheckState::new(cert_check_period(ctx.cfg.cert_check_interval_hours));
     // M3：控制请求由独立任务执行，应答经 channel 回到会话循环统一写 sink。
     // 这样控制执行不会阻塞采集、ACK 或心跳；sink 仍然只有一个写者。
     let (dispatcher, mut control_rx) = control::ControlDispatcher::new(ctx.cfg.control.clone());
 
     loop {
-        let batches = {
-            let mut guard = buffer.lock().await;
-            guard.read_next(16)?
-        };
-
-        if batches.is_empty() {
-            tokio::select! {
-                _ = ping_timer.tick() => {
-                    send_frame_with_config(&mut sink, &Frame::Ping { ts: now_ms() }, ctx.cfg)
-                        .await?;
-                }
-                _ = cert_timer.tick() => {
-                    // 只在无在途批次（本分支）检查，避免与 ACK 等待争抢同一个 stream。
-                    match client_cert_days_left(ctx.cfg) {
-                        Ok(days_left) => {
-                            let now = now_ms();
-                            let threshold = i64::from(ctx.cfg.cert_renew_before_days);
-                            if cert_check_due(days_left, threshold, now, last_cert_attempt_ms) {
-                                last_cert_attempt_ms = now;
-                                tracing::info!(days_left, threshold, "周期证书检查：进入续签窗口");
-                                if let Err(err) = maybe_renew_client_cert(
-                                    &mut sink,
-                                    &mut stream,
-                                    ctx.cfg,
-                                    ctx.agent_id,
-                                )
-                                .await
-                                {
-                                    if is_send_timeout_error(&err) {
-                                        return Err(err);
-                                    }
-                                    tracing::warn!(error = %err, "周期证书续签失败，本次会话继续");
-                                }
-                            } else {
-                                tracing::debug!(days_left, threshold, "周期证书检查：尚未进入续签窗口");
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(error = %err, "周期证书检查读取本地证书失败");
-                        }
-                    }
-                }
-                _ = notify.notified() => {}
-                Some(response) = control_rx.recv() => {
-                    send_frame_with_config(
-                        &mut sink,
-                        &Frame::ControlResponse(response),
-                        ctx.cfg,
-                    )
-                    .await?;
-                }
-                incoming = stream.next() => {
-                    match incoming {
-                        Some(Ok(Message::Close(_))) | None => bail!("hub 关闭了连接"),
-                        Some(Ok(Message::Binary(bytes))) => {
-                            handle_side_frame(
-                                &mut sink,
-                                &dispatcher,
-                                send_timeout,
-                                classify_incoming(bytes.as_ref()),
-                            )
-                            .await?;
-                        }
-                        Some(Ok(_)) => {}
-                        Some(Err(err)) => return Err(err.into()),
-                    }
-                }
-            }
+        let uploaded = upload_pending_batches(
+            &mut sink,
+            &mut stream,
+            buffer,
+            &mut control_rx,
+            &dispatcher,
+            ctx.cfg,
+            ctx.agent_id,
+            &mut cert_check,
+        )
+        .await?;
+        if uploaded > 0 {
             continue;
         }
 
-        for batch in batches {
-            let (batch_epoch, batch_seq) = (batch.epoch, batch.seq);
-            send_frame_with_config(&mut sink, &Frame::Batch(batch), ctx.cfg).await?;
-            // ACK 的 20s 预算从 Batch 写成功之后开始，不受发送超时影响。
-            wait_for_ack(
-                &mut sink,
-                &mut stream,
-                &mut control_rx,
-                &dispatcher,
-                send_timeout,
-                batch_epoch,
-                batch_seq,
-            )
-            .await?;
-            buffer.lock().await.ack(batch_epoch, batch_seq)?;
+        tokio::select! {
+            _ = ping_timer.tick() => {
+                send_frame_with_config(&mut sink, &Frame::Ping { ts: now_ms() }, ctx.cfg)
+                    .await?;
+            }
+            _ = tokio::time::sleep_until(cert_check.next_deadline()) => {
+                // 无在途批次时才走这个分支；有批次时由 upload_pending_batches
+                // 在 ACK 后检查，不会与 ACK 等待争抢同一个 stream。
+                run_cert_check_if_due(
+                    &mut sink,
+                    &mut stream,
+                    &mut control_rx,
+                    ctx.cfg,
+                    ctx.agent_id,
+                    &mut cert_check,
+                )
+                .await?;
+            }
+            _ = notify.notified() => {}
+            Some(response) = control_rx.recv() => {
+                send_frame_with_config(
+                    &mut sink,
+                    &Frame::ControlResponse(response),
+                    ctx.cfg,
+                )
+                .await?;
+            }
+            incoming = stream.next() => {
+                match incoming {
+                    Some(Ok(Message::Close(_))) | None => bail!("hub 关闭了连接"),
+                    Some(Ok(Message::Binary(bytes))) => {
+                        handle_side_frame(
+                            &mut sink,
+                            &dispatcher,
+                            send_timeout,
+                            classify_incoming(bytes.as_ref()),
+                        )
+                        .await?;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => return Err(err.into()),
+                }
+            }
         }
     }
 }
@@ -1528,19 +2191,6 @@ where
             Some(Err(err)) => return Err(err.into()),
         }
     }
-}
-
-fn load_or_create_agent_id(dir: &std::path::Path) -> Result<String> {
-    let path = dir.join(AGENT_ID);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let id = existing.trim().to_string();
-        if !id.is_empty() {
-            return Ok(id);
-        }
-    }
-    let id = uuid::Uuid::new_v4().to_string();
-    fsutil::atomic_write(&path, id.as_bytes(), 0o644)?;
-    Ok(id)
 }
 
 /// `cert-info`：打印客户端证书的公开信息。
@@ -1608,15 +2258,14 @@ fn renew(config: Option<PathBuf>) -> Result<()> {
 }
 
 async fn renew_once(cfg: &AgentConfig) -> Result<()> {
-    if !is_enrolled(cfg) {
-        bail!("尚未纳管（缺少 agent.crt / agent.key / agent.secret），先执行 rustboard-agent run");
-    }
-    // 不能在这里 create：拿一个随机 agent_id 去连，hub 会因 CN 不一致直接拒绝。
-    let agent_id = std::fs::read_to_string(cfg.data_dir.join(AGENT_ID))
-        .ok()
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
-        .context("读取 agent_id 失败（尚未纳管？）")?;
+    // 手工续签同样走身份解析：旧安装可补 marker；半完成状态直接失败，
+    // 不能拿随机/缺失的 agent_id 去连 hub。
+    let agent_id = match resolve_enrollment(cfg)? {
+        EnrollmentState::Fresh => {
+            bail!("尚未纳管（缺少完整身份或 enrollment.complete），先执行 rustboard-agent run")
+        }
+        EnrollmentState::Ready { agent_id } => agent_id,
+    };
 
     let ws = connect(cfg, true).await?;
     let (mut sink, mut stream) = ws.split();
@@ -2071,6 +2720,8 @@ mod tests {
         fsutil::atomic_write(&dir.join(AGENT_ID), b"agent-test", 0o644).unwrap();
         // 纳管成功时 hub 会下发 ca.crt；续签的签发者校验依赖它。
         fsutil::atomic_write(&dir.join(AGENT_CA), ca_pem.as_bytes(), 0o644).unwrap();
+        // #45：与真实 enrollment 一致，全部身份文件写完后最后写入完成标记。
+        write_enrollment_marker(dir, "agent-test", &cert_pem, now_ms()).unwrap();
 
         AgentConfig {
             data_dir: dir.to_path_buf(),
@@ -2093,6 +2744,7 @@ mod tests {
         let dir = temp_dir("renew");
         let cfg = enrolled_config(&dir, 1);
         let key_before = std::fs::read_to_string(dir.join(AGENT_KEY)).unwrap();
+        let marker_before = read_enrollment_marker(&dir).unwrap().unwrap();
 
         let csr = tls::make_csr_with_key(&key_before).unwrap();
         let new_cert = hub_sign(&dir, &csr, 90);
@@ -2120,6 +2772,441 @@ mod tests {
             key_before,
             "续签必须复用原私钥"
         );
+        // #45：marker 绑定证书指纹，续签后必须同步；created_at 仍表示纳管时间。
+        let marker_after = read_enrollment_marker(&dir).unwrap().unwrap();
+        assert_eq!(marker_after.agent_id, "agent-test");
+        assert_eq!(
+            marker_after.cert_sha256,
+            cert_sha256(&new_cert).unwrap(),
+            "续签后 marker 必须绑定新证书"
+        );
+        assert_eq!(
+            marker_after.created_at, marker_before.created_at,
+            "续签不得改写纳管完成时间"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：读出五个身份文件的原始内容，用于断言迁移/恢复没有覆盖身份。
+    fn identity_snapshot(dir: &Path) -> Vec<(&'static str, Vec<u8>)> {
+        ENROLLED_FILES
+            .into_iter()
+            .map(|name| (name, std::fs::read(dir.join(name)).unwrap()))
+            .collect()
+    }
+
+    fn remove_identity_file(dir: &Path, name: &str) {
+        std::fs::remove_file(dir.join(name)).unwrap();
+    }
+
+    /// #45：`info` 对旧安装不能误报“未纳管”，对半完成状态要提示 fail-closed。
+    #[test]
+    fn v100_info_status_distinguishes_legacy_and_half_completed() {
+        let dir = temp_dir("info-status-empty");
+        let cfg = AgentConfig {
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        assert_eq!(enrollment_status(&cfg), "未纳管");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = temp_dir("info-status-legacy");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        let legacy = enrollment_status(&cfg);
+        assert!(
+            legacy.contains("旧安装") && legacy.contains("补齐"),
+            "旧安装必须提示自动补齐而不是未纳管: {legacy}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = temp_dir("info-status-half");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, AGENT_KEY);
+        let half = enrollment_status(&cfg);
+        assert!(
+            half.contains("未完成") && half.contains("fail-closed"),
+            "半完成状态必须提示 fail-closed: {half}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：`is_enrolled` 必须同时要求 marker 与五个身份文件，空文件不算。
+    #[test]
+    fn v100_is_enrolled_requires_marker_and_five_files() {
+        let dir = temp_dir("marker-required");
+        let cfg = enrolled_config(&dir, 90);
+        assert!(is_enrolled(&cfg), "完整 enrollment 状态必须为已纳管");
+
+        for name in [AGENT_CA, AGENT_ID, ENROLLMENT_MARKER] {
+            let path = dir.join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert!(!is_enrolled(&cfg), "缺少 {name} 不得算已纳管");
+            let mode = if name == ENROLLMENT_MARKER {
+                0o600
+            } else {
+                0o644
+            };
+            fsutil::atomic_write(&path, &bytes, mode).unwrap();
+            assert!(is_enrolled(&cfg), "恢复 {name} 后应重新算已纳管");
+        }
+
+        // 空 marker 不是完成标记。
+        std::fs::write(dir.join(ENROLLMENT_MARKER), b"").unwrap();
+        assert!(!is_enrolled(&cfg), "空 marker 不得算已纳管");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：旧安装（五个文件齐全、无 marker）升级启动时只补 marker，
+    /// 不重新 enrollment、不生成新 agent_id、不覆盖任何身份文件。
+    #[test]
+    fn v100_legacy_install_without_marker_migrates_without_new_identity() {
+        let dir = temp_dir("legacy-migrate");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        let before = identity_snapshot(&dir);
+        assert!(!is_enrolled(&cfg));
+
+        let state = resolve_enrollment(&cfg).expect("旧安装身份自洽时必须能补齐 marker");
+        assert_eq!(
+            state,
+            EnrollmentState::Ready {
+                agent_id: "agent-test".to_string()
+            }
+        );
+        assert_eq!(
+            identity_snapshot(&dir),
+            before,
+            "补 marker 不得改写 cert/key/secret/CA/agent_id"
+        );
+
+        let marker = read_enrollment_marker(&dir).unwrap().unwrap();
+        assert_eq!(marker.agent_id, "agent-test");
+        assert_eq!(
+            marker.cert_sha256,
+            cert_sha256(&String::from_utf8(before[0].1.clone()).unwrap()).unwrap()
+        );
+
+        // 再次启动（幂等）：marker 与全部身份文件都不再变化。
+        let after_first = std::fs::read(dir.join(ENROLLMENT_MARKER)).unwrap();
+        resolve_enrollment(&cfg).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join(ENROLLMENT_MARKER)).unwrap(),
+            after_first,
+            "重复启动不得重写 marker"
+        );
+        assert_eq!(identity_snapshot(&dir), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：有 cert/key/secret/CA 但缺 marker 与 agent_id 时，从证书 CN 恢复
+    /// 同一身份并补 marker；绝不随机生成 UUID。
+    #[test]
+    fn v100_missing_agent_id_recovers_from_cert_cn() {
+        let dir = temp_dir("recover-cn");
+        let cfg = enrolled_config(&dir, 90);
+        let before = identity_snapshot(&dir);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        remove_identity_file(&dir, AGENT_ID);
+
+        let state = resolve_enrollment(&cfg).expect("证书 CN 可解析时必须恢复身份");
+        assert_eq!(
+            state,
+            EnrollmentState::Ready {
+                agent_id: "agent-test".to_string()
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(AGENT_ID)).unwrap().trim(),
+            "agent-test",
+            "必须从证书 CN 恢复，不能生成随机 UUID"
+        );
+        assert_eq!(
+            identity_snapshot(&dir)[..4],
+            before[..4],
+            "恢复 agent_id 不得改写证书/私钥/secret/CA"
+        );
+        let marker = read_enrollment_marker(&dir).unwrap().unwrap();
+        assert_eq!(marker.agent_id, "agent-test");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：marker 是 0600 JSON，只含公开身份信息，不含 secret / 私钥。
+    #[cfg(unix)]
+    #[test]
+    fn v100_marker_is_private_json_without_secrets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("marker-json");
+        enrolled_config(&dir, 90);
+        let path = dir.join(ENROLLMENT_MARKER);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "enrollment.complete 必须是 0600");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["agent_id"], "agent-test");
+        assert_eq!(
+            value["cert_sha256"],
+            cert_sha256(&std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap()).unwrap()
+        );
+        assert!(value["created_at"].as_i64().unwrap() > 0);
+        assert!(!raw.contains("test-secret"), "marker 不得包含 agent secret");
+        assert!(!raw.contains("PRIVATE KEY"), "marker 不得包含私钥");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：每个写点的半完成状态都必须 fail-closed；不能重新纳管或随机补身份。
+    #[test]
+    fn v100_half_completed_identity_fails_closed() {
+        // (1) 逐个写点崩溃：只有 cert / 有 cert+key / 有 cert+key+secret。
+        for kept in [
+            vec![AGENT_CERT],
+            vec![AGENT_CERT, AGENT_KEY],
+            vec![AGENT_CERT, AGENT_KEY, AGENT_SECRET],
+        ] {
+            let dir = temp_dir("half-write-point");
+            let cfg = enrolled_config(&dir, 90);
+            let kept_before: Vec<(&str, Vec<u8>)> = kept
+                .iter()
+                .map(|name| (*name, std::fs::read(dir.join(name)).unwrap()))
+                .collect();
+            for name in ENROLLED_FILES {
+                if !kept.contains(&name) {
+                    remove_identity_file(&dir, name);
+                }
+            }
+            remove_identity_file(&dir, ENROLLMENT_MARKER);
+
+            let err = resolve_enrollment(&cfg).unwrap_err();
+            let text = format!("{err:#}");
+            assert!(text.contains("enrollment 未完成"), "{text}");
+            assert!(!dir.join(AGENT_ID).exists(), "半完成时不得生成 agent_id");
+            assert!(
+                !dir.join(ENROLLMENT_MARKER).exists(),
+                "半完成时不得写 marker"
+            );
+            for (name, bytes) in kept_before {
+                assert_eq!(
+                    std::fs::read(dir.join(name)).unwrap(),
+                    bytes,
+                    "半完成状态不得覆盖 {name}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // (2) 有 cert/key/secret/agent_id 但缺 CA（v0.1 残留）：不猜信任模型。
+        let dir = temp_dir("half-no-ca");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        remove_identity_file(&dir, AGENT_CA);
+        let id_before = std::fs::read(dir.join(AGENT_ID)).unwrap();
+        let err = resolve_enrollment(&cfg).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("ca.crt"), "错误必须点名 ca.crt: {text}");
+        assert!(text.contains("不会重新纳管"), "{text}");
+        assert_eq!(std::fs::read(dir.join(AGENT_ID)).unwrap(), id_before);
+        assert!(!dir.join(ENROLLMENT_MARKER).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // (3) 证书损坏：无法恢复 CN，也不生成随机身份。
+        let dir = temp_dir("half-corrupt-cert");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        std::fs::write(dir.join(AGENT_CERT), b"not a certificate").unwrap();
+        let id_before = std::fs::read(dir.join(AGENT_ID)).unwrap();
+        let err = resolve_enrollment(&cfg).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("解析 agent.crt 失败"),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read(dir.join(AGENT_ID)).unwrap(), id_before);
+        assert!(!dir.join(ENROLLMENT_MARKER).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：marker 与身份文件不一致时 fail-closed，不覆盖 ID / 证书。
+    #[test]
+    fn v100_marker_mismatch_fails_closed_without_overwrite() {
+        let dir = temp_dir("marker-mismatch");
+        let cfg = enrolled_config(&dir, 90);
+        let cert_before = std::fs::read(dir.join(AGENT_CERT)).unwrap();
+        let id_before = std::fs::read(dir.join(AGENT_ID)).unwrap();
+
+        let mut marker = read_enrollment_marker(&dir).unwrap().unwrap();
+        marker.agent_id = "other-agent".to_string();
+        fsutil::atomic_write(
+            &dir.join(ENROLLMENT_MARKER),
+            serde_json::to_vec(&marker).unwrap().as_slice(),
+            0o600,
+        )
+        .unwrap();
+        let err = resolve_enrollment(&cfg).unwrap_err();
+        assert!(format!("{err:#}").contains("不一致"), "{err:#}");
+        assert_eq!(std::fs::read(dir.join(AGENT_ID)).unwrap(), id_before);
+        assert_eq!(std::fs::read(dir.join(AGENT_CERT)).unwrap(), cert_before);
+
+        // 损坏的 marker JSON 同样 fail-closed。
+        std::fs::write(dir.join(ENROLLMENT_MARKER), b"{broken").unwrap();
+        let err = resolve_enrollment(&cfg).unwrap_err();
+        assert!(format!("{err:#}").contains("内容损坏"), "{err:#}");
+        assert_eq!(std::fs::read(dir.join(AGENT_ID)).unwrap(), id_before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：续签在「证书已落盘、marker 未更新」之间崩溃后，只有身份全部
+    /// 校验通过才按当前证书修复 marker。
+    #[test]
+    fn v100_stale_marker_is_repaired_only_after_identity_validation() {
+        let dir = temp_dir("stale-marker");
+        let cfg = enrolled_config(&dir, 90);
+        let created_at = read_enrollment_marker(&dir).unwrap().unwrap().created_at;
+        let key = std::fs::read_to_string(dir.join(AGENT_KEY)).unwrap();
+        let csr = tls::make_csr_with_key(&key).unwrap();
+        let new_cert = hub_sign(&dir, &csr, 120);
+        fsutil::atomic_write(&dir.join(AGENT_CERT), new_cert.as_bytes(), 0o644).unwrap();
+
+        let state = resolve_enrollment(&cfg).expect("身份自洽时允许修复续签遗留的 marker");
+        assert_eq!(
+            state,
+            EnrollmentState::Ready {
+                agent_id: "agent-test".to_string()
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap(),
+            new_cert,
+            "修复 marker 不得回滚已续签的证书"
+        );
+        let marker = read_enrollment_marker(&dir).unwrap().unwrap();
+        assert_eq!(marker.cert_sha256, cert_sha256(&new_cert).unwrap());
+        assert_eq!(marker.created_at, created_at, "保留纳管完成时间");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：最后一个写点（marker）失败时保留可恢复的半完成状态；障碍移除后
+    /// 重启仍恢复同一身份，不重新 enrollment。
+    #[test]
+    fn v100_marker_write_failure_keeps_identity_recoverable() {
+        let dir = temp_dir("marker-write-fail");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        let before = identity_snapshot(&dir);
+
+        let marker_path = dir.join(ENROLLMENT_MARKER);
+        std::os::unix::fs::symlink(dir.join("not-a-marker-target"), &marker_path).unwrap();
+        let err = resolve_enrollment(&cfg).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("enrollment.complete"),
+            "{err:#}"
+        );
+        assert_eq!(identity_snapshot(&dir), before, "写 marker 失败不得改身份");
+        assert!(std::fs::symlink_metadata(&marker_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        std::fs::remove_file(&marker_path).unwrap();
+        let state = resolve_enrollment(&cfg).expect("障碍移除后必须能补齐 marker");
+        assert_eq!(
+            state,
+            EnrollmentState::Ready {
+                agent_id: "agent-test".to_string()
+            }
+        );
+        assert_eq!(identity_snapshot(&dir), before, "恢复后身份必须完全一致");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 缺 ID 恢复时，ID 写入失败也不得留下 marker 或随机身份。
+        let dir = temp_dir("id-write-fail");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        remove_identity_file(&dir, AGENT_ID);
+        std::fs::create_dir(dir.join(AGENT_ID)).unwrap();
+        let err = resolve_enrollment(&cfg).unwrap_err();
+        assert!(format!("{err:#}").contains("agent_id"), "{err:#}");
+        assert!(
+            !dir.join(ENROLLMENT_MARKER).exists(),
+            "ID 未写成时不得写 marker"
+        );
+        std::fs::remove_dir(dir.join(AGENT_ID)).unwrap();
+        resolve_enrollment(&cfg).expect("障碍移除后必须能从 CN 恢复");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(AGENT_ID)).unwrap().trim(),
+            "agent-test"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：未纳管或身份对不上时，`load_or_create_agent_id` 只报错，
+    /// 绝不落盘随机 UUID（token 已被消耗的场景尤其重要）。
+    #[test]
+    fn v100_load_or_create_agent_id_never_generates_random_identity() {
+        // 空目录：未纳管。
+        let dir = temp_dir("no-random-empty");
+        fsutil::ensure_dir(&dir, 0o700).unwrap();
+        let err = load_or_create_agent_id(&dir).unwrap_err();
+        assert!(format!("{err:#}").contains("尚未纳管"), "{err:#}");
+        assert!(!dir.join(AGENT_ID).exists(), "不得生成随机 agent_id");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 只有证书的半完成状态：同样只报错。
+        let dir = temp_dir("no-random-half");
+        let cfg = enrolled_config(&dir, 90);
+        for name in [
+            AGENT_KEY,
+            AGENT_SECRET,
+            AGENT_CA,
+            AGENT_ID,
+            ENROLLMENT_MARKER,
+        ] {
+            remove_identity_file(&dir, name);
+        }
+        let err = load_or_create_agent_id(&dir).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("enrollment.complete"),
+            "{err:#}"
+        );
+        assert!(!dir.join(AGENT_ID).exists());
+        assert!(resolve_enrollment(&cfg).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 旧安装 agent_id 与证书 CN 对不上：报错且不覆盖 ID，也不补 marker。
+        let dir = temp_dir("no-random-mismatch");
+        let cfg = enrolled_config(&dir, 90);
+        remove_identity_file(&dir, ENROLLMENT_MARKER);
+        fsutil::atomic_write(&dir.join(AGENT_ID), b"other-agent", 0o644).unwrap();
+        let err = resolve_enrollment(&cfg).unwrap_err();
+        assert!(format!("{err:#}").contains("不一致"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(AGENT_ID)).unwrap().trim(),
+            "other-agent",
+            "对不上时不得覆盖原 agent_id"
+        );
+        assert!(!dir.join(ENROLLMENT_MARKER).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #45：正常重启（resolve 多次）身份与 marker 完全不变。
+    #[test]
+    fn v100_identity_is_stable_across_restarts() {
+        let dir = temp_dir("stable-restart");
+        let cfg = enrolled_config(&dir, 90);
+        let snapshot = identity_snapshot(&dir);
+        let marker = std::fs::read(dir.join(ENROLLMENT_MARKER)).unwrap();
+        for _ in 0..3 {
+            let state = resolve_enrollment(&cfg).unwrap();
+            assert_eq!(
+                state,
+                EnrollmentState::Ready {
+                    agent_id: "agent-test".to_string()
+                }
+            );
+        }
+        assert_eq!(identity_snapshot(&dir), snapshot);
+        assert_eq!(std::fs::read(dir.join(ENROLLMENT_MARKER)).unwrap(), marker);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2892,6 +3979,742 @@ mod tests {
             .to_string()
             .contains("server_ca"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #34：`buffer repair --from-start` 的 CLI 形状：子命令存在、flag 可解析，
+    /// 缺少 flag 时执行层必须拒绝，`--help` 能看到该 flag。
+    #[test]
+    fn v100_buffer_repair_cli_shape() {
+        let parsed = Cli::try_parse_from(["rustboard-agent", "buffer", "repair", "--from-start"])
+            .expect("buffer repair --from-start 应能解析");
+        match parsed.cmd {
+            Cmd::Buffer {
+                cmd: BufferCmd::Repair { config, from_start },
+            } => {
+                assert!(from_start, "--from-start 必须被识别");
+                assert!(config.is_none());
+            }
+            _ => panic!("应解析为 buffer repair 子命令"),
+        }
+
+        // 不带 flag 也能解析（由执行层给出明确拒绝信息与操作风险）。
+        let parsed = Cli::try_parse_from(["rustboard-agent", "buffer", "repair"])
+            .expect("不带 --from-start 也应能解析出 repair 子命令");
+        match parsed.cmd {
+            Cmd::Buffer {
+                cmd: BufferCmd::Repair { from_start, .. },
+            } => assert!(!from_start),
+            _ => panic!("应解析为 buffer repair 子命令"),
+        }
+
+        let help = match Cli::try_parse_from(["rustboard-agent", "buffer", "repair", "--help"]) {
+            Ok(_) => panic!("--help 应以 DisplayHelp 结束"),
+            Err(err) => err,
+        };
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        let text = help.to_string();
+        assert!(text.contains("--from-start"), "帮助必须展示 --from-start");
+        assert!(
+            text.contains("重发") || text.contains("ACK"),
+            "帮助必须说明会重发已 ACK 数据: {text}"
+        );
+    }
+
+    /// #34：缺少 --from-start 时拒绝执行且不碰 meta；显式指定后两条 meta 都归零。
+    #[test]
+    fn v100_buffer_repair_requires_explicit_flag_and_resets_metas() {
+        let dir = temp_dir("buffer-repair");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = AgentConfig {
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let cfg_path = dir.join("agent.toml");
+        cfg.save(&cfg_path).expect("写入测试配置失败");
+
+        let err = buffer_repair(Some(cfg_path.clone()), false)
+            .expect_err("未指定 --from-start 必须拒绝执行");
+        assert!(
+            err.to_string().contains("--from-start"),
+            "错误信息必须点明缺少的 flag: {err}"
+        );
+        assert!(!dir.join("buffer.meta").exists(), "拒绝执行时不得创建 meta");
+        assert!(
+            !dir.join("buffer.meta.bak").exists(),
+            "拒绝执行时不得创建 backup meta"
+        );
+
+        // 模拟两条 meta 都已不可用的现场。
+        std::fs::write(dir.join("buffer.meta"), "1").unwrap();
+        std::fs::write(dir.join("buffer.meta.bak"), "2").unwrap();
+        buffer_repair(Some(cfg_path), true).expect("显式 --from-start 应成功");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("buffer.meta")).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("buffer.meta.bak")).unwrap(),
+            "0"
+        );
+    }
+
+    // ===== v1.0.0 R2：#42 建连总超时 =====
+
+    /// 黑洞服务器：accept 后持有 socket，既不读也不写。
+    ///
+    /// 对 `ws://` 模拟「TCP 通了但永远不回 101」，对 `wss://` 模拟「TCP 通了但
+    /// 永远不发 ServerHello」。返回监听地址与后台任务句柄（测试结束 abort）。
+    async fn blackhole_listener() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定黑洞监听失败");
+        let addr = listener.local_addr().expect("读取黑洞监听地址失败");
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        (addr, handle)
+    }
+
+    fn assert_connect_timeout(err: &anyhow::Error, started: std::time::Instant, budget: u64) {
+        let elapsed = started.elapsed();
+        assert!(
+            err.to_string().contains("超时"),
+            "必须报告建连超时: {err:#}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(budget * 1_000 - 100),
+            "必须等满 {budget}s deadline 才失败，实际 {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(budget + 2),
+            "不得远超标称超时，实际 {elapsed:?}"
+        );
+    }
+
+    /// #42：TCP 已连接但 TLS 不回 ServerHello、或明文不回 HTTP 101 时，
+    /// `connect()` 必须在 `connect_timeout_secs` 内返回可重试错误；连接拒绝
+    /// 必须快速失败；慢但在 deadline 内的正常握手必须成功。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v100_connect_deadline_covers_tcp_tls_and_101() {
+        let dir = temp_dir("connect-deadline");
+        let (addr, server) = blackhole_listener().await;
+
+        // (a) 明文 ws：TCP 已接通，服务端不回 101。
+        let cfg = AgentConfig {
+            hub_url: format!("ws://{addr}/agent/ws"),
+            connect_timeout_secs: 1,
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let err = connect(&cfg, false)
+            .await
+            .expect_err("101 黑洞必须超时失败");
+        assert_connect_timeout(&err, started, 1);
+
+        // (b) wss：TCP 已接通，服务端不发 ServerHello（TLS 握手黑洞）。
+        let cfg = AgentConfig {
+            hub_url: format!("wss://{addr}/agent/ws"),
+            server_fingerprint: "ab".repeat(32),
+            connect_timeout_secs: 1,
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let err = connect(&cfg, false)
+            .await
+            .expect_err("TLS 黑洞必须超时失败");
+        assert_connect_timeout(&err, started, 1);
+        server.abort();
+        let _ = server.await;
+
+        // (c) wss：TLS 握手完成，但服务端读到 HTTP 请求后不回 101。
+        use tokio::io::AsyncReadExt as _;
+
+        let hub_dir = dir.join("hub-tls");
+        tls::ensure_hub_material(
+            &hub_dir,
+            &["localhost".to_string()],
+            tls::CertPolicy::default(),
+        )
+        .unwrap();
+        let server_config = tls::server_config(&hub_dir).unwrap();
+        let server_pem =
+            std::fs::read_to_string(tls::cert_dir(&hub_dir).join(tls::SERVER_CERT_FILE)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定 TLS 101 黑洞监听失败");
+        let tls_port = listener.local_addr().expect("读取 TLS 监听地址失败").port();
+        let tls_server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("TLS accept 失败");
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+            let mut stream = acceptor.accept(tcp).await.expect("TLS 握手必须完成");
+            let mut buf = [0u8; 1024];
+            let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+            // 已读到 HTTP 请求，但绝不写回 101。
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let cfg = AgentConfig {
+            hub_url: format!("wss://localhost:{tls_port}/agent/ws"),
+            server_fingerprint: tls::fingerprint_of_pem(&server_pem).unwrap(),
+            connect_timeout_secs: 1,
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let err = connect(&cfg, false)
+            .await
+            .expect_err("TLS 完成后不回 101 也必须超时");
+        assert_connect_timeout(&err, started, 1);
+        tls_server.abort();
+        let _ = tls_server.await;
+
+        // (d) 连接拒绝：立即失败，不能等到 deadline。
+        let free = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定临时端口失败");
+        let refused_addr = free.local_addr().expect("读取临时端口失败");
+        drop(free);
+        let cfg = AgentConfig {
+            hub_url: format!("ws://{refused_addr}/agent/ws"),
+            connect_timeout_secs: 2,
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let err = connect(&cfg, false).await.expect_err("连接拒绝必须失败");
+        assert!(
+            !err.to_string().contains("超时"),
+            "连接拒绝不得伪装成超时: {err:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "连接拒绝应立即返回，实际 {:?}",
+            started.elapsed()
+        );
+
+        // (e) 慢但仍在 deadline 内：服务端延迟 300ms 再做 WebSocket 握手。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定慢握手监听失败");
+        let slow_addr = listener.local_addr().expect("读取慢握手地址失败");
+        let slow_server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("慢握手 accept 失败");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ws = tokio_tungstenite::accept_async(tcp)
+                .await
+                .expect("慢握手 accept_async 失败");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let cfg = AgentConfig {
+            hub_url: format!("ws://{slow_addr}/agent/ws"),
+            connect_timeout_secs: 2,
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let ws = connect(&cfg, false).await.expect("慢但未超时必须成功");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(2),
+            "慢握手应成功且耗时合理，实际 {elapsed:?}"
+        );
+        drop(ws);
+        slow_server.abort();
+        let _ = slow_server.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #42：`try_enroll` / `renew_once` 都通过同一个 `connect()`，黑洞地址
+    /// 必须被同一个 deadline 约束，不能无限挂起。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v100_enroll_and_renew_are_bounded_by_connect_timeout() {
+        let (addr, server) = blackhole_listener().await;
+        let dir = temp_dir("enroll-renew-deadline");
+        std::fs::create_dir_all(&dir).expect("创建临时数据目录失败");
+
+        // try_enroll：首次纳管路径。
+        let cfg = AgentConfig {
+            hub_url: format!("ws://{addr}/agent/ws"),
+            connect_timeout_secs: 1,
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        let started = std::time::Instant::now();
+        match try_enroll(&cfg).await {
+            Err(EnrollError::Retry(err)) => {
+                assert!(err.to_string().contains("超时"), "错误信息: {err:#}");
+                assert!(
+                    started.elapsed() < Duration::from_secs(3),
+                    "try_enroll 必须受建连 deadline 约束，实际 {:?}",
+                    started.elapsed()
+                );
+            }
+            Err(EnrollError::Fatal(err)) => panic!("连接超时应可重试，实际 Fatal: {err:#}"),
+            Ok(()) => panic!("黑洞服务器不可能完成纳管"),
+        }
+
+        // renew_once：已纳管后的手工续签路径。
+        let mut enrolled = enrolled_config(&dir, 90);
+        enrolled.hub_url = format!("ws://{addr}/agent/ws");
+        enrolled.connect_timeout_secs = 1;
+        let started = std::time::Instant::now();
+        let err = renew_once(&enrolled)
+            .await
+            .expect_err("黑洞服务器上的 renew_once 必须失败");
+        assert!(err.to_string().contains("超时"), "错误信息: {err:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "renew_once 必须受建连 deadline 约束，实际 {:?}",
+            started.elapsed()
+        );
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #42：`run_async` 的常驻重连循环不能卡在第一次建连；超时后必须进入
+    /// 退避并再次尝试（用 accept 次数观察，不依赖日志）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v100_run_async_retries_after_connect_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定重试监听失败");
+        let addr = listener.local_addr().expect("读取重试监听地址失败");
+        let accepted = Arc::new(AtomicU32::new(0));
+        let accepted_server = accepted.clone();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted_server.fetch_add(1, Ordering::Relaxed);
+                held.push(socket);
+            }
+        });
+
+        let dir = temp_dir("run-async-deadline");
+        let mut cfg = enrolled_config(&dir, 90);
+        cfg.hub_url = format!("ws://{addr}/agent/ws");
+        cfg.connect_timeout_secs = 1;
+        cfg.session_max_hours = 0;
+        let run = tokio::spawn(run_async(cfg));
+
+        // 第 1 次连接 1s 超时 + 1s 退避，第 2 次应在 ~2s 出现；轮询避免 CI
+        // 机器负载导致的固定 sleep 抖动。
+        let wait_until = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut count = 0;
+        while tokio::time::Instant::now() < wait_until {
+            count = accepted.load(Ordering::Relaxed);
+            if count >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            count >= 2,
+            "run_async 必须在建连超时后重试，实际只 accept {count} 次"
+        );
+
+        run.abort();
+        server.abort();
+        let _ = run.await;
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===== v1.0.0 R2：#48 明文 ws 策略 =====
+
+    /// #48：远程明文 ws 必须在发出任何网络请求之前被拒绝，且错误不泄露 token。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v100_remote_plaintext_ws_is_rejected_before_network() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
+            .await
+            .expect("绑定非回环测试监听失败");
+        let port = listener.local_addr().expect("读取监听地址失败").port();
+        let dir = temp_dir("insecure-ws-reject");
+
+        let cfg = AgentConfig {
+            // 0.0.0.0 不是回环地址；若策略失效会真的连上本地监听。
+            hub_url: format!("ws://0.0.0.0:{port}/agent/ws"),
+            token: "super-secret-token".to_string(),
+            connect_timeout_secs: 5,
+            data_dir: dir,
+            ..AgentConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let err = connect(&cfg, false)
+            .await
+            .expect_err("非回环 ws 默认必须被拒绝");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("allow_insecure_ws"),
+            "错误必须给出 opt-in 指引: {message}"
+        );
+        assert!(
+            !message.contains("super-secret-token"),
+            "错误不得泄露 token: {message}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "必须在建连前快速失败，实际 {:?}",
+            started.elapsed()
+        );
+
+        // 没有发出任何网络请求：监听端不应收到连接。
+        let accepted = tokio::time::timeout(Duration::from_millis(250), listener.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "策略拒绝不得先发网络请求（accept 到了连接）"
+        );
+    }
+
+    /// #48：loopback ws 默认允许；非回环显式 opt-in 后允许。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v100_loopback_ws_allowed_and_opt_in_unlocks_remote() {
+        let dir = temp_dir("insecure-ws-allow");
+
+        // loopback：默认合法。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定 loopback 监听失败");
+        let addr = listener.local_addr().expect("读取 loopback 地址失败");
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("loopback accept 失败");
+            let _ws = tokio_tungstenite::accept_async(tcp)
+                .await
+                .expect("loopback accept_async 失败");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let cfg = AgentConfig {
+            hub_url: format!("ws://{addr}/agent/ws"),
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        assert!(!cfg.allow_insecure_ws);
+        cfg.validate().expect("loopback ws 默认必须合法");
+        let ws = connect(&cfg, false).await.expect("loopback ws 必须能连上");
+        drop(ws);
+        server.abort();
+        let _ = server.await;
+
+        // 非回环：显式 opt-in 后允许。
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
+            .await
+            .expect("绑定 opt-in 监听失败");
+        let port = listener.local_addr().expect("读取 opt-in 地址失败").port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("opt-in accept 失败");
+            let _ws = tokio_tungstenite::accept_async(tcp)
+                .await
+                .expect("opt-in accept_async 失败");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let cfg = AgentConfig {
+            hub_url: format!("ws://0.0.0.0:{port}/agent/ws"),
+            allow_insecure_ws: true,
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        cfg.validate().expect("opt-in 后必须合法");
+        let ws = connect(&cfg, false)
+            .await
+            .expect("显式 opt-in 的远程 ws 必须能连上");
+        drop(ws);
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #48 复审：日志 / CLI 只展示 host:port，绝不回显 URL userinfo。
+    #[test]
+    fn v100_hub_endpoint_display_redacts_userinfo() {
+        assert_eq!(
+            hub_endpoint_for_display("wss://user:pass@hub.example.com:8443/agent/ws"),
+            "hub.example.com:8443"
+        );
+        assert_eq!(
+            hub_endpoint_for_display("ws://127.0.0.1:8080/agent/ws"),
+            "127.0.0.1:8080"
+        );
+        assert_eq!(
+            hub_endpoint_for_display("wss://[::1]:8443/agent/ws"),
+            "[::1]:8443"
+        );
+
+        for url in [
+            "wss://user:pass@hub.example.com:8443/agent/ws",
+            "ws://token@127.0.0.1:1/agent/ws",
+        ] {
+            let shown = hub_endpoint_for_display(url);
+            assert!(!shown.contains("user"), "不得回显 userinfo: {shown}");
+            assert!(!shown.contains("pass"), "不得回显密码: {shown}");
+            assert!(!shown.contains("token"), "不得回显 token: {shown}");
+            assert!(!shown.contains('@'), "不得回显 userinfo 分隔符: {shown}");
+        }
+
+        // 非法 URL 也不能回显原文（其中可能带凭据）。
+        let shown = hub_endpoint_for_display("not-a-url://user:pass@host/x");
+        assert_eq!(shown, "(invalid hub_url)");
+        assert!(!shown.contains("pass"));
+    }
+
+    // ===== v1.0.0 R2：#44 证书检查饥饿 =====
+
+    type DelayedStream =
+        std::pin::Pin<Box<dyn Stream<Item = std::result::Result<Message, WsError>>>>;
+
+    /// 按给定延迟返回帧；用于让控制应答有机会在 ACK 之前写回 sink。
+    fn delayed_frames(items: Vec<(Duration, Message)>) -> DelayedStream {
+        Box::pin(futures_util::stream::unfold(
+            items.into_iter(),
+            |mut iter| async move {
+                let (delay, message) = iter.next()?;
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                Some((Ok(message), iter))
+            },
+        ))
+    }
+
+    fn test_batch(seq: u64) -> SampleBatch {
+        SampleBatch {
+            agent_id: "agent-test".to_string(),
+            epoch: 1,
+            seq,
+            boot_id: "boot".to_string(),
+            sent_at: now_ms(),
+            samples: vec![Sample::new("cpu.user", now_ms(), 1.0)],
+        }
+    }
+
+    /// #44：持续有 pending 批次时，证书 deadline 在每批 ACK 后、下一批发送前
+    /// 被检查：续签发生且不丢 ACK / ControlRequest。
+    #[tokio::test]
+    async fn v100_cert_check_between_pending_batches_keeps_ack_and_control() {
+        use rustboard_common::control::{codes as common_codes, ControlOp, ControlRequest};
+
+        let dir = temp_dir("cert-check-starvation");
+        // 证书剩余 1 天 ≤ 阈值 30：一旦检查就应续签。
+        let cfg = enrolled_config(&dir, 1);
+        let key_pem = std::fs::read_to_string(dir.join(AGENT_KEY)).unwrap();
+        let new_cert = hub_sign(&dir, &tls::make_csr_with_key(&key_pem).unwrap(), 90);
+
+        let mut buffer = DiskBuffer::open(&dir, 64 * 1024 * 1024, 0).expect("打开 DiskBuffer 失败");
+        for seq in 1..=2 {
+            buffer
+                .push(&test_batch(seq))
+                .expect("写入 pending 批次失败");
+        }
+        assert_eq!(buffer.pending_len(), 2, "测试前必须有两批 pending");
+        let buffer = Arc::new(Mutex::new(buffer));
+
+        let ack = |seq: u64| {
+            Message::Binary(Frame::Ack { epoch: 1, seq }.encode().expect("Ack 编码失败"))
+        };
+        let renewal_control = Message::Binary(
+            Frame::ControlRequest(ControlRequest::new(77, ControlOp::ProcessList))
+                .encode()
+                .expect("ControlRequest 编码失败"),
+        );
+        let renewed = Message::Binary(
+            Frame::CertRenewed { cert_pem: new_cert }
+                .encode()
+                .expect("CertRenewed 编码失败"),
+        );
+        // 无法解码的控制操作：用于验证 ACK 等待路径会回 unsupported，而不是丢帧。
+        let unknown_control = Message::Binary(
+            rmp_serde::to_vec(&serde_json::json!({
+                "ControlRequest": {"id": 4242, "op": {"FutureOp": {}}}
+            }))
+            .expect("构造未知控制帧失败"),
+        );
+
+        // 顺序：Ack#1 → 续签期间的 ControlRequest → CertRenewed →
+        //       ACK 等待期间的未知 ControlRequest → 延迟后 Ack#2。
+        let mut stream = delayed_frames(vec![
+            (Duration::ZERO, ack(1)),
+            (Duration::ZERO, renewal_control),
+            (Duration::ZERO, renewed),
+            (Duration::ZERO, unknown_control),
+            (Duration::from_millis(150), ack(2)),
+        ]);
+
+        let (mut sink, sent) = RecordingSink::new();
+        let (dispatcher, mut control_rx) = control::ControlDispatcher::new(cfg.control.clone());
+        let mut cert_check = CertCheckState::new(cert_check_period(cfg.cert_check_interval_hours));
+        // 模拟「推进时钟进入续签窗口」：deadline 已到，业务侧必须检查。
+        cert_check.force_due();
+
+        let uploaded = tokio::time::timeout(
+            Duration::from_secs(5),
+            upload_pending_batches(
+                &mut sink,
+                &mut stream,
+                &buffer,
+                &mut control_rx,
+                &dispatcher,
+                &cfg,
+                "agent-test",
+                &mut cert_check,
+            ),
+        )
+        .await
+        .expect("持续 pending 时上传循环不得挂死")
+        .expect("两批都必须成功 ACK");
+        assert_eq!(uploaded, 2);
+        assert_eq!(
+            buffer.lock().await.pending_len(),
+            0,
+            "两批都必须被 ACK 丢弃"
+        );
+
+        let frames: Vec<Frame> = sent
+            .lock()
+            .expect("测试记录锁不应中毒")
+            .iter()
+            .map(|message| match message {
+                Message::Binary(bytes) => {
+                    Frame::decode(bytes.as_ref()).expect("发出的帧必须可解码")
+                }
+                other => panic!("只应发送二进制帧，实际: {other:?}"),
+            })
+            .collect();
+
+        let batch_positions: Vec<(usize, u64)> = frames
+            .iter()
+            .enumerate()
+            .filter_map(|(index, frame)| match frame {
+                Frame::Batch(batch) => Some((index, batch.seq)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            batch_positions
+                .iter()
+                .map(|(_, seq)| *seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "两批都必须发送: {frames:?}"
+        );
+        let renew_pos = frames
+            .iter()
+            .position(|frame| matches!(frame, Frame::RenewCert { .. }))
+            .expect("证书到期必须触发续签");
+        assert!(
+            batch_positions[0].0 < renew_pos && renew_pos < batch_positions[1].0,
+            "续签必须在第一批 ACK 后、第二批发送前: {frames:?}"
+        );
+
+        // 续签期间的 ControlRequest 回 busy_renewing，没有被丢弃。
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                Frame::ControlResponse(response)
+                    if response.id == 77
+                        && response.error.as_ref().is_some_and(|err| err.code == common_codes::BUSY_RENEWING)
+            )),
+            "续签期间的 ControlRequest 必须被答复: {frames:?}"
+        );
+        // ACK 等待期间的未知控制操作必须回 unsupported（不是丢帧）。
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                Frame::ControlResponse(response)
+                    if response.id == 4242
+                        && response.error.as_ref().is_some_and(|err| err.code == common_codes::UNSUPPORTED)
+            )),
+            "ACK 期间的 ControlRequest 不得丢失: {frames:?}"
+        );
+
+        // 新证书已落盘（续签真的完成）。
+        let on_disk = std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap();
+        assert_eq!(
+            tls::days_left(&on_disk, now_ms()).unwrap(),
+            90,
+            "续签证书必须落盘"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #44 复审：续签前必须先 drain 已完成的控制应答。
+    ///
+    /// 续签最多占用 stream 20s，而 hub 的控制命令超时是 15s；不 drain 会让已经
+    /// 执行完的应答被压在 channel 里直到超时。
+    #[tokio::test]
+    async fn v100_due_cert_check_drains_control_before_renew() {
+        let dir = temp_dir("cert-drain-control");
+        let cfg = enrolled_config(&dir, 1);
+        let key_pem = std::fs::read_to_string(dir.join(AGENT_KEY)).unwrap();
+        let new_cert = hub_sign(&dir, &tls::make_csr_with_key(&key_pem).unwrap(), 90);
+        let renewed = Message::Binary(
+            Frame::CertRenewed { cert_pem: new_cert }
+                .encode()
+                .expect("CertRenewed 编码失败"),
+        );
+        let mut stream = futures_util::stream::iter(vec![Ok(renewed)]);
+
+        let (mut sink, sent) = RecordingSink::new();
+        let (dispatcher, mut control_rx) = control::ControlDispatcher::new(cfg.control.clone());
+        // 模拟控制任务已完成、应答还在 channel 里排队，尚未来得及写回 hub。
+        dispatcher.unsupported(4243, "queued-before-renew");
+
+        let mut cert_check = CertCheckState::new(cert_check_period(cfg.cert_check_interval_hours));
+        cert_check.force_due();
+        run_cert_check_if_due(
+            &mut sink,
+            &mut stream,
+            &mut control_rx,
+            &cfg,
+            "agent-test",
+            &mut cert_check,
+        )
+        .await
+        .expect("到期证书检查必须成功");
+
+        let frames: Vec<Frame> = sent
+            .lock()
+            .expect("测试记录锁不应中毒")
+            .iter()
+            .map(|message| match message {
+                Message::Binary(bytes) => {
+                    Frame::decode(bytes.as_ref()).expect("发出的帧必须可解码")
+                }
+                other => panic!("只应发送二进制帧，实际: {other:?}"),
+            })
+            .collect();
+        let control_pos = frames
+            .iter()
+            .position(|frame| {
+                matches!(
+                    frame,
+                    Frame::ControlResponse(response) if response.id == 4243
+                )
+            })
+            .expect("排队的控制应答必须先写回");
+        let renew_pos = frames
+            .iter()
+            .position(|frame| matches!(frame, Frame::RenewCert { .. }))
+            .expect("证书到期必须触发续签");
+        assert!(
+            control_pos < renew_pos,
+            "控制应答必须先于续签写回: {frames:?}"
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "进入续签前 channel 必须已经 drain 空"
+        );
+
+        let on_disk = std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap();
+        assert_eq!(
+            tls::days_left(&on_disk, now_ms()).unwrap(),
+            90,
+            "续签必须完成并落盘"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -10,6 +10,18 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.3] - 2026-10-27
+
+### Fixed
+
+- 修复 #27–#50 全量缺陷：schema v8 归档 claim/1m/1h 增量降采样、迟到与保留期、
+  DiskBuffer 双 meta/损坏恢复、Agent 建连/续签/控制输出、面板 TLS/刷新/401、
+  WebDAV MKCOL、采集器路径与 CPU、告警状态与标签过滤、CI/e2e 等。
+- 归档重试缺行不再卡死整轮；1m retention 不会删除仍有未聚合 raw 的小时；
+  残缺 1m 不再覆盖历史 1h。
+- 时间戳策略 [#50]：60 秒/30 天准入、启动 legacy 审计与 ACK 丢弃计数。
+
+
 ### Added
 
 - Phase D PostgreSQL 后端（显式 opt-in）：`database = "postgres://..."` 时启用；
@@ -36,6 +48,8 @@
   `troubleshooting` 文档给出三种可用部署路径
 - `docs/install/postgres.md`：PostgreSQL 安装、TLS/`sslmode`、迁移、备份/恢复、
   Docker 与限制说明
+- agent 新增 `connect_timeout_secs`（默认 10，范围 1–60，覆盖 DNS/TCP/TLS/101）
+  与 `allow_insecure_ws`（默认 false，非回环明文必须显式开启）
 
 ### Changed
 
@@ -51,9 +65,18 @@
 - `migrate`/`restore` 要求先停 hub；`migrate` 目标非空必须 `--force`，当前清空
   路径仅支持 `sslmode=disable` 目标，`verify-full` 非空目标需手工备份并清空后
   再迁移
+- agent 建连改为共享绝对 deadline，`run_async`/`try_enroll`/`renew_once` 超时后
+  进入既有退避；同会话证书续签从「永久一次」改为 10 分钟冷却（成功仅记录
+  `last_success_ms`）；持续 backlog 时每批 ACK 后检查证书 deadline，避免续签饥饿
 
 ### Fixed
 
+- 采集器 #35/#36：磁盘容量按 `/proc/mounts` 原始字节解析并传给 `statvfs`，
+  非法 UTF-8 路径的 label 改为唯一、可逆的 `\xNN` 编码（字面反斜杠写 `\\`）；
+  CPU 每核 `core` 标签改用实际 `cpuN` 编号，汇总计数回退时重建基线并跳过整帧，
+  单核计数回退只跳过该核。**兼容性**：历史 `cpu.cores.usage` 的 `core` 是顺序索引，
+  旧序列不迁移、与新编号序列并存（同一核心可能同时出现旧索引与新编号两条历史线）；
+  协议 v2、数据库 schema 与指标名不变
 - L-01：修复旧 ACME `account.json`/`state.toml` 的 0644 权限只在签发时收紧的问题；
   hub 启动即收紧，`tls status` 不再写文件
 - PostgreSQL：修复并发 ingest 幂等/CAS、非法批次处理与迁移源库只读快照问题，
@@ -74,6 +97,10 @@
 - KI-22：控制面日志白名单文件在单次 `openat2` 后按同一 fd 校验 `nlink == 1`；
   多硬链接 fail-closed 拒绝，错误含来源 id/路径但不读取或回显目标内容。使用硬链接
   保留日志、`cp -l` 备份等部署在额外链接存在期间会被拒绝，需改为单链接
+- **breaking**：agent `ws://` 默认只允许回环（`127.0.0.0/8`、`::1`、`localhost`）；
+  远程明文连接必须在 `agent.toml` 显式设置 `allow_insecure_ws = true`（启动 WARN，
+  日志只输出 host:port）。生产环境请改用 `wss://`；`ws://` + custom-ca/system-roots
+  仍被拒绝。明文会暴露 enrollment token、agent secret 与采样数据
 
 ### 已知限制
 

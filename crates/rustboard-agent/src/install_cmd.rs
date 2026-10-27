@@ -45,7 +45,12 @@ use rustboard_install::{
 const AGENT_CERT: &str = "agent.crt";
 const AGENT_KEY: &str = "agent.key";
 const AGENT_SECRET: &str = "agent.secret";
+const AGENT_CA: &str = "ca.crt";
 const AGENT_ID: &str = "agent_id";
+/// enrollment 完成标记；必须与 agent 主程序写入的文件名一致。
+const ENROLLMENT_MARKER: &str = "enrollment.complete";
+/// 五个身份文件；完成标记在它们全部落盘后最后写入。
+const ENROLLMENT_FILES: [&str; 5] = [AGENT_CERT, AGENT_KEY, AGENT_SECRET, AGENT_CA, AGENT_ID];
 
 /// `custom-ca` 模式复制到 data_dir 的服务端 CA 文件名。
 const SERVER_CA_FILE: &str = "server-ca.pem";
@@ -307,7 +312,9 @@ pub fn install(args: InstallArgs) -> Result<()> {
         .unwrap_or_else(|| paths.prefix.clone());
     // dry-run 时 ServiceManager 的内部调用全部跳过，不会执行任何 systemctl。
     let manager = ServiceManager::new(unit_dir, manage, args.dry_run);
-    let enrolled = is_enrolled_data_dir(&paths.data_dir);
+    // 安装幂等判断用「五件身份齐全」而不是完成标记：旧安装可能还没有 marker，
+    // 但它们已经是已安装状态，`run` 启动时会校验并补齐，不能要求 --force。
+    let enrolled = has_enrollment_identity(&paths.data_dir);
     // 幂等判断要确认 state 记录的文件都在：配置、二进制必写；由 systemd 管理时
     // unit 也必须是安装出来的那个。缺文件必须报错要求 --force，不能假装已安装。
     let unit_required = manage
@@ -1385,18 +1392,26 @@ fn validate_fingerprint(cfg: &AgentConfig) -> Result<()> {
     Ok(())
 }
 
-/// 数据目录是否已纳管：agent.crt / agent.key / agent.secret 都是非空普通文件。
+/// 数据目录是否已有完整身份材料（五件齐全，允许旧安装暂时缺 marker）。
 ///
-/// 不用 `exists()`：空文件或符号链接都不算已纳管，避免幂等判断把坏状态当成功。
-fn is_enrolled_data_dir(data_dir: &Path) -> bool {
-    [AGENT_CERT, AGENT_KEY, AGENT_SECRET]
+/// 不用 `exists()`：空文件或符号链接都不算，避免幂等判断把坏状态当成功。
+fn has_enrollment_identity(data_dir: &Path) -> bool {
+    ENROLLMENT_FILES
         .iter()
         .all(|name| file_is_nonempty(&data_dir.join(name)))
 }
 
-/// enrollment 是否完整：除三个凭据外还要求 agent_id 非空。
+/// enrollment 是否真正完成：五件身份文件 + 最后写入的完成标记。
+///
+/// 不能用「证书/secret 已出现」判完成：agent 在写完 marker 之前崩溃时，
+/// 安装器不能提前报成功。marker 也必须是普通非空文件（符号链接不算）。
+fn is_enrolled_data_dir(data_dir: &Path) -> bool {
+    has_enrollment_identity(data_dir) && file_is_nonempty(&data_dir.join(ENROLLMENT_MARKER))
+}
+
+/// 安装器等待 enrollment 的完成条件；与 agent 主程序 `is_enrolled` 一致。
 fn enrollment_complete(data_dir: &Path) -> bool {
-    is_enrolled_data_dir(data_dir) && file_is_nonempty(&data_dir.join(AGENT_ID))
+    is_enrolled_data_dir(data_dir)
 }
 
 /// 文件存在、是普通文件且非空（符号链接一律不算）。
@@ -1420,13 +1435,14 @@ fn wait_for_enrollment(data_dir: &Path, timeout: Duration) -> Result<()> {
         }
         std::thread::sleep(ENROLLMENT_POLL.min(timeout - elapsed));
     }
-    let missing: Vec<&str> = [AGENT_CERT, AGENT_KEY, AGENT_SECRET, AGENT_ID]
+    let missing: Vec<&str> = ENROLLMENT_FILES
         .into_iter()
+        .chain(std::iter::once(ENROLLMENT_MARKER))
         .filter(|name| !file_is_nonempty(&data_dir.join(name)))
         .collect();
     bail!(
         "等待 agent 完成 enrollment 超时（{}s），缺少或为空: {}；\
-         请检查 hub 地址、指纹与 token 是否有效",
+         请检查 hub 地址、指纹与 token 是否有效（enrollment.complete 由 agent 在全部身份文件写完后最后写入）",
         timeout.as_secs(),
         if missing.is_empty() {
             "未知".to_string()
@@ -1576,7 +1592,7 @@ fn print_dry_run(
     println!("  安装状态: {} (0600)", paths.state.display());
     if manage {
         println!("  systemctl daemon-reload && systemctl enable --now {AGENT_UNIT_NAME}");
-        println!("  等待 enrollment（agent.crt/agent.key/agent.secret/agent_id）最长 30s");
+        println!("  等待 enrollment（五个身份文件 + enrollment.complete）最长 30s");
     } else if write_unit {
         println!("  不启用 systemd（仅写 unit；如需管理请加 --systemd）");
     }
@@ -2666,26 +2682,40 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_detection_ignores_empty_and_symlinks() {
+    fn enrollment_detection_requires_five_files_and_marker() {
         let dir = temp_dir("enroll");
+        assert!(!has_enrollment_identity(&dir));
         assert!(!is_enrolled_data_dir(&dir));
         assert!(!enrollment_complete(&dir));
 
+        // 只出现部分凭据（例如写完 cert/key/secret 后崩溃）：不能算完成。
         for name in [AGENT_CERT, AGENT_KEY, AGENT_SECRET] {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
-        assert!(is_enrolled_data_dir(&dir));
-        assert!(
-            !enrollment_complete(&dir),
-            "缺 agent_id 不算 enrollment 完成"
-        );
+        assert!(!has_enrollment_identity(&dir));
+        assert!(!is_enrolled_data_dir(&dir));
+        assert!(!enrollment_complete(&dir));
 
+        // 五个身份文件齐全但 marker 未写：仍不算 enrollment 完成。
+        std::fs::write(dir.join(AGENT_CA), b"ca").unwrap();
         std::fs::write(dir.join(AGENT_ID), b"agent-1").unwrap();
+        assert!(has_enrollment_identity(&dir), "五件身份齐全供安装幂等判断");
+        assert!(!is_enrolled_data_dir(&dir), "marker 未写不得判完成");
+        assert!(!enrollment_complete(&dir));
+
+        // marker 最后写入后才算完成。
+        std::fs::write(dir.join(ENROLLMENT_MARKER), b"{}").unwrap();
+        assert!(is_enrolled_data_dir(&dir));
         assert!(enrollment_complete(&dir));
 
-        // 空文件不能算已纳管，否则幂等判断会把坏安装当成功。
+        // 空文件不能算完成，否则安装器/幂等判断会把坏状态当成功。
         std::fs::write(dir.join(AGENT_CERT), b"").unwrap();
+        assert!(!has_enrollment_identity(&dir));
         assert!(!is_enrolled_data_dir(&dir));
+        assert!(!enrollment_complete(&dir));
+        std::fs::write(dir.join(AGENT_CERT), b"x").unwrap();
+        std::fs::write(dir.join(ENROLLMENT_MARKER), b"").unwrap();
+        assert!(!is_enrolled_data_dir(&dir), "空 marker 不得判完成");
         assert!(!enrollment_complete(&dir));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2698,8 +2728,16 @@ mod tests {
         let target = dir.join("real-cert");
         std::fs::write(&target, b"cert").unwrap();
         std::os::unix::fs::symlink(&target, dir.join(AGENT_CERT)).unwrap();
-        std::fs::write(dir.join(AGENT_KEY), b"key").unwrap();
-        std::fs::write(dir.join(AGENT_SECRET), b"secret").unwrap();
+        for name in [
+            AGENT_KEY,
+            AGENT_SECRET,
+            AGENT_CA,
+            AGENT_ID,
+            ENROLLMENT_MARKER,
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        assert!(!has_enrollment_identity(&dir), "符号链接凭据不能算身份齐全");
         assert!(!is_enrolled_data_dir(&dir), "符号链接凭据不能算已纳管");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2961,9 +2999,10 @@ mod tests {
             b"hub_url = \"wss://127.0.0.1:8443/agent/ws\"\n",
         );
         std::fs::create_dir_all(&paths.data_dir).unwrap();
-        for name in [AGENT_CERT, AGENT_KEY, AGENT_SECRET, AGENT_ID] {
+        for name in ENROLLMENT_FILES {
             std::fs::write(paths.data_dir.join(name), b"x").unwrap();
         }
+        std::fs::write(paths.data_dir.join(ENROLLMENT_MARKER), b"{}").unwrap();
         std::fs::create_dir_all(paths.binary.parent().unwrap()).unwrap();
         std::fs::write(&paths.binary, b"bin").unwrap();
         std::fs::create_dir_all(paths.unit.parent().unwrap()).unwrap();

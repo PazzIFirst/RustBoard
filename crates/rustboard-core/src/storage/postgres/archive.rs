@@ -34,14 +34,21 @@ use postgres::Row;
 use rustboard_common::util::now_ms;
 
 use super::PostgresStorage;
-use crate::archive::{ArchiveObject, ArchiveStatus, ArchiveStoreError};
+use crate::archive::{ArchiveObject, ArchiveStatus, ArchiveStoreError, LEDGER_VERSION_V8};
 use crate::downsample::STATE_DOWNSAMPLE_1M_LAST_RAW_ROWID;
-use crate::storage::sqlite::{ArchiveRawRow, PRUNE_BATCH_ROWS, STATE_RAW_PRUNE_GENERATION};
-use crate::storage::{DownsampleRangeResult, PruneResult, TierStats, BUCKET_1H_MS, BUCKET_1M_MS};
+use crate::storage::sqlite::{
+    validate_archive_claim, validate_archive_sha256, ArchiveRawRow, MAX_ARCHIVE_TS_MS,
+    MIN_ARCHIVE_TS_MS, PRUNE_BATCH_ROWS, STATE_RAW_PRUNE_GENERATION,
+};
+use crate::storage::{
+    DownsampleDeltaResult, DownsampleHourResult, DownsampleRangeResult, PruneResult, TierStats,
+    BUCKET_1H_MS, BUCKET_1M_MS,
+};
 
 /// `archive_objects` 的 SELECT 列表；列下标与 [`row_to_archive_object`] 一一对应。
 const ARCHIVE_OBJECT_COLUMNS: &str = "id, backend, object_key, manifest_key, from_ts, to_ts, \
-     rows, bytes, sha256, status, error, created_at, uploaded_at, deleted_at";
+     rows, bytes, sha256, status, error, created_at, uploaded_at, deleted_at, ledger_version, \
+     attempts";
 
 /// 1m 聚合：`[from, to)` 内 raw 行按「整分钟」聚合后 upsert。
 ///
@@ -107,16 +114,93 @@ ON CONFLICT (agent_id, metric, labels, bucket_ts) DO UPDATE SET
     avg_value = EXCLUDED.avg_value,
     last_value = EXCLUDED.last_value,
     count = EXCLUDED.count
+WHERE EXCLUDED.count >= samples_1h.count
 "#;
+
+/// R1b：1m 增量合并。只处理已锁定的 raw `id` 集合（`$1`），按桶计算 delta
+/// 后与已有 1m 行合并；`last_value/last_ts` 仅在 delta 更新时改写。
+const AGGREGATE_1M_DELTA_SQL: &str = r#"
+INSERT INTO samples_1m
+    (agent_id, metric, labels, bucket_ts, min_value, max_value, avg_value,
+     last_value, count, last_ts, aggregated_1h)
+SELECT agent_id, metric, labels, bucket_ts,
+       MIN(value), MAX(value), AVG(value), MAX(last_value), COUNT(*),
+       MAX(last_ts), 0
+FROM (
+    SELECT agent_id, metric, labels,
+           (ts / 60000) * 60000 AS bucket_ts,
+           value, ts AS last_ts,
+           FIRST_VALUE(value) OVER (
+               PARTITION BY agent_id, metric, labels, (ts / 60000) * 60000
+               ORDER BY ts DESC, id DESC
+           ) AS last_value
+    FROM samples
+    WHERE id = ANY($1::BIGINT[])
+) AS aggregated
+GROUP BY agent_id, metric, labels, bucket_ts
+ON CONFLICT (agent_id, metric, labels, bucket_ts) DO UPDATE SET
+    min_value = LEAST(samples_1m.min_value, EXCLUDED.min_value),
+    max_value = GREATEST(samples_1m.max_value, EXCLUDED.max_value),
+    avg_value = (samples_1m.avg_value * samples_1m.count
+                 + EXCLUDED.avg_value * EXCLUDED.count)
+                / (samples_1m.count + EXCLUDED.count),
+    last_value = CASE
+        WHEN EXCLUDED.last_ts > samples_1m.last_ts THEN EXCLUDED.last_value
+        ELSE samples_1m.last_value
+    END,
+    last_ts = GREATEST(samples_1m.last_ts, EXCLUDED.last_ts),
+    count = samples_1m.count + EXCLUDED.count,
+    aggregated_1h = 0
+"#;
+
+/// 把本批 raw 所在的**整小时**全部 1m 行置 `aggregated_1h=0`。
+const MARK_1M_HOURS_DIRTY_SQL: &str = "UPDATE samples_1m SET aggregated_1h = 0 \
+     WHERE (bucket_ts / 3600000) IN ( \
+         SELECT DISTINCT (ts / 3600000) FROM samples WHERE id = ANY($1::BIGINT[]))";
+
+/// 认领本批 raw：只把仍为 0 的行置 1；affected 必须等于锁定行数。
+const CLAIM_RAW_AGGREGATED_SQL: &str = "UPDATE samples SET aggregated_1m = 1 \
+     WHERE id = ANY($1::BIGINT[]) AND aggregated_1m = 0";
 
 /// 保留期删除：每批最多 `$2` 行，`$1` 是排他 cutoff（`< cutoff`）。
 ///
 /// PG 没有 `rowid`，用 `id IN (SELECT id ... LIMIT)` 把单批事务控制在
 /// [`PRUNE_BATCH_ROWS`] 行以内；`ORDER BY` 与 SQLite 基线保持一致。
 const PRUNE_RAW_SQL: &str = "DELETE FROM samples WHERE id IN \
-     (SELECT id FROM samples WHERE ts < $1 ORDER BY ts LIMIT $2)";
-const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE id IN \
-     (SELECT id FROM samples_1m WHERE bucket_ts < $1 ORDER BY bucket_ts LIMIT $2)";
+     (SELECT id FROM samples WHERE ts < $1 AND aggregated_1m = 1 \
+      ORDER BY ts LIMIT $2)";
+/// v8 归档启用时的 raw 保留期：只删「已聚合且所属对象已 uploaded」的行。
+///
+/// 与 SQLite 的 `PRUNE_ARCHIVED_RAW_SQL` 语义一致；R1a-1 只提供原语，
+/// 现有 [`PRUNE_RAW_SQL`] 的行为不变。
+const PRUNE_ARCHIVED_RAW_SQL: &str = "DELETE FROM samples WHERE id IN \
+     (SELECT s.id FROM samples s \
+        JOIN archive_objects o ON o.id = s.archive_object_id \
+      WHERE s.ts < $1 AND s.aggregated_1m = 1 AND o.status = 'uploaded' \
+      ORDER BY s.ts LIMIT $2)";
+const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE \
+     (agent_id, metric, labels, (bucket_ts / 3600000) * 3600000) IN ( \
+     SELECT g.agent_id, g.metric, g.labels, g.hour_start \
+     FROM ( \
+         SELECT agent_id, metric, labels, \
+                (bucket_ts / 3600000) * 3600000 AS hour_start, \
+                SUM(count) AS source_count, \
+                MAX(CASE WHEN aggregated_1h = 0 THEN 1 ELSE 0 END) AS dirty \
+         FROM samples_1m \
+         WHERE bucket_ts < $1 \
+         GROUP BY agent_id, metric, labels, hour_start \
+     ) g \
+     LEFT JOIN samples_1h h \
+       ON h.agent_id = g.agent_id AND h.metric = g.metric \
+      AND h.labels = g.labels AND h.bucket_ts = g.hour_start \
+     WHERE g.dirty = 0 AND h.count = g.source_count \
+       AND NOT EXISTS ( \
+           SELECT 1 FROM samples s \
+           WHERE s.aggregated_1m = 0 \
+             AND s.ts >= g.hour_start AND s.ts < g.hour_start + 3600000 \
+       ) \
+     ORDER BY g.hour_start LIMIT $2 \
+)";
 const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE id IN \
      (SELECT id FROM samples_1h WHERE bucket_ts < $1 ORDER BY bucket_ts LIMIT $2)";
 
@@ -131,6 +215,13 @@ const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE id IN \
 /// [`SCHEMA_ADVISORY_LOCK_KEY`]: super::schema::SCHEMA_ADVISORY_LOCK_KEY
 const RAW_MAINTENANCE_ADVISORY_LOCK_KEY: i64 = 0x5242_5047_0000_0012;
 
+/// 降采样 1m delta / 1h 小时重算共用的固定事务级 advisory lock key。
+///
+/// 两者都会读写 `samples_1m.aggregated_1h`：1m delta 把整小时置 0，1h 锁行
+/// 后重算并置 1。用同一把锁把维护写事务串行化，避免「1h 已 SELECT、1m delta
+/// 随后置 0」被 1h 的批量 UPDATE 覆盖；行锁（`FOR UPDATE`）仍按方案要求保留。
+const DOWNSAMPLE_ADVISORY_LOCK_KEY: i64 = 0x5242_5050_0000_0013;
+
 /// raw 删除后收敛 `downsample_1m_last_raw_rowid` 的结果；`new == None`
 /// 表示水位键被删除/失效，只在事务提交后用于日志。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,8 +234,10 @@ struct RowidWatermarkChange {
 ///
 /// 与 SQLite 的 `bucket_floor` 完全一致：使用欧几里得除法，负时间戳也向
 /// 更小的边界取整。
-fn bucket_floor(ts: i64, bucket_ms: i64) -> i64 {
-    ts.div_euclid(bucket_ms) * bucket_ms
+fn bucket_floor(ts: i64, bucket_ms: i64) -> Result<i64> {
+    ts.checked_div_euclid(bucket_ms)
+        .and_then(|quotient| quotient.checked_mul(bucket_ms))
+        .ok_or_else(|| anyhow!("时间戳无法对齐到 {bucket_ms}ms 桶：超出 i64 可表示范围"))
 }
 
 /// 把 `archive_objects.object_key` 的唯一约束冲突翻译成领域错误。
@@ -163,6 +256,46 @@ fn map_archive_object_insert_error(err: postgres::Error) -> anyhow::Error {
     }
     tracing::debug!(error = %err, "写入归档对象失败（非 object_key 唯一约束错误）");
     anyhow!("写入归档对象失败（数据库错误，详见日志）")
+}
+
+/// 在调用方事务内插入归档对象并返回 `id`。
+///
+/// claim 必须与对象插入同事务，不能复用会自动提交的
+/// [`PostgresStorage::insert_archive_object`]。
+fn insert_archive_object_tx(
+    tx: &mut postgres::Transaction<'_>,
+    object: &ArchiveObject,
+) -> Result<i64> {
+    let rows = i64::try_from(object.rows).context("归档对象行数超出 BIGINT 范围")?;
+    let bytes = i64::try_from(object.bytes).context("归档对象字节数超出 BIGINT 范围")?;
+    let row = tx
+        .query_one(
+            "INSERT INTO archive_objects
+                (backend, object_key, manifest_key, from_ts, to_ts, rows, bytes,
+                 sha256, status, error, created_at, uploaded_at, deleted_at,
+                 ledger_version, attempts)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+             RETURNING id",
+            &[
+                &object.backend,
+                &object.object_key,
+                &object.manifest_key,
+                &object.from_ts,
+                &object.to_ts,
+                &rows,
+                &bytes,
+                &object.sha256,
+                &object.status.as_str(),
+                &object.error,
+                &object.created_at,
+                &object.uploaded_at,
+                &object.deleted_at,
+                &object.ledger_version,
+                &object.attempts,
+            ],
+        )
+        .map_err(map_archive_object_insert_error)?;
+    Ok(row.get::<_, i64>(0))
 }
 
 /// 一行 `archive_objects` 映射成 [`ArchiveObject`]。
@@ -188,6 +321,8 @@ fn row_to_archive_object(row: &Row) -> Result<ArchiveObject> {
         created_at: row.get(11),
         uploaded_at: row.get(12),
         deleted_at: row.get(13),
+        ledger_version: row.get(14),
+        attempts: row.get(15),
     })
 }
 
@@ -315,8 +450,8 @@ impl PostgresStorage {
     /// 两端先按整分钟向下取整（不足一分钟的窗口返回空结果），整个区间在
     /// 单个事务内完成「统计源行数 + upsert」；重复执行幂等。
     pub fn downsample_1m_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult> {
-        let from = bucket_floor(from_ts, BUCKET_1M_MS);
-        let to = bucket_floor(to_ts, BUCKET_1M_MS);
+        let from = bucket_floor(from_ts, BUCKET_1M_MS)?;
+        let to = bucket_floor(to_ts, BUCKET_1M_MS)?;
         if to <= from {
             return Ok(DownsampleRangeResult::default());
         }
@@ -332,6 +467,11 @@ impl PostgresStorage {
             let buckets = tx
                 .execute(AGGREGATE_1M_SQL, &[&from, &to])
                 .context("执行 1m 聚合 SQL 失败")?;
+            tx.execute(
+                "UPDATE samples SET aggregated_1m = 1 WHERE ts >= $1 AND ts < $2",
+                &[&from, &to],
+            )
+            .context("标记 1m 源 raw 已聚合失败")?;
             tx.commit().context("提交 1m 降采样事务失败")?;
             Ok(DownsampleRangeResult {
                 buckets: usize::try_from(buckets).context("1m 聚合返回了超出 usize 的桶数")?,
@@ -345,8 +485,8 @@ impl PostgresStorage {
     ///
     /// 两端先按整点向下取整；`avg_value` 按 `count` 加权。重复执行幂等。
     pub fn downsample_1h_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult> {
-        let from = bucket_floor(from_ts, BUCKET_1H_MS);
-        let to = bucket_floor(to_ts, BUCKET_1H_MS);
+        let from = bucket_floor(from_ts, BUCKET_1H_MS)?;
+        let to = bucket_floor(to_ts, BUCKET_1H_MS)?;
         if to <= from {
             return Ok(DownsampleRangeResult::default());
         }
@@ -363,6 +503,11 @@ impl PostgresStorage {
             let buckets = tx
                 .execute(AGGREGATE_1H_SQL, &[&from, &to])
                 .context("执行 1h 聚合 SQL 失败")?;
+            tx.execute(
+                "UPDATE samples_1m SET aggregated_1h = 1 WHERE bucket_ts >= $1 AND bucket_ts < $2",
+                &[&from, &to],
+            )
+            .context("标记 1h 源 1m 已聚合失败")?;
             tx.commit().context("提交 1h 降采样事务失败")?;
             Ok(DownsampleRangeResult {
                 buckets: usize::try_from(buckets).context("1h 聚合返回了超出 usize 的桶数")?,
@@ -373,6 +518,266 @@ impl PostgresStorage {
     }
 
     // ---- 数据层统计与分块 ----
+
+    /// R1b：认领并增量合并一批未聚合 raw 到 1m。
+    ///
+    /// 与 SQLite 基线一致：`FOR UPDATE` 锁定 raw 行 → 按桶 delta 合并 →
+    /// 整小时标脏 → 条件 UPDATE 认领；affected 必须等于锁定行数，否则回滚。
+    pub fn downsample_1m_delta(
+        &self,
+        closed_end: i64,
+        max_rows: usize,
+    ) -> Result<DownsampleDeltaResult> {
+        let closed_end = bucket_floor(closed_end, BUCKET_1M_MS)?;
+        if closed_end <= 0 || max_rows == 0 {
+            return Ok(DownsampleDeltaResult::default());
+        }
+        self.with_client(|client| {
+            let mut tx = client.transaction().context("开启 1m 增量聚合事务失败")?;
+            tx.query_one(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&DOWNSAMPLE_ADVISORY_LOCK_KEY],
+            )
+            .context("获取降采样 advisory lock 失败")?;
+            let offset = i64::try_from(max_rows.saturating_sub(1)).unwrap_or(i64::MAX);
+            let boundary: Option<i64> = tx
+                .query_opt(
+                    "SELECT ts FROM samples
+                     WHERE aggregated_1m = 0 AND ts >= 0 AND ts < $1
+                     ORDER BY ts ASC, id ASC LIMIT 1 OFFSET $2",
+                    &[&closed_end, &offset],
+                )
+                .context("读取 1m delta 分块边界失败")?
+                .map(|row| row.get(0));
+            let chunk_end = match boundary {
+                Some(ts) => bucket_floor(ts, BUCKET_1M_MS)?
+                    .checked_add(BUCKET_1M_MS)
+                    .ok_or_else(|| anyhow!("分钟桶上界溢出"))?
+                    .min(closed_end),
+                None => closed_end,
+            };
+            // 锁住本批 raw 行，按 ts,id 固定顺序，避免与其它维护事务交叉。
+            let locked: Vec<i64> = tx
+                .query(
+                    "SELECT id FROM samples
+                     WHERE aggregated_1m = 0 AND ts >= 0 AND ts < $1
+                     ORDER BY ts ASC, id ASC FOR UPDATE",
+                    &[&chunk_end],
+                )
+                .context("锁定 1m delta 源行失败")?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            if locked.is_empty() {
+                tx.commit().context("提交空 1m delta 事务失败")?;
+                return Ok(DownsampleDeltaResult {
+                    processed_to: chunk_end,
+                    ..DownsampleDeltaResult::default()
+                });
+            }
+            let buckets = tx
+                .execute(AGGREGATE_1M_DELTA_SQL, &[&locked])
+                .context("执行 1m delta 聚合 SQL 失败")?;
+            tx.execute(MARK_1M_HOURS_DIRTY_SQL, &[&locked])
+                .context("标记 1m 整小时为 dirty 失败")?;
+            let claimed = tx
+                .execute(CLAIM_RAW_AGGREGATED_SQL, &[&locked])
+                .context("认领 1m delta 源行失败")?;
+            if usize::try_from(claimed).unwrap_or(usize::MAX) != locked.len() {
+                anyhow::bail!(
+                    "1m 增量认领行数不一致（锁定 {} 行，affected {claimed} 行）：已回滚本批",
+                    locked.len()
+                );
+            }
+            tx.commit().context("提交 1m 增量聚合事务失败")?;
+            Ok(DownsampleDeltaResult {
+                buckets: usize::try_from(buckets).context("1m delta 桶数溢出")?,
+                rows: locked.len(),
+                processed_to: chunk_end,
+            })
+        })
+        .context("downsample_1m_delta")
+    }
+
+    /// R1b：锁定并重算最早一个可重算整点小时的 1h。
+    ///
+    /// 与 SQLite 基线一致：只选 1m 源完整的脏小时；`FOR UPDATE` 锁定整小时
+    /// 1m 行后重算，再按小时范围置 1，affected 必须等于锁定行数。
+    pub fn downsample_1h_hour(&self, closed_hour: i64) -> Result<Option<DownsampleHourResult>> {
+        let closed_hour = bucket_floor(closed_hour, BUCKET_1H_MS)?;
+        if closed_hour <= 0 {
+            return Ok(None);
+        }
+        self.with_client(|client| {
+            let mut tx = client.transaction().context("开启 1h 重算事务失败")?;
+            tx.query_one(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&DOWNSAMPLE_ADVISORY_LOCK_KEY],
+            )
+            .context("获取降采样 advisory lock 失败")?;
+            let hour: Option<i64> = tx
+                .query_one(
+                    "SELECT MIN(hour_start) FROM (
+                         SELECT (m.bucket_ts / 3600000) * 3600000 AS hour_start
+                         FROM samples_1m m
+                         WHERE m.aggregated_1h = 0 AND m.bucket_ts >= 0
+                           AND m.bucket_ts < $1
+                         GROUP BY hour_start
+                     ) h
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM samples s
+                         WHERE s.aggregated_1m = 0 AND s.ts >= 0
+                           AND s.ts < h.hour_start + 3600000
+                     )",
+                    &[&closed_hour],
+                )
+                .context("选择可重算 1h 小时失败")?
+                .get(0);
+            let Some(hour) = hour else {
+                tx.commit().context("提交空 1h 重算事务失败")?;
+                return Ok(None);
+            };
+            let hour_end = hour
+                .checked_add(BUCKET_1H_MS)
+                .ok_or_else(|| anyhow!("整点小时上界溢出"))?;
+            let incomplete: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM samples
+                     WHERE aggregated_1m = 0 AND ts >= 0 AND ts < $1)",
+                    &[&hour_end],
+                )
+                .context("检查 1m 源完整性失败")?
+                .get(0);
+            if incomplete {
+                tx.commit().context("提交跳过 1h 重算事务失败")?;
+                return Ok(None);
+            }
+            let locked: Vec<i64> = tx
+                .query(
+                    "SELECT id FROM samples_1m
+                     WHERE bucket_ts >= $1 AND bucket_ts < $2
+                     ORDER BY id ASC FOR UPDATE",
+                    &[&hour, &hour_end],
+                )
+                .context("锁定 1h 源行失败")?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            if locked.is_empty() {
+                tx.commit().context("提交空 1h 重算事务失败")?;
+                return Ok(None);
+            }
+            let buckets = tx
+                .execute(AGGREGATE_1H_SQL, &[&hour, &hour_end])
+                .context("执行 1h 重算 SQL 失败")?;
+            let marked = tx
+                .execute(
+                    "UPDATE samples_1m SET aggregated_1h = 1
+                     WHERE bucket_ts >= $1 AND bucket_ts < $2",
+                    &[&hour, &hour_end],
+                )
+                .context("标记 1h 源行失败")?;
+            if usize::try_from(marked).unwrap_or(usize::MAX) != locked.len() {
+                anyhow::bail!(
+                    "1h 认领行数不一致（锁定 {} 行，affected {marked} 行）：已回滚本小时",
+                    locked.len()
+                );
+            }
+            tx.commit().context("提交 1h 重算事务失败")?;
+            Ok(Some(DownsampleHourResult {
+                hour_ts: hour,
+                buckets: usize::try_from(buckets).context("1h 桶数溢出")?,
+                rows: locked.len(),
+            }))
+        })
+        .context("downsample_1h_hour")
+    }
+
+    /// `maintenance status`：未聚合 raw 行数。
+    pub fn count_unaggregated_raw_rows(&self) -> Result<i64> {
+        self.with_client(|client| {
+            Ok(client
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT FROM samples WHERE aggregated_1m = 0",
+                    &[],
+                )
+                .context("统计未聚合 raw 失败")?
+                .get(0))
+        })
+        .context("count_unaggregated_raw_rows")
+    }
+
+    /// 旧超界时间戳审计：统计 `ts < min_ts OR ts > max_ts` 的 raw 行数。
+    pub fn count_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        self.with_client(|client| {
+            Ok(client
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT FROM samples WHERE ts < $1 OR ts > $2",
+                    &[&min_ts, &max_ts],
+                )
+                .context("统计超界 raw 失败")?
+                .get(0))
+        })
+        .context("count_raw_rows_outside")
+    }
+
+    /// 旧超界时间戳中仍未聚合的 raw 行数。
+    pub fn count_unaggregated_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        self.with_client(|client| {
+            Ok(client
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT FROM samples
+                     WHERE aggregated_1m = 0 AND (ts < $1 OR ts > $2)",
+                    &[&min_ts, &max_ts],
+                )
+                .context("统计未聚合超界 raw 失败")?
+                .get(0))
+        })
+        .context("count_unaggregated_raw_rows_outside")
+    }
+
+    /// `ts < before_ts` 且未聚合的 raw 行数（legacy 1m horizon）。
+    pub fn count_unaggregated_raw_rows_before(&self, before_ts: i64) -> Result<i64> {
+        self.with_client(|client| {
+            Ok(client
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT FROM samples
+                     WHERE aggregated_1m = 0 AND ts < $1",
+                    &[&before_ts],
+                )
+                .context("统计 legacy 未聚合 raw 失败")?
+                .get(0))
+        })
+        .context("count_unaggregated_raw_rows_before")
+    }
+
+    /// 把超界时间戳的未聚合 raw 分批标记为已隔离（`aggregated_1m=1`）。
+    pub fn isolate_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<usize> {
+        let batch = PRUNE_BATCH_ROWS as i64;
+        let mut total = 0usize;
+        loop {
+            let marked = self.with_client(|client| {
+                client
+                    .execute(
+                        "UPDATE samples SET aggregated_1m = 1 WHERE id IN (
+                         SELECT id FROM samples
+                         WHERE aggregated_1m = 0 AND (ts < $1 OR ts > $2)
+                         ORDER BY ts LIMIT $3)",
+                        &[&min_ts, &max_ts, &batch],
+                    )
+                    .context("隔离超界 raw 失败")
+            })?;
+            if marked == 0 {
+                break;
+            }
+            total += usize::try_from(marked).context("隔离行数溢出")?;
+            if marked < PRUNE_BATCH_ROWS as u64 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        Ok(total)
+    }
 
     /// raw 层的行数与最旧 / 最新时间戳。
     pub fn raw_stats(&self) -> Result<TierStats> {
@@ -504,13 +909,26 @@ impl PostgresStorage {
     /// `prune_raw_batched` 一致。即使本批删除 0 行也收敛一次水位，可修复残留
     /// 的高水位。
     pub fn prune_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
-        self.prune_raw_batched(cutoff)
+        self.prune_raw_batched(PRUNE_RAW_SQL, cutoff)
             .context("prune_samples_before")
     }
 
-    /// 分批删除 1m 中 `bucket_ts < cutoff` 的行。
+    /// v8 归档启用时的 raw 保留期：只删「已聚合且对象已 uploaded」的行。
+    ///
+    /// R1a-1 只提供原语，不改变 [`Self::prune_samples_before`] 的行为；
+    /// R1b 在 `archive.enabled` 分支接入，并在 ledger pending 时跳过。
+    pub fn prune_archived_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
+        self.prune_raw_batched(PRUNE_ARCHIVED_RAW_SQL, cutoff)
+            .context("prune_archived_samples_before")
+    }
+
+    /// 分批删除 1m 中 `bucket_ts < cutoff` 且整小时已聚合的行。
+    ///
+    /// `cutoff` 先向下取整到整点；dirty hour（任一行 `aggregated_1h=0`）
+    /// 整小时跳过。
     pub fn prune_samples_1m_before(&self, cutoff: i64) -> Result<PruneResult> {
-        self.prune_batched(PRUNE_1M_SQL, cutoff)
+        let hour_cutoff = bucket_floor(cutoff, BUCKET_1H_MS)?;
+        self.prune_batched(PRUNE_1M_SQL, hour_cutoff)
             .context("prune_samples_1m_before")
     }
 
@@ -545,7 +963,9 @@ impl PostgresStorage {
     }
 
     /// raw 专属分批删除，见 [`Self::prune_samples_before`]。
-    fn prune_raw_batched(&self, cutoff: i64) -> Result<PruneResult> {
+    ///
+    /// `sql` 只来自本文件的编译期常量（普通 raw 删除 / 归档 uploaded join）。
+    fn prune_raw_batched(&self, sql: &'static str, cutoff: i64) -> Result<PruneResult> {
         let batch = PRUNE_BATCH_ROWS as i64;
         let mut result = PruneResult::default();
         loop {
@@ -564,7 +984,7 @@ impl PostgresStorage {
                     .context("读取删除前 samples.MAX(id) 失败")?
                     .get(0);
                 let deleted = tx
-                    .execute(PRUNE_RAW_SQL, &[&cutoff, &batch])
+                    .execute(sql, &[&cutoff, &batch])
                     .context("执行 raw 保留期删除 SQL 失败")?;
                 let max_after: Option<i64> = tx
                     .query_one("SELECT MAX(id) FROM samples", &[])
@@ -690,34 +1110,11 @@ impl PostgresStorage {
     /// `object.id` 被忽略；`object_key` 重复返回
     /// [`ArchiveStoreError::ObjectExists`]，不会覆盖已有记录。
     pub fn insert_archive_object(&self, object: &ArchiveObject) -> Result<i64> {
-        let rows = i64::try_from(object.rows).context("归档对象行数超出 BIGINT 范围")?;
-        let bytes = i64::try_from(object.bytes).context("归档对象字节数超出 BIGINT 范围")?;
         self.with_client(|client| {
-            let row = client
-                .query_one(
-                    "INSERT INTO archive_objects
-                        (backend, object_key, manifest_key, from_ts, to_ts, rows, bytes,
-                         sha256, status, error, created_at, uploaded_at, deleted_at)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                     RETURNING id",
-                    &[
-                        &object.backend,
-                        &object.object_key,
-                        &object.manifest_key,
-                        &object.from_ts,
-                        &object.to_ts,
-                        &rows,
-                        &bytes,
-                        &object.sha256,
-                        &object.status.as_str(),
-                        &object.error,
-                        &object.created_at,
-                        &object.uploaded_at,
-                        &object.deleted_at,
-                    ],
-                )
-                .map_err(map_archive_object_insert_error)?;
-            Ok(row.get::<_, i64>(0))
+            let mut tx = client.transaction().context("开启归档对象插入事务失败")?;
+            let id = insert_archive_object_tx(&mut tx, object)?;
+            tx.commit().context("提交归档对象插入事务失败")?;
+            Ok(id)
         })
         .context("insert_archive_object")
     }
@@ -780,6 +1177,36 @@ impl PostgresStorage {
         .context("list_archive_objects")
     }
 
+    /// 按 id 升序分页列出待重试的 v8 归档对象（`pending` / `failed`）。
+    ///
+    /// 只包含 `ledger_version = LEDGER_VERSION_V8` 的对象：v7 旧对象没有 claim
+    /// 行集，不能按 `archive_rows_for_object` 重建。`after_id` 为上一页最后
+    /// 一条的 id（排他）；`limit == 0` 返回空列表。
+    pub fn list_retryable_archive_objects(
+        &self,
+        limit: usize,
+        after_id: Option<i64>,
+    ) -> Result<Vec<ArchiveObject>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let sql = format!(
+            "SELECT {ARCHIVE_OBJECT_COLUMNS} FROM archive_objects \
+             WHERE ledger_version = $1 AND status IN ('pending', 'failed') \
+               AND ($2::BIGINT IS NULL OR id > $2) ORDER BY id ASC LIMIT $3"
+        );
+        self.with_client(|client| {
+            let rows = client
+                .query(&sql, &[&LEDGER_VERSION_V8, &after_id, &limit])
+                .context("执行 list_retryable_archive_objects SQL 失败")?;
+            rows.iter()
+                .map(row_to_archive_object)
+                .collect::<Result<Vec<_>>>()
+        })
+        .context("list_retryable_archive_objects")
+    }
+
     /// 更新归档对象状态，并校验合法迁移。
     ///
     /// 允许 `pending -> uploaded -> local_deleted` 与
@@ -829,6 +1256,42 @@ impl PostgresStorage {
             Ok(())
         })
         .context("update_archive_object_status")
+    }
+
+    /// 记录一次上传失败：状态置 `failed`、覆盖 `error`，`attempts` 加一。
+    ///
+    /// 只允许 `pending` / `failed` 迁移到 `failed`；已 `uploaded` /
+    /// `local_deleted` 的状态回退返回 [`ArchiveStoreError::InvalidTransition`]。
+    /// id 不存在返回 [`ArchiveStoreError::NotFound`]。
+    pub fn record_archive_object_failure(&self, id: i64, error: &str) -> Result<()> {
+        self.with_client(|client| {
+            let mut tx = client.transaction().context("开启归档失败记录事务失败")?;
+            let current: Option<String> = tx
+                .query_opt(
+                    "SELECT status FROM archive_objects WHERE id = $1 FOR UPDATE",
+                    &[&id],
+                )
+                .context("读取归档对象当前状态失败")?
+                .map(|row| row.get(0));
+            let Some(current) = current else {
+                return Err(ArchiveStoreError::NotFound.into());
+            };
+            let current = ArchiveStatus::parse(&current)
+                .ok_or_else(|| anyhow!("archive_objects.status 字段值非法"))?;
+            if !matches!(current, ArchiveStatus::Pending | ArchiveStatus::Failed) {
+                return Err(ArchiveStoreError::InvalidTransition.into());
+            }
+            tx.execute(
+                "UPDATE archive_objects
+                 SET status = 'failed', error = $2, attempts = attempts + 1
+                 WHERE id = $1",
+                &[&id, &error],
+            )
+            .context("执行归档失败记录 SQL 失败")?;
+            tx.commit().context("提交归档失败记录事务失败")?;
+            Ok(())
+        })
+        .context("record_archive_object_failure")
     }
 
     /// 读取归档水位；键不存在返回 `None`。
@@ -922,6 +1385,225 @@ impl PostgresStorage {
                 .collect())
         })
         .context("scan_archive_rows")
+    }
+
+    /// 按 `ts, samples.id` 升序扫描尚未被任何归档对象认领的 raw 行。
+    ///
+    /// 时间范围左闭右开 `[from_ts, to_ts)`；谓词与
+    /// `idx_samples_unarchived` partial index 一致。`limit == 0` 返回空列表。
+    pub fn list_unclaimed_archive_rows(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        limit: usize,
+    ) -> Result<Vec<ArchiveRawRow>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "SELECT id, agent_id, metric, labels, ts, value FROM samples \
+                     WHERE archive_object_id IS NULL AND ts >= $1 AND ts < $2 \
+                       AND ts >= $4 AND ts <= $5 \
+                     ORDER BY ts ASC, id ASC LIMIT $3",
+                    &[
+                        &from_ts,
+                        &to_ts,
+                        &limit,
+                        &MIN_ARCHIVE_TS_MS,
+                        &now_ms().min(MAX_ARCHIVE_TS_MS),
+                    ],
+                )
+                .context("执行 list_unclaimed_archive_rows SQL 失败")?;
+            Ok(rows
+                .iter()
+                .map(|row| ArchiveRawRow {
+                    rowid: row.get(0),
+                    agent_id: row.get(1),
+                    metric: row.get(2),
+                    labels: row.get(3),
+                    ts: row.get(4),
+                    value: row.get(5),
+                })
+                .collect())
+        })
+        .context("list_unclaimed_archive_rows")
+    }
+
+    /// 插入归档对象并原子认领 `rows`，返回新对象 id。
+    ///
+    /// `UPDATE ... WHERE id = ANY(...) AND archive_object_id IS NULL` 的
+    /// affected 行数必须等于选中数；否则整事务回滚并返回可重试的
+    /// [`ArchiveStoreError::ClaimConflict`]。并发 claim 由行级锁串行化，
+    /// 后提交者会看到已认领行并失败。
+    pub fn claim_archive_rows(
+        &self,
+        object: &ArchiveObject,
+        rows: &[ArchiveRawRow],
+    ) -> Result<i64> {
+        validate_archive_claim(object, rows)?;
+        self.with_client(|client| {
+            let mut tx = client.transaction().context("开启归档 claim 事务失败")?;
+            let object_id = insert_archive_object_tx(&mut tx, object)?;
+            // 与 SQLite 一样做行身份比对：即使 id 理论上不复用，也不把
+            // 「同 id 但内容已变」的行算作同一 claim 目标。
+            let mut updated = 0usize;
+            for row in rows {
+                let affected = tx
+                    .execute(
+                        "UPDATE samples SET archive_object_id = $1 \
+                         WHERE id = $2 AND archive_object_id IS NULL \
+                           AND agent_id = $3 AND metric = $4 AND labels = $5 \
+                           AND ts = $6 AND value = $7",
+                        &[
+                            &object_id,
+                            &row.rowid,
+                            &row.agent_id,
+                            &row.metric,
+                            &row.labels,
+                            &row.ts,
+                            &row.value,
+                        ],
+                    )
+                    .context("执行归档 claim 更新失败")?;
+                updated += usize::try_from(affected).context("归档 claim 返回行数溢出")?;
+            }
+            if updated != rows.len() {
+                tx.rollback().context("回滚归档 claim 事务失败")?;
+                tracing::warn!(
+                    object_id,
+                    selected = rows.len(),
+                    claimed = updated,
+                    "归档 claim 行集与扫描结果不一致，整事务回滚"
+                );
+                return Err(ArchiveStoreError::ClaimConflict.into());
+            }
+            tx.commit().context("提交归档 claim 事务失败")?;
+            Ok(object_id)
+        })
+        .context("claim_archive_rows")
+    }
+
+    /// 更新归档对象的压缩后字节数与 SHA-256。
+    ///
+    /// 短事务 claim 只插入对象并把 bytes/sha256 留作占位；CSV.GZ 在事务外
+    /// 生成后调用本方法补元数据。`sha256` 必须是 64 位小写十六进制；对象
+    /// 不存在返回 [`ArchiveStoreError::NotFound`]。
+    pub fn update_archive_object_metadata(&self, id: i64, bytes: u64, sha256: &str) -> Result<()> {
+        validate_archive_sha256(sha256)?;
+        let bytes = i64::try_from(bytes).context("归档对象字节数超出 BIGINT 范围")?;
+        self.with_client(|client| {
+            let mut tx = client.transaction().context("开启归档元数据更新事务失败")?;
+            let object: Option<(i64, String)> = tx
+                .query_opt(
+                    "SELECT ledger_version, status FROM archive_objects WHERE id = $1 FOR UPDATE",
+                    &[&id],
+                )
+                .context("读取归档对象状态失败")?
+                .map(|row| (row.get(0), row.get(1)));
+            let Some((ledger_version, status)) = object else {
+                return Err(ArchiveStoreError::NotFound.into());
+            };
+            let status = ArchiveStatus::parse(&status)
+                .ok_or_else(|| anyhow!("archive_objects.status 字段值非法"))?;
+            if ledger_version != LEDGER_VERSION_V8
+                || !matches!(status, ArchiveStatus::Pending | ArchiveStatus::Failed)
+            {
+                return Err(ArchiveStoreError::InvalidTransition.into());
+            }
+            tx.execute(
+                "UPDATE archive_objects SET bytes = $2, sha256 = $3 WHERE id = $1",
+                &[&id, &bytes, &sha256],
+            )
+            .context("执行 update_archive_object_metadata SQL 失败")?;
+            tx.commit().context("提交归档元数据更新事务失败")?;
+            Ok(())
+        })
+        .context("update_archive_object_metadata")
+    }
+
+    /// 记录一次上传尝试：仅 pending / failed 对象允许，`attempts += 1`。
+    ///
+    /// 返回递增后的 attempts。对象不存在返回 `NotFound`，uploaded /
+    /// local_deleted 返回 `InvalidTransition`。
+    pub fn record_archive_attempt(&self, id: i64) -> Result<i64> {
+        self.with_client(|client| {
+            let mut tx = client.transaction().context("开启归档尝试计数事务失败")?;
+            let status: Option<String> = tx
+                .query_opt(
+                    "SELECT status FROM archive_objects WHERE id = $1 FOR UPDATE",
+                    &[&id],
+                )
+                .context("读取归档对象状态失败")?
+                .map(|row| row.get(0));
+            let Some(status) = status else {
+                return Err(ArchiveStoreError::NotFound.into());
+            };
+            let status = ArchiveStatus::parse(&status)
+                .ok_or_else(|| anyhow!("archive_objects.status 字段值非法"))?;
+            if !matches!(status, ArchiveStatus::Pending | ArchiveStatus::Failed) {
+                return Err(ArchiveStoreError::InvalidTransition.into());
+            }
+            let attempts: i64 = tx
+                .query_one(
+                    "UPDATE archive_objects SET attempts = attempts + 1 \
+                     WHERE id = $1 RETURNING attempts",
+                    &[&id],
+                )
+                .context("执行归档尝试计数 SQL 失败")?
+                .get(0);
+            tx.commit().context("提交归档尝试计数事务失败")?;
+            Ok(attempts)
+        })
+        .context("record_archive_attempt")
+    }
+
+    /// 统计不可归档 raw 行数（`ts < 0` 或 `ts > now`）；只计数不修改。
+    ///
+    /// 与 SQLite 语义一致，供 R1b 的 `invalid_timestamp_rows` 使用。
+    pub fn count_invalid_archive_raw_rows(&self) -> Result<i64> {
+        self.with_client(|client| {
+            Ok(client
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT FROM samples WHERE ts < $1 OR ts > $2",
+                    &[&MIN_ARCHIVE_TS_MS, &now_ms().min(MAX_ARCHIVE_TS_MS)],
+                )
+                .context("统计不可归档 raw 行数失败")?
+                .get(0))
+        })
+        .context("count_invalid_archive_raw_rows")
+    }
+
+    /// 按 `archive_object_id` 读回 claim 行集，按 `ts, samples.id` 升序。
+    ///
+    /// 上传失败 / 崩溃后的重试必须用同一行集重建 CSV 与 manifest，不能重扫 raw；
+    /// 排序必须与 claim 扫描（`list_unclaimed_archive_rows` 的 `ts, id`）一致，
+    /// 否则重试会输出不同的行顺序，导致 SHA-256 与已记录对象不一致。
+    /// 对象不存在或行已删除时返回空列表。
+    pub fn archive_rows_for_object(&self, object_id: i64) -> Result<Vec<ArchiveRawRow>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "SELECT id, agent_id, metric, labels, ts, value FROM samples \
+                     WHERE archive_object_id = $1 ORDER BY ts ASC, id ASC",
+                    &[&object_id],
+                )
+                .context("执行 archive_rows_for_object SQL 失败")?;
+            Ok(rows
+                .iter()
+                .map(|row| ArchiveRawRow {
+                    rowid: row.get(0),
+                    agent_id: row.get(1),
+                    metric: row.get(2),
+                    labels: row.get(3),
+                    ts: row.get(4),
+                    value: row.get(5),
+                })
+                .collect())
+        })
+        .context("archive_rows_for_object")
     }
 
     /// `archive_objects` 的总行数。
@@ -1155,6 +1837,8 @@ mod tests {
             created_at: 1_000,
             uploaded_at: None,
             deleted_at: None,
+            ledger_version: 0,
+            attempts: 0,
         }
     }
 
@@ -1168,6 +1852,9 @@ mod tests {
         for sql in [
             AGGREGATE_1M_SQL,
             AGGREGATE_1H_SQL,
+            AGGREGATE_1M_DELTA_SQL,
+            MARK_1M_HOURS_DIRTY_SQL,
+            CLAIM_RAW_AGGREGATED_SQL,
             PRUNE_RAW_SQL,
             PRUNE_1M_SQL,
             PRUNE_1H_SQL,
@@ -1177,6 +1864,28 @@ mod tests {
             assert!(sql.contains('$'), "SQL 必须使用 $N 占位符：{sql}");
         }
         assert!(PRUNE_RAW_SQL.contains("samples WHERE id IN"));
+        assert!(
+            PRUNE_RAW_SQL.contains("aggregated_1m = 1"),
+            "raw retention 必须只删已聚合行"
+        );
+        assert!(
+            PRUNE_1M_SQL.contains("aggregated_1h = 0"),
+            "1m retention 必须整小时跳过 dirty hour"
+        );
+        // R1b：delta 必须按桶加权合并而非覆盖，并把整小时标脏。
+        for needle in [
+            "id = ANY($1::BIGINT[])",
+            "aggregated_1h = 0",
+            "samples_1m.count",
+            "EXCLUDED.last_ts > samples_1m.last_ts",
+        ] {
+            assert!(
+                AGGREGATE_1M_DELTA_SQL.contains(needle),
+                "delta SQL 缺少 {needle}: {AGGREGATE_1M_DELTA_SQL}"
+            );
+        }
+        assert!(MARK_1M_HOURS_DIRTY_SQL.contains("(bucket_ts / 3600000)"));
+        assert!(CLAIM_RAW_AGGREGATED_SQL.contains("aggregated_1m = 0"));
     }
 
     #[test]
@@ -1448,21 +2157,21 @@ mod tests {
             return;
         };
         let storage = pg.storage();
-        let cutoff = 1_700_000_000_000_i64;
+        let cutoff = 1_699_999_920_000_i64; // 整点，边界语义确定
         let expired_rows = PRUNE_BATCH_ROWS + 3;
 
         // 5003 条 `ts < cutoff` 的过期 raw + 1 条恰好等于 cutoff 的边界行。
         execute(
             storage,
-            "INSERT INTO samples (agent_id, metric, labels, ts, value)
-             SELECT 'a', 'cpu.usage', '{}', $1::BIGINT - 1 - g, 0.5
+            "INSERT INTO samples (agent_id, metric, labels, ts, value, aggregated_1m)
+             SELECT 'a', 'cpu.usage', '{}', $1::BIGINT - 1 - g, 0.5, 1
              FROM generate_series(0, $2::BIGINT) AS g",
             &[&cutoff, &(expired_rows as i64 - 1)],
         );
         execute(
             storage,
-            "INSERT INTO samples (agent_id, metric, labels, ts, value)
-             VALUES ('a', 'cpu.usage', '{}', $1, 1.0)",
+            "INSERT INTO samples (agent_id, metric, labels, ts, value, aggregated_1m)
+             VALUES ('a', 'cpu.usage', '{}', $1, 1.0, 1)",
             &[&cutoff],
         );
 
@@ -1483,19 +2192,37 @@ mod tests {
         assert_eq!(ts, cutoff);
 
         // 1m / 1h：cutoff 是排他边界，等于 cutoff 的行保留。
-        for table in ["samples_1m", "samples_1h"] {
-            execute(
-                storage,
-                &format!(
-                    "INSERT INTO {table}
-                         (agent_id, metric, labels, bucket_ts, min_value, max_value,
-                          avg_value, last_value, count)
-                     VALUES ('a', 'cpu.usage', '{{}}', $1::BIGINT - 1, 1, 1, 1, 1, 1),
-                            ('a', 'cpu.usage', '{{}}', $1::BIGINT, 2, 2, 2, 2, 2)"
-                ),
-                &[&cutoff],
-            );
-        }
+        // 1h 的 bucket_ts 必须是整点，不能直接复用 raw/1m 的时间戳。
+        let hour_prev = ((cutoff - 3_600_000) / 3_600_000) * 3_600_000;
+        execute(
+            storage,
+            "INSERT INTO samples_1m
+                 (agent_id, metric, labels, bucket_ts, min_value, max_value,
+                  avg_value, last_value, count)
+             VALUES ('a', 'cpu.usage', '{}', $1::BIGINT - 3600000, 1, 1, 1, 1, 1),
+                    ('a', 'cpu.usage', '{}', $1, 2, 2, 2, 2, 2)",
+            &[&cutoff],
+        );
+        execute(
+            storage,
+            "INSERT INTO samples_1h
+                 (agent_id, metric, labels, bucket_ts, min_value, max_value,
+                  avg_value, last_value, count)
+             VALUES ('a', 'cpu.usage', '{}', $1, 1, 1, 1, 1, 1),
+                    ('a', 'cpu.usage', '{}', $2, 2, 2, 2, 2, 2)",
+            &[&hour_prev, &cutoff],
+        );
+        // v8 1m retention 只删除「该 series 已有匹配 1h」的整小时；
+        // 先走真实 1h 聚合生成对应历史，再验证删除。
+        storage
+            .downsample_1h_range(cutoff - 3_600_000, cutoff)
+            .expect("生成 1h 历史失败");
+        // 边界行必须仍是 dirty；只允许其前一行被 1m retention 选中。
+        execute(
+            storage,
+            "UPDATE samples_1m SET aggregated_1h = 0 WHERE bucket_ts >= $1",
+            &[&cutoff],
+        );
         let pruned_1m = storage
             .prune_samples_1m_before(cutoff)
             .expect("1m 保留期删除失败");
@@ -1535,8 +2262,8 @@ mod tests {
         for ts in [1_000_i64, 2_000, 3_000] {
             execute(
                 storage,
-                "INSERT INTO samples (agent_id, metric, labels, ts, value)
-                 VALUES ('a', 'cpu.usage', '{}', $1, 1.0)",
+                "INSERT INTO samples (agent_id, metric, labels, ts, value, aggregated_1m)
+                 VALUES ('a', 'cpu.usage', '{}', $1, 1.0, 1)",
                 &[&ts],
             );
         }
@@ -1809,6 +2536,138 @@ mod tests {
             "单点范围也要包含跨过该点的对象"
         );
         assert_eq!(storage.count_archive_objects().expect("对象计数失败"), 4);
+    }
+
+    #[test]
+    fn pg_claim_rows_readback_and_metadata_update_use_sample_ids() {
+        const NAME: &str = "pg_claim_rows_readback_and_metadata_update_use_sample_ids";
+        let Some(pg) = TestPg::create(NAME, "claim") else {
+            return;
+        };
+        let storage = pg.storage();
+        // 插入顺序与 ts 顺序相反，验证 scan/readback 都按 (ts, id) 排序。
+        for ts in [2_000_i64, 1_000] {
+            execute(
+                storage,
+                "INSERT INTO samples (agent_id, metric, labels, ts, value)
+                 VALUES ('a', 'cpu.usage', '{}', $1, 1.0)",
+                &[&ts],
+            );
+        }
+        let rows = storage
+            .list_unclaimed_archive_rows(0, 10_000, 100)
+            .expect("读取未认领行失败");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().map(|row| row.ts).collect::<Vec<_>>(),
+            vec![1_000, 2_000],
+            "scan 必须按 (ts, id) 排序"
+        );
+        let mut row_ids: Vec<i64> = rows.iter().map(|row| row.rowid).collect();
+        row_ids.sort_unstable();
+        let sample_ids: Vec<i64> = fetch(storage, "SELECT id FROM samples ORDER BY id", &[])
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            row_ids, sample_ids,
+            "ArchiveRawRow.rowid 必须来自 samples.id"
+        );
+
+        let mut object = archive_object(
+            "v8/part-00001-v8.csv.gz",
+            1_000,
+            2_000,
+            ArchiveStatus::Pending,
+        );
+        object.rows = 2;
+        object.ledger_version = crate::archive::LEDGER_VERSION_V8;
+        object.bytes = 0;
+        object.sha256.clear();
+        let object_id = storage
+            .claim_archive_rows(&object, &rows)
+            .expect("PG claim 失败");
+        let readback = storage
+            .archive_rows_for_object(object_id)
+            .expect("PG 读回 claim 行集失败");
+        assert_eq!(readback, rows);
+
+        let digest = "e".repeat(64);
+        storage
+            .update_archive_object_metadata(object_id, 321, &digest)
+            .expect("PG 元数据更新失败");
+        let stored = storage.get_archive_object(object_id).unwrap().unwrap();
+        assert_eq!(stored.bytes, 321);
+        assert_eq!(stored.sha256, digest);
+        assert_eq!(stored.attempts, 0);
+        assert_eq!(storage.record_archive_attempt(object_id).unwrap(), 1);
+        assert_eq!(storage.record_archive_attempt(object_id).unwrap(), 2);
+        storage
+            .update_archive_object_status(object_id, ArchiveStatus::Uploaded, "", Some(2_000), None)
+            .expect("pending→uploaded 合法");
+        let err = storage
+            .update_archive_object_metadata(object_id, 1, &"f".repeat(64))
+            .expect_err("uploaded 后不得再改元数据");
+        assert_eq!(
+            err.downcast_ref::<ArchiveStoreError>(),
+            Some(&ArchiveStoreError::InvalidTransition)
+        );
+        let err = storage
+            .record_archive_attempt(object_id)
+            .expect_err("uploaded 后不得再记录尝试");
+        assert_eq!(
+            err.downcast_ref::<ArchiveStoreError>(),
+            Some(&ArchiveStoreError::InvalidTransition)
+        );
+
+        // uploaded 不得被迟到的失败记录翻回 failed（双 worker 竞态防线）。
+        let err = storage
+            .record_archive_object_failure(object_id, "backend_unavailable")
+            .expect_err("uploaded 后不得记录失败");
+        assert_eq!(
+            err.downcast_ref::<ArchiveStoreError>(),
+            Some(&ArchiveStoreError::InvalidTransition)
+        );
+
+        // v7 旧对象没有 claim 行集，禁止补写 v8 元数据。
+        let mut legacy = archive_object("v7/old.csv.gz", 1_000, 2_000, ArchiveStatus::Pending);
+        legacy.ledger_version = crate::archive::LEDGER_VERSION_V7;
+        legacy.bytes = 0;
+        legacy.sha256.clear();
+        let legacy_id = storage
+            .insert_archive_object(&legacy)
+            .expect("插入 v7 对象失败");
+        let err = storage
+            .update_archive_object_metadata(legacy_id, 1, &"f".repeat(64))
+            .expect_err("v7 对象不得补写 v8 元数据");
+        assert_eq!(
+            err.downcast_ref::<ArchiveStoreError>(),
+            Some(&ArchiveStoreError::InvalidTransition)
+        );
+
+        // 同一批行再次 claim 必须整事务回滚并返回可重试冲突。
+        let mut again = archive_object(
+            "v8/part-00002-v8.csv.gz",
+            1_000,
+            2_000,
+            ArchiveStatus::Pending,
+        );
+        again.rows = 2;
+        again.ledger_version = crate::archive::LEDGER_VERSION_V8;
+        let err = storage
+            .claim_archive_rows(&again, &rows)
+            .expect_err("重复 claim 必须失败");
+        assert_eq!(
+            err.downcast_ref::<ArchiveStoreError>(),
+            Some(&ArchiveStoreError::ClaimConflict)
+        );
+        assert!(
+            storage
+                .find_archive_object_by_key("v8/part-00002-v8.csv.gz")
+                .unwrap()
+                .is_none(),
+            "冲突 claim 的对象插入必须回滚"
+        );
     }
 
     #[test]
@@ -2117,8 +2976,8 @@ mod tests {
             let start = base + cycle * 100;
             execute(
                 &storage,
-                "INSERT INTO samples (agent_id, metric, labels, ts, value)
-                 SELECT 'a', 'cpu.usage', '{}', $1::BIGINT + g, 1.0
+                "INSERT INTO samples (agent_id, metric, labels, ts, value, aggregated_1m)
+                 SELECT 'a', 'cpu.usage', '{}', $1::BIGINT + g, 1.0, 1
                  FROM generate_series(0, 7) AS g",
                 &[&start],
             );
@@ -2190,8 +3049,8 @@ mod tests {
         let start = base + 10_000;
         execute(
             &storage,
-            "INSERT INTO samples (agent_id, metric, labels, ts, value)
-             SELECT 'a', 'cpu.usage', '{}', $1::BIGINT + g, 1.0
+            "INSERT INTO samples (agent_id, metric, labels, ts, value, aggregated_1m)
+             SELECT 'a', 'cpu.usage', '{}', $1::BIGINT + g, 1.0, 1
              FROM generate_series(0, 2) AS g",
             &[&start],
         );

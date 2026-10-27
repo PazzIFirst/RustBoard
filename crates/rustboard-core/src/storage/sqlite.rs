@@ -16,14 +16,14 @@ use crate::alerts::{
     AlertEvent, AlertRule, AlertRuleStoreError, AlertSilence, AlertSilenceStoreError, AlertSource,
     AlertState, AlertStateKind, Comparator, MAX_ALERT_RULES, MAX_ALERT_SILENCES,
 };
-use crate::archive::{ArchiveObject, ArchiveStatus, ArchiveStoreError};
+use crate::archive::{ArchiveObject, ArchiveStatus, ArchiveStoreError, LEDGER_VERSION_V8};
 use crate::channels::{ChannelConfig, ChannelKind, NotificationChannel};
 
 use super::{
     invalid_batch, AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry,
-    DownsampleRangeResult, IngestOutcome, MaintenanceStateEntry, NewAuditEntry, PruneResult,
-    QueryTooLarge, RejectReason, SampleTier, Storage, TierStats, AUDIT_RETENTION_MS, BUCKET_1H_MS,
-    BUCKET_1M_MS,
+    DownsampleDeltaResult, DownsampleHourResult, DownsampleRangeResult, IngestOutcome,
+    MaintenanceStateEntry, NewAuditEntry, PruneResult, QueryTooLarge, RejectReason, SampleTier,
+    Storage, TierStats, AUDIT_RETENTION_MS, BUCKET_1H_MS, BUCKET_1M_MS,
 };
 
 /// 默认只读连接池大小（与 `HubConfig::read_pool_size` 默认值一致）。
@@ -38,7 +38,8 @@ pub const MAX_READ_POOL_SIZE: usize = 16;
 /// v5 = 新增 `agent_control` / `audit_log`（M3 控制面，纯新增表），
 /// v6 = 新增 `api_tokens`（管理 API scoped token，纯新增表），
 /// v7 = 新增 M4 降采样 / 告警 / 通知 / 归档 / 维护水位表（纯新增表与索引）。
-const SCHEMA_VERSION: i64 = 7;
+/// v8 = raw 归档归属 / 聚合认领列、1m 水位列、归档 ledger 版本与对应 partial index。
+const SCHEMA_VERSION: i64 = 8;
 
 /// `last_used_at` 的写入节流窗口：同一 token 60s 内只写一次，避免每个管理
 /// 请求都抢写连接；首次鉴权（`last_used_at IS NULL`）一定会写。
@@ -84,7 +85,9 @@ CREATE TABLE IF NOT EXISTS samples (
     metric    TEXT NOT NULL,
     labels    TEXT NOT NULL DEFAULT '{}',
     ts        INTEGER NOT NULL,
-    value     REAL NOT NULL
+    value     REAL NOT NULL,
+    archive_object_id INTEGER,
+    aggregated_1m INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_samples_lookup ON samples(agent_id, metric, ts);
 CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
@@ -212,6 +215,8 @@ CREATE TABLE IF NOT EXISTS samples_1m (
     avg_value  REAL NOT NULL,
     last_value REAL NOT NULL,
     count      INTEGER NOT NULL,
+    last_ts    INTEGER NOT NULL DEFAULT 0,
+    aggregated_1h INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (agent_id, metric, labels, bucket_ts)
 );
 CREATE INDEX IF NOT EXISTS idx_samples_1m_lookup ON samples_1m(agent_id, metric, bucket_ts);
@@ -331,7 +336,9 @@ CREATE TABLE IF NOT EXISTS archive_objects (
     error        TEXT NOT NULL DEFAULT '',
     created_at   INTEGER NOT NULL,
     uploaded_at  INTEGER,
-    deleted_at   INTEGER
+    deleted_at   INTEGER,
+    ledger_version INTEGER NOT NULL DEFAULT 0,
+    attempts     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_archive_objects_range ON archive_objects(from_ts, to_ts);
 CREATE INDEX IF NOT EXISTS idx_archive_objects_status ON archive_objects(status);
@@ -342,6 +349,70 @@ CREATE TABLE IF NOT EXISTS archive_state (
     updated_at INTEGER NOT NULL
 );
 "#;
+
+/// v8 的 partial index。
+///
+/// 必须在 [`ensure_v8_columns`] 之后执行：旧 v7 库建索引时新列还不存在。
+/// 扫描条件与索引谓词完全一致，SQLite 才会走 partial index 而不是全表。
+const V8_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_samples_unarchived ON samples(ts)
+    WHERE archive_object_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_samples_unaggregated ON samples(ts)
+    WHERE aggregated_1m = 0;
+CREATE INDEX IF NOT EXISTS idx_samples_1m_unaggregated ON samples_1m(bucket_ts)
+    WHERE aggregated_1h = 0;
+"#;
+
+/// v8 新增列（旧 v7 库逐列检查后 ALTER）。
+///
+/// `(表, 列, ALTER 语句)` 全部是编译期常量，不接受外部输入。
+const V8_COLUMNS: [(&str, &str, &str); 6] = [
+    (
+        "samples",
+        "archive_object_id",
+        "ALTER TABLE samples ADD COLUMN archive_object_id INTEGER",
+    ),
+    (
+        "samples",
+        "aggregated_1m",
+        "ALTER TABLE samples ADD COLUMN aggregated_1m INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "samples_1m",
+        "last_ts",
+        "ALTER TABLE samples_1m ADD COLUMN last_ts INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "samples_1m",
+        "aggregated_1h",
+        "ALTER TABLE samples_1m ADD COLUMN aggregated_1h INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "archive_objects",
+        "ledger_version",
+        "ALTER TABLE archive_objects ADD COLUMN ledger_version INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "archive_objects",
+        "attempts",
+        "ALTER TABLE archive_objects ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+    ),
+];
+
+/// `archive_state` 中的最后成功归档水位。
+const STATE_LAST_ARCHIVED_TS: &str = "last_archived_ts";
+/// `archive_state` 中的 v8 ledger 重建待办标记。
+const STATE_ARCHIVE_LEDGER_PENDING: &str = "archive_ledger_pending";
+
+/// 可归档 raw 的最小时间戳（Unix 毫秒）：小于 0 的旧行不进入 v8 claim。
+///
+/// R1b 会把这些超界行计数并隔离；本切片只保证它们不会被
+/// [`SqliteStorage::list_unclaimed_archive_rows`] 选中，避免 `archive_day_for`
+/// 在 i64::MIN 上整轮报错。
+pub const MIN_ARCHIVE_TS_MS: i64 = 0;
+
+/// 可归档 raw 的绝对上界：9999-12-31T23:59:59.999Z（与 `ArchiveDay` 上限一致）。
+pub const MAX_ARCHIVE_TS_MS: i64 = 253_402_300_799_999;
 
 /// 1m 聚合：把 `[?1, ?2)` 内 raw 行按 `(agent_id, metric, labels, 整分钟)` 聚合，
 /// 按主键 upsert。`last_value` 取桶内最大 `ts`，同 ts 取最大 `rowid`。
@@ -404,16 +475,108 @@ ON CONFLICT(agent_id, metric, labels, bucket_ts) DO UPDATE SET
     avg_value = excluded.avg_value,
     last_value = excluded.last_value,
     count = excluded.count
+WHERE excluded.count >= samples_1h.count
 "#;
+
+/// R1b：1m 增量合并。只认领 `aggregated_1m=0` 的 raw，按桶计算 delta 后与
+/// 已有 1m 行合并：
+///
+/// - `count += delta.count`；`min/max` 取两边极值；
+/// - `avg` 按两边 count 加权，不能覆盖为 delta 的简单平均；
+/// - `last_value/last_ts` 仅在 `delta.last_ts > samples_1m.last_ts` 时改写；
+/// - 新桶 `aggregated_1h=0`；已有桶同样置 0，保证 1h 源完整。
+///
+/// 下标 60000 与 [`BUCKET_1M_MS`] 必须一致（单测断言）。
+const AGGREGATE_1M_DELTA_SQL: &str = r#"
+INSERT INTO samples_1m
+    (agent_id, metric, labels, bucket_ts, min_value, max_value, avg_value,
+     last_value, count, last_ts, aggregated_1h)
+SELECT agent_id, metric, labels, bucket_ts,
+       MIN(value), MAX(value), AVG(value), MAX(last_value), COUNT(*),
+       MAX(last_ts), 0
+FROM (
+    SELECT agent_id, metric, labels,
+           (ts / 60000) * 60000 AS bucket_ts,
+           value, ts AS last_ts,
+           FIRST_VALUE(value) OVER (
+               PARTITION BY agent_id, metric, labels, (ts / 60000) * 60000
+               ORDER BY ts DESC, rowid DESC
+           ) AS last_value
+    FROM samples
+    WHERE aggregated_1m = 0 AND ts >= 0 AND ts < ?1
+)
+GROUP BY agent_id, metric, labels, bucket_ts
+ON CONFLICT(agent_id, metric, labels, bucket_ts) DO UPDATE SET
+    min_value = MIN(samples_1m.min_value, excluded.min_value),
+    max_value = MAX(samples_1m.max_value, excluded.max_value),
+    avg_value = (samples_1m.avg_value * samples_1m.count
+                 + excluded.avg_value * excluded.count)
+                / (samples_1m.count + excluded.count),
+    last_value = CASE
+        WHEN excluded.last_ts > samples_1m.last_ts THEN excluded.last_value
+        ELSE samples_1m.last_value
+    END,
+    last_ts = MAX(samples_1m.last_ts, excluded.last_ts),
+    count = samples_1m.count + excluded.count,
+    aggregated_1h = 0
+"#;
+
+/// 把本批 raw 所在的**整小时**全部 1m 行置 `aggregated_1h=0`。
+///
+/// 只重置当前桶所在分钟不够：1h 由整点小时内所有 1m 行重算，同一小时其它
+/// 分钟/序列的 1m 行也属于同一份源，必须一起标脏。
+const MARK_1M_HOURS_DIRTY_SQL: &str = "UPDATE samples_1m SET aggregated_1h = 0 \
+     WHERE (bucket_ts / 3600000) IN ( \
+         SELECT DISTINCT (ts / 3600000) FROM samples \
+         WHERE aggregated_1m = 0 AND ts >= 0 AND ts < ?1)";
+
+/// 认领本批 raw：只把仍为 0 的行置 1；affected 必须等于选中行数。
+const CLAIM_RAW_AGGREGATED_SQL: &str = "UPDATE samples SET aggregated_1m = 1 \
+     WHERE aggregated_1m = 0 AND ts >= 0 AND ts < ?1";
 
 /// 保留期删除 SQL：每批最多 `?2` 行，`?1` 是排他 cutoff（`< cutoff`）。
 ///
 /// 用 `rowid IN (SELECT ... LIMIT)` 而不是全表 DELETE，保证单批事务短、批间
 /// 可以释放写锁；`rowid` 对三张表都可用（均非 WITHOUT ROWID）。
 const PRUNE_RAW_SQL: &str = "DELETE FROM samples WHERE rowid IN \
-     (SELECT rowid FROM samples WHERE ts < ?1 ORDER BY ts LIMIT ?2)";
-const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE rowid IN \
-     (SELECT rowid FROM samples_1m WHERE bucket_ts < ?1 ORDER BY bucket_ts LIMIT ?2)";
+     (SELECT rowid FROM samples \
+      WHERE ts < ?1 AND aggregated_1m = 1 ORDER BY ts LIMIT ?2)";
+/// v8 归档启用时的 raw 保留期：只删「已聚合且所属对象已 uploaded」的行。
+///
+/// 未认领行（`archive_object_id IS NULL`）与 pending / failed 对象必须保留；
+/// 本常量只在 [`SqliteStorage::prune_archived_samples_before`] 中使用，
+/// [`PRUNE_RAW_SQL`] 仅供归档关闭路径。
+const PRUNE_ARCHIVED_RAW_SQL: &str = "DELETE FROM samples WHERE rowid IN \
+     (SELECT s.rowid FROM samples s \
+        JOIN archive_objects o ON o.id = s.archive_object_id \
+      WHERE s.ts < ?1 AND s.aggregated_1m = 1 AND o.status = 'uploaded' \
+      ORDER BY s.ts LIMIT ?2)";
+/// 1m 保留期：只删**整小时都已 `aggregated_1h=1`** 的行。
+///
+/// 调用方已把 `?1` 向下取整到整点；dirty hour 只要有一行未聚合，整小时跳过。
+const PRUNE_1M_SQL: &str = "DELETE FROM samples_1m WHERE \
+     (agent_id, metric, labels, (bucket_ts / 3600000) * 3600000) IN ( \
+     SELECT g.agent_id, g.metric, g.labels, g.hour_start \
+     FROM ( \
+         SELECT agent_id, metric, labels, \
+                (bucket_ts / 3600000) * 3600000 AS hour_start, \
+                SUM(count) AS source_count, \
+                MAX(CASE WHEN aggregated_1h = 0 THEN 1 ELSE 0 END) AS dirty \
+         FROM samples_1m \
+         WHERE bucket_ts < ?1 \
+         GROUP BY agent_id, metric, labels, hour_start \
+     ) g \
+     LEFT JOIN samples_1h h \
+       ON h.agent_id = g.agent_id AND h.metric = g.metric \
+      AND h.labels = g.labels AND h.bucket_ts = g.hour_start \
+     WHERE g.dirty = 0 AND h.count = g.source_count \
+       AND NOT EXISTS ( \
+           SELECT 1 FROM samples s \
+           WHERE s.aggregated_1m = 0 \
+             AND s.ts >= g.hour_start AND s.ts < g.hour_start + 3600000 \
+       ) \
+     ORDER BY g.hour_start LIMIT ?2 \
+)";
 const PRUNE_1H_SQL: &str = "DELETE FROM samples_1h WHERE rowid IN \
      (SELECT rowid FROM samples_1h WHERE bucket_ts < ?1 ORDER BY bucket_ts LIMIT ?2)";
 
@@ -1073,6 +1236,9 @@ fn init_writer(mut conn: Connection) -> Result<Connection> {
     // busy_timeout 必须最先设置：两个进程并发首次打开旧库时，
     // 切 WAL 会拿写锁，没有超时就会直接报 database is locked。
     conn.pragma_update(None, "busy_timeout", 5_000)?;
+    // v8 门禁：更高版本库必须在 WAL/DDL/迁移之前拒绝，避免旧二进制写坏新库。
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    reject_newer_schema_version(version)?;
     // journal_mode 会返回一行，必须用 query_row 消费掉
     let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     tracing::debug!(mode, "sqlite journal mode");
@@ -1081,6 +1247,17 @@ fn init_writer(mut conn: Connection) -> Result<Connection> {
     conn.execute_batch(SCHEMA)?;
     migrate(&mut conn)?;
     Ok(conn)
+}
+
+/// 拒绝比本程序更新的 SQLite schema，避免旧二进制写坏新库。
+fn reject_newer_schema_version(version: i64) -> Result<()> {
+    if version > SCHEMA_VERSION {
+        anyhow::bail!(
+            "SQLite schema 版本 {version} 高于本程序支持的 v{SCHEMA_VERSION}；\
+             请升级 rustboard-hub 后再启动，避免旧二进制写坏新库"
+        );
+    }
+    Ok(())
 }
 
 /// 打开一条文件库只读连接。
@@ -1109,15 +1286,22 @@ fn prepare_reader(conn: Connection) -> Result<Connection> {
 
 /// 把 `ingest_state` 从 v1（agent_id 主键）迁移到 v2（agent_id + epoch 主键），
 /// 为 v3 建好 `ingest_batches` 精确判重表，为 v4 建好 `agent_settings` 表，
-/// 为 v5–v7 建好 M3/M4 的纯新增表。旧行原样保留。
+/// 为 v5–v7 建好 M3/M4 的纯新增表，并把 v7 库补列/回填到 v8。旧行原样保留。
 ///
 /// v1 代码从未写过 `user_version`，所以只靠版本号无法区分「空库」和「v1 库」：
 /// 版本号不足 2 时再看表是否存在。整个迁移在一个 `BEGIN IMMEDIATE` 事务里完成，
 /// 避免多个 hub 进程同时启动时重复迁移；旧行原样保留。
+///
+/// **v8 是单向升级**：已发布的 v7 二进制不会识别新列，升级后不得回退旧二进制，
+/// 回滚只能恢复升级前备份。
 fn migrate(conn: &mut Connection) -> Result<()> {
     // L3：先拿写锁再读版本，两个进程同时启动时只有一个能迁移。
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+
+    // v8 门禁放在任何 DDL/数据迁移之前；init_writer 的预检只是提前拒绝，
+    // 这里在持有写锁后再判一次，避免与另一个迁移进程竞态。
+    reject_newer_schema_version(version)?;
 
     if version < 2 {
         // 半途失败的残留表先清掉，避免 ALTER RENAME 撞名；即使本次没有
@@ -1160,18 +1344,183 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     // 带 IF NOT EXISTS，迁移中断或重复打开都不会重复建表。
     tx.execute_batch(M4_SCHEMA)?;
     // 旧 v7 库（B2b 首次落地）的 alert_events 没有 series_key；纯新增列，
-    // 不提升 user_version，历史事件自动补空串，通知 worker 按空序列处理。
+    // 历史事件自动补空串，通知 worker 按空序列处理。
     ensure_alert_events_series_key(&tx)?;
+
+    // v8：先补列（旧 v7 的 CREATE TABLE IF NOT EXISTS 不会改已存在的表），
+    // 再建依赖新列的 partial index，最后回填旧数据。
+    ensure_v8_columns(&tx)?;
+    tx.execute_batch(V8_INDEXES)?;
+    apply_v8_data_migration(&tx, version)?;
 
     if version < SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tracing::info!(
             from = version,
             to = SCHEMA_VERSION,
-            "数据库已迁移：新增 M4 schema v7（降采样、告警、通知、归档、维护水位表）"
+            "数据库已迁移：schema v8（归档 claim / 聚合认领列与 v7 旧数据回填）"
         );
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// 为旧 v7 库逐列补 v8 新增列；列已存在时零写入。
+fn ensure_v8_columns(tx: &Transaction<'_>) -> Result<()> {
+    for (table, column, alter_sql) in V8_COLUMNS {
+        let exists: i64 = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2
+             )",
+            params![table, column],
+            |row| row.get(0),
+        )?;
+        if exists != 0 {
+            continue;
+        }
+        tx.execute_batch(alter_sql)?;
+        tracing::info!(table, column, "已补充 v8 列");
+    }
+    Ok(())
+}
+
+/// v7→v8 数据回填；`version >= 8` 时整体跳过，保证重复打开不重写数据。
+///
+/// **按桶对账，不按维护水位**：v7 的 downsample 先写 1m 行再推进水位，崩溃
+/// 窗口里会有「1m 已写、水位未推进」的桶。若按水位标记 `aggregated_1m`，
+/// 这些桶的 raw 会被再次聚合（双计）；反过来水位先行也会漏计。因此：
+///
+/// 1. `samples.aggregated_1m`：同一分钟桶的 raw 按 `rowid` 升序编号，
+///    编号 `<= 1m.count` 的置 1；raw 少于 count 全置 1，无 1m 行保持 0。
+///    仅凭「桶已有 1m 行」会把崩溃窗口后到达的 late raw 误标，造成永久漏计；
+/// 2. `samples_1m.last_ts`：按 `rowid` 升序取最早 `1m.count` 条 raw 的
+///    `MAX(ts)`；raw 已删（无现存 raw）才回填 `bucket_ts + 59999`，避免迟到行
+///    被错误当成已聚合的 last；
+/// 3. `samples_1m.aggregated_1h`：同小时 1m 行按 `(bucket_ts, rowid)` 累计
+///    `count`，累计值 `<= 1h.count` 的置 1，其余保持 0；不读 1h 水位（v7 水位
+///    可能落在非整点）；
+/// 4. `archive_objects.ledger_version` / `attempts`：DB 默认 0，不需要额外更新；
+/// 5. 归档水位存在时写 `archive_state.archive_ledger_pending=1`，交给 R1a-2
+///    worker 重新导出仍存在的 unclaimed raw；这里只写状态，不做上传。
+///
+/// 迁移层拿不到 `archive.enabled`；`last_archived_ts` 是 v7 归档 worker 唯一
+/// 的持久化证据，因此以「水位存在」作为归档曾启用的 DB 侧代理。禁用归档的库
+/// 不会写入 pending，重复打开也不会重写。
+///
+/// TODO(R1b): 超界旧 `ts` 的隔离/计数（`invalid_timestamp_rows`）与聚合查询
+/// 过滤不在本切片；这里不修改任何 raw 的 `ts`，避免写坏数据。
+fn apply_v8_data_migration(tx: &Transaction<'_>, version: i64) -> Result<()> {
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // 按桶对账，而不是按非原子水位：避免 v7 崩溃窗口造成双计/漏计。
+    // 先清掉非 0 残留（半迁移/异常数据），保证「无 1m 桶」严格为 0。
+    // 超界时间戳（i64::MIN / 未来）不参与认领，留给 R1b 计数/隔离。
+    let now = now_ms().min(MAX_ARCHIVE_TS_MS);
+    tx.execute(
+        "UPDATE samples SET aggregated_1m = 0 WHERE aggregated_1m != 0",
+        [],
+    )?;
+    // 只认领每个 1m 桶「最早 1m.count 条 raw」（按 rowid 排序）；raw 少于
+    // count 时全部认领。不能仅凭桶存在就把所有 raw 标 1，否则崩溃窗口后
+    // 才到的 late raw 会被永久漏聚合。
+    let aggregated = tx.execute(
+        "UPDATE samples SET aggregated_1m = 1
+         WHERE rowid IN (
+             SELECT s.rowid FROM (
+                 SELECT rowid, agent_id, metric, labels, ts,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY agent_id, metric, labels, (ts / 60000) * 60000
+                            ORDER BY rowid ASC
+                        ) AS rn
+                 FROM samples
+                 WHERE ts >= ?1 AND ts <= ?2
+             ) s
+             JOIN samples_1m m
+               ON m.agent_id = s.agent_id
+              AND m.metric = s.metric
+              AND m.labels = s.labels
+              AND m.bucket_ts = (s.ts / 60000) * 60000
+             WHERE s.rn <= m.count
+         )",
+        params![MIN_ARCHIVE_TS_MS, now],
+    )?;
+    tracing::info!(aggregated, "v8 迁移：按已存在的 1m 桶标记已聚合 raw");
+
+    // last_ts 取「该桶最早 count 条 raw」的 MAX(ts)；raw 已删的桶才回填
+    // bucket_ts+59999。这样 late raw 不会被错误当成已聚合的 last。
+    tx.execute("UPDATE samples_1m SET last_ts = 0 WHERE last_ts != 0", [])?;
+    let backfilled = tx.execute(
+        "UPDATE samples_1m SET last_ts = COALESCE(
+             (SELECT MAX(s.ts) FROM samples s
+              WHERE s.agent_id = samples_1m.agent_id
+                AND s.metric = samples_1m.metric
+                AND s.labels = samples_1m.labels
+                AND s.ts >= samples_1m.bucket_ts
+                AND s.ts < samples_1m.bucket_ts + 60000
+                AND (SELECT COUNT(*) FROM samples s2
+                     WHERE s2.agent_id = samples_1m.agent_id
+                       AND s2.metric = samples_1m.metric
+                       AND s2.labels = samples_1m.labels
+                       AND s2.ts >= samples_1m.bucket_ts
+                       AND s2.ts < samples_1m.bucket_ts + 60000
+                       AND s2.rowid <= s.rowid) <= samples_1m.count),
+             samples_1m.bucket_ts + 59999)
+         WHERE bucket_ts >= ?1 AND bucket_ts <= ?2",
+        params![MIN_ARCHIVE_TS_MS, now],
+    )?;
+    tracing::info!(backfilled, "v8 迁移：回填 legacy 1m last_ts");
+
+    // 1h 按 (bucket_ts, rowid) 累计 count 对账：累计值 <= 1h.count 的 1m
+    // 行才算已并入；崩溃窗口后的 late 1m 行保持 0，交给 R1b 重算。
+    tx.execute(
+        "UPDATE samples_1m SET aggregated_1h = 0 WHERE aggregated_1h != 0",
+        [],
+    )?;
+    let aggregated_hour = tx.execute(
+        "UPDATE samples_1m SET aggregated_1h = 1
+         WHERE rowid IN (
+             SELECT m.rowid FROM (
+                 SELECT rowid, agent_id, metric, labels, bucket_ts, count,
+                        SUM(count) OVER (
+                            PARTITION BY agent_id, metric, labels,
+                                         (bucket_ts / 3600000) * 3600000
+                            ORDER BY bucket_ts ASC, rowid ASC
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                        ) AS cumulative_count
+                 FROM samples_1m
+                 WHERE bucket_ts >= ?1 AND bucket_ts <= ?2
+             ) m
+             JOIN samples_1h h
+               ON h.agent_id = m.agent_id
+              AND h.metric = m.metric
+              AND h.labels = m.labels
+              AND h.bucket_ts = (m.bucket_ts / 3600000) * 3600000
+             WHERE m.cumulative_count <= h.count
+         )",
+        params![MIN_ARCHIVE_TS_MS, now],
+    )?;
+    tracing::info!(aggregated_hour, "v8 迁移：按已存在的 1h 桶标记已聚合 1m");
+
+    let archived_watermark: Option<String> = tx
+        .query_row(
+            "SELECT value FROM archive_state WHERE key = ?1",
+            params![STATE_LAST_ARCHIVED_TS],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if archived_watermark.is_some_and(|value| !value.trim().is_empty()) {
+        tx.execute(
+            "INSERT INTO archive_state (key, value, updated_at)
+             VALUES (?1, '1', ?2)
+             ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value,
+                 updated_at = excluded.updated_at",
+            params![STATE_ARCHIVE_LEDGER_PENDING, now_ms()],
+        )?;
+        tracing::info!("v8 迁移：archive_ledger_pending=1（等待 R1a-2 重建 ledger）");
+    }
     Ok(())
 }
 
@@ -1999,9 +2348,10 @@ impl Storage for SqliteStorage {
         metric: &str,
         since: i64,
         agent: Option<&str>,
+        filter_labels: &Labels,
         limit: usize,
     ) -> Result<AlertSeriesSnapshot> {
-        SqliteStorage::latest_alert_series(self, metric, since, agent, limit)
+        SqliteStorage::latest_alert_series(self, metric, since, agent, filter_labels, limit)
     }
 
     fn apply_alert_transitions(&self, events: &[AlertEvent], states: &[AlertState]) -> Result<()> {
@@ -2121,6 +2471,38 @@ impl Storage for SqliteStorage {
         SqliteStorage::downsample_1h_range(self, from_ts, to_ts)
     }
 
+    fn downsample_1m_delta(
+        &self,
+        closed_end: i64,
+        max_rows: usize,
+    ) -> Result<DownsampleDeltaResult> {
+        SqliteStorage::downsample_1m_delta(self, closed_end, max_rows)
+    }
+
+    fn downsample_1h_hour(&self, closed_hour: i64) -> Result<Option<DownsampleHourResult>> {
+        SqliteStorage::downsample_1h_hour(self, closed_hour)
+    }
+
+    fn count_unaggregated_raw_rows(&self) -> Result<i64> {
+        SqliteStorage::count_unaggregated_raw_rows(self)
+    }
+
+    fn count_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        SqliteStorage::count_raw_rows_outside(self, min_ts, max_ts)
+    }
+
+    fn count_unaggregated_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        SqliteStorage::count_unaggregated_raw_rows_outside(self, min_ts, max_ts)
+    }
+
+    fn count_unaggregated_raw_rows_before(&self, before_ts: i64) -> Result<i64> {
+        SqliteStorage::count_unaggregated_raw_rows_before(self, before_ts)
+    }
+
+    fn isolate_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<usize> {
+        SqliteStorage::isolate_raw_rows_outside(self, min_ts, max_ts)
+    }
+
     fn raw_stats(&self) -> Result<TierStats> {
         SqliteStorage::raw_stats(self)
     }
@@ -2156,6 +2538,10 @@ impl Storage for SqliteStorage {
 
     fn prune_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
         SqliteStorage::prune_samples_before(self, cutoff)
+    }
+
+    fn prune_archived_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
+        SqliteStorage::prune_archived_samples_before(self, cutoff)
     }
 
     fn prune_samples_1m_before(&self, cutoff: i64) -> Result<PruneResult> {
@@ -2200,6 +2586,14 @@ impl Storage for SqliteStorage {
         SqliteStorage::list_archive_objects(self, limit, before_id)
     }
 
+    fn list_retryable_archive_objects(
+        &self,
+        limit: usize,
+        after_id: Option<i64>,
+    ) -> Result<Vec<ArchiveObject>> {
+        SqliteStorage::list_retryable_archive_objects(self, limit, after_id)
+    }
+
     fn update_archive_object_status(
         &self,
         id: i64,
@@ -2242,6 +2636,39 @@ impl Storage for SqliteStorage {
         limit: usize,
     ) -> Result<Vec<ArchiveRawRow>> {
         SqliteStorage::scan_archive_rows(self, from_ts, to_ts, after_rowid, limit)
+    }
+
+    fn list_unclaimed_archive_rows(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        limit: usize,
+    ) -> Result<Vec<ArchiveRawRow>> {
+        SqliteStorage::list_unclaimed_archive_rows(self, from_ts, to_ts, limit)
+    }
+
+    fn claim_archive_rows(&self, object: &ArchiveObject, rows: &[ArchiveRawRow]) -> Result<i64> {
+        SqliteStorage::claim_archive_rows(self, object, rows)
+    }
+
+    fn archive_rows_for_object(&self, object_id: i64) -> Result<Vec<ArchiveRawRow>> {
+        SqliteStorage::archive_rows_for_object(self, object_id)
+    }
+
+    fn record_archive_object_failure(&self, id: i64, error: &str) -> Result<()> {
+        SqliteStorage::record_archive_object_failure(self, id, error)
+    }
+
+    fn update_archive_object_metadata(&self, id: i64, bytes: u64, sha256: &str) -> Result<()> {
+        SqliteStorage::update_archive_object_metadata(self, id, bytes, sha256)
+    }
+
+    fn count_invalid_archive_raw_rows(&self) -> Result<i64> {
+        SqliteStorage::count_invalid_archive_raw_rows(self)
+    }
+
+    fn record_archive_attempt(&self, id: i64) -> Result<i64> {
+        SqliteStorage::record_archive_attempt(self, id)
     }
 
     fn count_archive_objects(&self) -> Result<i64> {
@@ -2654,7 +3081,11 @@ const ALERT_EVENT_INSERT_SQL: &str = "INSERT INTO alert_events
          notify_error, silenced)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
 
-/// 插入或整行更新一条状态；单条 upsert 与批量事务共用。
+/// 插入或更新一条状态；单条 upsert 与批量事务共用。
+///
+/// `last_notified_at` 只由新插入行携带（引擎的新序列为 NULL），冲突分支
+/// **绝不覆盖**：通知时间归 [`SqliteStorage::update_alert_state_notified`] 独占，
+/// 避免“引擎读旧快照 → worker 写通知时间 → 引擎提交”把冷却锚点冲掉。
 const ALERT_STATE_UPSERT_SQL: &str = "INSERT INTO alert_states
         (rule_id, agent_id, series_key, state, since, last_eval_at, last_value,
          last_notified_at)
@@ -2663,8 +3094,7 @@ const ALERT_STATE_UPSERT_SQL: &str = "INSERT INTO alert_states
         state = excluded.state,
         since = excluded.since,
         last_eval_at = excluded.last_eval_at,
-        last_value = excluded.last_value,
-        last_notified_at = excluded.last_notified_at";
+        last_value = excluded.last_value";
 
 /// B2 `notify_error` 的存储上限（字节）；B2 的错误信息也只能是脱敏后的摘要。
 const MAX_ALERT_NOTIFY_ERROR_BYTES: usize = 512;
@@ -2688,10 +3118,15 @@ const ALERT_STATE_PRUNE_FOR_RULE_SQL: &str = "DELETE FROM alert_states
          ORDER BY (state = 'resolved') ASC, last_eval_at DESC, rowid DESC LIMIT ?2
      )";
 
-/// 构造 `latest_alert_series` 的 SQL；`has_agent` 只影响占位符数量。
+/// 构造 `latest_alert_series` 的 SQL；`has_agent` / `filter_labels` 只影响
+/// 占位符数量与过滤子句。
+///
+/// 标签过滤是**精确子集**：每个过滤标签生成一个参数化的
+/// `EXISTS (SELECT 1 FROM json_each(samples.labels) ...)`，在 `ROW_NUMBER` 与
+/// `LIMIT` 之前生效。键与值只作为绑定参数传入，绝不拼接到 SQL 字符串里。
 ///
 /// 单独抽出来是为了 EXPLAIN QUERY PLAN 测试能断言走 `(metric, ts)` 索引。
-fn latest_alert_series_sql(has_agent: bool) -> String {
+fn latest_alert_series_sql(has_agent: bool, filter_labels: &Labels) -> String {
     // 索引名来自固定分支；`INDEXED BY` 保证无统计信息时也走预期索引，避免
     // 优化器误选 `idx_samples_ts` 后逐行过滤 metric（全窗口扫描）。
     let index = if has_agent {
@@ -2708,10 +3143,23 @@ fn latest_alert_series_sql(has_agent: bool) -> String {
              FROM samples INDEXED BY {index}
              WHERE metric = ?1 AND ts >= ?2"
     );
+    let mut next_param = 3;
     if has_agent {
-        sql.push_str(" AND agent_id = ?");
+        sql.push_str(&format!(" AND agent_id = ?{next_param}"));
+        next_param += 1;
     }
-    sql.push_str(") WHERE rn = 1 ORDER BY agent_id ASC, labels ASC LIMIT ?");
+    for _ in filter_labels {
+        let key_param = next_param;
+        let value_param = next_param + 1;
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM json_each(samples.labels) AS filter_label \
+             WHERE filter_label.key = ?{key_param} AND filter_label.value = ?{value_param})"
+        ));
+        next_param += 2;
+    }
+    sql.push_str(&format!(
+        ") WHERE rn = 1 ORDER BY agent_id ASC, labels ASC LIMIT ?{next_param}"
+    ));
     sql
 }
 
@@ -2883,7 +3331,9 @@ impl SqliteStorage {
             .optional()?)
     }
 
-    /// 插入或整行更新一条告警状态（主键冲突时覆盖状态、时间与值）。
+    /// 插入或更新一条告警状态：冲突时覆盖状态、时间与值，但**保留**
+    /// 库中已有的 `last_notified_at`（由通知 worker 独占；新行按传入值写入，
+    /// 引擎构造的新序列为 NULL）。
     pub fn upsert_alert_state(&self, state: &AlertState) -> Result<()> {
         self.lock_write().execute(
             ALERT_STATE_UPSERT_SQL,
@@ -3139,14 +3589,12 @@ impl SqliteStorage {
     /// 语义：
     /// - 只查 `samples` 原始表，**不回退** 1m / 1h（旧桶不能当当前值）；
     /// - 只取 `ts >= since` 的样本；
+    /// - `filter_labels` 是精确子集，SQL 侧用参数化 `json_each` 下推，先过滤再
+    ///   做 `ROW_NUMBER` / 排序 / `LIMIT`，因此截断只作用于匹配的序列；
     /// - 每个 `(agent_id, labels)` 取 `ts` 最大的一行，同 `ts` 取 `rowid` 最大；
     /// - `agent` 为 `Some` 时只查该 agent；
     /// - SQL 侧向数据库要 `limit + 1` 行：拿到 `limit + 1` 条就说明还有更多序列，
     ///   返回前 `limit` 条并置 `truncated = true`，**不返回 QueryTooLarge**。
-    ///
-    /// 注意：labels 过滤由引擎在返回后完成，因此截断发生在过滤之前。某一 metric
-    /// 的序列基数远超上限时，即使规则带较窄的 `filter_labels` 也可能漏评估；
-    /// 应优先用 `filter_agent_id` 收窄，或拆分 metric。
     ///
     /// `limit == 0` 返回空快照且 `truncated = true`（有数据也不返回）。
     pub fn latest_alert_series(
@@ -3154,6 +3602,7 @@ impl SqliteStorage {
         metric: &str,
         since: i64,
         agent: Option<&str>,
+        filter_labels: &Labels,
         limit: usize,
     ) -> Result<AlertSeriesSnapshot> {
         if limit == 0 {
@@ -3163,13 +3612,17 @@ impl SqliteStorage {
             });
         }
         let conn = self.lock_read();
-        let sql = latest_alert_series_sql(agent.is_some());
+        let sql = latest_alert_series_sql(agent.is_some(), filter_labels);
         let mut params: Vec<rusqlite::types::Value> = vec![
             rusqlite::types::Value::Text(metric.to_string()),
             rusqlite::types::Value::Integer(since),
         ];
         if let Some(agent_id) = agent {
             params.push(rusqlite::types::Value::Text(agent_id.to_string()));
+        }
+        for (key, value) in filter_labels {
+            params.push(rusqlite::types::Value::Text(key.clone()));
+            params.push(rusqlite::types::Value::Text(value.clone()));
         }
         // 多取一条用于判断是否被截断；溢出时退回 usize::MAX 会被 SQLite 当成
         // 极大值处理，实际不可能有那么多序列。
@@ -3836,9 +4289,66 @@ impl SqliteStorage {
 // M4：降采样与保留期（schema v7 的 samples_1m / samples_1h / maintenance_state）
 // ---------------------------------------------------------------------------
 
-/// 把时间戳向下取整到 `bucket_ms` 边界（UTC 毫秒，非负）。
-fn bucket_floor(ts: i64, bucket_ms: i64) -> i64 {
-    ts.div_euclid(bucket_ms) * bucket_ms
+/// 把时间戳向下取整到 `bucket_ms` 边界（UTC 毫秒）。
+///
+/// #50：除法与乘法都走 checked，`i64::MIN` 等极端值只返回显式错误，
+/// 不 panic、不回绕。
+fn bucket_floor(ts: i64, bucket_ms: i64) -> Result<i64> {
+    ts.checked_div_euclid(bucket_ms)
+        .and_then(|quotient| quotient.checked_mul(bucket_ms))
+        .ok_or_else(|| anyhow::anyhow!("时间戳无法对齐到 {bucket_ms}ms 桶：超出 i64 可表示范围"))
+}
+
+/// 计算一批 1m delta 的排他上界：第 `max_rows` 条 raw 所在分钟桶的结束点。
+///
+/// 找不到第 `max_rows` 条时整段剩余行都纳入；桶不可拆分，所以返回上界可能
+/// 包含超过 `max_rows` 的行（整桶）。
+fn delta_chunk_end(tx: &Transaction<'_>, closed_end: i64, max_rows: usize) -> Result<i64> {
+    let offset = i64::try_from(max_rows.saturating_sub(1)).unwrap_or(i64::MAX);
+    let boundary: Option<i64> = tx
+        .query_row(
+            "SELECT ts FROM samples \
+             WHERE aggregated_1m = 0 AND ts >= 0 AND ts < ?1 \
+             ORDER BY ts ASC, rowid ASC LIMIT 1 OFFSET ?2",
+            params![closed_end, offset],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match boundary {
+        Some(ts) => {
+            let bucket = bucket_floor(ts, BUCKET_1M_MS)?;
+            let end = bucket
+                .checked_add(BUCKET_1M_MS)
+                .ok_or_else(|| anyhow::anyhow!("分钟桶上界溢出"))?;
+            Ok(end.min(closed_end))
+        }
+        None => Ok(closed_end),
+    }
+}
+
+/// 选最早一个「1m 源已完整」的脏整点小时。
+///
+/// 候选：`aggregated_1h=0 AND bucket_ts < closed_hour`；只接受该小时结束前
+/// 不再有未聚合 raw 的小时，避免用残缺 1m 源生成 1h。
+fn next_recomputable_hour(tx: &Transaction<'_>, closed_hour: i64) -> Result<Option<i64>> {
+    Ok(tx
+        .query_row(
+            "SELECT MIN(hour_start) FROM ( \
+                 SELECT (m.bucket_ts / 3600000) * 3600000 AS hour_start \
+                 FROM samples_1m m \
+                 WHERE m.aggregated_1h = 0 AND m.bucket_ts >= 0 AND m.bucket_ts < ?1 \
+                 GROUP BY hour_start \
+             ) h \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM samples s \
+                 WHERE s.aggregated_1m = 0 AND s.ts >= 0 \
+                   AND s.ts < h.hour_start + 3600000 \
+             )",
+            params![closed_hour],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 impl SqliteStorage {
@@ -3852,8 +4362,8 @@ impl SqliteStorage {
     ///
     /// 返回本次 upsert 的桶数与参与聚合的 raw 行数。
     pub fn downsample_1m_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult> {
-        let from = bucket_floor(from_ts, BUCKET_1M_MS);
-        let to = bucket_floor(to_ts, BUCKET_1M_MS);
+        let from = bucket_floor(from_ts, BUCKET_1M_MS)?;
+        let to = bucket_floor(to_ts, BUCKET_1M_MS)?;
         if to <= from {
             return Ok(DownsampleRangeResult::default());
         }
@@ -3865,6 +4375,12 @@ impl SqliteStorage {
             |row| row.get(0),
         )?;
         let buckets = tx.execute(AGGREGATE_1M_SQL, params![from, to])?;
+        // v8：该范围已被本次聚合覆盖，raw 必须标记为已聚合，否则会被
+        // delta 再算一次，且 retention 无法安全删除。
+        tx.execute(
+            "UPDATE samples SET aggregated_1m = 1 WHERE ts >= ?1 AND ts < ?2",
+            params![from, to],
+        )?;
         tx.commit()?;
         Ok(DownsampleRangeResult {
             buckets,
@@ -3877,8 +4393,8 @@ impl SqliteStorage {
     /// `avg_value` 使用按 `count` 加权的平均值；`last_value` 取最新 1m 桶；
     /// 两端向下取整到整点，保证不聚合半个小时的残缺数据；upsert 幂等。
     pub fn downsample_1h_range(&self, from_ts: i64, to_ts: i64) -> Result<DownsampleRangeResult> {
-        let from = bucket_floor(from_ts, BUCKET_1H_MS);
-        let to = bucket_floor(to_ts, BUCKET_1H_MS);
+        let from = bucket_floor(from_ts, BUCKET_1H_MS)?;
+        let to = bucket_floor(to_ts, BUCKET_1H_MS)?;
         if to <= from {
             return Ok(DownsampleRangeResult::default());
         }
@@ -3890,11 +4406,185 @@ impl SqliteStorage {
             |row| row.get(0),
         )?;
         let buckets = tx.execute(AGGREGATE_1H_SQL, params![from, to])?;
+        tx.execute(
+            "UPDATE samples_1m SET aggregated_1h = 1 WHERE bucket_ts >= ?1 AND bucket_ts < ?2",
+            params![from, to],
+        )?;
         tx.commit()?;
         Ok(DownsampleRangeResult {
             buckets,
             rows: rows as usize,
         })
+    }
+
+    /// R1b：认领并增量合并一批未聚合 raw 到 1m。
+    ///
+    /// 选择、聚合、标脏 1h 源、标记 raw 全部在同一个 `BEGIN IMMEDIATE` 事务内，
+    /// 并在提交前校验 `UPDATE ... aggregated_1m=0` 的 affected 等于选中行数。
+    pub fn downsample_1m_delta(
+        &self,
+        closed_end: i64,
+        max_rows: usize,
+    ) -> Result<DownsampleDeltaResult> {
+        let closed_end = bucket_floor(closed_end, BUCKET_1M_MS)?;
+        if closed_end <= 0 || max_rows == 0 {
+            return Ok(DownsampleDeltaResult::default());
+        }
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let chunk_end = delta_chunk_end(&tx, closed_end, max_rows)?;
+        let rows: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM samples \
+             WHERE aggregated_1m = 0 AND ts >= 0 AND ts < ?1",
+            params![chunk_end],
+            |row| row.get(0),
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(DownsampleDeltaResult {
+                processed_to: chunk_end,
+                ..DownsampleDeltaResult::default()
+            });
+        }
+        let buckets = tx.execute(AGGREGATE_1M_DELTA_SQL, params![chunk_end])?;
+        tx.execute(MARK_1M_HOURS_DIRTY_SQL, params![chunk_end])?;
+        let claimed = tx.execute(CLAIM_RAW_AGGREGATED_SQL, params![chunk_end])?;
+        if i64::try_from(claimed).unwrap_or(i64::MAX) != rows {
+            anyhow::bail!(
+                "1m 增量认领行数不一致（选中 {rows} 行，affected {claimed} 行）：\
+                 已回滚本批，避免重复计数或漏标记"
+            );
+        }
+        tx.commit()?;
+        Ok(DownsampleDeltaResult {
+            buckets,
+            rows: usize::try_from(rows).context("1m delta 源行数溢出")?,
+            processed_to: chunk_end,
+        })
+    }
+
+    /// R1b：锁定并重算最早一个可重算整点小时的 1h。
+    ///
+    /// SQLite 的写事务本身就是小时锁；affected 与行数不一致时 drop 事务回滚。
+    pub fn downsample_1h_hour(&self, closed_hour: i64) -> Result<Option<DownsampleHourResult>> {
+        let closed_hour = bucket_floor(closed_hour, BUCKET_1H_MS)?;
+        if closed_hour <= 0 {
+            return Ok(None);
+        }
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(hour) = next_recomputable_hour(&tx, closed_hour)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let hour_end = hour
+            .checked_add(BUCKET_1H_MS)
+            .ok_or_else(|| anyhow::anyhow!("整点小时上界溢出"))?;
+        let incomplete: i64 = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM samples \
+             WHERE aggregated_1m = 0 AND ts >= 0 AND ts < ?1)",
+            params![hour_end],
+            |row| row.get(0),
+        )?;
+        if incomplete != 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let rows: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM samples_1m WHERE bucket_ts >= ?1 AND bucket_ts < ?2",
+            params![hour, hour_end],
+            |row| row.get(0),
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let buckets = tx.execute(AGGREGATE_1H_SQL, params![hour, hour_end])?;
+        let marked = tx.execute(
+            "UPDATE samples_1m SET aggregated_1h = 1 \
+             WHERE bucket_ts >= ?1 AND bucket_ts < ?2",
+            params![hour, hour_end],
+        )?;
+        if i64::try_from(marked).unwrap_or(i64::MAX) != rows {
+            anyhow::bail!(
+                "1h 认领行数不一致（锁定 {rows} 行，affected {marked} 行）：\
+                 已回滚本小时"
+            );
+        }
+        tx.commit()?;
+        Ok(Some(DownsampleHourResult {
+            hour_ts: hour,
+            buckets,
+            rows: usize::try_from(rows).context("1h 源行数溢出")?,
+        }))
+    }
+
+    /// `maintenance status`：未聚合 raw 行数。
+    pub fn count_unaggregated_raw_rows(&self) -> Result<i64> {
+        let conn = self.lock_read();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM samples WHERE aggregated_1m = 0",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// 旧超界时间戳审计：统计 `ts < min_ts OR ts > max_ts` 的 raw 行数。
+    pub fn count_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        let conn = self.lock_read();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM samples WHERE ts < ?1 OR ts > ?2",
+            params![min_ts, max_ts],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// 旧超界时间戳中仍未聚合的 raw 行数。
+    pub fn count_unaggregated_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        let conn = self.lock_read();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM samples \
+             WHERE aggregated_1m = 0 AND (ts < ?1 OR ts > ?2)",
+            params![min_ts, max_ts],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// `ts < before_ts` 且未聚合的 raw 行数（legacy 1m horizon）。
+    pub fn count_unaggregated_raw_rows_before(&self, before_ts: i64) -> Result<i64> {
+        let conn = self.lock_read();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM samples WHERE aggregated_1m = 0 AND ts < ?1",
+            params![before_ts],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// 把超界时间戳的未聚合 raw 分批标记为已隔离（`aggregated_1m=1`）。
+    pub fn isolate_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<usize> {
+        let mut total = 0usize;
+        loop {
+            let marked = {
+                let conn = self.lock_write();
+                conn.execute(
+                    "UPDATE samples SET aggregated_1m = 1 WHERE rowid IN (\
+                     SELECT rowid FROM samples \
+                     WHERE aggregated_1m = 0 AND (ts < ?1 OR ts > ?2) \
+                     ORDER BY ts LIMIT ?3)",
+                    params![min_ts, max_ts, PRUNE_BATCH_ROWS as i64],
+                )?
+            };
+            if marked == 0 {
+                break;
+            }
+            total += marked;
+            if marked < PRUNE_BATCH_ROWS {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        Ok(total)
     }
 
     /// raw 层的行数与最旧/最新时间戳。
@@ -4016,12 +4706,25 @@ impl SqliteStorage {
     /// 每批删除都在同一 `BEGIN IMMEDIATE` 事务内收敛
     /// `downsample_1m_last_raw_rowid`，见 [`Self::prune_raw_batched`]。
     pub fn prune_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
-        self.prune_raw_batched(cutoff)
+        self.prune_raw_batched(PRUNE_RAW_SQL, cutoff)
     }
 
-    /// 分批删除 1m 中 `bucket_ts < cutoff` 的行。
+    /// v8 归档启用时的 raw 保留期：只删「已聚合且对象已 uploaded」的行。
+    ///
+    /// R1a-1 只提供原语，不改变现有 [`Self::prune_samples_before`] 的行为；
+    /// R1b 在 `archive.enabled` 分支接入，并在 `archive_ledger_pending=1`
+    /// 时直接跳过。未认领行、pending / failed 对象、未聚合行都不删。
+    pub fn prune_archived_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
+        self.prune_raw_batched(PRUNE_ARCHIVED_RAW_SQL, cutoff)
+    }
+
+    /// 分批删除 1m 中 `bucket_ts < cutoff` 且整小时已聚合的行。
+    ///
+    /// `cutoff` 先向下取整到整点：只删完整小时，避免在 dirty/clean 边界留下
+    /// 半小时间隔；dirty hour（任一行 `aggregated_1h=0`）整小时跳过。
     pub fn prune_samples_1m_before(&self, cutoff: i64) -> Result<PruneResult> {
-        self.prune_batched(PRUNE_1M_SQL, cutoff)
+        let hour_cutoff = bucket_floor(cutoff, BUCKET_1H_MS)?;
+        self.prune_batched(PRUNE_1M_SQL, hour_cutoff)
     }
 
     /// 分批删除 1h 中 `bucket_ts < cutoff` 的行。
@@ -4039,7 +4742,7 @@ impl SqliteStorage {
     ///
     /// 批大小、提前退出条件与返回结构都和 1m / 1h 的 [`Self::prune_batched`]
     /// 保持一致；1m / 1h 的行为不受影响。
-    fn prune_raw_batched(&self, cutoff: i64) -> Result<PruneResult> {
+    fn prune_raw_batched(&self, sql: &'static str, cutoff: i64) -> Result<PruneResult> {
         let mut result = PruneResult::default();
         loop {
             let (deleted, change) = {
@@ -4050,8 +4753,7 @@ impl SqliteStorage {
                 // generation（见 helper）。
                 let max_before: Option<i64> =
                     tx.query_row("SELECT MAX(rowid) FROM samples", [], |row| row.get(0))?;
-                let deleted =
-                    tx.execute(PRUNE_RAW_SQL, params![cutoff, PRUNE_BATCH_ROWS as i64])?;
+                let deleted = tx.execute(sql, params![cutoff, PRUNE_BATCH_ROWS as i64])?;
                 let max_after: Option<i64> =
                     tx.query_row("SELECT MAX(rowid) FROM samples", [], |row| row.get(0))?;
                 // 即使本批删除 0 行也收敛一次：可修复 v0.4.0 遗留的高水位，
@@ -4240,7 +4942,8 @@ pub(crate) struct AggregateRowForTest {
 
 /// `archive_objects` 的 SELECT 列表；列下标与 [`row_to_archive_object`] 一一对应。
 const ARCHIVE_OBJECT_COLUMNS: &str = "id, backend, object_key, manifest_key, from_ts, to_ts, \
-     rows, bytes, sha256, status, error, created_at, uploaded_at, deleted_at";
+     rows, bytes, sha256, status, error, created_at, uploaded_at, deleted_at, ledger_version, \
+     attempts";
 
 /// 数据库里出现非法状态 / 负数行数时产生的错误（不静默降级成默认值）。
 #[derive(Debug)]
@@ -4303,6 +5006,8 @@ fn row_to_archive_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveObj
         created_at: row.get(11)?,
         uploaded_at: row.get(12)?,
         deleted_at: row.get(13)?,
+        ledger_version: row.get(14)?,
+        attempts: row.get(15)?,
     })
 }
 
@@ -4319,41 +5024,130 @@ fn map_archive_object_unique_error(err: rusqlite::Error) -> anyhow::Error {
     anyhow::anyhow!("写入归档对象失败（数据库错误，详见日志）")
 }
 
+/// 在给定连接（或调用方已开启的事务）上插入一条归档对象，返回自增 id。
+///
+/// 单独抽成自由函数：claim 必须与对象插入处于同一事务，不能被
+/// [`SqliteStorage::insert_archive_object`] 的隐式提交边界拆开。
+fn insert_archive_object_on(conn: &Connection, object: &ArchiveObject) -> Result<i64> {
+    let rows = i64::try_from(object.rows).context("归档对象行数超出 SQLite INTEGER 范围")?;
+    let bytes = i64::try_from(object.bytes).context("归档对象字节数超出 SQLite INTEGER 范围")?;
+    let result = conn.execute(
+        "INSERT INTO archive_objects
+            (backend, object_key, manifest_key, from_ts, to_ts, rows, bytes, sha256,
+             status, error, created_at, uploaded_at, deleted_at, ledger_version, attempts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            object.backend,
+            object.object_key,
+            object.manifest_key,
+            object.from_ts,
+            object.to_ts,
+            rows,
+            bytes,
+            object.sha256,
+            object.status.as_str(),
+            object.error,
+            object.created_at,
+            object.uploaded_at,
+            object.deleted_at,
+            object.ledger_version,
+            object.attempts,
+        ],
+    );
+    match result {
+        Ok(_) => Ok(conn.last_insert_rowid()),
+        Err(err) => Err(map_archive_object_unique_error(err)),
+    }
+}
+
+/// 校验元数据 SHA-256：64 位小写十六进制。
+///
+/// claim 事务允许 sha256 为空占位；只有 CSV 生成完成后的
+/// `update_archive_object_metadata` 才要求真实摘要。
+pub(crate) fn validate_archive_sha256(sha256: &str) -> Result<()> {
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        anyhow::bail!("归档对象 sha256 必须是 64 位小写十六进制");
+    }
+    Ok(())
+}
+
+/// 校验 claim 输入与行集完全一致；不合法直接拒绝，绝不部分认领。
+///
+/// 关键不变量：
+/// - 空行集没有可下载对象，拒绝；
+/// - 只接受 v8 claim 对象（`ledger_version=1`）且状态必须是 `pending`；
+/// - `rows/from_ts/to_ts` 必须与行集逐项一致；
+/// - 行键不得重复（否则 affected 行数永远小于选中数）；
+/// - 行时间戳必须落在可归档范围（`0 ..= 9999-12-31`），超界行留给 R1b；
+/// - `bytes` / `sha256` 允许是占位值：claim 只做短事务，CSV.GZ 在事务外生成，
+///   之后用 `update_archive_object_metadata` 补真实摘要。
+///
+/// SQLite 用 `samples.rowid`、PG 用 `samples.id`，调用方不得自行拼接。
+pub(crate) fn validate_archive_claim(object: &ArchiveObject, rows: &[ArchiveRawRow]) -> Result<()> {
+    if rows.is_empty() {
+        anyhow::bail!("归档 claim 行集不能为空");
+    }
+    if object.ledger_version != LEDGER_VERSION_V8 {
+        anyhow::bail!(
+            "归档 claim 对象的 ledger_version 必须为 {LEDGER_VERSION_V8}，实际为 {}",
+            object.ledger_version
+        );
+    }
+    if object.status != ArchiveStatus::Pending {
+        anyhow::bail!(
+            "归档 claim 对象状态必须为 pending，实际为 {}",
+            object.status.as_str()
+        );
+    }
+    let expected_rows = u64::try_from(rows.len()).context("归档 claim 行数超出 u64 范围")?;
+    if object.rows != expected_rows {
+        anyhow::bail!(
+            "归档 claim 对象的 rows={} 与行集大小 {expected_rows} 不一致",
+            object.rows
+        );
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(rows.len());
+    let mut min_ts = i64::MAX;
+    let mut max_ts = i64::MIN;
+    for row in rows {
+        if !seen.insert(row.rowid) {
+            anyhow::bail!("归档 claim 行集包含重复行键 {}", row.rowid);
+        }
+        if !(MIN_ARCHIVE_TS_MS..=MAX_ARCHIVE_TS_MS).contains(&row.ts) {
+            anyhow::bail!(
+                "归档 claim 行时间戳超出可归档范围 {}..={}",
+                MIN_ARCHIVE_TS_MS,
+                MAX_ARCHIVE_TS_MS
+            );
+        }
+        min_ts = min_ts.min(row.ts);
+        max_ts = max_ts.max(row.ts);
+    }
+    if object.from_ts != min_ts || object.to_ts != max_ts {
+        anyhow::bail!(
+            "归档 claim 对象的 from_ts/to_ts={}..={} 与行集 {}..={} 不一致",
+            object.from_ts,
+            object.to_ts,
+            min_ts,
+            max_ts
+        );
+    }
+    Ok(())
+}
+
 impl SqliteStorage {
     /// 插入一条归档对象记录，返回数据库生成的自增 id。
     ///
     /// `object.id` 被忽略；`object_key` 有 UNIQUE 约束，重复插入返回
     /// [`ArchiveStoreError::ObjectExists`]，不会覆盖已有记录。
     pub fn insert_archive_object(&self, object: &ArchiveObject) -> Result<i64> {
-        let rows = i64::try_from(object.rows).context("归档对象行数超出 SQLite INTEGER 范围")?;
-        let bytes =
-            i64::try_from(object.bytes).context("归档对象字节数超出 SQLite INTEGER 范围")?;
         let conn = self.lock_write();
-        let result = conn.execute(
-            "INSERT INTO archive_objects
-                (backend, object_key, manifest_key, from_ts, to_ts, rows, bytes, sha256,
-                 status, error, created_at, uploaded_at, deleted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                object.backend,
-                object.object_key,
-                object.manifest_key,
-                object.from_ts,
-                object.to_ts,
-                rows,
-                bytes,
-                object.sha256,
-                object.status.as_str(),
-                object.error,
-                object.created_at,
-                object.uploaded_at,
-                object.deleted_at,
-            ],
-        );
-        match result {
-            Ok(_) => Ok(conn.last_insert_rowid()),
-            Err(err) => Err(map_archive_object_unique_error(err)),
-        }
+        insert_archive_object_on(&conn, object)
     }
 
     /// 按 id 读取归档对象；不存在返回 `None`。
@@ -4399,6 +5193,34 @@ impl SqliteStorage {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// 按 id 升序分页列出待重试的 v8 归档对象（`pending` / `failed`）。
+    ///
+    /// 只包含 `ledger_version = LEDGER_VERSION_V8` 的对象：v7 旧对象没有 claim
+    /// 行集，不能按 `archive_rows_for_object` 重建。`after_id` 为上一页最后
+    /// 一条的 id（排他）；`limit == 0` 返回空列表。
+    pub fn list_retryable_archive_objects(
+        &self,
+        limit: usize,
+        after_id: Option<i64>,
+    ) -> Result<Vec<ArchiveObject>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.lock_read();
+        let sql = format!(
+            "SELECT {ARCHIVE_OBJECT_COLUMNS} FROM archive_objects \
+             WHERE ledger_version = ?1 AND status IN ('pending', 'failed') \
+               AND (?2 IS NULL OR id > ?2) ORDER BY id ASC LIMIT ?3"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![LEDGER_VERSION_V8, after_id, limit],
+            row_to_archive_object,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// 更新归档对象状态，并校验合法迁移。
     ///
     /// - 允许 `pending -> uploaded -> local_deleted`，以及 `pending` / `uploaded`
@@ -4439,6 +5261,38 @@ impl SqliteStorage {
              uploaded_at = COALESCE(?4, uploaded_at), \
              deleted_at = COALESCE(?5, deleted_at) WHERE id = ?1",
             params![id, status.as_str(), error, uploaded_at, deleted_at],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 记录一次上传失败：状态置 `failed`、覆盖 `error`，`attempts` 加一。
+    ///
+    /// 只允许 `pending` / `failed` 迁移到 `failed`；已 `uploaded` /
+    /// `local_deleted` 的状态回退返回 [`ArchiveStoreError::InvalidTransition`]。
+    /// id 不存在返回 [`ArchiveStoreError::NotFound`]。
+    pub fn record_archive_object_failure(&self, id: i64, error: &str) -> Result<()> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT status FROM archive_objects WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let current = match current {
+            Some(value) => ArchiveStatus::parse(&value)
+                .ok_or_else(|| anyhow::anyhow!("archive_objects.status 字段值非法"))?,
+            None => return Err(ArchiveStoreError::NotFound.into()),
+        };
+        if !matches!(current, ArchiveStatus::Pending | ArchiveStatus::Failed) {
+            return Err(ArchiveStoreError::InvalidTransition.into());
+        }
+        tx.execute(
+            "UPDATE archive_objects SET status = 'failed', error = ?2, \
+             attempts = attempts + 1 WHERE id = ?1",
+            params![id, error],
         )?;
         tx.commit()?;
         Ok(())
@@ -4514,6 +5368,204 @@ impl SqliteStorage {
              ORDER BY rowid ASC LIMIT ?4",
         )?;
         let rows = stmt.query_map(params![from_ts, to_ts, after_rowid, limit], |row| {
+            Ok(ArchiveRawRow {
+                rowid: row.get(0)?,
+                agent_id: row.get(1)?,
+                metric: row.get(2)?,
+                labels: row.get(3)?,
+                ts: row.get(4)?,
+                value: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 按 `ts, rowid` 升序扫描尚未被任何归档对象认领的 raw 行。
+    ///
+    /// 归档 worker 的 claim 入口：只扫 `archive_object_id IS NULL`，时间范围
+    /// 左闭右开 `[from_ts, to_ts)`；SQL 谓词与 `idx_samples_unarchived` 的
+    /// partial index 一致，避免全表扫描。`limit == 0` 返回空列表。
+    pub fn list_unclaimed_archive_rows(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        limit: usize,
+    ) -> Result<Vec<ArchiveRawRow>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.lock_read();
+        let mut stmt = conn.prepare(
+            "SELECT rowid, agent_id, metric, labels, ts, value FROM samples \
+             WHERE archive_object_id IS NULL AND ts >= ?1 AND ts < ?2 \
+               AND ts >= ?4 AND ts <= ?5 \
+             ORDER BY ts ASC, rowid ASC LIMIT ?3",
+        )?;
+        let now = now_ms().min(MAX_ARCHIVE_TS_MS);
+        let rows = stmt.query_map(
+            params![from_ts, to_ts, limit, MIN_ARCHIVE_TS_MS, now],
+            |row| {
+                Ok(ArchiveRawRow {
+                    rowid: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    metric: row.get(2)?,
+                    labels: row.get(3)?,
+                    ts: row.get(4)?,
+                    value: row.get(5)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 统计不可归档的 raw 行数（`ts < 0` 或 `ts > now`）。
+    ///
+    /// R1a-1 只提供计数原语，供 R1b 的 `maintenance status
+    /// invalid_timestamp_rows` 与运维清理使用；不修改、不删除这些行。
+    pub fn count_invalid_archive_raw_rows(&self) -> Result<i64> {
+        let conn = self.lock_read();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM samples WHERE ts < ?1 OR ts > ?2",
+            params![MIN_ARCHIVE_TS_MS, now_ms().min(MAX_ARCHIVE_TS_MS)],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// 插入归档对象并原子认领 `rows` 的行集，返回新对象 id。
+    ///
+    /// 对象插入和 `archive_object_id` 更新在同一 `BEGIN IMMEDIATE` 事务内；
+    /// `UPDATE ... AND archive_object_id IS NULL` 的 affected 行数必须等于
+    /// 选中行数，否则整事务回滚并返回可重试的
+    /// [`ArchiveStoreError::ClaimConflict`]。两个 worker 并发 claim 同一批行
+    /// 时只有一个能提交。
+    pub fn claim_archive_rows(
+        &self,
+        object: &ArchiveObject,
+        rows: &[ArchiveRawRow],
+    ) -> Result<i64> {
+        validate_archive_claim(object, rows)?;
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let object_id = insert_archive_object_on(&tx, object)?;
+        let mut claimed = 0usize;
+        {
+            // rowid 在 scan→claim 之间可能因删除最大行而被复用；必须同时比对
+            // 行身份（agent/metric/labels/ts/value），否则会把新行误认领。
+            let mut stmt = tx.prepare(
+                "UPDATE samples SET archive_object_id = ?1 \
+                 WHERE rowid = ?2 AND archive_object_id IS NULL \
+                   AND agent_id = ?3 AND metric = ?4 AND labels = ?5 \
+                   AND ts = ?6 AND value = ?7",
+            )?;
+            for row in rows {
+                claimed += stmt.execute(params![
+                    object_id,
+                    row.rowid,
+                    row.agent_id,
+                    row.metric,
+                    row.labels,
+                    row.ts,
+                    row.value,
+                ])?;
+            }
+        }
+        if claimed != rows.len() {
+            tx.rollback()?;
+            tracing::warn!(
+                object_id,
+                selected = rows.len(),
+                claimed,
+                "归档 claim 行集与扫描结果不一致，整事务回滚"
+            );
+            return Err(ArchiveStoreError::ClaimConflict.into());
+        }
+        tx.commit()?;
+        Ok(object_id)
+    }
+
+    /// 更新归档对象的压缩后字节数与 SHA-256。
+    ///
+    /// 配合短事务 claim：claim 只插入对象（bytes/sha256 可为占位空值）并
+    /// 认领行集，CSV.GZ 在事务外生成后调用本方法补元数据，避免大对象编码
+    /// 阻塞 ingest 写锁。`sha256` 必须是 64 位小写十六进制；对象不存在返回
+    /// [`ArchiveStoreError::NotFound`]。
+    pub fn update_archive_object_metadata(&self, id: i64, bytes: u64, sha256: &str) -> Result<()> {
+        validate_archive_sha256(sha256)?;
+        let bytes = i64::try_from(bytes).context("归档对象字节数超出 SQLite INTEGER 范围")?;
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let object: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT ledger_version, status FROM archive_objects WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((ledger_version, status)) = object else {
+            return Err(ArchiveStoreError::NotFound.into());
+        };
+        let status = ArchiveStatus::parse(&status)
+            .ok_or_else(|| anyhow::anyhow!("archive_objects.status 字段值非法"))?;
+        if ledger_version != LEDGER_VERSION_V8
+            || !matches!(status, ArchiveStatus::Pending | ArchiveStatus::Failed)
+        {
+            return Err(ArchiveStoreError::InvalidTransition.into());
+        }
+        tx.execute(
+            "UPDATE archive_objects SET bytes = ?2, sha256 = ?3 WHERE id = ?1",
+            params![id, bytes, sha256],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 记录一次上传尝试：仅 pending / failed 对象允许，`attempts += 1`。
+    ///
+    /// 返回递增后的 attempts。对象不存在返回 `NotFound`，uploaded /
+    /// local_deleted 返回 `InvalidTransition`。
+    pub fn record_archive_attempt(&self, id: i64) -> Result<i64> {
+        let mut conn = self.lock_write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM archive_objects WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(status) = status else {
+            return Err(ArchiveStoreError::NotFound.into());
+        };
+        let status = ArchiveStatus::parse(&status)
+            .ok_or_else(|| anyhow::anyhow!("archive_objects.status 字段值非法"))?;
+        if !matches!(status, ArchiveStatus::Pending | ArchiveStatus::Failed) {
+            return Err(ArchiveStoreError::InvalidTransition.into());
+        }
+        tx.execute(
+            "UPDATE archive_objects SET attempts = attempts + 1 WHERE id = ?1",
+            params![id],
+        )?;
+        let attempts: i64 = tx.query_row(
+            "SELECT attempts FROM archive_objects WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(attempts)
+    }
+
+    /// 按 `archive_object_id` 读回 claim 行集，按 `ts, rowid` 升序。
+    ///
+    /// 排序必须与 claim/scan 的 `(ts, rowid)` 一致，重试才能重建字节级相同的
+    /// CSV；上传失败 / 崩溃后不得重扫 raw。对象不存在或行已删除返回空列表。
+    pub fn archive_rows_for_object(&self, object_id: i64) -> Result<Vec<ArchiveRawRow>> {
+        let conn = self.lock_read();
+        let mut stmt = conn.prepare(
+            "SELECT rowid, agent_id, metric, labels, ts, value FROM samples \
+             WHERE archive_object_id = ?1 ORDER BY ts ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![object_id], |row| {
             Ok(ArchiveRawRow {
                 rowid: row.get(0)?,
                 agent_id: row.get(1)?,
@@ -5045,6 +6097,33 @@ mod tests {
         }
     }
 
+    /// R1b：retention 只删已聚合 raw；测试要构造可删行时先标记。
+    fn mark_all_raw_aggregated(s: &SqliteStorage) {
+        s.lock_write()
+            .execute("UPDATE samples SET aggregated_1m = 1", [])
+            .unwrap();
+    }
+
+    /// R1b：1m retention 只删整小时 clean 行；旧 API 直接造桶时显式标 clean。
+    fn mark_all_1m_aggregated(s: &SqliteStorage) {
+        s.lock_write()
+            .execute("UPDATE samples_1m SET aggregated_1h = 1", [])
+            .unwrap();
+    }
+
+    /// 测试 helper：先走真实 1h 聚合生成匹配历史，再标 1m clean。
+    fn materialize_1h_and_mark_1m(s: &SqliteStorage) {
+        if let (Some(oldest), Some(newest)) = (
+            s.samples_1m_stats().unwrap().oldest_ts,
+            s.samples_1m_stats().unwrap().newest_ts,
+        ) {
+            let from = (oldest / BUCKET_1H_MS) * BUCKET_1H_MS;
+            let to = (newest / BUCKET_1H_MS) * BUCKET_1H_MS + BUCKET_1H_MS;
+            s.downsample_1h_range(from, to).unwrap();
+        }
+        mark_all_1m_aggregated(s);
+    }
+
     /// v4：`agent_settings` 按 agent 覆盖写入，列表按 agent_id 稳定排序。
     #[test]
     fn v4_agent_settings_roundtrip() {
@@ -5330,9 +6409,8 @@ mod tests {
         "archive_state",
     ];
 
-    /// v7 的 13 个显式索引（方案 §4 的 9 个 + B1b 的待通知 / 状态清理 / 静默
-    /// 到期 / 告警 metric 查询索引）。
-    const V7_INDEXES: [&str; 13] = [
+    /// v7 的 13 个显式索引 + v8 的 3 个 partial index，共 16 个。
+    const V7_INDEXES: [&str; 16] = [
         "idx_samples_1m_lookup",
         "idx_samples_1m_ts",
         "idx_samples_1h_lookup",
@@ -5346,6 +6424,9 @@ mod tests {
         "idx_alert_silences_until",
         "idx_archive_objects_range",
         "idx_archive_objects_status",
+        "idx_samples_unarchived",
+        "idx_samples_unaggregated",
+        "idx_samples_1m_unaggregated",
     ];
 
     /// 查询 sqlite_master 中指定类型（table / index）的对象是否存在。
@@ -6155,7 +7236,7 @@ mod tests {
     // v7：M4 schema（降采样 / 告警 / 归档 / 维护水位）
     // ------------------------------------------------------------------
 
-    /// fresh 库：方案 §4 的 10 张新表与 13 个索引全部存在，版本号为 7。
+    /// fresh 库：方案 §4 的 10 张新表与 v8 的 16 个索引全部存在，版本号为 8。
     #[test]
     fn v7_schema_creates_all_tables_and_indexes() {
         let s = SqliteStorage::open_in_memory().unwrap();
@@ -6215,8 +7296,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// v6 库升级到 v7：只建新表，旧 agents / samples / api_tokens 数据不变，
-    /// 连续打开两次不报错、不重复建表，`user_version=7`。
+    /// v6 库升级到 v8：建新表并给 samples 补 v8 列，旧 agents / samples /
+    /// api_tokens 数据不变，连续打开两次不报错、不重复建表，`user_version=8`。
     #[test]
     fn v7_v6_schema_upgrades_preserves_old_data_and_is_idempotent() {
         let path = temp_db("v7-migration");
@@ -6266,13 +7347,13 @@ mod tests {
         let mut first_object_count = None;
         for round in 0..2 {
             let s = SqliteStorage::open(&path).unwrap_or_else(|err| {
-                panic!("第 {round} 次打开 v6 库失败（v6→v7 迁移必须幂等）: {err}")
+                panic!("第 {round} 次打开 v6 库失败（v6→v8 迁移必须幂等）: {err}")
             });
             let version: i64 = s
                 .lock_read()
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, SCHEMA_VERSION, "必须升级到 v7");
+            assert_eq!(version, SCHEMA_VERSION, "必须升级到 v8");
 
             // 旧数据逐字段保留。
             let agent = s.get_agent("a1").unwrap().expect("旧 agent 必须保留");
@@ -6578,6 +7659,74 @@ mod tests {
         );
     }
 
+    /// R1b：旧 1m 已被 retention 删除后，迟到 raw 只能形成残缺 1m；
+    /// 1h worker 必须保留历史 1h，不能把 count 2 覆盖成 1。
+    #[test]
+    fn r1b_1h_worker_preserves_history_when_1m_source_shrank() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let hour = 1_699_999_200_000;
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", hour + 1_000, 1.0),
+                ("cpu.usage", "{}", hour + 2_000, 2.0),
+            ],
+        );
+        s.downsample_1m_range(hour, hour + BUCKET_1H_MS).unwrap();
+        s.downsample_1h_range(hour, hour + BUCKET_1H_MS).unwrap();
+        assert_eq!(agg_rows(&s, "samples_1h")[0].count, 2);
+
+        // 模拟旧 retention 已删除该小时 1m，只剩旧 1h 历史。
+        s.lock_write()
+            .execute(
+                "DELETE FROM samples_1m WHERE bucket_ts >= ?1 AND bucket_ts < ?2",
+                rusqlite::params![hour, hour + BUCKET_1H_MS],
+            )
+            .unwrap();
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", hour + 121_000, 30.0),
+                ("cpu.usage", "{\"host\":\"b\"}", hour + 122_000, 5.0),
+            ],
+        );
+        s.downsample_1m_delta(hour + BUCKET_1H_MS, 100).unwrap();
+
+        let result = s.downsample_1h_hour(hour + BUCKET_1H_MS).unwrap();
+        assert!(result.is_some(), "残缺组应跳过 1h 更新但小时仍需标 clean");
+        let rows = agg_rows(&s, "samples_1h");
+        assert_eq!(rows.len(), 2, "同小时其它 series 仍必须生成 1h");
+        let a = rows
+            .iter()
+            .find(|row| row.labels == "{}")
+            .expect("缺少 A 的 1h");
+        assert_eq!(a.count, 2, "历史 1h count 不得被部分源覆盖");
+        assert!((a.avg_value - 1.5).abs() < 1e-9);
+        let b = rows
+            .iter()
+            .find(|row| row.labels == "{\"host\":\"b\"}")
+            .expect("缺少 B 的 1h");
+        assert_eq!(b.count, 1, "新 series 必须正常生成 1h");
+        let clean: i64 = s
+            .lock_read()
+            .query_row(
+                "SELECT COUNT(*) FROM samples_1m WHERE bucket_ts >= ?1 AND bucket_ts < ?2 AND aggregated_1h = 0",
+                rusqlite::params![hour, hour + BUCKET_1H_MS],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(clean, 0, "冻结后必须把 1m 标记 clean，避免下一轮反复选中");
+        assert_eq!(
+            s.prune_samples_1m_before(hour + BUCKET_1H_MS)
+                .unwrap()
+                .deleted,
+            1,
+            "只删已完整进入 1h 的 B；A 的历史 count 未追平，残缺 1m 必须保留"
+        );
+    }
+
     /// M4-A2：三层统计与分块探测用的 offset 时间戳。
     #[test]
     fn m4a_tier_stats_and_offset_probe() {
@@ -6630,6 +7779,27 @@ mod tests {
         assert_eq!(hour.newest_ts, Some(1_699_999_200_000));
     }
 
+    /// R1b：静态自检 SQL 常量必须坚持增量合并 / 整小时标脏 / 只删已聚合行。
+    #[test]
+    fn r1b_sql_constants_enforce_delta_and_retention_semantics() {
+        assert!(AGGREGATE_1M_DELTA_SQL.contains("aggregated_1m = 0"));
+        assert!(AGGREGATE_1M_DELTA_SQL.contains("ts >= 0"));
+        assert!(AGGREGATE_1M_DELTA_SQL.contains("samples_1m.count"));
+        assert!(AGGREGATE_1M_DELTA_SQL.contains("excluded.last_ts"));
+        assert!(AGGREGATE_1M_DELTA_SQL.contains("aggregated_1h = 0"));
+        assert!(MARK_1M_HOURS_DIRTY_SQL.contains("(bucket_ts / 3600000)"));
+        assert!(CLAIM_RAW_AGGREGATED_SQL.contains("aggregated_1m = 0"));
+        assert!(
+            PRUNE_RAW_SQL.contains("aggregated_1m = 1"),
+            "raw retention 必须只删已聚合行"
+        );
+        assert!(
+            PRUNE_1M_SQL.contains("aggregated_1h = 0"),
+            "1m retention 必须整小时跳过 dirty hour"
+        );
+        assert!(PRUNE_1M_SQL.contains("3600000"));
+    }
+
     /// M4-A2：rowid 扫描能发现增量行、无新行不误报、整表删除后 rowid 回退可恢复。
     #[test]
     fn m4a_raw_new_rows_detects_incremental_and_rowid_reset() {
@@ -6659,6 +7829,8 @@ mod tests {
         assert_eq!(min_ts2, Some(base - 5_000));
 
         // 整表删除后重新插入：rowid 回退，旧 rowid 水位必须失效并重新扫描。
+        // R1b：retention 只删已聚合 raw，先标记再删除。
+        mark_all_raw_aggregated(&s);
         assert_eq!(s.prune_samples_before(i64::MAX).unwrap().deleted, 3);
         insert_samples(&s, "a1", &[("cpu.usage", "{}", base + 10_000, 3.0)]);
         let (max3, min_ts3) = s.raw_new_rows(Some(max2)).unwrap();
@@ -6686,6 +7858,7 @@ mod tests {
         rows.push(("cpu.usage", "{}", cutoff, 1.0));
         rows.push(("cpu.usage", "{}", cutoff + 1_000, 2.0));
         insert_samples(&s, "a1", &rows);
+        mark_all_raw_aggregated(&s);
 
         let pruned = s.prune_samples_before(cutoff).unwrap();
         assert_eq!(pruned.deleted, 12_000);
@@ -6700,26 +7873,50 @@ mod tests {
             PruneResult::default()
         );
 
-        // 1m：bucket_ts 严格小于 cutoff 才删除。
+        // 1m：cutoff 向下取整到整点；只删整小时且该小时全部 clean。
+        let hour = 1_699_999_200_000;
         insert_samples(
             &s,
             "a1",
             &[
-                ("cpu.usage", "{}", cutoff - 60_000 + 1_000, 1.0),
-                ("cpu.usage", "{}", cutoff + 1_000, 2.0),
+                ("cpu.usage", "{}", hour - 60_000 + 1_000, 1.0),
+                ("cpu.usage", "{}", hour + 1_000, 2.0),
             ],
         );
-        s.downsample_1m_range(cutoff - 60_000, cutoff + 60_000)
-            .unwrap();
+        s.downsample_1m_range(hour - 60_000, hour + 60_000).unwrap();
+        materialize_1h_and_mark_1m(&s);
         assert_eq!(s.samples_1m_stats().unwrap().rows, 2);
-        assert_eq!(s.prune_samples_1m_before(cutoff).unwrap().deleted, 1);
+        assert_eq!(s.prune_samples_1m_before(hour).unwrap().deleted, 1);
         let minute = s.samples_1m_stats().unwrap();
         assert_eq!(minute.rows, 1);
-        assert_eq!(minute.oldest_ts, Some(cutoff));
+        assert_eq!(minute.oldest_ts, Some(hour));
 
-        // 1h：整点边界同样是严格小于。
-        let hour = 1_699_999_200_000;
-        insert_samples(&s, "a1", &[("cpu.usage", "{}", hour - 1_800_000, 5.0)]);
+        // dirty hour 整小时跳过：独立旧小时里的桶未标记 clean 时不得删除。
+        let dirty_hour = hour - 10 * BUCKET_1H_MS;
+        insert_samples(&s, "a1", &[("cpu.usage", "{}", dirty_hour + 1_000, 5.0)]);
+        s.downsample_1m_range(dirty_hour, dirty_hour + BUCKET_1H_MS)
+            .unwrap();
+        assert_eq!(
+            s.prune_samples_1m_before(hour).unwrap().deleted,
+            0,
+            "dirty hour 必须整小时跳过"
+        );
+        materialize_1h_and_mark_1m(&s);
+        assert_eq!(s.prune_samples_1m_before(hour).unwrap().deleted, 1);
+
+        // 清空三层后单独构造 1h 边界数据：整点边界同样是严格小于。
+        mark_all_raw_aggregated(&s);
+        s.prune_samples_before(i64::MAX).unwrap();
+        s.prune_samples_1m_before(i64::MAX).unwrap();
+        s.prune_samples_1h_before(i64::MAX).unwrap();
+        insert_samples(
+            &s,
+            "a1",
+            &[
+                ("cpu.usage", "{}", hour - 2_000_000, 5.0),
+                ("cpu.usage", "{}", hour + 1_000, 6.0),
+            ],
+        );
         s.downsample_1m_range(hour - BUCKET_1H_MS, hour + BUCKET_1H_MS)
             .unwrap();
         s.downsample_1h_range(hour - BUCKET_1H_MS, hour + BUCKET_1H_MS)
@@ -6727,6 +7924,32 @@ mod tests {
         assert_eq!(s.samples_1h_stats().unwrap().rows, 2);
         assert_eq!(s.prune_samples_1h_before(hour).unwrap().deleted, 1);
         assert_eq!(s.samples_1h_stats().unwrap().oldest_ts, Some(hour));
+    }
+
+    /// 1m retention 按 (series,hour) 整组删除，不能被 5000 行批次截断后
+    /// 让等式门禁永久失效（旧实现 6000 行只能删 5000，剩 1000 永不清）。
+    #[test]
+    fn r1b_prune_1m_deletes_more_than_batch_rows_per_hour() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let hour = 1_699_999_200_000;
+        let mut rows: Vec<(&str, &str, i64, f64)> = Vec::new();
+        for series in 0..100 {
+            let metric: &'static str = Box::leak(format!("cpu.{series}").into_boxed_str());
+            for minute in 0..60 {
+                rows.push((metric, "{}", hour + minute * 60_000, 1.0));
+            }
+        }
+        insert_samples(&s, "a1", &rows);
+        s.downsample_1m_range(hour, hour + BUCKET_1H_MS).unwrap();
+        s.downsample_1h_range(hour, hour + BUCKET_1H_MS).unwrap();
+        assert_eq!(s.samples_1m_stats().unwrap().rows, 6_000);
+        let pruned = s.prune_samples_1m_before(hour + BUCKET_1H_MS).unwrap();
+        assert_eq!(pruned.deleted, 6_000, "整组删除必须覆盖 >5000 行小时");
+        assert_eq!(s.samples_1m_stats().unwrap().rows, 0);
+        assert_eq!(
+            s.prune_samples_1m_before(hour + BUCKET_1H_MS).unwrap(),
+            PruneResult::default()
+        );
     }
 
     /// KI-29：raw 删除最大 rowid 行后，水位必须在同一批事务里降到新 MAX。
@@ -6745,6 +7968,7 @@ mod tests {
         );
         s.set_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, "3", 1)
             .unwrap();
+        mark_all_raw_aggregated(&s);
 
         let pruned = s.prune_samples_before(5_000).unwrap();
         assert_eq!(pruned.deleted, 2);
@@ -6774,6 +7998,7 @@ mod tests {
         );
         s.set_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, "1", 1)
             .unwrap();
+        mark_all_raw_aggregated(&s);
 
         // 删掉 rowid 1/2，MAX 仍是 3：旧水位更低，不得抬高。
         assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 2);
@@ -6803,6 +8028,7 @@ mod tests {
                 ("cpu.usage", "{}", 9_000, 2.0),
             ],
         );
+        mark_all_raw_aggregated(&s);
         assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 1);
         assert_eq!(
             s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
@@ -6815,6 +8041,7 @@ mod tests {
         s.set_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, "bogus", 1)
             .unwrap();
         insert_samples(&s, "a1", &[("cpu.usage", "{}", 2_000, 4.0)]);
+        mark_all_raw_aggregated(&s);
         assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 1);
         assert_eq!(
             s.get_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY)
@@ -6860,6 +8087,7 @@ mod tests {
         // 仍会成功并把 max_before=10 写回，因此必须删键。
         s.set_maintenance_state(DOWNSAMPLE_1M_LAST_RAW_ROWID_KEY, "5", 1)
             .unwrap();
+        mark_all_raw_aggregated(&s);
 
         let pruned = s.prune_samples_before(5_000).unwrap();
         assert_eq!(pruned.deleted, 1);
@@ -6888,6 +8116,7 @@ mod tests {
             ],
         );
 
+        mark_all_raw_aggregated(&s);
         // 删 rowid 1：MAX 保持 3，不推进 generation（缺失保持缺失）。
         assert_eq!(s.prune_samples_before(1_500).unwrap().deleted, 1);
         assert_eq!(
@@ -6908,6 +8137,7 @@ mod tests {
 
         // 新迟到行复用 rowid 3，再删一次最大行：1 -> 2。
         insert_samples(&s, "a1", &[("cpu.usage", "{}", 3_000, 4.0)]);
+        mark_all_raw_aggregated(&s);
         assert_eq!(s.raw_new_rows(None).unwrap().0, Some(3));
         assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 1);
         assert_eq!(
@@ -6922,6 +8152,7 @@ mod tests {
         s.set_maintenance_state(STATE_RAW_PRUNE_GENERATION, "bogus", 1)
             .unwrap();
         insert_samples(&s, "a1", &[("cpu.usage", "{}", 3_000, 5.0)]);
+        mark_all_raw_aggregated(&s);
         assert_eq!(s.prune_samples_before(5_000).unwrap().deleted, 1);
         assert_eq!(
             s.get_maintenance_state(STATE_RAW_PRUNE_GENERATION)
@@ -7318,6 +8549,8 @@ mod tests {
         assert!((rows[0].value - 9.0).abs() < 1e-9);
 
         // 删除 raw：回退 1m，ts 用 bucket_ts、value 用 last_value。
+        // R1b：先标记已聚合，retention 才会删除。
+        mark_all_raw_aggregated(&s);
         s.prune_samples_before(i64::MAX).unwrap();
         assert_eq!(s.raw_stats().unwrap().rows, 0);
         let rows = s.latest_samples(0, &[], Some("a1")).unwrap();
@@ -7350,8 +8583,11 @@ mod tests {
         assert_eq!(rows[0].agent_id, "a2");
         assert!((rows[0].value - 99.0).abs() < 1e-9);
 
-        // 1m 也为空：再回退 1h。
-        s.prune_samples_1m_before(i64::MAX).unwrap();
+        // 1m 也为空：直接清空 1m 模拟保留期已删（本用例只验证 fallback，
+        // 不走 retention 的“必须已有匹配 1h”安全门禁）。
+        s.lock_write()
+            .execute("DELETE FROM samples_1m", [])
+            .unwrap();
         assert_eq!(s.samples_1m_stats().unwrap().rows, 0);
         let rows = s.latest_samples(0, &[], None).unwrap();
         assert_eq!(rows.len(), 1, "只能回退到 1h: {rows:?}");
@@ -7797,16 +9033,32 @@ mod tests {
             Some(state.clone())
         );
 
+        // 通知时间由 notify_worker 的专用 UPDATE 独占写入。
+        assert!(s
+            .update_alert_state_notified("rule-1", "agent-1", "series-1", 1_500)
+            .unwrap());
+
+        // 引擎持有的是旧快照（last_notified_at = Some(2_050)）：冲突分支必须
+        // 保留库中的 1_500，其余状态机字段照常覆盖。
         state.state = AlertStateKind::Firing;
         state.since = 2_000;
         state.last_eval_at = 2_100;
         state.last_value = None;
         state.last_notified_at = Some(2_050);
         s.upsert_alert_state(&state).unwrap();
+        let stored = s
+            .get_alert_state("rule-1", "agent-1", "series-1")
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            s.get_alert_state("rule-1", "agent-1", "series-1").unwrap(),
-            Some(state.clone()),
-            "upsert 必须覆盖状态、时间与值"
+            stored.last_notified_at,
+            Some(1_500),
+            "upsert 冲突分支不得覆盖 worker 写入的 last_notified_at"
+        );
+        state.last_notified_at = Some(1_500);
+        assert_eq!(
+            stored, state,
+            "upsert 仍必须覆盖状态、时间与值（通知时间除外）"
         );
 
         let mut second = alert_state("rule-1", "agent-2", "");
@@ -7814,6 +9066,14 @@ mod tests {
         second.since = 500;
         second.last_eval_at = 500;
         s.upsert_alert_state(&second).unwrap();
+        // 新插入行的 last_notified_at 仍按传入值写入（引擎新序列为 NULL）。
+        assert_eq!(
+            s.get_alert_state("rule-1", "agent-2", "")
+                .unwrap()
+                .unwrap()
+                .last_notified_at,
+            None
+        );
         let states = s.list_alert_states().unwrap();
         assert_eq!(states.len(), 2);
         assert_eq!(states[0], state, "按 (rule, agent, series) 稳定排序");
@@ -8018,7 +9278,7 @@ mod tests {
         seed_metric_sample(&s, "a3", 7, Labels::new(), 500, 99.0);
 
         let snapshot = s
-            .latest_alert_series("disk.used_percent", 1_000, None, 10)
+            .latest_alert_series("disk.used_percent", 1_000, None, &Labels::new(), 10)
             .unwrap();
         assert!(!snapshot.truncated);
         assert_eq!(snapshot.rows.len(), 3);
@@ -8039,25 +9299,25 @@ mod tests {
 
         // limit+1 探测：3 条序列、limit=2 → 只回 2 条且 truncated。
         let bounded = s
-            .latest_alert_series("disk.used_percent", 1_000, None, 2)
+            .latest_alert_series("disk.used_percent", 1_000, None, &Labels::new(), 2)
             .unwrap();
         assert!(bounded.truncated);
         assert_eq!(bounded.rows.len(), 2);
         // limit=0 不返回数据。
         let empty = s
-            .latest_alert_series("disk.used_percent", 1_000, None, 0)
+            .latest_alert_series("disk.used_percent", 1_000, None, &Labels::new(), 0)
             .unwrap();
         assert!(empty.truncated);
         assert!(empty.rows.is_empty());
 
         // agent 过滤与 since 过滤。
         let a2 = s
-            .latest_alert_series("disk.used_percent", 1_000, Some("a2"), 10)
+            .latest_alert_series("disk.used_percent", 1_000, Some("a2"), &Labels::new(), 10)
             .unwrap();
         assert_eq!(a2.rows.len(), 1);
         assert_eq!(a2.rows[0].agent_id, "a2");
         let recent = s
-            .latest_alert_series("disk.used_percent", 2_600, None, 10)
+            .latest_alert_series("disk.used_percent", 2_600, None, &Labels::new(), 10)
             .unwrap();
         assert_eq!(recent.rows.len(), 1);
         assert_eq!(recent.rows[0].ts, 3_000);
@@ -8065,14 +9325,124 @@ mod tests {
         // 只有 1m 聚合桶、raw 已删除：raw-only 查询必须为空。
         seed_metric_sample(&s, "a4", 8, Labels::new(), 100_000, 88.0);
         s.downsample_1m_range(100_000, 200_000).unwrap();
+        mark_all_raw_aggregated(&s);
         s.prune_samples_before(200_000).unwrap();
         let raw_only = s
-            .latest_alert_series("disk.used_percent", 0, None, 10)
+            .latest_alert_series("disk.used_percent", 0, None, &Labels::new(), 10)
             .unwrap();
         assert!(
             raw_only.rows.is_empty(),
             "raw-only 查询不得回退到 1m: {raw_only:?}"
         );
+    }
+
+    /// 标签过滤必须下推到 SQL：5001 条序列时，排序最后的目标序列在 `limit=1`
+    /// 下仍能被找到；多标签、空过滤、无匹配、特殊键值与注入字符串都只作为
+    /// 参数绑定。
+    #[test]
+    fn m4_b1b_latest_alert_series_pushes_label_filter_before_limit() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let now = 1_700_000_000_000;
+
+        // 前 5000 条与目标无关的序列；目标序列按 (agent_id, labels) 排在最后。
+        let bulk: Vec<Sample> = (0..5_000)
+            .map(|index| {
+                let mut labels = Labels::new();
+                labels.insert("instance".into(), format!("bulk-{index:04}"));
+                Sample {
+                    metric: "disk.used_percent".into(),
+                    labels,
+                    ts: now - 1_000,
+                    value: 10.0,
+                }
+            })
+            .collect();
+        s.insert_batch(&SampleBatch {
+            agent_id: "a0".into(),
+            epoch: 1,
+            seq: 1,
+            boot_id: "boot".into(),
+            sent_at: now,
+            samples: bulk,
+        })
+        .unwrap();
+
+        let mut target_labels = Labels::new();
+        target_labels.insert("__proto__".into(), "x'; DROP TABLE samples; --".into());
+        target_labels.insert("path".into(), "a\"b\\c\n中文".into());
+        target_labels.insert("empty".into(), "".into());
+        target_labels.insert("weird\"key\\name".into(), "值".into());
+        target_labels.insert("z".into(), "target".into());
+        s.insert_batch(&SampleBatch {
+            agent_id: "z-target".into(),
+            epoch: 1,
+            seq: 1,
+            boot_id: "boot".into(),
+            sent_at: now,
+            samples: vec![Sample {
+                metric: "disk.used_percent".into(),
+                labels: target_labels.clone(),
+                ts: now - 1_000,
+                value: 95.0,
+            }],
+        })
+        .unwrap();
+
+        // 多标签精确子集；`__proto__` 是普通 JSON 键，值里的引号 / 分号只作为
+        // 绑定参数，不参与 SQL 拼接。
+        let mut filter = Labels::new();
+        filter.insert("__proto__".into(), "x'; DROP TABLE samples; --".into());
+        filter.insert("weird\"key\\name".into(), "值".into());
+        filter.insert("z".into(), "target".into());
+        let filtered = s
+            .latest_alert_series("disk.used_percent", 0, None, &filter, 1)
+            .unwrap();
+        assert!(!filtered.truncated, "过滤后只剩目标序列，不应触发截断");
+        assert_eq!(filtered.rows.len(), 1);
+        assert_eq!(filtered.rows[0].agent_id, "z-target");
+        assert_eq!(filtered.rows[0].labels, target_labels);
+        assert!((filtered.rows[0].value - 95.0).abs() < 1e-9);
+
+        // 证明目标确实是全量排序的第 5001 条，而不是数据本来就少。
+        let all = s
+            .latest_alert_series("disk.used_percent", 0, None, &Labels::new(), 10_000)
+            .unwrap();
+        assert_eq!(all.rows.len(), 5_001);
+        assert_eq!(all.rows.last().unwrap().labels, target_labels);
+
+        // 空过滤等价于不过滤，limit 仍作用于过滤后的全量集合。
+        let first_ten = s
+            .latest_alert_series("disk.used_percent", 0, None, &Labels::new(), 10)
+            .unwrap();
+        assert!(first_ten.truncated);
+        assert_eq!(first_ten.rows.len(), 10);
+
+        // 无匹配 / 多标签部分不匹配都返回空快照，且不标记截断。
+        let mut missing = Labels::new();
+        missing.insert("z".into(), "missing".into());
+        let no_match = s
+            .latest_alert_series("disk.used_percent", 0, None, &missing, 10)
+            .unwrap();
+        assert!(!no_match.truncated);
+        assert!(no_match.rows.is_empty());
+
+        let mut partial = filter.clone();
+        partial.insert("path".into(), "wrong".into());
+        let no_partial = s
+            .latest_alert_series("disk.used_percent", 0, None, &partial, 10)
+            .unwrap();
+        assert!(!no_partial.truncated);
+        assert!(no_partial.rows.is_empty());
+
+        // 注入样式的过滤键也只是参数：表结构完好、原数据仍在。
+        let mut injected = Labels::new();
+        injected.insert("k'; DROP TABLE samples; --".into(), "v".into());
+        let injected_snapshot = s
+            .latest_alert_series("disk.used_percent", 0, None, &injected, 10)
+            .unwrap();
+        assert!(injected_snapshot.rows.is_empty());
+        assert_eq!(s.sample_count("a0").unwrap(), 5_000);
+        assert_eq!(s.sample_count("z-target").unwrap(), 1);
     }
 
     /// 单事务批量写：事件与状态一起落库，空批次是 no-op。
@@ -8384,28 +9754,33 @@ mod tests {
             .is_empty());
     }
 
-    /// 告警 raw 查询必须走 `(metric, ts)` / `(agent, metric, ts)` 索引，不能全表扫描。
+    /// 告警 raw 查询必须走 `(metric, ts)` / `(agent, metric, ts)` 索引，不能全表扫描；
+    /// 标签过滤通过相关 `json_each` 子查询下推后，索引选择不能被破坏。
     #[test]
     fn m4_b1b_latest_alert_series_uses_index_without_full_scan() {
         let s = SqliteStorage::open_in_memory().unwrap();
         let conn = s.lock_read();
+        let mut filters = Labels::new();
+        filters.insert("mount".into(), "/".into());
+        filters.insert("__proto__".into(), "x".into());
         let plan_for = |has_agent: bool| -> Vec<String> {
-            let sql = format!("EXPLAIN QUERY PLAN {}", latest_alert_series_sql(has_agent));
+            let sql = format!(
+                "EXPLAIN QUERY PLAN {}",
+                latest_alert_series_sql(has_agent, &filters)
+            );
             let mut stmt = conn.prepare(&sql).unwrap();
-            let values: Vec<rusqlite::types::Value> = if has_agent {
-                vec![
-                    rusqlite::types::Value::Text("disk.used_percent".into()),
-                    rusqlite::types::Value::Integer(0),
-                    rusqlite::types::Value::Text("a1".into()),
-                    rusqlite::types::Value::Integer(10),
-                ]
-            } else {
-                vec![
-                    rusqlite::types::Value::Text("disk.used_percent".into()),
-                    rusqlite::types::Value::Integer(0),
-                    rusqlite::types::Value::Integer(10),
-                ]
-            };
+            let mut values: Vec<rusqlite::types::Value> = vec![
+                rusqlite::types::Value::Text("disk.used_percent".into()),
+                rusqlite::types::Value::Integer(0),
+            ];
+            if has_agent {
+                values.push(rusqlite::types::Value::Text("a1".into()));
+            }
+            for (key, value) in &filters {
+                values.push(rusqlite::types::Value::Text(key.clone()));
+                values.push(rusqlite::types::Value::Text(value.clone()));
+            }
+            values.push(rusqlite::types::Value::Integer(10));
             stmt.query_map(rusqlite::params_from_iter(values), |row| {
                 row.get::<_, String>(3)
             })

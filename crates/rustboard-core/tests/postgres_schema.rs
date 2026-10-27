@@ -44,7 +44,7 @@ use rustboard_core::storage::sqlite::SqliteStorage;
 /// 实库测试 DSN 的环境变量；未设置时全部 JSON schema 用例 skip。
 const PG_ENV: &str = "RUSTBOARD_TEST_PG";
 
-/// 21 张业务表（与 SQLite v7 一致），本清单独立于实现硬编码。
+/// 21 张业务表（与 SQLite v8 一致），本清单独立于实现硬编码。
 const TABLES: [&str; 21] = [
     "agents",
     "samples",
@@ -69,13 +69,12 @@ const TABLES: [&str; 21] = [
     "archive_state",
 ];
 
-/// SQLite v7 的显式命名索引。
+/// SQLite v8 的显式命名索引（22 个）。
 ///
-/// 方案文字写的是「20 个 SQLite 索引」，但基线 `sqlite.rs` 实际只有 19 条
-/// `CREATE INDEX`（`grep -c 'CREATE INDEX'`）；其余是 `sqlite_autoindex_*`
-/// 主键/唯一约束的隐式索引。本文件以真实 SQLite 建库结果为准（见
-/// `named_index_set_matches_sqlite_baseline`），不照抄「20」这个数字。
-const INDEXES: [&str; 19] = [
+/// v8 在 v7 的 19 个命名索引上新增 3 个 partial index；其余是
+/// `sqlite_autoindex_*` 主键/唯一约束的隐式索引。本文件以真实 SQLite 建库
+/// 结果为准（见 `table_and_index_sets_match_sqlite_baseline`）。
+const INDEXES: [&str; 22] = [
     "idx_samples_lookup",
     "idx_samples_ts",
     "idx_ingest_batches_ts",
@@ -95,6 +94,9 @@ const INDEXES: [&str; 19] = [
     "idx_alert_silences_until",
     "idx_archive_objects_range",
     "idx_archive_objects_status",
+    "idx_samples_unarchived",
+    "idx_samples_unaggregated",
+    "idx_samples_1m_unaggregated",
 ];
 
 /// 每次调用返回递增序号，避免同一纳秒内两个用例撞库名。
@@ -320,7 +322,7 @@ fn assert_all_named_indexes(client: &mut Client) {
     );
 }
 
-/// 用真实 SQLite v7 建库，返回 `(业务表集合, 显式命名索引集合)`。
+/// 用真实 SQLite v8 建库，返回 `(业务表集合, 显式命名索引集合)`。
 ///
 /// 不依赖 schema 常量，直接读 `sqlite_master`，作为 PG 表/索引的对照基线。
 fn sqlite_baseline_objects() -> (BTreeSet<String>, BTreeSet<String>) {
@@ -334,8 +336,8 @@ fn sqlite_baseline_objects() -> (BTreeSet<String>, BTreeSet<String>) {
     fs::create_dir_all(&dir).expect("创建 SQLite 测试目录失败");
     let db_path = dir.join("baseline.db");
 
-    // SqliteStorage::open 会建全量 v7 schema；drop 后再用独立连接读目录表。
-    let storage = SqliteStorage::open(&db_path).expect("创建 SQLite v7 基线失败");
+    // SqliteStorage::open 会建全量 v8 schema；drop 后再用独立连接读目录表。
+    let storage = SqliteStorage::open(&db_path).expect("创建 SQLite v8 基线失败");
     drop(storage);
 
     let connection = rusqlite::Connection::open(&db_path).expect("打开 SQLite 基线失败");
@@ -364,12 +366,12 @@ fn sqlite_object_names(connection: &rusqlite::Connection, kind: &str) -> BTreeSe
 }
 
 // ---------------------------------------------------------------------------
-// 1. 空库：21 张表 + 19 个索引 + 版本 7
+// 1. 空库：21 张表 + 22 个索引 + 版本 8
 // ---------------------------------------------------------------------------
 
 #[test]
-fn empty_database_apply_creates_21_tables_and_19_indexes() {
-    const NAME: &str = "empty_database_apply_creates_21_tables_and_19_indexes";
+fn empty_database_apply_creates_21_tables_and_22_indexes() {
+    const NAME: &str = "empty_database_apply_creates_21_tables_and_22_indexes";
     let Some(db) = TestDatabase::create("empty") else {
         skip(NAME);
         return;
@@ -379,11 +381,11 @@ fn empty_database_apply_creates_21_tables_and_19_indexes() {
     apply_schema(&mut client).expect("空库 apply_schema 必须成功");
 
     assert_eq!(schema_version(&mut client), POSTGRES_SCHEMA_VERSION);
-    assert_eq!(migration_row_count(&mut client), 1, "版本表应只有一行 v7");
+    assert_eq!(migration_row_count(&mut client), 1, "版本表应只有一行 v8");
     assert_all_21_tables(&mut client);
     assert_all_named_indexes(&mut client);
 
-    // SQLite 基线的 19 个命名索引必须全部存在；PG 另有主键/唯一约束的隐式索引。
+    // SQLite 基线的 22 个命名索引必须全部存在；PG 另有主键/唯一约束的隐式索引。
     let all_indexes = index_names(&mut client);
     eprintln!(
         "[d2] 空库结果：tables={} named_indexes={} all_indexes={}",
@@ -419,14 +421,14 @@ fn table_and_index_sets_match_sqlite_baseline() {
     let pg_indexes = named_index_names(&mut client);
     let (sqlite_tables, sqlite_indexes) = sqlite_baseline_objects();
 
-    assert_eq!(sqlite_tables.len(), 21, "SQLite v7 应有 21 张业务表");
+    assert_eq!(sqlite_tables.len(), 21, "SQLite v8 应有 21 张业务表");
     assert_eq!(
         pg_tables, sqlite_tables,
-        "PG 21 张业务表必须与真实 SQLite v7 的 sqlite_master 完全一致"
+        "PG 21 张业务表必须与真实 SQLite v8 的 sqlite_master 完全一致"
     );
     assert_eq!(
         pg_indexes, sqlite_indexes,
-        "PG 命名索引集合必须与真实 SQLite v7 的 sqlite_master 完全一致"
+        "PG 命名索引集合必须与真实 SQLite v8 的 sqlite_master 完全一致"
     );
     eprintln!(
         "[d2] 对照：SQLite tables={} indexes={}，PG tables={} named_indexes={}",
@@ -464,6 +466,12 @@ fn type_mapping_booleans_constraints_and_upsert_targets() {
         ("audit_log", "duration_ms", "bigint"),
         ("archive_objects", "rows", "bigint"),
         ("archive_objects", "bytes", "bigint"),
+        ("archive_objects", "ledger_version", "bigint"),
+        ("archive_objects", "attempts", "bigint"),
+        ("samples", "archive_object_id", "bigint"),
+        ("samples", "aggregated_1m", "bigint"),
+        ("samples_1m", "last_ts", "bigint"),
+        ("samples_1m", "aggregated_1h", "bigint"),
     ] {
         let (data_type, _, _) = column_meta(&mut client, table, column);
         assert_eq!(
@@ -513,6 +521,44 @@ fn type_mapping_booleans_constraints_and_upsert_targets() {
     ] {
         let (_, nullable, _) = column_meta(&mut client, table, column);
         assert_eq!(nullable, "YES", "{table}.{column} 应可空（与 SQLite 对齐）");
+    }
+
+    // v8 列的默认值/可空性必须与 SQLite 语义一致。
+    for (table, column) in [
+        ("samples", "aggregated_1m"),
+        ("samples_1m", "last_ts"),
+        ("samples_1m", "aggregated_1h"),
+        ("archive_objects", "ledger_version"),
+        ("archive_objects", "attempts"),
+    ] {
+        let (_, nullable, default) = column_meta(&mut client, table, column);
+        assert_eq!(nullable, "NO", "{table}.{column} 必须 NOT NULL");
+        assert_eq!(
+            default.as_deref().map(str::trim),
+            Some("0"),
+            "{table}.{column} 默认值应为 0，实际 {default:?}"
+        );
+    }
+    let (_, nullable, _) = column_meta(&mut client, "samples", "archive_object_id");
+    assert_eq!(nullable, "YES", "samples.archive_object_id 必须可空");
+
+    // v8 partial index 的谓词必须随 DDL 落地（不能只建普通索引）。
+    for (index, predicate) in [
+        ("idx_samples_unarchived", "archive_object_id IS NULL"),
+        ("idx_samples_unaggregated", "aggregated_1m = 0"),
+        ("idx_samples_1m_unaggregated", "aggregated_1h = 0"),
+    ] {
+        let definition: String = client
+            .query_one(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = $1",
+                &[&index],
+            )
+            .unwrap_or_else(|e| panic!("读取索引 {index} 定义失败：{e}"))
+            .get(0);
+        assert!(
+            definition.contains("WHERE") && definition.contains(predicate),
+            "索引 {index} 必须是 partial index（{predicate}），实际：{definition}"
+        );
     }
 
     // NOT NULL 的 error 字段不能被放宽。
@@ -785,12 +831,125 @@ fn half_migration_keeps_existing_rows_and_completes_schema() {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. v7 旧库：显式 ALTER 补 v8 列 + partial index，旧数据保留
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v7_database_is_altered_to_v8_without_losing_rows() {
+    const NAME: &str = "v7_database_is_altered_to_v8_without_losing_rows";
+    let Some(db) = TestDatabase::create("v7_alter") else {
+        skip(NAME);
+        return;
+    };
+    let mut client = db.connect();
+    client
+        .batch_execute(
+            "CREATE TABLE schema_migrations (
+                 version BIGINT PRIMARY KEY,
+                 applied_at BIGINT NOT NULL
+             );
+             INSERT INTO schema_migrations VALUES (7, 1);
+             CREATE TABLE samples (
+                 id       BIGSERIAL PRIMARY KEY,
+                 agent_id TEXT NOT NULL,
+                 metric   TEXT NOT NULL,
+                 labels   TEXT NOT NULL DEFAULT '{}',
+                 ts       BIGINT NOT NULL,
+                 value    DOUBLE PRECISION NOT NULL
+             );
+             INSERT INTO samples (agent_id, metric, labels, ts, value)
+             VALUES ('a7', 'cpu.usage', '{}', 30000, 1.0);
+             CREATE TABLE samples_1m (
+                 id         BIGSERIAL PRIMARY KEY,
+                 agent_id   TEXT NOT NULL,
+                 metric     TEXT NOT NULL,
+                 labels     TEXT NOT NULL DEFAULT '{}',
+                 bucket_ts  BIGINT NOT NULL,
+                 min_value  DOUBLE PRECISION NOT NULL,
+                 max_value  DOUBLE PRECISION NOT NULL,
+                 avg_value  DOUBLE PRECISION NOT NULL,
+                 last_value DOUBLE PRECISION NOT NULL,
+                 count      BIGINT NOT NULL,
+                 CONSTRAINT samples_1m_unique UNIQUE (agent_id, metric, labels, bucket_ts)
+             );
+             INSERT INTO samples_1m
+                 (agent_id, metric, labels, bucket_ts, min_value, max_value,
+                  avg_value, last_value, count)
+             VALUES ('a7', 'cpu.usage', '{}', 60000, 1, 1, 1, 1, 1);
+             CREATE TABLE archive_objects (
+                 id           BIGSERIAL PRIMARY KEY,
+                 backend      TEXT NOT NULL,
+                 object_key   TEXT NOT NULL UNIQUE,
+                 manifest_key TEXT NOT NULL,
+                 from_ts      BIGINT NOT NULL,
+                 to_ts        BIGINT NOT NULL,
+                 rows         BIGINT NOT NULL,
+                 bytes        BIGINT NOT NULL,
+                 sha256       TEXT NOT NULL,
+                 status       TEXT NOT NULL,
+                 error        TEXT NOT NULL DEFAULT '',
+                 created_at   BIGINT NOT NULL,
+                 uploaded_at  BIGINT,
+                 deleted_at   BIGINT
+             );
+             INSERT INTO archive_objects
+                 (backend, object_key, manifest_key, from_ts, to_ts, rows, bytes,
+                  sha256, status, created_at)
+             VALUES ('webdav', 'v7/old.csv.gz', 'v7/old.manifest.json', 0, 60000, 1,
+                     10, repeat('a', 64), 'uploaded', 1);",
+        )
+        .expect("构造 v7 PG 库失败");
+
+    apply_schema(&mut client).expect("v7→v8 迁移必须成功");
+
+    assert_eq!(schema_version(&mut client), POSTGRES_SCHEMA_VERSION);
+    for (table, column, expected_default) in [
+        ("samples", "aggregated_1m", Some("0")),
+        ("samples_1m", "last_ts", Some("0")),
+        ("samples_1m", "aggregated_1h", Some("0")),
+        ("archive_objects", "ledger_version", Some("0")),
+        ("archive_objects", "attempts", Some("0")),
+    ] {
+        let (data_type, nullable, default) = column_meta(&mut client, table, column);
+        assert_eq!(data_type, "bigint", "{table}.{column} 必须是 BIGINT");
+        assert_eq!(nullable, "NO", "{table}.{column} 必须 NOT NULL");
+        assert_eq!(
+            default.as_deref().map(str::trim),
+            expected_default,
+            "{table}.{column} 默认值不符"
+        );
+    }
+    let (_, nullable, _) = column_meta(&mut client, "samples", "archive_object_id");
+    assert_eq!(nullable, "YES");
+
+    // ALTER 不得丢数据；v7 旧桶 last_ts 按统一保守值回填。
+    let (raw_rows, last_ts): (i64, i64) = {
+        let row = client
+            .query_one(
+                "SELECT (SELECT COUNT(*) FROM samples WHERE agent_id = 'a7')::bigint,
+                        (SELECT last_ts FROM samples_1m WHERE agent_id = 'a7')",
+                &[],
+            )
+            .expect("读取迁移后 v7 数据失败");
+        (row.get(0), row.get(1))
+    };
+    assert_eq!(raw_rows, 1, "v7 raw 行不得丢失");
+    assert_eq!(last_ts, 119_999, "legacy 1m 桶必须回填 bucket_ts+59999");
+    assert_eq!(
+        migration_row_count(&mut client),
+        2,
+        "保留 v7 版本行并追加 v8 版本行"
+    );
+    assert_all_named_indexes(&mut client);
+}
+
+// ---------------------------------------------------------------------------
 // 6. 并发 apply：两线程竞争 + advisory lock 串行化
 // ---------------------------------------------------------------------------
 
 #[test]
-fn concurrent_apply_on_empty_database_ends_at_version_7() {
-    const NAME: &str = "concurrent_apply_on_empty_database_ends_at_version_7";
+fn concurrent_apply_on_empty_database_ends_at_version_8() {
+    const NAME: &str = "concurrent_apply_on_empty_database_ends_at_version_8";
     let Some(db) = TestDatabase::create("race") else {
         skip(NAME);
         return;
@@ -825,7 +984,7 @@ fn concurrent_apply_on_empty_database_ends_at_version_7() {
     assert_eq!(
         migration_row_count(&mut client),
         1,
-        "并发迁移只允许一行 v7 版本记录"
+        "并发迁移只允许一行 v8 版本记录"
     );
     assert_all_21_tables(&mut client);
     assert_all_named_indexes(&mut client);
@@ -888,7 +1047,7 @@ fn advisory_lock_blocks_second_migration_until_release() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. 版本 8 必须拒绝
+// 7. 版本 9 必须拒绝
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -906,14 +1065,14 @@ fn future_schema_version_is_rejected_without_ddl() {
                  version BIGINT PRIMARY KEY,
                  applied_at BIGINT NOT NULL
              );
-             INSERT INTO schema_migrations (version, applied_at) VALUES (8, 123456);",
+             INSERT INTO schema_migrations (version, applied_at) VALUES (9, 123456);",
         )
-        .expect("构造 v8 库失败");
+        .expect("构造 v9 库失败");
 
-    let err = apply_schema(&mut client).expect_err("schema 版本 8 必须被拒绝");
+    let err = apply_schema(&mut client).expect_err("schema 版本 9 必须被拒绝");
     let message = format!("{err:#}");
     assert!(
-        message.contains('8') && message.contains('7'),
+        message.contains('9') && message.contains('8'),
         "拒绝信息应包含实际/支持版本：{message}"
     );
     assert!(
@@ -927,7 +1086,7 @@ fn future_schema_version_is_rejected_without_ddl() {
         vec!["schema_migrations".to_string()],
         "版本过高时不得建业务表"
     );
-    assert_eq!(schema_version(&mut client), 8, "版本行不得被改写");
+    assert_eq!(schema_version(&mut client), 9, "版本行不得被改写");
 }
 
 // ---------------------------------------------------------------------------

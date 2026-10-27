@@ -1,4 +1,4 @@
-//! M5 Phase D5 核心：SQLite v7 → PostgreSQL 实库迁移/校验测试。
+//! M5 Phase D5 核心：SQLite v8 → PostgreSQL 实库迁移/校验测试。
 //!
 //! 依据 `docs/plans/2026-10-26-m5-phase-d-postgres-backup-l01-l03.md`
 //! §3.4/§5 D5/§6.3 编写。测试只覆盖 `storage::migrate` 的核心 API：
@@ -200,7 +200,7 @@ impl TestDatabase {
         .unwrap_or_else(|e| panic!("打开 PostgresStorage 失败：{e:#}"))
     }
 
-    /// 应用 schema v7 后打开 storage，用于「schema 已 apply 但全空」场景。
+    /// 应用 schema v8 后打开 storage，用于「schema 已 apply 但全空」场景。
     fn open_storage(&self) -> PostgresStorage {
         let mut client = connect_for_schema(&self.app_dsn)
             .unwrap_or_else(|e| panic!("schema 连接失败（{}）：{e:#}", self.name));
@@ -426,6 +426,8 @@ fn archive_object(index: i64, uploaded: bool) -> ArchiveObject {
         created_at: NOW - 6_000,
         uploaded_at: if uploaded { Some(NOW - 1_000) } else { None },
         deleted_at: None,
+        ledger_version: 0,
+        attempts: 0,
     }
 }
 
@@ -436,7 +438,7 @@ fn build_fixture(tag: &str) -> Fixture {
     let watermark;
 
     {
-        let storage = SqliteStorage::open(&path).expect("创建 SQLite v7 源库失败");
+        let storage = SqliteStorage::open(&path).expect("创建 SQLite v8 源库失败");
 
         // agents：3 行，其中 agent-3 走吊销终态。
         storage
@@ -965,8 +967,8 @@ fn migrates_all_tables_and_preserves_ids() {
         "迁移修改了 SQLite 源库或 WAL"
     );
 
-    assert_eq!(report.sqlite_schema_version, 7);
-    assert_eq!(report.postgres_schema_version, 7);
+    assert_eq!(report.sqlite_schema_version, 8);
+    assert_eq!(report.postgres_schema_version, 8);
     assert_eq!(report.tables.len(), TABLES.len());
     assert_eq!(
         report
@@ -1486,7 +1488,11 @@ fn bool_failure_rolls_back_target_and_second_migration_succeeds() {
         .query_one("SELECT MAX(version) FROM schema_migrations", &[])
         .unwrap()
         .get(0);
-    assert_eq!(version, Some(7), "schema 版本行应保留（DDL 不是业务数据）");
+    assert_eq!(
+        version,
+        Some(8),
+        "v8 DDL 已提交；数据导入失败只回滚业务数据，schema 版本保持 8"
+    );
     assert_eq!(
         hash_source(&fixture.path),
         source_hash_before,
@@ -1527,7 +1533,7 @@ fn empty_source_migrates_and_sequences_start_at_one() {
     let temp = TempDir::new("empty");
     let path = temp.0.join("empty.db");
     {
-        let storage = SqliteStorage::open(&path).expect("创建空 SQLite v7 失败");
+        let storage = SqliteStorage::open(&path).expect("创建空 SQLite v8 失败");
         drop(storage);
     }
 

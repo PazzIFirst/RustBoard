@@ -210,6 +210,40 @@ const MAINTENANCE_MAX_BACKFILL_HOURS: u32 = 6;
 /// M4：`maintenance_state.last_error` 的最大字符数，避免把超长错误写进库。
 const MAX_MAINTENANCE_ERROR_CHARS: usize = 2_000;
 
+/// #50：时间戳超界批次的审计计数（仅进程内，不写库）。
+///
+/// 每批拒绝都 +1；日志按固定间隔采样，避免恶意 agent 用坏批次刷爆日志。
+static INGEST_TS_REJECTED_BATCHES: AtomicU64 = AtomicU64::new(0);
+/// 每拒绝这么多批采样打一条 WARN；首批一定打。
+const INGEST_TS_REJECT_LOG_EVERY: u64 = 100;
+
+/// #50：批内是否有样本时间戳超出 `[ingest]` 准入范围。
+///
+/// 只做比较，不回显任何样本值；`now_ms` 由调用方统一传入，避免同一批
+/// 各样本使用不同边界。
+fn batch_timestamp_out_of_bounds(batch: &SampleBatch, cfg: &HubConfig, now: i64) -> bool {
+    batch
+        .samples
+        .iter()
+        .any(|sample| !cfg.ingest.accepts_ts(sample.ts, now))
+}
+
+/// 记录一次时间戳超界批次拒绝，返回累计拒绝批次数。
+fn note_timestamp_rejected_batch(agent_id: &str, batch: &SampleBatch) -> u64 {
+    let total = INGEST_TS_REJECTED_BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    if total == 1 || total.is_multiple_of(INGEST_TS_REJECT_LOG_EVERY) {
+        tracing::warn!(
+            agent = %agent_id,
+            epoch = batch.epoch,
+            seq = batch.seq,
+            samples = batch.samples.len(),
+            rejected_total = total,
+            "批次样本时间戳超出 ingest 准入范围：整批 ACK 丢弃（不写库、不改水位）"
+        );
+    }
+    total
+}
+
 /// CSR 长度门禁：纳管与续签共用，必须在解析/消费 token 之前调用。
 fn csr_within_limit(csr_pem: &str) -> bool {
     csr_pem.len() <= MAX_CSR_PEM_LEN
@@ -365,6 +399,26 @@ enum ArchiveAction {
     },
     /// 立即执行一轮归档（忽略每日计划时间，同样只处理已到期数据）。
     Run {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// v8 归档 ledger 重建状态与手动续跑。
+    Ledger {
+        #[command(subcommand)]
+        action: ArchiveLedgerAction,
+    },
+}
+
+/// `archive ledger` 子命令（R1a-2）。
+#[derive(Subcommand)]
+enum ArchiveLedgerAction {
+    /// 输出 archive_ledger_pending / 旧水位 / 对象数（JSON）。
+    Status {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// 标记 ledger 待重建并立即执行一轮归档；完整成功后清除 pending。
+    Rebuild {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
@@ -853,18 +907,23 @@ struct MaintenanceStatusOutput {
     retention_1m_days: u32,
     retention_1h_days: u32,
     maintenance_interval_secs: u64,
+    ingest_max_late_days: u32,
+    ingest_max_future_skew_secs: u64,
 }
 
 /// 读取维护状态并返回 JSON（调用方负责打印）。
 fn maintenance_status_json(config: Option<PathBuf>) -> Result<String> {
     let (storage, cfg) = open_maintenance_storage(config)?;
-    let status = downsample::maintenance_status(&*storage).context("读取维护状态失败")?;
+    let status =
+        downsample::maintenance_status(&*storage, &cfg, now_ms()).context("读取维护状态失败")?;
     let output = MaintenanceStatusOutput {
         status,
         retention_raw_days: cfg.retention_raw_days,
         retention_1m_days: cfg.retention_1m_days,
         retention_1h_days: cfg.retention_1h_days,
         maintenance_interval_secs: cfg.maintenance_interval_secs,
+        ingest_max_late_days: cfg.ingest.max_late_days,
+        ingest_max_future_skew_secs: cfg.ingest.max_future_skew_secs,
     };
     Ok(serde_json::to_string_pretty(&output)?)
 }
@@ -879,6 +938,20 @@ fn archive_command(action: ArchiveAction) -> Result<()> {
         ArchiveAction::Test { config } => println!("{}", archive_test_json(config)?),
         ArchiveAction::Status { config } => println!("{}", archive_status_json(config)?),
         ArchiveAction::Run { config } => println!("{}", archive_run_json(config)?),
+        ArchiveAction::Ledger { action } => archive_ledger_command(action)?,
+    }
+    Ok(())
+}
+
+/// `archive ledger` 子命令入口；只负责打印业务函数返回的 JSON。
+fn archive_ledger_command(action: ArchiveLedgerAction) -> Result<()> {
+    match action {
+        ArchiveLedgerAction::Status { config } => {
+            println!("{}", archive_ledger_status_json(config)?);
+        }
+        ArchiveLedgerAction::Rebuild { config } => {
+            println!("{}", archive_ledger_rebuild_json(config)?);
+        }
     }
     Ok(())
 }
@@ -941,6 +1014,45 @@ fn archive_run_json(config: Option<PathBuf>) -> Result<String> {
         ))
         .context("归档任务失败（archive run）")?;
     Ok(serde_json::to_string_pretty(&report)?)
+}
+
+/// `archive ledger status`：只读 pending 标记 / 旧水位 / 对象数。
+///
+/// `archive.enabled = false` 时也可执行，用于查看迁移留下的待重建标记。
+fn archive_ledger_status_json(config: Option<PathBuf>) -> Result<String> {
+    let (storage, _cfg) = open_maintenance_storage(config)?;
+    let status = archive::ledger_status(&storage).context("读取归档 ledger 状态失败")?;
+    Ok(serde_json::to_string_pretty(&status)?)
+}
+
+/// `archive ledger rebuild`：先置 pending=1，再立即跑一轮归档。
+///
+/// 失败 / 中断时 pending 保持为 1（R1b 接入后 retention 会继续阻塞）；
+/// 完整成功由 worker 清除 pending。输出只含固定报告与 ledger 状态，不含后端
+/// URL / 凭据 / 对象内容。
+fn archive_ledger_rebuild_json(config: Option<PathBuf>) -> Result<String> {
+    let (storage, cfg) = open_maintenance_storage(config)?;
+    if !cfg.archive.enabled {
+        bail!("归档未启用（archive.enabled = false）");
+    }
+    let store = archive::build_store(&cfg.archive)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("初始化归档 ledger 重建运行时失败")?;
+    let report = runtime
+        .block_on(archive::rebuild_ledger(
+            &storage,
+            &cfg,
+            store.as_ref(),
+            now_ms(),
+        ))
+        .context("归档 ledger 重建失败（archive ledger rebuild）")?;
+    let ledger = archive::ledger_status(&storage).context("读取归档 ledger 状态失败")?;
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "report": report,
+        "ledger": ledger,
+    }))?)
 }
 
 // init 的参数与 `init` 子命令的 CLI 字段一一对应，拆结构体只会多一层搬运。
@@ -1954,6 +2066,23 @@ fn run(cfg: HubConfig) -> Result<()> {
             tracing::info!(count = reset, "启动时已将残留的 online 状态重置为 offline");
         }
 
+        // #50 / R1b：迁移旧库里的超界时间戳 raw 与超过 1m horizon 的未聚合行，
+        // 避免 delta 为这些历史坏数据构造残缺 1m。审计失败不阻塞监听；新的
+        // 超界批次仍会在 ingest 前被 ACK 丢弃。
+        let audit_now = now_ms();
+        let audit_cfg = cfg.clone();
+        match storage_blocking(storage.clone(), move |storage| {
+            downsample::audit_legacy_raw_rows(storage.as_storage(), &audit_cfg, audit_now)
+        })
+        .await
+        {
+            Ok(report) => tracing::debug!(?report, "启动时 legacy raw 时间戳审计完成"),
+            Err(err) => tracing::warn!(
+                error = %err,
+                "启动时 legacy raw 时间戳审计失败；新批次仍受 ingest 准入校验保护"
+            ),
+        }
+
         // M3：审计保留 180 天，启动时先清一次过期记录（运行期每 1000 条再清）。
         let audit_cutoff = now_ms().saturating_sub(AUDIT_RETENTION_MS);
         match storage_blocking(storage.clone(), move |storage| {
@@ -2716,13 +2845,14 @@ const MAX_ARCHIVE_DOWNLOAD_PRINCIPALS: usize = 1024;
 const ARCHIVE_DOWNLOAD_SEND_TIMEOUT: Duration = Duration::from_secs(120);
 /// `archive_objects.error` 允许透传的固定错误码；其它内容（可能来自人工改库 /
 /// 旧版本）一律收敛为 `archive_error`，避免把 URL 或后端正文带到 API。
-const ARCHIVE_OBJECT_ERROR_CODES: [&str; 6] = [
+const ARCHIVE_OBJECT_ERROR_CODES: [&str; 7] = [
     "invalid_key",
     "invalid_manifest",
     "invalid_status",
     "encode_failed",
     "backend_unavailable",
     "not_found",
+    "rows_missing",
 ];
 
 /// 归档对象列表响应：`objects` 按 id 倒序，`next_before_id` 是下一页排他游标。
@@ -2748,6 +2878,10 @@ struct ArchiveObjectView {
     created_at: i64,
     uploaded_at: Option<i64>,
     deleted_at: Option<i64>,
+    /// failed 重试次数（v8 claim 对象；旧 v7 对象为 0）。
+    attempts: i64,
+    /// 对象 claim 行集已缺失，无法再重建上传（error = `rows_missing`）。
+    rows_missing: bool,
     /// 是否可下载：状态就绪且对象大小未超过固定 64 MiB 下载上限。
     downloadable: bool,
 }
@@ -2765,6 +2899,7 @@ fn archive_object_downloadable(object: &ArchiveObject) -> bool {
 impl From<ArchiveObject> for ArchiveObjectView {
     fn from(object: ArchiveObject) -> Self {
         let downloadable = archive_object_downloadable(&object);
+        let rows_missing = object.error == "rows_missing";
         Self {
             id: object.id,
             object_key: object.object_key,
@@ -2779,6 +2914,8 @@ impl From<ArchiveObject> for ArchiveObjectView {
             created_at: object.created_at,
             uploaded_at: object.uploaded_at,
             deleted_at: object.deleted_at,
+            attempts: object.attempts,
+            rows_missing,
             downloadable,
         }
     }
@@ -5052,7 +5189,7 @@ async fn handle_session(mut socket: WebSocket, state: AppState, hello: AgentHell
 
         let mut shutdown = handle.shutdown;
         let mut watch_shutdown = true;
-        // 每个会话最多成功续签一次，状态跟随会话生命周期。
+        // 会话内只记录最近一次成功时间；能否续签由每 agent 冷却窗口决定。
         let mut renew = RenewState::default();
         // 绝对空闲 deadline：每秒的控制清理 tick 不会重置它，只有入站帧才续期。
         let mut idle = SessionIdle::new(SESSION_IDLE_TIMEOUT);
@@ -5296,16 +5433,18 @@ impl SessionIdle {
 
 /// 单个会话的客户端证书续签状态。
 ///
-/// 每个会话最多成功签发 1 次；跨会话的重复请求由 [`RenewGuard`] 的冷却窗口兜住。
+/// 只记录本会话最近一次成功的时间（Unix 毫秒，0 表示尚未成功），用于日志 /
+/// 指标；准入门槛完全由 [`RenewGuard`] 的每 agent 冷却窗口与容量上限决定，
+/// 因此同一会话在冷却结束后可以再次续签。
 #[derive(Default)]
 struct RenewState {
-    succeeded: bool,
+    last_success_ms: i64,
 }
 
 /// 客户端续签的冷却窗口：同一 agent 10 分钟内只允许一次尝试。
 ///
-/// 每会话 1 次可以被「断开重连」绕过，冷却表把窗口收紧到每 agent 10 分钟；
-/// 正常轮换（90 天证书、30 天阈值）完全用不到第二次请求。
+/// 冷却窗口同时约束「同会话高频重试」与「断开重连绕过会话状态」；正常轮换
+/// （90 天证书、30 天阈值）远低于该频率，保留下来的只是防刷签名与内存上界。
 const RENEW_COOLDOWN_MS: i64 = 10 * 60 * 1_000;
 /// 冷却表容量上限；超过后清理过期项，防止被大量 agent_id 撑爆内存。
 const RENEW_GUARD_MAX_ENTRIES: usize = 4_096;
@@ -5335,19 +5474,17 @@ impl RenewGuard {
             let cutoff = now_ms.saturating_sub(RENEW_COOLDOWN_MS);
             self.last_attempt_ms.retain(|_, ts| *ts > cutoff);
 
-            // 仍在窗口内的条目占满表时，淘汰最早的一条，保证内存有硬上界。
-            // 合法 agent 数远小于上限，被淘汰的只会是极久未活跃的身份。
+            // 清理过期项后仍然满表：拒绝新身份，绝不淘汰仍在冷却窗口内的记录。
+            // 否则攻击者可以用 ≥ 上限数量的新 agent_id 轮换，把任意身份的冷却
+            // 记录挤掉，从而绕过 10 分钟限流。已在表中的身份仍可正常更新。
             if self.last_attempt_ms.len() >= RENEW_GUARD_MAX_ENTRIES
                 && !self.last_attempt_ms.contains_key(agent_id)
             {
-                if let Some(oldest) = self
-                    .last_attempt_ms
-                    .iter()
-                    .min_by_key(|(_, ts)| **ts)
-                    .map(|(id, _)| id.clone())
-                {
-                    self.last_attempt_ms.remove(&oldest);
-                }
+                tracing::warn!(
+                    capacity = RENEW_GUARD_MAX_ENTRIES,
+                    "续签冷却表已满，拒绝新身份的续签尝试"
+                );
+                return false;
             }
         }
         self.last_attempt_ms.insert(agent_id.to_string(), now_ms);
@@ -5391,10 +5528,12 @@ enum SignOutcome {
 /// 处理一条 `RenewCert` 请求，返回要回给 agent 的帧。
 ///
 /// 顺序（评审要求）：
-/// 1. 会话内已成功 → 限流；
-/// 2. 全局冷却窗口 → 限流（记录尝试，**无效 CSR 也计入**）；
-/// 3. CSR 长度上限（16 KiB，O(1)，不解析）；
-/// 4. 读 CA 私钥 + 解析 CSR + 签发，全部在 `spawn_blocking` 里做。
+/// 1. 全局冷却窗口 → 限流（记录尝试，**无效 CSR 也计入**）；
+/// 2. CSR 长度上限（16 KiB，O(1)，不解析）；
+/// 3. 读 CA 私钥 + 解析 CSR + 签发，全部在 `spawn_blocking` 里做。
+///
+/// 不再有「同会话只能成功一次」的永久拒绝：证书跨多个周期轮换时，只要冷却
+/// 窗口已过就允许再次签发；成功后只更新 [`RenewState::last_success_ms`]。
 ///
 /// 安全要点：证书 CN **强制**取会话身份 `agent_id`，CSR 里自带的 CN 会被丢弃，
 /// 因此伪造 CN 也拿不到别人的身份。CSR 只作为公钥载体。
@@ -5405,10 +5544,6 @@ async fn handle_renewal(
     csr_pem: &str,
     now_ms: i64,
 ) -> Frame {
-    if renew.succeeded {
-        tracing::warn!(agent = %agent_id, "同一会话重复请求证书续签，已拒绝");
-        return problem(codes::RATE_LIMITED, "同一会话只能续签一次");
-    }
     if !ctx.guard().begin_attempt(agent_id, now_ms) {
         tracing::warn!(
             agent = %agent_id,
@@ -5448,11 +5583,12 @@ async fn handle_renewal(
     match outcome {
         Ok(SignOutcome::Signed(cert_pem)) => match tls::not_after_unix(&cert_pem) {
             Ok(not_after) => {
-                renew.succeeded = true;
-                // 日志只记身份与到期时间：CSR / 证书内容一律不入日志。
+                renew.last_success_ms = now_ms;
+                // 日志只记身份、到期时间与上次成功时间：CSR / 证书内容一律不入日志。
                 tracing::info!(
                     agent = %agent_id,
                     not_after = %tls::format_unix_utc(not_after),
+                    last_success_ms = renew.last_success_ms,
                     "客户端证书已续签"
                 );
                 Frame::CertRenewed { cert_pem }
@@ -5533,6 +5669,20 @@ async fn handle_message(
                         reject_and_close(socket, IDENTITY_MISMATCH, "批次身份与会话身份不一致")
                             .await;
                         return Ok(MessageAction::Close);
+                    }
+                    // #50：入库前统一校验 sample.ts。超界整批 ACK 丢弃，不写
+                    // samples、不改维护水位；只记审计计数与采样 WARN（不含值）。
+                    if batch_timestamp_out_of_bounds(&batch, &state.cfg, now_ms()) {
+                        note_timestamp_rejected_batch(agent_id, &batch);
+                        send_frame(
+                            socket,
+                            &Frame::Ack {
+                                epoch: batch.epoch,
+                                seq: batch.seq,
+                            },
+                        )
+                        .await?;
+                        return Ok(MessageAction::Continue);
                     }
 
                     let batch_for_db = batch.clone();
@@ -6125,14 +6275,19 @@ fn spawn_self_monitor(storage: Arc<StorageHandle>, cfg: HubConfig) {
                     sent_at: ts,
                     samples,
                 };
-                let storage = storage.clone();
-                match tokio::task::spawn_blocking(move || storage.insert_batch(&batch)).await {
-                    Ok(Ok(IngestOutcome::Inserted { .. } | IngestOutcome::Duplicate)) => {}
-                    Ok(Ok(IngestOutcome::Rejected(reason))) => {
-                        tracing::warn!(?reason, "本机采集批次被拒绝");
+                // #50：self-monitor 与 agent 共用同一时间戳准入校验。
+                if batch_timestamp_out_of_bounds(&batch, &cfg, ts) {
+                    note_timestamp_rejected_batch(HUB_SELF_AGENT_ID, &batch);
+                } else {
+                    let storage = storage.clone();
+                    match tokio::task::spawn_blocking(move || storage.insert_batch(&batch)).await {
+                        Ok(Ok(IngestOutcome::Inserted { .. } | IngestOutcome::Duplicate)) => {}
+                        Ok(Ok(IngestOutcome::Rejected(reason))) => {
+                            tracing::warn!(?reason, "本机采集批次被拒绝");
+                        }
+                        Ok(Err(err)) => tracing::error!(error = %err, "本机采集入库失败"),
+                        Err(err) => tracing::error!(error = %err, "本机采集任务失败"),
                     }
-                    Ok(Err(err)) => tracing::error!(error = %err, "本机采集入库失败"),
-                    Err(err) => tracing::error!(error = %err, "本机采集任务失败"),
                 }
             }
             tokio::time::sleep(Duration::from_millis(cfg.sample_interval_ms)).await;
@@ -6184,6 +6339,7 @@ fn run_maintenance_round(storage: &StorageHandle, cfg: &HubConfig) {
     let now = now_ms();
     let mut errors: Vec<String> = Vec::new();
 
+    let mut downsample_ok = true;
     match downsample::run_downsample(
         storage.as_storage(),
         now,
@@ -6191,18 +6347,23 @@ fn run_maintenance_round(storage: &StorageHandle, cfg: &HubConfig) {
     ) {
         Ok(report) => tracing::debug!(?report, "维护任务：降采样完成"),
         Err(err) => {
+            downsample_ok = false;
             let message = format!("downsample: {err:#}");
-            tracing::warn!(error = %message, "维护任务：降采样失败，下一轮重试");
+            tracing::warn!(error = %message, "维护任务：降采样失败，跳过本轮保留期");
             errors.push(message);
         }
     }
-    let gate = archive::archive_gate(storage, cfg);
-    match downsample::run_retention(storage.as_storage(), cfg, now, gate) {
-        Ok(report) => tracing::debug!(?report, "维护任务：保留期完成"),
-        Err(err) => {
-            let message = format!("retention: {err:#}");
-            tracing::warn!(error = %message, "维护任务：保留期失败，下一轮重试");
-            errors.push(message);
+    // 降采样失败时源数据状态未知；本轮不删除任何层级，避免 1m 先于迟到
+    // raw 被删。保留期下一轮重试。
+    if downsample_ok {
+        let gate = archive::archive_gate(storage, cfg);
+        match downsample::run_retention(storage.as_storage(), cfg, now, gate) {
+            Ok(report) => tracing::debug!(?report, "维护任务：保留期完成"),
+            Err(err) => {
+                let message = format!("retention: {err:#}");
+                tracing::warn!(error = %message, "维护任务：保留期失败，下一轮重试");
+                errors.push(message);
+            }
         }
     }
 
@@ -6546,10 +6707,11 @@ mod tests {
         }
     }
 
-    /// A5/安全：走真实 `handle_renewal` 路径——CN 强制取会话身份，
-    /// 同一会话第二次、以及重连后仍在冷却窗口内的请求都被限流。
+    /// A5/安全：走真实 `handle_renewal` 路径——CN 强制取会话身份；
+    /// #43：同会话不再永久拒绝，只受 10 分钟冷却约束（冷却内拒绝、冷却后成功），
+    /// 跨两个证书周期仍能继续轮换并推进 `last_success_ms`。
     #[tokio::test]
-    async fn a5_renewal_uses_session_identity_and_rate_limits() {
+    async fn a5_renewal_uses_session_identity_and_cooldown_only() {
         let (dir, ctx) = renewal_fixture("renew-identity");
         let now = now_ms();
         let csr = csr_with_cn("hub-self");
@@ -6567,48 +6729,67 @@ mod tests {
                 let not_after = tls::not_after_unix(&cert_pem).unwrap();
                 assert!(not_after * 1_000 > now, "新证书必须尚未过期");
                 assert_eq!(tls::days_left(&cert_pem, now).unwrap(), 90);
-                assert!(session.succeeded);
+                assert_eq!(session.last_success_ms, now);
             }
             other => panic!("首次续签必须成功，实际: {other:?}"),
         }
 
-        // 同一会话第二次：即使冷却已过也必须被会话级限流拦住。
+        // 同一会话冷却窗口内：拒绝。
         let reply = handle_renewal(
             &ctx,
             &mut session,
             "session-agent",
             &csr,
-            now + RENEW_COOLDOWN_MS + 1,
+            now + RENEW_COOLDOWN_MS - 1,
         )
         .await;
         assert_eq!(problem_code(&reply), codes::RATE_LIMITED);
+        assert_eq!(
+            session.last_success_ms, now,
+            "冷区内失败不得改写上次成功时间"
+        );
+
+        // 冷却窗口到期后，同一会话必须能再次续签（旧实现会永久拒绝）。
+        let second_success_at = now + RENEW_COOLDOWN_MS;
+        match handle_renewal(&ctx, &mut session, "session-agent", &csr, second_success_at).await {
+            Frame::CertRenewed { .. } => {}
+            other => panic!("冷却结束后同一会话必须可以续签，实际: {other:?}"),
+        }
+        assert_eq!(session.last_success_ms, second_success_at);
 
         // 换一个新会话（模拟断开重连）：仍在冷却窗口内 → 仍被限流。
         let mut reconnect = RenewState::default();
-        let reply = handle_renewal(&ctx, &mut reconnect, "session-agent", &csr, now + 1_000).await;
+        let reply = handle_renewal(
+            &ctx,
+            &mut reconnect,
+            "session-agent",
+            &csr,
+            second_success_at + 1_000,
+        )
+        .await;
         assert_eq!(problem_code(&reply), codes::RATE_LIMITED);
-        assert!(!reconnect.succeeded);
+        assert_eq!(reconnect.last_success_ms, 0);
 
         // 其他 agent 不受影响。
         let mut other = RenewState::default();
         assert!(matches!(
-            handle_renewal(&ctx, &mut other, "other-agent", &csr, now + 1).await,
+            handle_renewal(&ctx, &mut other, "other-agent", &csr, second_success_at + 1).await,
             Frame::CertRenewed { .. }
         ));
 
-        // 冷却窗口到期后允许再次续签。
-        let mut later = RenewState::default();
-        assert!(matches!(
-            handle_renewal(
-                &ctx,
-                &mut later,
-                "session-agent",
-                &csr,
-                now + RENEW_COOLDOWN_MS + 1
-            )
-            .await,
-            Frame::CertRenewed { .. }
-        ));
+        // 跨两个证书周期（90 天一轮）：每次冷却都早已过去，均应成功。
+        let day_ms = 24 * 60 * 60 * 1_000i64;
+        for cycle in 1..=2 {
+            let at = second_success_at + cycle * 90 * day_ms;
+            match handle_renewal(&ctx, &mut session, "session-agent", &csr, at).await {
+                Frame::CertRenewed { .. } => {}
+                other => panic!("第 {cycle} 个周期续签必须成功，实际: {other:?}"),
+            }
+            assert_eq!(
+                session.last_success_ms, at,
+                "第 {cycle} 个周期必须记录新的成功时间"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6640,7 +6821,7 @@ mod tests {
         let mut session = RenewState::default();
         let reply = handle_renewal(&ctx, &mut session, "agent-garbage", "not a csr", now).await;
         assert_eq!(problem_code(&reply), codes::BAD_FRAME);
-        assert!(!session.succeeded);
+        assert_eq!(session.last_success_ms, 0, "失败不得记录成功时间");
 
         // 客户端有效期非法（0 天）：即使 CSR 合法也必须被拒。
         let bad_days = RenewalContext::new(tls::cert_dir(&dir), 0);
@@ -6760,6 +6941,9 @@ mod tests {
     }
 
     /// 冷却表：窗口内拒绝、窗口后放行、不同 agent 互不影响，且表大小有硬上界。
+    ///
+    /// 满表且条目仍在冷却窗口内时必须拒绝新身份：若淘汰旧条目，攻击者可用
+    /// ≥ 上限数量的新 agent_id 轮流挤掉任意身份的冷却记录，从而绕过 10 分钟限流。
     #[test]
     fn renew_guard_cooldown_and_memory_bound() {
         let mut guard = RenewGuard::new();
@@ -6776,14 +6960,40 @@ mod tests {
         );
         assert!(guard.begin_attempt("b", now), "不同 agent 的冷却互不影响");
 
-        // 塞入远多于上限的身份，表长度必须始终不超过上限（内存有硬上界）。
-        for i in 0..(RENEW_GUARD_MAX_ENTRIES + 32) {
-            assert!(guard.begin_attempt(&format!("agent-{i}"), now + i as i64));
+        // 独立表精确填满容量，所有条目都处于冷却窗口内。
+        let mut full = RenewGuard::new();
+        for i in 0..RENEW_GUARD_MAX_ENTRIES {
+            assert!(
+                full.begin_attempt(&format!("agent-{i}"), now),
+                "第 {i} 个身份在未满表时必须放行"
+            );
         }
+        assert_eq!(full.last_attempt_ms.len(), RENEW_GUARD_MAX_ENTRIES);
+
+        // 满表且全在冷却窗口：新身份拒绝，表大小不变，旧身份的冷却不被挤掉。
         assert!(
-            guard.last_attempt_ms.len() <= RENEW_GUARD_MAX_ENTRIES,
+            !full.begin_attempt("agent-overflow", now + 1),
+            "满表时不得淘汰冷却中的记录来放行新身份"
+        );
+        assert_eq!(
+            full.last_attempt_ms.len(),
+            RENEW_GUARD_MAX_ENTRIES,
+            "拒绝新身份后表大小必须保持上限"
+        );
+        assert!(
+            !full.begin_attempt("agent-0", now + 1),
+            "已有身份仍必须受冷却窗口约束"
+        );
+
+        // 冷却结束后：只清理过期项即可放行新身份，表仍不超过上限。
+        assert!(
+            full.begin_attempt("agent-overflow", now + RENEW_COOLDOWN_MS),
+            "冷却结束并清理过期项后必须放行新身份"
+        );
+        assert!(
+            full.last_attempt_ms.len() <= RENEW_GUARD_MAX_ENTRIES,
             "冷却表不得无限增长，实际 {}",
-            guard.last_attempt_ms.len()
+            full.last_attempt_ms.len()
         );
     }
 
@@ -7885,14 +8095,8 @@ mod tests {
                 samples: vec![Sample::new("cpu.usage", sample_ts, 42.0)],
             })
             .unwrap();
-        state
-            .storage
-            .downsample_1m_range(from, from + 3_600_000)
-            .unwrap();
-        state
-            .storage
-            .downsample_1h_range(from, from + 3_600_000)
-            .unwrap();
+        // R1b：走真实增量聚合，同一事务内标记 raw 并生成 clean 的 1m/1h。
+        downsample::run_downsample(state.storage.as_storage(), now_ms(), None).unwrap();
         state.storage.prune_samples_before(i64::MAX).unwrap();
         state.storage.prune_samples_1m_before(i64::MAX).unwrap();
         assert_eq!(state.storage.raw_stats().unwrap().rows, 0);
@@ -7942,10 +8146,8 @@ mod tests {
         let sample_ts = now - 2 * 3_600_000;
         let minute = sample_ts.div_euclid(60_000) * 60_000;
         seed_cpu_point(&state, sample_ts, 33.0);
-        state
-            .storage
-            .downsample_1m_range(minute, minute + 60_000)
-            .unwrap();
+        // R1b：run_downsample 标记 raw 后才可被 retention 删除。
+        downsample::run_downsample(state.storage.as_storage(), now, None).unwrap();
         state.storage.prune_samples_before(i64::MAX).unwrap();
         assert_eq!(state.storage.raw_stats().unwrap().rows, 0);
         assert_eq!(state.storage.samples_1m_stats().unwrap().rows, 1);
@@ -7974,10 +8176,7 @@ mod tests {
         let sample_ts = from + 1_000;
         let minute = sample_ts.div_euclid(60_000) * 60_000;
         seed_cpu_point(&state, sample_ts, 42.0);
-        state
-            .storage
-            .downsample_1m_range(minute, minute + 60_000)
-            .unwrap();
+        downsample::run_downsample(state.storage.as_storage(), now, None).unwrap();
         state.storage.prune_samples_before(i64::MAX).unwrap();
         assert_eq!(state.storage.raw_stats().unwrap().rows, 0);
         assert_eq!(state.storage.samples_1m_stats().unwrap().rows, 1);
@@ -8013,14 +8212,7 @@ mod tests {
         let from = to - 3_600_000;
         let sample_ts = from + 1_000;
         seed_cpu_point(&state, sample_ts, 7.0);
-        state
-            .storage
-            .downsample_1m_range(from, from + 3_600_000)
-            .unwrap();
-        state
-            .storage
-            .downsample_1h_range(from, from + 3_600_000)
-            .unwrap();
+        downsample::run_downsample(state.storage.as_storage(), now, None).unwrap();
         state.storage.prune_samples_before(i64::MAX).unwrap();
         state.storage.prune_samples_1m_before(i64::MAX).unwrap();
         assert_eq!(state.storage.raw_stats().unwrap().rows, 0);
@@ -11196,7 +11388,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(json["raw"]["deleted"], 0);
-        assert_eq!(json["raw"]["skipped_no_watermark"], true);
+        assert_eq!(json["raw"]["skipped_no_watermark"], false);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11257,6 +11449,37 @@ mod tests {
                 action: ArchiveAction::Run { .. }
             }
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["rustboard-hub", "archive", "ledger", "status"])
+                .unwrap()
+                .cmd,
+            Cmd::Archive {
+                action: ArchiveAction::Ledger {
+                    action: ArchiveLedgerAction::Status { .. }
+                }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "rustboard-hub",
+                "archive",
+                "ledger",
+                "rebuild",
+                "--config",
+                "hub.toml",
+            ])
+            .unwrap()
+            .cmd,
+            Cmd::Archive {
+                action: ArchiveAction::Ledger {
+                    action: ArchiveLedgerAction::Rebuild { .. }
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["rustboard-hub", "archive", "ledger"]).is_err(),
+            "ledger 必须指定 status / rebuild"
+        );
         // maintenance 只接受 downsample / retention，archive 走独立子命令。
         assert!(
             Cli::try_parse_from(["rustboard-hub", "maintenance", "run", "--task", "archive"])
@@ -11308,13 +11531,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// M4-C1b：`maintenance run --task retention` 必须使用归档门禁：
-    /// 归档已启用但水位缺失时 raw 不删；水位覆盖 cutoff 后才删。
+    /// M4-C1b / R1b：`maintenance run --task retention` 的归档门禁。
+    ///
+    /// 原始水位（`last_archived_ts`）不再单独证明 raw 可删；必须有 uploaded
+    /// 的 v8 claim 对象（`archive_object_id` join）才能删除。
     #[test]
-    fn m4c1b_maintenance_retention_uses_archive_watermark() {
+    fn m4c1b_maintenance_retention_requires_uploaded_claim() {
         use rustboard_common::config::ArchiveWebdavConfig;
         use rustboard_common::model::SampleBatch;
-        use rustboard_core::downsample::STATE_DOWNSAMPLE_1M_WATERMARK;
+        use rustboard_core::archive::{ArchiveObject, ArchiveStatus, LEDGER_VERSION_V8};
 
         let dir = temp_dir("archive-gate-retention");
         std::fs::create_dir_all(&dir).unwrap();
@@ -11328,7 +11553,7 @@ mod tests {
         cfg.archive.enabled = true;
         cfg.archive.after_days = 7;
         cfg.archive.webdav = Some(ArchiveWebdavConfig {
-            // 不需要真实连通：retention 只读水位，不构建后端。
+            // 不需要真实连通：retention 只读 ledger，不构建后端。
             url: "http://127.0.0.1:9/rustboard".to_string(),
             username: "user".to_string(),
             password: "password".to_string(),
@@ -11353,16 +11578,32 @@ mod tests {
             storage.insert_batch(&batch).unwrap(),
             rustboard_core::storage::IngestOutcome::Inserted { inserted: 3 }
         ));
-        storage
-            .set_maintenance_state(STATE_DOWNSAMPLE_1M_WATERMARK, &now.to_string(), now)
-            .unwrap();
+        // R1b：raw 必须先被增量聚合认领，retention 才会考虑删除。
+        downsample::run_downsample(&*storage, now, None).unwrap();
         drop(storage);
 
+        // 归档启用但没有任何 uploaded claim：raw 不删。
         let report: serde_json::Value = serde_json::from_str(
             &maintenance_run_json(Some(cfg_path.clone()), MaintenanceTask::Retention).unwrap(),
         )
         .unwrap();
         assert_eq!(report["raw"]["deleted"], 0);
+        assert_eq!(report["raw"]["blocked_by_archive"], true);
+
+        // 仅写旧归档水位仍然不能删；必须 uploaded join。
+        let storage = StorageHandle::sqlite(&db_path, DEFAULT_READ_POOL_SIZE).unwrap();
+        storage
+            .set_archive_state("last_archived_ts", &now.to_string(), now)
+            .unwrap();
+        drop(storage);
+        let report: serde_json::Value = serde_json::from_str(
+            &maintenance_run_json(Some(cfg_path.clone()), MaintenanceTask::Retention).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            report["raw"]["deleted"], 0,
+            "last_archived_ts 不能单独证明 raw 可删"
+        );
         assert_eq!(report["raw"]["blocked_by_archive"], true);
         assert_eq!(
             StorageHandle::sqlite(&db_path, DEFAULT_READ_POOL_SIZE)
@@ -11371,14 +11612,34 @@ mod tests {
                 .unwrap()
                 .rows,
             3,
-            "无归档水位时 raw 必须保留"
+            "无 uploaded claim 时 raw 必须保留"
         );
 
+        // 构造 v8 claim 并置 uploaded：此时 retention 才可删除。
         let storage = StorageHandle::sqlite(&db_path, DEFAULT_READ_POOL_SIZE).unwrap();
+        let rows = storage.list_unclaimed_archive_rows(0, now + 1, 10).unwrap();
+        assert_eq!(rows.len(), 3);
+        let from_ts = rows.iter().map(|row| row.ts).min().unwrap();
+        let to_ts = rows.iter().map(|row| row.ts).max().unwrap();
+        let object = ArchiveObject {
+            backend: "webdav".to_string(),
+            object_key: "rustboard-test/claim-v8.csv.gz".to_string(),
+            manifest_key: "rustboard-test/claim-v8.csv.gz.manifest.json".to_string(),
+            from_ts,
+            to_ts,
+            rows: rows.len() as u64,
+            ledger_version: LEDGER_VERSION_V8,
+            status: ArchiveStatus::Pending,
+            sha256: "0".repeat(64),
+            created_at: now,
+            ..ArchiveObject::default()
+        };
+        let id = storage.claim_archive_rows(&object, &rows).unwrap();
         storage
-            .set_archive_state("last_archived_ts", &now.to_string(), now)
+            .update_archive_object_status(id, ArchiveStatus::Uploaded, "", Some(now), None)
             .unwrap();
         drop(storage);
+
         let report: serde_json::Value = serde_json::from_str(
             &maintenance_run_json(Some(cfg_path), MaintenanceTask::Retention).unwrap(),
         )
@@ -11473,6 +11734,8 @@ mod tests {
             created_at: 1_700_000_000_000,
             uploaded_at: Some(1_700_000_000_000),
             deleted_at: None,
+            ledger_version: 0,
+            attempts: 0,
         }
     }
 
@@ -11588,6 +11851,8 @@ mod tests {
         assert_eq!(objects[0]["rows"], 42);
         assert_eq!(objects[0]["bytes"], 128);
         assert_eq!(objects[0]["sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(objects[0]["attempts"], 0);
+        assert_eq!(objects[0]["rows_missing"], false);
         assert!(
             objects[0].get("backend").is_none(),
             "列表不返回 backend 字段"
@@ -11637,6 +11902,32 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "query={query}");
             assert_eq!(json_body(&body)["error"], "bad_request", "query={query}");
         }
+    }
+
+    /// R1a-2：对象视图暴露 attempts 与 rows_missing，固定错误码不被掩码。
+    #[test]
+    fn archive_object_view_exposes_rows_missing_and_attempts() {
+        let mut object = archive_object_record(
+            "rustboard/2026/10/24/part-00001-v8.csv.gz",
+            ArchiveStatus::Failed,
+            "rows_missing",
+        );
+        object.attempts = 3;
+        let view = ArchiveObjectView::from(object);
+        assert_eq!(view.attempts, 3);
+        assert!(view.rows_missing);
+        assert_eq!(view.error, "rows_missing");
+        assert!(!view.downloadable);
+
+        let mut other = archive_object_record(
+            "rustboard/2026/10/24/part-00002-v8.csv.gz",
+            ArchiveStatus::Failed,
+            "backend_unavailable",
+        );
+        other.attempts = 1;
+        let view = ArchiveObjectView::from(other);
+        assert!(!view.rows_missing);
+        assert_eq!(view.error, "backend_unavailable");
     }
 
     /// M4-C2b：下载 200 的响应头与字节；走真实 router + mock WebDAV。
@@ -12454,7 +12745,9 @@ mod tests {
             Some(String::new())
         );
 
-        // 损坏水位：降采样与保留期都失败，错误必须带任务前缀被记录下来。
+        // 损坏 1m 水位：降采样失败并记录前缀。R1b 的保留期只依赖
+        // aggregated_1m / aggregated_1h / 归档 ledger，不再读旧水位，因此
+        // 保留期本轮应成功，不得把 1m 水位错误重复算到 retention 前缀下。
         storage
             .set_maintenance_state(
                 downsample::STATE_DOWNSAMPLE_1M_WATERMARK,
@@ -12472,8 +12765,8 @@ mod tests {
             "缺少降采样错误: {recorded}"
         );
         assert!(
-            recorded.contains("retention:"),
-            "缺少保留期错误: {recorded}"
+            !recorded.contains("retention:"),
+            "R1b retention 不再依赖旧水位，本轮不应失败: {recorded}"
         );
 
         // 修好水位后下一轮恢复并清空错误。

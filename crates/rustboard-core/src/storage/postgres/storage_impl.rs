@@ -9,7 +9,7 @@
 //! 共 97 个；dyn 化的注册只在这里发生，域实现保持不变。
 
 use anyhow::Result;
-use rustboard_common::model::{AgentRecord, SampleBatch, SeriesQuery, SeriesRow};
+use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 
 use super::PostgresStorage;
 use crate::alerts::{AlertEvent, AlertRule, AlertSilence, AlertState};
@@ -17,9 +17,9 @@ use crate::archive::{ArchiveObject, ArchiveStatus};
 use crate::channels::NotificationChannel;
 use crate::storage::sqlite::{AlertSeriesSnapshot, ArchiveRawRow};
 use crate::storage::{
-    AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, DownsampleRangeResult,
-    IngestOutcome, MaintenanceStateEntry, NewAuditEntry, PruneResult, SampleTier, Storage,
-    TierStats,
+    AgentControlRecord, AgentSeriesRow, ApiTokenRecord, AuditEntry, DownsampleDeltaResult,
+    DownsampleHourResult, DownsampleRangeResult, IngestOutcome, MaintenanceStateEntry,
+    NewAuditEntry, PruneResult, SampleTier, Storage, TierStats,
 };
 
 impl Storage for PostgresStorage {
@@ -276,9 +276,10 @@ impl Storage for PostgresStorage {
         metric: &str,
         since: i64,
         agent: Option<&str>,
+        filter_labels: &Labels,
         limit: usize,
     ) -> Result<AlertSeriesSnapshot> {
-        PostgresStorage::latest_alert_series(self, metric, since, agent, limit)
+        PostgresStorage::latest_alert_series(self, metric, since, agent, filter_labels, limit)
     }
 
     fn apply_alert_transitions(&self, events: &[AlertEvent], states: &[AlertState]) -> Result<()> {
@@ -398,6 +399,38 @@ impl Storage for PostgresStorage {
         PostgresStorage::downsample_1h_range(self, from_ts, to_ts)
     }
 
+    fn downsample_1m_delta(
+        &self,
+        closed_end: i64,
+        max_rows: usize,
+    ) -> Result<DownsampleDeltaResult> {
+        PostgresStorage::downsample_1m_delta(self, closed_end, max_rows)
+    }
+
+    fn downsample_1h_hour(&self, closed_hour: i64) -> Result<Option<DownsampleHourResult>> {
+        PostgresStorage::downsample_1h_hour(self, closed_hour)
+    }
+
+    fn count_unaggregated_raw_rows(&self) -> Result<i64> {
+        PostgresStorage::count_unaggregated_raw_rows(self)
+    }
+
+    fn count_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        PostgresStorage::count_raw_rows_outside(self, min_ts, max_ts)
+    }
+
+    fn count_unaggregated_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<i64> {
+        PostgresStorage::count_unaggregated_raw_rows_outside(self, min_ts, max_ts)
+    }
+
+    fn count_unaggregated_raw_rows_before(&self, before_ts: i64) -> Result<i64> {
+        PostgresStorage::count_unaggregated_raw_rows_before(self, before_ts)
+    }
+
+    fn isolate_raw_rows_outside(&self, min_ts: i64, max_ts: i64) -> Result<usize> {
+        PostgresStorage::isolate_raw_rows_outside(self, min_ts, max_ts)
+    }
+
     fn raw_stats(&self) -> Result<TierStats> {
         PostgresStorage::raw_stats(self)
     }
@@ -433,6 +466,10 @@ impl Storage for PostgresStorage {
 
     fn prune_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
         PostgresStorage::prune_samples_before(self, cutoff)
+    }
+
+    fn prune_archived_samples_before(&self, cutoff: i64) -> Result<PruneResult> {
+        PostgresStorage::prune_archived_samples_before(self, cutoff)
     }
 
     fn prune_samples_1m_before(&self, cutoff: i64) -> Result<PruneResult> {
@@ -477,6 +514,14 @@ impl Storage for PostgresStorage {
         PostgresStorage::list_archive_objects(self, limit, before_id)
     }
 
+    fn list_retryable_archive_objects(
+        &self,
+        limit: usize,
+        after_id: Option<i64>,
+    ) -> Result<Vec<ArchiveObject>> {
+        PostgresStorage::list_retryable_archive_objects(self, limit, after_id)
+    }
+
     fn update_archive_object_status(
         &self,
         id: i64,
@@ -519,6 +564,39 @@ impl Storage for PostgresStorage {
         limit: usize,
     ) -> Result<Vec<ArchiveRawRow>> {
         PostgresStorage::scan_archive_rows(self, from_ts, to_ts, after_rowid, limit)
+    }
+
+    fn list_unclaimed_archive_rows(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        limit: usize,
+    ) -> Result<Vec<ArchiveRawRow>> {
+        PostgresStorage::list_unclaimed_archive_rows(self, from_ts, to_ts, limit)
+    }
+
+    fn claim_archive_rows(&self, object: &ArchiveObject, rows: &[ArchiveRawRow]) -> Result<i64> {
+        PostgresStorage::claim_archive_rows(self, object, rows)
+    }
+
+    fn archive_rows_for_object(&self, object_id: i64) -> Result<Vec<ArchiveRawRow>> {
+        PostgresStorage::archive_rows_for_object(self, object_id)
+    }
+
+    fn record_archive_object_failure(&self, id: i64, error: &str) -> Result<()> {
+        PostgresStorage::record_archive_object_failure(self, id, error)
+    }
+
+    fn update_archive_object_metadata(&self, id: i64, bytes: u64, sha256: &str) -> Result<()> {
+        PostgresStorage::update_archive_object_metadata(self, id, bytes, sha256)
+    }
+
+    fn count_invalid_archive_raw_rows(&self) -> Result<i64> {
+        PostgresStorage::count_invalid_archive_raw_rows(self)
+    }
+
+    fn record_archive_attempt(&self, id: i64) -> Result<i64> {
+        PostgresStorage::record_archive_attempt(self, id)
     }
 
     fn count_archive_objects(&self) -> Result<i64> {
