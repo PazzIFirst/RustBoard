@@ -19,7 +19,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use rustboard_common::config::HubConfig;
+use rustboard_common::config::{ArchiveBackend, ArchiveWebdavConfig, HubConfig};
 use rustboard_common::model::{AgentRecord, Sample, SampleBatch};
 use rustboard_common::tls;
 use rustboard_core::alerts::{AlertState, AlertStateKind};
@@ -752,6 +752,46 @@ fn service_commands_bad_config_do_not_echo_token_or_password() {
         assert!(text.contains("TOML 解析失败"), "{name}: {text}");
         assert!(text.contains("hub.toml"), "{name}: {text}");
         assert!(!text.contains(secret), "{name}: 错误泄露配置原文: {text}");
+    }
+}
+
+/// P1 复审：TOML 合法但 `archive.webdav.url` 是坏 scheme 时，run/tls status
+/// 的校验错误不能回显 URL 里的 userinfo 密码。
+#[test]
+fn service_commands_invalid_webdav_url_do_not_echo_password() {
+    let root = TestRoot::new("bad-webdav-url");
+    let config_path = root.path().join("hub.toml");
+    let secret = "webdav-super-secret-4b2c";
+    let mut cfg = HubConfig::default();
+    cfg.archive.enabled = true;
+    cfg.archive.backend = ArchiveBackend::Webdav;
+    cfg.archive.webdav = Some(ArchiveWebdavConfig {
+        url: format!("ftp://user:{secret}@host/dav"),
+        username: "user".to_string(),
+        password: "dav-password".to_string(),
+    });
+    cfg.save(&config_path).expect("写测试 hub.toml");
+    let config = config_path.to_str().unwrap();
+
+    for (name, args) in [
+        ("run", vec!["run", "--config", config]),
+        ("tls status", vec!["tls", "status", "--config", config]),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rustboard-hub"))
+            .args(&args)
+            .env_remove("RUSTBOARD_DATABASE_PASSWORD")
+            .output()
+            .unwrap_or_else(|err| panic!("执行 {name} 坏 URL 用例失败: {err}"));
+        assert!(!output.status.success(), "{name}: 坏 URL 必须失败");
+        let text = combined(&output);
+        assert!(
+            text.contains("archive.webdav.url"),
+            "{name}: 错误应点名字段: {text}"
+        );
+        assert!(
+            !text.contains(secret) && !text.contains("user:"),
+            "{name}: 错误泄露 WebDAV userinfo: {text}"
+        );
     }
 }
 

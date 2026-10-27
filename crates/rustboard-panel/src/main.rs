@@ -1886,7 +1886,7 @@ pub(crate) fn validate_panel_tls_names(
     let origin = public_origin.trim();
     if !origin.is_empty() {
         let host = origin_host(origin)
-            .ok_or_else(|| anyhow!("public_origin 无法解析出主机名: {origin:?}"))?;
+            .ok_or_else(|| anyhow!("public_origin 无法解析出主机名（期望 https://host[:port]）"))?;
         let name = ServerName::try_from(host)
             .map_err(|_| anyhow!("public_origin 主机名非法: {host:?}"))?;
         rustls::client::verify_server_name(&parsed, &name).map_err(|_| {
@@ -2302,7 +2302,8 @@ fn run(config: Option<PathBuf>, listen: Option<String>, hub: Option<String>) -> 
                  建议显式设置 https://<host>"
             );
         } else if !origin.starts_with("https://") {
-            bail!("直连 TLS 时 public_origin 必须是 https://（当前 {origin:?}）");
+            // 不回显 origin：它可能带 userinfo（如 https://user:pass@host）。
+            bail!("直连 TLS 时 public_origin 必须使用 https://");
         }
         // 直连 HTTPS 时 Auto 依赖可信反代 + X-Forwarded-Proto，永远不会给浏览器
         // 加 Secure；这里强制 always，避免会话 Cookie 在 HTTPS 下可被明文回放。

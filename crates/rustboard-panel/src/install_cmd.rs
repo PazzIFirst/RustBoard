@@ -331,6 +331,20 @@ fn resolve_tls_downgrade(
     ))
 }
 
+/// 直连 TLS 的 `public_origin` 必须是显式 `https://`。
+///
+/// 错误只报字段与期望值，不回显 origin：配置可能写成
+/// `https://user:password@host`，密码不能进 stderr。
+fn ensure_https_public_origin(public_origin: &str) -> Result<()> {
+    if !public_origin.starts_with("https://") {
+        bail!(
+            "直连 TLS 时 public_origin 必须是 https://<host>；\
+             反代部署才使用 http:// 或 auto"
+        );
+    }
+    Ok(())
+}
+
 /// 解析面板直连 TLS 参数（含 `--force` 复用旧配置）。
 ///
 /// 任何不完整 / 不配套 / 权限不合规 / SAN 不覆盖的情况都在写盘前返回错误。
@@ -402,12 +416,7 @@ fn resolve_panel_tls(
         // 避免 Origin 校验退回 Host 比较导致部署歧义。
         None => crate::derived_https_origin(&material)?,
     };
-    if !public_origin.starts_with("https://") {
-        bail!(
-            "直连 TLS 时 public_origin 必须是 https://<host>（当前 {public_origin:?}）；\
-             反代部署才使用 http:// 或 auto"
-        );
-    }
+    ensure_https_public_origin(&public_origin)?;
     crate::validate_panel_tls_names(&material, listen, &public_origin)
         .context("面板 TLS 证书 SAN 校验失败")?;
 
@@ -4568,5 +4577,24 @@ mod tests {
         assert!(!fixture.paths.data_dir.exists());
         assert!(!fixture.tls_dir.exists());
         assert!(!fixture.paths.state.exists());
+    }
+
+    /// P1 复审：直连 TLS 的 public_origin 错误不得回显 userinfo 密码。
+    #[test]
+    fn tls_public_origin_error_does_not_echo_userinfo_password() {
+        let secret = "panel-installer-super-secret";
+        let err = ensure_https_public_origin(&format!("http://user:{secret}@panel.example.com"))
+            .expect_err("非 https 的 public_origin 必须拒绝");
+        let message = format!("{err:#}");
+        assert!(message.contains("public_origin"), "{message}");
+        assert!(message.contains("https://"), "{message}");
+        assert!(
+            !message.contains(secret),
+            "installer 错误泄露密码: {message}"
+        );
+        assert!(
+            !message.contains("user:"),
+            "installer 错误泄露 userinfo: {message}"
+        );
     }
 }

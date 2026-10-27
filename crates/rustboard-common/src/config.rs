@@ -371,9 +371,8 @@ fn validate_absolute_config_path(field: &str, value: &str) -> Result<()> {
         )));
     }
     if !Path::new(value).is_absolute() {
-        return Err(Error::InvalidConfig(format!(
-            "{field} 必须是绝对路径，实际 {value:?}"
-        )));
+        // 不回显 value：配置值可能来自含凭据的模板/环境展开，路径也不应进日志。
+        return Err(Error::InvalidConfig(format!("{field} 必须是绝对路径")));
     }
     Ok(())
 }
@@ -1660,9 +1659,8 @@ fn validate_archive_http_url(field: &str, value: &str) -> Result<()> {
         .strip_prefix("https://")
         .or_else(|| value.strip_prefix("http://"))
         .ok_or_else(|| {
-            Error::InvalidConfig(format!(
-                "{field} 必须以 http:// 或 https:// 开头，实际 {value:?}"
-            ))
+            // 只报字段名与期望 scheme：value 可能是带 userinfo 密码的 URL。
+            Error::InvalidConfig(format!("{field} 必须以 http:// 或 https:// 开头"))
         })?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() {
@@ -2867,9 +2865,8 @@ fn validate_public_origin(origin: &str) -> Result<()> {
         .strip_prefix("https://")
         .or_else(|| origin.strip_prefix("http://"))
         .ok_or_else(|| {
-            Error::InvalidConfig(format!(
-                "public_origin 必须以 http:// 或 https:// 开头，实际 {origin:?}"
-            ))
+            // 不回显 origin：非法 scheme 可能是带 userinfo 密码的 URL。
+            Error::InvalidConfig("public_origin 必须以 http:// 或 https:// 开头".into())
         })?;
     if rest.is_empty() {
         return Err(Error::InvalidConfig(
@@ -2880,9 +2877,10 @@ fn validate_public_origin(origin: &str) -> Result<()> {
         .chars()
         .any(|c| c.is_whitespace() || c == '/' || c == '?' || c == '#' || c == '@')
     {
-        return Err(Error::InvalidConfig(format!(
-            "public_origin 只能是 scheme://host[:port]，不能带路径 / 查询串或空白，实际 {origin:?}"
-        )));
+        return Err(Error::InvalidConfig(
+            "public_origin 只能是 scheme://host[:port]，不能带路径 / 查询串、userinfo 或空白"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -5501,5 +5499,78 @@ name = ""
         assert!(err.contains("database_kind()"), "错误应指向正确入口: {err}");
         assert!(!err.contains("secr3t"), "错误不得回显密码: {err}");
         assert!(!err.contains("db.example.com"), "错误不得回显 URL: {err}");
+    }
+
+    /// P1 复审：坏 scheme 的 WebDAV URL 不能把 userinfo 密码带进错误链。
+    #[test]
+    fn archive_url_scheme_error_does_not_echo_userinfo_password() {
+        let secret = "webdav-super-secret";
+        let mut hub = HubConfig::default();
+        hub.archive.enabled = true;
+        hub.archive.backend = ArchiveBackend::Webdav;
+        hub.archive.webdav = Some(ArchiveWebdavConfig {
+            url: format!("ftp://user:{secret}@host/dav"),
+            username: "user".to_string(),
+            password: "dav-password".to_string(),
+        });
+
+        let err = hub.archive.validate().expect_err("非法 scheme 必须拒绝");
+        let message = format!("{err}");
+        assert!(message.contains("archive.webdav.url"), "{message}");
+        assert!(message.contains("http://") && message.contains("https://"));
+        assert!(
+            !message.contains(secret),
+            "archive URL 错误泄露密码: {message}"
+        );
+        assert!(
+            !message.contains("user:"),
+            "archive URL 错误泄露 userinfo: {message}"
+        );
+
+        // `hub.validate()` → run/tls status 的完整错误链也不能含密码。
+        let err = hub.validate().expect_err("HubConfig 校验必须拒绝");
+        let chain = format!("{:#}", anyhow::anyhow!(err).context("hub 配置校验失败"));
+        assert!(
+            chain.contains("archive.webdav.url"),
+            "完整错误链应点名字段: {chain}"
+        );
+        assert!(!chain.contains(secret), "完整错误链泄露密码: {chain}");
+    }
+
+    /// P1 复审：public_origin 的坏 scheme 同样不能回显含密码的 URL。
+    #[test]
+    fn public_origin_scheme_error_does_not_echo_userinfo_password() {
+        let secret = "origin-super-secret";
+        let panel = PanelConfig {
+            public_origin: format!("ftp://user:{secret}@panel.example.com"),
+            ..PanelConfig::default()
+        };
+        let err = panel.validate().expect_err("非法 scheme 必须拒绝");
+        let message = format!("{err}");
+        assert!(message.contains("public_origin"), "{message}");
+        assert!(
+            !message.contains(secret),
+            "public_origin 错误泄露密码: {message}"
+        );
+        assert!(
+            !message.contains("user:"),
+            "public_origin 错误泄露 userinfo: {message}"
+        );
+    }
+
+    /// P1 复审：绝对路径错误不再回显配置值（路径也可能来自含凭据的模板）。
+    #[test]
+    fn absolute_path_error_does_not_echo_value() {
+        let secret = "path-canary-super-secret";
+        let panel = PanelConfig {
+            tls_cert: format!("relative/{secret}.pem"),
+            tls_key: "/etc/rustboard/panel.key".to_string(),
+            ..PanelConfig::default()
+        };
+        let err = panel.validate().expect_err("相对路径必须拒绝");
+        let message = format!("{err}");
+        assert!(message.contains("tls_cert"), "{message}");
+        assert!(message.contains("绝对路径"), "{message}");
+        assert!(!message.contains(secret), "路径错误泄露配置值: {message}");
     }
 }
