@@ -19,9 +19,9 @@
 | M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | v0.4.1 已知问题修复 | 🟢 完成 | KI-29 rowid 竞态、KI-31 64 MiB 配置/下载一致性、KI-28 拒绝日志采样、KI-20 安装命令引用；SFTP 真实环境 29/29，M4 基线渗透无高危；v041 26/26；v0.4.1 发布 |
 | v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
-| M5 安装与交付 | 🟢 Phase E rc.4 代码/门禁完成；3h/24h 待跑 | Phase A 安装器；Phase B 离线/Docker；Phase C RC `v1.0.0-rc.2`；Phase D PG 迁移/备份/恢复；#51–#102 第二轮：schema v9（fresh install only）、告警 CAS/关系表、备份 TLS/证书锁、控制面/安装器、SFTP vendor、测试门禁、文档；workspace+真实 PG 全绿，security 9/9、cert 103/103、panel 159/159、hardening 36/36、control 103/103、v041 26/26+2 SKIP；**3h 预检/24h 长稳、100/500/1000、Docker PG、arm64、v1.0.0 未完成** |
+| M5 安装与交付 | 🟢 Phase E v1.0.0 候选代码/门禁完成；3h/24h 待跑 | Phase A 安装器；Phase B 离线/Docker；Phase C RC `v1.0.0-rc.2`；Phase D PG 迁移/备份/恢复；#51–#102 第二轮：schema v9（fresh install only）、告警 CAS/关系表、备份 TLS/证书锁、控制面/安装器、SFTP vendor、测试门禁、文档；workspace+真实 PG 全绿，security 9/9、cert 103/103、panel 159/159、hardening 36/36、control 103/103、v041 26/26+2 SKIP；**3h 预检/24h 长稳、100/500/1000、Docker PG、arm64、v1.0.0 未完成** |
 
-## 2026-10-28 第二轮开放 issue 修复（rc.4 候选）
+## 2026-10-28 第二轮开放 issue 修复（v1.0.0 候选）
 
 对应方案：[2026-10-28-open-issues-round2.md](plans/2026-10-28-open-issues-round2.md)。
 
