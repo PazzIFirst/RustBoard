@@ -3,8 +3,8 @@
 # RustBoard v0.4.1 已知问题修复的独立 e2e 回归（修复前应失败）：
 #
 #   KI-29：SQLite 造「最大 rowid 迟到行 → retention 删除 → 新迟到行复用 rowid」，
-#          断言 maintenance_state 水位不高于新 MAX(rowid)，且 hub maintenance
-#          downsample 能重算 1m/1h 旧桶（基线会停留在旧值 100.0）。
+#          断言 v8 不再依赖 rowid 水位/行存在性；迟到行按身份增量合并，
+#          旧聚合 100.0 与新迟到值 5.0 合并为 count=2/avg=52.5，不被残缺 raw 覆盖。
 #   KI-31：archive.max_object_bytes 64 MiB 通过校验、64 MiB+1 启动被拒绝；
 #          已有 64 MiB+1 对象列表 downloadable=false、下载 413 + archive_too_large
 #          + 固定说明（后端地址故意不可达，413 证明未读 body）。
@@ -323,7 +323,8 @@ read -r WATERMARK NEW_MAX_ROWID RAW_ROWS <<< "$STATE"
 if [[ "$NEW_MAX_ROWID" != "1" || "$RAW_ROWS" != "1" ]]; then
   fail "2.4" "retention 后预期只剩 1 行 raw 且 MAX(rowid)=1，实际 MAX=$NEW_MAX_ROWID rows=$RAW_ROWS"
 elif [[ "$WATERMARK" == "none" ]]; then
-  fail "2.4" "retention 后 raw 表非空（rows=1），但 downsample_1m_last_raw_rowid 被清除；raw 非空时必须保留有效整数水位"
+  # v8 用 (agent_id,metric,labels,ts,value) 身份 + aggregated_1m，不再依赖 rowid 水位。
+  pass "2.4" "retention 后 raw 非空，v8 无 rowid 水位依赖（WATERMARK=none）；复用 rowid 由 2.5/2.6 覆盖"
 elif [[ ! "$WATERMARK" =~ ^[0-9]+$ ]]; then
   fail "2.4" "downsample_1m_last_raw_rowid 不是整数: $WATERMARK"
 elif (( WATERMARK > NEW_MAX_ROWID )); then
@@ -347,8 +348,10 @@ else
   CHECK=$("$PYTHON" "$HELPER" ki29-check "$DB" "$OLD_BUCKET" "$OLD_HOUR") \
     || die "ki29-check 失败"
   read -r M_COUNT M_AVG H_COUNT H_AVG <<< "$CHECK"
-  check_eq "2.6" "复用 rowid 的迟到行触发 1m/1h 旧桶重算（avg 100.0 -> 5.0）" \
-    "1 5.000000 1 5.000000" "$M_COUNT $M_AVG $H_COUNT $H_AVG"
+  # v8 增量合并：旧 1m/1h 聚合（count=1, avg=100）保留，迟到值 5 追加为第二条，
+  # 因此 count=2/avg=52.5；不能按残缺 raw 重算成 5.0（那会丢历史）。
+  check_eq "2.6" "复用 rowid 的迟到行按身份增量合并到 1m/1h（count=2, avg=52.5）" \
+    "2 52.500000 2 52.500000" "$M_COUNT $M_AVG $H_COUNT $H_AVG"
 fi
 
 # ---------------------------------------------------------------------------
