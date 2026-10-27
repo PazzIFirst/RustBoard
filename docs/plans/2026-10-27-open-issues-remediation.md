@@ -760,6 +760,19 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 - 尚未关闭或评论任何 issue；修复合并/发布证据齐后只补评论，由用户确认关闭。
 - 24h 长稳不能复用 2026-10-26 的 2h 中止证据。
 
+### 12.13 3h 预检、arm64 与 rc.3 tag（2026-10-27 10:55）
+
+- 3h 预检 PASS（最终 amd64，200 agent，2h warmup）：
+  planned/sent/acked 432000/432000/432000，samples 1,296,000，0 错/重试/重连；
+  RssAnon baseline 50,736 → end 50,740 KiB（**+0.008%**，门禁 10%），
+  FD 223→223、线程 81→81、health 10801/10801。
+- arm64 最终包 E2E：**40 PASS / 0 FAIL / 2 SKIP**（x86 主机 install.sh 跨架构按设计拒绝）。
+- CI 修复 v041 旧 KI-29 断言后全绿（`745d2f9`）。
+- **v1.0.0-rc.3 tag 已打并推送**（不再移动 rc.2）。
+- 24h 已用最终 amd64（hub sha256 `97a934…`）启动，证据目录
+  `target/load/20261027T025506Z-200a`；预计 2026-10-28 10:55 +08 完成。
+- 100/500/1000 agent 短档与最终 v1.0.0 发布仍未完成。
+
 ### 12.12 rc.3 合入 main（2026-10-27 08:30）
 
 - `feat/v100-integration`（`80a43ad`）已合入 main，merge commit `6a333ce`，并 push。
