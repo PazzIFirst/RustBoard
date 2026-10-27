@@ -760,6 +760,15 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 - 尚未关闭或评论任何 issue；修复合并/发布证据齐后只补评论，由用户确认关闭。
 - 24h 长稳不能复用 2026-10-26 的 2h 中止证据。
 
+### 12.10 rc.3 最终全量门禁（2026-10-27 08:10）
+
+- 最终代码 `80a43ad` 上 `cargo test --workspace` + 真实 PostgreSQL 16 **rc=0**；
+  fmt/clippy/audit 通过。
+- 最终包/源码重跑：install 121/121、offline 122/122、Docker PG 104/0+1 SKIP、
+  security 9/9、panel 159/159。
+- 3h 预检仍在最终 amd64 二进制上运行；arm64 包 qemu 构建未完成。
+- **仍未 tag rc.3、未跑 24h/1000 agent**。
+
 ### 12.9 rc.3 最终包与最终 E2E（2026-10-27 08:00）
 
 - 1m retention 改为按 `(series,hour)` 整组删除，修复 5000 行批次导致的永久残留；
