@@ -1054,6 +1054,16 @@ kill "$RESET_WATCHDOG" 2>/dev/null || true
 wait "$RESET_WATCHDOG" 2>/dev/null || true
 drop_pid "$RESET_PID"
 
+# 最后一次核对：reset 可能恰好在上一轮 sleep 之后、kill -0 失败之前完成，
+# 轮询循环会因进程退出先 break 而来不及看到新哈希。进程成功后必须再读一次
+# 文件；否则稳定成功的 reset 会被误判为“未落盘”（v034 CI 曾偶发此竞态）。
+if [[ -z "$RESET_WRITE_MS" && "$RESET_RC" == "0" ]]; then
+  CURRENT_HASH=$(sha256sum "$PANEL_CFG" 2>/dev/null | awk '{print $1}')
+  if [[ -n "$CURRENT_HASH" && "$CURRENT_HASH" != "$PANEL_CFG_HASH_BEFORE" ]]; then
+    RESET_WRITE_MS=$(date +%s%3N)
+  fi
+fi
+
 if [[ -n "$RESET_WRITE_MS" && "$RESET_RC" == "0" ]]; then
   pass "3.2" "reset-password 成功且配置已落盘（耗时 $(( RESET_WRITE_MS - RESET_START ))ms）"
 else
