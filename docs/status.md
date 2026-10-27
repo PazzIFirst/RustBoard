@@ -19,7 +19,7 @@
 | M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | v0.4.1 已知问题修复 | 🟢 完成 | KI-29 rowid 竞态、KI-31 64 MiB 配置/下载一致性、KI-28 拒绝日志采样、KI-20 安装命令引用；SFTP 真实环境 29/29，M4 基线渗透无高危；v041 26/26；v0.4.1 发布 |
 | v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
-| M5 安装与交付 | 🟢 Phase E S1/S3/S4 完成；S2 短档完成、24h 长稳运行中；S5/S6 进行中 | Phase A 安装器/e2e 121/121；Phase B 两架构静态 musl、离线包 122/122、arm64 qemu 40/40、Docker 126/126；Phase C RC `v1.0.0-rc.2`；Phase D PostgreSQL 显式 opt-in、迁移/备份/恢复；S1 KI-22（agent 145、control 102/102、workspace 1386/0/5）；S2 hub 级 200/100/500/1000 各 10min（最低 1000/600：120000 批/360000 点，0 丢点/重复/错误）；S3 真实 TLS PG 27/27；S4 Docker PG overlay 104/104（1 arm64 SKIP）；**24h 长稳、S5 发布演练、v1.0.0 未完成** |
+| M5 安装与交付 | 🟢 Phase E rc.3 代码/amd64 门禁完成；3h/24h 与 arm64 进行中 | Phase A 安装器 121/121；Phase B 离线包 122/122、Docker 126/126；Phase C RC `v1.0.0-rc.2`；Phase D PG 迁移/备份/恢复；#27–#50 rc.3：schema v8/归档/1m/1h/Buffer/Agent/Panel/WebDAV；workspace+真实 PG 全绿，security 9/9、panel 159/159、Docker PG 104/0+1 SKIP；**3h 预检/24h 长稳、100/500/1000 最终复跑、arm64 包、rc.3 tag、v1.0.0 未完成** |
 
 ## 构建产物清理（2026-10-25 Phase C 收尾）
 
