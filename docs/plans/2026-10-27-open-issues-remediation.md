@@ -760,6 +760,14 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 - 尚未关闭或评论任何 issue；修复合并/发布证据齐后只补评论，由用户确认关闭。
 - 24h 长稳不能复用 2026-10-26 的 2h 中止证据。
 
+### 12.12 rc.3 合入 main（2026-10-27 08:30）
+
+- `feat/v100-integration`（`80a43ad`）已合入 main，merge commit `6a333ce`，并 push。
+- 合入内容与已验证的 rc.3 代码一致（仅保留 main 的执行记录解决 plan 冲突）。
+- amd64 最终包、全 workspace+PG、install/offline/security/panel/Docker PG 均已通过。
+- 3h 预检仍在最终二进制上运行；arm64 包仍在 qemu 构建。
+- **未 tag rc.3、未跑 24h/1000 agent**。
+
 ### 12.11 rc.3 全量门禁最终确认（2026-10-27 08:15）
 
 - 最终代码 `80a43ad` 上 `cargo test --workspace` + 真实 PG **rc=0**（最终全量）。
