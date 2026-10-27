@@ -7,20 +7,23 @@
 #   docker compose -f docker/compose.example.yml \
 #     -f docker/compose.acme.example.yml up -d
 #
-# 这个叠加文件只做四件事：
+# 这个叠加文件做五件事：
 # 1. 给 hub 发布 TCP 80（HTTP-01）与 443（TLS-ALPN-01）；默认文件仍不发布；
 # 2. 把 hub 的 RUSTBOARD_TLS_MODE 切到 acme-domain；
 # 3. 传入 ACME 邮箱 / 域名 / 挑战 / 可选 profile、directory、私有 CA；
-# 4. 保持 panel 与 hub 共享 network namespace，8444 仍不 EXPOSE、不发布。
+# 4. 保持 panel 与 hub 共享 network namespace，8444 仍不 EXPOSE、不发布；
+# 5. 把 agent 的信任模式切到 system-roots（公共 ACME 证书）。私有 ACME 需再
+#    叠加 compose.agent-custom-ca.example.yml 改用 custom-ca。
 #
 # 重要：
 # - 首次启动前必须把邮箱、域名换成真实值；ACME 会访问公网并消耗 Let's Encrypt
 #   的限额，调试请先设置 RUSTBOARD_ACME_DIRECTORY 指向 staging。
 # - 证书、ACME 账户与状态都保存在 hub_data volume 的
 #   /data/var/lib/rustboard/hub/certs 下；重建容器不会重新申请。
-# - 已有 volume 的 TLS 模式不会被本文件改写。切换 self-signed ↔ ACME 需要
-#   `rustboard-hub install --force ...`（见 docs/install/docker.md）或删除 volume
-#   （会丢数据）；不要只改环境变量。
+# - 已有 volume 的 TLS 模式不会被本文件改写。切换 self-signed ↔ ACME 必须按
+#   docs/install/docker.md §6.6 的受控流程执行 `install --yes --force`：已初始化
+#   volume 属主是 10001，直接 root install 会被 prefix/data_dir 校验拒绝。不要只改
+#   环境变量，也不要删除 volume（会丢数据）。
 # - 80/443 需要云安全组和本机防火墙放行；安装器只做只读诊断，不会自动改防火墙。
 # - 公网 IP 证书请把 RUSTBOARD_TLS_MODE 改成 acme-ip、域名填公网 IPv4；entrypoint
 #   会拒绝非 IPv4 的 acme-ip 标识。
@@ -56,3 +59,12 @@ services:
       # RUSTBOARD_ACME_CA_FILE: "/run/rustboard/acme-ca.pem"
     # volumes:
     #   - ./secrets/acme-ca.pem:/run/rustboard/acme-ca.pem:ro
+
+  agent:
+    environment:
+      # 公共 ACME 证书由系统根校验；不要同时设置 fingerprint/server CA。
+      # 用 RUSTBOARD_AGENT_TLS_MODE 显式覆盖时，私有 ACME 应配合
+      # compose.agent-custom-ca.example.yml（custom-ca）使用。
+      RUSTBOARD_TLS_MODE: "${RUSTBOARD_AGENT_TLS_MODE:-system-roots}"
+      RUSTBOARD_FINGERPRINT: ""
+      RUSTBOARD_SERVER_CA: ""

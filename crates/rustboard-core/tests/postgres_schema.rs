@@ -44,8 +44,8 @@ use rustboard_core::storage::sqlite::SqliteStorage;
 /// 实库测试 DSN 的环境变量；未设置时全部 JSON schema 用例 skip。
 const PG_ENV: &str = "RUSTBOARD_TEST_PG";
 
-/// 21 张业务表（与 SQLite v8 一致），本清单独立于实现硬编码。
-const TABLES: [&str; 21] = [
+/// 22 张业务表（与 SQLite v9 一致），本清单独立于实现硬编码。
+const TABLES: [&str; 22] = [
     "agents",
     "samples",
     "enroll_tokens",
@@ -65,16 +65,17 @@ const TABLES: [&str; 21] = [
     "alert_events",
     "alert_silences",
     "notification_channels",
+    "alert_rule_channels",
     "archive_objects",
     "archive_state",
 ];
 
-/// SQLite v8 的显式命名索引（22 个）。
+/// SQLite v9 的显式命名索引（23 个）。
 ///
-/// v8 在 v7 的 19 个命名索引上新增 3 个 partial index；其余是
-/// `sqlite_autoindex_*` 主键/唯一约束的隐式索引。本文件以真实 SQLite 建库
-/// 结果为准（见 `table_and_index_sets_match_sqlite_baseline`）。
-const INDEXES: [&str; 22] = [
+/// v8 在 v7 的 19 个命名索引上新增 3 个 partial index，v9 再新增渠道反查索引；
+/// 其余是 `sqlite_autoindex_*` 主键/唯一约束的隐式索引。本文件以真实 SQLite
+/// 建库结果为准（见 `table_and_index_sets_match_sqlite_baseline`）。
+const INDEXES: [&str; 23] = [
     "idx_samples_lookup",
     "idx_samples_ts",
     "idx_ingest_batches_ts",
@@ -92,6 +93,7 @@ const INDEXES: [&str; 22] = [
     "idx_alert_events_agent_ts",
     "idx_alert_events_pending",
     "idx_alert_silences_until",
+    "idx_alert_rule_channels_channel",
     "idx_archive_objects_range",
     "idx_archive_objects_status",
     "idx_samples_unarchived",
@@ -296,14 +298,14 @@ fn column_meta(client: &mut Client, table: &str, column: &str) -> (String, Strin
     (row.get(0), row.get(1), row.get(2))
 }
 
-fn assert_all_21_tables(client: &mut Client) {
+fn assert_all_business_tables(client: &mut Client) {
     let mut expected: Vec<String> = TABLES.iter().map(|table| table.to_string()).collect();
     expected.push("schema_migrations".to_string());
     expected.sort_unstable();
     assert_eq!(
         table_names(client),
         expected,
-        "public schema 必须恰好是 21 张业务表 + schema_migrations"
+        "public schema 必须恰好是 22 张业务表 + schema_migrations"
     );
 }
 
@@ -322,7 +324,7 @@ fn assert_all_named_indexes(client: &mut Client) {
     );
 }
 
-/// 用真实 SQLite v8 建库，返回 `(业务表集合, 显式命名索引集合)`。
+/// 用真实 SQLite v9 建库，返回 `(业务表集合, 显式命名索引集合)`。
 ///
 /// 不依赖 schema 常量，直接读 `sqlite_master`，作为 PG 表/索引的对照基线。
 fn sqlite_baseline_objects() -> (BTreeSet<String>, BTreeSet<String>) {
@@ -336,8 +338,8 @@ fn sqlite_baseline_objects() -> (BTreeSet<String>, BTreeSet<String>) {
     fs::create_dir_all(&dir).expect("创建 SQLite 测试目录失败");
     let db_path = dir.join("baseline.db");
 
-    // SqliteStorage::open 会建全量 v8 schema；drop 后再用独立连接读目录表。
-    let storage = SqliteStorage::open(&db_path).expect("创建 SQLite v8 基线失败");
+    // SqliteStorage::open 会建全量 v9 schema；drop 后再用独立连接读目录表。
+    let storage = SqliteStorage::open(&db_path).expect("创建 SQLite v9 基线失败");
     drop(storage);
 
     let connection = rusqlite::Connection::open(&db_path).expect("打开 SQLite 基线失败");
@@ -366,12 +368,12 @@ fn sqlite_object_names(connection: &rusqlite::Connection, kind: &str) -> BTreeSe
 }
 
 // ---------------------------------------------------------------------------
-// 1. 空库：21 张表 + 22 个索引 + 版本 8
+// 1. 空库：22 张表 + 23 个索引 + 版本 9
 // ---------------------------------------------------------------------------
 
 #[test]
-fn empty_database_apply_creates_21_tables_and_22_indexes() {
-    const NAME: &str = "empty_database_apply_creates_21_tables_and_22_indexes";
+fn empty_database_apply_creates_22_tables_and_23_indexes() {
+    const NAME: &str = "empty_database_apply_creates_22_tables_and_23_indexes";
     let Some(db) = TestDatabase::create("empty") else {
         skip(NAME);
         return;
@@ -381,11 +383,11 @@ fn empty_database_apply_creates_21_tables_and_22_indexes() {
     apply_schema(&mut client).expect("空库 apply_schema 必须成功");
 
     assert_eq!(schema_version(&mut client), POSTGRES_SCHEMA_VERSION);
-    assert_eq!(migration_row_count(&mut client), 1, "版本表应只有一行 v8");
-    assert_all_21_tables(&mut client);
+    assert_eq!(migration_row_count(&mut client), 1, "版本表应只有一行 v9");
+    assert_all_business_tables(&mut client);
     assert_all_named_indexes(&mut client);
 
-    // SQLite 基线的 22 个命名索引必须全部存在；PG 另有主键/唯一约束的隐式索引。
+    // SQLite 基线的 23 个命名索引必须全部存在；PG 另有主键/唯一约束的隐式索引。
     let all_indexes = index_names(&mut client);
     eprintln!(
         "[d2] 空库结果：tables={} named_indexes={} all_indexes={}",
@@ -421,14 +423,14 @@ fn table_and_index_sets_match_sqlite_baseline() {
     let pg_indexes = named_index_names(&mut client);
     let (sqlite_tables, sqlite_indexes) = sqlite_baseline_objects();
 
-    assert_eq!(sqlite_tables.len(), 21, "SQLite v8 应有 21 张业务表");
+    assert_eq!(sqlite_tables.len(), 22, "SQLite v9 应有 22 张业务表");
     assert_eq!(
         pg_tables, sqlite_tables,
-        "PG 21 张业务表必须与真实 SQLite v8 的 sqlite_master 完全一致"
+        "PG 22 张业务表必须与真实 SQLite v9 的 sqlite_master 完全一致"
     );
     assert_eq!(
         pg_indexes, sqlite_indexes,
-        "PG 命名索引集合必须与真实 SQLite v8 的 sqlite_master 完全一致"
+        "PG 命名索引集合必须与真实 SQLite v9 的 sqlite_master 完全一致"
     );
     eprintln!(
         "[d2] 对照：SQLite tables={} indexes={}，PG tables={} named_indexes={}",
@@ -463,6 +465,7 @@ fn type_mapping_booleans_constraints_and_upsert_targets() {
         ("samples_1m", "count", "bigint"),
         ("samples_1m", "avg_value", "double precision"),
         ("alert_rules", "threshold", "double precision"),
+        ("alert_rules", "revision", "bigint"),
         ("audit_log", "duration_ms", "bigint"),
         ("archive_objects", "rows", "bigint"),
         ("archive_objects", "bytes", "bigint"),
@@ -523,13 +526,14 @@ fn type_mapping_booleans_constraints_and_upsert_targets() {
         assert_eq!(nullable, "YES", "{table}.{column} 应可空（与 SQLite 对齐）");
     }
 
-    // v8 列的默认值/可空性必须与 SQLite 语义一致。
+    // v8/v9 列的默认值/可空性必须与 SQLite 语义一致。
     for (table, column) in [
         ("samples", "aggregated_1m"),
         ("samples_1m", "last_ts"),
         ("samples_1m", "aggregated_1h"),
         ("archive_objects", "ledger_version"),
         ("archive_objects", "attempts"),
+        ("alert_rules", "revision"),
     ] {
         let (_, nullable, default) = column_meta(&mut client, table, column);
         assert_eq!(nullable, "NO", "{table}.{column} 必须 NOT NULL");
@@ -541,6 +545,35 @@ fn type_mapping_booleans_constraints_and_upsert_targets() {
     }
     let (_, nullable, _) = column_meta(&mut client, "samples", "archive_object_id");
     assert_eq!(nullable, "YES", "samples.archive_object_id 必须可空");
+
+    // v9 alert_rule_channels：两列 TEXT NOT NULL，外键 CASCADE / RESTRICT。
+    for column in ["rule_id", "channel_id"] {
+        let (data_type, nullable, _) = column_meta(&mut client, "alert_rule_channels", column);
+        assert_eq!(
+            data_type, "text",
+            "alert_rule_channels.{column} 必须是 TEXT"
+        );
+        assert_eq!(nullable, "NO", "alert_rule_channels.{column} 必须 NOT NULL");
+    }
+    let fk_actions: Vec<String> = client
+        .query(
+            "SELECT confdeltype::text FROM pg_constraint
+             WHERE conrelid = 'alert_rule_channels'::regclass AND contype = 'f'",
+            &[],
+        )
+        .expect("读取 alert_rule_channels 外键失败")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    // confdeltype: 'c' = CASCADE, 'r' = RESTRICT。
+    assert!(
+        fk_actions.iter().any(|action| action == "c"),
+        "rule_id 外键必须是 ON DELETE CASCADE：{fk_actions:?}"
+    );
+    assert!(
+        fk_actions.iter().any(|action| action == "r"),
+        "channel_id 外键必须是 ON DELETE RESTRICT：{fk_actions:?}"
+    );
 
     // v8 partial index 的谓词必须随 DDL 落地（不能只建普通索引）。
     for (index, predicate) in [
@@ -752,19 +785,19 @@ fn repeated_apply_is_idempotent_and_preserves_data() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. 半迁移：表在、无版本行、已有数据
+// 5. 半迁移/旧库：版本 0 但已有业务表 → fail closed
 // ---------------------------------------------------------------------------
 
 #[test]
-fn half_migration_keeps_existing_rows_and_completes_schema() {
-    const NAME: &str = "half_migration_keeps_existing_rows_and_completes_schema";
+fn half_migration_with_business_tables_is_rejected() {
+    const NAME: &str = "half_migration_with_business_tables_is_rejected";
     let Some(db) = TestDatabase::create("half") else {
         skip(NAME);
         return;
     };
     let mut client = db.connect();
 
-    // 模拟 DDL 执行到一半（agents/samples 已建、无 schema_migrations）后中断。
+    // 模拟旧库/半迁移：agents/samples 已建、有数据、无 schema_migrations。
     client
         .batch_execute(
             "CREATE TABLE agents (
@@ -800,18 +833,38 @@ fn half_migration_keeps_existing_rows_and_completes_schema() {
         "半迁移前置状态应为两张表"
     );
 
-    apply_schema(&mut client).expect("半迁移库必须能用 IF NOT EXISTS 补齐");
+    let err = apply_schema(&mut client).expect_err("版本 0 但已有业务表时 v1.0.0 必须 fail closed");
+    let message = format!("{err:#}");
+    assert!(message.contains("只支持全新安装"), "{message}");
+    assert!(message.contains("schema v0"), "{message}");
+    assert!(
+        message.contains("旧数据兼容将在首个正式版本之后提供"),
+        "{message}"
+    );
 
-    assert_eq!(schema_version(&mut client), POSTGRES_SCHEMA_VERSION);
-    assert_all_21_tables(&mut client);
-    assert_all_named_indexes(&mut client);
+    // 拒绝路径整体回滚：不留下版本表，也不新增任何业务表。
+    let version_table_exists: bool = client
+        .query_one(
+            "SELECT EXISTS (
+                 SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = current_schema() AND table_name = 'schema_migrations'
+             )",
+            &[],
+        )
+        .expect("检查 schema_migrations 失败")
+        .get(0);
+    assert!(!version_table_exists, "拒绝路径不得留下 schema_migrations");
+    assert_eq!(
+        table_names(&mut client),
+        vec!["agents".to_string(), "samples".to_string()],
+        "拒绝路径不得创建其它业务表"
+    );
 
     let name: String = client
         .query_one("SELECT name FROM agents WHERE agent_id = 'half-agent'", &[])
         .expect("读取保留的 agent 失败")
         .get(0);
-    assert_eq!(name, "半迁移数据", "补齐 schema 不得丢已有行");
-
+    assert_eq!(name, "半迁移数据", "拒绝路径不得丢已有行");
     let value: f64 = client
         .query_one(
             "SELECT value FROM samples WHERE agent_id = 'half-agent' AND ts = 999",
@@ -819,24 +872,16 @@ fn half_migration_keeps_existing_rows_and_completes_schema() {
         )
         .expect("读取保留的 sample 失败")
         .get(0);
-    assert_eq!(value, 42.5, "补齐 schema 不得改已有样本");
-
-    // 补出来的表必须真的可用（不是仅存在于名字层面）。
-    client
-        .execute(
-            "INSERT INTO archive_state (key, value, updated_at) VALUES ('half', 'ok', 1)",
-            &[],
-        )
-        .expect("补齐后的 archive_state 必须可写");
+    assert_eq!(value, 42.5, "拒绝路径不得改已有样本");
 }
 
 // ---------------------------------------------------------------------------
-// 5b. v7 旧库：显式 ALTER 补 v8 列 + partial index，旧数据保留
+// 5b. v7 旧库：v1.0.0 只支持全新安装 → fail closed，不 ALTER、不回填
 // ---------------------------------------------------------------------------
 
 #[test]
-fn v7_database_is_altered_to_v8_without_losing_rows() {
-    const NAME: &str = "v7_database_is_altered_to_v8_without_losing_rows";
+fn v7_database_is_rejected_without_altering_or_backfilling() {
+    const NAME: &str = "v7_database_is_rejected_without_altering_or_backfilling";
     let Some(db) = TestDatabase::create("v7_alter") else {
         skip(NAME);
         return;
@@ -900,47 +945,66 @@ fn v7_database_is_altered_to_v8_without_losing_rows() {
         )
         .expect("构造 v7 PG 库失败");
 
-    apply_schema(&mut client).expect("v7→v8 迁移必须成功");
-
-    assert_eq!(schema_version(&mut client), POSTGRES_SCHEMA_VERSION);
-    for (table, column, expected_default) in [
-        ("samples", "aggregated_1m", Some("0")),
-        ("samples_1m", "last_ts", Some("0")),
-        ("samples_1m", "aggregated_1h", Some("0")),
-        ("archive_objects", "ledger_version", Some("0")),
-        ("archive_objects", "attempts", Some("0")),
-    ] {
-        let (data_type, nullable, default) = column_meta(&mut client, table, column);
-        assert_eq!(data_type, "bigint", "{table}.{column} 必须是 BIGINT");
-        assert_eq!(nullable, "NO", "{table}.{column} 必须 NOT NULL");
-        assert_eq!(
-            default.as_deref().map(str::trim),
-            expected_default,
-            "{table}.{column} 默认值不符"
-        );
-    }
-    let (_, nullable, _) = column_meta(&mut client, "samples", "archive_object_id");
-    assert_eq!(nullable, "YES");
-
-    // ALTER 不得丢数据；v7 旧桶 last_ts 按统一保守值回填。
-    let (raw_rows, last_ts): (i64, i64) = {
-        let row = client
-            .query_one(
-                "SELECT (SELECT COUNT(*) FROM samples WHERE agent_id = 'a7')::bigint,
-                        (SELECT last_ts FROM samples_1m WHERE agent_id = 'a7')",
-                &[],
-            )
-            .expect("读取迁移后 v7 数据失败");
-        (row.get(0), row.get(1))
-    };
-    assert_eq!(raw_rows, 1, "v7 raw 行不得丢失");
-    assert_eq!(last_ts, 119_999, "legacy 1m 桶必须回填 bucket_ts+59999");
-    assert_eq!(
-        migration_row_count(&mut client),
-        2,
-        "保留 v7 版本行并追加 v8 版本行"
+    let err =
+        apply_schema(&mut client).expect_err("v7 旧库在 v1.0.0 只支持全新安装的约束下必须被拒绝");
+    let message = format!("{err:#}");
+    assert!(message.contains("只支持全新安装"), "{message}");
+    assert!(message.contains("schema v7"), "{message}");
+    assert!(
+        message.contains("旧数据兼容将在首个正式版本之后提供"),
+        "{message}"
     );
-    assert_all_named_indexes(&mut client);
+
+    // 拒绝路径不得 ALTER 旧表、不得回填、不得写新版本行。
+    for (table, column) in [
+        ("samples", "archive_object_id"),
+        ("samples", "aggregated_1m"),
+        ("samples_1m", "last_ts"),
+        ("samples_1m", "aggregated_1h"),
+        ("archive_objects", "ledger_version"),
+        ("archive_objects", "attempts"),
+    ] {
+        let exists: bool = client
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1 FROM information_schema.columns
+                     WHERE table_schema = current_schema()
+                       AND table_name = $1 AND column_name = $2
+                 )",
+                &[&table, &column],
+            )
+            .unwrap_or_else(|e| panic!("检查列 {table}.{column} 失败：{e}"))
+            .get(0);
+        assert!(!exists, "拒绝路径不得新增列 {table}.{column}");
+    }
+    assert_eq!(schema_version(&mut client), 7, "版本行不得被改写");
+    assert_eq!(migration_row_count(&mut client), 1, "不得追加 v9 版本行");
+
+    // 旧数据原样保留。
+    let raw_rows: i64 = client
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM samples WHERE agent_id = 'a7'",
+            &[],
+        )
+        .expect("读取 v7 数据失败")
+        .get(0);
+    assert_eq!(raw_rows, 1, "v7 raw 行不得丢失");
+    let object_rows: i64 = client
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM archive_objects WHERE backend = 'webdav'",
+            &[],
+        )
+        .expect("读取 v7 归档对象失败")
+        .get(0);
+    assert_eq!(object_rows, 1, "v7 归档对象不得丢失");
+    let object_key: String = client
+        .query_one(
+            "SELECT object_key FROM archive_objects WHERE backend = 'webdav'",
+            &[],
+        )
+        .expect("读取 v7 归档 key 失败")
+        .get(0);
+    assert_eq!(object_key, "v7/old.csv.gz");
 }
 
 // ---------------------------------------------------------------------------
@@ -948,8 +1012,8 @@ fn v7_database_is_altered_to_v8_without_losing_rows() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn concurrent_apply_on_empty_database_ends_at_version_8() {
-    const NAME: &str = "concurrent_apply_on_empty_database_ends_at_version_8";
+fn concurrent_apply_on_empty_database_ends_at_version_9() {
+    const NAME: &str = "concurrent_apply_on_empty_database_ends_at_version_9";
     let Some(db) = TestDatabase::create("race") else {
         skip(NAME);
         return;
@@ -984,9 +1048,9 @@ fn concurrent_apply_on_empty_database_ends_at_version_8() {
     assert_eq!(
         migration_row_count(&mut client),
         1,
-        "并发迁移只允许一行 v8 版本记录"
+        "并发迁移只允许一行 v9 版本记录"
     );
-    assert_all_21_tables(&mut client);
+    assert_all_business_tables(&mut client);
     assert_all_named_indexes(&mut client);
 }
 
@@ -1043,11 +1107,11 @@ fn advisory_lock_blocks_second_migration_until_release() {
 
     let mut client = db.connect();
     assert_eq!(schema_version(&mut client), POSTGRES_SCHEMA_VERSION);
-    assert_all_21_tables(&mut client);
+    assert_all_business_tables(&mut client);
 }
 
 // ---------------------------------------------------------------------------
-// 7. 版本 9 必须拒绝
+// 7. 版本 10 必须拒绝
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1065,14 +1129,14 @@ fn future_schema_version_is_rejected_without_ddl() {
                  version BIGINT PRIMARY KEY,
                  applied_at BIGINT NOT NULL
              );
-             INSERT INTO schema_migrations (version, applied_at) VALUES (9, 123456);",
+             INSERT INTO schema_migrations (version, applied_at) VALUES (10, 123456);",
         )
-        .expect("构造 v9 库失败");
+        .expect("构造 v10 库失败");
 
-    let err = apply_schema(&mut client).expect_err("schema 版本 9 必须被拒绝");
+    let err = apply_schema(&mut client).expect_err("schema 版本 10 必须被拒绝");
     let message = format!("{err:#}");
     assert!(
-        message.contains('9') && message.contains('8'),
+        message.contains("10") && message.contains('9'),
         "拒绝信息应包含实际/支持版本：{message}"
     );
     assert!(
@@ -1086,65 +1150,54 @@ fn future_schema_version_is_rejected_without_ddl() {
         vec!["schema_migrations".to_string()],
         "版本过高时不得建业务表"
     );
-    assert_eq!(schema_version(&mut client), 9, "版本行不得被改写");
+    assert_eq!(schema_version(&mut client), 10, "版本行不得被改写");
 }
 
 // ---------------------------------------------------------------------------
-// 8. 失败回滚：DDL 中途出错不留半套
+// 8. 失败回滚：迁移中途出错不留半套
 // ---------------------------------------------------------------------------
 
 #[test]
-fn failed_ddl_rolls_back_entire_transaction() {
-    const NAME: &str = "failed_ddl_rolls_back_entire_transaction";
+fn failed_migration_rolls_back_entire_transaction() {
+    const NAME: &str = "failed_migration_rolls_back_entire_transaction";
     let Some(db) = TestDatabase::create("rollback") else {
         skip(NAME);
         return;
     };
     let mut client = db.connect();
 
-    // 预先放一张结构不兼容的 samples：DDL 建到 idx_samples_lookup 时会失败。
-    // 这是对 apply_schema 真实失败路径的注入，而不是另写一个假事务。
+    // 注入迁移失败：预先放一张缺少 version 列的 schema_migrations。DDL 的
+    // `CREATE TABLE IF NOT EXISTS` 会跳过它，随后读取 MAX(version) 失败，
+    // 整个事务（包括已建的表）必须回滚。这是对 apply_schema 真实失败路径的
+    // 注入，而不是另写一个假事务。
     client
-        .batch_execute(
-            "CREATE TABLE samples (poisoned INTEGER NOT NULL);
-             INSERT INTO samples (poisoned) VALUES (7);",
-        )
+        .batch_execute("CREATE TABLE schema_migrations (applied_at BIGINT NOT NULL);")
         .expect("构造失败注入表失败");
 
-    let err = apply_schema(&mut client).expect_err("不兼容的 samples 必须让迁移失败");
+    let err = apply_schema(&mut client).expect_err("损坏的 schema_migrations 必须让迁移失败");
     let message = format!("{err:#}");
     assert!(
-        message.contains("agent_id") || message.contains("idx_samples_lookup"),
-        "失败信息应指向不兼容的列/索引：{message}"
+        message.contains("version") || message.contains("schema 版本"),
+        "失败信息应指向版本表读取失败：{message}"
     );
 
-    // 事务回滚：本次创建的表与版本表都不能残留。
+    // 事务回滚：本次创建的业务表不能残留；注入表原样保留。
     let agents: Option<String> = client
         .query_one("SELECT to_regclass('public.agents')::text", &[])
         .expect("查询 agents 是否存在失败")
         .get(0);
     assert!(agents.is_none(), "失败事务不得残留 agents 表");
-    let migrations: Option<String> = client
-        .query_one("SELECT to_regclass('public.schema_migrations')::text", &[])
-        .expect("查询 schema_migrations 是否存在失败")
-        .get(0);
-    assert!(
-        migrations.is_none(),
-        "失败事务不得残留 schema_migrations 表"
+    assert_eq!(
+        table_names(&mut client),
+        vec!["schema_migrations".to_string()],
+        "失败事务只应保留注入表"
     );
-
-    // 预先存在的数据原样保留（回滚不能误删）。
-    let count: i64 = client
-        .query_one("SELECT COUNT(*)::bigint FROM samples", &[])
-        .expect("读取注入表失败")
-        .get(0);
-    assert_eq!(count, 1, "回滚不得影响迁移前已存在的数据");
 
     // 修复注入后再次 apply 必须成功（证明失败没有留下不可恢复状态）。
     client
-        .batch_execute("DROP TABLE samples")
+        .batch_execute("DROP TABLE schema_migrations")
         .expect("清理注入表失败");
     apply_schema(&mut client).expect("清理注入后 apply_schema 必须成功");
     assert_eq!(schema_version(&mut client), POSTGRES_SCHEMA_VERSION);
-    assert_all_21_tables(&mut client);
+    assert_all_business_tables(&mut client);
 }

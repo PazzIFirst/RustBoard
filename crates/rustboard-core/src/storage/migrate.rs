@@ -1,4 +1,4 @@
-//! SQLite v8 → PostgreSQL 离线迁移与校验（M5 Phase D5 核心）。
+//! SQLite v9 → PostgreSQL 离线迁移与校验（M5 Phase D5 核心）。
 //!
 //! 本模块只实现「读 SQLite、写 PostgreSQL、校验、回滚」的核心逻辑；CLI
 //! （`hub migrate --to ... --dry-run/--force/--yes`）、迁移前 `VACUUM INTO`
@@ -8,10 +8,13 @@
 //!
 //! [`validate_target_empty`] 的判定：
 //!
-//! - 21 张业务表**全部不存在或没有行**；
-//! - `schema_migrations` 不存在 / 没有版本行，或只有不高于
-//!   [`POSTGRES_SCHEMA_VERSION`] 的版本（允许「schema 已 apply 但业务表全空」）；
-//! - 版本高于本程序支持的版本时明确拒绝，避免旧二进制写坏新库。
+//! - 22 张业务表**全部不存在或没有行**；
+//! - `schema_migrations` 不存在 / 没有版本行且没有任何业务表（真正的空库），
+//!   或版本为 v9 且 22 张表/23 个命名索引完整（允许「schema 已 apply 但业务表
+//!   全空」）；
+//! - 版本高于本程序支持的版本时明确拒绝，避免旧二进制写坏新库；
+//! - `0 < version < 9`、版本 0 但已有业务表、自称 v9 但对象不完整时**一律拒绝**：
+//!   CLI 的 `--force` 会在本校验通过后才 `pg_dump`/`TRUNCATE`，旧库绝不能被清空。
 //!
 //! 非空目标返回可读错误，**不覆盖任何数据**。`--force` 的备份 + 清空由 CLI
 //! 先完成，再调用本模块；核心函数没有隐式 force 参数，避免误覆盖。
@@ -24,8 +27,8 @@
 //!
 //! # 单事务导入
 //!
-//! 1. 先调用 [`PostgresStorage::apply_schema`] 幂等补齐 schema v8；
-//! 2. 在一个 PostgreSQL 事务内取固定 key 的**事务级 advisory lock**，再对 21
+//! 1. 先调用 [`PostgresStorage::apply_schema`] 幂等补齐 schema v9；
+//! 2. 在一个 PostgreSQL 事务内取固定 key 的**事务级 advisory lock**，再对 22
 //!    张业务表取 `SHARE` 表锁，阻止其他实例在导入期间写入；
 //! 3. 再次校验目标为空（防止 `apply_schema` 与导入之间的竞态）；
 //! 4. 按 [`TABLE_SPECS`] 的固定顺序逐表导入，每张表先读源库行数/范围；
@@ -35,11 +38,12 @@
 //!    数量以及 `maintenance_state` 的 rowid 水位；
 //! 7. 全部通过才 `COMMIT`。任何一步失败都回滚整个事务，目标库不会留下部分行。
 //!
-//! 目标写入期间其他实例不能写这 21 张表；离线迁移完成后才恢复写入。
+//! 目标写入期间其他实例不能写这 22 张表；离线迁移完成后才恢复写入。
 //!
 //! # 行序与 ID
 //!
-//! 21 张表之间没有外键，按 PostgreSQL schema 的表顺序导入即可。SQLite 的
+//! 表之间只有 `alert_rule_channels` 的三条外键，按 PostgreSQL schema 的声明
+//! 顺序导入即可（被引用的 `alert_rules` / `notification_channels` 都排在它前面）。SQLite 的
 //! `samples` / `samples_1m` / `samples_1h` / `alert_states` 没有显式 `id`，
 //! 用 `rowid AS id` 导出并显式写入 PG 的 `id`；`audit_log` / `api_tokens` /
 //! `alert_events` / `alert_silences` / `archive_objects` 的
@@ -74,16 +78,19 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection as SqliteConnection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 
-use super::postgres::schema::{POSTGRES_SCHEMA_VERSION, SCHEMA_ADVISORY_LOCK_KEY};
+use super::postgres::schema::{
+    any_business_table_exists, bail_old_schema, ensure_schema_objects, POSTGRES_SCHEMA_VERSION,
+    SCHEMA_ADVISORY_LOCK_KEY,
+};
 use super::postgres::PostgresStorage;
 
 /// 本模块支持的 SQLite schema 版本；必须与 `sqlite.rs` 的 `SCHEMA_VERSION` 对齐。
-pub const SQLITE_SCHEMA_VERSION: i64 = 8;
+pub const SQLITE_SCHEMA_VERSION: i64 = 9;
 
 /// 单批最多导出的行数。
 ///
-/// 最宽的表有 17 列，500 行 × 17 = 8500 个绑定参数，低于 PostgreSQL 的
-/// 65535 上限；5000 行 samples 只有 10 批。
+/// 最宽的表有 18 列（`alert_rules`），500 行 × 18 = 9000 个绑定参数，低于
+/// PostgreSQL 的 65535 上限；5000 行 samples 只有 10 批。
 const BATCH_ROWS: usize = 500;
 
 /// `maintenance_state` 中记录降采样已认领 raw rowid 的键。
@@ -339,6 +346,7 @@ const ALERT_RULES_COLUMNS: &[Column] = &[
     text("updated_by"),
     int("created_at"),
     int("updated_at"),
+    int("revision"),
 ];
 
 const ALERT_STATES_COLUMNS: &[Column] = &[
@@ -388,6 +396,9 @@ const NOTIFICATION_CHANNELS_COLUMNS: &[Column] = &[
     int("updated_at"),
 ];
 
+/// v9 规则→渠道关系表；复合主键两列都是 TEXT。
+const ALERT_RULE_CHANNELS_COLUMNS: &[Column] = &[text("rule_id"), text("channel_id")];
+
 const ARCHIVE_OBJECTS_COLUMNS: &[Column] = &[
     int("id"),
     text("backend"),
@@ -409,11 +420,12 @@ const ARCHIVE_OBJECTS_COLUMNS: &[Column] = &[
 
 const ARCHIVE_STATE_COLUMNS: &[Column] = &[text("key"), text("value"), int("updated_at")];
 
-/// 21 张业务表的固定导入顺序；与 `postgres/schema.rs` 的 `TABLES` 完全一致。
+/// 22 张业务表的固定导入顺序；与 `postgres/schema.rs` 的 `TABLES` 完全一致。
 ///
-/// 表之间没有外键，顺序只影响可复现性与失败注入时已写表的覆盖范围；这里
-/// 保持 PG schema 的声明顺序，便于对照。
-const TABLE_SPECS: [TableSpec; 21] = [
+/// `alert_rule_channels` 依赖 `alert_rules` / `notification_channels` 的外键，
+/// 因此必须排在两者之后；其余表之间没有外键，顺序只影响可复现性与失败注入时
+/// 已写表的覆盖范围。这里保持 PG schema 的声明顺序，便于对照。
+const TABLE_SPECS: [TableSpec; 22] = [
     TableSpec {
         name: "agents",
         columns: AGENTS_COLUMNS,
@@ -529,6 +541,12 @@ const TABLE_SPECS: [TableSpec; 21] = [
         time_column: None,
     },
     TableSpec {
+        name: "alert_rule_channels",
+        columns: ALERT_RULE_CHANNELS_COLUMNS,
+        id_source: IdSource::None,
+        time_column: None,
+    },
+    TableSpec {
         name: "archive_objects",
         columns: ARCHIVE_OBJECTS_COLUMNS,
         id_source: IdSource::Column,
@@ -590,7 +608,7 @@ pub struct MigrateReport {
     pub sqlite_schema_version: i64,
     /// 目标 PostgreSQL schema 版本。
     pub postgres_schema_version: i64,
-    /// 21 张表的行数/范围/耗时，顺序与 [`TABLE_SPECS`] 一致。
+    /// 22 张表的行数/范围/耗时，顺序与 [`TABLE_SPECS`] 一致。
     pub tables: Vec<TableMigration>,
     /// raw 采样的 rowid 与 ts 范围。
     pub samples_range: MigrateRange,
@@ -608,7 +626,7 @@ pub struct MigrateReport {
     pub api_token_hashes: u64,
     /// `archive_objects` 行数。
     pub archive_objects: u64,
-    /// 21 张表的总行数。
+    /// 22 张表的总行数。
     pub total_rows: u64,
     /// 整个迁移耗时（毫秒，含源库打开、schema 校验与提交）。
     pub duration_ms: u64,
@@ -616,7 +634,7 @@ pub struct MigrateReport {
 
 /// 校验目标 PostgreSQL 是否为空。
 ///
-/// 允许 `apply_schema` 已经执行、`schema_migrations` 已有 v7、但 21 张业务表
+/// 允许 `apply_schema` 已经执行、`schema_migrations` 已有 v9、但 22 张业务表
 /// 全空的目标；任何一张业务表有行都返回明确错误。判定细节见模块文档。
 ///
 /// 只读：在短事务内查询目录与行数，不取 advisory lock；真正导入时会在同一
@@ -635,7 +653,7 @@ pub fn validate_target_empty(storage: &PostgresStorage) -> Result<()> {
         .context("校验目标 PostgreSQL 是否为空失败")
 }
 
-/// SQLite v8 → PostgreSQL 离线迁移。
+/// SQLite v9 → PostgreSQL 离线迁移。
 ///
 /// 调用方必须保证 hub 已停止（离线迁移）且目标库为空；本函数会在导入事务内
 /// 再次校验空库并加表锁，防止导入期间其他实例写入。非空目标直接报错，
@@ -764,7 +782,7 @@ fn source_schema_version(conn: &SqliteConnection) -> Result<i64> {
         .context("读取 SQLite 源库 PRAGMA user_version 失败")
 }
 
-/// 迁移前确认源库 21 张表都存在；缺表时给出明确列表，不进入导入阶段。
+/// 迁移前确认源库 22 张表都存在；缺表时给出明确列表，不进入导入阶段。
 fn ensure_source_tables(conn: &SqliteConnection) -> Result<()> {
     let mut missing = Vec::new();
     for spec in TABLE_SPECS {
@@ -880,7 +898,7 @@ fn import_all_inner(
     ))
 }
 
-/// 对 21 张业务表取 `SHARE` 锁：允许读，阻止 INSERT/UPDATE/DELETE。
+/// 对 22 张业务表取 `SHARE` 锁：允许读，阻止 INSERT/UPDATE/DELETE。
 ///
 /// 事务提交/回滚后自动释放；只持有一张连接，不额外占用池。
 fn lock_target_tables(tx: &mut Transaction<'_>) -> Result<()> {
@@ -895,21 +913,37 @@ fn lock_target_tables(tx: &mut Transaction<'_>) -> Result<()> {
 }
 
 fn validate_target_empty_tx(tx: &mut Transaction<'_>) -> Result<()> {
-    // 允许空库（没有 schema_migrations）和「已 apply schema 但业务表全空」；
-    // 只拒绝高于本程序支持的版本，避免旧二进制写坏新库。
+    // 先判定版本与对象完整性，**再**统计行数。`--force` 迁移会先 pg_dump 再
+    // TRUNCATE 全部业务表；若旧 schema（0<v<9）或声明 v9 但对象不全的目标被
+    // 归入 Empty/NonEmpty，旧库会在 apply_schema 拒绝之前就被清空。
+    let mut version: Option<i64> = None;
     if pg_table_exists(tx, "schema_migrations")? {
-        let version: Option<i64> = tx
+        version = tx
             .query_one("SELECT MAX(version) FROM schema_migrations", &[])
             .context("读取目标 PostgreSQL schema_migrations 版本失败")?
             .get(0);
-        if let Some(version) = version {
-            if version > POSTGRES_SCHEMA_VERSION {
-                bail!(
-                    "目标 PostgreSQL schema 版本 {version} 高于本程序支持的 \
-                     {POSTGRES_SCHEMA_VERSION}；拒绝迁移，请升级 rustboard-hub 后再试"
-                );
-            }
+    }
+    let version = version.unwrap_or(0);
+    if version > POSTGRES_SCHEMA_VERSION {
+        bail!(
+            "目标 PostgreSQL schema 版本 {version} 高于本程序支持的 \
+             {POSTGRES_SCHEMA_VERSION}；拒绝迁移，请升级 rustboard-hub 后再试"
+        );
+    }
+    if version > 0 {
+        if version != POSTGRES_SCHEMA_VERSION {
+            // v1.0.0 只支持全新安装：旧版本目标即使业务表全空也不得被清空。
+            return bail_old_schema(version);
         }
+        // 版本号自称 v9 仍不够：TRUNCATE 的是表，若 22 张表/23 个索引不完整，
+        // 必须在这里拒绝，不能等 apply_schema 在清空之后才发现。
+        ensure_schema_objects(tx).context(
+            "目标 PostgreSQL 声明 schema v9，但 22 张业务表/23 个命名索引不完整；\
+             拒绝迁移/清空",
+        )?;
+    } else if any_business_table_exists(tx)? {
+        // 版本 0 但已有业务表：半迁移/旧库；与 apply_schema 的 v9 门禁保持一致。
+        return bail_old_schema(0);
     }
 
     let mut non_empty = Vec::new();
@@ -1297,7 +1331,7 @@ fn reset_sequences(tx: &mut Transaction<'_>) -> Result<()> {
 
 /// 在提交前完成全部校验；返回 `api_tokens.token_hash` 去重数量。
 fn verify_migration(tx: &mut Transaction<'_>, source: &SqliteConnection) -> Result<i64> {
-    // 目标版本必须是 v7（apply_schema 刚跑过；这里防止调用方绕过）。
+    // 目标版本必须是 v9（apply_schema 刚跑过；这里防止调用方绕过）。
     let version: Option<i64> = tx
         .query_one("SELECT MAX(version) FROM schema_migrations", &[])
         .context("校验目标 PostgreSQL schema 版本失败")?
@@ -1329,8 +1363,9 @@ fn verify_migration(tx: &mut Transaction<'_>, source: &SqliteConnection) -> Resu
         }
     }
 
-    // v8 列必须真的搬过去：只校验行数/id/ts 会漏掉 claim 与聚合标记。
-    verify_v8_columns(tx, source)?;
+    // v8/v9 列必须真的搬过去：只校验行数/id/ts 会漏掉 claim、聚合标记与
+    // revision。
+    verify_extra_columns(tx, source)?;
 
     // api_tokens 只存哈希：去重数量必须等于行数（UNIQUE 约束之外的二次检查）。
     let source_hashes: i64 = source
@@ -1361,8 +1396,8 @@ fn verify_migration(tx: &mut Transaction<'_>, source: &SqliteConnection) -> Resu
     Ok(target_hashes)
 }
 
-/// 校验 v8 新增列在源/目标的一致性（计数/求和，不回显行内容）。
-fn verify_v8_columns(tx: &mut Transaction<'_>, source: &SqliteConnection) -> Result<()> {
+/// 校验 v8/v9 新增列在源/目标的一致性（计数/求和，不回显行内容）。
+fn verify_extra_columns(tx: &mut Transaction<'_>, source: &SqliteConnection) -> Result<()> {
     let checks = [
         (
             "samples.aggregated_1m=1 行数",
@@ -1394,14 +1429,19 @@ fn verify_v8_columns(tx: &mut Transaction<'_>, source: &SqliteConnection) -> Res
             "SELECT COALESCE(SUM(attempts), 0) FROM archive_objects",
             "SELECT COALESCE(SUM(attempts), 0)::BIGINT FROM archive_objects",
         ),
+        (
+            "alert_rules.revision 求和",
+            "SELECT COALESCE(SUM(revision), 0) FROM alert_rules",
+            "SELECT COALESCE(SUM(revision), 0)::BIGINT FROM alert_rules",
+        ),
     ];
     for (label, source_sql, target_sql) in checks {
         let source_value: i64 = source
             .query_row(source_sql, [], |row| row.get(0))
-            .with_context(|| format!("读取 SQLite v8 列校验值失败：{label}"))?;
+            .with_context(|| format!("读取 SQLite 扩展列校验值失败：{label}"))?;
         let target_value: i64 = tx
             .query_one(target_sql, &[])
-            .with_context(|| format!("读取目标 PostgreSQL v8 列校验值失败：{label}"))?
+            .with_context(|| format!("读取目标 PostgreSQL 扩展列校验值失败：{label}"))?
             .get(0);
         if source_value != target_value {
             bail!(
@@ -1559,6 +1599,7 @@ mod tests {
             "alert_events",
             "alert_silences",
             "notification_channels",
+            "alert_rule_channels",
             "archive_objects",
             "archive_state",
         ];
@@ -1567,8 +1608,8 @@ mod tests {
             assert_eq!(actual.name, expected);
             assert!(!actual.columns.is_empty());
         }
-        assert_eq!(SQLITE_SCHEMA_VERSION, 8);
-        assert_eq!(POSTGRES_SCHEMA_VERSION, 8);
+        assert_eq!(SQLITE_SCHEMA_VERSION, 9);
+        assert_eq!(POSTGRES_SCHEMA_VERSION, 9);
         assert_eq!(BATCH_ROWS, 500);
     }
 

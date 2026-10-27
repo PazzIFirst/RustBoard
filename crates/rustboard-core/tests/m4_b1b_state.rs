@@ -82,6 +82,7 @@ fn rule_with_duration(duration_secs: u32) -> AlertRule {
         updated_by: "admin".to_string(),
         created_at: 1_700_000_000_000,
         updated_at: 1_700_000_000_000,
+        revision: 0,
     }
 }
 

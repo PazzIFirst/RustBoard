@@ -70,6 +70,8 @@ BUILD_RELEASE="$ROOT/packaging/build-release.sh"
 PASSES=0
 FAILS=0
 SKIPS=0
+# 只有正常走到 finish() 才置 1；cleanup 用它在异常 exit 0 时兜底非零退出。
+E2E_COMPLETED=0
 
 TMP_ROOT=""
 LOG_DIR=""
@@ -184,6 +186,8 @@ die() {
 
 finish() {
   local code=0
+  # 显式完成标记：正常跑到汇总才算完成；EXIT 兜底据此区分“提前 exit 0”。
+  E2E_COMPLETED=1
   printf '\n===== v100-offline e2e: PASS=%s FAIL=%s SKIP=%s STRICT=%s =====\n' \
     "$PASSES" "$FAILS" "$SKIPS" "$STRICT"
   if (( FAILS > 0 )); then
@@ -365,7 +369,7 @@ ensure_tmp_root() {
   is_safe_tmp_root || die "临时目录未通过安全校验: $TMP_ROOT"
   LOG_DIR="$TMP_ROOT/logs"
   mkdir -p -- "$LOG_DIR" || die "无法创建日志目录: $LOG_DIR"
-  trap cleanup EXIT INT TERM
+  install_cleanup_traps
   return 0
 }
 
@@ -434,11 +438,34 @@ dump_failure_logs() {
   printf '（明文 argv 测试日志含 secret，按约定不打印）\n' >&2
 }
 
+install_cleanup_traps() {
+  trap cleanup EXIT
+  trap 'on_signal 130' INT
+  trap 'on_signal 143' TERM
+}
+
+on_signal() {
+  local code=$1
+  # 信号路径必须保留 130/143，不能先被 cleanup 当成普通 EXIT 0 吞掉。
+  trap - EXIT INT TERM
+  cleanup "$code"
+}
+
 cleanup() {
-  local code=$?
+  local code=${1:-$?}
   trap - EXIT INT TERM
 
   stop_servers
+
+  # 已有断言失败时，无论调用方传什么 code 都必须非零退出。
+  if (( FAILS > 0 )); then
+    code=1
+  fi
+  # 未到 finish() 的完成标记却以 0 退出，说明流程提前结束，按失败处理。
+  if (( E2E_COMPLETED == 0 )) && (( code == 0 )); then
+    printf 'FATAL: 未到达完成标记（finish），按失败退出\n' >&2
+    code=1
+  fi
 
   if (( code != 0 || FAILS > 0 )); then
     dump_failure_logs
@@ -554,10 +581,11 @@ resolve_package() {
 
 # 复用/构建产物必须与当前源码一致；缺源默认 FATAL，只有 ALLOW_UNVERIFIED=1
 # 显式放行“缺源”（打印 WARN、不计 PASS）；hash 不一致始终 FATAL。
+# 逐项处理：所有可得来源先校验，不能因为 web 缺源就跳过 install.sh/二进制的比对。
 validate_package_provenance() {
   local cargo_version pkg_hash src_hash bin src pkg_install
-  local src_bin_dir="" src_web="$ROOT/web/dist" pkg_web src_dir
-  local src_web_digest pkg_web_digest missing="" complete rc
+  local src_web="$ROOT/web/dist" pkg_web src_dir
+  local src_web_digest pkg_web_digest missing="" rc
 
   cargo_version=$(workspace_version)
   [[ -n "$cargo_version" ]] \
@@ -571,70 +599,69 @@ validate_package_provenance() {
     die "包内缺少普通文件 install.sh，无法校验来源一致性"
   fi
 
-  # 找一个三二进制齐全的源目录；任一缺失即视为缺源。
-  for src_dir in "$ROOT/dist/$DIST_ARCH/bin" "$ROOT/dist/$ARCH_SUFFIX/bin"; do
-    [[ -d "$src_dir" && ! -L "$src_dir" ]] || continue
-    complete=1
-    for bin in rustboard-hub rustboard-panel rustboard-agent; do
-      if [[ ! -f "$src_dir/$bin" || -L "$src_dir/$bin" ]]; then
-        complete=0
-      fi
-    done
-    if (( complete == 1 )); then
-      src_bin_dir="$src_dir"
-      break
+  # install.sh：源可得就必须比对；只有源文件本身不可得才记 missing。
+  if [[ -f "$ROOT/packaging/install.sh" && ! -L "$ROOT/packaging/install.sh" ]]; then
+    pkg_hash=$(sha256_file "$pkg_install")
+    src_hash=$(sha256_file "$ROOT/packaging/install.sh")
+    if [[ "$pkg_hash" != "$src_hash" ]]; then
+      die "包内 install.sh 与当前 packaging/install.sh 不一致（mode=$PACKAGE_MODE）；请重建或指定当前包"
     fi
-  done
-  if [[ -z "$src_bin_dir" ]]; then
-    missing+=" dist/$DIST_ARCH/bin/{rustboard-hub,rustboard-panel,rustboard-agent}"
-  fi
-  if [[ ! -f "$ROOT/packaging/install.sh" || -L "$ROOT/packaging/install.sh" ]]; then
+  else
     missing+=" packaging/install.sh"
   fi
-  if [[ ! -d "$src_web" || -L "$src_web" || ! -f "$src_web/index.html" ]]; then
+
+  # 三个二进制逐项找源并比对；某个二进制缺源不影响其余二进制先校验。
+  for bin in rustboard-hub rustboard-panel rustboard-agent; do
+    src=""
+    for src_dir in "$ROOT/dist/$DIST_ARCH/bin" "$ROOT/dist/$ARCH_SUFFIX/bin"; do
+      if [[ -d "$src_dir" && ! -L "$src_dir" \
+        && -f "$src_dir/$bin" && ! -L "$src_dir/$bin" ]]; then
+        src="$src_dir/$bin"
+        break
+      fi
+    done
+    if [[ -n "$src" ]]; then
+      pkg_hash=$(sha256_file "$PKG_ROOT/bin/$bin")
+      src_hash=$(sha256_file "$src")
+      if [[ "$pkg_hash" != "$src_hash" ]]; then
+        die "包内 bin/$bin 与当前 $src 不一致（mode=$PACKAGE_MODE）；请重建或指定当前包"
+      fi
+    else
+      missing+=" dist/$DIST_ARCH/bin/$bin"
+    fi
+  done
+
+  # web 树：源可得就必须比对；不可得才记 missing，且不因 ALLOW_UNVERIFIED
+  # 而跳过前面已经发现的 install.sh/二进制不一致。
+  if [[ -d "$src_web" && ! -L "$src_web" && -f "$src_web/index.html" ]]; then
+    pkg_web="$PKG_ROOT/share/rustboard/web"
+    if [[ ! -d "$pkg_web" || -L "$pkg_web" ]]; then
+      die "包内 share/rustboard/web 缺失或不是普通目录"
+    fi
+    src_web_digest=$(web_tree_digest "$src_web")
+    rc=$?
+    if (( rc != 0 )) || [[ -z "$src_web_digest" ]]; then
+      die "无法计算 web/dist 递归 hash（rc=$rc；符号链接/不可读视为不一致）"
+    fi
+    pkg_web_digest=$(web_tree_digest "$pkg_web")
+    rc=$?
+    if (( rc != 0 )) || [[ -z "$pkg_web_digest" ]]; then
+      die "无法计算包内 share/rustboard/web 递归 hash（rc=$rc；符号链接/不可读视为不一致）"
+    fi
+    if [[ "$src_web_digest" != "$pkg_web_digest" ]]; then
+      die "包内 share/rustboard/web 与当前 web/dist 的路径+sha256 不一致（src=$src_web_digest pkg=$pkg_web_digest）；请重建或指定当前包"
+    fi
+  else
     missing+=" web/dist"
   fi
 
   if [[ -n "$missing" ]]; then
     if [[ "$ALLOW_UNVERIFIED" == "1" ]]; then
-      printf 'WARN: ALLOW_UNVERIFIED=1：缺少源%s；跳过包来源一致性校验（不计 PASS，hash 不一致仍会 FATAL）\n' \
+      printf 'WARN: ALLOW_UNVERIFIED=1：缺少源%s；仅跳过实际不可得的项，已校验项不一致仍会 FATAL（不计 PASS）\n' \
         "$missing" >&2
       return 0
     fi
     die "缺少源$missing；默认 fail-closed，不能验证包来源。请先构建源码，或显式 ALLOW_UNVERIFIED=1（仅在源不可得的逃生场景）"
-  fi
-
-  pkg_hash=$(sha256_file "$pkg_install")
-  src_hash=$(sha256_file "$ROOT/packaging/install.sh")
-  if [[ "$pkg_hash" != "$src_hash" ]]; then
-    die "包内 install.sh 与当前 packaging/install.sh 不一致（mode=$PACKAGE_MODE）；请重建或指定当前包"
-  fi
-
-  for bin in rustboard-hub rustboard-panel rustboard-agent; do
-    src="$src_bin_dir/$bin"
-    pkg_hash=$(sha256_file "$PKG_ROOT/bin/$bin")
-    src_hash=$(sha256_file "$src")
-    if [[ "$pkg_hash" != "$src_hash" ]]; then
-      die "包内 bin/$bin 与当前 $src 不一致（mode=$PACKAGE_MODE）；请重建或指定当前包"
-    fi
-  done
-
-  pkg_web="$PKG_ROOT/share/rustboard/web"
-  if [[ ! -d "$pkg_web" || -L "$pkg_web" ]]; then
-    die "包内 share/rustboard/web 缺失或不是普通目录"
-  fi
-  src_web_digest=$(web_tree_digest "$src_web")
-  rc=$?
-  if (( rc != 0 )) || [[ -z "$src_web_digest" ]]; then
-    die "无法计算 web/dist 递归 hash（rc=$rc；符号链接/不可读视为不一致）"
-  fi
-  pkg_web_digest=$(web_tree_digest "$pkg_web")
-  rc=$?
-  if (( rc != 0 )) || [[ -z "$pkg_web_digest" ]]; then
-    die "无法计算包内 share/rustboard/web 递归 hash（rc=$rc；符号链接/不可读视为不一致）"
-  fi
-  if [[ "$src_web_digest" != "$pkg_web_digest" ]]; then
-    die "包内 share/rustboard/web 与当前 web/dist 的路径+sha256 不一致（src=$src_web_digest pkg=$pkg_web_digest）；请重建或指定当前包"
   fi
 
   pass "1.14" "包 VERSION、install.sh、三二进制、web 树与当前源码一致（mode=$PACKAGE_MODE）"
@@ -1783,7 +1810,7 @@ main() {
     KEEP_E2E_TMP="${RB_OFFLINE_KEEP_TMP:-0}"
     LOG_DIR="$TMP_ROOT/logs"
     [[ -n "$HOST_NETNS" ]] || die "子进程缺少 host netns 标记"
-    trap cleanup EXIT INT TERM
+    install_cleanup_traps
     is_safe_tmp_root || die "子进程临时目录未通过安全校验: $TMP_ROOT"
     [[ -d "$PKG_ROOT" && "$PKG_ROOT" == "$TMP_ROOT"/* ]] \
       || die "子进程包根不合法: $PKG_ROOT"
@@ -1818,4 +1845,8 @@ main() {
   die "无法进入 network namespace（unshare -n 失败）"
 }
 
-main "$@"
+# 测试注入点：RB_E2E_TESTING=1 时只加载函数，不执行真实 E2E（供 /tmp 最小
+# 子进程测试覆盖 trap/cleanup 退出码）。
+if [[ "${RB_E2E_TESTING:-0}" != "1" ]]; then
+  main "$@"
+fi

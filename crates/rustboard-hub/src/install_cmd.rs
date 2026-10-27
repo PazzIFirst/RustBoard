@@ -30,13 +30,14 @@ use rustboard_common::tls;
 use rustboard_common::util::{hostname, port_of};
 use rustboard_core::storage::postgres::PostgresStorage;
 use rustboard_install::{
-    detect_system, is_systemd_unit_dir, pick_free_port, render_unit, require_root, shell_arg,
+    detect_system, ensure_service_stopped, is_systemd_unit_dir, pick_free_port,
+    remove_enable_symlink, render_unit, require_root, shell_arg, stop_service_checked,
     unit_is_ours, validate_install_prefix, validate_managed_path, wait_http_ok,
     wait_https_ok_with_server_name, InstallLock, InstallState, InstallTxn, ManagedPathKind,
-    PathOverrides, Paths, Prompt, Role, RoleState, ServiceManager,
+    PathOverrides, Paths, Prompt, Role, RoleState, ServiceControl, ServiceManager,
 };
 
-// 与备份/迁移使用同一份 21 张业务表清单，避免守卫与迁移校验的表集合漂移。
+// 与备份/迁移使用同一份 22 张业务表清单，避免守卫与迁移校验的表集合漂移。
 use crate::backup_cmd::HUB_TABLES;
 
 // C5 只读诊断。用 `#[path]` 直接挂到 install_cmd 下，避免改 main.rs 与 C4 的
@@ -49,8 +50,6 @@ use tls_diag::{Diagnostics, StagingOutcome};
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 /// 生产数据根目录：`--purge` 允许删除该目录下的旧手工安装数据。
 const PRODUCTION_DATA_ROOT: &str = "/var/lib/rustboard";
-/// systemd 系统级 unit 目录：`uninstall` 清理 enable 生成的 wants 链接时一并检查。
-const SYSTEMD_SYSTEM_DIR: &str = "/etc/systemd/system";
 /// ACME 最多尝试轮数（D9：失败最多 3 轮后回退）。
 const ACME_MAX_ATTEMPTS: usize = 3;
 /// 两轮 `tls issue` 之间的等待，避免 ACME 目录短暂故障时立刻打满重试。
@@ -521,7 +520,7 @@ fn ensure_db_args_match_backend(args: &InstallArgs, cfg: &HubConfig) -> Result<(
 
 /// 只读判断 SQLite 是否已有业务数据；返回第一张非空表。
 ///
-/// 探测全部 21 张业务表（复用 `backup_cmd::HUB_TABLES`，与备份/迁移同一份
+/// 探测全部 22 张业务表（复用 `backup_cmd::HUB_TABLES`，与备份/迁移同一份
 /// 清单）。文件不存在、只有 schema 没有行、或 0 字节文件视为空；
 /// 符号链接 / 非普通文件 / 打开或读取失败时 fail-closed 返回错误，不能在
 /// 无法确认时允许切换（避免掩盖数据）；缺表按空处理，兼容旧 schema。
@@ -630,7 +629,7 @@ fn ensure_sqlite_empty_before_postgres_switch(
 /// 顺序固定：
 /// 1. [`PostgresStorage::open_from_config`] 解析 DSN、建立连接池；构造器自身会
 ///    做一次 `SELECT 1` 探活（D3 行为），连接不可达/认证失败在这里失败；
-/// 2. [`PostgresStorage::apply_schema`] 幂等应用 schema v8，事务级 advisory lock
+/// 2. [`PostgresStorage::apply_schema`] 幂等应用 schema v9，事务级 advisory lock
 ///    串行化多实例并发迁移；
 /// 3. [`PostgresStorage::ping`] 确认 schema 应用后连接仍可用。
 ///
@@ -1640,6 +1639,41 @@ fn looks_like_missing_tls_cli(output: &str) -> bool {
         || (lower.contains("unexpected argument") && lower.contains("tls"))
 }
 
+/// `tls issue` 输出上限（含截断提示）。留出提示自身长度，保证总输出有界。
+const ACME_OUTPUT_LIMIT: usize = 16 * 1024;
+/// 输出被截断时追加的提示；长度计入 [`ACME_OUTPUT_LIMIT`]。
+const ACME_TRUNCATED_NOTICE: &str = "\n[输出已截断]\n";
+
+/// 找到 `text` 中不超过 `index` 的最大 UTF-8 字符边界。
+///
+/// 不能假设固定 16 KiB 处一定是字符边界：中文等多字节字符可能跨过该位置。
+/// `str::floor_char_boundary` 在项目最低 Rust 版本上还不是稳定 API，这里用
+/// 显式递减实现；`index` 超过字符串长度时从末尾开始。
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// 把已脱敏输出限制在 [`ACME_OUTPUT_LIMIT`] 内，保证不切断 UTF-8 且总长度有界。
+///
+/// 截断点先取“扣除提示后的预算”，再用 [`floor_char_boundary`] 回退到合法字符
+/// 边界；**参数是截断后的总预算长度**，不能反复 `pop()` 去凑固定偏移——当预算
+/// 落在多字节字符内部时，固定偏移永远不是合法边界，`pop()` 不会让该偏移变短。
+fn truncate_acme_output(mut rendered: String) -> String {
+    if rendered.len() <= ACME_OUTPUT_LIMIT {
+        return rendered;
+    }
+    let budget = ACME_OUTPUT_LIMIT.saturating_sub(ACME_TRUNCATED_NOTICE.len());
+    let cut = floor_char_boundary(&rendered, budget);
+    rendered.truncate(cut);
+    rendered.push_str(ACME_TRUNCATED_NOTICE);
+    debug_assert!(rendered.len() <= ACME_OUTPUT_LIMIT);
+    rendered
+}
+
 /// 过滤 `tls issue` 输出中的敏感内容：私钥块、key authorization、超长行。
 ///
 /// 安装器不解析 ACME 账户 key / keyAuth；这里做兜底，即使子命令误打印也不会
@@ -1671,15 +1705,7 @@ fn sanitize_acme_output(text: &str) -> String {
         rendered.push_str(line);
         rendered.push('\n');
     }
-    if rendered.len() > 16 * 1024 {
-        let mut truncated = rendered;
-        while !truncated.is_char_boundary(16 * 1024) {
-            truncated.pop();
-        }
-        truncated.push_str("\n[输出已截断]\n");
-        return truncated;
-    }
-    rendered
+    truncate_acme_output(rendered)
 }
 
 /// 调用当前可执行文件的 `tls issue --config <path>`。
@@ -1700,10 +1726,12 @@ fn run_tls_issue(config: &Path, timeout: Duration) -> std::result::Result<(), Ac
     })?;
     let combined = sanitize_acme_output(&format!("{}{}", output.stdout, output.stderr));
     if output.timed_out {
-        return Err(AcmeIssueFailure::Failed(format!(
+        // combined 本身已被限制在 16 KiB；再拼前缀后重新截断一次，保证最终
+        // 错误信息（含提示）仍然有界。
+        return Err(AcmeIssueFailure::Failed(truncate_acme_output(format!(
             "tls issue 超时（上限 {}s）{combined}",
             timeout.as_secs()
-        )));
+        ))));
     }
     if output.success() {
         if !combined.trim().is_empty() {
@@ -1819,27 +1847,28 @@ fn prepare_private_acme_agent_ca(cfg: &HubConfig) -> Result<Option<PathBuf>> {
     Ok(Some(dest))
 }
 
-/// 安装前服务端证书材料的快照；ACME 成功后若后续安装失败，回滚时恢复旧证书。
+/// 安装前服务端证书材料的快照；ACME 签发或 self-signed 重签后若后续安装失败，
+/// 回滚时恢复旧证书。
 ///
 /// 只保存安装前**成对存在**的 `server.crt` / `server.key`。全新安装（安装前
 /// `data_dir` 不存在）没有旧材料，失败时清理本次创建的 `certs` 目录，并仅在
 /// `data_dir` 已空时删除它；**绝不**递归删除 `data_dir`，避免误删并发写入或
 /// 用户预置的其它文件。安装前已存在 `data_dir` 但没有旧证书时不做任何删除。
-struct AcmeCertGuard {
+struct ServerCertGuard {
     /// 数据目录（可能由本次安装创建）。
     data_dir_path: PathBuf,
-    /// 本次 ACME 写入的证书目录 `<data_dir>/certs`。
+    /// 本次安装可能写入的证书目录 `<data_dir>/certs`。
     certs_path: PathBuf,
     /// 安装前的 `server.crt` / `server.key`（只有成对存在才记录）。
     old: Option<(Vec<u8>, Vec<u8>)>,
     /// 安装前的 `agent-ca.pem`（私有 ACME 派生信任锚）；`None` 表示原先不存在。
     old_agent_ca: Option<Vec<u8>>,
-    /// `issue_acme_with_fallback` 开始前 `data_dir` 是否已存在。
+    /// 证书可能被改写前 `data_dir` 是否已存在。
     data_dir_existed_before: bool,
     armed: bool,
 }
 
-impl AcmeCertGuard {
+impl ServerCertGuard {
     fn capture(data_dir: &Path, data_dir_existed_before: bool) -> Self {
         let certs_path = tls::cert_dir(data_dir);
         let cert = fs::read(certs_path.join(tls::SERVER_CERT_FILE)).ok();
@@ -1895,7 +1924,7 @@ impl AcmeCertGuard {
                     }
                 },
             }
-            println!("已恢复安装前的服务端证书（ACME 安装未完成）。");
+            println!("已恢复安装前的服务端证书（安装未完成）。");
             return Ok(());
         }
         if self.data_dir_existed_before {
@@ -1944,22 +1973,22 @@ impl AcmeCertGuard {
                 })
             }
         }
-        println!("已清理本次安装创建的证书材料（ACME 安装未完成）。");
+        println!("已清理本次安装创建的证书材料（安装未完成）。");
         Ok(())
     }
 }
 
 /// 恢复 guard，失败只警告（不能掩盖原始安装错误）。
-fn restore_acme_guard(guard: &mut AcmeCertGuard) {
+fn restore_server_cert_guard(guard: &mut ServerCertGuard) {
     if let Err(err) = guard.restore() {
-        eprintln!("警告：恢复/清理 ACME 证书材料失败: {err:#}");
+        eprintln!("警告：恢复/清理服务端证书材料失败: {err:#}");
     }
 }
 
 /// ACME 签发的最终结果。
 enum AcmeOutcome {
     /// 已成功签发；guard 在本次安装失败时恢复旧证书。
-    Issued { guard: AcmeCertGuard },
+    Issued { guard: ServerCertGuard },
     /// 失败后按 `fallback_to_self_signed` 回退，调用方继续 self-signed 安装。
     FellBack,
 }
@@ -2239,7 +2268,7 @@ fn handle_acme_failure(
 /// 配置落盘（事务内，可回滚）、签发、校验与回退决策。
 ///
 /// 事务边界：`InstallTxn` 只管理配置 / unit / 二进制；`certs/` 下的 CA、ACME
-/// 账户/状态与服务端证书由 [`AcmeCertGuard`] 负责。全新安装失败时清理本次创建
+/// 账户/状态与服务端证书由 [`ServerCertGuard`] 负责。全新安装失败时清理本次创建
 /// 的 `certs`，已有安装则恢复旧 `server.crt/key`（账户/状态保留）。
 fn issue_acme_with_fallback(
     cfg: &mut HubConfig,
@@ -2255,10 +2284,10 @@ fn issue_acme_with_fallback(
         server_days: cfg.server_cert_validity_days,
         client_days: cfg.client_cert_validity_days,
     };
-    let mut guard = AcmeCertGuard::capture(&cfg.data_dir, data_dir_existed_before);
+    let mut guard = ServerCertGuard::capture(&cfg.data_dir, data_dir_existed_before);
     guard.arm();
     if let Err(err) = ensure_acme_client_ca(&cfg.data_dir, data_dir_existed_before, policy) {
-        restore_acme_guard(&mut guard);
+        restore_server_cert_guard(&mut guard);
         return Err(err);
     }
 
@@ -2271,11 +2300,11 @@ fn issue_acme_with_fallback(
         match run_staging_issue(cfg, staging_directory, paths, txn, policy) {
             Ok(()) => println!("ACME staging 检查通过；继续向 production 申请受信任证书。"),
             Err(StagingFailure::Issue(failure)) => {
-                restore_acme_guard(&mut guard);
+                restore_server_cert_guard(&mut guard);
                 return handle_acme_failure(cfg, diag, 1, failure);
             }
             Err(StagingFailure::Fatal(err)) => {
-                restore_acme_guard(&mut guard);
+                restore_server_cert_guard(&mut guard);
                 return Err(err);
             }
         }
@@ -2308,7 +2337,7 @@ fn issue_acme_with_fallback(
     let (attempts, result) = match production {
         Ok(value) => value,
         Err(err) => {
-            restore_acme_guard(&mut guard);
+            restore_server_cert_guard(&mut guard);
             return Err(err);
         }
     };
@@ -2321,7 +2350,7 @@ fn issue_acme_with_fallback(
                 let agent_ca = match prepare_private_acme_agent_ca(cfg) {
                     Ok(agent_ca) => agent_ca,
                     Err(err) => {
-                        restore_acme_guard(&mut guard);
+                        restore_server_cert_guard(&mut guard);
                         return Err(err);
                     }
                 };
@@ -2339,20 +2368,50 @@ fn issue_acme_with_fallback(
             }
             Err(err) => {
                 // 校验失败同样不能留下来源不明的新证书。
-                restore_acme_guard(&mut guard);
+                restore_server_cert_guard(&mut guard);
                 Err(err)
             }
         },
         Err(failure) => {
             // production 失败：恢复旧服务端材料；全新安装由 guard 清理 certs。
-            restore_acme_guard(&mut guard);
+            restore_server_cert_guard(&mut guard);
             handle_acme_failure(cfg, diag, attempts, failure)
         }
     }
 }
 
-/// install 子命令入口。
+/// 安装确认接口；生产实现是 [`Prompt`]，测试可注入固定回答。
+trait InstallPrompt {
+    fn confirm(&self, question: &str, default: bool) -> Result<bool>;
+}
+
+impl InstallPrompt for Prompt {
+    fn confirm(&self, question: &str, default: bool) -> Result<bool> {
+        Prompt::confirm(self, question, default)
+    }
+}
+
+/// `rustboard-hub install` 入口。
 pub(crate) fn install(args: InstallArgs) -> Result<()> {
+    let prompt = Prompt::new(args.yes);
+    install_with_prompt(args, &prompt)
+}
+
+/// 生产测试共用的确认入口；生产路径不跳过 root / 锁。
+fn install_with_prompt(args: InstallArgs, prompt: &dyn InstallPrompt) -> Result<()> {
+    install_impl(args, prompt, false)
+}
+
+/// 带可注入确认 / 权限钩子的安装实现。
+///
+/// `test_skip_privileged` 只由单元测试传 true：跳过 `require_root` 与真实
+/// `/run` 全局锁，让取消路径在非 root CI 也能验证“未加锁、未写盘”。生产入口
+/// 永远传 false。
+fn install_impl(
+    args: InstallArgs,
+    prompt: &dyn InstallPrompt,
+    test_skip_privileged: bool,
+) -> Result<()> {
     // 离线/ACME 互斥与 ACME 必填参数必须在读状态、写盘、访问网络之前失败。
     let requested_tls = validate_tls_args(&args)?;
     let prefix = args.prefix.clone().unwrap_or_else(|| PathBuf::from("/"));
@@ -2432,13 +2491,19 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
         return Ok(());
     }
 
-    require_root()?;
-    let prompt = Prompt::new(args.yes);
+    if !test_skip_privileged {
+        require_root()?;
+    }
     if !args.yes {
-        prompt.confirm(
+        // 取消必须在获取安装锁、读取/写入 state、生成证书或 unit 之前返回；
+        // 这里丢弃返回值会让用户回答 n 后继续安装。
+        if !prompt.confirm(
             "即将安装 RustBoard Hub（写入系统配置与 systemd unit），继续吗？",
             true,
-        )?;
+        )? {
+            println!("已取消安装（未做任何修改）。");
+            return Ok(());
+        }
     }
     let panel_yes = match args.panel.as_deref() {
         Some(value) => parse_panel(value)?,
@@ -2451,7 +2516,11 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
     // RUSTBOARD_INSTALL_LOCK_HELD=1 后再启动本命令，并一直持有到本进程退出；
     // 此时 acquire_install_lock 直接复用父进程的锁，不能再 flock 同一把锁。
     // hub 调起的 panel 子进程同样继承该标记并跳过，避免自锁。
-    let _lock = acquire_install_lock(false)?;
+    let _lock = if test_skip_privileged {
+        None
+    } else {
+        acquire_install_lock(false)?
+    };
 
     let state = InstallState::load(&paths.state)?;
     let existing = state.role(Role::Hub).cloned();
@@ -2658,13 +2727,13 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
     }
     // ACME 先写配置并调用 `tls issue`：成功后继续原事务；失败回退 self-signed
     // 后继续，确保最终落盘的配置与证书来源一致。
-    let mut acme_guard: Option<AcmeCertGuard> = None;
+    let mut cert_guard: Option<ServerCertGuard> = None;
     // 端口预检回退在 issue 之前把 cfg 改成 self-signed；此时仍要保护原 ACME
     // 服务端证书，后续任何安装失败都必须能恢复回来。
     if force_self_signed && !cfg.tls.mode.is_acme() && data_dir_existed_before {
-        let mut guard = AcmeCertGuard::capture(&paths.data_dir, data_dir_existed_before);
+        let mut guard = ServerCertGuard::capture(&paths.data_dir, data_dir_existed_before);
         guard.arm();
-        acme_guard = Some(guard);
+        cert_guard = Some(guard);
     }
     if cfg.tls.mode.is_acme() {
         match issue_acme_with_fallback(
@@ -2674,19 +2743,30 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
             diag.as_ref(),
             data_dir_existed_before,
         ) {
-            Ok(AcmeOutcome::Issued { guard }) => acme_guard = Some(guard),
+            Ok(AcmeOutcome::Issued { guard }) => cert_guard = Some(guard),
             Ok(AcmeOutcome::FellBack) => {
                 force_self_signed = true;
                 // issue 已在回退时恢复旧证书；重新捕获并保持 armed 到 commit，
                 // 防止后续 run_install/健康检查/面板失败留下 self-signed 证书 +
                 // 旧 ACME 配置。
-                let mut guard = AcmeCertGuard::capture(&paths.data_dir, data_dir_existed_before);
+                let mut guard = ServerCertGuard::capture(&paths.data_dir, data_dir_existed_before);
                 guard.arm();
-                acme_guard = Some(guard);
+                cert_guard = Some(guard);
             }
             Err(err) => {
                 // 尚未触碰服务 / unit；回滚配置与本次创建的文件。
+                let backup_dir = txn.backup_dir().to_path_buf();
                 let rollback = txn.rollback();
+                match &rollback {
+                    Ok(()) => eprintln!(
+                        "ACME 安装失败；事务回滚完成，临时安装备份 {} 已清理",
+                        backup_dir.display()
+                    ),
+                    Err(_) => eprintln!(
+                        "ACME 安装失败；事务回滚未完成，备份目录 {} 已保留，请人工恢复",
+                        backup_dir.display()
+                    ),
+                }
                 return match rollback {
                     Ok(()) => Err(err),
                     Err(rollback_err) => {
@@ -2696,6 +2776,16 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
             }
         }
     }
+    // 显式 ACME→self-signed（以及其它需要重签的自签安装）同样会在
+    // run_install 内重写 server.crt/key；这些材料不在 InstallTxn 的备份模型里。
+    // 必须在写盘前捕获旧证书，后续 config/binary/健康检查/面板失败时恢复，
+    // 否则事务只回滚配置，会留下“ACME 配置 + 自签证书”的不一致状态。
+    if cert_guard.is_none() && !cfg.tls.mode.is_acme() && (need_certs || force_self_signed) {
+        let mut guard = ServerCertGuard::capture(&paths.data_dir, data_dir_existed_before);
+        guard.arm();
+        cert_guard = Some(guard);
+    }
+
     // 回退后重新计算健康检查计划（self-signed 的 SNI/CA 可能不同）。
     let health = health_check_for(&cfg)?;
 
@@ -2716,7 +2806,7 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
     match run_install(&plan, &mut txn, &mut service_touched) {
         Ok(()) => {
             txn.commit()?;
-            if let Some(mut guard) = acme_guard.take() {
+            if let Some(mut guard) = cert_guard.take() {
                 guard.disarm();
             }
             print_install_success(&plan);
@@ -2732,10 +2822,25 @@ pub(crate) fn install(args: InstallArgs) -> Result<()> {
             Ok(())
         }
         Err(err) => {
+            let backup_dir = txn.backup_dir().to_path_buf();
             let rollback = txn.rollback();
-            // 事务只恢复 config/unit/binary；ACME 写出的证书/私钥由 guard 恢复。
-            if let Some(mut guard) = acme_guard.take() {
-                restore_acme_guard(&mut guard);
+            // 事务只恢复 config/unit/binary；ACME 或 self-signed 重签写出的
+            // 证书/私钥由 guard 恢复。回滚成功时 txn 备份已清理，不能再让
+            // 运维去找这个目录；失败时明确打印保留下来的路径。
+            if let Some(mut guard) = cert_guard.take() {
+                restore_server_cert_guard(&mut guard);
+            }
+            match &rollback {
+                Ok(()) => eprintln!(
+                    "安装失败；事务回滚完成，临时安装备份 {} 已清理。\
+                     证书若有成对备份，保留在 {}/certs/server.*.bak-*",
+                    backup_dir.display(),
+                    paths.data_dir.display()
+                ),
+                Err(_) => eprintln!(
+                    "安装失败；事务回滚未完成，备份目录 {} 已保留，请人工恢复",
+                    backup_dir.display()
+                ),
             }
             if plan.manager.manage {
                 if let Err(reload_err) = plan.manager.daemon_reload() {
@@ -3600,6 +3705,8 @@ struct UninstallTargets {
     unit_dir: PathBuf,
     /// unit 文件存在且归属校验通过、且位于 systemd unit 目录时才允许 stop/disable。
     manage_service: bool,
+    /// 是否必须查询同名 systemd 服务状态（即使 unit 文件不存在）。
+    check_service: bool,
     purge_config: bool,
     purge_data: bool,
 }
@@ -3613,6 +3720,7 @@ fn preflight_uninstall(
     prefix: &Path,
     paths: &Paths,
     record: Option<&RoleState>,
+    service_override: Option<&dyn ServiceControl>,
 ) -> Result<UninstallTargets> {
     // 优先 state 记录：e2e 安装时 unit 在 /run/systemd/system，卸载不传 --unit-dir
     // 也必须能停掉并删除。显式 flag 仍然优先于 state。
@@ -3697,10 +3805,16 @@ fn preflight_uninstall(
     // dry-run 保持“不调用 systemctl”的约定：只打印计划；真正卸载在删除任何
     // 文件之前查询 FragmentPath。unit 在 prefix 内时 systemd 不会读取它，查询
     // 只会命中宿主的同名外来 unit，因此直接按“只删自己的文件”处理。
-    let systemd_manage = detect_system().systemd && is_systemd_unit_dir(&unit_dir);
+    let systemd_manage =
+        service_override.is_some() || (detect_system().systemd && is_systemd_unit_dir(&unit_dir));
     let fragment = if unit_present && !args.dry_run && systemd_manage {
-        let manager = ServiceManager::new(unit_dir.clone(), true, false);
-        manager.fragment_path(Role::Hub.unit_name())?
+        match service_override {
+            Some(service) => service.fragment_path(Role::Hub.unit_name())?,
+            None => {
+                let manager = ServiceManager::new(unit_dir.clone(), true, false);
+                manager.fragment_path(Role::Hub.unit_name())?
+            }
+        }
     } else {
         None
     };
@@ -3722,6 +3836,7 @@ fn preflight_uninstall(
         binary,
         unit_dir,
         manage_service,
+        check_service: systemd_manage,
         purge_config,
         purge_data,
     })
@@ -3786,6 +3901,11 @@ fn remove_state_file(path: &Path) -> Result<()> {
 
 /// uninstall 子命令入口。
 pub(crate) fn uninstall(args: UninstallArgs) -> Result<()> {
+    uninstall_impl(args, None)
+}
+
+/// 带可注入 systemd 的卸载实现（测试用 fake，生产只经 [`uninstall`] 进入）。
+fn uninstall_impl(args: UninstallArgs, injected: Option<&dyn ServiceControl>) -> Result<()> {
     let prefix = args.prefix.clone().unwrap_or_else(|| PathBuf::from("/"));
     // P-01：原始 CLI prefix 先过 allowlist，再交给 Paths::for_role 归一化。
     let paths = paths_for_role_validated(
@@ -3800,14 +3920,18 @@ pub(crate) fn uninstall(args: UninstallArgs) -> Result<()> {
     )?;
 
     // 非 dry-run：先拿全局锁再读 state；dry-run 只读，不加锁也不产生写入。
-    if !args.dry_run {
+    if !args.dry_run && injected.is_none() {
         require_root()?;
     }
-    let _lock = acquire_install_lock(args.dry_run)?;
+    let _lock = if injected.is_some() {
+        None
+    } else {
+        acquire_install_lock(args.dry_run)?
+    };
 
-    let mut state = InstallState::load(&paths.state)?;
+    let state = InstallState::load(&paths.state)?;
     let record = state.role(Role::Hub).cloned();
-    let targets = preflight_uninstall(&args, &prefix, &paths, record.as_ref())?;
+    let targets = preflight_uninstall(&args, &prefix, &paths, record.as_ref(), injected)?;
 
     if args.dry_run {
         print_uninstall_plan(&args, &paths, &targets);
@@ -3830,27 +3954,59 @@ pub(crate) fn uninstall(args: UninstallArgs) -> Result<()> {
         }
     }
 
-    // 预检已保证 unit 文件存在且是 ours；但预检与真正 stop 之间隔着 --purge
-    // 确认（prompt），期间 unit 可能被替换。执行前必须即时重新核对 FragmentPath；
-    // 确认不了就直接返回错误——此时尚未删除任何文件，绝不 stop/disable。
+    // 预检已保证 unit 文件（若存在）是 ours。真正 stop 前还会再核对一次
+    // FragmentPath；stop 失败或无法确认已停止时立即返回，绝不删除文件。
+    // `check_service` 独立于 unit 文件是否存在：unit 文件消失时仍必须查询同名服务。
+    let manager = ServiceManager::new(targets.unit_dir.clone(), targets.check_service, false);
+    let service: &dyn ServiceControl = injected.unwrap_or(&manager);
+    execute_uninstall(
+        &args,
+        &paths,
+        &prefix,
+        state,
+        record.as_ref(),
+        &targets,
+        service,
+    )
+}
+
+/// 执行已通过 preflight 的卸载动作。
+///
+/// 独立成函数便于测试注入 [`ServiceControl`]：停止失败 / 状态未知时必须在删除
+/// 之前返回，unit、binary、config、data 与 state 全部保留。
+fn execute_uninstall(
+    args: &UninstallArgs,
+    paths: &Paths,
+    prefix: &Path,
+    mut state: InstallState,
+    record: Option<&RoleState>,
+    targets: &UninstallTargets,
+    service: &dyn ServiceControl,
+) -> Result<()> {
+    // 预检与真正 stop 之间隔着 --purge 确认（prompt），期间 unit 可能被替换。
+    // 执行前必须即时重新核对 FragmentPath；确认不了就直接返回错误——此时尚未
+    // 删除任何文件，绝不 stop/disable。
     if targets.manage_service {
-        let manager = ServiceManager::new(targets.unit_dir.clone(), true, false);
-        manager
+        service
             .ensure_fragment_is(Role::Hub.unit_name(), &targets.unit)
             .context("停止前 systemd 解析的 hub unit 已变化；未 stop/disable，也未删除任何文件")?;
-        // unit 归属确认后才 disable；disable 失败只警告并继续删 unit，
-        // 避免一次 systemctl 失败把卸载卡在半途。
-        if let Err(err) = manager.stop_disable(Role::Hub.unit_name()) {
-            eprintln!("警告：停止/禁用 hub 服务失败，继续删除 unit: {err:#}");
-        }
+        // stop 失败或 ActiveState 无法确认已停止时直接返回，保留全部文件与
+        // state；只有确认停止后才 disable（disable 失败只警告）。
+        stop_service_checked(service, Role::Hub.unit_name(), "hub")?;
+    } else if targets.check_service {
+        // unit 文件不存在或 FragmentPath 为空（transient）时不能 stop，但同名
+        // 服务仍在运行（active/activating/reloading 等）就绝不能删除或 purge。
+        ensure_service_stopped(service, Role::Hub.unit_name(), "hub")?;
     }
 
-    remove_file_if_exists(&targets.unit, "systemd unit")?;
     // 只有真正 stop/disable 过（fragment == 我们的 unit）才清理 wants 链接；
-    // 否则可能删掉生产环境同名外置 unit 的 enable 链接。
+    // 必须在 unit 文件仍存在时按目标 canonical path 确认归属，只删指向本安装
+    // unit 的链接；同名外来 unit 的 enable 链接保留。
     if targets.manage_service && is_systemd_unit_dir(&targets.unit_dir) {
-        remove_wants_symlink(&targets.unit_dir, Role::Hub.unit_name())?;
+        remove_enable_symlink(&targets.unit_dir, Role::Hub.unit_name(), &targets.unit)
+            .context("清理 hub 启用链接失败")?;
     }
+    remove_file_if_exists(&targets.unit, "systemd unit")?;
     remove_file_if_exists(&targets.binary, "hub 二进制")?;
 
     // 先完成 --purge（config/data）再删 state 记录：purge 失败时 state 仍记录
@@ -3859,7 +4015,7 @@ pub(crate) fn uninstall(args: UninstallArgs) -> Result<()> {
         purge_config(&targets.config)?;
     }
     if targets.purge_data {
-        purge_data_dir(&targets.data_dir, &prefix, &paths.state)?;
+        purge_data_dir(&targets.data_dir, prefix, &paths.state)?;
     }
 
     if record.is_some() {
@@ -3874,14 +4030,13 @@ pub(crate) fn uninstall(args: UninstallArgs) -> Result<()> {
         }
     }
     if targets.manage_service {
-        let manager = ServiceManager::new(targets.unit_dir.clone(), true, false);
-        if let Err(err) = manager.daemon_reload() {
+        if let Err(err) = service.daemon_reload() {
             eprintln!("警告：systemctl daemon-reload 失败: {err:#}");
         }
     }
 
     print_uninstall_success(
-        &args,
+        args,
         &targets.config,
         &targets.data_dir,
         &targets.unit,
@@ -3902,38 +4057,6 @@ fn remove_file_if_exists(path: &Path, label: &str) -> Result<()> {
         Err(err) if err.kind() == ErrorKind::NotFound => {}
         Err(err) => {
             return Err(err).with_context(|| format!("检查{label} {} 失败", path.display()))
-        }
-    }
-    Ok(())
-}
-
-/// 删除 `systemctl enable` 创建的 target.wants 符号链接。
-///
-/// `disable` 通常会清掉它；systemd 不可用或 disable 部分失败时兜底，避免卸载后
-/// 仍残留一个指向已删除 unit 的 wants 链接。`enable` 的链接可能落在 unit 所在
-/// 目录，也可能落在 `/etc/systemd/system`（systemd 的持久化 enable 目录），两处
-/// 都检查。只删符号链接，不碰普通文件。
-fn remove_wants_symlink(unit_dir: &Path, unit_name: &str) -> Result<()> {
-    let system_dir = Path::new(SYSTEMD_SYSTEM_DIR);
-    let mut dirs = vec![unit_dir];
-    if unit_dir != system_dir {
-        dirs.push(system_dir);
-    }
-    for dir in dirs {
-        for target in ["multi-user.target.wants", "graphical.target.wants"] {
-            let path = dir.join(target).join(unit_name);
-            match fs::symlink_metadata(&path) {
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    fs::remove_file(&path)
-                        .with_context(|| format!("删除启用链接 {} 失败", path.display()))?;
-                }
-                Ok(_) => {}
-                Err(err) if err.kind() == ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(err)
-                        .with_context(|| format!("检查启用链接 {} 失败", path.display()))
-                }
-            }
         }
     }
     Ok(())
@@ -4086,6 +4209,7 @@ fn print_uninstall_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustboard_install::ServiceState;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4096,11 +4220,15 @@ mod tests {
 
     impl TempDir {
         fn new(tag: &str) -> Self {
+            Self::new_in(&std::env::temp_dir(), tag)
+        }
+
+        fn new_in(base: &Path, tag: &str) -> Self {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_nanos())
                 .unwrap_or(0);
-            let path = std::env::temp_dir().join(format!(
+            let path = base.join(format!(
                 "rustboard-hub-install-cmd-{tag}-{}-{}-{nanos}",
                 std::process::id(),
                 TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -4142,6 +4270,155 @@ mod tests {
         assert!(
             !rendered.to_ascii_lowercase().contains("duplicate"),
             "错误信息保留了 toml 解析细节: {rendered}"
+        );
+    }
+
+    struct FixedPrompt(bool);
+
+    impl InstallPrompt for FixedPrompt {
+        fn confirm(&self, _question: &str, _default: bool) -> Result<bool> {
+            Ok(self.0)
+        }
+    }
+
+    /// 完整安装流程测试的 prefix 父目录：测试二进制所在 target 目录。
+    fn install_prefix_base() -> PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .unwrap_or_else(std::env::temp_dir)
+    }
+
+    /// #56/#79 复审：ACME→self-signed 会删掉 ACME 证书；若随后 config/binary
+    /// 写入失败，InstallTxn 只恢复配置。证书 guard 必须把旧 cert/key 一并恢复，
+    /// 不能留下“ACME 配置 + self-signed 证书”的不一致状态。
+    #[test]
+    fn self_signed_reissue_rolls_back_cert_material() {
+        let dir = TempDir::new_in(&install_prefix_base(), "self-signed-reissue-rollback");
+        let prefix = dir.path().to_path_buf();
+        let paths = Paths::for_role(Role::Hub, &prefix, PathOverrides::default()).unwrap();
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        tls::ensure_hub_material(
+            &paths.data_dir,
+            &["old.example".to_string()],
+            tls::CertPolicy::default(),
+        )
+        .unwrap();
+        let cert_dir = tls::cert_dir(&paths.data_dir);
+        let old_cert = fs::read(cert_dir.join(tls::SERVER_CERT_FILE)).unwrap();
+        let old_key = fs::read(cert_dir.join(tls::SERVER_KEY_FILE)).unwrap();
+
+        // 旧配置声称 ACME，实际证书是 self-signed；安装时 --tls self-signed
+        // 会触发“ACME→self-signed 复用既有 CA 重签”这条危险路径。
+        let mut old_cfg = HubConfig {
+            data_dir: paths.data_dir.clone(),
+            database: sqlite_database(&paths.data_dir),
+            agent_listen: "0.0.0.0:18443".to_string(),
+            admin_listen: "127.0.0.1:19000".to_string(),
+            server_names: vec!["old.example".to_string()],
+            admin_token: "test-admin-token".to_string(),
+            ..HubConfig::default()
+        };
+        old_cfg.tls.mode = ServerTlsMode::AcmeDomain;
+        old_cfg.tls.acme_email = "admin@example.com".to_string();
+        old_cfg.tls.domains = vec!["old.example".to_string()];
+        old_cfg.validate().unwrap();
+        old_cfg.save(&paths.config).unwrap();
+        let old_config = fs::read(&paths.config).unwrap();
+
+        // 让 run_install 在重签证书并写 config 之后、复制二进制时失败。
+        fs::create_dir_all(&paths.binary).unwrap();
+
+        let mut args = test_install_args();
+        args.dry_run = false;
+        args.offline = true;
+        args.force = true;
+        args.prefix = Some(prefix);
+        args.tls = Some("self-signed".to_string());
+        args.sans = vec!["new.example".to_string()];
+        args.panel = Some("no".to_string());
+        let err = install_impl(args, &FixedPrompt(true), true)
+            .expect_err("目标二进制是目录时安装必须失败");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("目标二进制") || rendered.contains("不是普通文件"),
+            "失败原因应为二进制写入: {rendered}"
+        );
+
+        assert_eq!(
+            fs::read(cert_dir.join(tls::SERVER_CERT_FILE)).unwrap(),
+            old_cert,
+            "失败后必须恢复旧 server.crt，不能留下 self-signed 证书"
+        );
+        assert_eq!(
+            fs::read(cert_dir.join(tls::SERVER_KEY_FILE)).unwrap(),
+            old_key,
+            "失败后必须恢复旧 server.key"
+        );
+        // 证明确实发生了重签：ensure_hub_material 在覆盖前会留下成对 .bak。
+        let reissue_backups = fs::read_dir(&cert_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("server.crt.bak-")
+            })
+            .count();
+        assert!(
+            reissue_backups > 0,
+            "测试必须真正触发 self-signed 重签，否则无法验证证书回滚"
+        );
+        assert_eq!(
+            fs::read(&paths.config).unwrap(),
+            old_config,
+            "事务回滚必须恢复旧 ACME 配置"
+        );
+        assert_eq!(
+            HubConfig::load(&paths.config).unwrap().tls.mode,
+            ServerTlsMode::AcmeDomain,
+            "恢复后的配置模式必须仍是旧的 ACME"
+        );
+    }
+
+    /// #53：确认回答 false 时必须在任何写入 / 加锁 / 证书 / unit 操作前返回取消。
+    #[test]
+    fn cancelled_install_confirmation_performs_no_writes() {
+        let dir = TempDir::new_in(&install_prefix_base(), "confirm-cancel");
+        let prefix = dir.path().to_path_buf();
+        let paths = Paths::for_role(Role::Hub, &prefix, PathOverrides::default()).unwrap();
+
+        let mut args = test_install_args();
+        args.yes = false;
+        args.dry_run = false;
+        args.offline = true;
+        args.systemd = false;
+        args.no_systemd = true;
+        args.prefix = Some(prefix.clone());
+        args.panel = Some("no".to_string());
+
+        // 跳过 root / 真实 /run 锁，让该用例在非 root CI 也执行；若取消路径
+        // 错误地继续执行，会走到 state/证书/unit 写入，下面的断言会失败。
+        install_impl(args, &FixedPrompt(false), true).expect("取消安装应返回 Ok");
+
+        for path in [
+            &paths.config,
+            &paths.data_dir,
+            &paths.unit,
+            &paths.binary,
+            &paths.state,
+        ] {
+            assert!(
+                !path.exists(),
+                "取消后不得写入任何受管路径: {}",
+                path.display()
+            );
+        }
+        // state 的父目录也不应该被创建。
+        assert!(
+            !paths.state.parent().unwrap().exists(),
+            "取消后不得创建 state 目录"
         );
     }
 
@@ -4352,10 +4629,10 @@ mod tests {
             dry_run: true,
         };
 
-        assert!(preflight_uninstall(&args, prefix, &paths, None).is_ok());
+        assert!(preflight_uninstall(&args, prefix, &paths, None, None).is_ok());
 
         fs::write(&paths.unit, "[Service]\nExecStart=/bin/false\n").unwrap();
-        let err = preflight_uninstall(&args, prefix, &paths, None)
+        let err = preflight_uninstall(&args, prefix, &paths, None, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("不是本安装器为当前 prefix 生成的"), "{err}");
@@ -4618,9 +4895,9 @@ mod tests {
         fs::write(&zero, b"").unwrap();
         assert_eq!(sqlite_business_data_table(&zero).unwrap(), None);
 
-        // 守卫与备份/迁移共用 21 张业务表清单；显式锁定 samples_1m / audit_log
+        // 守卫与备份/迁移共用 22 张业务表清单；显式锁定 samples_1m / audit_log
         // 也必须在探测范围内（评审要求：非主数据表同样不能被静默丢弃）。
-        assert_eq!(HUB_TABLES.len(), 21);
+        assert_eq!(HUB_TABLES.len(), 22);
         assert!(HUB_TABLES.contains(&"samples_1m"));
         assert!(HUB_TABLES.contains(&"audit_log"));
         for table in HUB_TABLES {
@@ -5216,13 +5493,13 @@ mod tests {
             yes: true,
             dry_run: true,
         };
-        assert!(preflight_uninstall(&args, prefix, &paths, None).is_ok());
+        assert!(preflight_uninstall(&args, prefix, &paths, None, None).is_ok());
 
         // 伪造 state 的 config 指向 prefix 之外：即使没有 --purge 也必须在
         // preflight 拒绝，不能等到 purge 分支才校验。
         let mut record = RoleState::new(&paths, "0.4.2", dir.path().join("backup"));
         record.config = PathBuf::from("/etc/rustboard/hub.toml");
-        let err = preflight_uninstall(&args, prefix, &paths, Some(&record))
+        let err = preflight_uninstall(&args, prefix, &paths, Some(&record), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("配置路径不在允许卸载的范围"), "{err}");
@@ -5233,7 +5510,7 @@ mod tests {
             let mut record = RoleState::new(&paths, "0.4.2", dir.path().join("backup"));
             record.config = dir.path().join("config-link.toml");
             std::os::unix::fs::symlink(dir.path().join("missing-target"), &record.config).unwrap();
-            let err = preflight_uninstall(&args, prefix, &paths, Some(&record))
+            let err = preflight_uninstall(&args, prefix, &paths, Some(&record), None)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("符号链接"), "config: {err}");
@@ -5242,7 +5519,7 @@ mod tests {
             record.data_dir = dir.path().join("data-link");
             std::os::unix::fs::symlink(dir.path().join("missing-target"), &record.data_dir)
                 .unwrap();
-            let err = preflight_uninstall(&args, prefix, &paths, Some(&record))
+            let err = preflight_uninstall(&args, prefix, &paths, Some(&record), None)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("符号链接"), "data_dir: {err}");
@@ -5591,6 +5868,107 @@ mod tests {
         assert!(sanitize_acme_output(&long).contains("[已隐藏超长输出行]"));
     }
 
+    /// 在独立线程里跑脱敏，超时即失败：旧的固定 16 KiB + `pop()` 实现会在
+    /// 截断点落进多字节字符时变成死循环（长度降到 16 KiB 以下后边界永远为 false）。
+    fn sanitize_with_timeout(text: String) -> String {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(sanitize_acme_output(&text));
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sanitize_acme_output 5s 内未返回，疑似截断死循环")
+    }
+
+    /// 固定 16 KiB 边界落在中文字符内部时，旧实现会永久循环；新实现必须在
+    /// 预算内回退到合法字符边界，并保证总输出（含提示）不超过上限。
+    #[test]
+    fn acme_output_truncation_handles_utf8_boundary_inside_char() {
+        let mut raw = String::new();
+        for _ in 0..31 {
+            raw.push_str(&"a".repeat(511));
+            raw.push('\n');
+        }
+        // 31 × 512 = 15872 字节；再放一行 510 个 ASCII（+换行）把下一行推到
+        // 偏移 16383，使旧的固定边界 16384 正好落在“中”的第二个字节上。
+        raw.push_str(&"a".repeat(510));
+        raw.push('\n');
+        raw.push('中');
+        raw.push('\n');
+        raw.push_str("tail\n");
+        assert!(raw.len() > ACME_OUTPUT_LIMIT);
+
+        let sanitized = sanitize_with_timeout(raw);
+        assert!(sanitized.ends_with(ACME_TRUNCATED_NOTICE), "{sanitized:?}");
+        assert!(sanitized.len() <= ACME_OUTPUT_LIMIT, "{}", sanitized.len());
+        let content_len = sanitized.len() - ACME_TRUNCATED_NOTICE.len();
+        assert!(
+            sanitized.is_char_boundary(content_len),
+            "截断点必须落在 UTF-8 字符边界"
+        );
+        assert!(!sanitized.contains('\u{FFFD}'), "不能出现替换字符");
+    }
+
+    /// 预算恰好落在字符边界、字符内部、纯 ASCII、纯中文四种情况。
+    #[test]
+    fn acme_output_truncation_never_splits_utf8() {
+        let budget = ACME_OUTPUT_LIMIT - ACME_TRUNCATED_NOTICE.len();
+
+        // 截断点落在 3 字节中文字符内部：必须回退到字符起点。
+        let mut inside = "a".repeat(budget - 1);
+        inside.push('中');
+        inside.push_str(&"尾".repeat(100));
+        assert!(inside.len() > ACME_OUTPUT_LIMIT);
+        let truncated = truncate_acme_output(inside);
+        assert!(truncated.ends_with(ACME_TRUNCATED_NOTICE));
+        assert!(truncated.len() <= ACME_OUTPUT_LIMIT);
+        assert_eq!(
+            truncated.len(),
+            budget - 1 + ACME_TRUNCATED_NOTICE.len(),
+            "应回退到中文字符起点，不能多删也不能切断"
+        );
+
+        // 截断点恰好在字符边界：预算内原样保留。
+        let mut exact = "a".repeat(budget);
+        exact.push_str(&"中文输出".repeat(10));
+        assert!(exact.len() > ACME_OUTPUT_LIMIT);
+        let truncated = truncate_acme_output(exact);
+        assert!(truncated.ends_with(ACME_TRUNCATED_NOTICE));
+        assert_eq!(truncated.len(), ACME_OUTPUT_LIMIT);
+        assert_eq!(
+            &truncated[..budget],
+            "a".repeat(budget),
+            "边界合法时不能提前截断"
+        );
+
+        // 长 ASCII：总输出仍必须有界。
+        let truncated = truncate_acme_output("x".repeat(ACME_OUTPUT_LIMIT * 3));
+        assert_eq!(truncated.len(), ACME_OUTPUT_LIMIT);
+        assert!(truncated.ends_with(ACME_TRUNCATED_NOTICE));
+
+        // 长中文：所有截断点都必须合法。
+        let mut chinese = "中文输出".repeat(ACME_OUTPUT_LIMIT);
+        chinese.push_str("结束");
+        let truncated = truncate_acme_output(chinese);
+        assert!(truncated.len() <= ACME_OUTPUT_LIMIT);
+        assert!(truncated.ends_with(ACME_TRUNCATED_NOTICE));
+        assert!(truncated.is_char_boundary(truncated.len() - ACME_TRUNCATED_NOTICE.len()));
+
+        // 恰好等于上限：不追加截断提示。
+        let exact_limit = "a".repeat(ACME_OUTPUT_LIMIT);
+        assert_eq!(truncate_acme_output(exact_limit.clone()), exact_limit);
+    }
+
+    /// 走完整 sanitize 路径的长中文输出也必须在超时内返回且有界。
+    #[test]
+    fn acme_output_sanitizer_bounds_long_chinese_output() {
+        let raw = "中文诊断输出\n".repeat(10_000);
+        let sanitized = sanitize_with_timeout(raw);
+        assert!(sanitized.len() <= ACME_OUTPUT_LIMIT, "{}", sanitized.len());
+        assert!(sanitized.ends_with(ACME_TRUNCATED_NOTICE));
+        assert!(!sanitized.contains('\u{FFFD}'));
+    }
+
     #[test]
     fn missing_tls_cli_is_detected_from_clap_error() {
         for text in [
@@ -5801,10 +6179,10 @@ mod tests {
     }
 
     #[test]
-    fn acme_guard_cleans_new_data_dir_and_allows_self_signed_retry() {
+    fn cert_guard_cleans_new_data_dir_and_allows_self_signed_retry() {
         let root = TempDir::new("acme-guard-new");
         let data_dir = root.path().join("data");
-        let mut guard = AcmeCertGuard::capture(&data_dir, false);
+        let mut guard = ServerCertGuard::capture(&data_dir, false);
         guard.arm();
         tls::ensure_client_ca(&data_dir, tls::CertPolicy::default()).unwrap();
         let cert_dir = tls::cert_dir(&data_dir);
@@ -5821,7 +6199,7 @@ mod tests {
     }
 
     #[test]
-    fn acme_guard_restores_old_server_material() {
+    fn cert_guard_restores_old_server_material() {
         let root = TempDir::new("acme-guard-old");
         let data_dir = root.path().join("data");
         let cert_dir = tls::cert_dir(&data_dir);
@@ -5830,7 +6208,7 @@ mod tests {
         fs::write(cert_dir.join(tls::SERVER_KEY_FILE), b"old-key").unwrap();
         fs::write(cert_dir.join(ACME_AGENT_CA_FILE), b"old-agent-ca").unwrap();
 
-        let mut guard = AcmeCertGuard::capture(&data_dir, true);
+        let mut guard = ServerCertGuard::capture(&data_dir, true);
         guard.arm();
         fs::write(cert_dir.join(tls::SERVER_CERT_FILE), b"new-cert").unwrap();
         fs::write(cert_dir.join(tls::SERVER_KEY_FILE), b"new-key").unwrap();
@@ -5853,7 +6231,7 @@ mod tests {
 
         // 安装前没有 agent-ca.pem：回滚时必须删除本次新派生的文件。
         fs::remove_file(cert_dir.join(ACME_AGENT_CA_FILE)).unwrap();
-        let mut guard = AcmeCertGuard::capture(&data_dir, true);
+        let mut guard = ServerCertGuard::capture(&data_dir, true);
         guard.arm();
         fs::write(cert_dir.join(ACME_AGENT_CA_FILE), b"derived-ca").unwrap();
         guard.restore().unwrap();
@@ -5861,14 +6239,14 @@ mod tests {
     }
 
     #[test]
-    fn acme_guard_never_deletes_existing_data_dir_without_old_material() {
+    fn cert_guard_never_deletes_existing_data_dir_without_old_material() {
         let root = TempDir::new("acme-guard-existing");
         let data_dir = root.path().join("data");
         fs::create_dir_all(&data_dir).unwrap();
         let sentinel = data_dir.join("rustboard.db");
         fs::write(&sentinel, b"db").unwrap();
 
-        let mut guard = AcmeCertGuard::capture(&data_dir, true);
+        let mut guard = ServerCertGuard::capture(&data_dir, true);
         guard.arm();
         assert!(!guard.armed, "已有 data_dir 且无旧证书时不应进入清理模式");
         guard.restore().unwrap();
@@ -5985,6 +6363,266 @@ mod tests {
         assert!(result.is_err(), "fallback=false 必须中止");
         let err = result.err().expect("必须有错误");
         assert!(err.to_string().contains("fallback_to_self_signed"), "{err}");
+    }
+
+    /// #72：卸载流程的 fake systemd，走 preflight→execute 完整卸载路径。
+    struct UninstallFakeService {
+        stop_error: Option<&'static str>,
+        stop_calls: std::cell::Cell<usize>,
+        disable_calls: std::cell::Cell<usize>,
+        fragment: Option<PathBuf>,
+        state: std::cell::RefCell<ServiceState>,
+        state_after_stop: ServiceState,
+        state_error: Option<&'static str>,
+    }
+
+    impl UninstallFakeService {
+        fn stopped(fragment: Option<PathBuf>) -> Self {
+            Self {
+                stop_error: None,
+                stop_calls: std::cell::Cell::new(0),
+                disable_calls: std::cell::Cell::new(0),
+                fragment,
+                state: std::cell::RefCell::new(ServiceState::Inactive),
+                state_after_stop: ServiceState::Inactive,
+                state_error: None,
+            }
+        }
+    }
+
+    impl ServiceControl for UninstallFakeService {
+        fn fragment_path(&self, _unit: &str) -> Result<Option<PathBuf>> {
+            Ok(self.fragment.clone())
+        }
+
+        fn ensure_fragment_is(&self, _unit: &str, _expected: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn daemon_reload(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_managing(&self) -> bool {
+            true
+        }
+
+        fn active_state(&self, _unit: &str) -> Result<ServiceState> {
+            match self.state_error {
+                Some(message) => bail!("{message}"),
+                None => Ok(self.state.borrow().clone()),
+            }
+        }
+
+        fn main_pid(&self, _unit: &str) -> Result<u32> {
+            Ok(0)
+        }
+
+        fn enable_now(&self, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn restart(&self, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&self, _unit: &str) -> Result<()> {
+            self.stop_calls.set(self.stop_calls.get() + 1);
+            match self.stop_error {
+                Some(message) => bail!("{message}"),
+                None => {
+                    *self.state.borrow_mut() = self.state_after_stop.clone();
+                    Ok(())
+                }
+            }
+        }
+
+        fn disable(&self, _unit: &str) -> Result<()> {
+            self.disable_calls.set(self.disable_calls.get() + 1);
+            Ok(())
+        }
+    }
+
+    struct HubUninstallFixture {
+        _dir: TempDir,
+        paths: Paths,
+        prefix: PathBuf,
+    }
+
+    fn hub_uninstall_fixture(tag: &str, unit_present: bool) -> HubUninstallFixture {
+        let dir = TempDir::new_in(&install_prefix_base(), tag);
+        let prefix = dir.path().to_path_buf();
+        let paths = Paths::for_role(Role::Hub, &prefix, PathOverrides::default()).unwrap();
+        fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+        fs::write(&paths.config, b"admin_token = \"x\"\n").unwrap();
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        fs::write(paths.data_dir.join("keep"), b"data").unwrap();
+        fs::create_dir_all(paths.unit.parent().unwrap()).unwrap();
+        if unit_present {
+            fs::write(&paths.unit, render_unit(Role::Hub, &paths).unwrap()).unwrap();
+        }
+        fs::create_dir_all(paths.binary.parent().unwrap()).unwrap();
+        fs::write(&paths.binary, b"bin").unwrap();
+
+        let mut state = InstallState::new();
+        state.upsert(
+            Role::Hub,
+            RoleState::new(&paths, env!("CARGO_PKG_VERSION"), paths.backup_root.clone()),
+        );
+        state.save(&paths.state).unwrap();
+        HubUninstallFixture {
+            _dir: dir,
+            paths,
+            prefix,
+        }
+    }
+
+    fn run_hub_uninstall(
+        fixture: HubUninstallFixture,
+        service: &UninstallFakeService,
+    ) -> (Result<()>, HubUninstallFixture) {
+        let args = UninstallArgs {
+            prefix: Some(fixture.prefix.clone()),
+            config: None,
+            unit_dir: None,
+            purge: true,
+            yes: true,
+            dry_run: false,
+        };
+        let result = uninstall_impl(args, Some(service));
+        (result, fixture)
+    }
+
+    /// stop 失败时必须在删除 unit / binary / config / data / state 之前返回。
+    #[test]
+    fn uninstall_stop_failure_preserves_everything() {
+        let fixture = hub_uninstall_fixture("uninstall-stop-fail", true);
+        let unit = fixture.paths.unit.clone();
+        let mut service = UninstallFakeService::stopped(Some(unit));
+        service.stop_error = Some("mock stop failure");
+        service.state = std::cell::RefCell::new(ServiceState::Active);
+        let (result, fixture) = run_hub_uninstall(fixture, &service);
+        let message = format!("{:#}", result.expect_err("stop 失败必须返回错误"));
+        assert!(message.contains("停止 hub 服务"), "{message}");
+        assert!(message.contains("安装状态已保留"), "{message}");
+        assert_eq!(service.stop_calls.get(), 1);
+        assert_eq!(service.disable_calls.get(), 0, "stop 失败不得 disable");
+
+        for path in [
+            &fixture.paths.unit,
+            &fixture.paths.binary,
+            &fixture.paths.config,
+            &fixture.paths.data_dir,
+            &fixture.paths.state,
+        ] {
+            assert!(path.exists(), "stop 失败时必须保留 {}", path.display());
+        }
+        let state = InstallState::load(&fixture.paths.state).unwrap();
+        assert!(state.role(Role::Hub).is_some(), "state 必须保留");
+    }
+
+    /// stop 返回成功但服务仍 active / 状态查询失败：同样不得删除。
+    #[test]
+    fn uninstall_active_or_unknown_state_preserves_everything() {
+        let fixture = hub_uninstall_fixture("uninstall-active", true);
+        let unit = fixture.paths.unit.clone();
+        let mut active = UninstallFakeService::stopped(Some(unit));
+        active.state = std::cell::RefCell::new(ServiceState::Active);
+        active.state_after_stop = ServiceState::Active;
+        let (result, fixture) = run_hub_uninstall(fixture, &active);
+        let message = format!("{:#}", result.expect_err("仍 active 必须失败"));
+        assert!(message.contains("ActiveState=active"), "{message}");
+        assert_eq!(active.disable_calls.get(), 0);
+        for path in [
+            &fixture.paths.unit,
+            &fixture.paths.binary,
+            &fixture.paths.config,
+            &fixture.paths.data_dir,
+            &fixture.paths.state,
+        ] {
+            assert!(path.exists(), "active 时必须保留 {}", path.display());
+        }
+
+        let fixture = hub_uninstall_fixture("uninstall-unknown", true);
+        let unit = fixture.paths.unit.clone();
+        let mut unknown = UninstallFakeService::stopped(Some(unit));
+        unknown.state_error = Some("mock ActiveState failure");
+        let (result, fixture) = run_hub_uninstall(fixture, &unknown);
+        let message = format!("{:#}", result.expect_err("无法确认停止必须失败"));
+        assert!(message.contains("无法确认 hub 服务"), "{message}");
+        assert_eq!(unknown.disable_calls.get(), 0);
+        for path in [
+            &fixture.paths.unit,
+            &fixture.paths.binary,
+            &fixture.paths.config,
+            &fixture.paths.data_dir,
+            &fixture.paths.state,
+        ] {
+            assert!(path.exists(), "状态未知时必须保留 {}", path.display());
+        }
+    }
+
+    /// unit 文件已不存在但同名服务仍 active：preflight 之后也必须拒绝删除/purge。
+    #[test]
+    fn uninstall_missing_unit_but_active_service_preserves_everything() {
+        for (tag, state) in [
+            ("activating", ServiceState::Activating),
+            ("deactivating", ServiceState::Deactivating),
+            ("other", ServiceState::Other("maintenance".to_string())),
+        ] {
+            let fixture = hub_uninstall_fixture(&format!("uninstall-unit-missing-{tag}"), false);
+            let mut service = UninstallFakeService::stopped(None);
+            service.state = std::cell::RefCell::new(state.clone());
+            let (result, fixture) = run_hub_uninstall(fixture, &service);
+            let message = format!("{:#}", result.expect_err("unit 缺失但服务未停止必须失败"));
+            assert!(
+                message.contains(&format!("ActiveState={}", state.as_str())),
+                "{message}"
+            );
+            assert_eq!(service.stop_calls.get(), 0, "unit 缺失时不得 stop");
+            assert_eq!(service.disable_calls.get(), 0);
+            for path in [
+                &fixture.paths.binary,
+                &fixture.paths.config,
+                &fixture.paths.data_dir,
+                &fixture.paths.state,
+            ] {
+                assert!(path.exists(), "必须保留 {}", path.display());
+            }
+        }
+    }
+
+    /// unit 文件缺失但同名服务已明确 stopped：允许清理，且不得 stop / 清理链接。
+    #[test]
+    fn uninstall_missing_unit_but_inactive_service_proceeds() {
+        let fixture = hub_uninstall_fixture("uninstall-unit-missing-inactive", false);
+        let service = UninstallFakeService::stopped(None);
+        let (result, fixture) = run_hub_uninstall(fixture, &service);
+        result.expect("unit 缺失但服务 inactive 时卸载应成功");
+        assert_eq!(service.stop_calls.get(), 0);
+        assert_eq!(service.disable_calls.get(), 0);
+        assert!(!fixture.paths.unit.exists());
+        assert!(!fixture.paths.binary.exists());
+        assert!(!fixture.paths.config.exists());
+        assert!(!fixture.paths.data_dir.exists());
+        assert!(!fixture.paths.state.exists());
+    }
+
+    /// 确认停止后才允许删除全部目标并清理 state。
+    #[test]
+    fn uninstall_successful_stop_removes_files_and_state() {
+        let fixture = hub_uninstall_fixture("uninstall-ok", true);
+        let unit = fixture.paths.unit.clone();
+        let service = UninstallFakeService::stopped(Some(unit));
+        let (result, fixture) = run_hub_uninstall(fixture, &service);
+        result.expect("已停止时卸载应成功");
+        assert_eq!(service.stop_calls.get(), 1);
+        assert_eq!(service.disable_calls.get(), 1);
+        assert!(!fixture.paths.unit.exists());
+        assert!(!fixture.paths.binary.exists());
+        assert!(!fixture.paths.config.exists());
+        assert!(!fixture.paths.data_dir.exists());
+        assert!(!fixture.paths.state.exists());
     }
 
     #[test]

@@ -4,10 +4,11 @@
 hub / panel / agent 三个静态 musl 二进制、前端静态资源、systemd unit 参考文件和
 `install.sh`；安装时不需要下载依赖。
 
-> 当前版本按 `Cargo.toml` 为 `1.0.0-rc.2`；Phase C 已以 `v1.0.0-rc.2` 发布，
-> Phase D 已实现 PostgreSQL 显式 opt-in、迁移/备份/恢复 CLI 与 L-01/L-03 收口，
-> 默认安装仍是 SQLite。正式 `v1.0.0` 发布在 Phase E 完成版本归档后触发。包布局
-> 与命令不随版本变化。
+> 当前版本以根 `Cargo.toml` 的 `[workspace.package].version` 为准
+> （`packaging/build-release.sh` 生成的包名与包内 `VERSION` 都与之一致）；
+> Phase C RC 已发布，Phase D 已实现 PostgreSQL 显式 opt-in、迁移/备份/恢复 CLI
+> 与 L-01/L-03 收口，默认安装仍是 SQLite。正式 `v1.0.0` 发布在 Phase E 完成
+> 版本归档后触发。包布局与命令不随版本变化。
 >
 > 构建/维护说明见 [packaging/README.md](../../packaging/README.md)；Docker 交付见
 > [docker.md](docker.md)。
@@ -38,8 +39,11 @@ serverdashboard-v<version>-<arch>/
 
 ```bash
 sha256sum -c SHA256SUMS.x86_64
-tar -xzf serverdashboard-v1.0.0-rc.2-x86_64.tar.gz
-cd serverdashboard-v1.0.0-rc.2-x86_64
+# 以当前目录实际下载的 x86_64 包为准；多个版本并存时把 TARBALL 显式改成要安装的包
+TARBALL=$(find . -maxdepth 1 -name 'serverdashboard-v*-x86_64.tar.gz' -print -quit)
+test -n "$TARBALL" || { echo '找不到 x86_64 离线包' >&2; exit 1; }
+tar -xzf "$TARBALL"
+cd "${TARBALL%.tar.gz}"
 sha256sum -c --strict SHA256SUMS
 ```
 

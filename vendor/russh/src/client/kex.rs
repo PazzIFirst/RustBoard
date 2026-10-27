@@ -415,6 +415,7 @@ fn compute_keys(
         session_id_ref,
         &hash,
         names.cipher,
+        names.server_cipher,
         names.server_mac,
         names.client_mac,
         false,

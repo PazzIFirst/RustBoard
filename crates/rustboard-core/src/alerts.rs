@@ -11,7 +11,9 @@
 //! 安全约定：
 //! - 规则名等用户输入只做格式校验，**错误信息不回显原始输入**（防止把超长 /
 //!   控制字符带进响应与日志）；
-//! - `channel_ids` 只校验格式与数量，不查渠道是否存在（渠道 CRUD 在 B2）；
+//! - `channel_ids` 在本层只校验格式与数量；渠道是否存在、是否启用由存储层在
+//!   写规则事务内复核（并发删除 / 禁用时返回
+//!   [`AlertRuleStoreError::ChannelNotFound`] / [`AlertRuleStoreError::ChannelDisabled`]）；
 //! - 内置规则固定 id、初始 disabled：升级后没有渠道时不会产生意外通知。
 
 use std::collections::BTreeSet;
@@ -138,7 +140,7 @@ impl Comparator {
     }
 }
 
-/// 一条告警规则（schema v7 `alert_rules` 的一行，JSON 即管理 API 结构）。
+/// 一条告警规则（schema v9 `alert_rules` 的一行，JSON 即管理 API 结构）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlertRule {
     /// 主键：自定义规则为 UUID，内置规则为固定的 `builtin-*`。
@@ -163,7 +165,10 @@ pub struct AlertRule {
     pub filter_agent_id: Option<String>,
     /// 精确子集匹配的 labels。
     pub filter_labels: Labels,
-    /// 绑定的通知渠道 id；B1a 只存不校验渠道是否存在。
+    /// 绑定的通知渠道 id；管理 API 兼容字段。
+    ///
+    /// 存储层在规则写事务内同时维护 JSON 与 `alert_rule_channels` 关系行，
+    /// 并校验渠道存在且启用；读取时两处不一致会 fail closed。
     pub channel_ids: Vec<String>,
     /// 恢复时是否发送通知。
     pub notify_on_resolve: bool,
@@ -175,6 +180,12 @@ pub struct AlertRule {
     pub created_at: i64,
     /// 最近修改时间（Unix 毫秒）。
     pub updated_at: i64,
+    /// 规则内容版本；每次更新由存储层执行 `revision = revision + 1`。
+    ///
+    /// 仅用于评估事务的 CAS（旧评估结果必须能识别规则已被改过），
+    /// 不属于管理 API JSON：序列化时跳过，反序列化默认 0。
+    #[serde(skip)]
+    pub revision: i64,
 }
 
 impl AlertRule {
@@ -496,6 +507,17 @@ pub enum AlertRuleStoreError {
     LimitReached,
     /// 内置规则不允许删除（403 `builtin_rule`）。
     BuiltinRule,
+    /// 规则引用的通知渠道不存在（400 `channel_not_found`）。
+    ///
+    /// Hub 在写入前会先校验渠道存在 / 启用，但该校验与落库不在同一事务；
+    /// 并发删除渠道时仍可能在这里失败。存储层在写规则的同一事务内复核，
+    /// 映射成与前置校验一致的 400，而不是 500。
+    ChannelNotFound,
+    /// 规则引用的通知渠道存在但已禁用（400 `channel_disabled`）。
+    ///
+    /// 与 Hub 的前置校验一致：启用中的规则不能绑定禁用渠道；存储层在写事务内
+    /// 复核，避免并发禁用造成“规则可用但永远发不出去”的静默配置。
+    ChannelDisabled,
 }
 
 impl fmt::Display for AlertRuleStoreError {
@@ -505,11 +527,29 @@ impl fmt::Display for AlertRuleStoreError {
             Self::NameExists => write!(f, "告警规则名称已存在"),
             Self::LimitReached => write!(f, "告警规则数量已达上限 {MAX_ALERT_RULES} 条"),
             Self::BuiltinRule => write!(f, "内置告警规则不允许删除"),
+            Self::ChannelNotFound => write!(f, "告警规则引用的通知渠道不存在"),
+            Self::ChannelDisabled => write!(f, "告警规则引用的通知渠道已禁用"),
         }
     }
 }
 
 impl std::error::Error for AlertRuleStoreError {}
+
+/// [`Storage::apply_alert_evaluation`] 的事务结果。
+///
+/// CAS 的判定标准是事务内重新读取的 `alert_rules.enabled` 与 `revision`：
+/// 规则不存在、已禁用或 revision 与评估开始时读到的不一致，都意味着本轮
+/// 评估结果已经过期，**不得**写入任何状态 / 事件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertEvaluationOutcome {
+    /// 规则仍启用且 revision 匹配；事件 / 状态已在同一事务内落库。
+    Applied {
+        /// 本事务按每规则状态上限淘汰的行数。
+        removed: usize,
+    },
+    /// 规则不存在、已禁用或 revision 已变化；未写入 / 未清理任何数据。
+    Stale,
+}
 
 /// 静默存储的领域错误；hub 映射成固定 409 `silence_limit`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,6 +684,7 @@ fn builtin_rule(
         updated_by: "builtin".to_string(),
         created_at: now,
         updated_at: now,
+        revision: 0,
     }
 }
 
@@ -1208,7 +1249,23 @@ mod tests {
             updated_by: "admin".into(),
             created_at: 1,
             updated_at: 1,
+            revision: 0,
         }
+    }
+
+    /// revision 是存储层内部字段：API JSON 不输出，反序列化默认 0。
+    #[test]
+    fn alert_rule_revision_is_not_part_of_api_json() {
+        let rule = base_rule();
+        let json = serde_json::to_value(&rule).expect("AlertRule 必须可序列化");
+        assert!(
+            json.get("revision").is_none(),
+            "API JSON 不得输出内部 revision 字段：{json}"
+        );
+
+        let parsed: AlertRule = serde_json::from_value(json).expect("AlertRule 必须可反序列化");
+        assert_eq!(parsed.revision, 0, "反序列化时 revision 必须默认 0");
+        assert_eq!(parsed, rule, "跳过 revision 不得改变其它字段");
     }
 
     /// 内置规则：固定 id、5 条、全部 disabled、is_builtin、无渠道、阈值语义正确。
@@ -1570,6 +1627,8 @@ mod tests {
         for error in [
             AlertRuleStoreError::NameExists,
             AlertRuleStoreError::BuiltinRule,
+            AlertRuleStoreError::ChannelNotFound,
+            AlertRuleStoreError::ChannelDisabled,
         ] {
             let text = error.to_string();
             assert!(!text.is_empty());

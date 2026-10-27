@@ -36,10 +36,11 @@ use rustboard_common::tls;
 use rustboard_common::util::hostname;
 use rustboard_common::VERSION;
 use rustboard_install::{
-    detect_system, is_systemd_unit_dir, read_private_file, render_unit, require_root,
-    require_systemd, shell_arg, unit_is_ours, validate_install_prefix, validate_managed_path,
+    detect_system, ensure_service_stopped, is_systemd_unit_dir, read_private_file,
+    remove_enable_symlink, render_unit, require_root, require_systemd, shell_arg,
+    stop_service_checked, unit_is_ours, validate_install_prefix, validate_managed_path,
     InstallLock, InstallState, InstallTxn, ManagedPathKind, PathOverrides, Paths, Prompt, Role,
-    RoleState, ServiceManager,
+    RoleState, ServiceControl, ServiceManager, ServiceState,
 };
 
 const AGENT_CERT: &str = "agent.crt";
@@ -93,6 +94,19 @@ const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// enrollment 轮询间隔。
 const ENROLLMENT_POLL: Duration = Duration::from_millis(200);
 
+/// 重启 / 启动后等待 systemd 报告新 MainPID 的上限。
+///
+/// `enable --now` 对已经在运行的服务是 no-op；`was_active` 的升级必须 restart
+/// 并确认产生了新进程，否则会把“旧二进制仍在跑”误报成安装成功。
+const SERVICE_START_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 等待新 MainPID 的轮询间隔。
+const SERVICE_START_POLL: Duration = Duration::from_millis(100);
+
+/// 确认新进程稳定运行的间隔：重启后必须连续两次（间隔约 500ms）看到
+/// ActiveState=active，避免 crash-loop 的瞬时 active 被误判为成功。
+const SERVICE_STABLE_INTERVAL: Duration = Duration::from_millis(500);
+
 /// systemd unit 文件名（固定名字，与 `render_unit` / packaging 一致）。
 const AGENT_UNIT_NAME: &str = "rustboard-agent.service";
 
@@ -137,7 +151,8 @@ pub struct InstallArgs {
     pub token_file: Option<PathBuf>,
     /// hub 服务端证书 SHA-256 指纹；支持 64 位 hex 或 `sha256:...`。
     ///
-    /// `fingerprint` 模式新装必填；`custom-ca` 模式可选；`system-roots` 模式不需要。
+    /// `fingerprint` 模式新装必填；`custom-ca` 模式可选；
+    /// `system-roots` 模式不使用（显式提供会被拒绝）。
     #[arg(long)]
     pub fingerprint: Option<String>,
     /// 服务端信任模型；默认 `fingerprint`（旧 CLI 不传时行为不变）。
@@ -377,6 +392,9 @@ pub fn install(args: InstallArgs) -> Result<()> {
         if let Some(tls_mode) = requested_tls_mode {
             cfg.tls_mode = tls_mode;
         }
+        // 模式可能来自旧配置或本次 --tls-mode；system-roots 下显式 --fingerprint
+        // 不能静默忽略，否则用户会误以为仍启用了证书 pin。
+        reject_system_roots_fingerprint(cfg.tls_mode, args.fingerprint.as_deref())?;
         if let Some(fingerprint) = args.fingerprint.as_deref() {
             cfg.server_fingerprint = normalize_fingerprint(fingerprint)?;
         }
@@ -490,10 +508,22 @@ pub fn install(args: InstallArgs) -> Result<()> {
     // 记录安装前服务状态：只有本次确实 enable/start 过才 stop/disable；原本
     // active 的话，回滚成功后尽力把旧服务恢复回来。
     let was_active = if manage {
-        manager.is_active(AGENT_UNIT_NAME).unwrap_or(false)
+        manager
+            .is_active(AGENT_UNIT_NAME)
+            .context("查询 agent 服务当前状态失败，拒绝在状态未知时安装")?
     } else {
         false
     };
+    // 记录安装前的 MainPID：was_active 时必须确认 restart 产生了新进程，不能
+    // 只凭 enable --now 成功或 enrollment 文件存在判断新二进制/配置已生效。
+    let previous_pid = if manage && was_active {
+        manager
+            .main_pid(AGENT_UNIT_NAME)
+            .context("读取当前 agent 服务 MainPID 失败，无法验证重启结果")?
+    } else {
+        0
+    };
+    ensure_active_service_pid(was_active, previous_pid)?;
     let mut started = false;
     let mut txn = InstallTxn::begin(&paths, false)?;
 
@@ -522,20 +552,23 @@ pub fn install(args: InstallArgs) -> Result<()> {
             manager
                 .daemon_reload()
                 .context("systemctl daemon-reload 失败")?;
-            // systemd 按 unit 名字操作：写完 unit 并 reload 后，必须确认它实际
-            // 解析到的就是本次写入的文件，才能 enable/start。
+            // 先确认 systemd 解析到本次写入的 unit，之后才允许标记“已激活”；
+            // 归属确认失败时不应 stop/disable 原本在跑的服务。真正的 enable /
+            // restart 失败发生在 started=true 之后，回滚会恢复旧文件与服务。
             manager
                 .ensure_fragment_is(AGENT_UNIT_NAME, &paths.unit)
-                .context("systemd 未解析到本次写入的 agent unit，拒绝 enable/start")?;
-            manager
-                .enable_now(AGENT_UNIT_NAME)
-                .context("启动 agent 服务失败（systemctl enable --now）")?;
+                .context("systemd 未解析到本次写入的 agent unit，拒绝启动/重启")?;
             started = true;
+            activate_agent_service(
+                &manager,
+                AGENT_UNIT_NAME,
+                &paths.unit,
+                was_active,
+                previous_pid,
+                SERVICE_START_VERIFY_TIMEOUT,
+            )?;
             // enrollment 等待前后各确认一次：期间同名 unit 可能被更高优先级
             // 文件或 transient unit 顶替，不能在归属不确定时等待/记录成功。
-            manager
-                .ensure_fragment_is(AGENT_UNIT_NAME, &paths.unit)
-                .context("enable 后 systemd 解析的 agent unit 已变化，拒绝等待 enrollment")?;
             wait_for_enrollment(&paths.data_dir, ENROLLMENT_TIMEOUT)?;
             manager
                 .ensure_fragment_is(AGENT_UNIT_NAME, &paths.unit)
@@ -552,55 +585,16 @@ pub fn install(args: InstallArgs) -> Result<()> {
     })();
 
     if let Err(err) = result {
-        let mut message = format!("安装失败: {err:#}");
-        // 只有本次确实 enable/start 过才 stop/disable；失败也不能阻止回滚。
-        // 回滚同样只能操作 systemd 实际解析到的、本安装器写入的 unit；解析
-        // 不一致时宁可留下服务，也不能停掉同名外来 unit。
-        if started {
-            match manager.ensure_fragment_is(AGENT_UNIT_NAME, &paths.unit) {
-                Ok(()) => {
-                    if let Err(stop_err) = manager.stop_disable(AGENT_UNIT_NAME) {
-                        message.push_str(&format!("；停止本次启动的 agent 服务失败: {stop_err:#}"));
-                    }
-                }
-                Err(guard_err) => message.push_str(&format!(
-                    "；回滚停止服务前确认 unit 归属失败，未 stop/disable 以避免影响外来服务: {guard_err:#}"
-                )),
-            }
-        }
-        let rollback_ok = match txn.rollback() {
-            Ok(()) => true,
-            Err(rollback_err) => {
-                message.push_str(&format!("；回滚本次写入失败: {rollback_err:#}"));
-                false
-            }
-        };
-        // 回滚可能删除本次新建的 unit 或恢复旧 unit；reload 放在回滚之后，
-        // 避免 systemd 继续持有已回滚文件的旧缓存。reload 错误并入返回错误。
-        if manage {
-            if let Err(reload_err) = manager.daemon_reload() {
-                message.push_str(&format!("；回滚后 daemon-reload 失败: {reload_err:#}"));
-            }
-        }
-        if let Err(restore_err) = restore_state(&paths.state, previous_state.as_deref()) {
-            message.push_str(&format!("；恢复安装状态失败: {restore_err:#}"));
-        }
-        // 原本 active 的旧服务在回滚成功后尽力恢复；失败只追加说明，不掩盖
-        // 原始错误。恢复前同样确认 systemd 解析到的是本安装器的 unit。
-        if rollback_ok && started && was_active {
-            match manager.ensure_fragment_is(AGENT_UNIT_NAME, &paths.unit) {
-                Ok(()) => {
-                    if let Err(restart_err) = manager.enable_now(AGENT_UNIT_NAME) {
-                        message
-                            .push_str(&format!("；回滚后恢复原有 agent 服务失败: {restart_err:#}"));
-                    }
-                }
-                Err(guard_err) => message.push_str(&format!(
-                    "；回滚后 unit 归属已变化，未恢复原有 agent 服务: {guard_err:#}"
-                )),
-            }
-        }
-        return Err(anyhow!(message));
+        return Err(rollback_agent_install(
+            &manager,
+            &paths,
+            &mut txn,
+            previous_state.as_deref(),
+            started,
+            was_active,
+            manage,
+            err,
+        ));
     }
 
     txn.commit()?;
@@ -608,8 +602,85 @@ pub fn install(args: InstallArgs) -> Result<()> {
     Ok(())
 }
 
+/// 安装失败后的回滚：停掉本次启动的服务、恢复旧文件/state，并尽量恢复原有
+/// active 服务。
+///
+/// 独立成函数便于用 fake [`ServiceControl`] 验证“失败后旧文件与旧服务状态
+/// 都恢复”这条路径，而不必真的调用宿主机 systemd。
+#[allow(clippy::too_many_arguments)]
+fn rollback_agent_install(
+    service: &dyn ServiceControl,
+    paths: &Paths,
+    txn: &mut InstallTxn,
+    previous_state: Option<&[u8]>,
+    started: bool,
+    was_active: bool,
+    manage: bool,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let mut message = format!("安装失败: {error:#}");
+    // 只有本次确实 enable/start/restart 过才 stop/disable；失败也不能阻止回滚。
+    // 回滚同样只能操作 systemd 实际解析到的、本安装器写入的 unit；解析不一致
+    // 时宁可留下服务，也不能停掉同名外来 unit。
+    if started {
+        match service.ensure_fragment_is(AGENT_UNIT_NAME, &paths.unit) {
+            Ok(()) => {
+                if let Err(stop_err) = service.stop(AGENT_UNIT_NAME) {
+                    message.push_str(&format!("；停止本次启动的 agent 服务失败: {stop_err:#}"));
+                }
+                if let Err(disable_err) = service.disable(AGENT_UNIT_NAME) {
+                    message.push_str(&format!(
+                        "；禁用本次启动的 agent 服务失败: {disable_err:#}"
+                    ));
+                }
+            }
+            Err(guard_err) => message.push_str(&format!(
+                "；回滚停止服务前确认 unit 归属失败，未 stop/disable 以避免影响外来服务: {guard_err:#}"
+            )),
+        }
+    }
+    let rollback_ok = match txn.rollback() {
+        Ok(()) => true,
+        Err(rollback_err) => {
+            message.push_str(&format!("；回滚本次写入失败: {rollback_err:#}"));
+            false
+        }
+    };
+    // 回滚可能删除本次新建的 unit 或恢复旧 unit；reload 放在回滚之后，
+    // 避免 systemd 继续持有已回滚文件的旧缓存。reload 错误并入返回错误。
+    if manage {
+        if let Err(reload_err) = service.daemon_reload() {
+            message.push_str(&format!("；回滚后 daemon-reload 失败: {reload_err:#}"));
+        }
+    }
+    if let Err(restore_err) = restore_state(&paths.state, previous_state) {
+        message.push_str(&format!("；恢复安装状态失败: {restore_err:#}"));
+    }
+    // 原本 active 的旧服务在回滚成功后尽力恢复：先 enable 恢复自启，再 restart
+    // 让恢复后的旧文件生效（只 enable --now 对仍在运行/半停止的服务不可靠）。
+    if rollback_ok && started && was_active {
+        match restore_agent_service_after_rollback(
+            service,
+            AGENT_UNIT_NAME,
+            &paths.unit,
+            SERVICE_START_VERIFY_TIMEOUT,
+        ) {
+            Ok(()) => {}
+            Err(restart_err) => {
+                message.push_str(&format!("；回滚后恢复原有 agent 服务失败: {restart_err:#}"))
+            }
+        }
+    }
+    anyhow!(message)
+}
+
 /// 执行 `rustboard-agent uninstall`。
 pub fn uninstall(args: UninstallArgs) -> Result<()> {
+    uninstall_impl(args, None)
+}
+
+/// 带可注入 systemd 的卸载实现（测试用 fake，生产只经 [`uninstall`] 进入）。
+fn uninstall_impl(args: UninstallArgs, injected: Option<&dyn ServiceControl>) -> Result<()> {
     let system = detect_system();
     // P-01：同 install，必须用**原始** prefix 先校验；Paths::for_role 会把
     // `//`、尾斜杠与 `.` 归一化，先归一化再校验会让 `--prefix //` 指向生产路径。
@@ -618,7 +689,7 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
     // H1：顺序固定为 校验 prefix → 获取全局锁 → 读取 state。任何一步失败都不
     // 会停止服务或删除文件。
     validate_install_prefix(&paths.prefix).context("安装前缀不安全，拒绝卸载")?;
-    let _lock = if args.dry_run {
+    let _lock = if args.dry_run || injected.is_some() {
         None
     } else {
         Some(InstallLock::acquire_global().context("获取全局卸载锁失败")?)
@@ -647,11 +718,13 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
     preflight_uninstall_targets(&paths, &own_paths, args.purge)?;
 
     let unit_present = path_present(&unit_path);
-    // R-S2：systemd 管理只认 is_systemd_unit_dir 的完整列表，并且必须确实存在
-    // 对应 unit 文件（且 preflight 已确认归属本安装器）；unit 文件不存在时，
-    // 即使同名服务 active 也不 stop/disable。prefix 内 unit 只删文件。
-    let in_systemd_dir = unit_path.parent().is_some_and(is_systemd_unit_dir);
-    let service_candidate = system.systemd && unit_present && in_systemd_dir;
+    // R-S2：systemd 管理只认 is_systemd_unit_dir 的完整列表；prefix 内 unit 只删
+    // 文件。注意 `check_service` 不能依赖 unit 文件是否存在：文件被删掉后同名
+    // 服务仍可能 active/activating/reloading，卸载前必须查询并拒绝。
+    let in_systemd_dir = injected.is_some() || unit_path.parent().is_some_and(is_systemd_unit_dir);
+    let systemd_available = injected.is_some() || system.systemd;
+    let check_service = systemd_available && in_systemd_dir;
+    let service_candidate = unit_present && check_service;
 
     let binary_present = path_present(&binary_path);
     let config_present = path_present(&config_path);
@@ -680,15 +753,22 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| paths.prefix.clone());
     let fragment = if service_candidate {
-        let probe = ServiceManager::new(unit_dir.clone(), true, false);
-        probe
-            .fragment_path(&unit_name)
-            .with_context(|| format!("查询 systemd 实际解析的 unit {unit_name} 失败"))?
+        match injected {
+            Some(service) => service
+                .fragment_path(&unit_name)
+                .with_context(|| format!("查询 systemd 实际解析的 unit {unit_name} 失败"))?,
+            None => {
+                let probe = ServiceManager::new(unit_dir.clone(), true, false);
+                probe
+                    .fragment_path(&unit_name)
+                    .with_context(|| format!("查询 systemd 实际解析的 unit {unit_name} 失败"))?
+            }
+        }
     } else {
         None
     };
     let manage_service = match uninstall_unit_action(
-        system.systemd,
+        systemd_available,
         unit_present,
         in_systemd_dir,
         fragment.as_deref(),
@@ -750,29 +830,74 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
         return Ok(());
     }
 
-    if manage_service {
+    if manage_service && injected.is_none() {
         require_root().context("停止/禁用系统 agent 服务需要 root")?;
     }
-    let manager = ServiceManager::new(unit_dir, manage_service, false);
+    let manager = ServiceManager::new(unit_dir, check_service, false);
+    let service: &dyn ServiceControl = injected.unwrap_or(&manager);
+    execute_uninstall(
+        &paths,
+        &own_paths,
+        state,
+        record.as_ref(),
+        &unit_name,
+        purge,
+        manage_service,
+        check_service,
+        service,
+    )
+}
 
-    let mut txn = InstallTxn::begin(&paths, false)?;
-    // 只有 preflight 已确认“unit 文件存在、属于本安装器且 systemd 实际解析到
-    // 它”时才操作 systemd；停服前再复核一次，缩小 preflight 与 stop 之间被
-    // 替换的窗口。disable 失败只警告并继续，避免把 unit 文件留在系统里。
-    if manage_service && path_present(&unit_path) {
-        ensure_existing_unit_is_ours(&unit_path, &own_paths, "停止/删除")?;
-        manager
-            .ensure_fragment_is(&unit_name, &unit_path)
+/// 执行已通过 preflight / 确认的 agent 卸载动作。
+///
+/// 独立成函数便于测试注入 [`ServiceControl`]：stop 失败或无法确认 inactive 时
+/// 必须在创建删除事务之前返回，unit、binary、config、data 与 state 全部保留。
+#[allow(clippy::too_many_arguments)]
+fn execute_uninstall(
+    paths: &Paths,
+    own_paths: &Paths,
+    state: InstallState,
+    record: Option<&RoleState>,
+    unit_name: &str,
+    purge: bool,
+    manage_service: bool,
+    check_service: bool,
+    service: &dyn ServiceControl,
+) -> Result<()> {
+    let unit_path = own_paths.unit.clone();
+    let binary_path = own_paths.binary.clone();
+    let config_path = own_paths.config.clone();
+    let data_dir = own_paths.data_dir.clone();
+
+    // 停服前再复核一次 unit 归属与 FragmentPath；确认不了就绝不 stop/disable，
+    // 也不创建删除事务。stop 失败或无法确认已停止时立即返回，保留全部文件。
+    if path_present(&unit_path) {
+        ensure_existing_unit_is_ours(&unit_path, own_paths, "停止/删除")?;
+    }
+    if manage_service {
+        service
+            .ensure_fragment_is(unit_name, &unit_path)
             .context("systemd 实际解析的 agent unit 已变化，拒绝 stop/disable")?;
-        if let Err(err) = manager.stop_disable(&unit_name) {
-            eprintln!("警告：停止/禁用 agent 服务失败，继续删除 unit: {err:#}");
+        stop_service_checked(service, unit_name, "agent")?;
+    } else if check_service {
+        // unit 文件不存在 / FragmentPath 为空（transient）时不能 stop，但同名
+        // 服务仍在运行就绝不能删除与 purge。
+        ensure_service_stopped(service, unit_name, "agent")?;
+    }
+
+    // 在删除 unit 之前清理 wants 链接：remove_enable_symlink 需要按本安装
+    // unit 的真实路径确认链接归属，unit 文件缺失时它会保留链接（不按名字删）。
+    if check_service {
+        if let Some(dir) = unit_path.parent() {
+            remove_enable_symlink(dir, unit_name, &unit_path).context("清理 agent 启用链接失败")?;
         }
     }
 
+    let mut txn = InstallTxn::begin(paths, false)?;
     let result = (|| -> Result<()> {
         txn.remove(&unit_path)?;
         if manage_service {
-            manager
+            service
                 .daemon_reload()
                 .context("删除 unit 后 daemon-reload 失败")?;
         }
@@ -803,7 +928,7 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
             message.push_str(&format!("；回滚本次删除失败: {rollback_err:#}"));
         }
         if manage_service {
-            if let Err(reload_err) = manager.daemon_reload() {
+            if let Err(reload_err) = service.daemon_reload() {
                 message.push_str(&format!("；回滚后 daemon-reload 失败: {reload_err:#}"));
             }
         }
@@ -1259,6 +1384,14 @@ fn read_token(path: &Path) -> Result<String> {
     Ok(token.to_string())
 }
 
+/// system-roots 不使用 `--fingerprint`；显式传入必须拒绝，不能静默忽略。
+fn reject_system_roots_fingerprint(mode: AgentTlsMode, fingerprint: Option<&str>) -> Result<()> {
+    if mode == AgentTlsMode::SystemRoots && fingerprint.is_some() {
+        bail!("system-roots 模式不使用 --fingerprint；公共 ACME 证书由系统根 + URL 主机名校验");
+    }
+    Ok(())
+}
+
 /// 新装时校验 `--tls-mode` 与 `--fingerprint` / `--server-ca` 的组合。
 ///
 /// 抽成纯函数便于单测；`--force` 复用旧配置时模式可能来自旧配置，因此不能
@@ -1278,6 +1411,7 @@ fn validate_fresh_tls_args(
             }
         }
         AgentTlsMode::SystemRoots => {
+            reject_system_roots_fingerprint(mode, fingerprint)?;
             if server_ca.is_some() {
                 bail!("system-roots 模式不使用 --server-ca；公共 ACME 证书由系统根校验");
             }
@@ -1293,11 +1427,19 @@ fn validate_fresh_tls_args(
 
 /// 读取并校验 `--server-ca`：
 ///
+/// - 必须是绝对路径，且从 `/` 到目标不存在任何符号链接组件；
 /// - 0600/0644 的普通文件、非符号链接、≤1 MiB（防止误把目录/私钥/大文件读进内存）；
 /// - UTF-8 PEM，至少一张可解析证书（可包含多张，作为多根 bundle 复制）。
 ///
 /// 错误信息只包含路径与原因，不打印证书内容。返回原始字节供事务原样复制。
 fn read_server_ca(path: &Path) -> Result<Vec<u8>> {
+    if !path.is_absolute() {
+        bail!("--server-ca 必须是绝对路径: {}", path.display());
+    }
+    // 逐组件拒绝符号链接：只检查最终文件挡不住父目录被替换成链接后读取任意文件。
+    // context 放在外层，底层“符号链接”根因仍保留在 `{err:#}` 错误链中。
+    reject_symlink_components(path)
+        .with_context(|| format!("--server-ca 路径不安全: {}", path.display()))?;
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("读取 --server-ca {} 失败", path.display()))?;
     if meta.file_type().is_symlink() {
@@ -1420,6 +1562,137 @@ fn file_is_nonempty(path: &Path) -> bool {
         Ok(meta) => meta.file_type().is_file() && meta.len() > 0,
         Err(_) => false,
     }
+}
+
+/// 已 active 的服务必须能读到有效旧 MainPID，否则 restart 无法验证是否真的
+/// 切换了进程（`enable --now` 的 no-op 会被误报成功），应 fail closed。
+fn ensure_active_service_pid(was_active: bool, previous_pid: u32) -> Result<()> {
+    if was_active && previous_pid == 0 {
+        bail!(
+            "agent 服务当前处于 active，但 MainPID 为 0；无法验证 restart 是否切换进程，拒绝安装"
+        );
+    }
+    Ok(())
+}
+
+/// 等待 systemd 报告 agent 新进程稳定运行。
+///
+/// `previous_pid` 是安装前记录的主进程（0 表示安装前未运行或无法区分）。重启后
+/// 必须同时满足：
+/// - `ActiveState` 精确为 `active`；
+/// - `MainPID` > 0，且与已知的旧 PID 不同（旧 PID 为 0 时不跳过稳定性校验）；
+/// - 同一 MainPID 连续两次（间隔约 500ms）保持 active，防止 crash-loop 的
+///   瞬时 active / 旧 enrollment 文件被误判为成功。
+fn wait_for_agent_process(
+    service: &dyn ServiceControl,
+    unit: &str,
+    previous_pid: Option<u32>,
+    timeout: Duration,
+) -> Result<u32> {
+    let deadline = Instant::now() + timeout;
+    let mut candidate: Option<(u32, Instant)> = None;
+    loop {
+        let state = service
+            .active_state(unit)
+            .with_context(|| format!("查询 {unit} 的 ActiveState 失败"))?;
+        if state == ServiceState::Active {
+            let pid = service
+                .main_pid(unit)
+                .with_context(|| format!("查询 {unit} 的 MainPID 失败"))?;
+            let changed = previous_pid.is_none_or(|old| old == 0 || pid != old);
+            if pid > 0 && changed {
+                match candidate {
+                    Some((same_pid, since))
+                        if same_pid == pid && since.elapsed() >= SERVICE_STABLE_INTERVAL =>
+                    {
+                        return Ok(pid);
+                    }
+                    Some((same_pid, _)) if same_pid == pid => {}
+                    _ => candidate = Some((pid, Instant::now())),
+                }
+            } else {
+                candidate = None;
+            }
+        } else {
+            // activating / reloading / deactivating / failed 都不算稳定运行。
+            candidate = None;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            let expected = previous_pid
+                .filter(|pid| *pid > 0)
+                .map(|pid| format!("（安装前 MainPID={pid}）"))
+                .unwrap_or_default();
+            bail!(
+                "agent 服务未在 {timeout:?} 内确认切换到新进程并稳定运行{expected}                 （要求 ActiveState=active 且同一 MainPID 连续 {}ms）；                 不能用 enable --now / enrollment 文件存在代替 restart 验证",
+                SERVICE_STABLE_INTERVAL.as_millis()
+            );
+        }
+        std::thread::sleep(SERVICE_START_POLL.min(deadline - now));
+    }
+}
+
+/// 启动 / 重启 agent 服务并验证新进程。
+///
+/// - `was_active`：先 `enable --now` 保证开机自启，再 `restart` 强制加载新
+///   二进制与配置，并等待 MainPID 变化；
+/// - 原本未运行：`enable --now` 启动，等待出现新 MainPID；
+/// - 调用前后都校验 FragmentPath，防止同名外来 unit 在窗口内抢占。
+fn activate_agent_service(
+    service: &dyn ServiceControl,
+    unit: &str,
+    expected_unit: &Path,
+    was_active: bool,
+    previous_pid: u32,
+    timeout: Duration,
+) -> Result<u32> {
+    service
+        .ensure_fragment_is(unit, expected_unit)
+        .context("systemd 未解析到本次写入的 agent unit，拒绝启动/重启")?;
+    service
+        .enable_now(unit)
+        .context("启用 agent 服务失败（systemctl enable --now）")?;
+    if was_active {
+        // 关键：已运行的服务仅 enable --now 不会加载新文件，必须 restart。
+        service
+            .restart(unit)
+            .context("重启 agent 服务失败（systemctl restart）")?;
+    }
+    let pid = wait_for_agent_process(
+        service,
+        unit,
+        if was_active { Some(previous_pid) } else { None },
+        timeout,
+    )
+    .context("agent 服务未确认使用新进程，拒绝写入安装状态")?;
+    service
+        .ensure_fragment_is(unit, expected_unit)
+        .context("启动/重启后 systemd 解析的 agent unit 已变化，拒绝写入安装状态")?;
+    Ok(pid)
+}
+
+/// 回滚后恢复原本 active 的旧服务。
+///
+/// 回滚已恢复旧 unit/config/binary；这里先 enable 恢复开机自启，再 restart
+/// 让旧文件真正生效（若失败前的 stop 未成功，仅 enable --now 不会重启）。
+fn restore_agent_service_after_rollback(
+    service: &dyn ServiceControl,
+    unit: &str,
+    expected_unit: &Path,
+    timeout: Duration,
+) -> Result<()> {
+    service
+        .ensure_fragment_is(unit, expected_unit)
+        .context("回滚后 unit 归属已变化，未恢复原有 agent 服务")?;
+    service
+        .enable_now(unit)
+        .context("回滚后重新启用 agent 服务失败")?;
+    service
+        .restart(unit)
+        .context("回滚后重启 agent 旧服务失败")?;
+    // 尽力确认服务重新运行；旧 PID 已无意义，只要求出现有效 MainPID。
+    wait_for_agent_process(service, unit, None, timeout).context("回滚后 agent 服务未重新运行")?;
+    Ok(())
 }
 
 /// 轮询等待 enrollment 落盘；超时错误只列出缺失文件名，不读取内容。
@@ -1941,8 +2214,6 @@ mod tests {
             .expect("fingerprint + 指纹必须合法");
         validate_fresh_tls_args(AgentTlsMode::SystemRoots, None, None)
             .expect("system-roots 不需要指纹/CA");
-        validate_fresh_tls_args(AgentTlsMode::SystemRoots, Some(&fingerprint), None)
-            .expect("system-roots 携带旧指纹也应允许");
         validate_fresh_tls_args(AgentTlsMode::CustomCa, None, Some(ca))
             .expect("custom-ca + CA 必须合法");
         validate_fresh_tls_args(AgentTlsMode::CustomCa, Some(&fingerprint), Some(ca))
@@ -1955,6 +2226,12 @@ mod tests {
                 Some(fingerprint.as_str()),
                 Some(ca),
                 "--server-ca",
+            ),
+            (
+                AgentTlsMode::SystemRoots,
+                Some(fingerprint.as_str()),
+                None,
+                "--fingerprint",
             ),
             (AgentTlsMode::SystemRoots, None, Some(ca), "--server-ca"),
             (AgentTlsMode::CustomCa, None, None, "--server-ca"),
@@ -2002,8 +2279,49 @@ mod tests {
         );
     }
 
-    /// C2：`--server-ca` 只接受 0600/0644 普通文件、非符号链接、≤1 MiB，
-    /// 且 PEM 至少有一张可解析证书；错误不打印证书内容。
+    /// system-roots 不要求 fingerprint，但显式携带必须拒绝（不能静默忽略 pin），
+    /// 且该模式不能同时使用 --server-ca（公共 ACME 由系统根校验）。
+    #[test]
+    fn system_roots_rejects_fingerprint_and_server_ca() {
+        let fingerprint = "ab".repeat(32);
+        validate_fresh_tls_args(AgentTlsMode::SystemRoots, None, None)
+            .expect("system-roots 不要求指纹");
+        let error = validate_fresh_tls_args(AgentTlsMode::SystemRoots, Some(&fingerprint), None)
+            .expect_err("system-roots 不能使用 --fingerprint");
+        assert!(error.to_string().contains("--fingerprint"), "{error}");
+        assert!(
+            reject_system_roots_fingerprint(AgentTlsMode::SystemRoots, Some(&fingerprint)).is_err()
+        );
+        assert!(
+            reject_system_roots_fingerprint(AgentTlsMode::CustomCa, Some(&fingerprint)).is_ok()
+        );
+
+        let ca = Path::new("/etc/rustboard/server-ca.pem");
+        let error = validate_fresh_tls_args(AgentTlsMode::SystemRoots, None, Some(ca))
+            .expect_err("system-roots 不能使用 --server-ca");
+        assert!(error.to_string().contains("--server-ca"), "{error}");
+
+        // 非空但非法的 fingerprint 即使不是 system-roots 的必需项也不能静默
+        // 写进配置（运行时虽不用于 pin，但配置必须自洽）。
+        let cfg = AgentConfig {
+            hub_url: "wss://127.0.0.1:8443/agent/ws".to_string(),
+            tls_mode: AgentTlsMode::SystemRoots,
+            server_fingerprint: "not-a-sha256".to_string(),
+            ..AgentConfig::default()
+        };
+        assert!(validate_fingerprint(&cfg).is_err(), "显式非法指纹必须拒绝");
+        let cfg = AgentConfig {
+            server_fingerprint: String::new(),
+            ..cfg
+        };
+        assert!(
+            validate_fingerprint(&cfg).is_ok(),
+            "system-roots 空指纹应允许"
+        );
+    }
+
+    /// C2：`--server-ca` 只接受绝对路径、逐组件无符号链接、0600/0644 普通文件、
+    /// ≤1 MiB，且 PEM 至少有一张可解析证书；错误不打印证书内容。
     #[cfg(unix)]
     #[test]
     fn c2_read_server_ca_validates_mode_size_and_pem() {
@@ -2037,12 +2355,32 @@ mod tests {
         // 符号链接、目录、超限、空文件、非法 PEM 全部拒绝。
         let link = dir.join("ca-link.pem");
         std::os::unix::fs::symlink(&good, &link).unwrap();
+        let err = format!("{:#}", read_server_ca(&link).unwrap_err());
         assert!(
-            read_server_ca(&link)
+            err.contains("符号链接") || err.contains("路径不安全"),
+            "符号链接必须拒绝且错误链保留根因: {err}"
+        );
+        // 父目录是符号链接同样拒绝，不能只检查最终文件。
+        let real_dir = dir.join("real-ca-dir");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        write_mode(&real_dir.join("ca.pem"), ca_pem.as_bytes(), 0o644);
+        let ancestor = dir.join("ca-dir-link");
+        std::os::unix::fs::symlink(&real_dir, &ancestor).unwrap();
+        let err = format!(
+            "{:#}",
+            read_server_ca(&ancestor.join("ca.pem")).unwrap_err()
+        );
+        assert!(
+            err.contains("符号链接") && err.contains("路径不安全"),
+            "祖先符号链接必须拒绝且错误链保留根因: {err}"
+        );
+        // 相对路径没有明确的解析基准，必须拒绝。
+        assert!(
+            read_server_ca(Path::new("relative-ca.pem"))
                 .unwrap_err()
                 .to_string()
-                .contains("符号链接"),
-            "符号链接必须拒绝"
+                .contains("绝对路径"),
+            "相对 --server-ca 必须拒绝"
         );
         assert!(
             read_server_ca(&dir)
@@ -3346,6 +3684,569 @@ mod tests {
         );
         assert!(paths.config.exists(), "校验失败时不能删配置");
         assert!(dir.exists(), "prefix 不能被递归删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #72：agent 卸载流程的 fake systemd，走 preflight→execute 完整卸载路径。
+    struct UninstallFakeService {
+        stop_error: Option<&'static str>,
+        stop_calls: std::cell::Cell<usize>,
+        disable_calls: std::cell::Cell<usize>,
+        fragment: Option<PathBuf>,
+        state: std::cell::RefCell<ServiceState>,
+        state_after_stop: ServiceState,
+        state_error: Option<&'static str>,
+    }
+
+    impl UninstallFakeService {
+        fn stopped(fragment: Option<PathBuf>) -> Self {
+            Self {
+                stop_error: None,
+                stop_calls: std::cell::Cell::new(0),
+                disable_calls: std::cell::Cell::new(0),
+                fragment,
+                state: std::cell::RefCell::new(ServiceState::Inactive),
+                state_after_stop: ServiceState::Inactive,
+                state_error: None,
+            }
+        }
+    }
+
+    impl ServiceControl for UninstallFakeService {
+        fn fragment_path(&self, _unit: &str) -> Result<Option<PathBuf>> {
+            Ok(self.fragment.clone())
+        }
+
+        fn ensure_fragment_is(&self, _unit: &str, _expected: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn daemon_reload(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_managing(&self) -> bool {
+            true
+        }
+
+        fn active_state(&self, _unit: &str) -> Result<ServiceState> {
+            match self.state_error {
+                Some(message) => bail!("{message}"),
+                None => Ok(self.state.borrow().clone()),
+            }
+        }
+
+        fn main_pid(&self, _unit: &str) -> Result<u32> {
+            Ok(0)
+        }
+
+        fn enable_now(&self, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn restart(&self, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&self, _unit: &str) -> Result<()> {
+            self.stop_calls.set(self.stop_calls.get() + 1);
+            match self.stop_error {
+                Some(message) => bail!("{message}"),
+                None => {
+                    *self.state.borrow_mut() = self.state_after_stop.clone();
+                    Ok(())
+                }
+            }
+        }
+
+        fn disable(&self, _unit: &str) -> Result<()> {
+            self.disable_calls.set(self.disable_calls.get() + 1);
+            Ok(())
+        }
+    }
+
+    /// 满足 validate_install_prefix 的测试目录（放在测试二进制所在 target 目录）。
+    fn install_prefix_dir(tag: &str) -> PathBuf {
+        let base = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!(
+            "rb-agent-install-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    struct AgentUninstallFixture {
+        _dir: PathBuf,
+        paths: Paths,
+    }
+
+    impl Drop for AgentUninstallFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self._dir);
+        }
+    }
+
+    fn agent_uninstall_fixture(tag: &str, unit_present: bool) -> AgentUninstallFixture {
+        let dir = install_prefix_dir(tag);
+        let paths = Paths::for_role(Role::Agent, &dir, PathOverrides::default()).unwrap();
+        std::fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+        std::fs::write(&paths.config, b"hub_url = \"wss://example/agent/ws\"\n").unwrap();
+        std::fs::create_dir_all(paths.unit.parent().unwrap()).unwrap();
+        if unit_present {
+            std::fs::write(&paths.unit, render_unit(Role::Agent, &paths).unwrap()).unwrap();
+        }
+        std::fs::create_dir_all(paths.binary.parent().unwrap()).unwrap();
+        std::fs::write(&paths.binary, b"bin").unwrap();
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::write(paths.data_dir.join("keep"), b"data").unwrap();
+
+        let mut state = InstallState::new();
+        state.upsert(
+            Role::Agent,
+            RoleState::new(&paths, VERSION, paths.backup_root.clone()),
+        );
+        state.save(&paths.state).unwrap();
+        AgentUninstallFixture { _dir: dir, paths }
+    }
+
+    fn run_agent_uninstall(
+        fixture: AgentUninstallFixture,
+        service: &UninstallFakeService,
+    ) -> (Result<()>, AgentUninstallFixture) {
+        let args = UninstallArgs {
+            prefix: fixture.paths.prefix.clone(),
+            config: None,
+            data_dir: None,
+            unit_dir: None,
+            purge: true,
+            yes: true,
+            dry_run: false,
+        };
+        let result = uninstall_impl(args, Some(service));
+        (result, fixture)
+    }
+
+    fn assert_agent_targets_preserved(fixture: &AgentUninstallFixture, context: &str) {
+        for path in [
+            &fixture.paths.unit,
+            &fixture.paths.binary,
+            &fixture.paths.config,
+            &fixture.paths.data_dir,
+            &fixture.paths.state,
+        ] {
+            assert!(path.exists(), "{context}时必须保留 {}", path.display());
+        }
+    }
+
+    fn assert_agent_targets_preserved_without_unit(fixture: &AgentUninstallFixture, context: &str) {
+        for path in [
+            &fixture.paths.binary,
+            &fixture.paths.config,
+            &fixture.paths.data_dir,
+            &fixture.paths.state,
+        ] {
+            assert!(path.exists(), "{context}时必须保留 {}", path.display());
+        }
+        assert!(
+            !fixture.paths.unit.exists(),
+            "{context}时本就不存在 unit 文件，不应被创建"
+        );
+    }
+
+    #[test]
+    fn uninstall_stop_failure_preserves_files_and_state() {
+        let fixture = agent_uninstall_fixture("stop-fail", true);
+        let unit = fixture.paths.unit.clone();
+        let mut service = UninstallFakeService::stopped(Some(unit));
+        service.stop_error = Some("mock stop failure");
+        service.state = std::cell::RefCell::new(ServiceState::Active);
+        let (result, fixture) = run_agent_uninstall(fixture, &service);
+        let message = format!("{:#}", result.expect_err("stop 失败必须返回错误"));
+        assert!(message.contains("停止 agent 服务"), "{message}");
+        assert!(message.contains("安装状态已保留"), "{message}");
+        assert_eq!(service.stop_calls.get(), 1);
+        assert_eq!(service.disable_calls.get(), 0);
+        assert_agent_targets_preserved(&fixture, "stop 失败");
+    }
+
+    #[test]
+    fn uninstall_active_or_unknown_state_preserves_files_and_state() {
+        let fixture = agent_uninstall_fixture("active", true);
+        let unit = fixture.paths.unit.clone();
+        let mut active = UninstallFakeService::stopped(Some(unit));
+        active.state = std::cell::RefCell::new(ServiceState::Active);
+        active.state_after_stop = ServiceState::Active;
+        let (result, fixture) = run_agent_uninstall(fixture, &active);
+        let message = format!("{:#}", result.expect_err("仍 active 必须失败"));
+        assert!(message.contains("ActiveState=active"), "{message}");
+        assert_eq!(active.disable_calls.get(), 0);
+        assert_agent_targets_preserved(&fixture, "仍 active");
+
+        let fixture = agent_uninstall_fixture("unknown", true);
+        let unit = fixture.paths.unit.clone();
+        let mut unknown = UninstallFakeService::stopped(Some(unit));
+        unknown.state_error = Some("mock ActiveState failure");
+        let (result, fixture) = run_agent_uninstall(fixture, &unknown);
+        let message = format!("{:#}", result.expect_err("无法确认停止必须失败"));
+        assert!(message.contains("无法确认 agent 服务"), "{message}");
+        assert_eq!(unknown.disable_calls.get(), 0);
+        assert_agent_targets_preserved(&fixture, "状态未知");
+    }
+
+    /// unit 文件已不存在但同名服务仍 active：preflight 之后也必须拒绝删除/purge。
+    #[test]
+    fn uninstall_missing_unit_but_active_service_preserves_everything() {
+        for (tag, state) in [
+            ("activating", ServiceState::Activating),
+            ("deactivating", ServiceState::Deactivating),
+            ("other", ServiceState::Other("maintenance".to_string())),
+        ] {
+            let fixture = agent_uninstall_fixture(&format!("unit-missing-{tag}"), false);
+            let mut service = UninstallFakeService::stopped(None);
+            service.state = std::cell::RefCell::new(state.clone());
+            let (result, fixture) = run_agent_uninstall(fixture, &service);
+            let message = format!("{:#}", result.expect_err("unit 缺失但服务未停止必须失败"));
+            assert!(
+                message.contains(&format!("ActiveState={}", state.as_str())),
+                "{message}"
+            );
+            assert_eq!(service.stop_calls.get(), 0, "unit 缺失时不得 stop");
+            assert_eq!(service.disable_calls.get(), 0);
+            assert_agent_targets_preserved_without_unit(&fixture, "unit 缺失但服务未停止");
+        }
+    }
+
+    /// unit 文件缺失但同名服务已明确 stopped：允许清理，且不得 stop / 清理链接。
+    #[test]
+    fn uninstall_missing_unit_but_inactive_service_proceeds() {
+        let fixture = agent_uninstall_fixture("unit-missing-inactive", false);
+        let service = UninstallFakeService::stopped(None);
+        let (result, fixture) = run_agent_uninstall(fixture, &service);
+        result.expect("unit 缺失但服务 inactive 时卸载应成功");
+        assert_eq!(service.stop_calls.get(), 0);
+        assert_eq!(service.disable_calls.get(), 0);
+        assert!(!fixture.paths.unit.exists());
+        assert!(!fixture.paths.binary.exists());
+        assert!(!fixture.paths.config.exists());
+        assert!(!fixture.paths.data_dir.exists());
+        assert!(!fixture.paths.state.exists());
+    }
+
+    #[test]
+    fn uninstall_successful_stop_removes_files_and_state() {
+        let fixture = agent_uninstall_fixture("stop-ok", true);
+        let unit = fixture.paths.unit.clone();
+        // 同名 foreign unit 的 enable 链接：指向别的 unit，卸载必须保留。
+        let foreign = fixture.paths.prefix.join("foreign-agent.service");
+        std::fs::write(&foreign, b"foreign unit").unwrap();
+        let wants = fixture
+            .paths
+            .unit
+            .parent()
+            .unwrap()
+            .join("multi-user.target.wants");
+        std::fs::create_dir_all(&wants).unwrap();
+        let foreign_link = wants.join(Role::Agent.unit_name());
+        std::os::unix::fs::symlink(&foreign, &foreign_link).unwrap();
+        let service = UninstallFakeService::stopped(Some(unit));
+        let (result, fixture) = run_agent_uninstall(fixture, &service);
+        result.expect("已停止时卸载应成功");
+        assert!(
+            std::fs::symlink_metadata(&foreign_link).is_ok(),
+            "同名外来 unit 的 wants 链接必须保留"
+        );
+        assert!(foreign.exists(), "外来 unit 不能被删除");
+        assert_eq!(service.stop_calls.get(), 1);
+        assert_eq!(service.disable_calls.get(), 1);
+        assert!(!fixture.paths.unit.exists());
+        assert!(!fixture.paths.binary.exists());
+        assert!(!fixture.paths.config.exists());
+        assert!(!fixture.paths.data_dir.exists());
+        assert!(!fixture.paths.state.exists());
+    }
+
+    /// #77：安装激活流程的 fake systemd，记录 restart / PID 变化。
+    struct InstallFakeService {
+        pid: std::cell::Cell<u32>,
+        next_pid: u32,
+        state: std::cell::RefCell<ServiceState>,
+        restart_error: Option<&'static str>,
+        flap: bool,
+        flap_count: std::cell::Cell<usize>,
+        restart_calls: std::cell::Cell<usize>,
+        enable_calls: std::cell::Cell<usize>,
+        stop_calls: std::cell::Cell<usize>,
+        disable_calls: std::cell::Cell<usize>,
+    }
+
+    impl InstallFakeService {
+        fn new(pid: u32, next_pid: u32) -> Self {
+            Self {
+                pid: std::cell::Cell::new(pid),
+                next_pid,
+                state: std::cell::RefCell::new(if pid > 0 {
+                    ServiceState::Active
+                } else {
+                    ServiceState::Inactive
+                }),
+                restart_error: None,
+                flap: false,
+                flap_count: std::cell::Cell::new(0),
+                restart_calls: std::cell::Cell::new(0),
+                enable_calls: std::cell::Cell::new(0),
+                stop_calls: std::cell::Cell::new(0),
+                disable_calls: std::cell::Cell::new(0),
+            }
+        }
+
+        fn crash_looping(pid: u32) -> Self {
+            let mut service = Self::new(pid, pid);
+            service.flap = true;
+            service
+        }
+
+        fn set_state(&self, state: ServiceState) {
+            *self.state.borrow_mut() = state;
+        }
+    }
+
+    impl ServiceControl for InstallFakeService {
+        fn fragment_path(&self, _unit: &str) -> Result<Option<PathBuf>> {
+            Ok(None)
+        }
+
+        fn ensure_fragment_is(&self, _unit: &str, _expected: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn daemon_reload(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_managing(&self) -> bool {
+            true
+        }
+
+        fn active_state(&self, _unit: &str) -> Result<ServiceState> {
+            if self.flap {
+                let count = self.flap_count.get();
+                self.flap_count.set(count + 1);
+                return Ok(if count.is_multiple_of(2) {
+                    ServiceState::Active
+                } else {
+                    ServiceState::Failed
+                });
+            }
+            Ok(self.state.borrow().clone())
+        }
+
+        fn main_pid(&self, _unit: &str) -> Result<u32> {
+            Ok(self.pid.get())
+        }
+
+        fn enable_now(&self, _unit: &str) -> Result<()> {
+            self.enable_calls.set(self.enable_calls.get() + 1);
+            self.set_state(ServiceState::Active);
+            if self.pid.get() == 0 {
+                self.pid.set(self.next_pid);
+            }
+            Ok(())
+        }
+
+        fn restart(&self, _unit: &str) -> Result<()> {
+            self.restart_calls.set(self.restart_calls.get() + 1);
+            if let Some(message) = self.restart_error {
+                return Err(anyhow!(message));
+            }
+            self.set_state(ServiceState::Active);
+            self.pid.set(self.next_pid);
+            Ok(())
+        }
+
+        fn stop(&self, _unit: &str) -> Result<()> {
+            self.stop_calls.set(self.stop_calls.get() + 1);
+            self.set_state(ServiceState::Inactive);
+            self.pid.set(0);
+            Ok(())
+        }
+
+        fn disable(&self, _unit: &str) -> Result<()> {
+            self.disable_calls.set(self.disable_calls.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn active_service_with_zero_previous_pid_fails_closed() {
+        let error = ensure_active_service_pid(true, 0).expect_err("active + PID=0 必须拒绝");
+        assert!(error.to_string().contains("MainPID 为 0"), "{error}");
+        ensure_active_service_pid(false, 0).expect("未 active 不要求旧 PID");
+        ensure_active_service_pid(true, 111).expect("active + 有效 PID 允许");
+    }
+
+    /// 从已 active（旧 PID=111）开始：必须 restart，并验证 MainPID = 222。
+    #[test]
+    fn active_install_restarts_and_verifies_new_pid() {
+        let service = InstallFakeService::new(111, 222);
+        let expected = Path::new("/var/lib/rustboard/etc/systemd/system/rustboard-agent.service");
+        let pid = activate_agent_service(
+            &service,
+            AGENT_UNIT_NAME,
+            expected,
+            true,
+            111,
+            Duration::from_secs(2),
+        )
+        .expect("restart 后应确认新进程");
+        assert_eq!(pid, 222, "必须返回重启后的新 MainPID");
+        assert_eq!(
+            service.restart_calls.get(),
+            1,
+            "was_active 必须调用 restart"
+        );
+        assert_eq!(service.enable_calls.get(), 1, "仍需 enable 保持开机自启");
+        assert!(matches!(*service.state.borrow(), ServiceState::Active));
+    }
+
+    /// 原本未运行：enable --now 启动，不调用 restart，但仍要确认新进程。
+    #[test]
+    fn inactive_install_starts_without_restart() {
+        let service = InstallFakeService::new(0, 333);
+        let expected = Path::new("/var/lib/rustboard/etc/systemd/system/rustboard-agent.service");
+        let pid = activate_agent_service(
+            &service,
+            AGENT_UNIT_NAME,
+            expected,
+            false,
+            0,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(pid, 333);
+        assert_eq!(service.enable_calls.get(), 1);
+        assert_eq!(service.restart_calls.get(), 0);
+    }
+
+    /// restart 返回成功但 PID 没变（等价于 enable --now 的 no-op）：必须失败。
+    #[test]
+    fn restart_without_new_pid_fails_closed() {
+        let service = InstallFakeService::new(111, 111);
+        let expected = Path::new("/var/lib/rustboard/etc/systemd/system/rustboard-agent.service");
+        let error = activate_agent_service(
+            &service,
+            AGENT_UNIT_NAME,
+            expected,
+            true,
+            111,
+            Duration::from_millis(50),
+        )
+        .expect_err("PID 未变化不能视为成功");
+        let message = format!("{error:#}");
+        assert!(message.contains("稳定运行"), "{message}");
+        assert!(message.contains("MainPID=111"), "{message}");
+    }
+
+    /// previous_pid=0 时不能跳过校验：PID 一直为 0 必须失败，而不是立即成功。
+    #[test]
+    fn previous_pid_zero_does_not_skip_process_verification() {
+        let service = InstallFakeService::new(0, 0);
+        let expected = Path::new("/var/lib/rustboard/etc/systemd/system/rustboard-agent.service");
+        let error = activate_agent_service(
+            &service,
+            AGENT_UNIT_NAME,
+            expected,
+            true,
+            0,
+            Duration::from_millis(100),
+        )
+        .expect_err("PID=0 不能视为新进程");
+        let message = format!("{error:#}");
+        assert!(message.contains("稳定运行"), "{message}");
+        assert!(message.contains("MainPID"), "{message}");
+    }
+
+    /// restart 后 crash-loop（active/failed 交替）不能因瞬时 active 而成功。
+    #[test]
+    fn crash_looping_service_is_not_treated_as_success() {
+        let service = InstallFakeService::crash_looping(444);
+        let expected = Path::new("/var/lib/rustboard/etc/systemd/system/rustboard-agent.service");
+        let error = activate_agent_service(
+            &service,
+            AGENT_UNIT_NAME,
+            expected,
+            true,
+            111,
+            Duration::from_millis(700),
+        )
+        .expect_err("crash-loop 不能稳定 500ms，必须失败");
+        let message = format!("{error:#}");
+        assert!(message.contains("稳定运行"), "{message}");
+    }
+
+    /// restart 失败后回滚：旧 config / binary / unit / state 恢复，旧服务被重新
+    /// restart（不是只 enable --now）。
+    #[test]
+    fn restart_failure_rolls_back_files_and_service() {
+        let dir = temp_dir("restart-rollback");
+        let paths = Paths::for_role(Role::Agent, &dir, PathOverrides::default()).unwrap();
+        std::fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(paths.binary.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(paths.unit.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(paths.state.parent().unwrap()).unwrap();
+        std::fs::write(&paths.config, b"old-config").unwrap();
+        std::fs::write(&paths.binary, b"old-binary").unwrap();
+        std::fs::write(&paths.unit, b"old-unit").unwrap();
+        let old_state = b"schema = 1\n".to_vec();
+        std::fs::write(&paths.state, &old_state).unwrap();
+
+        let mut txn = InstallTxn::begin(&paths, false).unwrap();
+        txn.write(&paths.config, b"new-config", 0o600).unwrap();
+        txn.write(&paths.binary, b"new-binary", 0o755).unwrap();
+        txn.write(&paths.unit, b"new-unit", 0o644).unwrap();
+
+        let service = InstallFakeService::new(111, 222);
+        let error = rollback_agent_install(
+            &service,
+            &paths,
+            &mut txn,
+            Some(&old_state),
+            true,
+            true,
+            true,
+            anyhow!("mock install failure"),
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("安装失败: mock install failure"),
+            "{message}"
+        );
+
+        assert_eq!(std::fs::read(&paths.config).unwrap(), b"old-config");
+        assert_eq!(std::fs::read(&paths.binary).unwrap(), b"old-binary");
+        assert_eq!(std::fs::read(&paths.unit).unwrap(), b"old-unit");
+        assert_eq!(std::fs::read(&paths.state).unwrap(), old_state);
+        assert_eq!(service.stop_calls.get(), 1, "回滚必须 stop 本次启动的服务");
+        assert_eq!(service.disable_calls.get(), 1);
+        assert_eq!(
+            service.restart_calls.get(),
+            1,
+            "回滚后必须 restart 旧服务，而不是只 enable --now"
+        );
+        assert_eq!(service.enable_calls.get(), 1);
+        assert!(
+            matches!(*service.state.borrow(), ServiceState::Active),
+            "旧服务应恢复运行"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

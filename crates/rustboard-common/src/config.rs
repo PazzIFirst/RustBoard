@@ -444,7 +444,11 @@ pub struct AgentConfig {
     /// 只应在开发 / 隔离网络使用；生产环境请改用 `wss://`。
     #[serde(default)]
     pub allow_insecure_ws: bool,
-    /// 单批最多多少条采样点。
+    /// 单批最多多少条采样点（必须 ≥ 1）。
+    ///
+    /// 一轮采集会同时产生多个 collector 以及 cert / buffer 指标；超过上限时
+    /// 按原始顺序拆成多个批次，每个子批使用独立 seq。0 会让拆批无法进行，
+    /// 因此由 [`AgentConfig::validate`] 明确拒绝，不能静默忽略。
     pub max_batch_samples: usize,
     /// M3 控制面配置；默认全部关闭，旧配置无需新增任何字段。
     #[serde(default)]
@@ -502,6 +506,11 @@ impl AgentConfig {
         }
         if self.sample_interval_ms < 1_000 {
             return Err(Error::InvalidConfig("采样间隔不能小于 1000ms".into()));
+        }
+        // #63：0 会让一轮采集无法拆出合法批次；必须在配置层明确拒绝，
+        // 不能等到采集循环里静默忽略或 panic。
+        if self.max_batch_samples < 1 {
+            return Err(Error::InvalidConfig("max_batch_samples 至少为 1".into()));
         }
         if self.hub_url.starts_with("wss://") {
             match self.tls_mode {
@@ -1796,110 +1805,149 @@ pub fn redact_database_url(url: &str) -> String {
     if !matches!(scheme, "postgres" | "postgresql") {
         return url.to_string();
     }
-    // authority 在第一个 `/` 或 `?` 前结束。这里**不**把 `#` 当作边界：
-    // 非法 URL 可能把 `#` 写进密码（例如 `user:pa#ss@host`），按 URL 语法
-    // 截断会在错误信息里残留密码片段；先按 userinfo 脱敏，`#` 留在 host
-    // 片段里也无害（PostgreSQL 校验随后会因 fragment 拒绝）。
-    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(authority_end);
-    let redacted_authority = redact_url_authority(authority);
-    // 空 authority 的畸形 URL（例如 `postgres:///user:pass@host/db`）没有可解析的
-    // userinfo，密码可能落在 path 里；用同样的保守裁剪避免错误信息泄露。
-    if authority.is_empty() {
-        if let (Some(colon), Some(at)) = (rest.find(':'), rest.rfind('@')) {
-            if colon < at {
-                return format!(
-                    "{scheme}://{}:***{}",
-                    &rest[..colon],
-                    redact_url_query(&rest[at..])
-                );
-            }
-        }
-    }
-    // `user:password` 里出现裸 `/` 或 `?` 时，按 URL 语法 authority 会提前结束，
-    // 常规脱敏只能覆盖密码的前半段。若 authority 没有 `@` 且冒号后不是纯数字
-    // 端口，就按「漏写 @host / 密码含裸分隔符」的畸形输入处理：
-    // 用第一个 `:` 到最后一个 `@` 之间的内容整体替换；完全没有 `@` 时丢弃
-    // `:` 之后的全部内容。这样错误信息不会残留密码片段。
-    let malformed_userinfo = !authority.contains('@')
-        && !authority.starts_with('[')
-        && authority.split_once(':').is_some_and(|(_, suffix)| {
-            !suffix.is_empty() && !suffix.bytes().all(|b| b.is_ascii_digit())
-        });
-    if malformed_userinfo {
-        if let (Some(colon), Some(at)) = (rest.find(':'), rest.rfind('@')) {
-            if colon < at {
-                return format!(
-                    "{scheme}://{}:***{}",
-                    &rest[..colon],
-                    redact_url_query(&rest[at..])
-                );
-            }
-        }
-        return format!("{scheme}://{redacted_authority}");
-    }
-    format!("{scheme}://{redacted_authority}{}", redact_url_query(tail))
-}
 
-/// 脱敏 authority 中的 userinfo 密码；无密码时保持原样。
-fn redact_url_authority(authority: &str) -> String {
-    // 用最后一个 `@` 切分：密码里的裸 `@`（非法但可能出现）也会被一起替换。
-    if let Some((userinfo, host)) = authority.rsplit_once('@') {
-        let Some((user, password)) = userinfo.split_once(':') else {
-            // `user@host`：没有密码字段，原样返回。
-            return authority.to_string();
+    // userinfo 到第一个 `@` 结束。**绝不**先按 `/` 截断 authority：密码里的
+    // 裸 `/`（例如 `user:2024/secret@host`）会让 authority 提前结束，旧逻辑
+    // 会把数字前缀当端口、把 `secret` 留在 path 里原样输出。
+    let boundary = rest.find(['?', '#']).unwrap_or(rest.len());
+    let head = &rest[..boundary];
+    if let Some(first_at) = head.find('@') {
+        let userinfo = &head[..first_at];
+        // 多个裸 `@`：驱动按第一个 `@` 结束 userinfo，其后内容算 host。
+        // 无法判断 `pa@ss` 哪段是密码，保守遮到最后一个 `@` 之前。
+        let host_start = head.rfind('@').expect("head 至少包含一个 @") + 1;
+        let redacted_userinfo = match userinfo.find(':') {
+            Some(colon) => format!("{}:***", &userinfo[..colon]),
+            None => userinfo.to_string(),
         };
-        if password == "***" {
-            return authority.to_string();
-        }
-        return format!("{user}:***@{host}");
+        return format!(
+            "{scheme}://{redacted_userinfo}@{}{}",
+            &head[host_start..],
+            redact_url_query(&rest[boundary..])
+        );
     }
 
-    // 没有 `@` 的 `user:password` 是非法 URL（例如漏写 `@host`），但错误信息
-    // 仍可能带出密码，做一次保守脱敏。`host:5432` 的端口是纯数字，不会误伤；
-    // IPv6 字面量以 `[` 开头，直接跳过。
-    if authority.starts_with('[') {
-        return authority.to_string();
+    // 查询/片段之前没有 `@`，但整串在 ?/# 之后仍出现 `@`：按畸形 userinfo
+    // 处理，隐藏第一个 `:` 到该 `@` 之间的全部内容。
+    if let Some(at) = rest.find('@') {
+        if let Some(colon) = rest[..at].find(':') {
+            return format!(
+                "{scheme}://{}:***{}",
+                &rest[..colon],
+                redact_url_query(&rest[at..])
+            );
+        }
+        // 没有 `:` 可定位密码字段；保守丢弃 `@` 之前的尾部内容。
+        return format!("{scheme}://***{}", redact_url_query(&rest[at..]));
     }
-    if let Some((user, password)) = authority.split_once(':') {
-        if !password.is_empty()
-            && password != "***"
-            && !password.bytes().all(|b| b.is_ascii_digit())
-        {
-            return format!("{user}:***");
+
+    // 完全没有 `@`：可能是 `user:password`（漏写 @host），或普通 host:port。
+    // 只在「冒号后不是纯数字端口」时按畸形 userinfo 遮蔽。
+    let authority_end = head.find('/').unwrap_or(head.len());
+    let authority = &head[..authority_end];
+    if !authority.starts_with('[') {
+        if let Some((user, password)) = authority.split_once(':') {
+            if !password.is_empty() && !password.bytes().all(|b| b.is_ascii_digit()) {
+                return format!(
+                    "{scheme}://{user}:***{}",
+                    redact_url_query(&rest[authority_end..])
+                );
+            }
         }
     }
-    authority.to_string()
+    format!("{scheme}://{head}{}", redact_url_query(&rest[boundary..]))
 }
 
-/// 脱敏 query 中的 `password` / `sslpassword` 参数，保留其它参数与 fragment。
+/// 脱敏 query 中的 `password` / `sslpassword` 参数。
+///
+/// - 参数名先按驱动/libpq 规则做百分号解码再识别，因此
+///   `pass%77ord=secret` / `%70assword=secret` 与 `password=secret` 等价；
+/// - 非法编码或非 UTF-8 的参数名无法判断语义，保守地把整个值遮成 `***`；
+/// - fragment 一律替换为 `***`：畸形输入可能把密码中的裸 `#` 之后的内容
+///   当作 fragment，原样保留会泄露密码后缀。
 fn redact_url_query(tail: &str) -> String {
     let Some(query_start) = tail.find('?') else {
-        return tail.to_string();
+        return redact_fragment_tail(tail);
     };
     let (prefix, query_and_fragment) = tail.split_at(query_start + 1);
     let (query, fragment) = match query_and_fragment.split_once('#') {
-        Some((query, fragment)) => (query, Some(fragment)),
-        None => (query_and_fragment, None),
+        Some((query, _fragment)) => (query, true),
+        None => (query_and_fragment, false),
     };
     let mut redacted = String::with_capacity(query_and_fragment.len());
-    for (index, pair) in query.split('&').enumerate() {
-        if index > 0 {
+    let mut first = true;
+    for pair in query.split('&') {
+        if !first {
             redacted.push('&');
         }
-        match pair.split_once('=') {
-            Some((key, value)) if is_secret_query_key(key) && value != "***" => {
-                redacted.push_str(key);
+        first = false;
+        let secret = pair
+            .split_once('=')
+            .map(|(raw_key, _)| decode_query_key(raw_key))
+            .unwrap_or(None);
+        match (pair.split_once('='), secret) {
+            (Some((raw_key, _)), Some(key)) if is_secret_query_key(&key) => {
+                redacted.push_str(raw_key);
                 redacted.push_str("=***");
             }
-            _ => redacted.push_str(pair),
+            (Some((raw_key, _)), None) => {
+                // 参数名编码非法：无法判断是不是密码参数，整套遮蔽。
+                redacted.push_str(raw_key);
+                redacted.push_str("=***");
+            }
+            (None, _) => {
+                // 没有 `=` 的畸形参数同样无法判断，直接整体遮蔽。
+                redacted.push_str("***");
+            }
+            (Some(_), Some(_)) => redacted.push_str(pair),
         }
     }
-    if let Some(fragment) = fragment {
-        redacted.push('#');
-        redacted.push_str(fragment);
+    if fragment {
+        redacted.push_str("#***");
     }
     format!("{prefix}{redacted}")
+}
+
+/// 没有 query 时，仍不能原样保留 fragment（可能是密码后缀）。
+fn redact_fragment_tail(tail: &str) -> String {
+    match tail.split_once('#') {
+        Some((head, _fragment)) => format!("{head}#***"),
+        None => tail.to_string(),
+    }
+}
+
+/// 解析 query 参数名中的百分号编码。
+///
+/// 返回 `None` 表示编码非法（不完整/非十六进制/非 UTF-8）；调用方据此保守
+/// 遮蔽整个值。`+` 不当作空格：libpq URI 使用 percent-encoding，不是 form 编码。
+fn decode_query_key(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
+            let high = hex_digit(bytes[index + 1])?;
+            let low = hex_digit(bytes[index + 2])?;
+            out.push(high << 4 | low);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// query 中按密码处理的参数名（大小写不敏感）。
@@ -5162,6 +5210,172 @@ name = ""
                 );
             }
         }
+    }
+
+    /// #62：query 参数名先百分号解码再识别（驱动规则），编码后不能绕过脱敏。
+    #[test]
+    fn d1_redact_database_url_decodes_query_keys() {
+        for (input, expected) in [
+            (
+                "postgres://db.example.com/rustboard?pass%77ord=encoded-secret",
+                "postgres://db.example.com/rustboard?pass%77ord=***",
+            ),
+            (
+                "postgres://db.example.com/rustboard?%70assword=encoded-secret",
+                "postgres://db.example.com/rustboard?%70assword=***",
+            ),
+            (
+                "postgres://db.example.com/rustboard?PASS%57ORD=encoded-secret",
+                "postgres://db.example.com/rustboard?PASS%57ORD=***",
+            ),
+            (
+                "postgres://db.example.com/rustboard?sslpass%77ord=encoded-secret",
+                "postgres://db.example.com/rustboard?sslpass%77ord=***",
+            ),
+            // 重复 password：每一处都必须遮蔽（驱动以最后一个为准，日志不能漏）。
+            (
+                "postgres://db.example.com/rustboard?password=first-secret&password=second-secret",
+                "postgres://db.example.com/rustboard?password=***&password=***",
+            ),
+        ] {
+            let output = redact_database_url(input);
+            assert_eq!(output, expected, "input={input}");
+            for secret in ["encoded-secret", "first-secret", "second-secret"] {
+                assert!(
+                    !output.contains(secret),
+                    "脱敏输出泄露 {secret}: input={input}, out={output}"
+                );
+            }
+        }
+    }
+
+    /// #62：非法编码/畸形参数名无法判断语义时，保守遮蔽整个值。
+    #[test]
+    fn d1_redact_database_url_masks_malformed_query_keys() {
+        for input in [
+            "postgres://db.example.com/rustboard?pass%77ord%zz=odd-secret",
+            "postgres://db.example.com/rustboard?%70assword%2=short-secret",
+            "postgres://db.example.com/rustboard?bad%zzkey=malformed-secret",
+            "postgres://db.example.com/rustboard?password=top-secret%zz",
+            "postgres://db.example.com/rustboard?%zz=opaque-secret",
+        ] {
+            let output = redact_database_url(input);
+            for secret in [
+                "odd-secret",
+                "short-secret",
+                "malformed-secret",
+                "top-secret",
+                "opaque-secret",
+            ] {
+                assert!(
+                    !output.contains(secret),
+                    "畸形参数名不得漏出 {secret}: input={input}, out={output}"
+                );
+            }
+            assert_eq!(
+                redact_database_url(&output),
+                output,
+                "畸形输入脱敏后仍必须幂等: input={input}"
+            );
+        }
+    }
+
+    /// #62：fragment 错误路径不能保留密码后缀（裸 `#` 会截断 query 密码）。
+    #[test]
+    fn d1_redact_database_url_never_keeps_fragment_password_suffix() {
+        for (input, leaked) in [
+            (
+                "postgres://db.example.com/rustboard?password=top-secret#suffix-secret",
+                "suffix-secret",
+            ),
+            (
+                "postgres://db.example.com/rustboard#password=top-secret",
+                "top-secret",
+            ),
+            (
+                "postgres://rb_user:top-secret@db.example.com/rustboard#tail-secret",
+                "tail-secret",
+            ),
+        ] {
+            let output = redact_database_url(input);
+            for secret in ["top-secret", leaked] {
+                assert!(
+                    !output.contains(secret),
+                    "fragment 不得保留密码后缀 {secret}: input={input}, out={output}"
+                );
+            }
+            assert!(output.contains("***"), "应保留脱敏标记: {output}");
+        }
+    }
+
+    /// P1 复审：密码含裸 `/`、且数字前缀像端口时，不能按 `/` 截断 authority。
+    #[test]
+    fn d1_redact_database_url_handles_raw_slash_in_password() {
+        for (input, secret, expected_fragment) in [
+            (
+                "postgres://rb_user:2024/secret@127.0.0.1:1/db?sslmode=disable",
+                "2024/secret",
+                "postgres://rb_user:***@127.0.0.1:1/db",
+            ),
+            (
+                "postgres://rb_user:99999/secret@127.0.0.1:1/db?sslmode=disable",
+                "99999/secret",
+                "postgres://rb_user:***@127.0.0.1:1/db",
+            ),
+            (
+                "postgres://us/er:s3cret@host/db",
+                "s3cret",
+                "postgres://us/er:***@host/db",
+            ),
+        ] {
+            let output = redact_database_url(input);
+            assert!(
+                !output.contains(secret),
+                "裸 / 密码泄漏 {secret}: input={input}, out={output}"
+            );
+            assert!(
+                output.contains(expected_fragment),
+                "脱敏结果不符合预期: input={input}, out={output}"
+            );
+            assert_eq!(
+                redact_database_url(&output),
+                output,
+                "脱敏必须幂等: input={input}"
+            );
+
+            // 校验错误/展示路径也必须使用同一脱敏结果。
+            match hub_with_database(input).database_kind() {
+                Ok(kind) => assert!(
+                    !kind.redacted().contains(secret),
+                    "DatabaseKind 回显密码 {secret}: {}",
+                    kind.redacted()
+                ),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        !message.contains(secret),
+                        "校验错误回显密码 {secret}: {message}"
+                    );
+                }
+            }
+        }
+
+        // 结构校验必然失败的路径（fragment）：错误信息也必须用新脱敏逻辑。
+        let invalid = "postgres://rb_user:2024/secret@host/db?sslmode=disable#frag";
+        let error = hub_with_database(invalid)
+            .database_kind()
+            .expect_err("含 fragment 的 DSN 必须被拒绝")
+            .to_string();
+        assert!(!error.contains("2024/secret"), "{error}");
+        assert!(!error.contains("secret"), "{error}");
+        assert!(error.contains("fragment"), "{error}");
+
+        // 密码里的裸 `@`：驱动按第一个 `@` 结束 userinfo，脱敏保守遮到最后
+        // 一个 `@` 之前，不能把 `ss` 当 host 残留。
+        let output = redact_database_url("postgres://rb_user:pa@ss@host/db?sslmode=disable");
+        assert!(!output.contains("pa"), "{output}");
+        assert!(!output.contains("ss@"), "{output}");
+        assert!(output.contains("***@host"), "{output}");
     }
 
     /// D1：DatabaseKind 的 Debug / redacted 不得泄露 PostgreSQL 密码。

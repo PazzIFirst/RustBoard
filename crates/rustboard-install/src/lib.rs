@@ -35,12 +35,14 @@ mod util;
 pub use files::read_private_file;
 pub use lock::{InstallLock, GLOBAL_LOCK_PATH, LOCK_HELD_ENV};
 pub use network::wait_https_ok_with_server_name;
+pub use path_validate::reject_symlink_components;
 pub use paths::{PathOverrides, Paths};
 pub use policy::{validate_install_prefix, validate_managed_path, ManagedPathKind};
 pub use prompt::Prompt;
 pub use role::Role;
 pub use service::{
-    is_systemd_unit_dir, render_unit, shell_arg, unit_is_ours, wait_http_ok, ServiceManager,
+    ensure_service_stopped, is_systemd_unit_dir, remove_enable_symlink, render_unit, shell_arg,
+    stop_service_checked, unit_is_ours, wait_http_ok, ServiceControl, ServiceManager, ServiceState,
     UNIT_MARKER,
 };
 pub use state::{InstallState, RoleState, INSTALL_STATE_SCHEMA};

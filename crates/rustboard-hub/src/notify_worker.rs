@@ -14,7 +14,10 @@
 //! - 每个启用渠道独立发送；至少一个成功即视为已通知并更新
 //!   `alert_states.last_notified_at`；全部失败也标记，错误摘要只含渠道名与固定
 //!   错误码（≤512 字节），不含 secret / URL；
-//! - 静默事件由 SQL 直接排除，worker 仍有防御性检查，永不发送。
+//! - 静默事件由 SQL 直接排除，worker 仍有防御性检查，永不发送；
+//! - 发送每个事件前重新读取规则（不复用批开始时的快照）：规则不存在写
+//!   `rule_missing`；已禁用时只跳过**禁用之后**产生的新事件（`rule_disabled`），
+//!   禁用前已入队的事件保留既有投递语义，不因一次禁用而丢弃或永久重试。
 //!
 //! 安全约定：日志只输出事件 id、渠道 id/kind 与固定错误码，不输出配置、token、
 //! 请求 URL 或上游响应正文。
@@ -26,7 +29,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rustboard_common::config::HubConfig;
 use rustboard_common::util::now_ms;
-use rustboard_core::alerts::{AlertEvent, AlertRule, AlertStateKind};
+use rustboard_core::alerts::{AlertEvent, AlertStateKind};
 use rustboard_core::channels::{build_text, NotificationChannel};
 use rustboard_core::storage::StorageHandle;
 
@@ -177,26 +180,19 @@ pub(crate) async fn notify_once(
         return Ok(report);
     }
 
-    // 规则 / 渠道数量都有硬上限（200 / 50），每批只读一次，避免逐事件查库。
-    let rules = {
-        let storage = storage.clone();
-        blocking(storage, move |storage| storage.list_alert_rules()).await?
-    };
+    // 渠道数量有硬上限（50），每批只读一次。规则必须在发送**每个**事件前
+    // 重新读取：批开始时加载的快照可能已过期，规则可能在批处理期间被禁用。
     let channels = {
         let storage = storage.clone();
         blocking(storage, move |storage| storage.list_notification_channels()).await?
     };
-    let rules: HashMap<String, AlertRule> = rules
-        .into_iter()
-        .map(|rule| (rule.id.clone(), rule))
-        .collect();
     let channels: HashMap<String, NotificationChannel> = channels
         .into_iter()
         .map(|channel| (channel.id.clone(), channel))
         .collect();
 
     for event in events {
-        match process_event(&storage, &notifier, &event, &rules, &channels, now).await {
+        match process_event(&storage, &notifier, &event, &channels, now).await {
             Ok(outcome) => {
                 report.processed += 1;
                 match outcome {
@@ -236,7 +232,6 @@ async fn process_event(
     storage: &Arc<StorageHandle>,
     notifier: &Arc<dyn Notifier>,
     event: &AlertEvent,
-    rules: &HashMap<String, AlertRule>,
     channels: &HashMap<String, NotificationChannel>,
     now: i64,
 ) -> Result<EventOutcome> {
@@ -249,10 +244,32 @@ async fn process_event(
         return Ok(EventOutcome::Skipped);
     }
 
-    let Some(rule) = rules.get(&event.rule_id) else {
+    // 发送前重新读取规则（不是批开始时的快照）：规则可能刚被禁用 / 修改。
+    // 规则不存在仍按 rule_missing 标记，事件保留在历史里但不重试。
+    let rule_id = event.rule_id.clone();
+    let rule = {
+        let storage = storage.clone();
+        blocking(storage, move |storage| storage.get_alert_rule(&rule_id)).await?
+    };
+    let Some(rule) = rule else {
         mark_skipped(storage, event.id, "rule_missing").await?;
         return Ok(EventOutcome::Skipped);
     };
+
+    // #69：规则已禁用时，不再发送**禁用之后**产生的新事件。禁用前已经产生、
+    // 仍在队列中的事件保留既有投递语义（事件时间早于 updated_at），不因一次
+    // 禁用而被丢弃或永久卡住；真正的新事件由评估侧 CAS 阻止，这里是兜底。
+    if !rule.enabled {
+        if event.ts >= rule.updated_at {
+            mark_skipped(storage, event.id, "rule_disabled").await?;
+            return Ok(EventOutcome::Skipped);
+        }
+        tracing::debug!(
+            event_id = event.id,
+            rule_id = %rule.id,
+            "规则已禁用；事件早于禁用时间，按历史事件语义继续投递"
+        );
+    }
 
     // 发送前重新检查当前生效静默：事件落库时还没静默、之后才创建的静默也必须
     // 阻止发送。命中后标记 processed，避免下一轮重复检查。
@@ -453,6 +470,7 @@ mod tests {
             updated_by: "admin".to_string(),
             created_at: NOW,
             updated_at: NOW,
+            revision: 0,
         }
     }
 
@@ -544,8 +562,8 @@ mod tests {
         let mut backlog_rule = rule("rule-old", 0);
         let backlog_channel = channel("存量渠道", true);
         backlog_rule.channel_ids = vec![backlog_channel.id.clone()];
-        seed_rule(&storage, &backlog_rule);
         seed_channel(&storage, &backlog_channel);
+        seed_rule(&storage, &backlog_rule);
 
         let first = insert_event(
             &storage,
@@ -625,8 +643,8 @@ mod tests {
         let mut rule = rule("rule-send", 1_800);
         let channel = channel("运维群", true);
         rule.channel_ids = vec![channel.id.clone()];
-        seed_rule(&storage, &rule);
         seed_channel(&storage, &channel);
+        seed_rule(&storage, &rule);
         storage
             .upsert_alert_state(&firing_state(&rule.id, "agent-1", "series-1", None))
             .unwrap();
@@ -672,8 +690,8 @@ mod tests {
         let mut rule = rule("rule-cooldown", 1_800);
         let channel = channel("冷却群", true);
         rule.channel_ids = vec![channel.id.clone()];
-        seed_rule(&storage, &rule);
         seed_channel(&storage, &channel);
+        seed_rule(&storage, &rule);
         storage
             .upsert_alert_state(&firing_state(
                 &rule.id,
@@ -734,7 +752,10 @@ mod tests {
         assert!(stored_event(&storage, resolved).notified);
     }
 
-    /// 无渠道 / 渠道不存在 / 渠道全禁用 / 规则不存在都标记固定原因且不阻塞。
+    /// 无渠道 / 渠道全禁用 / 规则不存在都标记固定原因且不阻塞。
+    ///
+    /// 渠道“不存在”在 v9 之后已被关系表 FK 阻止（规则写入时校验 + 渠道删除
+    /// RESTRICT），不再是可通过正常 API 构造的状态；worker 仍保留防御分支。
     #[tokio::test]
     async fn m4_b2b_worker_marks_no_channel_missing_rule_and_disabled() {
         let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
@@ -743,15 +764,17 @@ mod tests {
         let no_channel = rule("rule-no-channel", 0);
         seed_rule(&storage, &no_channel);
 
-        let mut missing_channel = rule("rule-missing-channel", 0);
-        missing_channel.channel_ids = vec!["00000000-0000-4000-8000-999999999999".into()];
-        seed_rule(&storage, &missing_channel);
-
-        let disabled_channel = channel("禁用渠道", false);
+        // 规则只能在渠道启用时创建（v9 存储事务内校验）；创建后再禁用渠道，
+        // 模拟“规则引用了一个后来被禁用的渠道”的线上状态。
+        let mut disabled_channel = channel("禁用渠道", true);
         seed_channel(&storage, &disabled_channel);
         let mut disabled = rule("rule-disabled-channel", 0);
         disabled.channel_ids = vec![disabled_channel.id.clone()];
         seed_rule(&storage, &disabled);
+        disabled_channel.enabled = false;
+        storage
+            .update_notification_channel(&disabled_channel)
+            .unwrap();
 
         let cursor = initialize_notify_cursor(&storage, NOW).unwrap();
         let ids = [
@@ -759,16 +782,6 @@ mod tests {
                 &storage,
                 event(
                     &no_channel.id,
-                    "agent-1",
-                    "series-1",
-                    AlertStateKind::Firing,
-                    false,
-                ),
-            ),
-            insert_event(
-                &storage,
-                event(
-                    &missing_channel.id,
                     "agent-1",
                     "series-1",
                     AlertStateKind::Firing,
@@ -799,20 +812,77 @@ mod tests {
         let report = notify_once(storage.clone(), mock.clone(), cursor, NOW + 1)
             .await
             .unwrap();
-        assert_eq!(report.processed, 4);
-        assert_eq!(report.skipped, 4);
+        assert_eq!(report.processed, 3);
+        assert_eq!(report.skipped, 3);
         assert_eq!(mock.send_count(), 0);
 
         for (id, reason) in [
             (ids[0], "no_channel"),
-            (ids[1], "channel_missing"),
-            (ids[2], "no_channel"),
-            (ids[3], "rule_missing"),
+            (ids[1], "no_channel"),
+            (ids[2], "rule_missing"),
         ] {
             let stored = stored_event(&storage, id);
             assert!(stored.notified, "event {id} 必须标记避免重试");
             assert_eq!(stored.notify_error, reason, "event {id}");
         }
+    }
+
+    /// 规则禁用后新产生的事件不发送；禁用前已入队的事件保留历史语义。
+    #[tokio::test]
+    async fn m4_b2b_worker_skips_events_created_after_disable() {
+        let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
+        let mock = Arc::new(MockNotifier::new());
+        let channel = channel("禁用后渠道", true);
+        seed_channel(&storage, &channel);
+        let mut rule = rule("rule-disable", 0);
+        rule.channel_ids = vec![channel.id.clone()];
+        seed_rule(&storage, &rule);
+
+        let cursor = initialize_notify_cursor(&storage, NOW).unwrap();
+        let before_disable = insert_event(
+            &storage,
+            event(
+                &rule.id,
+                "agent-1",
+                "series-1",
+                AlertStateKind::Firing,
+                false,
+            ),
+        );
+
+        // 禁用规则：updated_at 晚于禁用前事件的 ts。
+        let mut disabled = storage.get_alert_rule(&rule.id).unwrap().unwrap();
+        disabled.enabled = false;
+        disabled.updated_at = NOW + 1;
+        storage
+            .update_alert_rule_and_clear_states(&disabled)
+            .unwrap();
+
+        // 禁用前事件仍按既有语义投递（不因一次禁用被丢弃）。
+        let report = notify_once(storage.clone(), mock.clone(), cursor, NOW + 2)
+            .await
+            .unwrap();
+        assert_eq!(report.sent, 1);
+        assert!(stored_event(&storage, before_disable).notified);
+
+        // 禁用之后产生的新事件（兜底防御）：标记 rule_disabled，不再发送。
+        let mut after = event(
+            &rule.id,
+            "agent-1",
+            "series-1",
+            AlertStateKind::Firing,
+            false,
+        );
+        after.ts = NOW + 5;
+        let after_disable = insert_event(&storage, after);
+        let report = notify_once(storage.clone(), mock.clone(), report.cursor, NOW + 6)
+            .await
+            .unwrap();
+        assert_eq!(report.skipped, 1);
+        assert_eq!(mock.send_count(), 1, "禁用后新事件不得发送");
+        let stored = stored_event(&storage, after_disable);
+        assert!(stored.notified);
+        assert_eq!(stored.notify_error, "rule_disabled");
     }
 
     /// 部分失败：至少一个成功 → 事件成功且错误为空；全部失败 → 固定摘要。
@@ -911,8 +981,8 @@ mod tests {
         let mut rule = rule("rule-batch", 0);
         let channel = channel("批量渠道", true);
         rule.channel_ids = vec![channel.id.clone()];
-        seed_rule(&storage, &rule);
         seed_channel(&storage, &channel);
+        seed_rule(&storage, &rule);
 
         // 先建立游标（空库 = 0），再写入事件；否则首次上线会把它们当存量跳过。
         let cursor = initialize_notify_cursor(&storage, NOW).unwrap();
@@ -967,8 +1037,8 @@ mod tests {
         let mut rule = rule("rule-two-series", 1_800);
         let channel = channel("双序列渠道", true);
         rule.channel_ids = vec![channel.id.clone()];
-        seed_rule(&storage, &rule);
         seed_channel(&storage, &channel);
+        seed_rule(&storage, &rule);
         storage
             .upsert_alert_state(&firing_state(&rule.id, "agent-1", "series-a", None))
             .unwrap();
@@ -1025,8 +1095,8 @@ mod tests {
         let mut rule = rule("rule-late-silence", 0);
         let channel = channel("晚到静默渠道", true);
         rule.channel_ids = vec![channel.id.clone()];
-        seed_rule(&storage, &rule);
         seed_channel(&storage, &channel);
+        seed_rule(&storage, &rule);
 
         let cursor = initialize_notify_cursor(&storage, NOW).unwrap();
         let event_id = insert_event(
@@ -1070,8 +1140,8 @@ mod tests {
         rule.notify_on_resolve = false;
         let channel = channel("不恢复通知", true);
         rule.channel_ids = vec![channel.id.clone()];
-        seed_rule(&storage, &rule);
         seed_channel(&storage, &channel);
+        seed_rule(&storage, &rule);
         storage
             .upsert_alert_state(&AlertState {
                 state: AlertStateKind::Resolved,

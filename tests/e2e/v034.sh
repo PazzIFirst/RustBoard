@@ -1000,8 +1000,9 @@ run_agent_helper hold \
   --ca "$CA" --cert "$A1_DATA/agent.crt" --key "$A1_DATA/agent.key" \
   --agent-id "$A1_ID" --secret-file "$A1_DATA/agent.secret" \
   --hold-seconds 2
-HOLD_RESULT="$HELPER_RC|$(helper_field 'd.get("welcome")')|$(helper_field 'd.get("held")')"
-check_eq "2.17" "正常 Hello 仍拿到 Welcome 并保持会话" "0|True|True" "$HOLD_RESULT"
+HOLD_RESULT="$HELPER_RC|$(helper_field 'd.get("welcome")')|$(helper_field 'd.get("held")')|$(helper_field 'd.get("error","")')"
+check_eq "2.17" "正常 Hello 仍拿到 Welcome 并保持会话（无 Problem/提前关闭）" \
+  "0|True|True|" "$HOLD_RESULT"
 
 check_eq "2.18" "非法 Hello 后真实 agent 仍 online" "online" "$(read_agent_status "$A1_ID")"
 

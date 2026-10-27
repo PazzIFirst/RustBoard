@@ -6,10 +6,17 @@
 //!   `pg_restore`。外部命令一律用参数数组，绝不拼 shell；
 //! - `pg_dump` / `pg_restore` 的 `--dbname` 参数**不含密码**：密码从 DSN 中
 //!   提取后只通过 `PGPASSWORD` / `PGSSLPASSWORD` 环境变量传递；
+//! - 外部工具继承 Hub 的 PostgreSQL TLS 策略：`PGSSLMODE` 缺省 `verify-full`，
+//!   只有显式 `sslmode=disable` 才关闭；根 CA 通过 `PGSSLROOTCERT` 传递，
+//!   并清理会改变策略的继承环境（`PGSERVICE`/`PGREQUIRESSL` 等）；
 //! - 备份目录 `<out>/<UTC timestamp>/`，内部 `manifest.json` 记录版本、schema、
 //!   后端、创建时间与每个文件的 SHA256/大小；配置与证书 0600、目录 0700；
+//! - 复制证书与 `rotate-cert`/ACME 使用同一把 `CertLock`；复制后校验
+//!   server 证书/私钥与 CA 证书/私钥配套，失败不生成 manifest；
 //! - 恢复前校验 manifest 里每个文件的 SHA256 与大小，只接受相对、无 `..`、
-//!   无符号链接的路径；恢复前尽可能备份当前目标；恢复配置/证书是显式行为；
+//!   无符号链接的路径；恢复证书前再次校验配套，失败不覆盖现有材料；
+//!   恢复前尽可能备份当前目标；恢复配置/证书是显式行为；
+//! - v1.0.0 只支持全新安装：manifest schema 不是 v9 的备份一律在写目标前拒绝；
 //! - 错误信息不输出 DSN 密码；日志只出现 `user:***@host`。
 
 use std::fs::{self, File, OpenOptions};
@@ -17,7 +24,7 @@ use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
@@ -28,25 +35,60 @@ use rustboard_common::tls;
 use rustboard_common::util::now_ms;
 use rustboard_common::DEFAULT_HUB_CONFIG;
 use rustboard_core::storage::postgres::{
-    connect_for_schema, PostgresStorage, POSTGRES_SCHEMA_VERSION,
+    connect_with_config, resolve_external_tool_dsn, validate_postgres_schema_v9, PostgresStorage,
+    POSTGRES_SCHEMA_VERSION,
 };
 use rustboard_install::Prompt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::cert_rotation::{CertLock, CERT_LOCK_FILE};
+
 /// manifest 格式版本；恢复只接受完全匹配的版本，避免未来格式被旧二进制误读。
 const MANIFEST_VERSION: u32 = 1;
 /// 本程序支持的 SQLite schema 版本（与 core 的 `SQLITE_SCHEMA_VERSION` 对齐）。
-pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 8;
+pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 9;
 /// 备份/恢复时单个外部命令输出的最大收集长度，避免故障时把巨量日志读入内存。
 const MAX_TOOL_OUTPUT: usize = 8 * 1024;
+/// 等待证书轮换锁的间隔：与 rotate/ACME 的 flock 冲突时最多等待 5s。
+const CERT_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// 等待证书轮换锁的总时长；超时 fail closed，绝不绕过锁复制证书。
+const CERT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// 外部工具继承环境里会改变 PostgreSQL 连接/降级 TLS 的变量。
+///
+/// - `PGSSLMODE` / `PGSSLROOTCERT`：每处调用都由本模块显式设置；
+/// - `PGPASSWORD` / `PGSSLPASSWORD`：无密码时必须清除宿主的旧值；
+/// - `PGREQUIRESSL`：旧版 libpq 的隐式 SSL 要求，会与显式 `sslmode` 混淆；
+/// - `PGSERVICE` / `PGSERVICEFILE`：service 文件可注入另一套 sslmode/rootcert；
+/// - `PGSSLNEGOTIATION`：PG17 direct TLS 协商方式，避免继承意外配置；
+/// - `PGUSER/PGHOST/PGPORT/PGDATABASE`：连接目标只由 DSN 决定；
+/// - `PGPASSFILE/PGSSLCERT/PGSSLKEY/PGOPTIONS`：避免宿主密码文件或客户端证书
+///   参与本次连接（会改变认证/信任行为）。
+const PG_TOOL_ENV_CLEAR: [&str; 16] = [
+    "PGSSLMODE",
+    "PGSSLROOTCERT",
+    "PGPASSWORD",
+    "PGSSLPASSWORD",
+    "PGREQUIRESSL",
+    "PGSERVICE",
+    "PGSERVICEFILE",
+    "PGSSLNEGOTIATION",
+    "PGUSER",
+    "PGHOST",
+    "PGPORT",
+    "PGDATABASE",
+    "PGPASSFILE",
+    "PGSSLCERT",
+    "PGSSLKEY",
+    "PGOPTIONS",
+];
 
-/// hub schema v8 的 21 张业务表。
+/// hub schema v9 的 22 张业务表。
 ///
 /// 与 `rustboard-core/src/storage/postgres/schema.rs` 的 `TABLES` 保持一致；
 /// 只用于 `--force` 前确认目标库没有未知表，以及在迁移 CLIs 中展示。若核心
 /// 新增表而这里没更新，`--force` 会因「未知表」拒绝清空，属于 fail-closed。
-pub(crate) const HUB_TABLES: [&str; 21] = [
+pub(crate) const HUB_TABLES: [&str; 22] = [
     "agents",
     "samples",
     "enroll_tokens",
@@ -66,6 +108,7 @@ pub(crate) const HUB_TABLES: [&str; 21] = [
     "alert_events",
     "alert_silences",
     "notification_channels",
+    "alert_rule_channels",
     "archive_objects",
     "archive_state",
 ];
@@ -145,6 +188,23 @@ struct Manifest {
     files: Vec<ManifestFile>,
 }
 
+/// 解析配置 TOML，错误信息固定为「路径 + TOML 解析失败」。
+///
+/// `toml::de::Error` 的 `Display` 会带出源码行/片段，而 `hub.toml` 可能含
+/// `admin_token`、数据库密码等敏感值；这里丢弃底层错误，只保留可排障的路径，
+/// 与安装器 `load_hub_config_checked` 的脱敏策略一致。
+pub(crate) fn parse_toml_sanitized<T>(text: &str, path: &Path) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    toml::from_str(text).map_err(|_| {
+        anyhow!(
+            "TOML 解析失败: {}（已隐藏原始配置内容与解析位置，避免泄露 token/密码）",
+            path.display()
+        )
+    })
+}
+
 /// 读取配置文件，返回原始字节与解析结果。
 ///
 /// 与 `HubConfig::load` 的区别：**不 chmod** 配置文件，也不在读取阶段产生任何
@@ -166,8 +226,7 @@ pub(crate) fn load_config_snapshot(path: &Path) -> Result<(Vec<u8>, HubConfig)> 
     let bytes = fs::read(path).with_context(|| format!("读取配置失败: {}", path.display()))?;
     let text = std::str::from_utf8(&bytes)
         .with_context(|| format!("配置文件不是合法 UTF-8: {}", path.display()))?;
-    let cfg: HubConfig =
-        toml::from_str(text).with_context(|| format!("解析配置失败: {}", path.display()))?;
+    let cfg: HubConfig = parse_toml_sanitized(text, path)?;
     Ok((bytes, cfg))
 }
 
@@ -250,13 +309,7 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
         );
     }
     let backend = parse_backend(&manifest.backend)?;
-    if manifest.schema > supported_schema(&backend) {
-        bail!(
-            "备份 schema 版本 {} 高于当前程序支持的 {}；请升级 rustboard-hub 后再恢复",
-            manifest.schema,
-            supported_schema(&backend)
-        );
-    }
+    validate_manifest_schema(backend, manifest.schema)?;
     let verified = verify_manifest_files(&args.from, &manifest)?;
     let config_rel = verified
         .get("hub.toml")
@@ -265,11 +318,17 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
     if !verified.contains_key(db_name) {
         bail!("备份缺少数据库文件 {db_name}（不完整的备份不能恢复）");
     }
+    // 证书配套校验必须在任何目标写入（包括 pre-restore 备份/配置 .bak）之前。
+    validate_backup_cert_material(&args.from, &manifest)?;
+    // 不能只信 manifest 的 schema 字段：直接校验备份数据库本身是 v9 且
+    // 22 张业务表齐全，失败时不写目标、不做 pre-restore 覆盖。
+    if backend == Backend::Sqlite {
+        sqlite_assert_v9(&verified[db_name], "备份中的 SQLite ")?;
+    }
     let backup_config_bytes = fs::read(config_rel)?;
     let backup_config_text =
         std::str::from_utf8(&backup_config_bytes).context("备份中的 hub.toml 不是合法 UTF-8")?;
-    let backup_cfg: HubConfig =
-        toml::from_str(backup_config_text).context("解析备份中的 hub.toml 失败")?;
+    let backup_cfg: HubConfig = parse_toml_sanitized(backup_config_text, config_rel)?;
     let backup_kind = backup_cfg
         .database_kind()
         .context("备份中的 database 配置非法")?;
@@ -288,6 +347,7 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
     let (target_cfg, target_config_bytes) = resolve_restore_target(
         &args,
         &config_path,
+        config_rel,
         &backup_cfg,
         &backup_config_bytes,
         backend,
@@ -401,6 +461,22 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
             .context("清理恢复前只读检查产生的 SQLite sidecar 失败；已中止")?;
     }
 
+    // 10.4 目标写入前重验 manifest：缩小“入口校验后被替换备份文件”的 TOCTOU
+    //      窗口；失败时尚未替换目标数据库/证书/配置。
+    verify_manifest_files(&args.from, &manifest)?;
+
+    // 10.5 证书锁提前到数据库替换之前：DB 恢复成功、证书写入前不允许
+    //      rotate-cert/ACME 换掉目标证书材料。必须在 pre-restore 快照之后取锁，
+    //      否则快照自身的 CertLock 会与之冲突。
+    let cert_lock = if manifest_cert_paths(&manifest)?.is_empty() {
+        None
+    } else {
+        reject_existing_symlinks(&certs_dst)?;
+        fsutil::ensure_dir(&certs_dst, 0o700)
+            .with_context(|| format!("创建目标证书目录失败: {}", certs_dst.display()))?;
+        Some(acquire_cert_lock_bounded(&certs_dst)?)
+    };
+
     // 11. 先恢复数据，再恢复证书，最后写配置（配置决定下次启动读哪里）。
     match &target_kind {
         DatabaseKind::Sqlite(path) => {
@@ -409,12 +485,23 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
             println!("SQLite 数据库已恢复: {}", path.display());
         }
         DatabaseKind::Postgres(dsn) => {
-            pg_restore_from(dsn, &verified[db_name])?;
+            pg_restore_from(&target_cfg, dsn, &verified[db_name])?;
+            // 不能只信 manifest：pg_restore 后直接校验目标真实 schema
+            // （MAX(version)==9、22 表、23 索引），失败时不写证书/配置。
+            validate_postgres_schema_v9(&target_cfg, dsn).with_context(|| {
+                "PostgreSQL 恢复后 schema 校验失败；未恢复证书、未切换配置文件，请检查备份"
+            })?;
             println!("PostgreSQL 数据库已恢复: {}", dsn_redacted(dsn));
         }
     }
 
-    restore_certs(&args.from, &manifest, &target_cfg.data_dir)?;
+    restore_certs(
+        &args.from,
+        &manifest,
+        &target_cfg.data_dir,
+        cert_lock.as_ref(),
+    )?;
+    drop(cert_lock);
     println!("证书目录已恢复: {}", certs_dst.display());
 
     // 配置写最后：数据/证书失败时旧配置仍指向旧路径，避免启动到半恢复状态。
@@ -431,6 +518,7 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
 fn resolve_restore_target(
     args: &RestoreArgs,
     config_path: &Path,
+    backup_config_path: &Path,
     backup_cfg: &HubConfig,
     backup_config_bytes: &[u8],
     backend: Backend,
@@ -489,6 +577,7 @@ fn resolve_restore_target(
     }
     let bytes = rewrite_config_paths(
         backup_cfg,
+        backup_config_path,
         backup_config_bytes,
         &target_data_dir,
         &target_database,
@@ -502,6 +591,7 @@ fn resolve_restore_target(
 /// 保留；两个值本来就相等时直接复用备份原始字节，保留注释与排版。
 fn rewrite_config_paths(
     backup_cfg: &HubConfig,
+    backup_config_path: &Path,
     backup_bytes: &[u8],
     data_dir: &Path,
     database: &str,
@@ -513,7 +603,7 @@ fn rewrite_config_paths(
         .to_str()
         .ok_or_else(|| anyhow!("目标 data_dir 不是合法 UTF-8: {}", data_dir.display()))?;
     let text = std::str::from_utf8(backup_bytes).context("备份中的 hub.toml 不是合法 UTF-8")?;
-    let mut value: toml::Value = toml::from_str(text).context("解析备份中的 hub.toml 失败")?;
+    let mut value: toml::Value = parse_toml_sanitized(text, backup_config_path)?;
     let table = value
         .as_table_mut()
         .ok_or_else(|| anyhow!("备份中的 hub.toml 顶层不是 TOML table"))?;
@@ -560,8 +650,12 @@ pub(crate) fn snapshot_to(
                 sqlite_schema_version(path)?
             }
         }
-        DatabaseKind::Postgres(dsn) => postgres_schema_version(dsn),
+        DatabaseKind::Postgres(dsn) => postgres_schema_version(cfg, dsn)?,
     };
+    // v1.0.0 只支持全新安装：旧 schema 源库即使还能被读取，也不能产出
+    // restore 会拒绝的 manifest（必须先判版本，而不是等缺表/导入阶段报错）。
+    ensure_schema_supported(backend_of(&kind), schema)
+        .with_context(|| format!("源数据库 {} 的 schema 不受支持", kind.redacted()))?;
 
     match &kind {
         DatabaseKind::Sqlite(path) => {
@@ -570,11 +664,11 @@ pub(crate) fn snapshot_to(
         }
         DatabaseKind::Postgres(dsn) => {
             let dump = dir.join("rustboard.dump");
-            pg_dump_to(dsn, &dump)?;
+            pg_dump_to(cfg, dsn, &dump)?;
         }
     }
     write_private_file(&dir.join("hub.toml"), config_bytes)?;
-    copy_tree(&tls::cert_dir(&cfg.data_dir), &dir.join("certs"), "certs").with_context(|| {
+    copy_certs_snapshot(&cfg.data_dir, &dir).with_context(|| {
         format!(
             "复制证书目录失败: {}",
             tls::cert_dir(&cfg.data_dir).display()
@@ -603,6 +697,9 @@ pub(crate) fn snapshot_to(
     let json = serde_json::to_vec_pretty(&manifest).context("序列化备份 manifest 失败")?;
     write_private_file(&dir.join("manifest.json"), &json)?;
     sync_dir(&dir)?;
+    // 时间戳目录是新 entry，父目录也要 fsync；否则断电后可能出现
+    // manifest 已落盘但目录项丢失（或反之）的“半成品备份”。
+    sync_dir(out_root)?;
     guard.commit();
     Ok(dir)
 }
@@ -945,10 +1042,14 @@ impl Drop for SqlitePreflight {
     }
 }
 
-/// 迁移预检：版本 + 21 张表 + samples 行数，一次打开（WAL 库只复制一次）。
+/// 迁移预检：版本 + 22 张表 + samples 行数，一次打开（WAL 库只复制一次）。
 pub(crate) fn sqlite_source_info(path: &Path) -> Result<SqliteSourceInfo> {
     let preflight = SqlitePreflight::open(path)?;
     let schema_version = preflight.schema_version()?;
+    // 先判版本再判表：v8 源库即使缺 v9 新表，也必须先得到「只支持全新安装」
+    // 的统一文案，不能只报缺表。
+    ensure_schema_supported(Backend::Sqlite, schema_version)
+        .with_context(|| format!("SQLite 源库 {}", path.display()))?;
     preflight.validate_tables()?;
     let sample_count = preflight.sample_count()?;
     Ok(SqliteSourceInfo {
@@ -1027,6 +1128,14 @@ pub(crate) fn is_non_empty_target_error(err: &anyhow::Error) -> bool {
 /// 目标 schema 版本是否高于当前二进制支持版本。
 pub(crate) fn is_too_new_target_error(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains("高于本程序支持")
+}
+
+/// 目标是否被判定为旧 schema（v1.0.0 只支持全新安装）。
+///
+/// 这类错误必须在 `--force` 的 pg_dump/TRUNCATE 之前返回；调用方不能把它
+/// 归类成 Empty/NonEmpty，否则旧目标会在被拒绝前清空。
+pub(crate) fn is_old_schema_target_error(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("只支持全新安装")
 }
 
 /// 打开只读 SQLite 连接；拒绝符号链接与不存在的文件。
@@ -1341,6 +1450,38 @@ fn sqlite_quick_check(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 校验 SQLite 文件确实是 v9 且 22 张业务表齐全。
+///
+/// 恢复不能只信 manifest 的 `schema` 字段：备份文件可能是旧库，或被伪造
+/// manifest 包装。这里在 rename 到目标前直接读 `PRAGMA user_version` 与
+/// `sqlite_master`，不满足就拒绝，绝不把不可启动的库换到目标路径。
+fn sqlite_assert_v9(path: &Path, what: &str) -> Result<()> {
+    let conn = open_sqlite_readonly_immutable(path)?;
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .with_context(|| format!("读取{what} schema 版本失败: {}", path.display()))?;
+    if let Err(err) = ensure_schema_supported(Backend::Sqlite, version) {
+        return Err(err)
+            .with_context(|| format!("{what} schema 版本为 v{version}（{}）", path.display()));
+    }
+    for table in HUB_TABLES {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("检查{what}表 {table} 失败: {}", path.display()))?;
+        if exists == 0 {
+            bail!(
+                "{what}缺少表 {table}（schema 不完整），拒绝恢复: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// 关键表行数：只统计存在的业务表，源/目标必须完全一致。
 fn sqlite_key_table_counts(path: &Path) -> Result<Vec<(&'static str, i64)>> {
     let conn = open_sqlite_readonly_immutable(path)?;
@@ -1402,12 +1543,13 @@ fn rollback_sqlite_target(destination: &Path, rollback: Option<&Path>) -> Result
 /// 安全顺序：
 /// 1. 目标存在任何 `-wal/-shm/-journal` 直接拒绝（不把旧 WAL 留在 rename 之后）；
 /// 2. 目标旧库先复制一份本地回滚副本（即使目标为空/只有空 schema）；
-/// 3. 新库写入同目录临时文件，校验 SHA256、`quick_check` 与 21 张表行数；
+/// 3. 新库写入同目录临时文件，校验 SHA256、`quick_check` 与 22 张表行数；
 /// 4. 再检查一次无 sidecar 后 rename；
 /// 5. rename 后再次校验；失败则用回滚副本原子替换回去（没有旧库则删除新库），
 ///    并返回明确错误，绝不静默留下半恢复状态。
 fn restore_sqlite_file(source: &Path, destination: &Path) -> Result<()> {
     ensure_no_sqlite_sidecars(destination)?;
+    sqlite_assert_v9(source, "备份中的 SQLite ")?;
     let source_hash = sha256_file(source)?;
     let source_counts = sqlite_key_table_counts(source)?;
     sqlite_quick_check(source)?;
@@ -1445,6 +1587,9 @@ fn restore_sqlite_file(source: &Path, destination: &Path) -> Result<()> {
         );
     }
     sqlite_quick_check(tmp.path())?;
+    // rename 前直接校验恢复出的库：manifest 可被伪造，必须看真实
+    // `user_version` 与 22 张业务表。
+    sqlite_assert_v9(tmp.path(), "SQLite 恢复临时副本 ")?;
     let tmp_counts = sqlite_key_table_counts(tmp.path())?;
     if tmp_counts != source_counts {
         bail!(
@@ -1466,6 +1611,7 @@ fn restore_sqlite_file(source: &Path, destination: &Path) -> Result<()> {
             bail!("恢复后的 SQLite 文件 SHA256 与备份不一致");
         }
         sqlite_quick_check(destination)?;
+        sqlite_assert_v9(destination, "恢复后的 SQLite ")?;
         let counts = sqlite_key_table_counts(destination)?;
         if counts != source_counts {
             bail!(
@@ -1492,7 +1638,10 @@ fn restore_sqlite_file(source: &Path, destination: &Path) -> Result<()> {
 }
 
 /// 外部 `pg_dump` 备份。
-pub(crate) fn pg_dump_to(dsn: &str, destination: &Path) -> Result<()> {
+///
+/// TLS/密码策略来自 `cfg` 与 DSN，经 [`PgDsnSecrets`] 统一解析；`pg_dump` 与
+/// Hub 运行连接使用同一套 `sslmode` / 根 CA / 密码优先级，绝不允许工具侧降级。
+pub(crate) fn pg_dump_to(cfg: &HubConfig, dsn: &str, destination: &Path) -> Result<()> {
     ensure_tool("pg_dump")?;
     if destination.exists() {
         bail!(
@@ -1500,7 +1649,7 @@ pub(crate) fn pg_dump_to(dsn: &str, destination: &Path) -> Result<()> {
             destination.display()
         );
     }
-    let secrets = PgDsnSecrets::parse(dsn)?;
+    let secrets = PgDsnSecrets::parse(dsn, cfg)?;
     let mut command = Command::new("pg_dump");
     command
         .arg("--format=custom")
@@ -1525,9 +1674,11 @@ pub(crate) fn pg_dump_to(dsn: &str, destination: &Path) -> Result<()> {
 }
 
 /// 外部 `pg_restore` 恢复；`--single-transaction` 保证失败时目标不被半恢复。
-fn pg_restore_from(dsn: &str, dump: &Path) -> Result<()> {
+///
+/// TLS/密码策略与运行连接一致，见 [`pg_dump_to`]。
+fn pg_restore_from(cfg: &HubConfig, dsn: &str, dump: &Path) -> Result<()> {
     ensure_tool("pg_restore")?;
-    let secrets = PgDsnSecrets::parse(dsn)?;
+    let secrets = PgDsnSecrets::parse(dsn, cfg)?;
     let mut command = Command::new("pg_restore");
     command
         .arg("--clean")
@@ -1593,107 +1744,74 @@ fn run_pg_tool(command: Command, tool: &str, dsn: &str, secrets: &PgDsnSecrets) 
     )
 }
 
+/// 把统一的 TLS/密码策略传给外部 libpq 工具。
+///
+/// 先清理继承环境（见 [`PG_TOOL_ENV_CLEAR`]），再显式设置 `PGSSLMODE`、有 CA 时
+/// 设置 `PGSSLROOTCERT`、有密码时设置 `PGPASSWORD`/`PGSSLPASSWORD`。这样
+/// `pg_dump`/`pg_restore` 既不会用宿主遗留的 `PGSSLMODE=disable` 降级，也不会
+/// 让旧的 `PGPASSWORD` 覆盖本次目标密码。
 fn apply_pg_env(command: &mut Command, secrets: &PgDsnSecrets) {
-    if let Some(password) = secrets.effective_password() {
+    for key in PG_TOOL_ENV_CLEAR {
+        command.env_remove(key);
+    }
+    command.env("PGSSLMODE", secrets.sslmode);
+    if let Some(root) = &secrets.sslrootcert {
+        command.env("PGSSLROOTCERT", root);
+    }
+    if let Some(password) = secrets.password.as_deref() {
         command.env("PGPASSWORD", password);
     }
-    if let Some(sslpassword) = &secrets.sslpassword {
+    if let Some(sslpassword) = secrets.sslpassword.as_deref() {
         command.env("PGSSLPASSWORD", sslpassword);
     }
 }
 
-/// 从 PostgreSQL DSN 中提取密码，并生成可以放进 argv 的脱敏 DSN。
+/// PostgreSQL DSN 的密码与 TLS 策略，供外部 `pg_dump`/`pg_restore` 使用。
 ///
-/// 处理两处密码：authority 的 `user:password@` 与 query 的 `password=`；同时
-/// 把 `sslpassword=` 从 DSN 剥离，避免进入 argv。百分号编码的密码会先解码，
-/// 再通过环境变量传给 libpq。
-#[derive(Debug)]
+/// 解析统一交给 core 的 [`resolve_external_tool_dsn`]：URL 密码优先级与运行连接
+/// 使用同一个 `postgres::Config`，根 CA 冲突校验也完全一致。
+///
+/// 结构体包含密码，故意不实现 `Debug`。
 struct PgDsnSecrets {
+    /// 已剥离两处密码、sslpassword、sslmode、sslrootcert 的 DSN（argv 安全）。
     sanitized: String,
+    /// URL 自身密码（用于脱敏工具输出）。
+    url_password: Option<String>,
+    /// 实际传给 `PGPASSWORD` 的密码（环境变量覆盖后）。
     password: Option<String>,
     sslpassword: Option<String>,
+    sslmode: &'static str,
+    sslrootcert: Option<PathBuf>,
 }
 
 impl PgDsnSecrets {
-    fn parse(dsn: &str) -> Result<Self> {
-        let (scheme, rest) = dsn
-            .split_once("://")
-            .ok_or_else(|| anyhow!("PostgreSQL DSN 缺少 scheme（{}）", dsn_redacted(dsn)))?;
-        if !matches!(scheme, "postgres" | "postgresql") {
-            bail!("database 不是 PostgreSQL DSN（{}）", dsn_redacted(dsn));
-        }
-        let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
-        let (authority, tail) = rest.split_at(authority_end);
-        let (sanitized_authority, password) = match authority.rsplit_once('@') {
-            Some((userinfo, host)) => match userinfo.split_once(':') {
-                Some((user, raw)) => {
-                    let password = percent_decode(raw)?;
-                    (format!("{user}@{host}"), Some(password))
-                }
-                None => (authority.to_string(), None),
-            },
-            None => (authority.to_string(), None),
-        };
-
-        let (head, fragment) = match tail.split_once('#') {
-            Some((head, fragment)) => (head, Some(fragment)),
-            None => (tail, None),
-        };
-        let (path, query) = match head.split_once('?') {
-            Some((path, query)) => (path, Some(query)),
-            None => (head, None),
-        };
-        let mut sanitized_query = Vec::new();
-        let mut query_password = None;
-        let mut sslpassword = None;
-        if let Some(query) = query {
-            for pair in query.split('&') {
-                if pair.is_empty() {
-                    continue;
-                }
-                let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-                let key = percent_decode(raw_key)?;
-                if key.eq_ignore_ascii_case("password") {
-                    query_password = Some(percent_decode(raw_value)?);
-                } else if key.eq_ignore_ascii_case("sslpassword") {
-                    sslpassword = Some(percent_decode(raw_value)?);
-                } else {
-                    sanitized_query.push(pair.to_string());
-                }
-            }
-        }
-        let password = password.or(query_password);
-        let mut sanitized = format!("{scheme}://{sanitized_authority}{path}");
-        if !sanitized_query.is_empty() {
-            sanitized.push('?');
-            sanitized.push_str(&sanitized_query.join("&"));
-        }
-        if let Some(fragment) = fragment {
-            sanitized.push('#');
-            sanitized.push_str(fragment);
-        }
-        // 最后再做一次保守脱敏：即使上游校验漏掉了畸形 userinfo，argv 也不应
-        // 出现密码。合法 DSN 不含密码时该函数原样返回。
-        let sanitized = redact_database_url(&sanitized);
+    fn parse(dsn: &str, cfg: &HubConfig) -> Result<Self> {
+        let resolved =
+            resolve_external_tool_dsn(dsn, cfg.db_sslrootcert.as_deref()).with_context(|| {
+                format!(
+                    "解析 PostgreSQL DSN / TLS 策略失败（{}）",
+                    dsn_redacted(dsn)
+                )
+            })?;
         Ok(Self {
-            sanitized,
-            password,
-            sslpassword,
+            sanitized: resolved.sanitized,
+            url_password: resolved.url_password,
+            password: resolved.effective_password,
+            sslpassword: resolved.sslpassword,
+            sslmode: resolved.sslmode,
+            sslrootcert: resolved.sslrootcert,
         })
-    }
-
-    fn effective_password(&self) -> Option<String> {
-        match std::env::var("RUSTBOARD_DATABASE_PASSWORD") {
-            Ok(password) if !password.is_empty() => Some(password),
-            _ => self.password.clone(),
-        }
     }
 
     fn scrub(&self, text: &str, dsn: &str) -> String {
         let mut value = text.replace(dsn, &dsn_redacted(dsn));
-        for secret in [self.password.as_deref(), self.sslpassword.as_deref()]
-            .into_iter()
-            .flatten()
+        for secret in [
+            self.url_password.as_deref(),
+            self.password.as_deref(),
+            self.sslpassword.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             if !secret.is_empty() {
                 value = value.replace(secret, "***");
@@ -1703,30 +1821,264 @@ impl PgDsnSecrets {
     }
 }
 
-fn percent_decode(value: &str) -> Result<String> {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len() {
-                bail!("PostgreSQL DSN 百分号编码不完整");
+/// 预检 PostgreSQL 目标 DSN 的密码/TLS 策略，供 `migrate` 在交互确认前调用。
+///
+/// 与运行连接/外部工具共用 [`PgDsnSecrets`]，非法 `sslmode`、根证书冲突、
+/// 重复参数等都会在任何破坏性操作前 fail closed。
+pub(crate) fn validate_pg_connection_policy(cfg: &HubConfig, dsn: &str) -> Result<()> {
+    let _ = PgDsnSecrets::parse(dsn, cfg)?;
+    Ok(())
+}
+
+/// 获取与 `rotate-cert` / ACME 续期相同的证书锁，锁冲突时有界等待。
+///
+/// `CertLock` 用 `flock(LOCK_EX | LOCK_NB)`，持锁进程崩溃时内核自动释放。这里
+/// 只对「另一个 rotate-cert 正在运行」做 100ms × 50 次重试；其它错误（权限、
+/// 符号链接等）立即返回，不把真实故障伪装成锁竞争。等待超时 fail closed，
+/// 绝不无锁复制证书。
+fn acquire_cert_lock_bounded(cert_dir: &Path) -> Result<CertLock> {
+    let deadline = Instant::now() + CERT_LOCK_TIMEOUT;
+    loop {
+        match CertLock::acquire(cert_dir) {
+            Ok(lock) => return Ok(lock),
+            Err(err) => {
+                let contended = format!("{err:#}").contains("另一个 rotate-cert 正在运行");
+                let now = Instant::now();
+                if !contended || now >= deadline {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "获取证书轮换锁失败（{}）：证书操作必须与 rotate-cert/ACME 串行，\
+                             已安全中止",
+                            cert_dir.display()
+                        )
+                    });
+                }
+                std::thread::sleep(CERT_LOCK_RETRY_INTERVAL.min(deadline - now));
             }
-            let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
-                .context("PostgreSQL DSN 百分号编码不是 ASCII")?;
-            let byte = u8::from_str_radix(hex, 16)
-                .with_context(|| format!("PostgreSQL DSN 百分号编码非法: %{hex}"))?;
-            out.push(byte);
-            index += 3;
-        } else {
-            out.push(bytes[index]);
-            index += 1;
         }
     }
-    String::from_utf8(out).context("PostgreSQL DSN 中的百分号编码不是 UTF-8")
+}
+
+/// 校验一对证书/私钥是否配套；都不存在时跳过，只存在一个时 fail closed。
+fn validate_cert_file_pair(cert: &Path, key: &Path, label: &str) -> Result<()> {
+    let cert_meta = match fs::symlink_metadata(cert) {
+        Ok(meta) => Some(meta),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(err).with_context(|| format!("检查{label}失败: {}", cert.display()))
+        }
+    };
+    let key_meta = match fs::symlink_metadata(key) {
+        Ok(meta) => Some(meta),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).with_context(|| format!("检查{label}失败: {}", key.display())),
+    };
+    match (cert_meta, key_meta) {
+        (None, None) => return Ok(()),
+        (Some(_), None) => bail!(
+            "{label}材料不完整：证书 {} 存在但私钥 {} 缺失；已安全中止",
+            cert.display(),
+            key.display()
+        ),
+        (None, Some(_)) => bail!(
+            "{label}材料不完整：私钥 {} 存在但证书 {} 缺失；已安全中止",
+            key.display(),
+            cert.display()
+        ),
+        (Some(cert_meta), Some(key_meta)) => {
+            if cert_meta.file_type().is_symlink() || key_meta.file_type().is_symlink() {
+                bail!(
+                    "{label}不能是符号链接：{} / {}",
+                    cert.display(),
+                    key.display()
+                );
+            }
+            if !cert_meta.is_file() || !key_meta.is_file() {
+                bail!(
+                    "{label}必须是普通文件：{} / {}",
+                    cert.display(),
+                    key.display()
+                );
+            }
+        }
+    }
+    let cert_pem =
+        fs::read_to_string(cert).with_context(|| format!("读取{label}失败: {}", cert.display()))?;
+    let key_pem =
+        fs::read_to_string(key).with_context(|| format!("读取{label}失败: {}", key.display()))?;
+    let matches = tls::cert_matches_key(&cert_pem, &key_pem)
+        .with_context(|| format!("解析{label}失败：{} / {}", cert.display(), key.display()))?;
+    if !matches {
+        bail!(
+            "{label}不配套：{} 与 {} 不是一对（可能是轮换写盘中途被中断）；\
+             已安全中止，不生成备份/不覆盖目标",
+            cert.display(),
+            key.display()
+        );
+    }
+    Ok(())
+}
+
+/// 只按「manifest 实际会写入的证书集合」校验一对材料是否齐全/配套。
+///
+/// 备份目录里可能残留未列入 manifest 的旧文件（例如旧版备份的 `.rotate.lock`
+/// 或半套证书）。如果按目录实际内容校验，会误以为 server.crt/key 配套，而
+/// restore 只写 manifest 里的 crt，最终恢复出坏材料。
+fn validate_cert_file_pair_in_set(
+    dir: &Path,
+    cert_name: &str,
+    key_name: &str,
+    label: &str,
+    present: &std::collections::BTreeSet<PathBuf>,
+) -> Result<()> {
+    let cert_rel = Path::new(cert_name);
+    let key_rel = Path::new(key_name);
+    match (present.contains(cert_rel), present.contains(key_rel)) {
+        (false, false) => Ok(()),
+        (true, false) => {
+            bail!("{label}材料不完整：manifest 含 {cert_name} 但缺少 {key_name}；拒绝恢复")
+        }
+        (false, true) => {
+            bail!("{label}材料不完整：manifest 含 {key_name} 但缺少 {cert_name}；拒绝恢复")
+        }
+        (true, true) => validate_cert_file_pair(&dir.join(cert_name), &dir.join(key_name), label),
+    }
+}
+
+/// 按给定证书集合校验 server/CA 材料配套。
+fn validate_cert_material_set(
+    dir: &Path,
+    present: &std::collections::BTreeSet<PathBuf>,
+) -> Result<()> {
+    validate_cert_file_pair_in_set(
+        dir,
+        tls::SERVER_CERT_FILE,
+        tls::SERVER_KEY_FILE,
+        "服务端证书与私钥",
+        present,
+    )?;
+    validate_cert_file_pair_in_set(
+        dir,
+        tls::CA_CERT_FILE,
+        tls::CA_KEY_FILE,
+        "CA 证书与私钥",
+        present,
+    )
+}
+
+/// 校验目录实际存在的 server 与 CA 材料配套（用于备份临时副本）。
+fn validate_cert_material(dir: &Path) -> Result<()> {
+    let mut present = std::collections::BTreeSet::new();
+    for name in [
+        tls::SERVER_CERT_FILE,
+        tls::SERVER_KEY_FILE,
+        tls::CA_CERT_FILE,
+        tls::CA_KEY_FILE,
+    ] {
+        if fs::symlink_metadata(dir.join(name)).is_ok() {
+            present.insert(PathBuf::from(name));
+        }
+    }
+    validate_cert_material_set(dir, &present)
+}
+
+/// 在 `CertLock` 保护下把证书目录复制到备份临时目录，校验配套后再落到 `certs/`。
+///
+/// 证书目录不存在（HTTP/无 TLS 的 hub）时直接跳过，不因缺目录失败；目录存在
+/// 但只有非证书文件时按原样复制。任何配套校验失败都会删除临时目录并中止本次
+/// 备份（`BackupDirGuard` 随后删除整个时间戳目录），不会写出 manifest。
+fn copy_certs_snapshot(data_dir: &Path, backup_dir: &Path) -> Result<()> {
+    let source = tls::cert_dir(data_dir);
+    match fs::symlink_metadata(&source) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                bail!("证书路径是符号链接，拒绝备份: {}", source.display());
+            }
+            if !meta.is_dir() {
+                bail!("证书路径不是目录: {}", source.display());
+            }
+        }
+        // HTTP hub 没有证书目录：保持可备份，manifest 不包含 certs。
+        // 明确告警而不是静默省略，便于发现「TLS hub 证书目录被误删」。
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                path = %source.display(),
+                "证书目录不存在，本次备份不包含证书材料"
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("读取证书路径失败: {}", source.display()))
+        }
+    }
+
+    let _lock = acquire_cert_lock_bounded(&source)?;
+    // 持锁后目录可能已被清理（安装器删除/手工操作）；重新确认，避免为了
+    // 复制不存在的目录而失败，也避免在目录缺失时生成空 certs。
+    match fs::symlink_metadata(&source) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+        Ok(_) => bail!("证书路径不是普通目录: {}", source.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("读取证书路径失败: {}", source.display()))
+        }
+    }
+
+    let temp = backup_dir.join("certs.partial");
+    copy_tree(&source, &temp, "certs")?;
+    if let Err(err) = validate_cert_material(&temp) {
+        let _ = fs::remove_dir_all(&temp);
+        return Err(err).context("证书材料一致性校验失败，本次备份已中止");
+    }
+    let destination = backup_dir.join("certs");
+    if let Err(err) = fs::rename(&temp, &destination) {
+        let _ = fs::remove_dir_all(&temp);
+        return Err(err).with_context(|| {
+            format!(
+                "提交证书备份目录失败: {} -> {}",
+                temp.display(),
+                destination.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+/// manifest 中 `certs/` 下实际会写入的相对路径集合。
+fn manifest_cert_paths(manifest: &Manifest) -> Result<std::collections::BTreeSet<PathBuf>> {
+    let mut paths = std::collections::BTreeSet::new();
+    for file in &manifest.files {
+        let rel = safe_relative_path(&file.path)?;
+        let Ok(within) = rel.strip_prefix("certs") else {
+            continue;
+        };
+        if !within.as_os_str().is_empty() {
+            paths.insert(within.to_path_buf());
+        }
+    }
+    Ok(paths)
+}
+
+/// 校验备份内 **manifest 实际会写入的** 证书材料配套；不配套时在写目标前拒绝。
+fn validate_backup_cert_material(backup_dir: &Path, manifest: &Manifest) -> Result<()> {
+    let present = manifest_cert_paths(manifest)?;
+    if present.is_empty() {
+        return Ok(());
+    }
+    let certs_dir = backup_dir.join("certs");
+    let meta = fs::symlink_metadata(&certs_dir)
+        .with_context(|| format!("读取备份证书目录失败: {}", certs_dir.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        bail!("备份证书路径不是普通目录: {}", certs_dir.display());
+    }
+    validate_cert_material_set(&certs_dir, &present)
+        .context("备份中的证书材料不配套，拒绝恢复（未覆盖现有材料）")
 }
 
 /// 把证书目录复制到备份目录（目录 0700、文件 0600，拒绝符号链接）。
+///
+/// 持久化的 `.rotate.lock` 不属于证书材料，排除在备份之外；否则 restore 会
+/// 用备份里的旧锁文件覆盖目标目录中正在使用的锁 inode。
 fn copy_tree(source: &Path, destination: &Path, rel: &str) -> Result<()> {
     let meta = fs::symlink_metadata(source)
         .with_context(|| format!("读取证书路径失败: {}", source.display()))?;
@@ -1745,6 +2097,11 @@ fn copy_tree(source: &Path, destination: &Path, rel: &str) -> Result<()> {
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let name = entry.file_name();
+        if name.to_string_lossy() == CERT_LOCK_FILE {
+            // 锁文件是运行态资源，不是证书材料；复制它会在 restore 时覆盖
+            // 目标目录当前正在使用的锁 inode。
+            continue;
+        }
         let source_path = entry.path();
         let destination_path = destination.join(&name);
         let child_rel = format!("{rel}/{}", name.to_string_lossy());
@@ -1827,19 +2184,48 @@ fn record_file_entry(path: &Path, rel: &Path, files: &mut Vec<ManifestFile>) -> 
     Ok(())
 }
 
-/// 恢复证书目录：manifest 中 `certs/` 下的文件逐个写回目标证书目录。
-fn restore_certs(backup_dir: &Path, manifest: &Manifest, data_dir: &Path) -> Result<()> {
-    let certs_dst = tls::cert_dir(data_dir);
-    reject_existing_symlinks(&certs_dst)?;
-    fsutil::ensure_dir(&certs_dst, 0o700)
-        .with_context(|| format!("创建证书目录失败: {}", certs_dst.display()))?;
+/// 恢复证书目录：先校验备份内证书/私钥配套，再在 `CertLock` 下写目标。
+///
+/// 校验失败直接返回，不创建/覆盖目标证书目录；manifest 里没有证书文件时
+/// 不创建空目录（HTTP hub 备份）。`cert_lock` 由 `restore` 在数据库替换前
+/// 获取并持有；单元测试传 `None` 时自行取锁。
+fn restore_certs(
+    backup_dir: &Path,
+    manifest: &Manifest,
+    data_dir: &Path,
+    cert_lock: Option<&CertLock>,
+) -> Result<()> {
+    let mut cert_files = Vec::new();
     for file in &manifest.files {
         let rel = safe_relative_path(&file.path)?;
         if !rel.starts_with("certs") || rel.as_os_str() == "certs" {
             continue;
         }
-        let source = safe_join(backup_dir, &rel)?;
         let within = rel.strip_prefix("certs").expect("前面已确认 certs 前缀");
+        if within
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy() == CERT_LOCK_FILE)
+        {
+            continue;
+        }
+        cert_files.push((safe_join(backup_dir, &rel)?, within.to_path_buf()));
+    }
+    if cert_files.is_empty() {
+        return Ok(());
+    }
+    validate_backup_cert_material(backup_dir, manifest)?;
+
+    let certs_dst = tls::cert_dir(data_dir);
+    reject_existing_symlinks(&certs_dst)?;
+    fsutil::ensure_dir(&certs_dst, 0o700)
+        .with_context(|| format!("创建证书目录失败: {}", certs_dst.display()))?;
+    // 写目标证书与 rotate-cert/ACME 串行；调用方已持锁时不重复获取（同进程
+    // 两个 fd 的 flock 会互相冲突）。
+    let _owned_lock = match cert_lock {
+        Some(_) => None,
+        None => Some(acquire_cert_lock_bounded(&certs_dst)?),
+    };
+    for (source, within) in cert_files {
         let destination = certs_dst.join(within);
         reject_existing_symlinks(&destination)?;
         let bytes =
@@ -1863,30 +2249,31 @@ fn load_optional_config_snapshot(path: &Path) -> Result<Option<(Vec<u8>, HubConf
     }
 }
 
-/// PostgreSQL schema 版本：只读连接可用时查实际值，否则回退到当前支持版本。
+/// PostgreSQL schema 版本；连接/查询失败必须 fail closed，不能回退成“最新”。
 ///
-/// 回退只影响 manifest 的展示字段；恢复仍由 `pg_restore` 原样恢复。
-fn postgres_schema_version(dsn: &str) -> i64 {
-    let Ok(mut client) = connect_for_schema(dsn) else {
-        return POSTGRES_SCHEMA_VERSION;
-    };
-    let exists = client.query_one(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-         WHERE table_schema = current_schema() AND table_name = 'schema_migrations')",
-        &[],
-    );
-    let Ok(row) = exists else {
-        return 0;
-    };
-    let exists: bool = row.get(0);
+/// 连接使用与 Hub 运行连接相同的 DSN/TLS/密码策略；`schema_migrations` 不存在
+/// 或 `MAX(version)` 为 NULL 都返回 0（随后由 schema 门禁拒绝旧库），绝不静默
+/// 把不可达/旧库标成当前支持版本。
+fn postgres_schema_version(cfg: &HubConfig, dsn: &str) -> Result<i64> {
+    let redacted = dsn_redacted(dsn);
+    let mut client = connect_with_config(cfg, dsn)
+        .with_context(|| format!("连接 PostgreSQL 读取 schema 版本失败（{redacted}）"))?;
+    let exists: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name = 'schema_migrations')",
+            &[],
+        )
+        .with_context(|| format!("检查 PostgreSQL schema_migrations 失败（{redacted}）"))?
+        .get(0);
     if !exists {
-        return 0;
+        return Ok(0);
     }
-    client
+    let version: Option<i64> = client
         .query_one("SELECT MAX(version) FROM schema_migrations", &[])
-        .ok()
-        .and_then(|row| row.get::<_, Option<i64>>(0))
-        .unwrap_or(POSTGRES_SCHEMA_VERSION)
+        .with_context(|| format!("读取 PostgreSQL schema 版本失败（{redacted}）"))?
+        .get(0);
+    Ok(version.unwrap_or(0))
 }
 
 fn supported_schema(backend: &Backend) -> i64 {
@@ -1894,6 +2281,41 @@ fn supported_schema(backend: &Backend) -> i64 {
         Backend::Sqlite => SQLITE_SCHEMA_VERSION,
         Backend::Postgres => POSTGRES_SCHEMA_VERSION,
     }
+}
+
+/// 恢复前的 schema 门禁：v1.0.0 只接受 v9 备份，旧 schema 一律在写目标前拒绝。
+///
+/// 启动路径（SQLite/PG）同样 fail closed；这里提前到 restore 入口，避免先
+/// 覆盖目标数据库/证书/配置、直到下次打开数据库才发现不兼容。
+fn validate_manifest_schema(backend: Backend, schema: i64) -> Result<()> {
+    ensure_schema_supported(backend, schema).with_context(|| {
+        format!(
+            "备份 manifest 的 schema 版本为 v{schema}，当前程序要求 v{}",
+            supported_schema(&backend)
+        )
+    })
+}
+
+/// v1.0.0 的 schema 门禁：只接受当前支持版本，旧版本统一给 fresh-install 文案。
+///
+/// 备份源、恢复 manifest 与迁移目标共用这一判定；调用方必须在使用
+/// `--force` 的 dump/TRUNCATE 或写入任何目标文件之前执行。
+fn ensure_schema_supported(backend: Backend, schema: i64) -> Result<()> {
+    let supported = supported_schema(&backend);
+    if schema > supported {
+        bail!(
+            "数据库 schema 版本 {schema} 高于本程序支持的 {supported}；\
+             请升级 rustboard-hub 后再试"
+        );
+    }
+    if schema < supported {
+        bail!(
+            "检测到已有数据库 schema v{schema}：v1.0.0 只支持全新安装，\
+             不执行任何旧 schema 升级或数据回填；旧数据兼容将在首个正式版本之后提供。\
+             请先备份该数据库，再按全新安装部署（本程序不会修改旧库）"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2040,4 +2462,796 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
         month as u32,
         day as u32,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+    /// 进程级环境变量 + PATH 读取/修改必须串行，避免测试相互干扰。
+    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestRoot {
+        path: PathBuf,
+    }
+
+    impl TestRoot {
+        fn new(tag: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let path = std::env::temp_dir().join(format!(
+                "rb-backup-unit-{tag}-{}-{}-{nanos}",
+                std::process::id(),
+                NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("创建测试根目录");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 测试结束（含 panic）时恢复被修改的环境变量。
+    struct EnvRestore {
+        values: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                values: keys
+                    .iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.values {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn write_db(path: &Path) {
+        let conn = SqliteConnection::open(path).expect("创建测试 SQLite");
+        conn.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)
+            .expect("设置测试 schema 版本");
+    }
+
+    fn make_certs(data_dir: &Path) {
+        tls::ensure_self_signed_server(
+            data_dir,
+            &["127.0.0.1".to_string()],
+            tls::CertPolicy::default(),
+        )
+        .expect("生成测试证书");
+    }
+
+    fn sqlite_cfg(data_dir: &Path, db: &Path) -> HubConfig {
+        HubConfig {
+            data_dir: data_dir.to_path_buf(),
+            database: format!("sqlite://{}", db.display()),
+            ..HubConfig::default()
+        }
+    }
+
+    fn manifest_paths(manifest: &Manifest) -> Vec<String> {
+        manifest
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect()
+    }
+
+    fn assert_no_timestamp_dirs(out: &Path) {
+        let entries: Vec<_> = fs::read_dir(out)
+            .expect("读取备份根目录")
+            .map(|entry| entry.expect("目录项").path())
+            .collect();
+        assert!(entries.is_empty(), "失败备份不得留下目录: {entries:?}");
+    }
+
+    /// #52：正常备份包含配套证书，manifest 成功；恢复后 TLS 服务端配置可构建。
+    #[test]
+    fn snapshot_copies_consistent_certs_and_restore_builds_server_config() {
+        let root = TestRoot::new("certs-ok");
+        let data_dir = root.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        make_certs(&data_dir);
+        let db = data_dir.join("rustboard.db");
+        write_db(&db);
+        let cfg = sqlite_cfg(&data_dir, &db);
+
+        // 模拟 rotate-cert 持久锁文件：不能进入备份/manifest。
+        fs::write(tls::cert_dir(&data_dir).join(CERT_LOCK_FILE), b"lock").unwrap();
+        let out = root.path().join("backups");
+        let backup = snapshot_to(&out, &cfg, b"data_dir = \"placeholder\"\n", false)
+            .expect("正常备份必须成功");
+        let manifest = read_manifest(&backup).expect("manifest 必须可读");
+        let paths = manifest_paths(&manifest);
+        for rel in [
+            "certs/server.crt",
+            "certs/server.key",
+            "certs/ca.crt",
+            "certs/ca.key",
+        ] {
+            assert!(
+                paths.contains(&rel.to_string()),
+                "manifest 缺少 {rel}: {paths:?}"
+            );
+        }
+        assert!(
+            paths.iter().all(|path| !path.ends_with(CERT_LOCK_FILE)),
+            "锁文件不得进入备份: {paths:?}"
+        );
+        verify_manifest_files(&backup, &manifest).expect("manifest 哈希必须自洽");
+        validate_backup_cert_material(&backup, &manifest).expect("备份证书必须配套");
+
+        // 删除目标证书后恢复：材料配套，TLS 配置可构建（等价于可启动）。
+        fs::remove_dir_all(tls::cert_dir(&data_dir)).unwrap();
+        restore_certs(&backup, &manifest, &data_dir, None).expect("配套证书必须能恢复");
+        let config = tls::server_config(&data_dir).expect("恢复后 TLS 服务端配置必须可构建");
+        assert!(!config.alpn_protocols.is_empty());
+    }
+
+    /// #52：HTTP hub 没有证书目录时不因缺目录失败，也不创建空 certs。
+    #[test]
+    fn snapshot_allows_missing_cert_dir_for_plain_http_hub() {
+        let root = TestRoot::new("no-certs");
+        let data_dir = root.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db = data_dir.join("rustboard.db");
+        write_db(&db);
+        let cfg = sqlite_cfg(&data_dir, &db);
+
+        let out = root.path().join("backups");
+        let backup = snapshot_to(&out, &cfg, b"data_dir = \"placeholder\"\n", false)
+            .expect("无证书目录不得导致备份失败");
+        let manifest = read_manifest(&backup).unwrap();
+        assert!(
+            manifest_paths(&manifest)
+                .iter()
+                .all(|path| !path.starts_with("certs")),
+            "无证书时 manifest 不应包含 certs"
+        );
+        assert!(!backup.join("certs").exists());
+        restore_certs(&backup, &manifest, &data_dir, None).expect("无证书备份恢复应为空操作");
+        assert!(!tls::cert_dir(&data_dir).exists(), "不应创建空证书目录");
+    }
+
+    /// P0：旧 v8 SQLite 源库必须在生成 manifest 前拒绝，且文案与启动一致。
+    #[test]
+    fn snapshot_rejects_legacy_sqlite_source_before_manifest() {
+        let root = TestRoot::new("legacy-source");
+        let data_dir = root.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db = data_dir.join("rustboard.db");
+        {
+            let conn = SqliteConnection::open(&db).expect("创建测试 SQLite");
+            conn.pragma_update(None, "user_version", 8)
+                .expect("设置旧 schema 版本");
+        }
+        let cfg = sqlite_cfg(&data_dir, &db);
+        let out = root.path().join("backups");
+        let err = snapshot_to(&out, &cfg, b"data_dir = \"placeholder\"\n", false)
+            .expect_err("v8 源库不得产出备份");
+        let message = format!("{err:#}");
+        assert!(message.contains("只支持全新安装"), "{message}");
+        assert!(
+            message.contains("旧数据兼容将在首个正式版本之后提供"),
+            "{message}"
+        );
+        assert_no_timestamp_dirs(&out);
+    }
+
+    /// P1 复审：PG schema 探测失败必须 fail closed，不能回退成 v9 后继续 dump。
+    #[test]
+    fn snapshot_fails_closed_when_pg_schema_probe_is_unreachable() {
+        let _guard = env_lock();
+        let root = TestRoot::new("pg-probe-unreachable");
+        let fake_bin = root.path().join("bin");
+        let argv_file = root.path().join("argv.txt");
+        let env_file = root.path().join("env.txt");
+        install_fake_pg_tool(&fake_bin, "pg_dump", &argv_file, &env_file);
+
+        let _restore = EnvRestore::capture(&["PATH"]);
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = OsString::from(fake_bin.display().to_string());
+        new_path.push(":");
+        new_path.push(old_path);
+        std::env::set_var("PATH", new_path);
+
+        let data_dir = root.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let cfg = HubConfig {
+            data_dir,
+            database: "postgres://u:secret@127.0.0.1:1/db?sslmode=disable".to_string(),
+            db_connect_timeout_ms: 200,
+            ..HubConfig::default()
+        };
+        let out = root.path().join("backups");
+        let err = snapshot_to(&out, &cfg, b"data_dir = \"placeholder\"\n", false)
+            .expect_err("不可达目标不得产出备份");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("读取 schema 版本失败"),
+            "应报 PG schema 探测失败: {message}"
+        );
+        assert!(!argv_file.exists(), "schema 探测失败后不得执行 pg_dump");
+        assert_no_timestamp_dirs(&out);
+    }
+
+    /// P0：恢复侧不能只信 manifest；真实 SQLite 版本/表清单必须校验。
+    #[test]
+    fn sqlite_assert_v9_rejects_legacy_and_incomplete_database() {
+        let root = TestRoot::new("assert-v9");
+        let legacy = root.path().join("legacy.db");
+        {
+            let conn = SqliteConnection::open(&legacy).unwrap();
+            conn.pragma_update(None, "user_version", 8).unwrap();
+        }
+        let err = sqlite_assert_v9(&legacy, "测试 SQLite ").expect_err("v8 必须拒绝");
+        assert!(format!("{err:#}").contains("只支持全新安装"), "{err:#}");
+
+        let incomplete = root.path().join("incomplete.db");
+        {
+            let conn = SqliteConnection::open(&incomplete).unwrap();
+            conn.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)
+                .unwrap();
+        }
+        let err = sqlite_assert_v9(&incomplete, "测试 SQLite ").expect_err("缺表必须拒绝");
+        let message = format!("{err:#}");
+        assert!(message.contains("缺少表"), "{message}");
+        assert!(message.contains("拒绝恢复"), "{message}");
+    }
+
+    /// #52：旧 crt + 新 key 的交错快照必须拒绝，且不留下半成品目录。
+    #[test]
+    fn snapshot_rejects_interleaved_old_cert_new_key() {
+        let root = TestRoot::new("cert-mismatch");
+        let data_dir = root.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        make_certs(&data_dir);
+        let db = data_dir.join("rustboard.db");
+        write_db(&db);
+        let cfg = sqlite_cfg(&data_dir, &db);
+
+        let new_key = rcgen::KeyPair::generate().expect("生成新 key");
+        let key_path = tls::cert_dir(&data_dir).join(tls::SERVER_KEY_FILE);
+        fs::write(&key_path, new_key.serialize_pem()).unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let out = root.path().join("backups");
+        let err = snapshot_to(&out, &cfg, b"data_dir = \"placeholder\"\n", false)
+            .expect_err("证书/私钥不配套必须拒绝备份");
+        let message = format!("{err:#}");
+        assert!(message.contains("不配套"), "{message}");
+        assert_no_timestamp_dirs(&out);
+    }
+
+    /// #52：持有 CertLock 时，备份有界等待后安全失败（不会无锁复制）。
+    #[test]
+    fn snapshot_fails_bounded_when_cert_lock_is_held() {
+        let root = TestRoot::new("cert-lock");
+        let data_dir = root.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        make_certs(&data_dir);
+        let db = data_dir.join("rustboard.db");
+        write_db(&db);
+        let cfg = sqlite_cfg(&data_dir, &db);
+
+        let _lock = CertLock::acquire(&tls::cert_dir(&data_dir)).expect("测试先持有证书锁");
+        let out = root.path().join("backups");
+        let started = Instant::now();
+        let err = snapshot_to(&out, &cfg, b"data_dir = \"placeholder\"\n", false)
+            .expect_err("持锁期间备份必须失败");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "锁冲突应有界等待，实际 {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "锁冲突等待必须有限，实际 {elapsed:?}"
+        );
+        let message = format!("{err:#}");
+        assert!(message.contains("证书轮换锁"), "{message}");
+        assert_no_timestamp_dirs(&out);
+    }
+
+    /// #52：恢复时备份证书不配套 → 拒绝且不覆盖现有材料。
+    #[test]
+    fn restore_rejects_mismatched_backup_certs_without_overwriting() {
+        let root = TestRoot::new("restore-mismatch");
+        let source_dir = root.path().join("source");
+        let target_dir = root.path().join("target");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        make_certs(&source_dir);
+        make_certs(&target_dir);
+
+        let backup = root.path().join("backup");
+        fs::create_dir_all(&backup).unwrap();
+        copy_tree(&tls::cert_dir(&source_dir), &backup.join("certs"), "certs").unwrap();
+        // 篡改备份的 key，让证书与私钥不配套。
+        let new_key = rcgen::KeyPair::generate().expect("生成新 key");
+        let key_path = backup.join("certs").join(tls::SERVER_KEY_FILE);
+        fs::write(&key_path, new_key.serialize_pem()).unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let manifest = Manifest {
+            manifest_version: MANIFEST_VERSION,
+            version: "test".to_string(),
+            schema: SQLITE_SCHEMA_VERSION,
+            backend: "sqlite".to_string(),
+            created_at: format_rfc3339(now_ms()),
+            created_at_ms: now_ms(),
+            files: vec![
+                ManifestFile {
+                    path: format!("certs/{}", tls::SERVER_CERT_FILE),
+                    sha256: "0".repeat(64),
+                    size: 0,
+                    mode: "0600".to_string(),
+                },
+                ManifestFile {
+                    path: format!("certs/{}", tls::SERVER_KEY_FILE),
+                    sha256: "0".repeat(64),
+                    size: 0,
+                    mode: "0600".to_string(),
+                },
+            ],
+        };
+        let target_key = tls::cert_dir(&target_dir).join(tls::SERVER_KEY_FILE);
+        let before = fs::read(&target_key).unwrap();
+        let err = restore_certs(&backup, &manifest, &target_dir, None)
+            .expect_err("不配套的备份证书必须拒绝恢复");
+        assert!(format!("{err:#}").contains("不配套"), "{err:#}");
+        assert_eq!(
+            fs::read(&target_key).unwrap(),
+            before,
+            "拒绝恢复时不得覆盖现有私钥"
+        );
+    }
+
+    /// 只校验 manifest 实际会写入的证书集合：目录里多出的 key 不能“补全”一对。
+    #[test]
+    fn restore_validates_only_manifest_cert_set() {
+        let root = TestRoot::new("manifest-cert-set");
+        let source_dir = root.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        make_certs(&source_dir);
+        let backup = root.path().join("backup");
+        fs::create_dir_all(&backup).unwrap();
+        copy_tree(&tls::cert_dir(&source_dir), &backup.join("certs"), "certs").unwrap();
+
+        // manifest 只列出 server.crt；磁盘上的 server.key 不得被用来补全。
+        let manifest = Manifest {
+            manifest_version: MANIFEST_VERSION,
+            version: "test".to_string(),
+            schema: SQLITE_SCHEMA_VERSION,
+            backend: "sqlite".to_string(),
+            created_at: format_rfc3339(now_ms()),
+            created_at_ms: now_ms(),
+            files: vec![ManifestFile {
+                path: format!("certs/{}", tls::SERVER_CERT_FILE),
+                sha256: "0".repeat(64),
+                size: 0,
+                mode: "0600".to_string(),
+            }],
+        };
+        let target_dir = root.path().join("target");
+        fs::create_dir_all(&target_dir).unwrap();
+        let err = restore_certs(&backup, &manifest, &target_dir, None)
+            .expect_err("manifest 缺 key 时必须拒绝");
+        let message = format!("{err:#}");
+        assert!(message.contains("manifest"), "{message}");
+        assert!(message.contains(tls::SERVER_KEY_FILE), "{message}");
+        assert!(
+            !tls::cert_dir(&target_dir).exists(),
+            "拒绝时不得创建目标证书目录"
+        );
+    }
+
+    /// 旧的 manifest schema（v8）必须在写任何目标前拒绝。
+    #[test]
+    fn restore_rejects_legacy_schema_before_any_write() {
+        for schema in [0, 8] {
+            let err =
+                validate_manifest_schema(Backend::Sqlite, schema).expect_err("旧 schema 必须拒绝");
+            let message = format!("{err:#}");
+            assert!(message.contains("只支持全新安装"), "{message}");
+            assert!(
+                message.contains("旧数据兼容将在首个正式版本之后提供"),
+                "{message}"
+            );
+        }
+        assert!(validate_manifest_schema(Backend::Sqlite, SQLITE_SCHEMA_VERSION).is_ok());
+        let err = validate_manifest_schema(Backend::Sqlite, SQLITE_SCHEMA_VERSION + 1)
+            .expect_err("过新的 schema 必须拒绝");
+        assert!(format!("{err:#}").contains("高于"));
+    }
+
+    /// #61：配置 TOML 解析错误只保留路径，不回显含 token 的原始行。
+    #[test]
+    fn config_toml_errors_are_sanitized() {
+        let root = TestRoot::new("toml-sanitize");
+        let path = root.path().join("hub.toml");
+        let secret = "toml-canary-admin-token-77c1";
+        for content in [
+            // 重复键
+            format!("admin_token = \"{secret}\"\nadmin_token = \"other\"\ndata_dir = \"/tmp\"\n"),
+            // 类型错误
+            format!("admin_token = \"{secret}\"\ndb_pool_size = \"not-a-number\"\n"),
+            // 语法错误（未闭合字符串）
+            format!("admin_token = \"{secret}\ndata_dir = \"/tmp\"\n"),
+        ] {
+            fs::write(&path, content.as_bytes()).unwrap();
+            let err = load_config_snapshot(&path).expect_err("非法 TOML 必须失败");
+            let message = format!("{err:#}");
+            assert!(message.contains("TOML 解析失败"), "{message}");
+            assert!(message.contains(&path.display().to_string()), "{message}");
+            assert!(
+                !message.contains(secret),
+                "TOML 错误链泄露配置原文: {message}"
+            );
+        }
+
+        // 恢复备份 hub.toml 的解析路径同样脱敏。
+        let backup_toml = root.path().join("backup-hub.toml");
+        let invalid = format!("admin_token = \"{secret}\"\nbroken = [\n");
+        fs::write(&backup_toml, invalid.as_bytes()).unwrap();
+        let backup_cfg = HubConfig::default();
+        let err = rewrite_config_paths(
+            &backup_cfg,
+            &backup_toml,
+            invalid.as_bytes(),
+            Path::new("/new-data"),
+            "postgres://u@h/db",
+        )
+        .expect_err("非法备份配置必须失败");
+        let message = format!("{err:#}");
+        assert!(message.contains("TOML 解析失败"), "{message}");
+        assert!(!message.contains(secret), "恢复路径泄露配置原文: {message}");
+    }
+
+    /// #64：两处密码的优先级与驱动一致（query 覆盖 authority、重复 query 后者）。
+    #[test]
+    fn pg_dsn_password_priority_matches_driver_semantics() {
+        // `PgDsnSecrets::parse` 会读 RUSTBOARD_DATABASE_PASSWORD；与写 env 的测试串行。
+        let _guard = env_lock();
+        let cfg = HubConfig::default();
+        for (dsn, expected) in [
+            ("postgres://u:auth-secret@h/db", "auth-secret"),
+            ("postgres://u@h/db?password=query-secret", "query-secret"),
+            (
+                "postgres://u:auth-secret@h/db?password=query-secret",
+                "query-secret",
+            ),
+            (
+                "postgres://u@h/db?password=first-secret&password=second-secret",
+                "second-secret",
+            ),
+            (
+                "postgres://u:auth-secret@h/db?pass%77ord=encoded-secret",
+                "encoded-secret",
+            ),
+            (
+                "postgres://u@h/db?%70assword=encoded-secret",
+                "encoded-secret",
+            ),
+        ] {
+            let secrets = PgDsnSecrets::parse(dsn, &cfg).expect("合法 DSN 必须解析成功");
+            assert_eq!(
+                secrets.password.as_deref(),
+                Some(expected),
+                "DSN 密码优先级错误: {dsn}"
+            );
+            for secret in [
+                "auth-secret",
+                "query-secret",
+                "first-secret",
+                "second-secret",
+                "encoded-secret",
+            ] {
+                assert!(
+                    !secrets.sanitized.contains(secret),
+                    "argv DSN 泄露密码 {secret}: {}",
+                    secrets.sanitized
+                );
+            }
+            assert!(!secrets.sanitized.contains("password="));
+            assert!(!secrets.sanitized.contains("sslpassword="));
+        }
+    }
+
+    /// #64：非空 `RUSTBOARD_DATABASE_PASSWORD` 覆盖 URL 密码并传给 PGPASSWORD。
+    #[test]
+    fn pg_dsn_env_password_override_is_used() {
+        let _guard = env_lock();
+        let _restore = EnvRestore::capture(&["RUSTBOARD_DATABASE_PASSWORD"]);
+        std::env::set_var("RUSTBOARD_DATABASE_PASSWORD", "env-secret-override");
+        let secrets = PgDsnSecrets::parse(
+            "postgres://u:url-secret@h/db?password=query-secret",
+            &HubConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(secrets.password.as_deref(), Some("env-secret-override"));
+        assert_eq!(secrets.url_password.as_deref(), Some("query-secret"));
+        assert!(!secrets.sanitized.contains("url-secret"));
+        assert!(!secrets.sanitized.contains("query-secret"));
+    }
+
+    /// 在 PATH 前置一个捕获 argv/env 的 fake 工具目录。
+    fn install_fake_pg_tool(dir: &Path, name: &str, argv_file: &Path, env_file: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"${{1:-}}\" = \"--version\" ]; then echo '{name} (fake) 1'; exit 0; fi\n\
+             : > {argv}\n\
+             for arg in \"$@\"; do printf '%s\\n' \"$arg\" >> {argv}; done\n\
+             env > {env}\n\
+             prev=\"\"\n\
+             for arg in \"$@\"; do\n\
+               if [ \"$prev\" = \"--file\" ]; then printf 'fake dump' > \"$arg\"; fi\n\
+               prev=\"$arg\"\n\
+             done\n\
+             exit 0\n",
+            argv = sh_quote(&argv_file.display().to_string()),
+            env = sh_quote(&env_file.display().to_string()),
+        );
+        let path = dir.join(name);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn sh_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    fn env_has(text: &str, key: &str) -> bool {
+        let prefix = format!("{key}=");
+        text.lines().any(|line| line.starts_with(&prefix))
+    }
+
+    fn env_value(text: &str, key: &str) -> Option<String> {
+        let prefix = format!("{key}=");
+        text.lines()
+            .find_map(|line| line.strip_prefix(&prefix).map(str::to_string))
+    }
+
+    /// #67：fake `pg_dump` 捕获 argv + env：无密码、默认 verify-full、根 CA 正确，
+    /// 且清理会降级/覆盖的继承环境。
+    #[test]
+    fn pg_dump_inherits_hub_tls_policy_and_clears_environment() {
+        let _guard = env_lock();
+        let root = TestRoot::new("fake-pg-dump");
+        let fake_bin = root.path().join("bin");
+        let argv_file = root.path().join("argv.txt");
+        let env_file = root.path().join("env.txt");
+        install_fake_pg_tool(&fake_bin, "pg_dump", &argv_file, &env_file);
+        let ca = root.path().join("private-ca.pem");
+        fs::write(&ca, b"dummy ca").unwrap();
+        let cfg = HubConfig {
+            db_sslrootcert: Some(ca.clone()),
+            ..HubConfig::default()
+        };
+        // 无密码 DSN：验证清理继承的 PGPASSWORD，而不是把宿主旧密码带进工具。
+        let dsn = "postgres://rb_user@db.example.com:5432/rustboard";
+
+        let _restore = EnvRestore::capture(&[
+            "PATH",
+            "PGSSLMODE",
+            "PGSSLROOTCERT",
+            "PGPASSWORD",
+            "PGSSLPASSWORD",
+            "PGREQUIRESSL",
+            "PGSERVICE",
+            "PGSERVICEFILE",
+            "PGSSLNEGOTIATION",
+            "PGUSER",
+            "PGPASSFILE",
+            "PGSSLCERT",
+            "PGOPTIONS",
+        ]);
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = OsString::from(fake_bin.display().to_string());
+        new_path.push(":");
+        new_path.push(old_path);
+        std::env::set_var("PATH", new_path);
+        std::env::set_var("PGSSLMODE", "disable");
+        std::env::set_var("PGSSLROOTCERT", "/bogus-root.pem");
+        std::env::set_var("PGPASSWORD", "inherited-leak");
+        std::env::set_var("PGSSLPASSWORD", "inherited-ssl-leak");
+        std::env::set_var("PGREQUIRESSL", "1");
+        std::env::set_var("PGSERVICE", "evil");
+        std::env::set_var("PGSERVICEFILE", "/bogus-service.conf");
+        std::env::set_var("PGSSLNEGOTIATION", "direct");
+        std::env::set_var("PGUSER", "inherited-user");
+        std::env::set_var("PGPASSFILE", "/bogus-pgpass");
+        std::env::set_var("PGSSLCERT", "/bogus-client.crt");
+        std::env::set_var("PGOPTIONS", "-c search_path=evil");
+
+        let destination = root.path().join("rustboard.dump");
+        pg_dump_to(&cfg, dsn, &destination).expect("fake pg_dump 应成功");
+        assert!(destination.is_file());
+
+        let argv = fs::read_to_string(&argv_file).unwrap();
+        assert!(!argv.contains("db-secret"), "argv 泄露密码: {argv}");
+        assert!(
+            argv.lines()
+                .any(|line| line == "postgres://rb_user@db.example.com:5432/rustboard"),
+            "argv --dbname 必须剥离密码: {argv}"
+        );
+        assert!(!argv.contains("sslmode"), "argv 不应携带 sslmode: {argv}");
+
+        let env = fs::read_to_string(&env_file).unwrap();
+        assert_eq!(
+            env_value(&env, "PGSSLMODE").as_deref(),
+            Some("verify-full"),
+            "缺省必须是 verify-full"
+        );
+        assert_eq!(
+            env_value(&env, "PGSSLROOTCERT"),
+            Some(ca.display().to_string()),
+            "根 CA 必须来自 db_sslrootcert"
+        );
+        assert!(!env_has(&env, "PGPASSWORD"), "无密码时不得设置 PGPASSWORD");
+        assert!(
+            !env.contains("inherited-leak") && !env.contains("inherited-ssl-leak"),
+            "继承的密码环境必须被清理"
+        );
+        for key in [
+            "PGSSLPASSWORD",
+            "PGREQUIRESSL",
+            "PGSERVICE",
+            "PGSERVICEFILE",
+            "PGSSLNEGOTIATION",
+            "PGUSER",
+            "PGPASSFILE",
+            "PGSSLCERT",
+            "PGOPTIONS",
+        ] {
+            assert!(!env_has(&env, key), "继承的 {key} 必须清理");
+        }
+    }
+
+    /// P1 复审：密码含裸 `/` 时，fake pg_dump 的 argv 仍不得出现密码。
+    #[test]
+    fn pg_dump_argv_never_contains_raw_slash_password() {
+        let _guard = env_lock();
+        let root = TestRoot::new("raw-slash-password");
+        let fake_bin = root.path().join("bin");
+        let argv_file = root.path().join("argv.txt");
+        let env_file = root.path().join("env.txt");
+        install_fake_pg_tool(&fake_bin, "pg_dump", &argv_file, &env_file);
+
+        let _restore = EnvRestore::capture(&["PATH", "PGPASSWORD"]);
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = OsString::from(fake_bin.display().to_string());
+        new_path.push(":");
+        new_path.push(old_path);
+        std::env::set_var("PATH", new_path);
+
+        let dsn = "postgres://rb_user:2024/secret@127.0.0.1:1/db?sslmode=disable";
+        let destination = root.path().join("rustboard.dump");
+        pg_dump_to(&HubConfig::default(), dsn, &destination).expect("fake pg_dump 应成功");
+        let argv = fs::read_to_string(&argv_file).unwrap();
+        for secret in ["2024/secret", "secret"] {
+            assert!(
+                !argv.contains(secret),
+                "argv 泄露裸 / 密码 {secret}: {argv}"
+            );
+        }
+        assert!(
+            argv.lines()
+                .any(|line| line == "postgres://rb_user@127.0.0.1:1/db"),
+            "argv --dbname 必须按第一个 @ 剥离 userinfo: {argv}"
+        );
+        let env = fs::read_to_string(&env_file).unwrap();
+        assert_eq!(
+            env_value(&env, "PGPASSWORD").as_deref(),
+            Some("2024/secret"),
+            "密码必须只通过 PGPASSWORD 传递"
+        );
+    }
+
+    /// #67：显式 disable 与 DSN sslrootcert 的处理；fake pg_restore 捕获 env。
+    #[test]
+    fn pg_restore_honours_disable_and_dsn_rootcert() {
+        let _guard = env_lock();
+        let root = TestRoot::new("fake-pg-restore");
+        let fake_bin = root.path().join("bin");
+        let argv_file = root.path().join("argv.txt");
+        let env_file = root.path().join("env.txt");
+        install_fake_pg_tool(&fake_bin, "pg_restore", &argv_file, &env_file);
+
+        let _restore = EnvRestore::capture(&["PATH", "PGSSLMODE", "PGSSLROOTCERT"]);
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = OsString::from(fake_bin.display().to_string());
+        new_path.push(":");
+        new_path.push(old_path);
+        std::env::set_var("PATH", new_path);
+        std::env::set_var("PGSSLMODE", "verify-full");
+        std::env::set_var("PGSSLROOTCERT", "/bogus-root.pem");
+
+        let dump = root.path().join("rustboard.dump");
+        fs::write(&dump, b"fake").unwrap();
+        let dsn = "postgres://u:auth-secret@h/db?sslmode=disable&\
+                   sslrootcert=%2Ftmp%2Fdsn-ca.pem&password=query-secret";
+        pg_restore_from(&HubConfig::default(), dsn, &dump).expect("fake pg_restore 应成功");
+
+        let argv = fs::read_to_string(&argv_file).unwrap();
+        assert!(!argv.contains("auth-secret") && !argv.contains("query-secret"));
+        assert!(
+            argv.lines().any(|line| line == "postgres://u@h/db"),
+            "argv 必须剥离密码/TLS 参数: {argv}"
+        );
+        let env = fs::read_to_string(&env_file).unwrap();
+        assert_eq!(env_value(&env, "PGSSLMODE").as_deref(), Some("disable"));
+        assert!(
+            !env_has(&env, "PGSSLROOTCERT"),
+            "disable 下不得传递根 CA: {env}"
+        );
+        assert_eq!(
+            env_value(&env, "PGPASSWORD").as_deref(),
+            Some("query-secret"),
+            "query password 覆盖 authority"
+        );
+
+        // 缺省 verify-full + DSN sslrootcert：根 CA 必须传给外部工具。
+        let verify_dsn = "postgres://u@h/db?sslrootcert=%2Ftmp%2Fdsn-ca.pem";
+        pg_restore_from(&HubConfig::default(), verify_dsn, &dump).expect("fake pg_restore 应成功");
+        let env = fs::read_to_string(&env_file).unwrap();
+        assert_eq!(
+            env_value(&env, "PGSSLMODE").as_deref(),
+            Some("verify-full"),
+            "缺省必须 verify-full: {env}"
+        );
+        assert_eq!(
+            env_value(&env, "PGSSLROOTCERT").as_deref(),
+            Some("/tmp/dsn-ca.pem"),
+            "DSN sslrootcert 必须传给外部工具: {env}"
+        );
+        assert!(!env_has(&env, "PGPASSWORD"));
+
+        // 配置根 CA 与 DSN 根 CA 冲突：在启动 fake 工具前 fail closed。
+        let _ = fs::remove_file(&argv_file);
+        let cfg = HubConfig {
+            db_sslrootcert: Some(PathBuf::from("/tmp/other-ca.pem")),
+            ..HubConfig::default()
+        };
+        let err = pg_restore_from(&cfg, dsn, &dump).expect_err("根 CA 冲突必须拒绝");
+        assert!(format!("{err:#}").contains("不同文件"), "{err:#}");
+        assert!(!argv_file.exists(), "冲突时不得执行 pg_restore");
+    }
 }

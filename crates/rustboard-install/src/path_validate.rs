@@ -77,7 +77,7 @@ pub(crate) fn reject_line_injection(path: &Path, label: &str) -> Result<()> {
 /// 目标本身可以不存在；遇到第一个不存在的组件即停止（后续组件尚未创建）。
 /// 安装器在写配置 / unit / 状态以及递归删除前调用，避免父目录被替换成链接后
 /// 把 root 写入或删除作用到链接目标。路径必须先归一化，含 `..` / `.` 时直接报错。
-pub(crate) fn reject_symlink_components(path: &Path) -> Result<()> {
+pub fn reject_symlink_components(path: &Path) -> Result<()> {
     let normalized = normalize_absolute(path, "路径")?;
     let mut current = PathBuf::new();
     for component in normalized.components() {

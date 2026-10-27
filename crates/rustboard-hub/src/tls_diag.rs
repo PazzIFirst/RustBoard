@@ -38,7 +38,17 @@ const ACME_PORTS: [u16; 2] = [80, 443];
 /// 云厂商元数据根路径（只判状态码，不取内容）。
 const AWS_METADATA_URL: &str = "http://169.254.169.254/latest/meta-data/";
 const ALIYUN_METADATA_URL: &str = "http://100.100.100.200/latest/meta-data/";
-const TENCENT_METADATA_URL: &str = "http://metadata.tencentyun.com/latest/meta-data/";
+/// 腾讯云元数据域名 `metadata.tencentyun.com` 固定解析到 `169.254.0.23`。
+/// 探测只接受字面 IP（避免 DNS 解析成为不可控阻塞点），因此直接使用固定地址，
+/// 同时与 AWS 的 `169.254.169.254` 明确区分。
+const TENCENT_METADATA_URL: &str = "http://169.254.0.23/latest/meta-data/";
+
+/// 生产探测顺序；与单测共用，避免新增/修改常量时漏测。
+const METADATA_ENDPOINTS: [(CloudProvider, &str); 3] = [
+    (CloudProvider::Aws, AWS_METADATA_URL),
+    (CloudProvider::Aliyun, ALIYUN_METADATA_URL),
+    (CloudProvider::Tencent, TENCENT_METADATA_URL),
+];
 
 /// 云厂商（只用于打印安全组路径建议）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -625,11 +635,10 @@ fn collect_cloud(offline: bool, mode: ServerTlsMode, timeout: Duration) -> Optio
     if offline || !mode.is_acme() {
         return None;
     }
-    let endpoints = [
-        (CloudProvider::Aws, AWS_METADATA_URL.to_string()),
-        (CloudProvider::Aliyun, ALIYUN_METADATA_URL.to_string()),
-        (CloudProvider::Tencent, TENCENT_METADATA_URL.to_string()),
-    ];
+    let endpoints = METADATA_ENDPOINTS
+        .iter()
+        .map(|(provider, url)| (*provider, (*url).to_string()))
+        .collect::<Vec<_>>();
     detect_cloud_from(&endpoints, timeout)
 }
 
@@ -651,8 +660,18 @@ pub(crate) fn detect_cloud_from(
     None
 }
 
-/// 对 `http://<字面 IP>[:port]/path` 发 GET，只返回状态码；不读取响应体。
-fn fetch_http_status(url: &str, timeout: Duration) -> Option<u16> {
+/// 已通过校验的元数据探测目标；只允许 `http://` + 字面 IP。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataTarget {
+    addr: SocketAddr,
+    path: String,
+}
+
+/// 解析并校验 `http://<字面 IP>[:port]/path`；DNS 名一律拒绝。
+///
+/// 这是 [`fetch_http_status`] 建立连接前的同一道 host 校验；单测直接用该函数
+/// 验证生产常量，不发起任何网络请求。
+fn parse_metadata_target(url: &str) -> Option<MetadataTarget> {
     let rest = url.strip_prefix("http://")?;
     if rest.is_empty() || rest.contains('@') || rest.contains('#') || rest.contains('?') {
         return None;
@@ -665,16 +684,27 @@ fn fetch_http_status(url: &str, timeout: Duration) -> Option<u16> {
         return None;
     }
     let (host, port) = split_host_port(authority)?;
+    if host.is_empty() {
+        return None;
+    }
     // 只接受字面 IP：避免 DNS 解析成为不可控的阻塞点（SSRF 面也随之收敛）。
     let ip: IpAddr = host.parse().ok()?;
-    let addr = SocketAddr::new(ip, port);
+    Some(MetadataTarget {
+        addr: SocketAddr::new(ip, port),
+        path: path.to_string(),
+    })
+}
+
+/// 对 `http://<字面 IP>[:port]/path` 发 GET，只返回状态码；不读取响应体。
+fn fetch_http_status(url: &str, timeout: Duration) -> Option<u16> {
+    let target = parse_metadata_target(url)?;
 
     let started = Instant::now();
     let remaining = timeout.saturating_sub(started.elapsed());
     if remaining.is_zero() {
         return None;
     }
-    let mut stream = TcpStream::connect_timeout(&addr, remaining).ok()?;
+    let mut stream = TcpStream::connect_timeout(&target.addr, remaining).ok()?;
     let remaining = timeout.saturating_sub(started.elapsed());
     if remaining.is_zero() {
         return None;
@@ -682,15 +712,17 @@ fn fetch_http_status(url: &str, timeout: Duration) -> Option<u16> {
     stream.set_read_timeout(Some(remaining)).ok()?;
     stream.set_write_timeout(Some(remaining)).ok()?;
 
-    let host_header = if port == 80 {
-        host.to_string()
+    let host = target.addr.ip().to_string();
+    let host_header = if target.addr.port() == 80 {
+        host
     } else {
-        format!("{host}:{port}")
+        format!("{host}:{}", target.addr.port())
     };
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host_header}\r\n\
          User-Agent: rustboard-install-diagnostic\r\nAccept: */*\r\n\
-         Connection: close\r\n\r\n"
+         Connection: close\r\n\r\n",
+        path = target.path,
     );
     stream.write_all(request.as_bytes()).ok()?;
 
@@ -903,12 +935,19 @@ mod tests {
 
     #[test]
     fn released_port_is_bindable() {
-        let listener = TcpListener::bind("0.0.0.0:0").expect("绑定临时端口");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        // 释放端口与探测之间可能被并行测试/进程抢占；重试几个临时端口，
+        // 避免全量测试并行运行时出现与安装器逻辑无关的偶发失败。
+        for _ in 0..10 {
+            let listener = TcpListener::bind("0.0.0.0:0").expect("绑定临时端口");
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
 
-        let check = check_port_bind(port);
-        assert!(check.bindable, "{check:?}");
+            let check = check_port_bind(port);
+            if check.bindable {
+                return;
+            }
+        }
+        panic!("连续 10 个临时端口在释放后都被抢占");
     }
 
     #[test]
@@ -996,6 +1035,53 @@ LISTEN 0 511 127.0.0.1:9000 0.0.0.0:* users:((\"rustboard-hub\",pid=456,fd=7))\n
             format!("http://127.0.0.1:{}/latest/meta-data/", addr.port()),
         )];
         assert!(detect_cloud_from(&endpoints, Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn production_metadata_constants_pass_literal_ip_probe_validation() {
+        // 三个生产常量必须全部通过 fetch_http_status 使用的同一道 host 校验；
+        // 这里只做纯字符串/地址解析，不发起任何网络请求。
+        let expected = [
+            (CloudProvider::Aws, AWS_METADATA_URL, "169.254.169.254"),
+            (
+                CloudProvider::Aliyun,
+                ALIYUN_METADATA_URL,
+                "100.100.100.200",
+            ),
+            (CloudProvider::Tencent, TENCENT_METADATA_URL, "169.254.0.23"),
+        ];
+        // 生产探测表必须与常量逐一对应；只改常量却漏改 collect_cloud 的表会在这里失败。
+        assert_eq!(
+            METADATA_ENDPOINTS,
+            [
+                (CloudProvider::Aws, AWS_METADATA_URL),
+                (CloudProvider::Aliyun, ALIYUN_METADATA_URL),
+                (CloudProvider::Tencent, TENCENT_METADATA_URL),
+            ],
+            "METADATA_ENDPOINTS 的 provider↔URL 映射与生产常量不一致"
+        );
+        for (provider, url, expected_ip) in expected {
+            let target = parse_metadata_target(url).unwrap_or_else(|| {
+                panic!(
+                    "{} 元数据地址未通过字面 IP host 校验: {url}",
+                    provider.label()
+                )
+            });
+            assert_eq!(target.addr.ip().to_string(), expected_ip, "{url}");
+            assert_eq!(target.addr.port(), 80, "{url}");
+            assert_eq!(target.path, "/latest/meta-data/", "{url}");
+        }
+
+        // 腾讯云的固定地址必须与 AWS 的 169.254.169.254 区分，避免误判厂商。
+        let tencent = parse_metadata_target(TENCENT_METADATA_URL).expect("腾讯云地址");
+        let aws = parse_metadata_target(AWS_METADATA_URL).expect("AWS 地址");
+        assert_ne!(tencent.addr.ip(), aws.addr.ip());
+
+        // #73 的根因：域名形式会被 host 校验直接拒绝，绝不能进入网络探测。
+        assert!(
+            parse_metadata_target("http://metadata.tencentyun.com/latest/meta-data/").is_none(),
+            "元数据域名必须被拒绝，只允许字面 IP"
+        );
     }
 
     #[test]

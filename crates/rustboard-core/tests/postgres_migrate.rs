@@ -1,9 +1,9 @@
-//! M5 Phase D5 核心：SQLite v8 → PostgreSQL 实库迁移/校验测试。
+//! M5 Phase D5 核心：SQLite v9 → PostgreSQL 实库迁移/校验测试。
 //!
 //! 依据 `docs/plans/2026-10-26-m5-phase-d-postgres-backup-l01-l03.md`
 //! §3.4/§5 D5/§6.3 编写。测试只覆盖 `storage::migrate` 的核心 API：
 //!
-//! - 21 张表全量迁移、每表行数、samples/1m/1h 范围、token/alert/archive 数量；
+//! - 22 张表全量迁移、每表行数、samples/1m/1h 范围、token/alert/archive 数量；
 //! - samples/1m/1h/alert_states 的 SQLite rowid 与 PG `id` 一一对应；
 //! - 5 张 SQLite `AUTOINCREMENT` 表的 id 保留；
 //! - 9 个 `BIGSERIAL` 序列 setval 后不会撞主键；
@@ -49,8 +49,8 @@ use sha2::{Digest, Sha256};
 /// 实库测试 DSN 的环境变量；未设置时全部用例 skip。
 const PG_ENV: &str = "RUSTBOARD_TEST_PG";
 
-/// 与 schema.rs 一致的 21 张业务表；用于不依赖报告的全表计数。
-const TABLES: [&str; 21] = [
+/// 与 schema.rs 一致的 22 张业务表；用于不依赖报告的全表计数。
+const TABLES: [&str; 22] = [
     "agents",
     "samples",
     "enroll_tokens",
@@ -70,6 +70,7 @@ const TABLES: [&str; 21] = [
     "alert_events",
     "alert_silences",
     "notification_channels",
+    "alert_rule_channels",
     "archive_objects",
     "archive_state",
 ];
@@ -200,7 +201,7 @@ impl TestDatabase {
         .unwrap_or_else(|e| panic!("打开 PostgresStorage 失败：{e:#}"))
     }
 
-    /// 应用 schema v8 后打开 storage，用于「schema 已 apply 但全空」场景。
+    /// 应用 schema v9 后打开 storage，用于「schema 已 apply 但全空」场景。
     fn open_storage(&self) -> PostgresStorage {
         let mut client = connect_for_schema(&self.app_dsn)
             .unwrap_or_else(|e| panic!("schema 连接失败（{}）：{e:#}", self.name));
@@ -319,6 +320,7 @@ fn alert_rule(id: &str, name: &str, enabled: bool) -> AlertRule {
         updated_by: "admin".to_string(),
         created_at: NOW - 2_000,
         updated_at: NOW - 2_000,
+        revision: 0,
     }
 }
 
@@ -341,6 +343,7 @@ fn offline_rule(id: &str, name: &str) -> AlertRule {
         updated_by: "admin".to_string(),
         created_at: NOW - 1_000,
         updated_at: NOW - 1_000,
+        revision: 0,
     }
 }
 
@@ -431,14 +434,14 @@ fn archive_object(index: i64, uploaded: bool) -> ArchiveObject {
     }
 }
 
-/// 构建一个包含全部 21 张表、覆盖 NULL/布尔/rowid/AUTOINCREMENT 的 SQLite v7。
+/// 构建一个包含全部 22 张表、覆盖 NULL/布尔/rowid/AUTOINCREMENT 的 SQLite v9。
 fn build_fixture(tag: &str) -> Fixture {
     let temp = TempDir::new(tag);
     let path = temp.0.join("source.db");
     let watermark;
 
     {
-        let storage = SqliteStorage::open(&path).expect("创建 SQLite v8 源库失败");
+        let storage = SqliteStorage::open(&path).expect("创建 SQLite v9 源库失败");
 
         // agents：3 行，其中 agent-3 走吊销终态。
         storage
@@ -594,12 +597,29 @@ fn build_fixture(tag: &str) -> Fixture {
             .unwrap();
 
         // alert_rules / alert_states / alert_events / alert_silences / channels。
+        // v9 起规则写入会在同一事务内校验渠道并写关系行，先创建 chan-1。
+        storage
+            .create_notification_channel(&notification_channel())
+            .unwrap();
         storage
             .create_alert_rule(&alert_rule("rule-1", "High CPU", true))
             .unwrap();
-        storage
-            .create_alert_rule(&offline_rule("rule-2", "Agent Offline"))
-            .unwrap();
+        let mut offline = offline_rule("rule-2", "Agent Offline");
+        offline.channel_ids = vec!["chan-1".to_string()];
+        storage.create_alert_rule(&offline).unwrap();
+        // 更新一次 rule-1，让 revision 离开默认值 0，验证迁移原样复制。
+        let mut updated_rule = storage
+            .get_alert_rule("rule-1")
+            .unwrap()
+            .expect("rule-1 必须存在");
+        updated_rule.threshold = 81.0;
+        updated_rule.updated_at = NOW;
+        storage.update_alert_rule(&updated_rule).unwrap();
+        assert_eq!(
+            storage.get_alert_rule("rule-1").unwrap().unwrap().revision,
+            1,
+            "更新规则后 revision 必须为 1"
+        );
         storage
             .upsert_alert_state(&alert_state(
                 "rule-1",
@@ -656,10 +676,6 @@ fn build_fixture(tag: &str) -> Fixture {
                 created_at: NOW - 20,
             })
             .unwrap();
-        storage
-            .create_notification_channel(&notification_channel())
-            .unwrap();
-
         // archive_objects：pending / uploaded 各一行，覆盖可空时间戳。
         storage
             .insert_archive_object(&archive_object(1, false))
@@ -967,8 +983,8 @@ fn migrates_all_tables_and_preserves_ids() {
         "迁移修改了 SQLite 源库或 WAL"
     );
 
-    assert_eq!(report.sqlite_schema_version, 8);
-    assert_eq!(report.postgres_schema_version, 8);
+    assert_eq!(report.sqlite_schema_version, 9);
+    assert_eq!(report.postgres_schema_version, 9);
     assert_eq!(report.tables.len(), TABLES.len());
     assert_eq!(
         report
@@ -1209,6 +1225,55 @@ fn migrates_all_tables_and_preserves_ids() {
     assert_eq!(
         source_rule_text, target_rule_text,
         "alert_rules 的 NULL/TEXT JSON 列映射不一致"
+    );
+
+    // v9 关系表必须逐行迁移；alert_rules.revision 原样复制（不能重置成 0）。
+    let source_relations: Vec<(String, String)> = {
+        let conn = open_readonly(&fixture.path);
+        let mut stmt = conn
+            .prepare(
+                "SELECT rule_id, channel_id FROM alert_rule_channels ORDER BY rule_id, channel_id",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    };
+    let target_relations: Vec<(String, String)> = client
+        .query(
+            "SELECT rule_id, channel_id FROM alert_rule_channels ORDER BY rule_id, channel_id",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        source_relations, target_relations,
+        "alert_rule_channels 关系行未逐行迁移"
+    );
+    assert_eq!(target_relations.len(), 2, "关系表夹具应有 2 行");
+
+    let source_revisions: Vec<(String, i64)> = {
+        let conn = open_readonly(&fixture.path);
+        let mut stmt = conn
+            .prepare("SELECT id, revision FROM alert_rules ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    };
+    let target_revisions: Vec<(String, i64)> = client
+        .query("SELECT id, revision FROM alert_rules ORDER BY id", &[])
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        source_revisions, target_revisions,
+        "alert_rules.revision 未原样迁移"
     );
 
     // 两张水位表的 key/value 文本必须逐行原样保留。
@@ -1490,8 +1555,8 @@ fn bool_failure_rolls_back_target_and_second_migration_succeeds() {
         .get(0);
     assert_eq!(
         version,
-        Some(8),
-        "v8 DDL 已提交；数据导入失败只回滚业务数据，schema 版本保持 8"
+        Some(9),
+        "v9 DDL 已提交；数据导入失败只回滚业务数据，schema 版本保持 9"
     );
     assert_eq!(
         hash_source(&fixture.path),
@@ -1533,11 +1598,11 @@ fn empty_source_migrates_and_sequences_start_at_one() {
     let temp = TempDir::new("empty");
     let path = temp.0.join("empty.db");
     {
-        let storage = SqliteStorage::open(&path).expect("创建空 SQLite v8 失败");
+        let storage = SqliteStorage::open(&path).expect("创建空 SQLite v9 失败");
         drop(storage);
     }
 
-    // schema 已 apply、21 张业务表全空：按验收必须允许。
+    // schema 已 apply、22 张业务表全空：按验收必须允许。
     let storage = db.open_storage();
     validate_target_empty(&storage).expect("schema 已 apply 但全空的目标必须允许迁移");
     let report = migrate_sqlite_to_postgres(&path, &storage)
@@ -1598,7 +1663,7 @@ fn bulk_samples_5000_rows_migrate() {
         "[d5] 5000 行 samples 迁移耗时 {} ms，报告总行数 {}",
         report.duration_ms, report.total_rows
     );
-    // 21 表总行数 = 5000 samples + 1 agents + 1 ingest_state + 1 ingest_batches。
+    // 22 表总行数 = 5000 samples + 1 agents + 1 ingest_state + 1 ingest_batches。
     assert_eq!(report.total_rows, COUNT as u64 + 3);
     let samples_table = report
         .tables

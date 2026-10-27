@@ -8,7 +8,7 @@
 //! 2. 有 systemd 时用 `systemctl is-active rustboard-hub` 拒绝运行中的 hub；
 //!    容器/手工部署没有 systemd 时只依赖 `--yes` 与迁移前备份（**不伪造 PID 检查**）；
 //! 3. 非 dry-run 先 `VACUUM INTO` 备份 SQLite，再备份 `hub.toml`（0600）；
-//! 4. 目标非空必须 `--force`：先 `pg_dump` 目标，再二次确认并清空 21 张业务表；
+//! 4. 目标非空必须 `--force`：先 `pg_dump` 目标，再二次确认并清空 22 张业务表；
 //! 5. 核心迁移 + 校验全部成功后才改写配置；失败不改配置、不删 SQLite。
 //!
 //! `--dry-run` 只读：连接源库与目标库，检查目标是否为空/版本是否可迁移，
@@ -20,10 +20,10 @@ use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
-use rustboard_common::config::DatabaseKind;
+use rustboard_common::config::{DatabaseKind, HubConfig};
 use rustboard_common::fsutil;
 use rustboard_core::storage::migrate::{migrate_sqlite_to_postgres, validate_target_empty};
-use rustboard_core::storage::postgres::{connect_for_schema, PostgresStorage};
+use rustboard_core::storage::postgres::{connect_with_config, PostgresStorage};
 
 use super::backup_cmd;
 use super::backup_cmd::HUB_TABLES;
@@ -40,7 +40,7 @@ pub struct MigrateArgs {
     /// 只校验源/目标并打印计划；不写数据、不备份、不改配置。
     #[arg(long)]
     pub dry_run: bool,
-    /// 目标非空时先备份目标并清空 21 张业务表（必须二次确认）。
+    /// 目标非空时先备份目标并清空 22 张业务表（必须二次确认）。
     #[arg(long)]
     pub force: bool,
     /// 非交互执行（不读取 stdin）。
@@ -68,9 +68,10 @@ struct MigrateLock {
 }
 
 impl MigrateLock {
-    fn acquire(dsn: &str) -> Result<Self> {
-        let mut client =
-            connect_for_schema(dsn).context("建立迁移串行化连接失败（需要 sslmode=disable）")?;
+    fn acquire(cfg: &HubConfig, dsn: &str) -> Result<Self> {
+        // 与 Hub 运行连接、pg_dump/pg_restore 使用同一套 DSN/TLS/密码策略。
+        let mut client = connect_with_config(cfg, dsn)
+            .context("建立迁移串行化连接失败（目标 DSN/TLS 策略无效）")?;
         client
             .query_one("SELECT pg_advisory_lock($1)", &[&MIGRATE_ADVISORY_LOCK_KEY])
             .context("获取迁移 advisory lock 失败（可能有另一个 migrate 正在运行）")?;
@@ -124,17 +125,11 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
             source.display()
         );
     }
-    // 预检一次性读取版本/21 张表/samples；有未 checkpoint WAL 时会在临时副本
-    // 上读取，dry-run 不会在源目录创建 -shm/-wal。
+    // 预检一次性读取版本/22 张表/samples；有未 checkpoint WAL 时会在临时副本
+    // 上读取，dry-run 不会在源目录创建 -shm/-wal。`sqlite_source_info` 内部
+    // 先判版本（旧库统一 fresh-install 文案）再判 22 张表。
     let source_info = backup_cmd::sqlite_source_info(&source)?;
     let source_version = source_info.schema_version;
-    if source_version != backup_cmd::SQLITE_SCHEMA_VERSION {
-        bail!(
-            "SQLite 源库 schema 版本为 {source_version}，migrate 只支持 v{}；\
-             请先用能升级到该版本的 rustboard-hub 打开一次源库",
-            backup_cmd::SQLITE_SCHEMA_VERSION
-        );
-    }
 
     let mut target_cfg = cfg.clone();
     target_cfg.database = args.to.clone();
@@ -153,23 +148,29 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
     //    显式 --hub-stopped，不能仅凭 WARN 继续。
     ensure_hub_stopped("migrate", args.hub_stopped)?;
 
-    // 2.1 串行化整个迁移流程。force 清空只支持 sslmode=disable；TLS 目标拿不到
-    //     会话锁时，非 force 路径仍可依赖 core 导入事务的空库复验与表锁，但这里
+    // 2.1 在任何交互确认/写盘前校验目标 DSN 的密码与 TLS 策略（与运行连接、
+    //     pg_dump/pg_restore 共用同一份解析）。非法 sslmode、根证书冲突、
+    //     畸形参数都在这里 fail closed。
+    backup_cmd::validate_pg_connection_policy(&target_cfg, &target_dsn)
+        .with_context(|| format!("目标 PostgreSQL 连接策略校验失败（{target_redacted}）"))?;
+
+    // 2.2 串行化整个迁移流程（TLS 目标同样可以获取会话级 advisory lock）。
+    //     非 force 路径拿不到锁时仍可依赖 core 导入事务的空库复验与表锁，但这里
     //     明确 WARN，避免声称覆盖了 dump/clear 阶段。
-    let _migrate_lock = match MigrateLock::acquire(&target_dsn) {
+    let _migrate_lock = match MigrateLock::acquire(&target_cfg, &target_dsn) {
         Ok(lock) => Some(lock),
         Err(_) if args.force => {
             return Err(anyhow!(
-                "--force 迁移必须获取会话级 advisory lock（{}）；请使用 sslmode=disable 目标或先用单进程手工串行",
+                "--force 迁移必须获取会话级 advisory lock（{}）；请先结束其它 migrate/维护进程后重试",
                 target_redacted
-            ))
+            ));
         }
         Err(_) => {
-            // 不打印底层错误链：postgres DSN 解析错误可能回显连接串。只报告
-            // 脱敏目标和事实，避免密码进日志。
+            // 不打印底层错误链：连接错误可能带出连接串细节。只报告脱敏目标
+            // 和事实，避免密码进日志。
             eprintln!(
                 "WARN: 无法获取会话级迁移锁（{}）；非 force 迁移仅依赖 core 的导入事务空库复验/表锁，\
-                 并发 migrate 请使用 sslmode=disable 目标或手工串行",
+                 并发 migrate 请先手工串行",
                 target_redacted
             );
             None
@@ -188,7 +189,7 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
         );
     }
     if matches!(target_state, TargetState::NonEmpty) && args.force {
-        ensure_force_target_supported(&target_dsn, &target_redacted)?;
+        // TLS/密码策略已在上方校验；这里只确认外部工具存在。
         backup_cmd::ensure_tool("pg_dump")?;
     }
 
@@ -221,7 +222,7 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
         backup_cmd::confirm(
             args.yes,
             &format!(
-                "目标 {} 非空。--force 会先执行 pg_dump 备份，然后清空 21 张业务表；\
+                "目标 {} 非空。--force 会先执行 pg_dump 备份，然后清空 22 张业务表；\
                  数据丢失风险由该备份兜底。确认继续？",
                 target_redacted
             ),
@@ -237,14 +238,16 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
     // 6. 目标非空：先 pg_dump，成功后才清空；任何一步失败都不改配置、不删 SQLite。
     if matches!(target_state, TargetState::NonEmpty) {
         let target_backup = backup_dir.join("target-before-migrate.dump");
-        backup_cmd::pg_dump_to(&target_dsn, &target_backup).with_context(|| {
+        // 目标侧备份同样继承 Hub TLS 策略（默认 verify-full），不允许 --force
+        // 路径绕过 pg_dump 的证书校验。
+        backup_cmd::pg_dump_to(&target_cfg, &target_dsn, &target_backup).with_context(|| {
             format!(
                 "备份目标 PostgreSQL 失败（{}）；未清空目标、未迁移、未改配置",
                 target_redacted
             )
         })?;
         println!("目标侧备份: {}", target_backup.display());
-        clear_target(&target_dsn, &target_redacted)?;
+        clear_target(&target_cfg, &target_dsn, &target_redacted)?;
         // 清空后再次确认核心迁移看到的是空目标。
         validate_target_empty(&target).with_context(|| {
             format!("清空目标后仍无法通过空库校验（{target_redacted}）；已中止，未改配置")
@@ -409,6 +412,15 @@ fn inspect_target(target: &PostgresStorage, redacted: &str) -> Result<TargetStat
                     format!("目标 PostgreSQL schema 版本高于当前程序支持（{redacted}）")
                 });
             }
+            if backup_cmd::is_old_schema_target_error(&err) {
+                // 旧 schema 绝不归入 Empty/NonEmpty：--force 会先 dump+TRUNCATE，
+                // 必须在任何清空动作前把错误返回给调用方。
+                return Err(err).with_context(|| {
+                    format!(
+                        "目标 PostgreSQL 是旧 schema（v1.0.0 只支持全新安装），拒绝迁移（{redacted}）"
+                    )
+                });
+            }
             if backup_cmd::is_non_empty_target_error(&err) {
                 return Ok(TargetState::NonEmpty);
             }
@@ -417,29 +429,14 @@ fn inspect_target(target: &PostgresStorage, redacted: &str) -> Result<TargetStat
     }
 }
 
-/// `--force` 清空依赖 D2 的 `connect_for_schema`，目前只支持 `sslmode=disable`。
-fn ensure_force_target_supported(dsn: &str, redacted: &str) -> Result<()> {
-    match dsn_sslmode(dsn)? {
-        Some(mode) if mode == "disable" => Ok(()),
-        Some(mode) => bail!(
-            "目标非空且指定了 --force，但当前版本清空目标只支持 sslmode=disable（实际 {mode}，{redacted}）。\
-             请先手工备份并 TRUNCATE 21 张业务表后重试（不带 --force），或使用 sslmode=disable 的本地/内网目标"
-        ),
-        None => bail!(
-            "目标非空且指定了 --force，但当前版本清空目标只支持显式 sslmode=disable（{redacted}）。\
-             请先手工备份并 TRUNCATE 21 张业务表后重试（不带 --force），或使用 sslmode=disable 的本地/内网目标"
-        ),
-    }
-}
-
 /// 清空目标库中已存在的 hub 业务表。
 ///
-/// 只允许清空已知的 21 张表 + `schema_migrations`；发现其它表时拒绝（避免把
+/// 只允许清空已知的 22 张表 + `schema_migrations`；发现其它表时拒绝（避免把
 /// 同一 schema 中无关应用的数据一起清掉）。`schema_migrations` 保留，核心迁移
-/// 会幂等补齐/校验版本。
-fn clear_target(dsn: &str, redacted: &str) -> Result<()> {
-    let mut client = connect_for_schema(dsn)
-        .with_context(|| format!("以 sslmode=disable 连接目标 PostgreSQL 失败（{redacted}）"))?;
+/// 会幂等补齐/校验版本。连接继承 Hub 的 DSN/TLS 策略。
+fn clear_target(cfg: &HubConfig, dsn: &str, redacted: &str) -> Result<()> {
+    let mut client = connect_with_config(cfg, dsn)
+        .with_context(|| format!("连接目标 PostgreSQL 失败（{redacted}）"))?;
     let mut tx = client.transaction().context("开启清空目标事务失败")?;
     let rows = tx
         .query(
@@ -508,8 +505,9 @@ fn switch_config(config_path: &Path, old_bytes: &[u8], new_dsn: &str) -> Result<
         .with_context(|| format!("备份旧配置失败: {}", backup.display()))?;
 
     // 用 toml::Value 只替换 database，保留其它字段（包括本版本不认识的字段）。
+    // 解析错误走固定诊断：toml 的 source line 可能含 token/密码。
     let text = std::str::from_utf8(old_bytes).context("旧 hub.toml 不是合法 UTF-8")?;
-    let mut value: toml::Value = toml::from_str(text).context("解析旧 hub.toml 失败")?;
+    let mut value: toml::Value = backup_cmd::parse_toml_sanitized(text, config_path)?;
     let table = value
         .as_table_mut()
         .ok_or_else(|| anyhow!("旧 hub.toml 顶层不是 TOML table"))?;
@@ -533,14 +531,14 @@ fn print_dry_run(
 ) -> Result<()> {
     println!("migrate --dry-run（只读校验，不写数据/不备份/不改配置）");
     println!(
-        "  源: sqlite://{}（schema v{source_version}，samples {samples} 行，21 张表齐全）",
+        "  源: sqlite://{}（schema v{source_version}，samples {samples} 行，22 张表齐全）",
         source.display()
     );
     println!("  目标: {target_redacted}");
     match state {
         TargetState::Empty => println!("  目标状态: 空库（schema 版本可迁移）"),
         TargetState::NonEmpty if force => {
-            println!("  目标状态: 非空；--force 会先 pg_dump 目标、二次确认后清空 21 张业务表");
+            println!("  目标状态: 非空；--force 会先 pg_dump 目标、二次确认后清空 22 张业务表");
         }
         TargetState::NonEmpty => {
             println!("  目标状态: 非空；未指定 --force，实际迁移会被拒绝");
@@ -560,23 +558,6 @@ fn print_dry_run(
     Ok(())
 }
 
-fn dsn_sslmode(dsn: &str) -> Result<Option<String>> {
-    let Some(query) = dsn.split_once('?').map(|(_, tail)| tail) else {
-        return Ok(None);
-    };
-    let query = query.split('#').next().unwrap_or(query);
-    for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        if key.eq_ignore_ascii_case("sslmode") {
-            return Ok(Some(value.to_string()));
-        }
-    }
-    Ok(None)
-}
-
 fn dsn_redacted(dsn: &str) -> String {
     rustboard_common::config::redact_database_url(dsn)
 }
@@ -591,38 +572,124 @@ fn format_range(min: Option<i64>, max: Option<i64>) -> String {
 // 仅供单元测试使用：确保 HubConfig 迁移配置克隆不会改动源配置。
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
-    #[test]
-    fn sslmode_parser_ignores_password_and_reads_query() {
-        assert_eq!(
-            dsn_sslmode("postgres://u:p@host/db?sslmode=disable").unwrap(),
-            Some("disable".to_string())
-        );
-        assert_eq!(
-            dsn_sslmode("postgres://u:p@host/db?sslmode=verify-full&x=1").unwrap(),
-            Some("verify-full".to_string())
-        );
-        assert_eq!(dsn_sslmode("postgres://u:p@host/db").unwrap(), None);
-        // 密码里出现 sslmode=disable 不能被当成 query 参数。
-        assert_eq!(
-            dsn_sslmode("postgres://u:sslmode=disable@host/db").unwrap(),
-            None
-        );
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let path =
+            std::env::temp_dir().join(format!("rb-migrate-{tag}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&path).expect("创建测试目录");
+        path
     }
 
+    /// #67：migrate 的目标连接策略与运行连接共用解析。
     #[test]
-    fn ensure_force_target_supported_rejects_non_disable() {
-        assert!(ensure_force_target_supported(
-            "postgres://u:p@host/db?sslmode=disable",
-            "postgres://u:***@host/db"
-        )
-        .is_ok());
-        let err = ensure_force_target_supported(
-            "postgres://u:p@host/db?sslmode=verify-full",
-            "postgres://u:***@host/db",
-        )
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("sslmode=disable"));
+    fn target_connection_policy_matches_runtime_rules() {
+        let cfg = HubConfig::default();
+        // 缺省 verify-full（DSN 中没有 sslmode）。
+        backup_cmd::validate_pg_connection_policy(&cfg, "postgres://u:secret@h/db").unwrap();
+        // 显式 disable。
+        backup_cmd::validate_pg_connection_policy(&cfg, "postgres://u:secret@h/db?sslmode=disable")
+            .unwrap();
+
+        // require/prefer 会静默降级，与运行连接一样拒绝，且错误不含密码。
+        for mode in ["require", "prefer"] {
+            let dsn = format!("postgres://u:topsecret@h/db?sslmode={mode}");
+            let err = backup_cmd::validate_pg_connection_policy(&cfg, &dsn)
+                .expect_err("不安全的 sslmode 必须拒绝");
+            let message = format!("{err:#}");
+            assert!(message.contains("verify-full") && message.contains("disable"));
+            assert!(!message.contains("topsecret"), "错误泄露密码: {message}");
+        }
+
+        // 配置根 CA 与 DSN sslrootcert 冲突：与运行连接相同的错误。
+        let dsn = "postgres://u@h/db?sslrootcert=%2Ftmp%2Fa.pem";
+        let cfg = HubConfig {
+            db_sslrootcert: Some(PathBuf::from("/tmp/b.pem")),
+            ..HubConfig::default()
+        };
+        let err =
+            backup_cmd::validate_pg_connection_policy(&cfg, dsn).expect_err("根证书冲突必须拒绝");
+        assert!(format!("{err:#}").contains("不同文件"));
+    }
+
+    /// #61：迁移切换配置时的 TOML 解析错误不得回显配置原文（token/密码）。
+    #[test]
+    fn switch_config_toml_error_does_not_echo_secrets() {
+        let dir = temp_dir("switch-config-secret");
+        let config_path = dir.join("hub.toml");
+        let secret = "migrate-toml-canary-9f3a";
+        let invalid = format!(
+            "admin_token = \"{secret}\"\n\
+             duplicate = 1\n\
+             duplicate = 2\n\
+             database = \"sqlite:///tmp/x.db\"\n"
+        );
+        let err = switch_config(&config_path, invalid.as_bytes(), "postgres://u@h/db")
+            .expect_err("重复键必须解析失败");
+        let message = format!("{err:#}");
+        assert!(message.contains("TOML 解析失败"), "{message}");
+        assert!(
+            !message.contains(secret),
+            "TOML 错误链泄露配置原文: {message}"
+        );
+        // 配置本身未被改写；旧配置 .bak 允许存在（写在解析之前）。
+        assert!(!config_path.exists(), "失败时不得写入新配置");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 迁移前备份失败时不得改配置/留半成品（`switch_config` 只替换 database）。
+    #[test]
+    fn switch_config_rewrites_only_database() {
+        let dir = temp_dir("switch-config-ok");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let config_path = dir.join("hub.toml");
+        let old = "data_dir = \"/var/lib/rustboard/hub\"\n\
+                   database = \"sqlite:///var/lib/rustboard/hub/rustboard.db\"\n\
+                   admin_token = \"keep-me\"\n";
+        let backup = switch_config(&config_path, old.as_bytes(), "postgres://u@h/db").unwrap();
+        assert!(backup.exists(), "旧配置应成对备份");
+        let new_text = fs::read_to_string(&config_path).unwrap();
+        assert!(new_text.contains("postgres://u@h/db"));
+        assert!(new_text.contains("keep-me"));
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P0：迁移源库必须先判版本再判表；v8 源库要给统一的 fresh-install 文案，
+    /// 不能只报缺 v9 新表。
+    #[test]
+    fn sqlite_source_version_is_checked_before_tables() {
+        let dir = temp_dir("legacy-source");
+        let db = dir.join("v8.db");
+        {
+            let conn = rusqlite::Connection::open(&db).expect("创建测试 SQLite");
+            conn.pragma_update(None, "user_version", 8)
+                .expect("设置 v8 user_version");
+        }
+        let err = match backup_cmd::sqlite_source_info(&db) {
+            Ok(_) => panic!("v8 源库必须拒绝"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(message.contains("只支持全新安装"), "{message}");
+        assert!(
+            message.contains("旧数据兼容将在首个正式版本之后提供"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("缺少表"),
+            "必须先报版本而不是只报缺表: {message}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

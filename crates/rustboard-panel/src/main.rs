@@ -310,34 +310,83 @@ impl AppState {
     }
 }
 
+/// [`password_reload_tick`] 处理一轮轮询后的结果。
+#[derive(Debug)]
+enum PasswordReloadTick {
+    /// 本轮没有读到配置内容（例如原子 rename 的极短空窗），基线不变，下一轮重试。
+    Unreadable,
+    /// 内容与基线完全相同，没有触发热加载。
+    Skipped,
+    /// 触发了热加载，但密码哈希未变（首轮基线未知时也会走到这里；
+    /// 或磁盘只改了其他配置字段）。
+    HashUnchanged,
+    /// 触发了热加载且密码哈希已更新（全部会话已吊销、认证代际已推进）。
+    HashUpdated,
+    /// 内容变化但热加载失败，旧密码继续生效，基线已更新。
+    Failed(anyhow::Error),
+}
+
+/// 处理一轮「读取到的配置内容 → 基线比对 → 热加载密码」。
+///
+/// 单独拆出来是为了测试可以在不等待定时器的情况下精确模拟
+/// 「启动加载 A → 磁盘写成 B → 注册 watcher」的时序。
+/// `content` 为 `None` 表示读取失败；此时不推进基线，下一轮继续尝试。
+fn password_reload_tick(
+    state: &AppState,
+    baseline: &mut Option<String>,
+    content: Option<String>,
+) -> PasswordReloadTick {
+    let Some(text) = content else {
+        return PasswordReloadTick::Unreadable;
+    };
+    if baseline.as_deref() == Some(text.as_str()) {
+        return PasswordReloadTick::Skipped;
+    }
+    // 先推进基线再 reload，与既有语义一致：失败内容保持不变时只记录一次
+    // warning，不每秒重试；若内容再次变化，下一轮仍会重新 reload。
+    *baseline = Some(text);
+    match state.reload_password_hash() {
+        Ok(true) => PasswordReloadTick::HashUpdated,
+        Ok(false) => PasswordReloadTick::HashUnchanged,
+        Err(error) => PasswordReloadTick::Failed(error),
+    }
+}
+
 /// 每秒检查配置文件内容；变化时尝试热加载密码哈希。
 ///
 /// 比较完整文件内容而不是 mtime：`reset-password` 的原子 rename 与某些文件系统
 /// 的秒级 mtime 粒度可能让 mtime 看起来不变。配置文件很小，每秒读一次成本可忽略。
+///
+/// 基线必须从「未知」开始，不能在任务启动前从磁盘再读一次作为基线：启动配置在
+/// [`run`] 里已经加载，若把此刻磁盘上的内容当成基线，`reset-password` 恰好落在
+/// 「加载配置」与「注册 watcher」之间时，新哈希会被当成基线而永不热加载（#76）。
+/// 因此首轮拿到内容后无条件调用一次 [`AppState::reload_password_hash`]；该函数
+/// 在密码写锁内比对哈希，内容未真正变化时不会吊销会话或推进代际，不会误伤。
 fn spawn_password_reload(state: Arc<AppState>) {
     let Some(path) = state.config_path.clone() else {
         return;
     };
-    // 在 spawn 之前同步读取基线：否则 reset-password 若恰好发生在任务首次被
-    // 调度之前，任务会把“新内容”当成基线，永远看不到变化。
-    let mut last = std::fs::read_to_string(&path).ok();
+    let mut baseline = None;
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(PASSWORD_RELOAD_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             let read_path = path.clone();
-            let Ok(Ok(text)) =
-                tokio::task::spawn_blocking(move || std::fs::read_to_string(read_path)).await
-            else {
-                continue;
-            };
-            if last.as_deref() == Some(text.as_str()) {
-                continue;
-            }
-            last = Some(text);
-            if let Err(error) = state.reload_password_hash() {
-                tracing::warn!(path = %path.display(), error = %error, "密码热加载失败，保留旧密码");
+            let content =
+                match tokio::task::spawn_blocking(move || std::fs::read_to_string(read_path)).await
+                {
+                    Ok(Ok(text)) => Some(text),
+                    Ok(Err(_)) | Err(_) => None,
+                };
+            match password_reload_tick(&state, &mut baseline, content) {
+                PasswordReloadTick::Failed(error) => {
+                    tracing::warn!(path = %path.display(), error = %error, "密码热加载失败，保留旧密码");
+                }
+                PasswordReloadTick::Unreadable
+                | PasswordReloadTick::Skipped
+                | PasswordReloadTick::HashUnchanged
+                | PasswordReloadTick::HashUpdated => {}
             }
         }
     });
@@ -6203,6 +6252,270 @@ mod tests {
         assert!(!state.reload_password_hash().unwrap());
         assert_eq!(state.sessions.generation(), new_generation);
         assert!(state.sessions.is_authenticated(&fresh, now));
+    }
+
+    /// 热加载测试用的面板配置：监听地址固定回环，token 不含真实值。
+    fn password_reload_config(password: &str) -> PanelConfig {
+        PanelConfig {
+            hub_url: "http://127.0.0.1:1".to_string(),
+            token: "test-hub-token".to_string(),
+            admin_password_hash: auth::hash_password(password).unwrap(),
+            trusted_proxies: vec!["127.0.0.1".to_string()],
+            ..PanelConfig::default()
+        }
+    }
+
+    fn current_password_hash(state: &AppState) -> String {
+        state
+            .password_hash
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// #76 回归：启动加载配置 A 之后、watcher 注册之前发生 reset-password 写入 B，
+    /// watcher 不得把磁盘上的 B 当成基线。首轮 tick 必须加载 B，使新密码生效、
+    /// 旧密码失效并吊销全部已有会话。
+    #[test]
+    fn watcher_first_tick_covers_reset_between_load_and_register() {
+        let site = TempSite::new();
+        let path = site.dir.join("panel.toml");
+        let old = "old-password";
+        password_reload_config(old).save(&path).unwrap();
+        // 启动时实际加载配置 A；此时 watcher 尚未注册。
+        let loaded = PanelConfig::load(&path).unwrap();
+        let state = AppState::new(loaded, None, Some(path.clone())).unwrap();
+        let now = now_ms();
+        let stale = state.sessions.create(now);
+        assert!(state.sessions.is_authenticated(&stale, now));
+
+        // 加载与注册之间改密：磁盘内容变成 B。
+        reset_password(Some(path.clone()), Some("new-password".to_string())).unwrap();
+        let disk_b = std::fs::read_to_string(&path).unwrap();
+        let expected = PanelConfig::load(&path).unwrap().admin_password_hash;
+
+        // watcher 从“未知”基线启动；首轮读到 B 必须比对/加载，而不是直接采纳。
+        let mut baseline = None;
+        let tick = password_reload_tick(&state, &mut baseline, Some(disk_b.clone()));
+        assert!(matches!(tick, PasswordReloadTick::HashUpdated), "{tick:?}");
+
+        assert_eq!(baseline.as_deref(), Some(disk_b.as_str()));
+        assert_eq!(current_password_hash(&state), expected);
+        assert!(auth::verify_password("new-password", &expected));
+        assert!(!auth::verify_password(old, &expected));
+        assert_eq!(state.sessions.generation(), 1);
+        assert!(
+            !state.sessions.is_authenticated(&stale, now),
+            "旧密码会话必须被吊销"
+        );
+    }
+
+    /// #76 端到端回归：改密发生在 watcher **注册之前**，真实的 spawn 任务
+    /// 首轮 tick 就必须应用新哈希；若重新引入“注册时从磁盘读基线”，本测试会超时。
+    #[tokio::test]
+    async fn spawned_watcher_applies_reset_written_before_registration() {
+        let site = TempSite::new();
+        let path = site.dir.join("panel.toml");
+        let old = "old-password";
+        password_reload_config(old).save(&path).unwrap();
+        let loaded = PanelConfig::load(&path).unwrap();
+        let state = Arc::new(AppState::new(loaded, None, Some(path.clone())).unwrap());
+        let now = now_ms();
+        let stale = state.sessions.create(now);
+        assert!(state.sessions.is_authenticated(&stale, now));
+
+        // 启动配置加载完成后、watcher 注册前发生改密。
+        reset_password(Some(path.clone()), Some("new-password".to_string())).unwrap();
+        let expected = PanelConfig::load(&path).unwrap().admin_password_hash;
+
+        spawn_password_reload(state.clone());
+
+        // 首轮 tick 是立即到期的；2s 只是失败上限，正常路径只等实际调度。
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if current_password_hash(&state) == expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("watcher 首轮必须加载注册前写入的新密码，不能把磁盘内容当基线");
+
+        assert_eq!(state.sessions.generation(), 1);
+        assert!(
+            !state.sessions.is_authenticated(&stale, now),
+            "旧密码会话必须被吊销"
+        );
+        assert!(auth::verify_password("new-password", &expected));
+        assert!(!auth::verify_password(old, &expected));
+    }
+
+    /// #76：首轮无条件比对（内容未变也不得误伤会话）；同内容不重复 reload；
+    /// 后续 B→C 仍按“内容变化 → 热加载 → 吊销会话/推进代际”工作。
+    #[test]
+    fn watcher_tick_skips_unchanged_and_applies_later_changes() {
+        let site = TempSite::new();
+        let path = site.dir.join("panel.toml");
+        let old = "old-password";
+        password_reload_config(old).save(&path).unwrap();
+        let loaded = PanelConfig::load(&path).unwrap();
+        let state = AppState::new(loaded, None, Some(path.clone())).unwrap();
+        let disk_a = std::fs::read_to_string(&path).unwrap();
+        let mut baseline = None;
+
+        // 首轮内容与启动加载一致：确实调用了一次 reload，但哈希没变，
+        // 因此不得推进代际、不得清空会话。
+        let first = password_reload_tick(&state, &mut baseline, Some(disk_a.clone()));
+        assert!(
+            matches!(first, PasswordReloadTick::HashUnchanged),
+            "{first:?}"
+        );
+        assert_eq!(state.sessions.generation(), 0);
+        let now = now_ms();
+        let session = state.sessions.create(now);
+        assert!(state.sessions.is_authenticated(&session, now));
+
+        // 内容完全相同：直接跳过，不重复 reload。
+        let again = password_reload_tick(&state, &mut baseline, Some(disk_a));
+        assert!(matches!(again, PasswordReloadTick::Skipped), "{again:?}");
+        assert_eq!(state.sessions.generation(), 0);
+        assert!(state.sessions.is_authenticated(&session, now));
+
+        // B：正常热加载并吊销旧会话。
+        reset_password(Some(path.clone()), Some("new-password".to_string())).unwrap();
+        let disk_b = std::fs::read_to_string(&path).unwrap();
+        let expected_b = PanelConfig::load(&path).unwrap().admin_password_hash;
+        let to_b = password_reload_tick(&state, &mut baseline, Some(disk_b));
+        assert!(matches!(to_b, PasswordReloadTick::HashUpdated), "{to_b:?}");
+        assert_eq!(current_password_hash(&state), expected_b);
+        assert!(auth::verify_password("new-password", &expected_b));
+        assert!(!auth::verify_password(old, &expected_b));
+        assert_eq!(state.sessions.generation(), 1);
+        assert!(!state.sessions.is_authenticated(&session, now));
+
+        let after_b = state.sessions.create(now);
+        assert!(state.sessions.is_authenticated(&after_b, now));
+
+        // C：再次变化仍正常热加载，吊销 B 之后建立的会话。
+        reset_password(Some(path.clone()), Some("third-password".to_string())).unwrap();
+        let disk_c = std::fs::read_to_string(&path).unwrap();
+        let expected_c = PanelConfig::load(&path).unwrap().admin_password_hash;
+        let to_c = password_reload_tick(&state, &mut baseline, Some(disk_c.clone()));
+        assert!(matches!(to_c, PasswordReloadTick::HashUpdated), "{to_c:?}");
+        assert_eq!(baseline.as_deref(), Some(disk_c.as_str()));
+        assert_eq!(current_password_hash(&state), expected_c);
+        assert!(auth::verify_password("third-password", &expected_c));
+        assert!(!auth::verify_password("new-password", &expected_c));
+        assert_eq!(state.sessions.generation(), 2);
+        assert!(!state.sessions.is_authenticated(&after_b, now));
+    }
+
+    /// #76：reload 失败时保留旧哈希且只记录 warning；同样的坏内容不重复尝试，
+    /// 恢复成合法配置后仍能正常热加载。覆盖 TOML 解析失败与 PHC 非法两条路径。
+    #[test]
+    fn watcher_tick_keeps_old_hash_when_reload_fails() {
+        let site = TempSite::new();
+        let path = site.dir.join("panel.toml");
+        let old = "old-password";
+        let base = password_reload_config(old);
+        base.save(&path).unwrap();
+        let loaded = PanelConfig::load(&path).unwrap();
+        let state = AppState::new(loaded, None, Some(path.clone())).unwrap();
+        let disk_a = std::fs::read_to_string(&path).unwrap();
+        let old_hash = current_password_hash(&state);
+        let now = now_ms();
+        let session = state.sessions.create(now);
+        let mut baseline = None;
+
+        // 1) 原子 rename 后是坏 TOML：reload 失败，旧密码与会话保持有效。
+        let malformed = "admin_password_hash = [unterminated\n".to_string();
+        std::fs::write(&path, &malformed).unwrap();
+        let failed = password_reload_tick(&state, &mut baseline, Some(malformed.clone()));
+        assert!(
+            matches!(failed, PasswordReloadTick::Failed(_)),
+            "{failed:?}"
+        );
+        assert_eq!(current_password_hash(&state), old_hash);
+        assert_eq!(state.sessions.generation(), 0);
+        assert!(state.sessions.is_authenticated(&session, now));
+
+        // 坏内容未变：基线已推进，不每秒重复 reload。
+        let skipped = password_reload_tick(&state, &mut baseline, Some(malformed));
+        assert!(
+            matches!(skipped, PasswordReloadTick::Skipped),
+            "{skipped:?}"
+        );
+
+        // 2) TOML 合法但 admin_password_hash 不是 Argon2id PHC：同样保留旧哈希。
+        let mut invalid_phc = base;
+        invalid_phc.admin_password_hash = "not-a-valid-phc".to_string();
+        invalid_phc.save(&path).unwrap();
+        let disk_invalid = std::fs::read_to_string(&path).unwrap();
+        let failed = password_reload_tick(&state, &mut baseline, Some(disk_invalid.clone()));
+        assert!(
+            matches!(failed, PasswordReloadTick::Failed(_)),
+            "{failed:?}"
+        );
+        assert_eq!(current_password_hash(&state), old_hash);
+        assert_eq!(state.sessions.generation(), 0);
+        assert!(state.sessions.is_authenticated(&session, now));
+
+        // 恢复启动内容 A：回到基线，不产生代际变化。
+        std::fs::write(&path, &disk_a).unwrap();
+        let restored = password_reload_tick(&state, &mut baseline, Some(disk_a));
+        assert!(
+            matches!(restored, PasswordReloadTick::HashUnchanged),
+            "{restored:?}"
+        );
+        assert_eq!(state.sessions.generation(), 0);
+        assert!(state.sessions.is_authenticated(&session, now));
+
+        // 之后写回合法的新密码 B：仍能正常热加载并吊销旧会话。
+        reset_password(Some(path.clone()), Some("new-password".to_string())).unwrap();
+        let disk_b = std::fs::read_to_string(&path).unwrap();
+        let expected_b = PanelConfig::load(&path).unwrap().admin_password_hash;
+        let recovered = password_reload_tick(&state, &mut baseline, Some(disk_b));
+        assert!(
+            matches!(recovered, PasswordReloadTick::HashUpdated),
+            "{recovered:?}"
+        );
+        assert_eq!(current_password_hash(&state), expected_b);
+        assert!(auth::verify_password("new-password", &expected_b));
+        assert!(!auth::verify_password(old, &expected_b));
+        assert_eq!(state.sessions.generation(), 1);
+        assert!(!state.sessions.is_authenticated(&session, now));
+    }
+
+    /// #76：读取失败（例如原子 rename 的极短空窗）不推进基线；下一轮读到
+    /// 有效内容仍必须比对/加载，不能因为“首轮失败”而把新密码吞掉。
+    #[test]
+    fn watcher_tick_read_failure_keeps_baseline_for_retry() {
+        let site = TempSite::new();
+        let path = site.dir.join("panel.toml");
+        password_reload_config("old-password").save(&path).unwrap();
+        let loaded = PanelConfig::load(&path).unwrap();
+        let state = AppState::new(loaded, None, Some(path.clone())).unwrap();
+        let mut baseline = None;
+
+        let unreadable = password_reload_tick(&state, &mut baseline, None);
+        assert!(
+            matches!(unreadable, PasswordReloadTick::Unreadable),
+            "{unreadable:?}"
+        );
+        assert!(baseline.is_none(), "读取失败不得推进基线");
+        assert_eq!(state.sessions.generation(), 0);
+
+        // 读取失败期间磁盘被改成 B；下一轮成功读取必须应用 B。
+        reset_password(Some(path.clone()), Some("new-password".to_string())).unwrap();
+        let disk_b = std::fs::read_to_string(&path).unwrap();
+        let expected = PanelConfig::load(&path).unwrap().admin_password_hash;
+        let tick = password_reload_tick(&state, &mut baseline, Some(disk_b));
+        assert!(matches!(tick, PasswordReloadTick::HashUpdated), "{tick:?}");
+        assert_eq!(current_password_hash(&state), expected);
+        assert!(auth::verify_password("new-password", &expected));
+        assert!(!auth::verify_password("old-password", &expected));
+        assert_eq!(state.sessions.generation(), 1);
     }
 
     /// 回归 KI-18：登录读取旧代际后进入 Argon2，期间 reset-password 生效；

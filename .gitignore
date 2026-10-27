@@ -14,3 +14,6 @@ dist/
 # Python 字节码（测试脚本运行时生成，可重建）
 __pycache__/
 *.pyc
+
+# vendored crate 独立测试的构建目录（可重建）
+vendor/*/target/

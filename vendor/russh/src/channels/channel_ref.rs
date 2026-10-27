@@ -31,3 +31,13 @@ impl std::ops::Deref for ChannelRef {
         &self.sender
     }
 }
+
+impl Drop for ChannelRef {
+    fn drop(&mut self) {
+        // The session owns the only `ChannelRef` of a channel and drops it
+        // when the channel is closed by the peer, fails to open, or the
+        // session ends. Notify writers blocked on a zero-sized send window so
+        // they observe `BrokenPipe` instead of waiting forever (#97).
+        self.window_size.close();
+    }
+}

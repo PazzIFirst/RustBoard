@@ -5,9 +5,10 @@
 //!
 //! 失败退避：1m / 5m / 15m / 1h / 最大 6h。续期失败只 WARN 并保留旧证书，
 //! **绝不退出 hub**。成功安装后重建 `tls::server_config` 并 `watch::send_replace`，
-//! 新连接立即使用新证书；文件 watcher 仍保留作为兜底（CLI issue 也会被它加载）。
+//! 同一临界区用实际推送的证书 PEM 更新 live 摘要；文件 watcher 仍保留作为兜底
+//! （CLI issue 也会被它加载）。
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -16,7 +17,7 @@ use rustboard_common::tls;
 use rustboard_common::util::now_ms;
 use rustls::ServerConfig;
 
-use crate::cert_rotation::{CertLock, TlsConfigSender};
+use crate::cert_rotation::{write_live, CertLock, CertStatus, TlsConfigSender};
 
 use super::client::{self, IssuedCert};
 use super::store;
@@ -80,7 +81,7 @@ fn backoff_delay(failures: usize) -> Duration {
 }
 
 /// 启动 ACME 续期任务；非 ACME 模式直接返回（自签续期由 cert_rotation 负责）。
-pub fn spawn_acme_renewal(cfg: Arc<HubConfig>, tx: TlsConfigSender) {
+pub fn spawn_acme_renewal(cfg: Arc<HubConfig>, tx: TlsConfigSender, live: Arc<RwLock<CertStatus>>) {
     if !cfg.tls.mode.is_acme() {
         tracing::debug!(
             mode = cfg.tls.mode.as_str(),
@@ -92,7 +93,7 @@ pub fn spawn_acme_renewal(cfg: Arc<HubConfig>, tx: TlsConfigSender) {
         let period = Duration::from_secs(cfg.cert_check_interval_secs.max(60));
         let mut failures = 0usize;
         loop {
-            match renew_if_due(&cfg, Some(&tx)).await {
+            match renew_if_due(&cfg, Some(&tx), Some(&live)).await {
                 Ok(Some(issued)) => {
                     failures = 0;
                     tracing::info!(
@@ -143,6 +144,7 @@ pub async fn issue_and_install(cfg: &HubConfig) -> Result<IssuedCert> {
 pub async fn renew_if_due(
     cfg: &HubConfig,
     tx: Option<&TlsConfigSender>,
+    live: Option<&RwLock<CertStatus>>,
 ) -> Result<Option<IssuedCert>> {
     if !cfg.tls.mode.is_acme() {
         bail!("当前 tls.mode 不是 ACME 模式，不能执行 tls renew");
@@ -166,7 +168,24 @@ pub async fn renew_if_due(
         // 与 cert_rotation 的 watch 使用同一通道：accept 循环每条新连接读一次。
         tx.send_replace(config);
     }
+    if let Some(live) = live {
+        sync_live_from_pem(live, &issued.cert_pem);
+    }
     Ok(Some(issued))
+}
+
+/// 用刚安装并推送的证书 PEM 更新 live 摘要。
+///
+/// 调用时仍持有 `CertLock`，`issued.cert_pem` 就是写入磁盘并构建 watch 配置的
+/// 同一份材料；摘要解析失败只 WARN，文件 watcher 下个周期仍会补上。
+fn sync_live_from_pem(live: &RwLock<CertStatus>, cert_pem: &str) {
+    match CertStatus::from_pem(cert_pem) {
+        Ok(status) => write_live(live, status),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "ACME 续期后计算 live 证书摘要失败；下个 watcher 周期会补齐"
+        ),
+    }
 }
 
 /// 已持锁的签发 + 安装 + 重建配置。
@@ -187,8 +206,9 @@ async fn issue_locked(cfg: &HubConfig) -> Result<(IssuedCert, Arc<ServerConfig>)
         &issued.key_pem,
         &expected_sans,
     )?;
-    // 安装后重建**启用 mTLS** 的完整配置；失败说明 client CA 等前置条件异常。
-    let config = tls::server_config(&cfg.data_dir)
+    // 安装后用**刚写入的同一份证书 PEM** 重建启用 mTLS 的完整配置；失败说明
+    // client CA 等前置条件异常。不能重新读盘，否则并发 rotate 可能换掉证书。
+    let config = tls::server_config_with_cert_pem(&cfg.data_dir, &issued.cert_pem)
         .context("安装 ACME 证书后重建 TLS 配置失败（检查 ca.crt/ca.key）")?;
     record_success(cfg, &issued.cert_pem);
     Ok((issued, config))
@@ -311,6 +331,25 @@ mod tests {
             next_renewal_unix(&pem).unwrap(),
             not_after.unix_timestamp() - 48 * 3600
         );
+    }
+
+    /// #68：ACME 证书安装/推送后 live 立即使用刚签发的证书，不等 watcher。
+    #[test]
+    fn live_status_uses_just_installed_cert() {
+        let old_pem = cert(date_time_ymd(2020, 1, 1), date_time_ymd(2020, 2, 1));
+        let new_pem = cert(date_time_ymd(2020, 6, 1), date_time_ymd(2020, 9, 1));
+        let old_status = CertStatus::from_pem(&old_pem).unwrap();
+        let live = RwLock::new(old_status.clone());
+
+        sync_live_from_pem(&live, &new_pem);
+        let live_after = live.read().unwrap().clone();
+        assert_eq!(
+            live_after.fingerprint,
+            tls::fingerprint_of_pem(&new_pem).unwrap(),
+            "ACME 续期后 live 必须指向刚安装的证书"
+        );
+        assert_eq!(live_after.not_after, tls::not_after_unix(&new_pem).unwrap());
+        assert_ne!(live_after.fingerprint, old_status.fingerprint);
     }
 
     #[test]

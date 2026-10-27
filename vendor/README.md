@@ -1,13 +1,15 @@
 # Vendored 依赖
 
-本目录包含两个**只改 manifest**的 vendored crate，用于满足 `cargo audit`
-为 0 的要求。所有 `src/` 代码与 crates.io 发布包逐字节一致，SSH 协议实现与
-SFTP 相关逻辑完全来自上游。
+本目录包含两个 vendored crate：在最小 manifest 改动之外，还包含为了修复已确认
+安全/协议缺陷（#96–#102）而做的**最小源码 patch**，用于满足 `cargo audit` 为 0
+并保证 SFTP 行为正确。基线版本、逐文件偏差、测试与重放步骤见
+`vendor/russh/PATCHES.md` 与 `vendor/ssh-key/PATCHES.md`；`src/` 不再与 crates.io
+发布包逐字节一致。
 
 | 目录 | 包名 | 版本 | 许可证 | 改动 |
 | --- | --- | --- | --- | --- |
-| `russh/` | `russh` | `0.64.1` | Apache-2.0（`russh/LICENSE`） | 删除 optional `rsa` / `pkcs1` 依赖、`rsa` feature、`default` 中的 `"rsa"` |
-| `ssh-key/` | `ssh-key` | `0.7.0-rc.11` | Apache-2.0 OR MIT（两个 LICENSE 均保留） | 删除 optional `rsa` 依赖、`rsa` feature、`crypto` feature 中的 `"rsa"` |
+| `russh/` | `russh` | `0.64.1` | Apache-2.0（`russh/LICENSE`） | 删除 optional `rsa` / `pkcs1` 依赖、`rsa` feature、`default` 中的 `"rsa"`；修复 #96–#98（空 Data/零窗口断连/双向 cipher），见 `russh/PATCHES.md` |
+| `ssh-key/` | `ssh-key` | `0.7.0-rc.11` | Apache-2.0 OR MIT（两个 LICENSE 均保留） | 删除 optional `rsa` 依赖、`rsa` feature、`crypto` feature 中的 `"rsa"`；修复 #99–#102（RSA 相等/证书算法/authorized_keys/ECDSA 短标量），见 `ssh-key/PATCHES.md` |
 
 上游：
 
@@ -59,10 +61,11 @@ RSA 主机密钥，需要升级服务器或改用 WebDAV / S3 后端，不能通
 
 ## 文件清理
 
-为减小仓库体积，两个目录保留构建所需的 `src/`、`Cargo.toml`、`README.md`
-与许可证；删除发布包里的 `Cargo.lock`、`Cargo.toml.orig`、
-`.cargo_vcs_info.json`、`.cargo-ok`。`russh` 的 `tests/`、`examples/`、
-`benches/` 因 manifest 显式声明保留，不参与本仓库构建。
+为减小仓库体积，两个目录保留构建所需的 `src/`、`Cargo.toml`、`README.md`、
+`PATCHES.md` 与许可证；删除发布包里的 `Cargo.toml.orig`、`.cargo_vcs_info.json`、
+`.cargo-ok`。**保留独立 `Cargo.lock`**：CI 用 `--locked` 运行 vendor 单测，
+重新 vendor 时删掉会让该步骤失败（需按 `PATCHES.md` 重新生成）。`russh` 的
+`tests/`、`examples/`、`benches/` 因 manifest 显式声明保留，不参与本仓库构建。
 
 `ssh-key` 上游 manifest 自带 `[lints]`；`russh` 源码中残留的
 `cfg(feature = "rsa")` 在依赖编译时只产生 warning（Cargo cap-lints），
@@ -84,17 +87,26 @@ RSA 主机密钥，需要升级服务器或改用 WebDAV / S3 后端，不能通
    `ssh-key` 从 `https://crates.io/api/v1/crates/ssh-key/0.7.0-rc.11/download`
    下载，checksum 必须与 `Cargo.lock` 的 registry 条目一致。
 
-2. 用发布包内容替换对应目录（保留本 README）：
+2. 先备份本目录的 `README.md` / `PATCHES.md`，再用发布包内容替换
+   `src/` 与 `Cargo.toml`；`Cargo.lock` 必须重新生成并提交（CI 使用
+   `--locked`）：
 
    ```bash
+   BACKUP=$(mktemp -d)
+   cp vendor/russh/README.md vendor/russh/PATCHES.md "$BACKUP/"
    rm -rf vendor/russh && mkdir -p vendor/russh
    cp -a "$TMP/russh-${VERSION}/." vendor/russh/
-   rm -f vendor/russh/Cargo.lock vendor/russh/Cargo.toml.orig \
-         vendor/russh/.cargo-ok vendor/russh/.cargo_vcs_info.json
+   cp "$BACKUP/README.md" "$BACKUP/PATCHES.md" vendor/russh/
+   rm -f vendor/russh/Cargo.toml.orig vendor/russh/.cargo-ok \
+         vendor/russh/.cargo_vcs_info.json
    cp /path/to/Apache-2.0.txt vendor/russh/LICENSE
+   cargo generate-lockfile --manifest-path vendor/russh/Cargo.toml
    ```
 
-3. 按上表编辑 manifest；不要改任何 `src/` 文件，否则升级 diff 会失去可审计性。
+3. 按对应 `PATCHES.md` 重新应用 vendored patch（manifest + 列出的 `src/` 文件）；
+   不要只按本表改 manifest，否则会静默回退 #96–#102。重新生成独立
+   `Cargo.lock`（`cargo generate-lockfile --manifest-path vendor/<crate>/Cargo.toml`），
+   并运行 `cargo test --manifest-path vendor/<crate>/Cargo.toml --locked`。
 
 4. 同步根 `Cargo.toml` 的 `[patch.crates-io]` 与
    `crates/rustboard-hub/Cargo.toml` 中固定的 `russh` 版本，然后：
@@ -107,7 +119,7 @@ RSA 主机密钥，需要升级服务器或改用 WebDAV / S3 后端，不能通
    cargo test --workspace --locked
    ```
 
-5. 在 `CHANGELOG.md` 中记录 vendor 版本、advisory 与 SFTP 真实验证结果。
+5. 在 `CHANGELOG.md` 中记录 vendor 版本、advisory、patch 偏差与 SFTP 真实验证结果。
 
 ## 上游修复后
 

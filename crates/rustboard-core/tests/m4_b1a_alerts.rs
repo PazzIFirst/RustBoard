@@ -70,6 +70,28 @@ fn open_storage(dir: &TempDbDir) -> SqliteStorage {
     SqliteStorage::open(&dir.db_path()).expect("SqliteStorage::open 失败")
 }
 
+/// v9 起存储层在规则写事务内校验渠道存在；测试夹具按需种入这些渠道。
+fn seed_rule_channels(storage: &SqliteStorage, channel_ids: &[&str]) {
+    use rustboard_core::channels::{ChannelConfig, ChannelKind, NotificationChannel, Secret};
+    for id in channel_ids {
+        storage
+            .create_notification_channel(&NotificationChannel {
+                id: (*id).to_string(),
+                name: format!("渠道-{id}"),
+                kind: ChannelKind::Telegram,
+                config: ChannelConfig::Telegram {
+                    bot_token: Secret::new("123456789:AAH_test-token_0123456789"),
+                    chat_id: "-1001234567890".to_string(),
+                },
+                enabled: true,
+                updated_by: "admin".to_string(),
+                created_at: 1_700_000_000_000,
+                updated_at: 1_700_000_000_000,
+            })
+            .expect("种子告警渠道失败");
+    }
+}
+
 fn labels(pairs: &[(&str, &str)]) -> Labels {
     pairs
         .iter()
@@ -103,6 +125,7 @@ fn custom_rule(id: &str, name: &str) -> AlertRule {
         updated_by: "admin".to_string(),
         created_at: 1_700_000_000_000,
         updated_at: 1_700_000_000_000,
+        revision: 0,
     }
 }
 
@@ -724,6 +747,8 @@ fn seed_builtin_alert_rules_is_idempotent_and_preserves_user_edits() {
     storage
         .update_alert_rule(&edited)
         .expect("更新内置规则失败");
+    // 更新由存储层递增 revision；用于整行比较的副本同步为 1。
+    edited.revision = 1;
 
     assert_eq!(
         storage
@@ -753,6 +778,7 @@ fn seed_builtin_alert_rules_is_idempotent_and_preserves_user_edits() {
 fn alert_rule_crud_roundtrip_and_domain_errors() {
     let dir = TempDbDir::new("crud");
     let storage = open_storage(&dir);
+    seed_rule_channels(&storage, &["chan-a", "chan-b", "chan-z"]);
 
     // 不存在的规则：get 返回 None；update / delete 返回 NotFound。
     assert_eq!(
@@ -915,6 +941,7 @@ fn alert_rule_limit_is_enforced_without_writing() {
 
     let dir = TempDbDir::new("limit");
     let storage = open_storage(&dir);
+    seed_rule_channels(&storage, &["chan-a", "chan-b"]);
     let now = 1_700_000_000_000_i64;
 
     assert_eq!(

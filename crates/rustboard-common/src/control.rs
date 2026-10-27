@@ -12,6 +12,7 @@
 //! - 所有来自 hub 的字符串字段在使用前都必须过本模块的长度 / 字符校验。
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fmt;
 use std::path::{Component, Path};
 
@@ -466,20 +467,76 @@ impl fmt::Debug for ControlError {
 
 /// systemd 禁止操作的服务名（精确匹配，小写比较）。
 ///
-/// `ssh.service` / `sshd.service` 是不同发行版对 OpenSSH 的命名；
-/// 另外禁止 agent / hub 自身服务，防止控制面把自己管死。
-const FORBIDDEN_UNITS: [&str; 3] = ["sshd", "sshd.service", "ssh.service"];
+/// `ssh` / `ssh.service` / `ssh.socket` / `sshd` / `sshd.service` / `sshd.socket`
+/// 是不同发行版对 OpenSSH 的命名，短名会被 systemctl 自动补成 `.service`，
+/// 因此必须在**规范化后**比较；另外禁止 agent / hub 自身服务，防止控制面
+/// 把自己管死。
+const FORBIDDEN_UNITS: [&str; 6] = [
+    "ssh",
+    "ssh.service",
+    "ssh.socket",
+    "sshd",
+    "sshd.service",
+    "sshd.socket",
+];
 
 /// systemd 禁止操作的前缀（小写比较）。
-const FORBIDDEN_UNIT_PREFIXES: [&str; 4] = ["rustboard-", "sd-", "systemd-", "dbus"];
+///
+/// `ssh@` / `sshd@` 覆盖 OpenSSH 的实例模板（如 `sshd@0.service`）；即使管理员
+/// 配置了 `sshd@*` 白名单，也不能启动/停止实例。
+const FORBIDDEN_UNIT_PREFIXES: [&str; 6] =
+    ["rustboard-", "sd-", "systemd-", "dbus", "ssh@", "sshd@"];
 
-/// 是否是禁止操作的 unit（禁止项优先于白名单）。
+/// systemd 已知的 unit 类型后缀（**大小写敏感**）。
+///
+/// systemctl 对没有合法类型后缀的短名补 `.service`；`nginx.SERVICE` 不是合法
+/// 的 `.service` 后缀，systemctl 会按 `nginx.SERVICE.service` 处理，因此这里也
+/// 必须大小写敏感。已带 `.socket` / `.timer` 等后缀的 unit 绝不能补成
+/// `.socket.service`。`.busname` 不是 systemctl 可管理的 unit 类型，不能当作
+/// 合法后缀。
+const SYSTEMD_UNIT_SUFFIXES: [&str; 11] = [
+    ".service",
+    ".socket",
+    ".device",
+    ".mount",
+    ".automount",
+    ".swap",
+    ".target",
+    ".path",
+    ".timer",
+    ".slice",
+    ".scope",
+];
+
+/// 把 systemctl 可接受的短 unit 名规范化为完整 unit 名。
+///
+/// `systemctl start nginx` 与 `systemctl start nginx.service` 等价；禁止项 /
+/// 白名单 / 执行前检查必须使用同一形式，否则 `ssh` 可以绕过只禁止
+/// `ssh.service` 的列表。规则：
+/// - 已带已知类型后缀（`.service` / `.socket` / `.timer` 等，大小写敏感）→
+///   原样返回；
+/// - 其余简单名（含 `@` 实例名）→ 补 `.service`。
+pub fn normalize_unit_name(unit: &str) -> Cow<'_, str> {
+    if SYSTEMD_UNIT_SUFFIXES
+        .iter()
+        .any(|suffix| unit.ends_with(suffix))
+    {
+        Cow::Borrowed(unit)
+    } else {
+        Cow::Owned(format!("{unit}.service"))
+    }
+}
+
+/// 是否是禁止操作的 unit（禁止项优先于白名单，短名与完整名等价）。
 pub fn is_forbidden_unit(unit: &str) -> bool {
-    let lower = unit.to_ascii_lowercase();
-    FORBIDDEN_UNITS.contains(&lower.as_str())
+    let raw_lower = unit.to_ascii_lowercase();
+    let normalized = normalize_unit_name(unit);
+    let normalized_lower = normalized.to_ascii_lowercase();
+    FORBIDDEN_UNITS.contains(&raw_lower.as_str())
+        || FORBIDDEN_UNITS.contains(&normalized_lower.as_str())
         || FORBIDDEN_UNIT_PREFIXES
             .iter()
-            .any(|prefix| lower.starts_with(prefix))
+            .any(|prefix| normalized_lower.starts_with(prefix))
 }
 
 /// unit / 容器名前缀里允许出现的字符（systemd 允许 `@`、`:` 与转义用的 `\`）。
@@ -509,12 +566,18 @@ pub fn validate_unit_name(unit: &str) -> Result<(), String> {
     if !target_chars_are_safe(unit) {
         return Err("unit 含非法字符（空白、控制字符或路径分隔符）".into());
     }
+    // 短名会被补成 `.service`，规范化后的完整名也必须受长度上限约束。
+    if normalize_unit_name(unit).len() > MAX_TARGET_LEN {
+        return Err(format!("unit 长度不能超过 {MAX_TARGET_LEN} 字节"));
+    }
     Ok(())
 }
 
 /// 校验配置里的 unit 白名单项：精确名或尾部 `*` 前缀。
 ///
-/// 禁止项优先：`sshd`、`rustboard-*`、`sd-*`、`systemd-*`、`dbus*` 不允许出现在白名单里。
+/// 禁止项优先：`ssh` / `ssh.socket` / `sshd`、`rustboard-*`、`sd-*`、
+/// `systemd-*`、`dbus*` 不允许出现在白名单里。短名按 systemctl 规则规范化
+/// 后再判断，`ssh*` 与 `ssh.service*` 都不能绕过禁止项。
 pub fn validate_unit_pattern(pattern: &str) -> Result<(), String> {
     let prefix = pattern.strip_suffix('*').unwrap_or(pattern);
     if prefix.is_empty() {
@@ -532,6 +595,9 @@ pub fn validate_unit_pattern(pattern: &str) -> Result<(), String> {
     if !target_chars_are_safe(prefix) {
         return Err("unit 白名单含非法字符（空白、控制字符或路径分隔符）".into());
     }
+    if pattern.strip_suffix('*').is_none() && normalize_unit_name(prefix).len() > MAX_TARGET_LEN {
+        return Err(format!("unit 白名单长度不能超过 {MAX_TARGET_LEN} 字节"));
+    }
     if is_forbidden_unit(prefix) {
         return Err(format!("禁止操作系统服务: {prefix}"));
     }
@@ -539,18 +605,23 @@ pub fn validate_unit_pattern(pattern: &str) -> Result<(), String> {
 }
 
 /// 请求 unit 是否命中白名单（精确或尾部 `*` 前缀）。**不**检查禁止项。
+///
+/// 请求与精确白名单项都按 systemctl 规则规范化：配置 `["nginx"]` 同时放行
+/// `nginx` 与 `nginx.service`；通配项保留前缀语义，不额外补后缀。
 pub fn unit_matches_whitelist(unit: &str, patterns: &[String]) -> bool {
+    let normalized = normalize_unit_name(unit);
     patterns
         .iter()
         .any(|pattern| match pattern.strip_suffix('*') {
-            Some(prefix) => !prefix.is_empty() && unit.starts_with(prefix),
-            None => pattern == unit,
+            Some(prefix) => !prefix.is_empty() && normalized.starts_with(prefix),
+            None => pattern == unit || normalize_unit_name(pattern).as_ref() == normalized.as_ref(),
         })
 }
 
 /// 请求 unit 是否允许操作：禁止项优先，其次必须命中白名单。
 pub fn unit_allowed(unit: &str, patterns: &[String]) -> bool {
-    !is_forbidden_unit(unit) && unit_matches_whitelist(unit, patterns)
+    let normalized = normalize_unit_name(unit);
+    !is_forbidden_unit(normalized.as_ref()) && unit_matches_whitelist(normalized.as_ref(), patterns)
 }
 
 /// 校验精确容器名：`[a-zA-Z0-9][a-zA-Z0-9_.-]*`。
@@ -678,7 +749,12 @@ mod tests {
         for unit in [
             "sshd",
             "sshd.service",
+            "sshd.socket",
+            "sshd@0.service",
+            "ssh",
             "ssh.service",
+            "ssh.socket",
+            "ssh@0.service",
             "rustboard-agent.service",
             "rustboard-hub",
             "sd-agent",
@@ -689,7 +765,7 @@ mod tests {
             "SSHD",
         ] {
             assert!(is_forbidden_unit(unit), "{unit} 必须被禁止");
-            let patterns = owned(&["*", "sshd*", "rustboard-*", "dbus*"]);
+            let patterns = owned(&["*", "sshd*", "ssh*", "rustboard-*", "dbus*"]);
             assert!(
                 !unit_allowed(unit, &patterns),
                 "{unit} 即使命中白名单也必须被禁止"
@@ -698,6 +774,80 @@ mod tests {
         for unit in ["nginx.service", "web-1", "redis", "postgresql.service"] {
             assert!(!is_forbidden_unit(unit), "{unit} 不应被禁止");
         }
+    }
+
+    /// #78：`ssh` 短名与 `ssh.service` / `ssh.socket` 等价拒绝；
+    /// `sshd@0.service` 等实例模板也不能绕过；白名单 `ssh*` / `sshd@*` 本身
+    /// 也不能出现在配置里。
+    #[test]
+    fn ssh_short_name_and_unit_suffix_are_equivalent() {
+        for unit in [
+            "ssh",
+            "ssh.service",
+            "ssh.socket",
+            "ssh@0.service",
+            "sshd@0.service",
+        ] {
+            assert!(is_forbidden_unit(unit), "{unit} 必须被禁止");
+            assert!(
+                !unit_allowed(unit, &owned(&["ssh", "ssh*", "ssh.service", "sshd@*"])),
+                "{unit} 不能在白名单下放行"
+            );
+        }
+        for pattern in [
+            "ssh",
+            "ssh*",
+            "ssh.service",
+            "ssh.socket",
+            "ssh.service*",
+            "sshd@*",
+            "ssh@*",
+        ] {
+            assert!(
+                validate_unit_pattern(pattern).is_err(),
+                "白名单 {pattern:?} 必须被拒绝"
+            );
+        }
+    }
+
+    /// #78：合法短名与完整名等价放行；后缀匹配大小写敏感；`.busname` 不是
+    /// systemctl 可管理后缀，不能被当成完整名。
+    #[test]
+    fn unit_names_are_normalized_before_whitelist_checks() {
+        assert_eq!(normalize_unit_name("nginx"), "nginx.service");
+        assert_eq!(normalize_unit_name("nginx.service"), "nginx.service");
+        assert_eq!(normalize_unit_name("nginx.socket"), "nginx.socket");
+        assert_eq!(
+            normalize_unit_name("nginx.SERVICE"),
+            "nginx.SERVICE.service"
+        );
+        assert_eq!(
+            normalize_unit_name("nginx.busname"),
+            "nginx.busname.service"
+        );
+        assert_eq!(normalize_unit_name("nginx@blue"), "nginx@blue.service");
+        assert_eq!(
+            normalize_unit_name("nginx@blue.service"),
+            "nginx@blue.service"
+        );
+
+        for pattern in ["nginx", "nginx.service"] {
+            let patterns = owned(&[pattern]);
+            for unit in ["nginx", "nginx.service"] {
+                assert!(
+                    unit_allowed(unit, &patterns),
+                    "白名单 {pattern:?} 必须同时放行 {unit:?}"
+                );
+            }
+            assert!(
+                !unit_allowed("nginx.socket", &patterns),
+                "精确白名单 {pattern:?} 不应放行 nginx.socket"
+            );
+        }
+        // 通配前缀仍然按规范化后的完整名匹配。
+        assert!(unit_allowed("nginx", &owned(&["nginx*"])));
+        assert!(unit_allowed("nginx.service", &owned(&["nginx*"])));
+        assert!(unit_allowed("nginx@blue", &owned(&["nginx@*"])));
     }
 
     #[test]
@@ -710,15 +860,10 @@ mod tests {
             "redis",
             "nginx",
         ] {
-            if unit == "redis" {
-                // 精确项 `redis.service` 不匹配 `redis`，前缀项 `nginx*` 也不匹配。
-                assert!(!unit_matches_whitelist(unit, &patterns));
-            } else {
-                assert!(
-                    unit_matches_whitelist(unit, &patterns),
-                    "{unit} 应命中白名单"
-                );
-            }
+            assert!(
+                unit_matches_whitelist(unit, &patterns),
+                "{unit} 应命中白名单（短名与完整名等价）"
+            );
         }
         assert!(!unit_matches_whitelist("postgresql.service", &patterns));
     }
@@ -736,8 +881,14 @@ mod tests {
             "nginx\nservice",
             "nginx/../service",
             "nginx..service",
-            "sshd",
+            "ssh",
+            "ssh*",
             "ssh.service",
+            "ssh.socket",
+            "ssh@*",
+            "sshd",
+            "sshd*",
+            "sshd@*",
             "rustboard-*",
             "systemd-*",
             "dbus*",
@@ -750,6 +901,8 @@ mod tests {
         }
         let too_long = format!("{}*", "a".repeat(MAX_TARGET_LEN));
         assert!(validate_unit_pattern(&too_long).is_err());
+        // 短名规范化为 `.service` 后也不能超过长度上限。
+        assert!(validate_unit_pattern(&"a".repeat(MAX_TARGET_LEN)).is_err());
     }
 
     #[test]

@@ -144,6 +144,7 @@ HAVE_BUILDX=0
 LAST_STATE="unknown"
 LAST_CODE="000"
 LAST_AGENT_SUMMARY=""
+S4_AGENT_ID=""
 PG_COMPOSE_ARGS=(-f docker/compose.example.yml -f docker/compose.postgres.example.yml)
 DIST_MANIFEST=${DIST_MANIFEST:-}
 EXPECTED_DIST_SHA256=${EXPECTED_DIST_SHA256:-}
@@ -748,6 +749,51 @@ pg_count() {
   pg_count_db rustboard "$1"
 }
 
+# 单值 SQL 查询。调用方只能传内部生成、且参数已严格校验的 SQL；这里不接收
+# 外部输入，避免把管理 API 的任意字符串拼进 SQL。
+pg_scalar() {
+  docker exec -u postgres "$PG_CT" psql -X -q -A -t -U rustboard -d rustboard \
+    -c "$1" 2>>"$LOG_DIR/pg-count.err"
+}
+
+# agent_id 由 hub 用 UUID 生成；断言只接受该格式，既防 SQL 注入又避免把
+# 名字/主机名误当成 ID。
+is_agent_uuid() {
+  [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+}
+
+# 按唯一 agent_id 统计三张核心表；hub-self 的自采样不会计入。
+pg_agent_count() {
+  local table=$1 agent_id=$2
+  case "$table" in
+    agents|samples|ingest_batches) ;;
+    *)
+      printf 'FATAL: 不允许按 agent 统计的表名: %s\n' "$table" >&2
+      return 2
+      ;;
+  esac
+  is_agent_uuid "$agent_id" || {
+    printf 'FATAL: agent_id 不是 UUID: %s\n' "$agent_id" >&2
+    return 2
+  }
+  pg_scalar "SELECT count(*) FROM ${table} WHERE agent_id = '${agent_id}'"
+}
+
+# agent 启动之后新落库的批次（ingest_batches.ts 是 hub 接收时间）。
+pg_agent_new_batches_since() {
+  local agent_id=$1 since_ms=$2
+  is_agent_uuid "$agent_id" || return 2
+  [[ "$since_ms" =~ ^[0-9]+$ ]] || return 2
+  pg_scalar "SELECT count(*) FROM ingest_batches WHERE agent_id = '${agent_id}' AND ts >= ${since_ms}"
+}
+
+# 真实 agent 必须上报这些预期指标；只按 agent_id 计数以排除 hub-self。
+pg_agent_expected_metrics() {
+  local agent_id=$1
+  is_agent_uuid "$agent_id" || return 2
+  pg_scalar "SELECT count(DISTINCT metric) FROM samples WHERE agent_id = '${agent_id}' AND metric IN ('cpu.usage','mem.used','sys.uptime')"
+}
+
 # ---------------------------------------------------------------------------
 # 前置检查与镜像构建
 # ---------------------------------------------------------------------------
@@ -1107,6 +1153,8 @@ default_sqlite_checks() {
     "$(compose_fact "$facts" all_published_ports)"
   check_eq "C.4a" "默认 hub 发布 8443 与回环 8080，panel 没有自己的 ports" "8080,8443/" \
     "$(compose_fact "$facts" hub_published)/$(compose_fact "$facts" panel_published)"
+  check_eq "C.4b" "默认 compose 的 8080 发布项均显式回环 127.0.0.1/::1" "0/1" \
+    "$(compose_fact "$facts" published_8080_nonloopback)/$(compose_fact "$facts" published_8080_loopback)"
   check_eq "C.5" "默认 compose 的 hub 不注入 RUSTBOARD_DATABASE/SSLROOTCERT" "0/0" \
     "$(compose_fact "$facts" hub_database_env)/$(compose_fact "$facts" hub_sslrootcert_env)"
   check_eq "C.6" "默认 compose 使用当前源码镜像 $HUB_IMAGE" "$HUB_IMAGE" \
@@ -1273,6 +1321,8 @@ pg_overlay_config_checks() {
     "$(compose_fact "$facts" published_5432)/$(compose_fact "$facts" published_8444)/$(compose_fact "$facts" postgres_ports_count)"
   check_eq "C.10a" "PG overlay 仍只发布 8443/回环 8080" "8080,8443" \
     "$(compose_fact "$facts" all_published_ports)"
+  check_eq "C.10b" "PG overlay 的 8080 发布项均显式回环 127.0.0.1/::1" "0/1" \
+    "$(compose_fact "$facts" published_8080_nonloopback)/$(compose_fact "$facts" published_8080_loopback)"
   check_eq "C.11" "PG overlay 的 hub 使用 postgres:// 且不带密码" "postgres/postgres/5432//rustboard/disable/0" \
     "$(compose_fact "$facts" hub_db_scheme)/$(compose_fact "$facts" hub_db_host)/$(compose_fact "$facts" hub_db_port)/$(compose_fact "$facts" hub_db_path)/$(compose_fact "$facts" hub_db_sslmode)/$(compose_fact "$facts" hub_db_has_password)"
   check_eq "C.12" "PG overlay 通过 PASSWORD_FILE 注入密码，不误配 SSLROOTCERT/直接密码" "1/1/0/0/0" \
@@ -1476,6 +1526,7 @@ agent_enrollment_checks() {
   local add_out="$SECRETS/agent-add.out"
   local ports_out="$SECRETS/agent-ports.out"
   local token_info="" fp="" version_out="" summary="" config_mode=""
+  local agent_start_ms=""
 
   if ! hub_exec_pg rustboard-hub agent add \
     --config /data/etc/rustboard/hub.toml --name s4-agent \
@@ -1528,6 +1579,8 @@ agent_enrollment_checks() {
   fi
 
   # --network host：agent 连宿主已发布的 127.0.0.1:8443；证书 SAN 含 127.0.0.1。
+  # 记录启动前的时间戳，A.8 要求之后确有新批次落库（不能拿启动前的旧数据充数）。
+  agent_start_ms=$(date +%s%3N)
   if ! docker run -d --name "$AGENT_CT" \
     --label "rustboard.e2e=1" --label "rustboard.e2e.run=$RUN_ID" \
     --network host \
@@ -1560,32 +1613,53 @@ agent_enrollment_checks() {
   check_eq "A.6" "agent 配置权限为 0600" "600" "$config_mode"
 
   if wait_agent_online "$PG_HUB_CT" "s4-agent" "$AGENT_TIMEOUT"; then
-    pass "A.7" "管理 API 显示 agent s4-agent online（${LAST_AGENT_SUMMARY}）"
+    S4_AGENT_ID=$(printf '%s\n' "$LAST_AGENT_SUMMARY" \
+      | sed -n 's/^agent_id=//p' | head -n 1)
+    if [[ "$LAST_AGENT_SUMMARY" == *"matches=1"* ]] && is_agent_uuid "$S4_AGENT_ID"; then
+      pass "A.7" "管理 API 显示 s4-agent online 且 agent_id 唯一（agent_id=$S4_AGENT_ID）"
+    else
+      S4_AGENT_ID=""
+      fail "A.7" "s4-agent 的 agent_id 不唯一或非法（${LAST_AGENT_SUMMARY:-无响应}）"
+    fi
   else
     fail "A.7" "管理 API 未在 ${AGENT_TIMEOUT}s 内显示 agent s4-agent online（${LAST_AGENT_SUMMARY:-无响应}）"
   fi
 
-  # 等待真实样本落 PG；agent 采样间隔由 hub 下发，通常几秒内首批落库。
+  # 等待真实样本落 PG；计数必须按 s4-agent 的唯一 agent_id 过滤，
+  # 否则 hub-self 的自采样也能让全表 count>0 通过。还要确认启动后确有
+  # 新批次，并出现真实采集器的预期指标。
   local deadline=$((SECONDS + DATA_TIMEOUT))
-  local samples=0 batches=0 agents=0
-  while (( SECONDS < deadline )); do
-    samples=$(pg_count samples 2>/dev/null || true)
-    batches=$(pg_count ingest_batches 2>/dev/null || true)
-    agents=$(pg_count agents 2>/dev/null || true)
-    samples=$(printf '%s' "$samples" | tr -d '[:space:]')
-    batches=$(printf '%s' "$batches" | tr -d '[:space:]')
-    agents=$(printf '%s' "$agents" | tr -d '[:space:]')
-    if [[ "$samples" =~ ^[0-9]+$ && "$batches" =~ ^[0-9]+$ && "$agents" =~ ^[0-9]+$ ]] \
-      && (( samples > 0 && batches > 0 && agents > 0 )); then
-      break
-    fi
-    sleep 2
-  done
-  if [[ "$samples" =~ ^[0-9]+$ && "$batches" =~ ^[0-9]+$ && "$agents" =~ ^[0-9]+$ ]] \
-    && (( samples > 0 && batches > 0 && agents > 0 )); then
-    pass "A.8" "PG samples=$samples ingest_batches=$batches agents=$agents 均 >0"
+  local samples=0 batches=0 agents=0 new_batches=0 expected_metrics=0
+  if ! is_agent_uuid "$S4_AGENT_ID"; then
+    fail "A.8" "无法取得 s4-agent 的唯一 agent_id，不能按 ID 断言 PG 数据（不能退回全表计数）"
   else
-    fail "A.8" "PG 计数未在 ${DATA_TIMEOUT}s 内全部 >0（samples=[$samples] ingest_batches=[$batches] agents=[$agents]）"
+    while (( SECONDS < deadline )); do
+      samples=$(pg_agent_count samples "$S4_AGENT_ID" 2>/dev/null || true)
+      batches=$(pg_agent_count ingest_batches "$S4_AGENT_ID" 2>/dev/null || true)
+      agents=$(pg_agent_count agents "$S4_AGENT_ID" 2>/dev/null || true)
+      new_batches=$(pg_agent_new_batches_since "$S4_AGENT_ID" "$agent_start_ms" 2>/dev/null || true)
+      expected_metrics=$(pg_agent_expected_metrics "$S4_AGENT_ID" 2>/dev/null || true)
+      samples=$(printf '%s' "$samples" | tr -d '[:space:]')
+      batches=$(printf '%s' "$batches" | tr -d '[:space:]')
+      agents=$(printf '%s' "$agents" | tr -d '[:space:]')
+      new_batches=$(printf '%s' "$new_batches" | tr -d '[:space:]')
+      expected_metrics=$(printf '%s' "$expected_metrics" | tr -d '[:space:]')
+      if [[ "$samples" =~ ^[0-9]+$ && "$batches" =~ ^[0-9]+$ && "$agents" =~ ^[0-9]+$ \
+        && "$new_batches" =~ ^[0-9]+$ && "$expected_metrics" =~ ^[0-9]+$ ]] \
+        && (( samples > 0 && batches > 0 && agents == 1 && new_batches > 0 \
+          && expected_metrics == 3 )); then
+        break
+      fi
+      sleep 2
+    done
+    if [[ "$samples" =~ ^[0-9]+$ && "$batches" =~ ^[0-9]+$ && "$agents" =~ ^[0-9]+$ \
+      && "$new_batches" =~ ^[0-9]+$ && "$expected_metrics" =~ ^[0-9]+$ ]] \
+      && (( samples > 0 && batches > 0 && agents == 1 && new_batches > 0 \
+        && expected_metrics == 3 )); then
+      pass "A.8" "PG s4-agent(${S4_AGENT_ID}) samples=$samples ingest_batches=$batches agents=$agents new_batches=$new_batches 预期指标=3/3"
+    else
+      fail "A.8" "PG 按 s4-agent(${S4_AGENT_ID}) 断言失败（samples=[$samples] ingest_batches=[$batches] agents=[$agents] 启动后新批次=[$new_batches] 预期指标=[$expected_metrics]/3；hub-self 数据不能代替）"
+    fi
   fi
 
   version_out=$(docker exec "$AGENT_CT" rustboard-agent --version 2>/dev/null || true)
@@ -1608,6 +1682,12 @@ agent_enrollment_checks() {
 restart_persistence_checks() {
   local before=$FAILS
   local s0 b0 a0 s1 b1 a1 hash1=""
+  local as0="" ab0="" aa0="" as1="" ab1="" aa1=""
+  local scoped=1 full_ok=0 scoped_ok=0
+
+  if ! is_agent_uuid "$S4_AGENT_ID"; then
+    scoped=0
+  fi
 
   s0=$(pg_count samples 2>/dev/null || true)
   b0=$(pg_count ingest_batches 2>/dev/null || true)
@@ -1618,6 +1698,21 @@ restart_persistence_checks() {
   if [[ ! "$s0" =~ ^[0-9]+$ || ! "$b0" =~ ^[0-9]+$ || ! "$a0" =~ ^[0-9]+$ ]]; then
     fail "R.1" "重启前无法读取 PG 计数"
     return 1
+  fi
+
+  # 全表计数只作辅助：hub-self 持续自采样会掩盖 s4-agent 的数据丢失，
+  # 因此同时记录按唯一 s4 agent_id 过滤的计数（与 A.8 同口径）。
+  if (( scoped == 1 )); then
+    as0=$(pg_agent_count samples "$S4_AGENT_ID" 2>/dev/null || true)
+    ab0=$(pg_agent_count ingest_batches "$S4_AGENT_ID" 2>/dev/null || true)
+    aa0=$(pg_agent_count agents "$S4_AGENT_ID" 2>/dev/null || true)
+    as0=$(printf '%s' "$as0" | tr -d '[:space:]')
+    ab0=$(printf '%s' "$ab0" | tr -d '[:space:]')
+    aa0=$(printf '%s' "$aa0" | tr -d '[:space:]')
+    if [[ ! "$as0" =~ ^[0-9]+$ || ! "$ab0" =~ ^[0-9]+$ || ! "$aa0" =~ ^[0-9]+$ ]]; then
+      fail "R.7" "重启前无法按 s4-agent(${S4_AGENT_ID}) 读取 PG 计数"
+      return 1
+    fi
   fi
 
   # panel 共享 hub network namespace；先停 panel，避免 hub 重启时 netns 悬空。
@@ -1679,11 +1774,32 @@ restart_persistence_checks() {
   s1=$(printf '%s' "$s1" | tr -d '[:space:]')
   b1=$(printf '%s' "$b1" | tr -d '[:space:]')
   a1=$(printf '%s' "$a1" | tr -d '[:space:]')
+  if (( scoped == 1 )); then
+    as1=$(pg_agent_count samples "$S4_AGENT_ID" 2>/dev/null || true)
+    ab1=$(pg_agent_count ingest_batches "$S4_AGENT_ID" 2>/dev/null || true)
+    aa1=$(pg_agent_count agents "$S4_AGENT_ID" 2>/dev/null || true)
+    as1=$(printf '%s' "$as1" | tr -d '[:space:]')
+    ab1=$(printf '%s' "$ab1" | tr -d '[:space:]')
+    aa1=$(printf '%s' "$aa1" | tr -d '[:space:]')
+  fi
+
   if [[ "$s1" =~ ^[0-9]+$ && "$b1" =~ ^[0-9]+$ && "$a1" =~ ^[0-9]+$ ]] \
     && (( s1 >= s0 && b1 >= b0 && a1 >= a0 && a1 > 0 )); then
-    pass "R.7" "重启后数据不减少（samples $s0→$s1，ingest_batches $b0→$b1，agents $a0→$a1）"
+    full_ok=1
+  fi
+  if (( scoped == 1 )) \
+    && [[ "$as1" =~ ^[0-9]+$ && "$ab1" =~ ^[0-9]+$ && "$aa1" =~ ^[0-9]+$ ]] \
+    && (( as1 >= as0 && ab1 >= ab0 && as1 > 0 && ab1 > 0 \
+      && aa0 == 1 && aa1 == 1 )); then
+    scoped_ok=1
+  fi
+
+  if (( full_ok == 1 && scoped_ok == 1 )); then
+    pass "R.7" "重启后全表与 s4-agent 数据均不减少（s4-agent=${S4_AGENT_ID} samples ${as0}→${as1}，ingest_batches ${ab0}→${ab1}，agents ${aa0}→${aa1}；全表辅助 samples ${s0}→${s1}，ingest_batches ${b0}→${b1}，agents ${a0}→${a1}）"
+  elif (( scoped == 0 )); then
+    fail "R.7" "S4_AGENT_ID 不可用，无法排除 hub-self 补偿 s4-agent 丢失（全表 samples ${s0}→${s1}，ingest_batches ${b0}→${b1}，agents ${a0}→${a1}）"
   else
-    fail "R.7" "重启后数据减少或 agent 记录丢失（samples $s0→$s1，ingest_batches $b0→$b1，agents $a0→$a1）"
+    fail "R.7" "重启后数据减少或 s4-agent 记录丢失（s4-agent=${S4_AGENT_ID} samples ${as0}→${as1}，ingest_batches ${ab0}→${ab1}，agents ${aa0}→${aa1}；全表辅助 samples ${s0}→${s1}，ingest_batches ${b0}→${b1}，agents ${a0}→${a1}）"
   fi
 
   # agent 在 hub 重启后应能重连；不作为数据断言，但失败会提示。
@@ -2062,6 +2178,7 @@ init_evidence() {
 """v100-docker-pg.sh 的只读解析辅助（仅 Python 标准库）。"""
 
 import json
+import ipaddress
 import os
 import re
 import socket
@@ -2092,35 +2209,86 @@ def as_int(value):
     return int(text) if text.isdigit() else None
 
 
+LOOPBACK_V4 = ipaddress.IPv4Address("127.0.0.1")
+LOOPBACK_V6 = ipaddress.IPv6Address("::1")
+
+
+def normalize_host_ip(host_ip):
+    """把 host_ip 规范化为 'loopback' 或可比较的地址文本；空/缺省留空。"""
+    text = "" if host_ip is None else str(host_ip).strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    if not text:
+        return ""
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        return text.lower()
+    if addr == LOOPBACK_V4 or addr == LOOPBACK_V6:
+        return "loopback"
+    return str(addr)
+
+
+def is_loopback_host(host_ip):
+    return normalize_host_ip(host_ip) == "loopback"
+
+
 def parse_port(port):
     target = None
     published = None
+    host_ip = ""
     if isinstance(port, dict):
         target = as_int(port.get("target"))
         published = port.get("published")
+        # 缺省 host_ip 必须保留为空，不能被当成回环。
+        host_ip = port.get("host_ip")
     else:
         text = str(port).strip()
         if not text:
-            return None, None
+            return None, None, ""
+        if "/" in text:
+            text = text.split("/", 1)[0]
         if text.startswith("["):
             end = text.find("]")
-            rest = text[end + 1:] if end >= 0 else ""
-            parts = [part for part in rest.split(":") if part]
-            if parts:
-                target = as_int(parts[-1])
+            if end < 0:
+                return None, None, ""
+            host_ip = text[1:end]
+            rest = text[end + 1:]
+            if rest.startswith(":"):
+                rest = rest[1:]
+            parts = rest.split(":") if rest else []
             if len(parts) >= 2:
                 published = parts[-2]
+                target = as_int(parts[-1])
+            elif len(parts) == 1:
+                target = as_int(parts[0])
         else:
             parts = text.split(":")
-            if parts:
-                target = as_int(parts[-1])
-            if len(parts) >= 2:
+            if len(parts) >= 3:
+                host_ip = parts[0]
                 published = parts[-2]
-    if published == "" or published is None:
+                target = as_int(parts[-1])
+            elif len(parts) == 2:
+                published = parts[0]
+                target = as_int(parts[1])
+            elif len(parts) == 1:
+                target = as_int(parts[0])
+    if published in ("", None):
         published = None
     else:
         published = str(published)
-    return target, published
+    return target, published, normalize_host_ip(host_ip)
+
+
+def published_includes(published, wanted):
+    expected = str(wanted)
+    if published == expected:
+        return True
+    if "-" in published:
+        start, end = published.split("-", 1)
+        if start.isdigit() and end.isdigit() and int(start) <= wanted <= int(end):
+            return True
+    return False
 
 
 def env_map(service):
@@ -2144,19 +2312,33 @@ def collect_ports(services):
     all_targets = set()
     all_published = set()
     per_service = {}
+    count_8080 = 0
+    nonloopback_8080 = 0
     for name, service in (services or {}).items():
         targets = set()
         published = set()
         for port in (service or {}).get("ports") or []:
-            target, pub = parse_port(port)
+            target, pub, host_ip = parse_port(port)
             if target is not None:
                 targets.add(str(target))
                 all_targets.add(str(target))
             if pub is not None:
                 published.add(pub)
                 all_published.add(pub)
+                if published_includes(pub, 8080):
+                    count_8080 += 1
+                    if host_ip != "loopback":
+                        nonloopback_8080 += 1
         per_service[name] = (targets, published)
-    return all_targets, all_published, per_service
+    loopback_ok = 1 if count_8080 > 0 and nonloopback_8080 == 0 else 0
+    return (
+        all_targets,
+        all_published,
+        per_service,
+        count_8080,
+        nonloopback_8080,
+        loopback_ok,
+    )
 
 
 def command_compose_facts(args):
@@ -2169,7 +2351,14 @@ def command_compose_facts(args):
         die("读取/解析 compose JSON 失败: %s" % exc)
 
     services = data.get("services") or {}
-    all_targets, all_published, per_service = collect_ports(services)
+    (
+        all_targets,
+        all_published,
+        per_service,
+        count_8080,
+        nonloopback_8080,
+        loopback_8080_ok,
+    ) = collect_ports(services)
     hub = services.get("hub") or {}
     postgres = services.get("postgres") or {}
     hub_env = env_map(hub)
@@ -2213,6 +2402,9 @@ def command_compose_facts(args):
     print("panel_published=" + ",".join(sorted(panel_pub)))
     print("all_published_ports=" + ",".join(sorted(all_published)))
     print("all_target_ports=" + ",".join(sorted(all_targets)))
+    print("published_8080_entries=%d" % count_8080)
+    print("published_8080_nonloopback=%d" % nonloopback_8080)
+    print("published_8080_loopback=%d" % loopback_8080_ok)
     print("published_5432=%d" % has_port(all_published, 5432))
     print("published_8444=%d" % has_port(all_published, 8444))
     print("target_5432=%d" % has_port(all_targets, 5432))
@@ -2298,16 +2490,18 @@ def command_agents_check(args):
         die("读取/解析 agents JSON 失败: %s" % exc)
     if not isinstance(data, list):
         die("agents 响应不是 JSON 数组")
-    item = None
-    for candidate in data:
-        if not isinstance(candidate, dict):
-            continue
-        if candidate.get("name") == args[1] or candidate.get("agent_id") == args[1]:
-            item = candidate
-            break
+    matches = [
+        candidate
+        for candidate in data
+        if isinstance(candidate, dict)
+        and (candidate.get("name") == args[1] or candidate.get("agent_id") == args[1])
+    ]
+    item = matches[0] if matches else None
     print("count=%d" % len(data))
+    print("matches=%d" % len(matches))
     print("found=%d" % (1 if item else 0))
     print("status=" + (str(item.get("status") or "") if item else ""))
+    print("agent_id=" + (str(item.get("agent_id") or "") if item else ""))
 
 
 def command_sqlite_check(args):

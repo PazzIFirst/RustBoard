@@ -76,7 +76,7 @@ impl RsaPrivateKey {
 impl CtEq for RsaPrivateKey {
     fn ct_eq(&self, other: &Self) -> Choice {
         self.d.ct_eq(&other.d)
-            & self.iqmp.ct_eq(&self.iqmp)
+            & self.iqmp.ct_eq(&other.iqmp)
             & self.p.ct_eq(&other.p)
             & self.q.ct_eq(&other.q)
     }
@@ -317,5 +317,43 @@ where
 
     fn try_from(keypair: &RsaKeypair) -> Result<pkcs1v15::SigningKey<D>> {
         Ok(pkcs1v15::SigningKey::new(keypair.try_into()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RsaPrivateKey;
+    use crate::Mpint;
+    use ctutils::CtEq;
+
+    fn key(d: u8, iqmp: u8, p: u8, q: u8) -> RsaPrivateKey {
+        RsaPrivateKey::new(
+            Mpint::from_bytes(&[d]).unwrap(),
+            Mpint::from_bytes(&[iqmp]).unwrap(),
+            Mpint::from_bytes(&[p]).unwrap(),
+            Mpint::from_bytes(&[q]).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn eq_compares_iqmp() {
+        let key_a = key(3, 8, 11, 7);
+        let key_b = key(3, 9, 11, 7);
+
+        assert_ne!(key_a.iqmp(), key_b.iqmp());
+        assert_ne!(key_a, key_b);
+        assert_eq!(key_a, key(3, 8, 11, 7));
+        assert!(bool::from(key_a.ct_eq(&key_a)));
+    }
+
+    #[test]
+    fn eq_compares_all_private_components() {
+        let base = key(3, 8, 11, 7);
+
+        assert_ne!(base, key(4, 8, 11, 7));
+        assert_ne!(base, key(3, 9, 11, 7));
+        assert_ne!(base, key(3, 8, 12, 7));
+        assert_ne!(base, key(3, 8, 11, 6));
     }
 }

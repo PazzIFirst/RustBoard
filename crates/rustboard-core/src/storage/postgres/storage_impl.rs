@@ -12,7 +12,7 @@ use anyhow::Result;
 use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, SeriesRow};
 
 use super::PostgresStorage;
-use crate::alerts::{AlertEvent, AlertRule, AlertSilence, AlertState};
+use crate::alerts::{AlertEvaluationOutcome, AlertEvent, AlertRule, AlertSilence, AlertState};
 use crate::archive::{ArchiveObject, ArchiveStatus};
 use crate::channels::NotificationChannel;
 use crate::storage::sqlite::{AlertSeriesSnapshot, ArchiveRawRow};
@@ -289,11 +289,19 @@ impl Storage for PostgresStorage {
     fn apply_alert_evaluation(
         &self,
         rule_id: &str,
+        expected_revision: i64,
         events: &[AlertEvent],
         states: &[AlertState],
         keep_states: usize,
-    ) -> Result<usize> {
-        PostgresStorage::apply_alert_evaluation(self, rule_id, events, states, keep_states)
+    ) -> Result<AlertEvaluationOutcome> {
+        PostgresStorage::apply_alert_evaluation(
+            self,
+            rule_id,
+            expected_revision,
+            events,
+            states,
+            keep_states,
+        )
     }
 
     fn max_alert_event_id(&self) -> Result<i64> {

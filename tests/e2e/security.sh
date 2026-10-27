@@ -8,6 +8,7 @@
 # 依赖：bash 4+、python3（仅标准库）、cargo/rustc（能构建本仓库）。
 # 用法：bash tests/e2e/security.sh
 # 调试：KEEP_E2E_TMP=1 bash tests/e2e/security.sh   # 保留临时目录与日志
+# 脱敏自测：SECURITY_E2E_SELFTEST=1 bash tests/e2e/security.sh
 #
 
 set -euo pipefail
@@ -39,6 +40,54 @@ die() {
   exit 1
 }
 
+# 失败现场日志脱敏：复用 v041.sh 的规则，并额外遮蔽裸 64 位十六进制
+# （agent add 的一次性 token 打印在标题下一行）。只用于 stderr 诊断。
+redact_stream() {
+  sed -E \
+    -e 's/(管理 API token:).*/\1 <redacted>/' \
+    -e 's/(一次性 token[^:：]*[:：]).*/\1 <redacted>/' \
+    -e 's/(Bearer )[^[:space:]]+/\1<redacted>/' \
+    -e 's/^[[:space:]]*[0-9a-f]{64}[[:space:]]*$/  <redacted>/'
+}
+
+dump_log() {
+  local log=$1 lines=${2:-80}
+  if [[ -s "$log" ]]; then
+    echo "---- $(basename "$log") (tail -n $lines) ----" >&2
+    tail -n "$lines" "$log" | redact_stream >&2 || true
+  fi
+}
+
+# 本地假日志自测：不构建、不启动服务，断言脱敏函数不会输出 token。
+if [[ "${SECURITY_E2E_SELFTEST:-0}" == "1" ]]; then
+  selftest_dir="$(mktemp -d "${TMPDIR:-/tmp}/rustboard-security-redact.XXXXXX")"
+  trap 'rm -rf "$selftest_dir"' EXIT
+  admin_token="$(printf 'a%.0s' {1..64})"
+  enroll_token="$(printf 'b%.0s' {1..64})"
+  same_line_token="$(printf 'c%.0s' {1..64})"
+  {
+    echo "管理 API token: $admin_token"
+    echo "一次性 token（15 分钟内有效，仅可使用一次）:"
+    echo "  $enroll_token"
+    echo "一次性 token: $same_line_token"
+    echo "Authorization: Bearer $admin_token"
+    echo "hub ready"
+  } > "$selftest_dir/fake.log"
+  output="$(dump_log "$selftest_dir/fake.log" 80 2>&1)"
+  for secret in "$admin_token" "$enroll_token" "$same_line_token"; do
+    if [[ "$output" == *"$secret"* ]]; then
+      echo "FAIL 脱敏自测：失败输出包含未脱敏 token" >&2
+      exit 1
+    fi
+  done
+  if [[ "$output" != *"<redacted>"* || "$output" != *"hub ready"* ]]; then
+    echo "FAIL 脱敏自测：脱敏标记或普通日志行缺失" >&2
+    exit 1
+  fi
+  echo "PASS 脱敏自测：admin / 一次性 token 均未出现在失败输出"
+  exit 0
+fi
+
 command -v "$PYTHON" >/dev/null 2>&1 || die "找不到 python3（需要 3.8+）"
 command -v "$CARGO" >/dev/null 2>&1 || die "找不到 cargo（请放进 PATH 或设置 CARGO=...）"
 [[ -f "$PROBE" ]] || die "缺少 $PROBE"
@@ -69,10 +118,7 @@ cleanup() {
     echo "===== e2e 失败现场 =====" >&2
     for log in "$HUB_LOG" "$A_LOG" "$B_LOG" "$TMP_DIR/hold1.log" \
                "$TMP_DIR/hold2.log" "$TMP_DIR/hold3.log" "$TMP_DIR/init.log"; do
-      if [[ -s "$log" ]]; then
-        echo "---- $(basename "$log") (tail -n 80) ----" >&2
-        tail -n 80 "$log" >&2 || true
-      fi
+      dump_log "$log" 80
     done
   fi
 
@@ -182,11 +228,19 @@ wait_series() {
 add_agent_token() {
   local name=$1
   local out token
-  out=$("$HUB_BIN" agent add --config "$HUB_CFG" --name "$name") \
-    || die "agent add --name $name 失败"
+  local err="$TMP_DIR/agent-add.err"
+  if ! out=$("$HUB_BIN" agent add --config "$HUB_CFG" --name "$name" 2> "$err"); then
+    printf '%s\n' "$out" | redact_stream >&2 || true
+    dump_log "$err" 80
+    die "agent add --name $name 失败"
+  fi
   token=$(printf '%s\n' "$out" \
     | awk '/一次性 token/{getline; gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit}')
-  [[ "$token" =~ ^[0-9a-f]{64}$ ]] || die "无法从 agent add 输出解析 token: $out"
+  if [[ ! "$token" =~ ^[0-9a-f]{64}$ ]]; then
+    printf '%s\n' "$out" | redact_stream >&2 || true
+    dump_log "$err" 80
+    die "无法从 agent add 输出解析一次性 token（输出已脱敏）"
+  fi
   printf '%s' "$token"
 }
 
@@ -338,7 +392,7 @@ if OUT=$("$PYTHON" "$PROBE" hello \
   pass "[b] 无客户端证书 Hello 被拒：$(printf '%s' "$OUT" | tail -n 1)"
 else
   fail "[b] 无客户端证书 Hello 未被拒绝"
-  printf '%s\n' "$OUT" >&2
+  printf '%s\n' "$OUT" | redact_stream >&2 || true
 fi
 
 echo
@@ -357,7 +411,7 @@ if OUT=$("$PYTHON" "$PROBE" hello \
   fi
 else
   fail "[c] CN 与 Hello agent_id 不一致时未被拒绝"
-  printf '%s\n' "$OUT" >&2
+  printf '%s\n' "$OUT" | redact_stream >&2 || true
 fi
 
 echo
@@ -376,7 +430,7 @@ if OUT=$("$PYTHON" "$PROBE" batch \
   fi
 else
   fail "[d] 伪造 Batch 未被拒绝（可能收到 ACK）"
-  printf '%s\n' "$OUT" >&2
+  printf '%s\n' "$OUT" | redact_stream >&2 || true
 fi
 
 echo
@@ -400,8 +454,8 @@ PIDS+=("$HOLD2_PID")
 
 if ! wait_for_file "$READY1" 10 || ! wait_for_file "$READY2" 10; then
   fail "[g] 两条测试连接未在 10s 内建立"
-  tail -n 20 "$TMP_DIR/hold1.log" >&2 || true
-  tail -n 20 "$TMP_DIR/hold2.log" >&2 || true
+  dump_log "$TMP_DIR/hold1.log" 20
+  dump_log "$TMP_DIR/hold2.log" 20
 else
   # 关闭旧连接
   kill -9 "$HOLD1_PID" 2>/dev/null || true
@@ -434,7 +488,7 @@ if OUT=$("$PYTHON" "$PROBE" hello \
   pass "[h] 协议版本不匹配被拒：$(printf '%s' "$OUT" | tail -n 1)"
 else
   fail "[h] 协议版本不匹配未被拒绝（可能收到了 Welcome）"
-  printf '%s\n' "$OUT" >&2
+  printf '%s\n' "$OUT" | redact_stream >&2 || true
 fi
 
 echo
@@ -451,13 +505,13 @@ PIDS+=("$HOLD3_PID")
 
 if ! wait_for_file "$READY3" 10; then
   fail "[e] 吊销前的测试连接未在 10s 内建立"
-  tail -n 20 "$TMP_DIR/hold3.log" >&2 || true
+  dump_log "$TMP_DIR/hold3.log" 20
 else
   REVOKE_START=$(date +%s%3N)
   if ! "$HUB_BIN" agent revoke --config "$HUB_CFG" --id "$A_ID" \
       > "$TMP_DIR/revoke.log" 2>&1; then
     fail "[e] agent revoke 命令失败"
-    tail -n 20 "$TMP_DIR/revoke.log" >&2 || true
+    dump_log "$TMP_DIR/revoke.log" 20
   else
     HOLD_CLOSED=0
     if wait "$HOLD3_PID" 2>/dev/null; then HOLD_CLOSED=1; fi
@@ -480,8 +534,8 @@ else
       pass "[e] revoke 后 ${ELAPSED}ms 内连接关闭，状态 revoked，重连被拒"
     else
       fail "[e] revoke 后行为不符（closed=$HOLD_CLOSED elapsed=${ELAPSED}ms status_ok=$STATUS_OK reconnect_rejected=$RECONNECT_REJECTED last=$LAST_STATUS）"
-      tail -n 20 "$TMP_DIR/hold3.log" >&2 || true
-      printf '%s\n' "${OUT:-}" >&2 || true
+      dump_log "$TMP_DIR/hold3.log" 20
+      printf '%s\n' "${OUT:-}" | redact_stream >&2 || true
     fi
   fi
 fi

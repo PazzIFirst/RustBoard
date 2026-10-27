@@ -34,30 +34,40 @@
 //! 「渠道引用检查」这类先查后写在并发下也不会被击穿。PG 默认 READ COMMITTED
 //! 没有这层串行化，所以全部**告警配置写操作**（规则、渠道、静默的增删改与
 //! 种子）在事务开头取同一把事务级 advisory lock；热路径
-//! [`PostgresStorage::apply_alert_evaluation`] 不取锁，避免评估每轮阻塞管理
-//! 操作。并发唯一冲突仍由数据库 UNIQUE 约束兜底并翻译成领域错误，不吞错。
+//! [`PostgresStorage::apply_alert_evaluation`] 不取 advisory lock，只对规则行
+//! `SELECT ... FOR UPDATE` 做 revision CAS，避免评估阻塞其它配置操作，同时
+//! 与规则更新 / 删除严格串行。并发唯一冲突仍由数据库 UNIQUE 约束兜底并翻译成
+//! 领域错误，不吞错。
 
 use anyhow::{anyhow, Context, Result};
 use postgres::error::SqlState;
 use postgres::types::ToSql;
-use postgres::{Row, Transaction};
+use postgres::{IsolationLevel, Row, Transaction};
 use rustboard_common::model::Labels;
 
 use super::PostgresStorage;
 use crate::alerts::{
-    AlertEvent, AlertRule, AlertRuleStoreError, AlertSilence, AlertSilenceStoreError, AlertSource,
-    AlertState, AlertStateKind, Comparator, MAX_ALERT_RULES, MAX_ALERT_SILENCES,
+    dedupe_channel_ids, AlertEvaluationOutcome, AlertEvent, AlertRule, AlertRuleStoreError,
+    AlertSilence, AlertSilenceStoreError, AlertSource, AlertState, AlertStateKind, Comparator,
+    MAX_ALERT_RULES, MAX_ALERT_SILENCES,
 };
 use crate::channels::{ChannelConfig, ChannelKind, NotificationChannel};
-use crate::storage::sqlite::{AlertSeriesSnapshot, ChannelStoreError, MAX_NOTIFICATION_CHANNELS};
+use crate::storage::sqlite::{
+    ensure_alert_rule_channels_consistent, AlertSeriesSnapshot, ChannelStoreError,
+    MAX_NOTIFICATION_CHANNELS,
+};
 use crate::storage::AgentSeriesRow;
 
 /// `alert_rules` 的 SELECT 列表；列顺序与 [`alert_rule_from_row`] 一一对应。
+///
+/// `revision` 固定放在列尾，与 SQLite v9 的列顺序一致。
 const ALERT_RULE_COLUMNS: &str = "id, name, enabled, source, metric, comparator, threshold, \
      duration_secs, cooldown_secs, filter_agent_id, filter_labels, channel_ids, \
-     notify_on_resolve, is_builtin, updated_by, created_at, updated_at";
+     notify_on_resolve, is_builtin, updated_by, created_at, updated_at, revision";
 
 /// 新建 / 种子共用的插入语句；`created_at` / `updated_at` 由参数显式给出。
+///
+/// `revision` 不写入：由表默认值 0 起算，只有更新语句递增。
 const ALERT_RULE_INSERT_SQL: &str = "INSERT INTO alert_rules \
      (id, name, enabled, source, metric, comparator, threshold, duration_secs, \
       cooldown_secs, filter_agent_id, filter_labels, channel_ids, notify_on_resolve, \
@@ -65,10 +75,14 @@ const ALERT_RULE_INSERT_SQL: &str = "INSERT INTO alert_rules \
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)";
 
 /// 更新语句只覆盖可写字段：`id` 定位，`is_builtin` / `created_at` 保持原值。
+///
+/// `revision = revision + 1` 是 CAS 版本号的唯一产生点；调用方传入的
+/// `rule.revision` 不参与写入，避免业务层伪造版本。
 const ALERT_RULE_UPDATE_SQL: &str = "UPDATE alert_rules SET name = $2, enabled = $3, \
      source = $4, metric = $5, comparator = $6, threshold = $7, duration_secs = $8, \
      cooldown_secs = $9, filter_agent_id = $10, filter_labels = $11, channel_ids = $12, \
-     notify_on_resolve = $13, updated_by = $14, updated_at = $15 WHERE id = $1";
+     notify_on_resolve = $13, updated_by = $14, updated_at = $15, \
+     revision = revision + 1 WHERE id = $1";
 
 /// `alert_states` 的 SELECT 列表；列顺序与 [`alert_state_from_row`] 一一对应。
 const ALERT_STATE_COLUMNS: &str =
@@ -162,9 +176,11 @@ impl PostgresStorage {
                     // 可能已被用户改过阈值 / 启停 / 名称：种子绝不覆盖。
                     continue;
                 }
+                validate_alert_rule_channels_in_tx(&mut tx, &rule.channel_ids)?;
                 let filter_labels = serde_json::to_string(&rule.filter_labels)
                     .context("序列化内置规则 filter_labels 失败")?;
-                let channel_ids = serde_json::to_string(&rule.channel_ids)
+                let channel_ids = dedupe_channel_ids(&rule.channel_ids);
+                let channel_ids_json = serde_json::to_string(&channel_ids)
                     .context("序列化内置规则 channel_ids 失败")?;
                 let source = rule.source.as_str();
                 let comparator = rule.comparator.as_str();
@@ -184,7 +200,7 @@ impl PostgresStorage {
                         &cooldown_secs,
                         &rule.filter_agent_id,
                         &filter_labels,
-                        &channel_ids,
+                        &channel_ids_json,
                         &rule.notify_on_resolve,
                         &rule.is_builtin,
                         &rule.updated_by,
@@ -194,6 +210,7 @@ impl PostgresStorage {
                 ) {
                     return Err(map_seed_alert_rule_error(err, &rule.id));
                 }
+                replace_alert_rule_channels_in_tx(&mut tx, &rule.id, &channel_ids)?;
                 inserted += 1;
             }
             tx.commit()
@@ -204,28 +221,74 @@ impl PostgresStorage {
     }
 
     /// 按 id 读取一条规则；不存在返回 `None`。
+    ///
+    /// 读取时校验关系表与 JSON `channel_ids` 一致；不一致说明数据库被外部修改，
+    /// fail closed 返回错误而不是输出错误配置。
     pub fn get_alert_rule(&self, id: &str) -> Result<Option<AlertRule>> {
         self.with_client(|client| {
+            // REPEATABLE READ 让规则行与关系行来自同一快照；READ COMMITTED 下
+            // 两条 SELECT 之间若有 update 提交，会读到“新行 + 旧关系”而误报。
+            let mut tx = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()
+                .context("开启 get_alert_rule 只读事务失败")?;
             let sql = format!("SELECT {ALERT_RULE_COLUMNS} FROM alert_rules WHERE id = $1");
-            let row = client
+            let row = tx
                 .query_opt(&sql, &[&id])
                 .context("执行 get_alert_rule SQL 失败")?;
-            row.as_ref().map(alert_rule_from_row).transpose()
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let rule = alert_rule_from_row(&row)?;
+            let relation = load_alert_rule_channel_ids(&mut tx, &rule.id)?;
+            ensure_alert_rule_channels_consistent(&rule, &relation)?;
+            tx.commit().context("提交 get_alert_rule 只读事务失败")?;
+            Ok(Some(rule))
         })
         .context("get_alert_rule")
     }
 
     /// 列出全部规则：内置在前，同组按名称升序。
+    ///
+    /// 与 [`Self::get_alert_rule`] 相同，逐条校验关系表与 JSON 一致；两条查询在
+    /// 同一个 REPEATABLE READ 只读事务内，避免并发更新时误报不一致。
     pub fn list_alert_rules(&self) -> Result<Vec<AlertRule>> {
         self.with_client(|client| {
+            let mut tx = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()
+                .context("开启 list_alert_rules 只读事务失败")?;
             let sql = format!(
                 "SELECT {ALERT_RULE_COLUMNS} FROM alert_rules \
                  ORDER BY is_builtin DESC, name COLLATE \"C\" ASC"
             );
-            let rows = client
+            let rows = tx
                 .query(&sql, &[])
                 .context("执行 list_alert_rules SQL 失败")?;
-            rows.iter().map(alert_rule_from_row).collect()
+            let rules = rows
+                .iter()
+                .map(alert_rule_from_row)
+                .collect::<Result<Vec<_>>>()?;
+            let relation_rows = tx
+                .query("SELECT rule_id, channel_id FROM alert_rule_channels", &[])
+                .context("读取全部告警规则渠道关系失败")?;
+            let mut relation_map: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for row in relation_rows {
+                let rule_id: String = row.get(0);
+                let channel_id: String = row.get(1);
+                relation_map.entry(rule_id).or_default().push(channel_id);
+            }
+            for rule in &rules {
+                let relation = relation_map.get(&rule.id).cloned().unwrap_or_default();
+                ensure_alert_rule_channels_consistent(rule, &relation)?;
+            }
+            tx.commit().context("提交 list_alert_rules 只读事务失败")?;
+            Ok(rules)
         })
         .context("list_alert_rules")
     }
@@ -244,17 +307,19 @@ impl PostgresStorage {
 
     /// 新建一条规则。
     ///
-    /// 事务内先查重再写入，把两种失败翻译成领域错误：
+    /// 事务内先查重、再校验渠道、最后写规则 + 关系行；领域错误：
     /// - 总数（含内置）达到 [`MAX_ALERT_RULES`] → [`AlertRuleStoreError::LimitReached`]；
-    /// - 名称重复 → [`AlertRuleStoreError::NameExists`]（并发下仍由 UNIQUE 兜底）。
+    /// - 名称重复 → [`AlertRuleStoreError::NameExists`]（并发下仍由 UNIQUE 兜底）；
+    /// - 渠道不存在 / 已禁用 → `ChannelNotFound` / `ChannelDisabled`，整体回滚。
     ///
     /// 事务开头取配置 advisory lock，使「查总数 + 插入」在并发下与 SQLite 的
     /// `BEGIN IMMEDIATE` 语义一致。
     pub fn create_alert_rule(&self, rule: &AlertRule) -> Result<()> {
         let filter_labels =
             serde_json::to_string(&rule.filter_labels).context("序列化 filter_labels 失败")?;
-        let channel_ids =
-            serde_json::to_string(&rule.channel_ids).context("序列化 channel_ids 失败")?;
+        let channel_ids = dedupe_channel_ids(&rule.channel_ids);
+        let channel_ids_json =
+            serde_json::to_string(&channel_ids).context("序列化 channel_ids 失败")?;
         let source = rule.source.as_str();
         let comparator = rule.comparator.as_str();
         let duration_secs = i64::from(rule.duration_secs);
@@ -278,6 +343,7 @@ impl PostgresStorage {
             if name_exists {
                 return Err(AlertRuleStoreError::NameExists.into());
             }
+            validate_alert_rule_channels_in_tx(&mut tx, &channel_ids)?;
             if let Err(err) = tx.execute(
                 ALERT_RULE_INSERT_SQL,
                 &[
@@ -292,7 +358,7 @@ impl PostgresStorage {
                     &cooldown_secs,
                     &rule.filter_agent_id,
                     &filter_labels,
-                    &channel_ids,
+                    &channel_ids_json,
                     &rule.notify_on_resolve,
                     &rule.is_builtin,
                     &rule.updated_by,
@@ -302,6 +368,7 @@ impl PostgresStorage {
             ) {
                 return Err(map_alert_rule_write_error(err));
             }
+            replace_alert_rule_channels_in_tx(&mut tx, &rule.id, &channel_ids)?;
             tx.commit().context("提交 create_alert_rule 事务失败")?;
             Ok(())
         })
@@ -325,8 +392,9 @@ impl PostgresStorage {
     fn update_alert_rule_inner(&self, rule: &AlertRule, clear_states: bool) -> Result<()> {
         let filter_labels =
             serde_json::to_string(&rule.filter_labels).context("序列化 filter_labels 失败")?;
-        let channel_ids =
-            serde_json::to_string(&rule.channel_ids).context("序列化 channel_ids 失败")?;
+        let channel_ids = dedupe_channel_ids(&rule.channel_ids);
+        let channel_ids_json =
+            serde_json::to_string(&channel_ids).context("序列化 channel_ids 失败")?;
         let source = rule.source.as_str();
         let comparator = rule.comparator.as_str();
         let duration_secs = i64::from(rule.duration_secs);
@@ -353,6 +421,7 @@ impl PostgresStorage {
             if name_exists {
                 return Err(AlertRuleStoreError::NameExists.into());
             }
+            validate_alert_rule_channels_in_tx(&mut tx, &channel_ids)?;
             if let Err(err) = tx.execute(
                 ALERT_RULE_UPDATE_SQL,
                 &[
@@ -367,7 +436,7 @@ impl PostgresStorage {
                     &cooldown_secs,
                     &rule.filter_agent_id,
                     &filter_labels,
-                    &channel_ids,
+                    &channel_ids_json,
                     &rule.notify_on_resolve,
                     &rule.updated_by,
                     &rule.updated_at,
@@ -375,6 +444,7 @@ impl PostgresStorage {
             ) {
                 return Err(map_alert_rule_write_error(err));
             }
+            replace_alert_rule_channels_in_tx(&mut tx, &rule.id, &channel_ids)?;
             if clear_states {
                 tx.execute("DELETE FROM alert_states WHERE rule_id = $1", &[&rule.id])
                     .context("清理告警规则状态失败")?;
@@ -899,24 +969,46 @@ impl PostgresStorage {
         .context("apply_alert_transitions")
     }
 
-    /// 引擎单规则落库：事件 + 状态 + 每规则状态上限清理在同一事务内完成，
-    /// 返回本事务淘汰的状态行数。
+    /// 引擎单规则落库：事件 + 状态 + 每规则状态上限清理在同一事务内完成。
+    ///
+    /// 事务内 `SELECT ... FOR UPDATE` 规则行后做 CAS：规则不存在、已禁用或
+    /// `revision != expected_revision` 返回 [`AlertEvaluationOutcome::Stale`]，
+    /// 不写事件 / 状态、也不 prune。行锁与规则更新 / 删除互斥，防止旧评估在
+    /// 禁用并清空状态之后把状态写回。
     pub fn apply_alert_evaluation(
         &self,
         rule_id: &str,
+        expected_revision: i64,
         events: &[AlertEvent],
         states: &[AlertState],
         keep_states: usize,
-    ) -> Result<usize> {
+    ) -> Result<AlertEvaluationOutcome> {
         self.with_client(|client| {
             let mut tx = client
                 .transaction()
                 .context("开启 apply_alert_evaluation 事务失败")?;
+            // `FOR UPDATE` 锁住规则行：规则更新 / 删除必须等评估事务提交。
+            // 若本事务后拿到锁，读到的是已递增的 revision 或 enabled=false，
+            // 直接 Stale；不会在“禁用并清空状态”之后把旧状态写回来。
+            let current = tx
+                .query_opt(
+                    "SELECT enabled, revision FROM alert_rules WHERE id = $1 FOR UPDATE",
+                    &[&rule_id],
+                )
+                .context("读取告警规则启用状态与 revision 失败")?;
+            let Some(row) = current else {
+                return Ok(AlertEvaluationOutcome::Stale);
+            };
+            let enabled: bool = row.get(0);
+            let revision: i64 = row.get(1);
+            if !enabled || revision != expected_revision {
+                return Ok(AlertEvaluationOutcome::Stale);
+            }
             insert_alert_transitions(&mut tx, events, states)?;
             let removed = prune_alert_states_for_rule_in_tx(&mut tx, rule_id, keep_states)?;
             tx.commit()
                 .context("提交 apply_alert_evaluation 事务失败")?;
-            Ok(removed)
+            Ok(AlertEvaluationOutcome::Applied { removed })
         })
         .context("apply_alert_evaluation")
     }
@@ -1228,21 +1320,17 @@ impl PostgresStorage {
             if !exists {
                 return Err(ChannelStoreError::NotFound.into());
             }
-            let rows = tx
-                .query("SELECT id, channel_ids FROM alert_rules", &[])
-                .context("读取告警规则渠道引用失败")?;
-            for row in &rows {
-                let rule_id: String = row.get(0);
-                let channel_ids: String = row.get(1);
-                let ids: Vec<String> = serde_json::from_str(&channel_ids).with_context(|| {
-                    format!("告警规则 {rule_id} 的 channel_ids 损坏，拒绝删除渠道")
-                })?;
-                if ids.iter().any(|channel_id| channel_id == id) {
+            // 引用检查完全交给 `alert_rule_channels.channel_id` 的
+            // `ON DELETE RESTRICT`：检查与 DELETE 是同一条语句，且本事务持有
+            // 配置 advisory lock，与规则写入互斥，不存在先查 JSON 再删的竞态。
+            // 外键失败只按 SQLSTATE 23503 判定，不依赖自动生成的约束名。
+            if let Err(err) = tx.execute("DELETE FROM notification_channels WHERE id = $1", &[&id])
+            {
+                if is_foreign_key_violation(&err) {
                     return Err(ChannelStoreError::InUse.into());
                 }
+                return Err(err).context("删除通知渠道失败");
             }
-            tx.execute("DELETE FROM notification_channels WHERE id = $1", &[&id])
-                .context("删除通知渠道失败")?;
             tx.commit()
                 .context("提交 delete_notification_channel 事务失败")?;
             Ok(())
@@ -1259,6 +1347,73 @@ fn lock_alert_config(tx: &mut Transaction<'_>) -> Result<()> {
     )
     .context("获取告警配置 advisory lock 失败")?;
     Ok(())
+}
+
+/// PG 外键约束冲突判定。
+///
+/// 只按 SQLSTATE `23503`（foreign_key_violation）判断。两个外键由 PostgreSQL
+/// 自动命名，且 schema 将来可能改名，因此**不能**匹配 `db.constraint()`。
+fn is_foreign_key_violation(err: &postgres::Error) -> bool {
+    err.as_db_error()
+        .is_some_and(|db| db.code() == &SqlState::FOREIGN_KEY_VIOLATION)
+}
+
+/// 在规则写事务内复核每个 `channel_id` 都存在且启用。
+fn validate_alert_rule_channels_in_tx(
+    tx: &mut Transaction<'_>,
+    channel_ids: &[String],
+) -> Result<()> {
+    for channel_id in dedupe_channel_ids(channel_ids) {
+        let enabled = tx
+            .query_opt(
+                "SELECT enabled FROM notification_channels WHERE id = $1",
+                &[&channel_id],
+            )
+            .context("检查告警规则引用的通知渠道是否存在失败")?
+            .map(|row| row.get::<_, bool>(0));
+        match enabled {
+            None => return Err(AlertRuleStoreError::ChannelNotFound.into()),
+            Some(false) => return Err(AlertRuleStoreError::ChannelDisabled.into()),
+            Some(true) => {}
+        }
+    }
+    Ok(())
+}
+
+/// 用给定的渠道列表整体替换规则的关系行（与 JSON 写入同一事务）。
+fn replace_alert_rule_channels_in_tx(
+    tx: &mut Transaction<'_>,
+    rule_id: &str,
+    channel_ids: &[String],
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM alert_rule_channels WHERE rule_id = $1",
+        &[&rule_id],
+    )
+    .context("清理告警规则渠道关系失败")?;
+    for channel_id in dedupe_channel_ids(channel_ids) {
+        if let Err(err) = tx.execute(
+            "INSERT INTO alert_rule_channels (rule_id, channel_id) VALUES ($1, $2)",
+            &[&rule_id, &channel_id],
+        ) {
+            if is_foreign_key_violation(&err) {
+                return Err(AlertRuleStoreError::ChannelNotFound.into());
+            }
+            return Err(err).context("写入告警规则渠道关系失败");
+        }
+    }
+    Ok(())
+}
+
+/// 读取一条规则的关系行；顺序不保证，调用方按集合比较。
+fn load_alert_rule_channel_ids(tx: &mut Transaction<'_>, rule_id: &str) -> Result<Vec<String>> {
+    let rows = tx
+        .query(
+            "SELECT channel_id FROM alert_rule_channels WHERE rule_id = $1",
+            &[&rule_id],
+        )
+        .context("读取告警规则渠道关系失败")?;
+    Ok(rows.iter().map(|row| row.get(0)).collect())
 }
 
 /// PG 唯一约束冲突是否由指定约束触发。
@@ -1343,6 +1498,7 @@ fn alert_rule_from_row(row: &Row) -> Result<AlertRule> {
         updated_by: row.get(14),
         created_at: row.get(15),
         updated_at: row.get(16),
+        revision: row.get(17),
     })
 }
 
@@ -1674,6 +1830,7 @@ mod tests {
             updated_by: "tester".to_string(),
             created_at: 1_000,
             updated_at: 2_000,
+            revision: 0,
         }
     }
 
@@ -1795,6 +1952,7 @@ mod tests {
         assert!(reloaded.enabled, "seed 不得覆盖用户启停");
         assert_eq!(reloaded.threshold, 42.5);
         assert_eq!(reloaded.updated_at, now + 1);
+        assert_eq!(reloaded.revision, 1, "更新规则必须递增 revision");
 
         let offline = storage
             .get_alert_rule(BUILTIN_AGENT_OFFLINE)
@@ -1861,6 +2019,9 @@ mod tests {
             return;
         };
         let storage = db.open();
+        storage
+            .create_notification_channel(&channel("chan-a", "渠道 A"))
+            .unwrap();
         let mut rule = custom_rule("rule-1", "自定义规则");
         rule.enabled = true;
         rule.notify_on_resolve = false;
@@ -1949,6 +2110,7 @@ mod tests {
         assert!(!after.enabled);
         assert_eq!(after.created_at, loaded.created_at);
         assert_eq!(after.is_builtin, loaded.is_builtin);
+        assert_eq!(after.revision, 1, "update_alert_rule 必须递增 revision");
 
         storage
             .upsert_alert_state(&state(
@@ -1969,6 +2131,421 @@ mod tests {
             .get_alert_state("rule-1", "agent-1", "cpu{host=a}")
             .unwrap()
             .is_none());
+    }
+
+    /// #69：CAS 只按事务内读到的 enabled / revision 放行；禁用 / 删除后旧评估 Stale。
+    #[test]
+    fn v9_apply_alert_evaluation_rejects_stale_and_disabled_rules() {
+        const NAME: &str = "v9_apply_alert_evaluation_rejects_stale_and_disabled_rules";
+        let Some(db) = TestPg::create("cas") else {
+            skip(NAME);
+            return;
+        };
+        let storage = db.open();
+        storage
+            .create_alert_rule(&custom_rule("cas-rule", "CAS 规则"))
+            .unwrap();
+        let preserved = state(
+            "cas-rule",
+            "agent-keep",
+            "keep",
+            AlertStateKind::Firing,
+            4_000,
+            4_000,
+            Some(90.0),
+        );
+        storage.upsert_alert_state(&preserved).unwrap();
+
+        let evaluation_event = event(
+            5_000,
+            "cas-rule",
+            AlertStateKind::Firing,
+            false,
+            false,
+            "触发",
+        );
+        let evaluation_state = state(
+            "cas-rule",
+            "agent-1",
+            "series-1",
+            AlertStateKind::Firing,
+            5_000,
+            5_000,
+            Some(95.0),
+        );
+
+        // revision 不匹配：不写事件 / 状态，也不 prune（keep_states=0 也不得删既有行）。
+        assert_eq!(
+            storage
+                .apply_alert_evaluation(
+                    "cas-rule",
+                    1,
+                    std::slice::from_ref(&evaluation_event),
+                    std::slice::from_ref(&evaluation_state),
+                    0,
+                )
+                .unwrap(),
+            AlertEvaluationOutcome::Stale
+        );
+        assert!(storage.list_alert_events(10, None).unwrap().is_empty());
+        assert_eq!(
+            storage.list_alert_states().unwrap(),
+            vec![preserved],
+            "Stale 不得 prune 已有状态，也不得写入新状态"
+        );
+
+        // 禁用 + 清空（API 路径），revision 递增到 1；旧 revision 0 必须 Stale。
+        let mut disabled = storage.get_alert_rule("cas-rule").unwrap().unwrap();
+        disabled.enabled = false;
+        disabled.updated_at = 6_000;
+        storage
+            .update_alert_rule_and_clear_states(&disabled)
+            .unwrap();
+        assert_eq!(
+            storage
+                .apply_alert_evaluation(
+                    "cas-rule",
+                    0,
+                    std::slice::from_ref(&evaluation_event),
+                    std::slice::from_ref(&evaluation_state),
+                    10,
+                )
+                .unwrap(),
+            AlertEvaluationOutcome::Stale
+        );
+        assert!(storage.list_alert_states().unwrap().is_empty());
+        assert!(storage.list_alert_events(10, None).unwrap().is_empty());
+
+        // 删除规则后同样 Stale。
+        storage
+            .delete_alert_rule_and_clear_states("cas-rule")
+            .unwrap();
+        assert_eq!(
+            storage
+                .apply_alert_evaluation(
+                    "cas-rule",
+                    1,
+                    &[evaluation_event],
+                    &[evaluation_state],
+                    10,
+                )
+                .unwrap(),
+            AlertEvaluationOutcome::Stale
+        );
+        assert!(storage.list_alert_events(10, None).unwrap().is_empty());
+    }
+
+    /// #70：PG 关系行写入 / 替换 / FK RESTRICT / 级联删除，且不依赖自动约束名。
+    #[test]
+    fn v9_rule_channels_relation_and_fk_restrict() {
+        const NAME: &str = "v9_rule_channels_relation_and_fk_restrict";
+        let Some(db) = TestPg::create("relations") else {
+            skip(NAME);
+            return;
+        };
+        let storage = db.open();
+        storage
+            .create_notification_channel(&channel("chan-a", "渠道 A"))
+            .unwrap();
+        storage
+            .create_notification_channel(&channel("chan-b", "渠道 B"))
+            .unwrap();
+
+        let mut rule = custom_rule("relation-rule", "关系规则");
+        rule.channel_ids = vec!["chan-b".to_string(), "chan-a".to_string()];
+        storage.create_alert_rule(&rule).unwrap();
+        let relation = |storage: &PostgresStorage| -> Vec<String> {
+            storage
+                .with_client(|client| {
+                    let rows = client.query(
+                        "SELECT channel_id FROM alert_rule_channels \
+                         WHERE rule_id = $1 ORDER BY channel_id",
+                        &[&"relation-rule"],
+                    )?;
+                    Ok(rows.iter().map(|row| row.get(0)).collect())
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            relation(&storage),
+            vec!["chan-a".to_string(), "chan-b".to_string()]
+        );
+
+        // 直接 FK INSERT 失败（不经过 create/update 的前置校验），并确认
+        // SQLSTATE 23503，而不是依赖自动生成的约束名。
+        storage
+            .with_client(|client| {
+                let err = client
+                    .execute(
+                        "INSERT INTO alert_rule_channels (rule_id, channel_id) \
+                         VALUES ($1, 'missing-channel')",
+                        &[&"relation-rule"],
+                    )
+                    .unwrap_err();
+                assert_eq!(
+                    err.code(),
+                    Some(&SqlState::FOREIGN_KEY_VIOLATION),
+                    "缺 channel 必须 FK 失败: {err:?}"
+                );
+                let err = client
+                    .execute(
+                        "INSERT INTO alert_rule_channels (rule_id, channel_id) \
+                         VALUES ('missing-rule', $1)",
+                        &[&"chan-a"],
+                    )
+                    .unwrap_err();
+                assert_eq!(
+                    err.code(),
+                    Some(&SqlState::FOREIGN_KEY_VIOLATION),
+                    "缺 rule 必须 FK 失败: {err:?}"
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        // 更新为只引用 chan-a：旧关系行被替换。
+        let mut updated = storage.get_alert_rule("relation-rule").unwrap().unwrap();
+        updated.channel_ids = vec!["chan-a".to_string()];
+        updated.updated_at = 3_000;
+        storage.update_alert_rule(&updated).unwrap();
+        assert_eq!(relation(&storage), vec!["chan-a".to_string()]);
+
+        // 渠道仍被引用：DELETE 由 FK RESTRICT 阻止并映射 InUse。
+        assert_eq!(
+            storage
+                .delete_notification_channel("chan-a")
+                .unwrap_err()
+                .downcast_ref::<ChannelStoreError>(),
+            Some(&ChannelStoreError::InUse)
+        );
+
+        // 即使 JSON 被外部改成空，也要由关系表 FK 阻止（不是只扫描 JSON）；
+        // 读取路径必须 fail closed，不能把不一致的配置当真实数据输出。
+        storage
+            .with_client(|client| {
+                client
+                    .execute(
+                        "UPDATE alert_rules SET channel_ids = '[]' WHERE id = $1",
+                        &[&"relation-rule"],
+                    )
+                    .context("篡改 JSON channel_ids 失败")?;
+                Ok(())
+            })
+            .unwrap();
+        let err = storage.get_alert_rule("relation-rule").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("不一致"),
+            "关系表与 JSON 不一致必须 fail closed: {err:#}"
+        );
+        assert_eq!(
+            storage
+                .delete_notification_channel("chan-a")
+                .unwrap_err()
+                .downcast_ref::<ChannelStoreError>(),
+            Some(&ChannelStoreError::InUse)
+        );
+
+        // 删除关系行后渠道可删；删除规则时关系行级联清理。
+        storage
+            .with_client(|client| {
+                client
+                    .execute(
+                        "DELETE FROM alert_rule_channels WHERE rule_id = $1",
+                        &[&"relation-rule"],
+                    )
+                    .context("删除关系行失败")?;
+                Ok(())
+            })
+            .unwrap();
+        storage.delete_notification_channel("chan-a").unwrap();
+        // 反方向交错：渠道先被删除后，再创建引用它的规则必须明确失败。
+        let mut late = custom_rule("late-rule", "迟到规则");
+        late.channel_ids = vec!["chan-a".to_string()];
+        assert_eq!(
+            storage
+                .create_alert_rule(&late)
+                .unwrap_err()
+                .downcast_ref::<AlertRuleStoreError>(),
+            Some(&AlertRuleStoreError::ChannelNotFound)
+        );
+        assert!(storage.get_alert_rule("late-rule").unwrap().is_none());
+        storage.delete_alert_rule("relation-rule").unwrap();
+        storage.delete_notification_channel("chan-b").unwrap();
+    }
+
+    /// #70：不存在的渠道在规则 create / update 事务内被拒绝并整体回滚。
+    #[test]
+    fn v9_rule_channel_must_exist_and_failure_rolls_back() {
+        const NAME: &str = "v9_rule_channel_must_exist_and_failure_rolls_back";
+        let Some(db) = TestPg::create("missing_channel") else {
+            skip(NAME);
+            return;
+        };
+        let storage = db.open();
+        storage
+            .create_notification_channel(&channel("chan-ok", "有效渠道"))
+            .unwrap();
+        let mut disabled_channel = channel("chan-off", "禁用渠道");
+        disabled_channel.enabled = false;
+        storage
+            .create_notification_channel(&disabled_channel)
+            .unwrap();
+
+        let mut bad = custom_rule("bad-rule", "坏渠道");
+        bad.channel_ids = vec!["does-not-exist".to_string()];
+        assert_eq!(
+            storage
+                .create_alert_rule(&bad)
+                .unwrap_err()
+                .downcast_ref::<AlertRuleStoreError>(),
+            Some(&AlertRuleStoreError::ChannelNotFound)
+        );
+        assert_eq!(storage.alert_rule_count().unwrap(), 0);
+
+        let mut disabled_ref = custom_rule("disabled-rule", "禁用渠道规则");
+        disabled_ref.channel_ids = vec!["chan-off".to_string()];
+        assert_eq!(
+            storage
+                .create_alert_rule(&disabled_ref)
+                .unwrap_err()
+                .downcast_ref::<AlertRuleStoreError>(),
+            Some(&AlertRuleStoreError::ChannelDisabled)
+        );
+        assert_eq!(storage.alert_rule_count().unwrap(), 0);
+
+        let mut rule = custom_rule("update-rule", "更新坏渠道");
+        rule.channel_ids = vec!["chan-ok".to_string()];
+        storage.create_alert_rule(&rule).unwrap();
+        let mut updated = storage.get_alert_rule("update-rule").unwrap().unwrap();
+        updated.channel_ids = vec!["does-not-exist".to_string()];
+        updated.updated_at = 3_000;
+        assert_eq!(
+            storage
+                .update_alert_rule(&updated)
+                .unwrap_err()
+                .downcast_ref::<AlertRuleStoreError>(),
+            Some(&AlertRuleStoreError::ChannelNotFound)
+        );
+        let stored = storage.get_alert_rule("update-rule").unwrap().unwrap();
+        assert_eq!(stored.channel_ids, vec!["chan-ok".to_string()]);
+    }
+
+    /// #70 并发：删除渠道与创建引用它的规则串行化，至少一方失败且无 dangling。
+    #[test]
+    fn v9_concurrent_delete_channel_and_create_rule_never_dangle() {
+        const NAME: &str = "v9_concurrent_delete_channel_and_create_rule_never_dangle";
+        let Some(db) = TestPg::create("channel_race") else {
+            skip(NAME);
+            return;
+        };
+        let storage = std::sync::Arc::new(db.open());
+        let base = std::sync::Arc::new(std::sync::Barrier::new(2));
+        for index in 0..10 {
+            let channel_id = format!("race-chan-{index}");
+            let rule_id = format!("race-rule-{index}");
+            storage
+                .create_notification_channel(&channel(&channel_id, &format!("竞态渠道 {index}")))
+                .unwrap();
+            let mut rule = custom_rule(&rule_id, &format!("竞态规则 {index}"));
+            rule.channel_ids = vec![channel_id.clone()];
+
+            let barrier = std::sync::Arc::clone(&base);
+            let create_storage = std::sync::Arc::clone(&storage);
+            let create_rule = rule.clone();
+            let creator = std::thread::spawn(move || {
+                barrier.wait();
+                create_storage.create_alert_rule(&create_rule)
+            });
+            let barrier = std::sync::Arc::clone(&base);
+            let delete_storage = std::sync::Arc::clone(&storage);
+            let delete_id = channel_id.clone();
+            let deleter = std::thread::spawn(move || {
+                barrier.wait();
+                delete_storage.delete_notification_channel(&delete_id)
+            });
+
+            let created = creator.join().unwrap();
+            let deleted = deleter.join().unwrap();
+            match (&created, &deleted) {
+                (Ok(()), Err(err)) => assert_eq!(
+                    err.downcast_ref::<ChannelStoreError>(),
+                    Some(&ChannelStoreError::InUse),
+                    "iteration {index}: 创建成功后删除必须 InUse"
+                ),
+                (Err(err), Ok(())) => assert_eq!(
+                    err.downcast_ref::<AlertRuleStoreError>(),
+                    Some(&AlertRuleStoreError::ChannelNotFound),
+                    "iteration {index}: 渠道先删后创建必须 ChannelNotFound"
+                ),
+                (Ok(()), Ok(())) => panic!("iteration {index}: 两边都成功会留下 dangling"),
+                (Err(create_err), Err(delete_err)) => panic!(
+                    "iteration {index}: 两边都失败（create={create_err:#}, delete={delete_err:#}）"
+                ),
+            }
+            let rule_exists = storage.get_alert_rule(&rule_id).unwrap().is_some();
+            let channel_exists = storage
+                .get_notification_channel(&channel_id)
+                .unwrap()
+                .is_some();
+            if rule_exists {
+                assert!(channel_exists, "规则存在时渠道不能被删掉（dangling）");
+            }
+        }
+    }
+
+    /// #70 读一致性：PG 规则行 + 关系行在 REPEATABLE READ 事务内读取，
+    /// 并发 update 期间不能读到“新 JSON + 旧关系”而误报 500。
+    #[test]
+    fn v9_rule_read_snapshot_survives_concurrent_channel_update() {
+        const NAME: &str = "v9_rule_read_snapshot_survives_concurrent_channel_update";
+        let Some(db) = TestPg::create("rule_read_snapshot") else {
+            skip(NAME);
+            return;
+        };
+        let storage = std::sync::Arc::new(db.open());
+        storage
+            .create_notification_channel(&channel("snapshot-a", "快照渠道 A"))
+            .unwrap();
+        storage
+            .create_notification_channel(&channel("snapshot-b", "快照渠道 B"))
+            .unwrap();
+        let mut rule = custom_rule("snapshot-rule", "快照规则");
+        rule.channel_ids = vec!["snapshot-a".to_string()];
+        storage.create_alert_rule(&rule).unwrap();
+
+        let update_storage = std::sync::Arc::clone(&storage);
+        let updater = std::thread::spawn(move || {
+            for index in 0..50 {
+                let mut current = update_storage
+                    .get_alert_rule("snapshot-rule")
+                    .unwrap()
+                    .unwrap();
+                current.channel_ids = if index % 2 == 0 {
+                    vec!["snapshot-b".to_string()]
+                } else {
+                    vec!["snapshot-a".to_string()]
+                };
+                current.updated_at += 1;
+                update_storage.update_alert_rule(&current).unwrap();
+            }
+        });
+
+        for _ in 0..100 {
+            let current = storage
+                .get_alert_rule("snapshot-rule")
+                .expect("并发更新期间读取不得因快照撕裂而失败")
+                .unwrap();
+            assert!(
+                current.channel_ids == vec!["snapshot-a".to_string()]
+                    || current.channel_ids == vec!["snapshot-b".to_string()],
+                "读到半更新渠道列表: {:?}",
+                current.channel_ids
+            );
+            assert_eq!(storage.list_alert_rules().unwrap().len(), 1);
+        }
+        updater.join().unwrap();
+        let final_rule = storage.get_alert_rule("snapshot-rule").unwrap().unwrap();
+        assert_eq!(final_rule.channel_ids, vec!["snapshot-a".to_string()]);
     }
 
     #[test]
@@ -2140,9 +2717,9 @@ mod tests {
         ];
         assert_eq!(
             storage
-                .apply_alert_evaluation(rule, &events, &states, 2)
+                .apply_alert_evaluation(rule, 0, &events, &states, 2)
                 .unwrap(),
-            3
+            AlertEvaluationOutcome::Applied { removed: 3 }
         );
         let kept = storage.list_alert_states_for_rule(rule, 10).unwrap();
         assert_eq!(kept.len(), 2);
@@ -2495,6 +3072,10 @@ mod tests {
 
         let channel_two = channel("chan-2", "渠道二");
         storage.create_notification_channel(&channel_two).unwrap();
+        // 规则必须在渠道仍启用时创建；之后再禁用渠道（规则已存在不失效）。
+        let mut rule = custom_rule("rule-chan", "引用渠道");
+        rule.channel_ids = vec!["chan-1".to_string()];
+        storage.create_alert_rule(&rule).unwrap();
         let mut renamed = loaded.clone();
         renamed.name = "渠道二".to_string();
         let err = storage.update_notification_channel(&renamed).unwrap_err();
@@ -2526,9 +3107,6 @@ mod tests {
             Some(&ChannelStoreError::Invalid("通知渠道配置不合法"))
         );
 
-        let mut rule = custom_rule("rule-chan", "引用渠道");
-        rule.channel_ids = vec!["chan-1".to_string()];
-        storage.create_alert_rule(&rule).unwrap();
         let err = storage.delete_notification_channel("chan-1").unwrap_err();
         assert_eq!(
             err.downcast_ref::<ChannelStoreError>(),

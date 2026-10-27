@@ -96,6 +96,40 @@ impl CertStatus {
         self.days_left = (remaining_ms + DAY_MS - 1).div_euclid(DAY_MS);
         self
     }
+
+    /// 是否已加载过真实证书。
+    ///
+    /// 空指纹 / `not_after == 0` 只可能来自初始化前的占位状态；告警引擎遇到
+    /// 未初始化状态必须跳过本轮，不能把 0 当成“证书已过期”而误触发或 resolve。
+    pub fn is_initialized(&self) -> bool {
+        !self.fingerprint.is_empty() && self.not_after > 0
+    }
+
+    /// 距 `not_after` 的剩余小时数，向上取整；与 `tls::hours_left` 同语义。
+    ///
+    /// 直接由 live 状态的 `not_after` 与当前时间计算，不依赖加载时的
+    /// `days_left` 快照，因此长期运行不会使用过期数值。
+    pub fn hours_left_at(&self, now_ms: i64) -> Result<i64> {
+        if !self.is_initialized() {
+            bail!("live 证书状态尚未初始化");
+        }
+        const HOUR_MS: i64 = 60 * 60 * 1000;
+        let remaining_ms = self
+            .not_after
+            .checked_mul(1_000)
+            .and_then(|deadline| deadline.checked_sub(now_ms))
+            .context("计算 live 证书剩余寿命溢出")?;
+        Ok((remaining_ms + HOUR_MS - 1).div_euclid(HOUR_MS))
+    }
+}
+
+/// 启动 TLS 加载结果。
+///
+/// `status` 与 `config` 由**同一份证书 PEM** 派生：调用方可以放心用它初始化
+/// live 摘要，不会出现“config 用旧证书、磁盘摘要却已是新证书”的 TOCTOU。
+pub struct LoadedTlsConfig {
+    pub config: Arc<ServerConfig>,
+    pub status: CertStatus,
 }
 
 /// 读取磁盘上服务端证书的公开摘要。
@@ -112,7 +146,7 @@ fn read_live(live: &RwLock<CertStatus>) -> CertStatus {
         .clone()
 }
 
-fn write_live(live: &RwLock<CertStatus>, status: CertStatus) {
+pub(crate) fn write_live(live: &RwLock<CertStatus>, status: CertStatus) {
     *live
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = status;
@@ -186,14 +220,13 @@ impl RenewedServerCert {
 /// 任务本身不会 panic：单次失败只记日志，下个周期继续尝试（证书不会因为一次
 /// 写盘失败就永远不续签）。
 ///
-/// `live` 参数保留仅为兼容调用方；续签成功后**不在这里**更新 live，
-/// 而是由文件 watcher 在校验并热加载成功后统一更新。否则自动续签读到的
-/// 磁盘摘要可能覆盖并发 CLI `rotate-cert` 刚写入的新证书，导致 watcher
-/// 误判「已加载」而跳过真正的热加载。`/system` 最多滞后一个轮询周期（≤10s）。
+/// 续签成功后在同一把 `CertLock` 内用实际推送的证书 PEM 更新 `live`，使
+/// listener 配置、`/system` 摘要与 `hub_cert` 告警立即一致；文件 watcher 仍作为
+/// CLI `rotate-cert` / `tls issue` 的兜底。
 pub fn spawn_server_renewal(
     cfg: Arc<HubConfig>,
     tx: TlsConfigSender,
-    _live: Arc<RwLock<CertStatus>>,
+    live: Arc<RwLock<CertStatus>>,
 ) {
     // C3：ACME 模式的 server 证书由 acme::renewal 管理，绝不启动自签续期。
     if cfg.tls.mode.is_acme() {
@@ -217,9 +250,10 @@ pub fn spawn_server_renewal(
 
             let check_cfg = cfg.clone();
             let check_tx = tx.clone();
+            let check_live = live.clone();
             // 文件读写与签名都是阻塞操作，放到 blocking 线程池，避免卡住 reactor。
             let result = tokio::task::spawn_blocking(move || {
-                check_and_renew(&check_cfg, &check_tx, false, None)
+                check_and_renew_with_live(&check_cfg, &check_tx, &check_live, false, None)
             })
             .await;
 
@@ -338,8 +372,10 @@ pub fn reload_server_config_if_changed(
         return Ok(false);
     }
 
-    // 4) 用同一批文件构建 rustls 配置；随后复核指纹，防止读写之间又被 rotate 覆盖。
-    let server_config = tls::server_config(&cfg.data_dir).context("构建热加载 TLS 配置失败")?;
+    // 4) 用**同一份 cert_pem** 构建 rustls 配置，避免构建函数重新读盘后拿到
+    //    另一张证书；随后复核磁盘指纹，防止构建期间又被 rotate 覆盖。
+    let server_config = tls::server_config_with_cert_pem(&cfg.data_dir, &cert_pem)
+        .context("构建热加载 TLS 配置失败")?;
     let confirmed = CertStatus::from_pem(&std::fs::read_to_string(&cert_path)?)?;
     if confirmed.fingerprint != status.fingerprint {
         tracing::debug!("证书在热加载过程中再次变化，本周期跳过，下个周期重试");
@@ -347,7 +383,7 @@ pub fn reload_server_config_if_changed(
     }
 
     tx.send_replace(server_config);
-    write_live(live, confirmed);
+    write_live(live, status.clone());
     tracing::info!(
         fingerprint = %status.fingerprint,
         not_after = %tls::format_unix_utc(status.not_after),
@@ -610,11 +646,12 @@ pub fn renew_server_cert_files(
     }))
 }
 
-/// 重建服务端 TLS 配置。
+/// 重建服务端 TLS 配置，并返回构建它实际使用的证书 PEM。
 ///
-/// 生产路径就是 `tls::server_config`；测试可对指定 data_dir 注入一次失败，
-/// 用来覆盖「新材料已写盘、重建却失败 → 必须回滚」的分支（没有别的故障注入点）。
-fn rebuild_server_config(cfg: &HubConfig) -> Result<Arc<ServerConfig>> {
+/// 生产路径就是 `tls::server_config_with_cert_pem_from_disk`；测试可对指定
+/// data_dir 注入一次失败，用来覆盖「新材料已写盘、重建却失败 → 必须回滚」的
+/// 分支（没有别的故障注入点）。
+fn rebuild_server_config(cfg: &HubConfig) -> Result<(Arc<ServerConfig>, String)> {
     #[cfg(test)]
     {
         let mut fail_for = FAIL_REBUILD_FOR
@@ -625,7 +662,7 @@ fn rebuild_server_config(cfg: &HubConfig) -> Result<Arc<ServerConfig>> {
             anyhow::bail!("测试注入：重建 TLS 配置失败");
         }
     }
-    tls::server_config(&cfg.data_dir)
+    tls::server_config_with_cert_pem_from_disk(&cfg.data_dir)
 }
 
 #[cfg(test)]
@@ -640,9 +677,34 @@ static FAIL_REBUILD_FOR: std::sync::Mutex<Option<std::path::PathBuf>> = std::syn
 /// 锁被 CLI `rotate-cert` 占用时返回可读错误且不写任何文件，由续签任务下个
 /// 周期重试。CLI 自己已持锁并直接调用 [`renew_server_cert_files`]，不会走到
 /// 这里，因此不存在嵌套获取锁的死锁。
+#[cfg(test)]
 pub fn check_and_renew(
     cfg: &HubConfig,
     tx: &TlsConfigSender,
+    force: bool,
+    override_days: Option<u32>,
+) -> Result<Option<String>> {
+    check_and_renew_inner(cfg, tx, None, force, override_days)
+}
+
+/// 与 [`check_and_renew`] 相同，但在推送新配置的同一临界区更新 live 摘要。
+///
+/// `CertStatus` 由**构建配置所用的同一份 PEM** 派生，且此时仍持有 `CertLock`；
+/// 因此续签成功后 live 立即与 listener 一致，不会出现最长 10s 的旧摘要窗口。
+pub(crate) fn check_and_renew_with_live(
+    cfg: &HubConfig,
+    tx: &TlsConfigSender,
+    live: &RwLock<CertStatus>,
+    force: bool,
+    override_days: Option<u32>,
+) -> Result<Option<String>> {
+    check_and_renew_inner(cfg, tx, Some(live), force, override_days)
+}
+
+fn check_and_renew_inner(
+    cfg: &HubConfig,
+    tx: &TlsConfigSender,
+    live: Option<&RwLock<CertStatus>>,
     force: bool,
     override_days: Option<u32>,
 ) -> Result<Option<String>> {
@@ -678,8 +740,8 @@ pub fn check_and_renew(
         return Ok(None);
     };
 
-    let server_config = match rebuild_server_config(cfg) {
-        Ok(config) => config,
+    let (server_config, cert_pem) = match rebuild_server_config(cfg) {
+        Ok(result) => result,
         Err(err) => {
             return Err(match renewed.rollback(cfg) {
                 Ok(true) => err.context("重建 TLS 配置失败，已回滚旧证书与私钥"),
@@ -695,6 +757,18 @@ pub fn check_and_renew(
 
     // 只有自检通过才推送；订阅端（accept 循环）下次取用时立即生效。
     tx.send_replace(server_config);
+    if let Some(live) = live {
+        match CertStatus::from_pem(&cert_pem) {
+            Ok(status) => write_live(live, status),
+            Err(err) => tracing::warn!(
+                error = %err,
+                "续签后计算 live 证书摘要失败；下个 watcher 周期会补齐"
+            ),
+        }
+    } else {
+        // 兼容旧调用方（测试 / CLI）：watcher 会在下个周期按磁盘补齐 live。
+        tracing::debug!("续签调用方未提供 live，等待 watcher 同步");
+    }
     tracing::info!(
         old_fingerprint = %renewed.old_fingerprint,
         new_fingerprint = %renewed.fingerprint,
@@ -818,7 +892,17 @@ fn classify_startup_material(cfg: &HubConfig, ca: &tls::ValidatedCa) -> Result<S
 ///
 /// 其他任何异常（CA 材料非法、证书不可解析、非当前 CA 签发、CN/SAN 不覆盖、
 /// 尚未生效等）都在写盘前拒绝启动。
+#[cfg(test)]
 pub fn load_or_repair_tls_config(cfg: &HubConfig) -> Result<Arc<ServerConfig>> {
+    Ok(load_or_repair_tls_config_with_status(cfg)?.config)
+}
+
+/// 与 [`load_or_repair_tls_config`] 相同，但返回构建配置所用的同一份证书摘要。
+///
+/// hub 启动必须用这个入口初始化 live，不能加载完再读一次磁盘：否则
+/// rotate / `tls issue` 可能恰好写在新 crt、而 listener 仍用旧配置，watcher
+/// 会因 live 指纹已是新证书而跳过真正的热加载。
+pub fn load_or_repair_tls_config_with_status(cfg: &HubConfig) -> Result<LoadedTlsConfig> {
     // C3：ACME 模式只加载/校验，绝不自签修复；缺失/非法时给可执行错误。
     if cfg.tls.mode.is_acme() {
         return load_acme_tls_config(cfg);
@@ -832,8 +916,12 @@ pub fn load_or_repair_tls_config(cfg: &HubConfig) -> Result<Arc<ServerConfig>> {
     // 先分类，只有「配对损坏/缺失」与「仅过期」才允许进入写盘自愈；
     // 其余情况由 `classify_startup_material` 直接返回错误，不会碰任何文件。
     match classify_startup_material(cfg, &ca)? {
-        StartupMaterial::Healthy => match tls::server_config(&cfg.data_dir) {
-            Ok(config) => Ok(config),
+        StartupMaterial::Healthy => match tls::server_config_with_cert_pem_from_disk(&cfg.data_dir)
+        {
+            Ok((config, cert_pem)) => Ok(LoadedTlsConfig {
+                config,
+                status: CertStatus::from_pem(&cert_pem).context("计算启动时服务端证书摘要失败")?,
+            }),
             // 分类正常但配置构建失败（权限/IO/竞争）：仍进入锁内复核，
             // 复核若确认配对已损坏才自愈，否则报不可自愈错误。
             Err(original) => repair_tls_material(cfg, RepairCause::PairDamaged, original),
@@ -867,7 +955,7 @@ fn repair_tls_material(
     cfg: &HubConfig,
     cause: RepairCause,
     original: anyhow::Error,
-) -> Result<Arc<ServerConfig>> {
+) -> Result<LoadedTlsConfig> {
     let dir = tls::cert_dir(&cfg.data_dir);
     // KI-11：启动自愈同样会写服务端材料，必须与 CLI rotate-cert 互斥；
     // 锁被占用时宁可拒绝启动，也不能和运维进程交错写 key/cert。
@@ -888,12 +976,17 @@ fn repair_tls_material(
                 cause = cause.label(),
                 "锁内复核未发现需要重签的问题（可能已被并发 rotate 修复），直接加载现有材料"
             );
-            return tls::server_config(&cfg.data_dir).map_err(|err| {
-                unrepairable(
+            return match tls::server_config_with_cert_pem_from_disk(&cfg.data_dir) {
+                Ok((config, cert_pem)) => Ok(LoadedTlsConfig {
+                    config,
+                    status: CertStatus::from_pem(&cert_pem)
+                        .context("计算启动时服务端证书摘要失败")?,
+                }),
+                Err(err) => Err(unrepairable(
                     err,
                     "服务端证书与私钥配对正常且未过期（检查 CA 证书、文件权限与磁盘）",
-                )
-            });
+                )),
+            };
         }
         StartupMaterial::PairRepair(reason) => reason.to_string(),
         StartupMaterial::Expired { not_after } => format!(
@@ -920,8 +1013,8 @@ fn repair_tls_material(
     };
 
     // 重建配置；失败必须回到旧材料。
-    let config = match rebuild_server_config(cfg) {
-        Ok(config) => config,
+    let (config, cert_pem) = match rebuild_server_config(cfg) {
+        Ok(result) => result,
         Err(err) => {
             return Err(match renewed.rollback(cfg) {
                 Ok(true) => err.context(format!(
@@ -947,7 +1040,10 @@ fn repair_tls_material(
         "已自动重签服务端证书完成自愈；服务端指纹已变化，仍使用指纹钉扎的旧版 agent \
          需要升级到 v0.2 或重新纳管"
     );
-    Ok(config)
+    Ok(LoadedTlsConfig {
+        config,
+        status: CertStatus::from_pem(&cert_pem).context("计算自愈后服务端证书摘要失败")?,
+    })
 }
 
 /// ACME 模式的启动加载：只校验/加载，绝不自签修复。
@@ -958,7 +1054,7 @@ fn repair_tls_material(
 ///   `effective_server_names()`、未过期、EKU 含 serverAuth、非 CA。
 ///
 /// 任何缺失/非法都返回带可执行命令的错误，**不会**生成自签证书。
-fn load_acme_tls_config(cfg: &HubConfig) -> Result<Arc<ServerConfig>> {
+fn load_acme_tls_config(cfg: &HubConfig) -> Result<LoadedTlsConfig> {
     let expected_sans = cfg.effective_server_names();
     tls::parse_server_sans(&expected_sans).context("ACME 模式 tls.domains 非法，拒绝启动")?;
     // 客户端证书 CA 与 ACME 服务端证书来源无关，但 mTLS 仍必须依赖它。
@@ -994,8 +1090,12 @@ fn load_acme_tls_config(cfg: &HubConfig) -> Result<Arc<ServerConfig>> {
         "ACME 服务端证书链校验失败（至少需要叶子 + CA，且逐级验签通过）；\
          请执行 `rustboard-hub tls issue --config <hub.toml>` 重新获取证书（旧证书保持不动）",
     )?;
-    tls::server_config(&cfg.data_dir)
-        .context("构建 ACME TLS 配置失败（检查 ca.crt/ca.key 与证书文件权限）")
+    // 用刚读取并校验过的 cert_pem 构建配置，避免构建时重新读盘拿到另一张证书。
+    let config = tls::server_config_with_cert_pem(&cfg.data_dir, &material.cert_pem)
+        .context("构建 ACME TLS 配置失败（检查 ca.crt/ca.key 与证书文件权限）")?;
+    let status =
+        CertStatus::from_pem(&material.cert_pem).context("计算 ACME 服务端证书摘要失败")?;
+    Ok(LoadedTlsConfig { config, status })
 }
 
 /// 按证书来源构建管理 API TLS 配置。
@@ -1164,6 +1264,77 @@ mod tests {
             assert_eq!(mode(SERVER_KEY_FILE), 0o600);
             assert_eq!(mode(SERVER_CERT_FILE), 0o644);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #68：续签推送新配置的同一临界区内同步 live，避免最长 10s 的旧摘要窗口。
+    #[test]
+    fn force_renew_updates_live_with_pushed_cert() {
+        let dir = temp_dir("force-live");
+        let policy = tls::CertPolicy {
+            server_days: 365,
+            ..Default::default()
+        };
+        let (tx, _rx) = prepare(&dir, policy);
+        let cfg = test_config(&dir, 365, 30);
+        let old_status = read_disk_cert_status(&cfg).unwrap();
+        let live = RwLock::new(old_status.clone());
+
+        let new_fingerprint = check_and_renew_with_live(&cfg, &tx, &live, true, Some(10))
+            .unwrap()
+            .expect("force 必须重签");
+        assert_ne!(new_fingerprint, old_status.fingerprint);
+
+        let live_after = read_live(&live);
+        assert_eq!(
+            live_after.fingerprint, new_fingerprint,
+            "续签后 live 必须立即指向实际推送的证书"
+        );
+        assert_eq!(
+            live_after,
+            read_disk_cert_status(&cfg).unwrap(),
+            "live 摘要必须与磁盘材料一致"
+        );
+        // 下一轮 hub_cert 告警直接使用新 live，不再等待 watcher。
+        assert!(live_after.hours_left_at(now_ms()).unwrap() > 9 * 24);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #68：启动 load 返回的 status 是加载时刻的快照，与构建 config 的 PEM 同源。
+    ///
+    /// 模拟「load 返回后立刻 rotate」：返回的 status 不得变成磁盘上的新证书，
+    /// 否则 main 若二次读盘就会得到与 listener 不一致的 live。
+    #[test]
+    fn startup_status_is_snapshot_of_loaded_config() {
+        let dir = temp_dir("startup-status");
+        let policy = tls::CertPolicy {
+            server_days: 365,
+            ..Default::default()
+        };
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], policy).unwrap();
+        let cfg = test_config(&dir, 365, 30);
+
+        let loaded = load_or_repair_tls_config_with_status(&cfg).unwrap();
+        let loaded_fingerprint = loaded.status.fingerprint.clone();
+        assert_eq!(
+            loaded_fingerprint,
+            read_disk_cert_status(&cfg).unwrap().fingerprint,
+            "加载时磁盘证书必须与 status 一致"
+        );
+
+        // load 返回后立即 rotate：旧实现会在 main 里重新读盘并把 live 改成新证书。
+        let renewed = renew_server_cert_files(&cfg, true, Some(10))
+            .unwrap()
+            .expect("force 必须重签");
+        assert_ne!(renewed.fingerprint, loaded_fingerprint);
+        assert_eq!(
+            loaded.status.fingerprint, loaded_fingerprint,
+            "启动 status 必须是加载时快照，不能受后续磁盘变化影响"
+        );
+
+        // 再次加载才应该拿到新证书，说明 watcher 后的状态会正常前进。
+        let reloaded = load_or_repair_tls_config_with_status(&cfg).unwrap();
+        assert_eq!(reloaded.status.fingerprint, renewed.fingerprint);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

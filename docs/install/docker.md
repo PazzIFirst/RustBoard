@@ -5,13 +5,15 @@ slim，镜像内只复制静态 musl 二进制和前端资源，不在镜像里�
 同一镜像上增加 ACME 端口元数据、`RUSTBOARD_TLS_MODE`/`RUSTBOARD_ACME_*` 环境变量
 与降权后的 `NET_BIND_SERVICE` 保留；Phase D 增加 PostgreSQL 显式 opt-in
 （`RUSTBOARD_DATABASE*` 与 `docker/compose.postgres.example.yml`），默认 compose
-仍使用 SQLite。
+仍使用 SQLite。agent 增加显式服务端信任模式
+（`fingerprint` / `system-roots` / `custom-ca`），ACME Hub 不再被迫用指纹；
+已初始化 volume 的 TLS/监听重配置使用保留数据的受控流程。
 
 > 完整构建/运行说明、故障排查与安全边界见
 > [docker/README.md](../../docker/README.md)。本文只给最短路径与关键限制。
 >
-> 当前 `Cargo.toml`/本地验证版本为 `1.0.0-rc.2`；Phase C 已以 `v1.0.0-rc.2`
-> 发布，Phase D 已实现 PostgreSQL 显式 opt-in 与迁移/备份/恢复 CLI。正式镜像
+> 当前版本以根 `Cargo.toml` 的 `[workspace.package].version` 为准；Phase C
+> RC 已发布，Phase D 已实现 PostgreSQL 显式 opt-in 与迁移/备份/恢复 CLI。正式镜像
 > `v1.0.0` 在 Phase E 版本归档后由 release workflow 推送。
 
 ## 1. 构建前提
@@ -24,14 +26,20 @@ slim，镜像内只复制静态 musl 二进制和前端资源，不在镜像里�
 packaging/build-release.sh
 
 # 3) 单架构本地镜像（多架构由 release workflow 构建）
+#    从 Cargo.toml 派生版本；所有构建命令都在仓库根执行，
+#    -f docker/Dockerfile 与末尾的 .（仓库根 context）都不能省
+VERSION=$(cargo metadata --no-deps --format-version 1 --offline \
+  | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "rustboard-hub"))')
 docker buildx build --load --platform linux/amd64 \
   -f docker/Dockerfile --target hub \
-  --build-arg VERSION=1.0.0-rc.2 --build-arg REVISION="$(git rev-parse HEAD)" \
+  --build-arg VERSION="$VERSION" --build-arg REVISION="$(git rev-parse HEAD)" \
   -t ghcr.io/pazzifirst/rustboard-hub:dev .
 ```
 
-`panel`、`agent` 同理，改 `--target` 与镜像名。`TARGETARCH` 由 buildx 自动注入，
-对应 `dist/amd64` / `dist/arm64`。
+`panel`、`agent` 同理，改 `--target` 与镜像名。所有 `docker build` /
+`docker buildx build` 都必须在仓库根执行并显式带 `-f docker/Dockerfile`；
+末尾的 `.` 就是仓库根 build context，不能改成 `docker/`。`TARGETARCH` 由
+buildx 自动注入，对应 `dist/amd64` / `dist/arm64`。
 
 ## 2. 最短 Compose 启动
 
@@ -39,8 +47,10 @@ docker buildx build --load --platform linux/amd64 \
 # 先按 docker/compose.example.yml 修改占位符：
 #   RUSTBOARD_HUB_ADVERTISE   agent 实际连接的域名/IP（写入证书 SAN）
 #   RUSTBOARD_HUB_URL         wss://<hub>:8443/agent/ws
-#   RUSTBOARD_HUB_FINGERPRINT hub 证书 SHA-256 指纹
+#   RUSTBOARD_HUB_FINGERPRINT self-signed hub 的证书 SHA-256 指纹
 #   RUSTBOARD_ENROLL_TOKEN_FILE 0600 enrollment token 文件
+# ACME hub 的 agent 用 system-roots（公共证书）或 custom-ca（私有 CA），
+# 不再用 fingerprint；见 §6.5。
 RUSTBOARD_VERSION=dev \
 RUSTBOARD_HUB_ADVERTISE=hub.example.com \
 docker compose -f docker/compose.example.yml up -d
@@ -87,7 +97,9 @@ docker compose -f docker/compose.example.yml \
 - `/data` 是唯一运行期数据 volume；首启前必须是 root:root 0750，安装完成后 entrypoint
   统一 chown 到 10001。
 - 已初始化的 volume 可以用 `--user 10001:10001` 启动；空 volume 直接 `--user` 必须
-  失败，entrypoint 不会假装初始化成功。
+  失败，entrypoint 不会假装初始化成功。已初始化 volume 要改 TLS 模式/监听参数时，
+  不能直接把 `/data` chown 给 root 后跑 `install --force`；按 §6.6 的受控重配置
+  流程，安装后必须恢复 10001 属主。
 - hub 的 `/run/rustboard` 是共享 admin token 的敏感 volume：hub 写、panel 只读挂载。
   不需要同机 panel 时不要挂载或不要设置 `RUSTBOARD_ADMIN_TOKEN_SHARE`。
 - 健康检查：hub `127.0.0.1:8444/healthz`（HTTP），panel `127.0.0.1:8080/healthz`，
@@ -105,7 +117,31 @@ docker compose -f docker/compose.example.yml \
 docker image inspect ghcr.io/pazzifirst/rustboard-hub:dev \
   --format '{{json .Config.Labels}}'
 
-# 主进程 UID（tini 为 root，rustboard-* 必须是 10001）
+# 主进程真实 UID：读取唯一的 `rustboard-hub run` 进程的 /proc/<pid>/status，
+# 而不是 exec 新进程的 id；agent 的 healthcheck 会执行 `cert-info`，必须过滤掉。
+# 失败即非零退出：run 进程必须唯一，Uid 四列必须全为 10001。
+docker compose -f docker/compose.example.yml exec hub sh -c '
+  set -eu
+  pid=""
+  for p in $(pidof rustboard-hub 2>/dev/null || true); do
+    cmd=$(tr "\0" " " < "/proc/$p/cmdline" 2>/dev/null || true)
+    case "$cmd" in
+      *"rustboard-hub run "*)
+        [ -z "$pid" ] || { echo "rustboard-hub 有多个 run PID: $pid 与 $p" >&2; exit 1; }
+        pid="$p"
+        ;;
+    esac
+  done
+  [ -n "$pid" ] || { echo "未找到 rustboard-hub run 进程" >&2; exit 1; }
+  uid=$(awk "/^Uid:/ {print \$2, \$3, \$4, \$5}" "/proc/$pid/status")
+  [ "$uid" = "10001 10001 10001 10001" ] \
+    || { echo "rustboard-hub UID 不是 10001: $uid" >&2; exit 1; }
+  echo "rustboard-hub Uid: $uid"
+'
+
+# panel / agent 同理，把 rustboard-hub 换成 rustboard-panel / rustboard-agent。
+# 依赖容器内 pidof（Debian 基础层的 sysvinit-utils）；若自定义镜像裁掉了它，
+# 改用 docker top <container> -o pid,uid,gid,cmd 人工确认 rustboard-* 为 10001。
 docker top <hub-container> -o pid,uid,gid,cmd
 
 # 8444 不应出现在宿主端口；默认 EXPOSE 为 8443 80 443（80/443 仅 ACME 元数据，
@@ -128,10 +164,10 @@ docker exec <panel-container> curl -fsS http://127.0.0.1:8080/healthz
 arm64 产物存在时用 QEMU 构建运行 arm64 hub；多架构 manifest 与 GHCR 推送由 release
 workflow 验证。
 
-C8 文档变更后的本地复跑：`DOCKER_ARCH=amd64 SKIP_ARM64=1 bash
-tests/e2e/v100-docker.sh` → **123 PASS / 0 FAIL / 1 SKIP**（SKIP 为可选 arm64/QEMU
-检查，由 `delivery-arm64` 原生覆盖）。O.hub/O.union 断言默认 `EXPOSE 8443 80 443`；
-C.3 仍断言默认 compose 只发布 8443/8080，H.14 仍断言 8444 不发布。
+**历史 C8 本地复跑（rc.2 阶段，不可用作当前 HEAD 门禁）**：
+`DOCKER_ARCH=amd64 SKIP_ARM64=1 bash tests/e2e/v100-docker.sh` 当时记录
+**123 PASS / 0 FAIL / 1 SKIP**（SKIP 为可选 arm64/QEMU 检查，由
+`delivery-arm64` 原生覆盖）。当前 HEAD/新 dist 必须重新跑，不能引用旧结果。
 
 ## 6. ACME 与证书持久化
 
@@ -170,6 +206,11 @@ ACME 模式 entrypoint **不会追加 `--offline`**；self-signed 保持 `--offl
 缺失/非法的 ACME 变量在 install 之前退出，不写配置。`--offline` + ACME 的
 命令行负例见 [offline.md](offline.md)。
 
+> 上表的 `RUSTBOARD_TLS_MODE` 是 **hub** 的证书来源。agent 的
+> `RUSTBOARD_TLS_MODE` 是另一组取值（`fingerprint` / `system-roots` /
+> `custom-ca`），compose 用 `RUSTBOARD_AGENT_TLS_MODE` 传入，见 §6.5；不要把
+> `acme-domain` 直接设给 agent。
+
 ### 6.2 证书卷与权限
 
 - 证书、ACME 账户与状态都在 `hub_data`：
@@ -202,34 +243,177 @@ ACME 模式 entrypoint **不会追加 `--offline`**；self-signed 保持 `--offl
 ### 6.4 模式切换
 
 已有 `hub.toml` 时 entrypoint 跳过 install，改 `RUSTBOARD_TLS_MODE` 不会改变
-已有配置。切换 self-signed ↔ ACME 需要显式安装（会成对备份旧证书）：
+已有配置。切换 self-signed ↔ ACME 必须按 §6.6 的受控重配置流程执行
+`install --yes --force --no-systemd --prefix /data`；**不能**直接把 `/data`
+chown 给 root 后跑完就启动，也不能删除 `hub_data` 当作“重置证书”。
+
+§6.6 第 3 步的 ACME 安装命令（必须带 `--service-ports`，让 80/443 从公网可达）：
 
 ```bash
-# 1) 停掉旧 hub/panel，释放 80/443/8443/8080（会短暂中断服务）
-docker compose -f docker/compose.example.yml \
-  -f docker/compose.acme.example.yml stop panel hub
-
-# 2) 以 root 直接执行安装器；带参数时 entrypoint 不再初始化 volume。
-#    --service-ports 必须保留：ACME 挑战要从公网访问 80/443。
 docker compose -f docker/compose.example.yml \
   -f docker/compose.acme.example.yml run --rm --service-ports hub \
-  rustboard-hub install --force --no-systemd --prefix /data \
+  rustboard-hub install --yes --force --no-systemd --prefix /data \
     --listen 0.0.0.0:8443 --admin-listen 127.0.0.1:8444 --panel no \
-    --tls acme-domain --acme-email admin@example.com \
+    --tls acme-domain --advertise board.example.com \
+    --acme-email admin@example.com \
     --domain board.example.com --acme-challenge http-01
-
-# 3) 用新配置重建服务
-docker compose -f docker/compose.example.yml \
-  -f docker/compose.acme.example.yml up -d
 ```
 
-或删除 `hub_data` 重新初始化（会丢数据/账户，仅限可重建环境）。切换前备份
-`hub_data`，切换后先 `up -d` 再执行
-`docker compose exec hub rustboard-hub tls status --config /data/etc/rustboard/hub.toml`
-确认来源。
+完成后按 §6.6 第 4 步恢复 10001 属主，再带 ACME 叠加文件 `up -d`，最后执行
+`docker compose exec --user 10001:10001 hub rustboard-hub tls status --config /data/etc/rustboard/hub.toml`
+确认来源（`exec` 默认 root，会被 data_dir 属主校验拒绝）。安装器会成对备份旧证书；只有回滚未完成时才保留并打印 txn `backup_dir`，
+成功安装或回滚成功都会删除该临时目录（证书 `.bak` 与它不同）。
 
-> 本地/Docker 的 ACME 端到端验证依赖真实公网入口或 Pebble 端口映射；C8 只做
-> compose/脚本静态检查，**不伪造** ACME 成功。真实 LE staging 留 C9 手工门禁。
+> 本地/Docker 的 ACME 端到端验证依赖真实公网入口或 Pebble 端口映射；只做
+> compose/脚本静态检查时**不伪造** ACME 成功。真实 LE staging 留手工门禁。
+
+### 6.5 agent 信任模式（ACME / 私有 CA）
+
+Hub 的证书来源（§6.1）和 agent 的**服务端信任模式**是两件事。agent 容器内的
+`RUSTBOARD_TLS_MODE` 只接受：
+
+| 模式 | 适用 | 首次安装必填 | 必须为空 |
+|---|---|---|---|
+| `fingerprint`（默认） | self-signed Hub | `RUSTBOARD_FINGERPRINT` | `RUSTBOARD_SERVER_CA` |
+| `system-roots` | 公共 ACME（LE 等） | 无 | `RUSTBOARD_FINGERPRINT` / `RUSTBOARD_SERVER_CA` |
+| `custom-ca` | 私有 ACME / 私有 CA | `RUSTBOARD_SERVER_CA` | 无（fingerprint 可留空） |
+
+- 未知模式在写盘前失败，不会回退 fingerprint；非 fingerprint 模式必须用
+  `wss://`。
+- 安装器把模式写入 `agent.toml`；custom-ca 会把 CA 复制到
+  `/data/var/lib/rustboard/agent/server-ca.pem`。重启/重连直接读配置，不需要
+  重新 enrollment。
+- compose 变量是 `RUSTBOARD_AGENT_TLS_MODE`（容器内映射为
+  `RUSTBOARD_TLS_MODE`）和 `RUSTBOARD_AGENT_SERVER_CA_FILE`（宿主 CA 路径）；
+  不要把它们和 hub 的 `RUSTBOARD_TLS_MODE` 混用。
+
+公共 ACME（`compose.acme.example.yml` 已把 agent 设为 `system-roots`）：
+
+```bash
+RUSTBOARD_HUB_URL=wss://board.example.com:8443/agent/ws \
+RUSTBOARD_ENROLL_TOKEN_FILE=/absolute/path/to/enroll.token \
+docker compose -f docker/compose.example.yml \
+  -f docker/compose.acme.example.yml --profile agent up -d
+```
+
+私有 ACME / 私有 CA（必须最后叠加 custom-ca 文件，覆盖成 `custom-ca`）：
+
+```bash
+# 公开的 agent 信任锚（不是私钥）；从运行中的 hub 提取
+install -d -m 0700 ./secrets
+docker compose -f docker/compose.example.yml \
+  cp hub:/data/var/lib/rustboard/hub/certs/agent-ca.pem ./secrets/agent-ca.pem
+chmod 0644 ./secrets/agent-ca.pem
+
+RUSTBOARD_HUB_URL=wss://board.example.com:8443/agent/ws \
+RUSTBOARD_AGENT_SERVER_CA_FILE="$PWD/secrets/agent-ca.pem" \
+RUSTBOARD_ENROLL_TOKEN_FILE=/absolute/path/to/enroll.token \
+docker compose -f docker/compose.example.yml \
+  -f docker/compose.acme.example.yml \
+  -f docker/compose.agent-custom-ca.example.yml \
+  --profile agent up -d
+```
+
+- `agent-ca.pem` 只由**私有 ACME** 安装器生成；公共 ACME 用 system-roots，
+  不要用它。CA 只用于验证 Hub **服务端**证书；不要放客户端 CA、agent 证书或私钥。
+- 不要用 fingerprint 给会轮换的 ACME 证书兜底；续期换证后会失联。
+- `hub agent add` 在 ACME 模式会按证书来源打印 `--tls-mode system-roots` 或
+  `--tls-mode custom-ca --server-ca ...`；优先照该输出执行。
+- self-signed Hub 继续用 fingerprint：设置 `RUSTBOARD_HUB_FINGERPRINT`（或
+  `RUSTBOARD_AGENT_FINGERPRINT`），不要设置 `RUSTBOARD_AGENT_TLS_MODE`。
+- 模式只在 agent 首次初始化时生效；已有 agent volume 的环境变量不会改写
+  `agent.toml`。迁移见 §6.6 末尾。
+
+### 6.6 已初始化 volume 的受控重配置（保留数据）
+
+已初始化 `/data` 归 `10001:10001`；`rustboard-hub install` 需要 root，且
+`validate_install_prefix`、`data_dir` 与 `install-state.toml` 都会检查属主。
+所以直接 `docker compose ... run hub rustboard-hub install --force --prefix /data`
+会失败。不要删除 volume、不要把 `/data` 改成 0777，也不要放宽安装器校验。按下面
+顺序执行（以 self-signed 重配为例；ACME 命令见 §6.4）：
+
+```bash
+# 0) 先停服；停服前记录 tls status / hub.toml 基线
+docker compose -f docker/compose.example.yml \
+  exec --user 10001:10001 hub \
+  rustboard-hub tls status --config /data/etc/rustboard/hub.toml \
+  > /tmp/rb-tls-before.txt
+docker compose -f docker/compose.example.yml \
+  cp hub:/data/etc/rustboard/hub.toml /tmp/rb-hub-before.toml
+docker compose -f docker/compose.example.yml stop panel hub
+
+# 1) 停服后备份（含私钥/admin token；放仓库外并按 secret 保管）。
+#    不要对运行中的 SQLite volume 直接 tar；在线快照用 rustboard-hub backup。
+BACKUP_DIR=${RUSTBOARD_BACKUP_DIR:-$HOME/rustboard-backups}
+install -d -m 0700 "$BACKUP_DIR"
+docker compose -f docker/compose.example.yml run --rm --no-deps \
+  -v "$BACKUP_DIR:/backup" --entrypoint /bin/sh hub \
+  -c 'umask 077; tar -C /data -czf /backup/hub-data-$(date +%Y%m%dT%H%M%S).tgz .'
+
+# 2) 只切安装必需路径；先拒绝符号链接/子挂载，再 -xdev + chown -h
+docker compose -f docker/compose.example.yml run --rm --no-deps hub sh -c '
+  set -eu
+  bad=$(find /data -xdev -type l -print -quit)
+  [ -z "$bad" ] || { echo "拒绝：$bad 是符号链接" >&2; exit 1; }
+  dev=$(stat -c %d /data)
+  bad_mount=$(find /data -xdev -type d -exec stat -c "%d %n" {} + \
+    | awk -v dev="$dev" "\$1 != dev { print \$2; exit }")
+  [ -z "$bad_mount" ] || { echo "拒绝：$bad_mount 是子挂载" >&2; exit 1; }
+  chown -h 0:0 /data /data/var /data/var/lib
+  find /data/var/lib/rustboard -xdev -exec chown -h 0:0 {} +
+'
+
+# 3) 以 root 安装；非 TTY 必须 --yes
+docker compose -f docker/compose.example.yml run --rm hub \
+  rustboard-hub install --yes --force --no-systemd --prefix /data \
+    --listen 0.0.0.0:8443 --admin-listen 127.0.0.1:8444 --panel no \
+    --tls self-signed
+
+# 4) 成功或失败都恢复 10001；同样拒绝符号链接/子挂载，-xdev + chown -h
+docker compose -f docker/compose.example.yml run --rm --no-deps hub sh -c '
+  set -eu
+  bad=$(find /data -xdev -type l -print -quit)
+  [ -z "$bad" ] || { echo "拒绝：$bad 是符号链接" >&2; exit 1; }
+  dev=$(stat -c %d /data)
+  bad_mount=$(find /data -xdev -type d -exec stat -c "%d %n" {} + \
+    | awk -v dev="$dev" "\$1 != dev { print \$2; exit }")
+  [ -z "$bad_mount" ] || { echo "拒绝：$bad_mount 是子挂载" >&2; exit 1; }
+  find /data -xdev -exec chown -h 10001:10001 {} +
+  bad_owner=$(find /data -xdev \( ! -uid 10001 -o ! -gid 10001 \) -print -quit)
+  [ -z "$bad_owner" ] || { echo "属主未恢复: $bad_owner" >&2; exit 1; }
+'
+
+# 5) 启动；ACME 配置必须继续带 compose.acme.example.yml
+docker compose -f docker/compose.example.yml up -d
+```
+
+失败处理：
+
+- 第 2/4 步在 chown 前已拒绝符号链接/子挂载；若 chown 中途失败，重跑第 4 步。
+- 第 3 步失败/中断后，先单独重跑第 4 步恢复属主；不要用 `--user 10001` 启动
+  “修复”，也不要在 root 属主状态下直接 `up -d`。
+- **backup_dir**：成功安装会 commit 并删除临时事务备份；只有回滚未完成时才
+  打印并保留 `txn backup_dir`（旧 config/unit/binary/state），从它人工恢复后
+  再执行第 4 步。不要声称成功安装还有该目录。
+- 证书成对备份在 `certs/server.crt.bak-*` / `server.key.bak-*`，与 txn backup
+  不是同一个东西；需要回滚证书时按 `.bak` 恢复并再次执行第 4 步。
+- 若 `find ... chown -h` 本身失败，保留现场并检查只读挂载/文件系统错误；
+  不要删除 volume。
+
+恢复验收至少包括：§5 的 `check_uid`（只匹配 `run` 进程）、
+`tls status`（before/after）、`hub.toml` hash、`server.crt/server.key` 配对、
+SQLite `quick_check`/计数与 `agents` 数。完整可执行命令见
+[docker/README.md §5.3](../../docker/README.md#53-已初始化-volume-的受控重配置保留数据)；
+其中 `rustboard-hub backup` 用 `VACUUM INTO` 生成一致快照并做 `quick_check`。
+
+可复现脚本：`bash tests/e2e/v100-docker-tls-volume.sh`（默认启动一次性 Pebble；
+已有 Pebble 可设 `PEBBLE_REUSE=rb-pebble`；需要本地 local-s4 镜像，不进入 CI）。
+
+> agent volume 也是 10001；已有 agent 需要 `install --force` 时按同样顺序执行
+> （`--profile agent agent` + `rustboard-agent install --yes --force --no-systemd
+> --prefix /data ...`），随后恢复 10001。entrypoint 的环境变量只在首次初始化时
+> 生效；从 `custom-ca` 改到其他模式时安装器不会自动清空旧 `server_ca`，需先备份
+> 并处理该字段，或新建 volume 重新 enrollment。
 
 ## 7. 升级、回滚与限制
 
@@ -237,7 +421,12 @@ docker compose -f docker/compose.example.yml \
 - entrypoint 检测到已有配置会跳过 install；新版本运行期可能执行 SQLite schema
   迁移。回滚镜像前先确认数据库兼容性，必要时恢复 volume 快照。
 - ACME 证书在 `hub_data` 中持久化；升级不会重写证书/账户。切换 ACME
-  directory/profile 需要 `install --force` + `tls issue`。
+  directory/profile 需要 §6.6 的受控 `install --force` + `tls issue`。
+- 已有 volume 改 TLS 模式/监听参数必须按 §6.6 做；直接 root `install --force`
+  会被 prefix/data_dir 属主校验拒绝。不要删除 volume 或放宽校验。
+- ACME Hub 的证书不是本地客户端 CA 签发：agent 不能再靠 fingerprint/本地
+  `ca.crt` 校验服务端。公共 ACME 用 `system-roots`，私有 ACME 用
+  `custom-ca`；已有 fingerprint agent 需改信任或重新 enrollment，见 §6.5。
 - 已发布 tag 不移动；镜像 digest 与 `REVISION` label 一起记录。
 - 从 systemd 安装迁移到 Docker 不复用 `/etc/rustboard`、`/var/lib/rustboard`；需要
   重新初始化，agent 需重新 enrollment。
@@ -253,13 +442,14 @@ docker compose -f docker/compose.example.yml \
 
 ## 8. Phase E S4：PostgreSQL overlay e2e
 
-> **状态**：2026-10-26 已运行通过：**PASS=104 / FAIL=0 / SKIP=1（arm64 由 S5
-> 覆盖）**，退出码 0。证据：
-> `target/docker-pg-e2e/20261026t133124z-3736044/`（含 provenance、日志、PG 计数）。
-> 使用的是当前 dist（manifest 绑定，hub sha256 `1a23fa5e…`），不是旧 rc.2 镜像。
-> 下面的 PASS 条件是脚本判定标准，结果已由本次运行回填。
+> **历史证据（不可用于当前门禁）**：2026-10-26 在 `v1.0.0-rc.2` 提交
+> `68f24e0` 上记录 **PASS=104 / FAIL=0 / SKIP=1（arm64 由 S5 覆盖）**，退出码 0；
+> 证据 `target/docker-pg-e2e/20261026t133124z-3736044/`（含 provenance、日志、
+> PG 计数，hub sha256 `1a23fa5e…`）。该结果绑定的是当时 rc.2 dist，不是当前 HEAD/
+> 新 dist；当前代码必须重建 dist 并重跑后才能作为门禁证据。下面的 PASS 条件仍是
+> 脚本判定标准，历史结果不能回填到本次运行。
 
-脚本必须带 dist 来源绑定运行（**验证码版本号不够**，同名旧 rc.2 dist 也可能
+脚本必须带 dist 来源绑定运行（**验证码版本号不够**，同名旧 dist 也可能
 通过 `--version`；manifest 把本次源码产物与 e2e 强绑定）：
 
 ```bash
@@ -273,7 +463,11 @@ mkdir -p target
   printf 'web=%s\n'   "$(sha256sum web/dist/index.html             | awk '{ print $1 }')"
 } > target/dist-manifest.txt
 
-bash tests/e2e/v100-docker-pg.sh --dist-manifest target/dist-manifest.txt
+# 从 Cargo.toml 派生当前版本，与 dist/包名/镜像 label 使用同一来源
+EXPECTED_VERSION=$(cargo metadata --no-deps --format-version 1 --offline \
+  | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "rustboard-hub"))')
+EXPECTED_VERSION="$EXPECTED_VERSION" \
+  bash tests/e2e/v100-docker-pg.sh --dist-manifest target/dist-manifest.txt
 # 或：EXPECTED_DIST_SHA256='hub=... panel=... agent=... web=...' \
 #       bash tests/e2e/v100-docker-pg.sh
 ```
@@ -286,9 +480,9 @@ arm64（S5 独立）：
 
 1. 用 `dist/amd64/bin` 与 `web/dist` 构建
    `ghcr.io/pazzifirst/rustboard-{hub,panel,agent}:local-s4`；断言 hub 镜像内
-   `rustboard-hub --version` 与当前源码一致（默认期望 `1.0.0-rc.2`），
-   `org.opencontainers.image.revision` 等于当前 HEAD，且 dist sha256 与
-   manifest 强匹配，**不是**旧 rc.2 GHCR 镜像或同名旧 dist；
+   `rustboard-hub --version` 与当前源码一致（期望上面从 `Cargo.toml` 派生的
+   `EXPECTED_VERSION`），`org.opencontainers.image.revision` 等于当前 HEAD，
+   且 dist sha256 与 manifest 强匹配，**不是**旧 RC GHCR 镜像或同名旧 dist；
 2. 断言 hub 镜像内没有 `pg_dump` / `pg_restore` / `psql`；
 3. 默认 compose（`RUSTBOARD_VERSION=local-s4`）`config` 无 postgres service、
    无 5432/8444 发布；实跑 hub+panel healthy，hub 配置为
@@ -322,8 +516,9 @@ arm64（S5 独立）：
   缓存/网络，请预先准备好基础镜像与构建缓存。脚本本身不 pull；
 - `--user 10001` 用例需要 root 才能 `chown` 0600 测试密码文件到 10001；它使用
   已初始化 volume，不重新安装；
-- 当前 `Cargo.toml` 版本为 `1.0.0-rc.2`。版本归档后重跑请用
-  `EXPECTED_VERSION=<新版本>`，否则 preflight 会拒绝旧 dist。
+- 当前源码版本由上面的 `cargo metadata` 从 `Cargo.toml` 派生；脚本内置的
+  `EXPECTED_VERSION` 默认值可能落后于源码，重跑时始终显式传入派生值（或
+  `EXPECTED_VERSION=<新版本>`），否则 preflight 会拒绝不一致的 dist。
 
 成功且 cleanup 无残留时最后一行是 `全部 N 项通过`；失败、中断（HUP/INT/TERM）
 或资源残留只输出“未通过/中断”，以非 0 退出。证据（脱敏日志、计数、

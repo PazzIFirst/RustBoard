@@ -1,0 +1,43 @@
+# RustBoard Docker Compose agent 私有 CA 叠加示例（P4 #56）。
+#
+# 用途：Hub 服务端证书由私有 ACME / 私有 CA 签发时，agent 不能再用 fingerprint
+# （证书轮换后会失去连接），应使用 custom-ca。必须和默认文件一起使用：
+#
+#   RUSTBOARD_VERSION=v1.0.0 \
+#   RUSTBOARD_AGENT_SERVER_CA_FILE=/absolute/path/to/agent-ca.pem \
+#   docker compose -f docker/compose.example.yml \
+#     -f docker/compose.agent-custom-ca.example.yml \
+#     --profile agent up -d
+#
+# 私有 ACME hub（compose.acme.example.yml）也一起叠加；本文件必须放在最后，
+# 才能把 agent 从 system-roots 覆盖成 custom-ca：
+#
+#   RUSTBOARD_AGENT_SERVER_CA_FILE=/absolute/path/to/agent-ca.pem \
+#   docker compose -f docker/compose.example.yml \
+#     -f docker/compose.acme.example.yml \
+#     -f docker/compose.agent-custom-ca.example.yml \
+#     --profile agent up -d
+#
+# 重要：
+# - RUSTBOARD_AGENT_SERVER_CA_FILE 是宿主上的 PEM 文件，必须只读挂载；内容应是
+#   **签发 Hub 服务端证书的 CA/链**。私有 ACME 通常是 hub_data 中的
+#   certs/agent-ca.pem（该文件只由私有 ACME 安装器生成；公共 ACME 用
+#   system-roots，不要用它）。不要放客户端 CA、私钥或 agent 自己的证书。
+# - 安装器会把该文件复制到 agent 的 data 目录并在 agent.toml 写入复制后的绝对
+#   路径；重启/重连不需要重新 enrollment，也不再读取本环境变量。
+# - 模式只在首次初始化（/data/etc/rustboard/agent.toml 不存在）时生效。已有
+#   agent volume 不会被本文件改写；改信任模式见 docker/README.md §5.3。
+# - 不要用 fingerprint 给私有 CA 兜底：Hub 轮换服务端证书后将无法连接。
+#
+# 本文件不定义 name：Compose 项目名沿用默认文件，避免叠加后成为两个项目。
+
+services:
+  agent:
+    volumes:
+      # :? 让未设置变量时 compose config/up 直接失败，不挂载空目录或占位文件。
+      - ${RUSTBOARD_AGENT_SERVER_CA_FILE:?请设置 RUSTBOARD_AGENT_SERVER_CA_FILE 为服务端 CA PEM 的绝对路径}:/run/rustboard/server-ca.pem:ro
+    environment:
+      RUSTBOARD_TLS_MODE: "custom-ca"
+      RUSTBOARD_SERVER_CA: "/run/rustboard/server-ca.pem"
+      # custom-ca 以 CA + 主机名为准；清空 fingerprint，避免误用旧钉扎。
+      RUSTBOARD_FINGERPRINT: ""

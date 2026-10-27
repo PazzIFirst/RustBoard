@@ -193,7 +193,15 @@ def run_hold(args) -> int:
     capabilities = [item for item in args.capabilities.split(",") if item]
 
     ws = probe.WebSocket(args.url, args.ca, args.cert, args.key, timeout=args.timeout)
-    result = {"mode": "hold", "welcome": False, "held": False, "closed_early": False}
+    result = {
+        "mode": "hold",
+        "welcome": False,
+        "held": False,
+        "closed_early": False,
+        "error": "",
+        "code": "",
+    }
+    reached_hold_deadline = False
     try:
         ws.send_binary(hello_payload(args.agent_id, secret, metadata, capabilities))
         deadline = time.monotonic() + args.timeout
@@ -201,6 +209,7 @@ def run_hold(args) -> int:
             frame = recv_frame(ws, max(0.05, min(0.5, deadline - time.monotonic())))
             if frame is None:
                 result["closed_early"] = True
+                result["error"] = "closed_before_welcome"
                 break
             if frame is _TIMEOUT:
                 continue
@@ -209,9 +218,13 @@ def run_hold(args) -> int:
                 result["welcome"] = True
                 break
             if name == "Problem":
+                # Welcome 之前收到 Problem 说明会话没有建立，立即失败。
                 result["code"] = frame_code(body)
-                print(json.dumps(result, ensure_ascii=False), flush=True)
-                return 1
+                result["error"] = f"problem:{result['code']}"
+                break
+
+        if not result["welcome"] and not result["error"]:
+            result["error"] = "welcome_timeout"
 
         if result["welcome"]:
             hold_deadline = time.monotonic() + args.hold_seconds
@@ -223,19 +236,29 @@ def run_hold(args) -> int:
                 frame = recv_frame(ws, 0.3)
                 if frame is None:
                     result["closed_early"] = True
+                    result["error"] = "closed_early"
                     break
                 if frame is _TIMEOUT:
                     continue
                 name, body = frame
                 if name == "Problem":
+                    # Welcome 之后收到 Problem 也必须立即失败，不能把“连接
+                    # 仍打开”当成成功保持。
                     result["code"] = frame_code(body)
+                    result["error"] = f"problem:{result['code']}"
                     break
-            result["held"] = not result["closed_early"]
+            reached_hold_deadline = time.monotonic() >= hold_deadline
+            # held 只有在没有错误/提前关闭且实际走满 hold_deadline 时才为真。
+            result["held"] = (
+                reached_hold_deadline
+                and not result["closed_early"]
+                and not result["error"]
+            )
     finally:
         ws.close()
 
     print(json.dumps(result, ensure_ascii=False), flush=True)
-    return 0 if (result["welcome"] and result["held"]) else 1
+    return 0 if (result["welcome"] and result["held"] and not result["error"]) else 1
 
 
 # ---------------------------------------------------------------------------

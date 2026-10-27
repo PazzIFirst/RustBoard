@@ -6,7 +6,7 @@
 //! 安全模型：私有 CA + 服务端证书指纹固定 + 一次性 enrollment token。
 //! agent 首次连接只允许发 `Enroll`，换取客户端证书与独立 secret，之后走 mTLS。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path as FsPath, PathBuf};
@@ -43,7 +43,8 @@ use rustboard_common::wire::{codes, AgentHello, EnrollRequest, Frame, Welcome};
 use rustboard_common::{DEFAULT_HUB_CONFIG, PROTOCOL_VERSION, VERSION};
 use rustboard_core::alerts::builtin_rules;
 use rustboard_core::archive::{sha256_hex, ArchiveObject, ArchiveStatus, ColdStore};
-use rustboard_core::collect::default_collectors;
+use rustboard_core::buffer::DiskBuffer;
+use rustboard_core::collect::{default_collectors, Collector};
 use rustboard_core::downsample;
 use rustboard_core::storage::postgres::PostgresStorage;
 #[cfg(test)]
@@ -200,6 +201,22 @@ const OVERVIEW_METRICS: [&str; 7] = [
 /// 采样间隔允许范围（毫秒），与 agent 侧校验保持一致。
 const MIN_SAMPLE_INTERVAL_MS: u64 = 1_000;
 const MAX_SAMPLE_INTERVAL_MS: u64 = 300_000;
+
+/// #75：本机采集持久缓冲目录（`cfg.data_dir` 下的独立子目录）。
+///
+/// 绝不能与 agent 网络缓冲共用目录：hub 的 `data_dir` 还放数据库 / 证书，
+/// agent 的 `DiskBuffer` 直接使用自己的 `data_dir`；混用会让两套 meta 互相覆盖。
+const SELF_MONITOR_BUFFER_DIR: &str = "hub-self-buffer";
+/// 本机采集缓冲上限：64 MiB。
+const SELF_MONITOR_BUFFER_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// 本机采集缓冲最长保留 24h（毫秒）。
+const SELF_MONITOR_BUFFER_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
+/// 单轮最多重试的批次数，避免积压时阻塞采样循环。
+const SELF_MONITOR_FLUSH_MAX_BATCHES: usize = 16;
+/// 单轮 flush 的时间预算；超过后保留剩余批次下一轮继续。
+const SELF_MONITOR_FLUSH_BUDGET: Duration = Duration::from_millis(500);
+/// 持久缓冲都写不进去时，内存中最多暂存多少批（有界，满后丢最旧）。
+const SELF_MONITOR_MAX_UNPERSISTED_BATCHES: usize = 64;
 
 /// M4：后台每轮降采样最多推进的小时块数。
 ///
@@ -528,6 +545,10 @@ struct AppState {
     /// 同一 principal 同时最多一个请求持有 / 等待全局 permit；第二个请求立即
     /// 429，避免单客户端用多条连接排队。map 容量有上限，满了先清理空闲槽。
     archive_download_principal_slots: Arc<StdMutex<HashMap<String, Arc<Semaphore>>>>,
+    /// #66：本机采集的有效采样间隔。`PUT /agents/hub-self/settings` 成功后
+    /// 通过 watch 唤醒 self monitor；self_monitor 关闭时没有接收者，发送失败
+    /// 只记 debug。
+    self_interval: watch::Sender<u64>,
 }
 
 /// 由 TLS accept 层注入到每个请求扩展里的对端身份。
@@ -623,11 +644,12 @@ fn load_config(path: &std::path::Path) -> Result<HubConfig> {
     })
 }
 
-/// 只读加载配置：`tls status` 专用，绝不调用 `harden` / 写回配置文件。
+/// 只读加载配置：`tls` / `rotate-cert` 等诊断命令，绝不 `harden` / 写回配置。
 ///
 /// `HubConfig::load` → `load_toml` 会先把 0644 的配置收紧到 0600，诊断命令不应
-/// 产生这种磁盘副作用。这里直接读取并解析，权限与内容都保持不变；错误上下文与
-/// [`load_config`] 保持一致。其他命令仍使用 [`load_config`] 的既有语义。
+/// 产生这种磁盘副作用。这里直接读取并解析，权限与内容都保持不变。解析失败走
+/// [`backup_cmd::parse_toml_sanitized`] 的固定诊断：`toml::de::Error` 的 source
+/// line 可能含 admin_token / 数据库密码，绝不能进入 stderr。
 fn load_config_read_only(path: &FsPath) -> Result<HubConfig> {
     let text = std::fs::read_to_string(path).with_context(|| {
         format!(
@@ -635,12 +657,7 @@ fn load_config_read_only(path: &FsPath) -> Result<HubConfig> {
             path.display()
         )
     })?;
-    toml::from_str(&text).with_context(|| {
-        format!(
-            "读取配置失败: {}（先执行 rustboard-hub init）",
-            path.display()
-        )
-    })
+    backup_cmd::parse_toml_sanitized(&text, path)
 }
 
 /// hub 配置里的默认采样间隔范围校验。
@@ -1851,7 +1868,7 @@ fn tls_renew(config: Option<PathBuf>) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    match runtime.block_on(acme::renewal::renew_if_due(&cfg, None))? {
+    match runtime.block_on(acme::renewal::renew_if_due(&cfg, None, None))? {
         Some(issued) => {
             println!("ACME 证书已续期并安装（已有旧材料时已成对备份）");
             print_issued_cert(&issued);
@@ -2122,25 +2139,27 @@ fn run(cfg: HubConfig) -> Result<()> {
         harden_existing_cert_dir(&cfg.data_dir)?;
         // 启动加载：self-signed 允许有限自愈（配对损坏/仅过期）；ACME 只加载/校验，
         // 证书缺失时给 `rustboard-hub tls issue` 的明确提示，绝不自签。
-        let tls_config = cert_rotation::load_or_repair_tls_config(&cfg)?;
-        // KI-10：记录初始监听器证书摘要，供 `/api/v1/system` 区分 live 与 disk。
-        let initial_cert = cert_rotation::read_disk_cert_status(&cfg)
-            .context("读取服务端证书摘要失败（监听器已加载但状态不可读）")?;
+        //
+        // #68 严重项：live 摘要必须与这次真正构建 config 的证书是**同一份 PEM**，
+        // 不能在 load 之后重读磁盘——否则 rotate/tls issue 恰好写新 crt 时，
+        // listener 还用旧配置而 live 已显示新证书，watcher 会跳过真正的热加载。
+        let loaded_tls = cert_rotation::load_or_repair_tls_config_with_status(&cfg)?;
+        let tls_config = loaded_tls.config;
+        let initial_cert = loaded_tls.status;
         let live_cert = Arc::new(RwLock::new(initial_cert));
-        let fingerprint = {
-            let pem =
-                std::fs::read_to_string(tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE))?;
-            tls::fingerprint_of_pem(&pem)?
-        };
+        let fingerprint = live_cert
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .fingerprint
+            .clone();
         tracing::info!(
             fingerprint,
             mode = cfg.tls.mode.as_str(),
             names = %cfg.effective_server_names().join(","),
             "TLS 已启用"
         );
-        // 管理端 watcher 以「启动时实际构建配置的证书」为基线，而不是启动后读 live：
-        // 避免极端竞态下把启动后才切换的指纹误当成已加载。
-        let initial_admin_fingerprint = fingerprint.clone();
+        // 管理端 watcher 与 mTLS 使用同一来源的初始指纹，避免启动窗口内二次读盘。
+        let initial_admin_fingerprint = fingerprint;
 
         let sessions = SessionRegistry::new();
         // B2：固定四家端点 + 固定超时/重试次数；`notify_max_attempts` 在构造器内
@@ -2152,6 +2171,35 @@ fn run(cfg: HubConfig) -> Result<()> {
             )
             .context("初始化通知发送器失败")?,
         );
+        // #66：self monitor 必须使用存储中的有效间隔（启动读取一次），而不是
+        // 永远用启动配置。读失败 / 越界与 Welcome 的兜底规则一致；PUT settings
+        // 之后通过 watch 在运行时更新。
+        let fallback_interval = cfg
+            .sample_interval_ms
+            .clamp(MIN_SAMPLE_INTERVAL_MS, MAX_SAMPLE_INTERVAL_MS);
+        let initial_self_interval = if cfg.self_monitor {
+            match storage_blocking(storage.clone(), move |storage| {
+                Ok(sample_interval_from_storage(
+                    storage,
+                    HUB_SELF_AGENT_ID,
+                    fallback_interval,
+                ))
+            })
+            .await
+            {
+                Ok(ms) => ms,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "读取本机采集间隔失败，回退启动配置"
+                    );
+                    fallback_interval
+                }
+            }
+        } else {
+            fallback_interval
+        };
+        let (self_interval_tx, self_interval_rx) = watch::channel(initial_self_interval);
         let state = AppState {
             storage: storage.clone(),
             cfg: Arc::new(cfg.clone()),
@@ -2169,6 +2217,7 @@ fn run(cfg: HubConfig) -> Result<()> {
             archive_download_slots: Arc::new(Semaphore::new(1)),
             archive_download_send_timeout: ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
             archive_download_principal_slots: Arc::new(StdMutex::new(HashMap::new())),
+            self_interval: self_interval_tx,
         };
 
         spawn_revoke_watcher(storage.clone(), sessions);
@@ -2177,7 +2226,7 @@ fn run(cfg: HubConfig) -> Result<()> {
         // 两者都通过 watch 推送新 rustls 配置；accept 循环每条新连接读一次。
         let (tls_tx, tls_rx) = watch::channel(tls_config);
         if cfg.tls.mode.is_acme() {
-            acme::renewal::spawn_acme_renewal(state.cfg.clone(), tls_tx.clone());
+            acme::renewal::spawn_acme_renewal(state.cfg.clone(), tls_tx.clone(), live_cert.clone());
         } else {
             cert_rotation::spawn_server_renewal(
                 state.cfg.clone(),
@@ -2209,7 +2258,11 @@ fn run(cfg: HubConfig) -> Result<()> {
         };
 
         if cfg.self_monitor {
-            spawn_self_monitor(storage.clone(), cfg.clone());
+            spawn_self_monitor(storage.clone(), cfg.clone(), self_interval_rx);
+        } else {
+            // #66：关闭本机采集时丢弃接收端，避免 PUT settings 时 watch 仍报告
+            // 发送成功、日志误称“self monitor 将使用新周期”。
+            drop(self_interval_rx);
         }
         // M4：降采样 + 保留期后台任务。启动后先睡一个周期，不做同步 backfill，
         // 不阻塞监听；每轮在 spawn_blocking 内串行执行。
@@ -2219,7 +2272,8 @@ fn run(cfg: HubConfig) -> Result<()> {
         archive::spawn_archive_worker(storage.clone(), cfg.clone());
         // M4-B1b：告警评估任务。`alerts.enabled = false` 时只记日志不启动；
         // 启动后同样先睡一个周期，避免与监听 / 维护任务抢写锁。
-        alerts_engine::spawn_alert_engine(storage.clone(), cfg.clone());
+        // #68：hub_cert 规则读 watcher 成功应用后的 live 证书状态，不直接读磁盘。
+        alerts_engine::spawn_alert_engine(storage.clone(), cfg.clone(), live_cert.clone());
         // M4-B2b：通知 worker 在评估引擎之后启动。首次启动以当前最大事件 id 为
         // 水位（不补发 B1b 存量事件）；`alerts.enabled = false` 时不启动。
         notify_worker::spawn_notify_worker(storage.clone(), cfg.clone(), notifier.clone());
@@ -4297,6 +4351,16 @@ async fn put_settings(
         return Err(ApiError::not_found("agent 不存在"));
     }
 
+    // #66：本机采集不走网络会话，必须显式唤醒 self monitor；其他 agent 仍由
+    // 上面的 reconfigure 踢会话重连。self_monitor 关闭时没有接收者，helper
+    // 返回 false，只记 debug（设置已落库，下次开启后启动读取会生效）。
+    if agent_id == HUB_SELF_AGENT_ID && signal_self_interval(&state, sample_interval_ms) {
+        tracing::info!(
+            sample_interval_ms,
+            "本机采集间隔已更新，self monitor 将使用新周期"
+        );
+    }
+
     // 间隔已落库；踢掉活跃会话让 agent 立刻重连，在 Welcome 里拿到新值。
     // 没有活跃会话时返回 false，不影响本次修改（下次连接自然生效）。
     let signaled = state.sessions.reconfigure(&agent_id);
@@ -4311,6 +4375,39 @@ async fn put_settings(
         agent_id,
         sample_interval_ms,
     }))
+}
+
+/// #66：把有效间隔推给 self monitor；返回是否真的需要通知并已发送。
+///
+/// - 没有接收者（self_monitor=false 或任务已退出）→ 返回 false，只记 debug，
+///   调用方不能误报“self monitor 将使用新周期”；
+/// - 值与当前 sender 保存的值相同 → 不重复通知，避免相同的 PUT 重置采样计时；
+/// - 有变化且有接收者 → `send` 成功返回 true。
+fn signal_self_interval(state: &AppState, sample_interval_ms: u64) -> bool {
+    if state.self_interval.receiver_count() == 0 {
+        tracing::debug!(
+            sample_interval_ms,
+            "本机采集未运行，已保存间隔但当前没有 self monitor 接收者"
+        );
+        return false;
+    }
+    if *state.self_interval.borrow() == sample_interval_ms {
+        tracing::debug!(
+            sample_interval_ms,
+            "本机采集间隔未变化，不重复通知 self monitor"
+        );
+        return false;
+    }
+    match state.self_interval.send(sample_interval_ms) {
+        Ok(()) => true,
+        Err(_) => {
+            tracing::debug!(
+                sample_interval_ms,
+                "self monitor 接收者已退出，已保存间隔但本次未通知"
+            );
+            false
+        }
+    }
 }
 
 fn validate_agent_path(agent_id: &str) -> Result<(), ApiError> {
@@ -6226,14 +6323,241 @@ async fn send_frame(socket: &mut WebSocket, frame: &Frame) -> Result<()> {
     send_with_timeout(socket, Message::Binary(bytes.into())).await
 }
 
+/// #75：本机采集的持久 outbox。
+///
+/// 复用 `DiskBuffer`（与 agent 网络缓冲相同的磁盘格式），但目录固定在
+/// `cfg.data_dir/hub-self-buffer`，绝不与 agent 的 `data_dir` 混用。
+///
+/// 语义：
+/// - 每轮先 `push` 到磁盘，再按 FIFO 尝试入库；
+/// - `Inserted` / `Duplicate` / 永久 `Rejected` 都推进 ACK（成功入库后移除，
+///   `Rejected` 不重试）；
+/// - 入库失败保留在缓冲中，下一轮继续（单轮最多 `SELF_MONITOR_FLUSH_MAX_BATCHES`
+///   批、`SELF_MONITOR_FLUSH_BUDGET` 时间预算，绝不无限重试）；
+/// - `DiskBuffer` 容量 / 时效满时丢最旧并计数，不 panic。
+struct SelfMonitorOutbox {
+    buffer: DiskBuffer,
+    /// 连磁盘都写不进去时暂存的内存批次（有界）；通常为空。
+    pending: VecDeque<SampleBatch>,
+    /// 上一次观察到的 `DiskBuffer::dropped()`，用于只记录增量。
+    last_dropped: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SelfMonitorFlushStats {
+    attempted: usize,
+    inserted: usize,
+    duplicates: usize,
+    rejected: usize,
+    acked: usize,
+    failed: usize,
+}
+
+/// 把批次写入存储的入口；测试可注入确定性失败的实现。
+trait SelfMonitorSink {
+    fn insert_batch(&self, batch: &SampleBatch) -> Result<IngestOutcome>;
+}
+
+impl SelfMonitorSink for StorageHandle {
+    fn insert_batch(&self, batch: &SampleBatch) -> Result<IngestOutcome> {
+        self.as_storage().insert_batch(batch)
+    }
+}
+
+impl SelfMonitorOutbox {
+    fn open(dir: &FsPath, max_bytes: u64, max_age_ms: u64) -> std::io::Result<Self> {
+        Ok(Self {
+            buffer: DiskBuffer::open(dir, max_bytes, max_age_ms)?,
+            pending: VecDeque::new(),
+            last_dropped: 0,
+        })
+    }
+
+    /// 暂存一批（有界）；真正落盘由 [`Self::persist_pending`] 完成。
+    fn enqueue(&mut self, batch: SampleBatch) {
+        if self.pending.len() >= SELF_MONITOR_MAX_UNPERSISTED_BATCHES {
+            self.pending.pop_front();
+            tracing::warn!(
+                max = SELF_MONITOR_MAX_UNPERSISTED_BATCHES,
+                "本机采集内存暂存已满，丢弃最旧批次"
+            );
+        }
+        self.pending.push_back(batch);
+    }
+
+    /// 把内存暂存批次逐条写入持久缓冲；失败时保留在队列中下一轮重试。
+    fn persist_pending(&mut self) {
+        while let Some(batch) = self.pending.front() {
+            match self.buffer.push(batch) {
+                Ok(()) => {
+                    self.pending.pop_front();
+                }
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        "本机采集写入持久缓冲失败，保留在内存队列下一轮重试"
+                    );
+                    break;
+                }
+            }
+        }
+        self.note_dropped();
+    }
+
+    fn note_dropped(&mut self) {
+        let dropped = self.buffer.dropped();
+        if dropped > self.last_dropped {
+            let delta = dropped - self.last_dropped;
+            self.last_dropped = dropped;
+            tracing::warn!(
+                dropped = delta,
+                total = dropped,
+                "本机采集缓冲达到容量/时效上限，已丢弃最旧批次"
+            );
+        } else if dropped < self.last_dropped {
+            // 压实会重置 DiskBuffer 的 dropped 计数。
+            self.last_dropped = dropped;
+        }
+    }
+
+    /// 从持久缓冲按 FIFO 尝试入库，单轮有批次与时间上限。
+    fn flush(
+        &mut self,
+        sink: &dyn SelfMonitorSink,
+        max_batches: usize,
+        budget: Duration,
+    ) -> SelfMonitorFlushStats {
+        let started = Instant::now();
+        let mut stats = SelfMonitorFlushStats::default();
+        loop {
+            if stats.attempted >= max_batches || started.elapsed() >= budget {
+                break;
+            }
+            let batch = match self.buffer.read_next(1) {
+                Ok(mut batches) => match batches.drain(..).next() {
+                    Some(batch) => batch,
+                    None => break,
+                },
+                Err(err) => {
+                    tracing::warn!(error = %err, "读取本机采集持久缓冲失败，下一轮重试");
+                    stats.failed += 1;
+                    break;
+                }
+            };
+            stats.attempted += 1;
+            let outcome = match sink.insert_batch(&batch) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    // 不 ACK，批次继续留在磁盘缓冲中；单轮遇到失败立即停止，
+                    // 避免数据库故障时把整轮采样时间耗在重试上。
+                    tracing::warn!(
+                        epoch = batch.epoch,
+                        seq = batch.seq,
+                        samples = batch.samples.len(),
+                        error = %err,
+                        "本机采集入库失败，保留批次下一轮重试"
+                    );
+                    stats.failed += 1;
+                    break;
+                }
+            };
+            match outcome {
+                IngestOutcome::Inserted { .. } => stats.inserted += 1,
+                IngestOutcome::Duplicate => stats.duplicates += 1,
+                IngestOutcome::Rejected(reason) => {
+                    // 永久拒绝（吊销 / 非法值）：不重试，直接 ACK 移除。
+                    tracing::warn!(
+                        epoch = batch.epoch,
+                        seq = batch.seq,
+                        ?reason,
+                        "本机采集批次被永久拒绝，不再重试"
+                    );
+                    stats.rejected += 1;
+                }
+            }
+            if let Err(err) = self.buffer.ack(batch.epoch, batch.seq) {
+                tracing::warn!(
+                    epoch = batch.epoch,
+                    seq = batch.seq,
+                    error = %err,
+                    "本机采集批次已入库但 ACK 持久化失败，下一轮按重复批次重试"
+                );
+                stats.failed += 1;
+                break;
+            }
+            stats.acked += 1;
+        }
+        stats
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending.len() + self.buffer.pending_len()
+    }
+
+    #[cfg(test)]
+    fn dropped(&self) -> u64 {
+        self.buffer.dropped()
+    }
+}
+
 /// hub 自身作为一台 agent 采集，直接写库，不经过网络。
-fn spawn_self_monitor(storage: Arc<StorageHandle>, cfg: HubConfig) {
+///
+/// #66：启动间隔由调用方从 `agent_settings` 读取；运行时通过 `interval_rx`
+/// 接收 `PUT /agents/hub-self/settings` 的新值。
+/// #75：入库失败不丢弃，先落独立磁盘缓冲再重试。
+fn spawn_self_monitor(
+    storage: Arc<StorageHandle>,
+    cfg: HubConfig,
+    interval_rx: watch::Receiver<u64>,
+) -> tokio::task::JoinHandle<()> {
+    let collectors = default_collectors(cfg.per_core, &cfg.excluded_interfaces);
+    let buffer_dir = cfg.data_dir.join(SELF_MONITOR_BUFFER_DIR);
+    spawn_self_monitor_with(storage, cfg, collectors, interval_rx, buffer_dir)
+}
+
+/// [`spawn_self_monitor`] 的可注入版本：测试用自定义采集器 / 临时缓冲目录。
+fn spawn_self_monitor_with(
+    storage: Arc<StorageHandle>,
+    cfg: HubConfig,
+    collectors: Vec<Box<dyn Collector>>,
+    mut interval_rx: watch::Receiver<u64>,
+    buffer_dir: PathBuf,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let collectors = default_collectors(cfg.per_core, &cfg.excluded_interfaces);
         let agent_id = HUB_SELF_AGENT_ID.to_string();
         let epoch = now_ms() as u64;
         let boot = boot_id();
         let seq = AtomicU64::new(0);
+
+        // 持久缓冲在 blocking 线程打开；失败时 fail closed（不采集、不静默丢数据），
+        // 让 hub-self 在面板上明确离线，而不是看起来正常却丢样本。
+        let opened = tokio::task::spawn_blocking({
+            let dir = buffer_dir.clone();
+            move || {
+                SelfMonitorOutbox::open(
+                    &dir,
+                    SELF_MONITOR_BUFFER_MAX_BYTES,
+                    SELF_MONITOR_BUFFER_MAX_AGE_MS,
+                )
+            }
+        })
+        .await;
+        let outbox = match opened {
+            Ok(Ok(outbox)) => Arc::new(StdMutex::new(outbox)),
+            Ok(Err(err)) => {
+                tracing::error!(
+                    dir = %buffer_dir.display(),
+                    error = %err,
+                    "打开本机采集持久缓冲失败，self monitor 不启动"
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "本机采集缓冲打开任务失败，self monitor 不启动");
+                return;
+            }
+        };
 
         let record = AgentRecord {
             agent_id: agent_id.clone(),
@@ -6258,15 +6582,23 @@ fn spawn_self_monitor(storage: Arc<StorageHandle>, cfg: HubConfig) {
             Ok(Err(err)) => tracing::error!(error = %err, "注册本机 agent 失败"),
             Err(err) => tracing::error!(error = %err, "注册本机 agent 任务失败"),
         }
-        tracing::info!("本机采集已启用（agent_id = {HUB_SELF_AGENT_ID}）");
+        tracing::info!(
+            agent_id = HUB_SELF_AGENT_ID,
+            buffer_dir = %buffer_dir.display(),
+            "本机采集已启用（持久缓冲 + 重试）"
+        );
 
+        let mut interval_ms = (*interval_rx.borrow_and_update()).max(1);
+        let mut watch_alive = true;
         loop {
             let ts = now_ms();
             let mut samples = Vec::new();
             for collector in &collectors {
                 samples.extend(collector.collect(ts));
             }
-            if !samples.is_empty() {
+            let batch = if samples.is_empty() {
+                None
+            } else {
                 let batch = SampleBatch {
                     agent_id: agent_id.clone(),
                     epoch,
@@ -6278,21 +6610,76 @@ fn spawn_self_monitor(storage: Arc<StorageHandle>, cfg: HubConfig) {
                 // #50：self-monitor 与 agent 共用同一时间戳准入校验。
                 if batch_timestamp_out_of_bounds(&batch, &cfg, ts) {
                     note_timestamp_rejected_batch(HUB_SELF_AGENT_ID, &batch);
+                    None
                 } else {
-                    let storage = storage.clone();
-                    match tokio::task::spawn_blocking(move || storage.insert_batch(&batch)).await {
-                        Ok(Ok(IngestOutcome::Inserted { .. } | IngestOutcome::Duplicate)) => {}
-                        Ok(Ok(IngestOutcome::Rejected(reason))) => {
-                            tracing::warn!(?reason, "本机采集批次被拒绝");
+                    Some(batch)
+                }
+            };
+
+            // 即使本轮没有新样本，也要尝试清空上一轮积压（入库失败重试）。
+            let outbox = outbox.clone();
+            let storage = storage.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let mut guard = match outbox.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if let Some(batch) = batch {
+                    guard.enqueue(batch);
+                    guard.persist_pending();
+                }
+                guard.flush(
+                    storage.as_ref(),
+                    SELF_MONITOR_FLUSH_MAX_BATCHES,
+                    SELF_MONITOR_FLUSH_BUDGET,
+                )
+            })
+            .await;
+            match outcome {
+                Ok(stats) if stats.attempted > 0 => {
+                    tracing::debug!(?stats, "本机采集缓冲刷新完成");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    // join 失败通常意味着 blocking 任务 panic；批次仍可能
+                    // 在持久缓冲里，下一轮 flush 会重试。
+                    tracing::warn!(error = %err, "本机采集缓冲任务失败，下一轮重试");
+                }
+            }
+
+            // #66：等待下一轮期间同时监听间隔更新；更新后从当前时刻重新计时。
+            let mut next_tick = tokio::time::Instant::now() + Duration::from_millis(interval_ms);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(next_tick) => break,
+                    changed = interval_rx.changed(), if watch_alive => {
+                        match changed {
+                            Ok(()) => {
+                                let new_ms = (*interval_rx.borrow_and_update()).max(1);
+                                if new_ms != interval_ms {
+                                    tracing::info!(
+                                        old_ms = interval_ms,
+                                        new_ms,
+                                        "本机采集间隔已更新"
+                                    );
+                                    interval_ms = new_ms;
+                                    // 只有值变化才重算下一轮；相同值的重复通知
+                                    // 不能无限推迟采样。
+                                    next_tick = tokio::time::Instant::now()
+                                        + Duration::from_millis(interval_ms);
+                                }
+                            }
+                            Err(_) => {
+                                // AppState 被销毁（进程退出）时才可能发生；保持
+                                // 当前间隔继续采样，避免忙循环。
+                                watch_alive = false;
+                            }
                         }
-                        Ok(Err(err)) => tracing::error!(error = %err, "本机采集入库失败"),
-                        Err(err) => tracing::error!(error = %err, "本机采集任务失败"),
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(cfg.sample_interval_ms)).await;
         }
-    });
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -7058,6 +7445,7 @@ mod tests {
             archive_download_slots: Arc::new(Semaphore::new(1)),
             archive_download_send_timeout: ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
             archive_download_principal_slots: Arc::new(StdMutex::new(HashMap::new())),
+            self_interval: watch::channel(5_000).0,
         };
         let token = "enroll-token-bad-csr";
         let now = now_ms();
@@ -7120,6 +7508,7 @@ mod tests {
             archive_download_slots: Arc::new(Semaphore::new(1)),
             archive_download_send_timeout: ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
             archive_download_principal_slots: Arc::new(StdMutex::new(HashMap::new())),
+            self_interval: watch::channel(5_000).0,
         };
 
         let token = "enroll-token-value";
@@ -7419,6 +7808,7 @@ mod tests {
             archive_download_slots: Arc::new(Semaphore::new(1)),
             archive_download_send_timeout: ARCHIVE_DOWNLOAD_SEND_TIMEOUT,
             archive_download_principal_slots: Arc::new(StdMutex::new(HashMap::new())),
+            self_interval: watch::channel(5_000).0,
         }
     }
 
@@ -9674,7 +10064,7 @@ mod tests {
             ],
         );
         // 另一台在线 agent 故意不应答：覆盖超时分支（保持句柄存活让通道不关闭）。
-        let _silent = m3_register_agent(&state, "a2", &["docker"]).await;
+        let mut silent = m3_register_agent(&state, "a2", &["docker"]).await;
         let router = admin_router(state.clone());
 
         let body = r#"{"capability":"systemd","action":"restart","target":"nginx.service","confirm":true}"#;
@@ -9697,6 +10087,21 @@ mod tests {
             m3_post(&router, "a2", r#"{"capability":"docker","action":"list"}"#).await;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(response["error"]["code"], "control_timeout");
+
+        // #65 API 级断言：504 返回后，会话队列里遗留的命令必须已失去 reply；
+        // 会话真正发送前检查 `reply.is_closed()` 后不会再发给 agent。
+        let command = tokio::time::timeout(Duration::from_secs(1), silent.control_rx.recv())
+            .await
+            .expect("超时命令必须仍在会话队列中")
+            .expect("会话控制通道必须仍打开");
+        assert!(
+            command.reply.is_closed(),
+            "API 504 后 reply 接收端必须已丢弃，会话发送前检查才能拦住旧请求"
+        );
+        assert!(
+            command.deadline <= Instant::now(),
+            "API 504 后遗留命令的绝对 deadline 必须已过"
+        );
 
         // 按 id 倒序：最近一条是超时，最早一条是 agent 拒绝。
         let entries = m3_audit(&state);
@@ -12922,6 +13327,9 @@ mod tests {
             .try_send(ControlCommand {
                 op: rustboard_common::control::ControlOp::SystemdList,
                 reply: reply_tx,
+                // #65：API 入队时必须带绝对 deadline；本测试只验证吊销门禁，
+                // 给一个足够长的 deadline。
+                deadline: Instant::now() + Duration::from_secs(30),
             })
             .expect("队列应能接收命令");
 
@@ -13081,6 +13489,62 @@ mod tests {
             .map(|certs| certs.iter().map(|cert| cert.as_ref().to_vec()).collect())
             .unwrap_or_default();
         Ok((String::from_utf8_lossy(&response).into_owned(), peer_certs))
+    }
+
+    /// #68 启动严重项：live 摘要必须与启动时真正构建的 rustls 配置同源。
+    ///
+    /// 先 load 得到 `LoadedTlsConfig`，再用这份 config 起 TLS 监听，客户端握手
+    /// 读到的服务端证书指纹必须等于 `loaded.status.fingerprint`。这直接锁定
+    /// “listener 用旧 cert、live 已是新 cert”的 TOCTOU 回归。
+    #[tokio::test]
+    async fn v100_startup_live_status_matches_loaded_config_cert() {
+        let dir = temp_dir("startup-live-match");
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], tls::CertPolicy::default())
+            .unwrap();
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            server_names: vec!["localhost".to_string()],
+            ..HubConfig::default()
+        };
+        let loaded =
+            cert_rotation::load_or_repair_tls_config_with_status(&cfg).expect("启动 TLS 加载失败");
+        let expected_fingerprint = loaded.status.fingerprint.clone();
+        let config = loaded.config;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定测试端口");
+        let addr = listener.local_addr().unwrap();
+        let acceptor = TlsAcceptor::from(config);
+        let server = tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                let _ = acceptor.accept(tcp).await;
+            }
+        });
+
+        let client = admin_tls_client_config(&cfg.data_dir);
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("连接测试 TLS 端口");
+        let server_name =
+            rustls::pki_types::ServerName::try_from("localhost").expect("server name 合法");
+        let stream = tokio_rustls::TlsConnector::from(client)
+            .connect(server_name, tcp)
+            .await
+            .expect("TLS 握手失败");
+        let certs = stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .expect("客户端必须收到服务端证书");
+        assert_eq!(
+            der_fingerprint(certs[0].as_ref()),
+            expected_fingerprint,
+            "live status 必须与 listener 实际使用的证书一致"
+        );
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// required：HTTPS `/healthz` 200；明文 TCP 发同一请求拿不到 HTTP 200。
@@ -13921,5 +14385,421 @@ mod tests {
                 "必须拒绝控制字符: {bad:?}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // #66 / #75：self monitor 有效间隔与持久缓冲
+    // ------------------------------------------------------------------
+
+    /// #66：把 AppState 的 self interval watch 替换为测试通道，返回接收端。
+    fn self_interval_state(cfg: HubConfig, initial: u64) -> (AppState, watch::Receiver<u64>) {
+        let mut state = hub_state_with(cfg);
+        let (tx, rx) = watch::channel(initial);
+        state.self_interval = tx;
+        (state, rx)
+    }
+
+    /// 记录每轮采集时间戳的自定义采集器；用于断言实际采样周期变化。
+    struct RecordingCollector {
+        timestamps: Arc<StdMutex<Vec<i64>>>,
+    }
+
+    impl Collector for RecordingCollector {
+        fn name(&self) -> &'static str {
+            "test-recording"
+        }
+
+        fn collect(&self, ts: i64) -> Vec<Sample> {
+            self.timestamps.lock().expect("时间戳锁不得中毒").push(ts);
+            vec![Sample::new("hub.test", ts, 1.0)]
+        }
+    }
+
+    async fn wait_for_timestamp_count(
+        timestamps: &Arc<StdMutex<Vec<i64>>>,
+        expected: usize,
+        what: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if timestamps.lock().expect("时间戳锁不得中毒").len() >= expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}超时：期望至少 {expected} 次采样"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// #66：self monitor 必须使用运行时 watch 的新间隔，而不是启动配置。
+    /// 断言实际采集时间戳的间隔，而不只是 PUT/GET 返回值。
+    #[tokio::test]
+    async fn self_monitor_applies_runtime_interval_change() {
+        let dir = temp_dir("self-monitor-interval");
+        let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
+        let storage_check = storage.clone();
+        let timestamps = Arc::new(StdMutex::new(Vec::new()));
+        let cfg = HubConfig {
+            self_monitor: true,
+            data_dir: dir.clone(),
+            ..HubConfig::default()
+        };
+        let (tx, rx) = watch::channel(30u64);
+        let handle = spawn_self_monitor_with(
+            storage,
+            cfg,
+            vec![Box::new(RecordingCollector {
+                timestamps: timestamps.clone(),
+            })],
+            rx,
+            dir.join("buffer"),
+        );
+
+        wait_for_timestamp_count(&timestamps, 4, "初始周期采样").await;
+        let before = timestamps.lock().expect("时间戳锁不得中毒").len();
+        tx.send(250).expect("watch 接收端必须存活");
+        wait_for_timestamp_count(&timestamps, before + 2, "新周期采样").await;
+
+        let values = timestamps.lock().expect("时间戳锁不得中毒").clone();
+        let last_gap = values[values.len() - 1] - values[values.len() - 2];
+        assert!(
+            last_gap >= 200,
+            "更新为 250ms 后实际采样间隔应明显变长，实际 {last_gap}ms: {values:?}"
+        );
+        assert!(
+            storage_check.sample_count(HUB_SELF_AGENT_ID).unwrap() > 0,
+            "self monitor 样本必须经 outbox 成功入库"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #66：DB 中的有效间隔在启动时被读取，PUT hub-self settings 会唤醒
+    /// self monitor；普通 agent 的设置不能误改本机采集。
+    #[tokio::test]
+    async fn hub_self_put_settings_signals_self_interval_watch() {
+        let token = "self-interval-admin-token-0123456789";
+        let cfg = HubConfig {
+            admin_token: token.to_string(),
+            admin_rate_limit_per_min: 0,
+            admin_write_rate_limit_per_min: 0,
+            ..HubConfig::default()
+        };
+        let (state, mut rx) = self_interval_state(cfg, 5_000);
+        state
+            .storage
+            .upsert_agent(&test_agent(HUB_SELF_AGENT_ID))
+            .unwrap();
+        let router = admin_router(state.clone());
+
+        let (status, _, _) = admin_call(
+            &router,
+            "PUT",
+            "/api/v1/agents/hub-self/settings",
+            Some(token),
+            Some(r#"{"sample_interval_ms":7000}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(rx.has_changed().expect("watch 必须可用"));
+        assert_eq!(*rx.borrow_and_update(), 7_000);
+
+        // 相同值的 PUT 不应重复通知 self monitor（否则会不断重置采样计时）。
+        let (status, _, _) = admin_call(
+            &router,
+            "PUT",
+            "/api/v1/agents/hub-self/settings",
+            Some(token),
+            Some(r#"{"sample_interval_ms":7000}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !rx.has_changed().expect("watch 必须可用"),
+            "相同值的 PUT 不得重复通知 self monitor"
+        );
+
+        // 普通 agent 的 PUT 只踢它自己的会话，不能改 self monitor。
+        state.storage.upsert_agent(&test_agent("agent-1")).unwrap();
+        let (status, _, _) = admin_call(
+            &router,
+            "PUT",
+            "/api/v1/agents/agent-1/settings",
+            Some(token),
+            Some(r#"{"sample_interval_ms":9000}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !rx.has_changed().expect("watch 必须可用"),
+            "普通 agent 设置不得触发 self monitor 更新"
+        );
+    }
+
+    /// #66：没有 self monitor 接收者时不得误报“已通知”；相同值也不重复通知。
+    #[test]
+    fn signal_self_interval_requires_receiver_and_skips_same_value() {
+        let state = hub_state_with(HubConfig::default());
+        assert_eq!(state.self_interval.receiver_count(), 0);
+        assert!(
+            !signal_self_interval(&state, 7_000),
+            "无接收者时必须返回未通知"
+        );
+
+        let (tx, mut rx) = watch::channel(5_000u64);
+        let mut state = hub_state_with(HubConfig::default());
+        state.self_interval = tx;
+        assert!(signal_self_interval(&state, 7_000));
+        assert!(rx.has_changed().expect("watch 必须可用"));
+        assert_eq!(*rx.borrow_and_update(), 7_000);
+
+        assert!(!signal_self_interval(&state, 7_000), "相同值不重复通知");
+        assert!(!rx.has_changed().expect("watch 必须可用"));
+    }
+
+    /// #66：watch 收到相同间隔时不得重置 next_tick；否则高频同值 PUT/通知会让
+    /// 采样无限推迟。这里直接观察实际采集时间戳。
+    #[tokio::test]
+    async fn self_monitor_same_interval_notifications_do_not_postpone_sampling() {
+        let dir = temp_dir("self-monitor-same-interval");
+        let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
+        let timestamps = Arc::new(StdMutex::new(Vec::new()));
+        let cfg = HubConfig {
+            self_monitor: true,
+            data_dir: dir.clone(),
+            ..HubConfig::default()
+        };
+        let (tx, rx) = watch::channel(100u64);
+        let handle = spawn_self_monitor_with(
+            storage,
+            cfg,
+            vec![Box::new(RecordingCollector {
+                timestamps: timestamps.clone(),
+            })],
+            rx,
+            dir.join("buffer"),
+        );
+
+        wait_for_timestamp_count(&timestamps, 2, "同值通知前的采样").await;
+        let before = timestamps.lock().expect("时间戳锁不得中毒").len();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(350);
+        while tokio::time::Instant::now() < deadline {
+            tx.send(100).expect("watch 接收端必须存活");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let after = timestamps.lock().expect("时间戳锁不得中毒").len();
+        assert!(
+            after >= before + 2,
+            "相同间隔的重复通知不能推迟采样：before={before}, after={after}"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_self_batch(seq: u64) -> SampleBatch {
+        SampleBatch {
+            agent_id: HUB_SELF_AGENT_ID.to_string(),
+            epoch: 42,
+            seq,
+            boot_id: "test-boot".to_string(),
+            sent_at: now_ms(),
+            samples: vec![Sample::new("hub.test", now_ms(), 1.0)],
+        }
+    }
+
+    /// 可注入一次性入库失败的测试 sink；可选永久拒绝。
+    struct TestSelfSink {
+        fail_first: bool,
+        reject: bool,
+        calls: std::sync::atomic::AtomicUsize,
+        inserted: StdMutex<Vec<(u64, u64)>>,
+    }
+
+    impl TestSelfSink {
+        fn ok() -> Self {
+            Self {
+                fail_first: false,
+                reject: false,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                inserted: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn fail_once() -> Self {
+            Self {
+                fail_first: true,
+                ..Self::ok()
+            }
+        }
+
+        fn reject() -> Self {
+            Self {
+                reject: true,
+                ..Self::ok()
+            }
+        }
+
+        fn inserted(&self) -> Vec<(u64, u64)> {
+            self.inserted.lock().expect("inserted 锁不得中毒").clone()
+        }
+    }
+
+    impl SelfMonitorSink for TestSelfSink {
+        fn insert_batch(&self, batch: &SampleBatch) -> Result<IngestOutcome> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.reject {
+                return Ok(IngestOutcome::Rejected(RejectReason::Invalid));
+            }
+            if self.fail_first && call == 0 {
+                anyhow::bail!("测试注入：首次入库失败");
+            }
+            self.inserted
+                .lock()
+                .expect("inserted 锁不得中毒")
+                .push((batch.epoch, batch.seq));
+            Ok(IngestOutcome::Inserted {
+                inserted: batch.samples.len(),
+            })
+        }
+    }
+
+    /// #75：首次写失败后保留批次，下一次 flush 成功入库且只入库一次。
+    #[test]
+    fn self_monitor_outbox_retries_failed_insert_without_duplicates() {
+        let dir = temp_dir("self-monitor-outbox-retry");
+        let mut outbox = SelfMonitorOutbox::open(
+            &dir,
+            SELF_MONITOR_BUFFER_MAX_BYTES,
+            SELF_MONITOR_BUFFER_MAX_AGE_MS,
+        )
+        .expect("打开持久缓冲失败");
+        outbox.enqueue(test_self_batch(0));
+        outbox.persist_pending();
+        assert_eq!(outbox.pending_len(), 1, "批次必须先落盘");
+
+        let sink = TestSelfSink::fail_once();
+        let first = outbox.flush(&sink, 16, Duration::from_secs(1));
+        assert_eq!(first.failed, 1);
+        assert_eq!(first.acked, 0);
+        assert_eq!(outbox.pending_len(), 1, "失败批次必须保留待重试");
+
+        let second = outbox.flush(&sink, 16, Duration::from_secs(1));
+        assert_eq!(second.inserted, 1);
+        assert_eq!(second.failed, 0);
+        assert_eq!(outbox.pending_len(), 0, "成功入库后必须移除");
+        assert_eq!(sink.inserted(), vec![(42, 0)]);
+
+        drop(outbox);
+        let reopened = SelfMonitorOutbox::open(
+            &dir,
+            SELF_MONITOR_BUFFER_MAX_BYTES,
+            SELF_MONITOR_BUFFER_MAX_AGE_MS,
+        )
+        .expect("重新打开持久缓冲失败");
+        assert_eq!(reopened.pending_len(), 0, "成功后重启不得重放");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #75：未入库批次在重启后仍可恢复；恢复成功后 ACK，下一次重启不重放。
+    #[test]
+    fn self_monitor_outbox_survives_restart() {
+        let dir = temp_dir("self-monitor-outbox-restart");
+        {
+            let mut outbox = SelfMonitorOutbox::open(
+                &dir,
+                SELF_MONITOR_BUFFER_MAX_BYTES,
+                SELF_MONITOR_BUFFER_MAX_AGE_MS,
+            )
+            .expect("打开持久缓冲失败");
+            outbox.enqueue(test_self_batch(7));
+            outbox.persist_pending();
+            assert_eq!(outbox.pending_len(), 1);
+        }
+
+        {
+            let mut outbox = SelfMonitorOutbox::open(
+                &dir,
+                SELF_MONITOR_BUFFER_MAX_BYTES,
+                SELF_MONITOR_BUFFER_MAX_AGE_MS,
+            )
+            .expect("重启后打开持久缓冲失败");
+            assert_eq!(outbox.pending_len(), 1, "重启必须恢复未入库批次");
+            let sink = TestSelfSink::ok();
+            let stats = outbox.flush(&sink, 16, Duration::from_secs(1));
+            assert_eq!(stats.inserted, 1);
+            assert_eq!(stats.acked, 1);
+            assert_eq!(sink.inserted(), vec![(42, 7)]);
+            assert_eq!(outbox.pending_len(), 0);
+        }
+
+        let reopened = SelfMonitorOutbox::open(
+            &dir,
+            SELF_MONITOR_BUFFER_MAX_BYTES,
+            SELF_MONITOR_BUFFER_MAX_AGE_MS,
+        )
+        .expect("再次打开持久缓冲失败");
+        assert_eq!(reopened.pending_len(), 0, "已入库批次不得重复重放");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #75：永久 Rejected 不重试，ACK 后移除；重启也不得再次入库。
+    #[test]
+    fn self_monitor_outbox_does_not_retry_permanent_rejections() {
+        let dir = temp_dir("self-monitor-outbox-rejected");
+        let mut outbox = SelfMonitorOutbox::open(
+            &dir,
+            SELF_MONITOR_BUFFER_MAX_BYTES,
+            SELF_MONITOR_BUFFER_MAX_AGE_MS,
+        )
+        .expect("打开持久缓冲失败");
+        outbox.enqueue(test_self_batch(0));
+        outbox.persist_pending();
+        let sink = TestSelfSink::reject();
+        let stats = outbox.flush(&sink, 16, Duration::from_secs(1));
+        assert_eq!(stats.rejected, 1);
+        assert_eq!(stats.acked, 1);
+        assert_eq!(outbox.pending_len(), 0, "永久拒绝必须 ACK 移除");
+
+        drop(outbox);
+        let mut reopened = SelfMonitorOutbox::open(
+            &dir,
+            SELF_MONITOR_BUFFER_MAX_BYTES,
+            SELF_MONITOR_BUFFER_MAX_AGE_MS,
+        )
+        .expect("重新打开持久缓冲失败");
+        assert_eq!(reopened.pending_len(), 0);
+        let stats = reopened.flush(&sink, 16, Duration::from_secs(1));
+        assert_eq!(stats.attempted, 0, "永久拒绝不得重试");
+        assert_eq!(
+            sink.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "永久拒绝只允许一次入库尝试"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #75：容量满时丢最旧并记录 dropped，不 panic；重启仍可打开。
+    #[test]
+    fn self_monitor_outbox_drops_oldest_on_capacity_without_panic() {
+        let dir = temp_dir("self-monitor-outbox-capacity");
+        let mut outbox = SelfMonitorOutbox::open(&dir, 300, SELF_MONITOR_BUFFER_MAX_AGE_MS)
+            .expect("打开持久缓冲失败");
+        for seq in 0..20 {
+            outbox.enqueue(test_self_batch(seq));
+            outbox.persist_pending();
+        }
+        assert!(outbox.pending_len() < 20, "容量上限必须生效");
+        assert!(outbox.dropped() > 0, "必须记录丢弃计数");
+        drop(outbox);
+        let reopened = SelfMonitorOutbox::open(&dir, 300, SELF_MONITOR_BUFFER_MAX_AGE_MS)
+            .expect("容量淘汰后重启必须成功");
+        assert!(reopened.pending_len() < 20);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

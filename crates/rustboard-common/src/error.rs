@@ -36,10 +36,18 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// M3：读取前先收紧既有文件的权限。老版本可能把配置留成 0644，
 /// 而 agent.toml 里通常带着 enrollment token。
+///
+/// 解析失败只给固定诊断（路径 + “TOML 解析失败”）：`toml::de::Error` 会回显
+/// 源码行，配置里的 token / 密码不能进入 stderr 或日志。
 pub fn load_toml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     crate::fsutil::harden(path, 0o600)?;
     let text = std::fs::read_to_string(path)?;
-    Ok(toml::from_str(&text)?)
+    toml::from_str(&text).map_err(|_| {
+        Error::InvalidConfig(format!(
+            "TOML 解析失败: {}（已隐藏原始配置内容与解析位置，避免泄露 token/密码）",
+            path.display()
+        ))
+    })
 }
 
 /// 写入 TOML 配置：父目录 0700，文件原子写入且权限 0600。
@@ -59,7 +67,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    #[derive(serde::Serialize, serde::Deserialize)]
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
     struct TestConfig {
         token: String,
     }
@@ -102,6 +110,25 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1 复审：TOML 解析错误不得回显含 token 的原始配置行。
+    #[test]
+    fn load_toml_parse_error_does_not_echo_config_source() {
+        let dir =
+            std::env::temp_dir().join(format!("rb-load-toml-parse-leak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.toml");
+        let secret = "load-toml-canary-token-7c1a";
+        std::fs::write(&path, format!("token = \"{secret}\"\nbroken = [\n")).unwrap();
+
+        let err = load_toml::<TestConfig>(&path).expect_err("非法 TOML 必须失败");
+        let message = format!("{err:#}");
+        assert!(message.contains("TOML 解析失败"), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(!message.contains(secret), "解析错误泄露配置原文: {message}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2,7 +2,7 @@
 #
 # 使用前请：
 # 1. 准备 dist/<arch>/bin 与 web/dist，构建三个镜像（见 docker/README.md）；
-# 2. 把下面的 hub.example.com、REPLACE_WITH_... 占位符换成真实值；
+# 2. 把下面的 hub.example.com、RUSTBOARD_* 占位符换成真实值；
 # 3. 不要把 8444 发布到宿主；不要给 panel 添加 ports。
 #
 # 启动 hub + panel：
@@ -16,6 +16,11 @@
 #   docker compose -f docker/compose.example.yml \
 #     -f docker/compose.acme.example.yml up -d
 # 本文件默认不发布 80/443，避免不需要 ACME 的部署多开端口。
+#
+# agent 的 Trust 模式：self-signed hub 用 fingerprint（默认）；公共 ACME hub
+# 用 system-roots（compose.acme.example.yml 会一并切换）；私有 ACME 或私有
+# CA 用 custom-ca + compose.agent-custom-ca.example.yml 只读挂载服务端 CA。
+# 这些变量只在 agent 首次初始化时生效，之后以 agent.toml 为准。
 #
 # 数据库默认 SQLite（hub_data volume 内），本文件**不**包含 PostgreSQL service。
 # 需要显式 opt-in PostgreSQL 时叠加专用文件（不是默认行为）：
@@ -109,10 +114,23 @@ services:
       - agent_data:/data
       # enrollment token 只以 0600 文件挂载，禁止放进环境变量或镜像。
       - ${RUSTBOARD_ENROLL_TOKEN_FILE:-./secrets/enroll.token}:/run/rustboard/enroll_token:ro
+      # 仅 custom-ca：只读挂载服务端 CA PEM。推荐用叠加文件
+      # docker/compose.agent-custom-ca.example.yml（自动设置下面的路径和模式）。
+      # - ${RUSTBOARD_AGENT_SERVER_CA_FILE:-./secrets/agent-server-ca.pem}:/run/rustboard/server-ca.pem:ro
     environment:
       RUSTBOARD_HUB_URL: "${RUSTBOARD_HUB_URL:-wss://hub.example.com:8443/agent/ws}"
       RUSTBOARD_TOKEN_FILE: "/run/rustboard/enroll_token"
-      RUSTBOARD_FINGERPRINT: "${RUSTBOARD_HUB_FINGERPRINT:-REPLACE_WITH_64_HEX_FINGERPRINT}"
+      # 服务端信任模式：fingerprint（默认，自签 hub）/ system-roots（公共
+      # ACME 证书）/ custom-ca（私有 ACME / 私有 CA）。只影响首次初始化；
+      # 之后以 agent.toml 为准。ACME hub 用 compose.acme.example.yml 叠加，
+      # 私有 ACME/私有 CA 再用 compose.agent-custom-ca.example.yml 叠加。
+      RUSTBOARD_TLS_MODE: "${RUSTBOARD_AGENT_TLS_MODE:-fingerprint}"
+      # custom-ca 的容器内 CA 路径；其他模式必须为空。
+      RUSTBOARD_SERVER_CA: "${RUSTBOARD_AGENT_SERVER_CA:-}"
+      # fingerprint 模式必填；system-roots 必须留空。custom-ca 以 CA 为信任根，
+      # fingerprint 可留空（仅兼容记录，运行时不用于服务端校验）。保留旧变量名
+      # RUSTBOARD_HUB_FINGERPRINT；默认空，缺失时 entrypoint 会明确列出变量名。
+      RUSTBOARD_FINGERPRINT: "${RUSTBOARD_AGENT_FINGERPRINT:-${RUSTBOARD_HUB_FINGERPRINT:-}}"
       RUSTBOARD_NAME: "${RUSTBOARD_AGENT_NAME:-agent-01}"
     healthcheck:
       # 未完成 enrollment 前必然失败；Dockerfile 给了 90s start-period。

@@ -12,7 +12,9 @@
 已知问题见 [docs/known-issues.md](docs/known-issues.md)。
 协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面、v0.3.x 硬化、M4 告警/归档、v0.4.x 修复已完成；M5 Phase A/B/C/D 已完成，Phase E 的 #27–#50 缺陷修复已进入 `v1.0.0-rc.3`（schema v8、归档 claim、增量 1m/1h、Agent/Buffer/Panel/WebDAV 修复）。`v1.0.0-rc.2` 不移动；rc.3 的 amd64 全部测试/E2E 已通过，**24h 长稳与 100/500/1000 agent 最终复跑仍在进行，`v1.0.0` 未发布**。具体门禁见 [docs/status.md](docs/status.md) 与 [修复方案](docs/plans/2026-10-27-open-issues-remediation.md)。**
+> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面、v0.3.x 硬化、M4 告警/归档、v0.4.x 修复已完成；M5 Phase A/B/C/D 已完成，Phase E 第二轮 #51–#102 修复已进入 `v1.0.0-rc.4` 候选（schema v9、fresh install only、告警 CAS/关系表、备份 TLS/证书锁、安装器/SFTP/测试门禁修复）。** 已发布的 `v1.0.0-rc.2`/`v1.0.0-rc.3` tag 不移动；amd64 单元/PG/关键 E2E 已通过，**3h/24h 长稳、100/500/1000 agent、Docker PG/安装、arm64 与最终评审/渗透仍在进行，`v1.0.0` 未发布**。具体门禁见 [docs/status.md](docs/status.md) 与 [修复方案](docs/plans/2026-10-28-open-issues-round2.md)。
+>
+> **v1.0.0 只支持全新安装**：schema <9 的旧数据库会被明确拒绝，不执行旧数据迁移；`#51`/`#58`/`#59` 的旧数据兼容将在首个正式版本之后提供。**
 > Phase B 交付静态 musl 离线包、Docker 多架构镜像和 release workflow；Phase C 增加 ACME（域名 / 公网 IP 自动续期）与面板直连 HTTPS；Phase D 增加 PostgreSQL（默认仍 SQLite）与迁移/备份/恢复。PostgreSQL 为单 hub 语义，配置与限制见 [PostgreSQL 文档](docs/install/postgres.md)。
 >
 > 线协议版本为 **2**：hub 与 agent 必须严格一致。版本不符时 hub 回 `bad_protocol`
@@ -109,7 +111,11 @@ TLS 文档：
 ```bash
 (cd web && pnpm install --frozen-lockfile && pnpm build)
 packaging/build-release.sh --arch amd64
-PACKAGE=dist/serverdashboard-v1.0.0-rc.2-x86_64.tar.gz SKIP_BUILD=1 \
+
+# 从 Cargo.toml 派生版本；不要写死 RC 号，包名必须与之一致
+VERSION=$(cargo metadata --no-deps --format-version 1 --offline \
+  | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "rustboard-hub"))')
+PACKAGE="dist/serverdashboard-v${VERSION}-x86_64.tar.gz" SKIP_BUILD=1 \
   bash tests/e2e/v100-offline.sh
 # 仅当已显式 PACKAGE 且 dist/amd64/bin 三二进制、packaging/install.sh、web/dist
 # 完整时才可用 SKIP_BUILD=1；缺源默认 fail-closed（ALLOW_UNVERIFIED=1 仅用于
@@ -122,7 +128,8 @@ docker compose -f docker/compose.example.yml \
   -f docker/compose.acme.example.yml config >/dev/null
 ```
 
-> 当前 `Cargo.toml` 为 `1.0.0-rc.2`；`v1.0.0` 的 CHANGELOG 归档、tag 与正式发布在
+> 当前源码版本以根 `Cargo.toml` 的 `[workspace.package].version` 为准（上面的
+> `VERSION` 即由 `cargo metadata` 派生）；`v1.0.0` 的 CHANGELOG 归档、tag 与正式发布在
 > Phase E 完成。Phase C RC 已发布，Phase D 已实现 PG/迁移/备份与 L-01/L-03；
 > 不改变协议帧、SQLite schema 或配置必填项（PG 为显式 opt-in，新字段均有默认值）。
 

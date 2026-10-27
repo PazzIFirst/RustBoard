@@ -25,7 +25,7 @@ use rustboard_common::util::{arch, boot_id, hostname, now_ms, os_pretty_name};
 use rustboard_common::wire::{codes, AgentHello, EnrollRequest, Frame};
 use rustboard_common::{DEFAULT_AGENT_CONFIG, PROTOCOL_VERSION, VERSION};
 use rustboard_core::buffer::DiskBuffer;
-use rustboard_core::collect::default_collectors;
+use rustboard_core::collect::{default_collectors, Collector};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
@@ -580,50 +580,27 @@ async fn run_async(cfg: AgentConfig) -> Result<()> {
             loop {
                 // 首轮立即采集，之后按「当前」间隔休眠（首轮不等待）。
                 let ts = now_ms();
-                let mut samples = Vec::new();
-                for collector in collectors.iter() {
-                    samples.extend(collector.collect(ts));
-                }
-                // M4-B1：客户端证书剩余寿命（天 + 小时）。未纳管 / 读取失败时
-                // 跳过这两个指标，只记 debug（每个采集周期都失败时不能刷 WARN）。
-                match client_cert_lifetimes(&cfg, ts) {
-                    Ok((days_left, hours_left)) => {
-                        samples.push(Sample::new("cert.days_left", ts, days_left as f64));
-                        samples.push(Sample::new("cert.hours_left", ts, hours_left as f64));
-                    }
-                    Err(err) => {
-                        tracing::debug!(error = %err, "读取客户端证书剩余寿命失败，跳过指标")
-                    }
-                }
-
-                // M4-B1：本地缓冲水位。锁顺序固定为「先取 pending，再 push 同一个
-                // guard」：pending_bytes 只读偏移量、不额外加锁；两个样本在 push
-                // 前追加，统计的是本轮写入前的积压量。
-                let mut guard = buffer.lock().await;
-                let pending_bytes = guard.pending_bytes();
-                samples.push(Sample::new(
-                    "buffer.pending_bytes",
-                    ts,
-                    pending_bytes as f64,
-                ));
-                samples.push(Sample::new(
-                    "buffer.pending_ratio",
-                    ts,
-                    buffer_pending_ratio(pending_bytes, cfg.buffer_max_bytes),
-                ));
-                let batch = SampleBatch {
-                    agent_id: agent_id.clone(),
+                match collect_and_buffer_once(
+                    collectors.as_slice(),
+                    &cfg,
+                    &agent_id,
                     epoch,
-                    seq: seq.fetch_add(1, Ordering::Relaxed),
-                    boot_id: boot.clone(),
-                    sent_at: ts,
-                    samples,
-                };
-                match guard.push(&batch) {
-                    Ok(()) => notify.notify_one(),
-                    Err(err) => tracing::warn!(error = %err, "写入本地缓冲失败"),
+                    &boot,
+                    ts,
+                    &seq,
+                    &buffer,
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(_) => notify.notify_one(),
+                    Err(err) => {
+                        // 配置已在启动时校验；走到这里说明有调用方绕过校验，
+                        // 明确停止采集任务，不能继续用错误上限静默采集。
+                        tracing::error!(error = %err, "采集一轮失败，停止采集任务");
+                        return;
+                    }
                 }
-                drop(guard);
 
                 // 若本轮采集为空也照样休眠，避免空样本时忙等。
                 // 分片休眠，每片最多 `SAMPLE_INTERVAL_SLICE`；Welcome 更新间隔后
@@ -791,6 +768,112 @@ fn buffer_pending_ratio(pending_bytes: u64, max_bytes: u64) -> f64 {
         return 0.0;
     }
     (pending_bytes as f64 / max_bytes as f64).clamp(0.0, 1.0)
+}
+
+/// 把一轮采集结果按 `max_batch_samples` 拆成多个批次（#63）。
+///
+/// - 保持 `samples` 的原始顺序；`agent_id` / `epoch` / `boot_id` / `sent_at`
+///   在所有子批中一致；
+/// - 每个非空子批从共享 `next_seq` 取一个独立序号，避免 hub 把同一轮的不同
+///   子批按 `(agent_id, epoch, seq)` 判成重复批次；
+/// - 空输入返回空 Vec，绝不生成空批，也不消耗 seq。
+///
+/// `max_batch_samples` 已由 `AgentConfig::validate` 保证 ≥ 1；这里仍显式检查，
+/// 防止绕过配置校验的调用方触发 `chunks(0)` panic 或静默忽略上限。
+fn build_sample_batches(
+    samples: Vec<Sample>,
+    agent_id: &str,
+    epoch: u64,
+    boot_id: &str,
+    sent_at: i64,
+    max_batch_samples: usize,
+    next_seq: &AtomicU64,
+) -> Result<Vec<SampleBatch>> {
+    if max_batch_samples < 1 {
+        bail!("max_batch_samples 必须 ≥ 1，实际 {max_batch_samples}");
+    }
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(samples
+        .chunks(max_batch_samples)
+        .map(|chunk| SampleBatch {
+            agent_id: agent_id.to_string(),
+            epoch,
+            seq: next_seq.fetch_add(1, Ordering::Relaxed),
+            boot_id: boot_id.to_string(),
+            sent_at,
+            samples: chunk.to_vec(),
+        })
+        .collect())
+}
+
+/// 执行一轮采集：收集 collector / cert / buffer 指标，按上限拆批后写入本地缓冲。
+///
+/// 返回成功写入的批次数（空采集返回 0）。拆批参数非法时返回错误，由采集任务
+/// 明确停止，而不是继续用错误上限静默采集。
+///
+/// 锁顺序与旧实现一致：「先取 pending，再 push 同一个 guard」；两个 buffer
+/// 指标在 push 前追加，统计的是本轮写入前的积压量。
+#[allow(clippy::too_many_arguments)]
+async fn collect_and_buffer_once(
+    collectors: &[Box<dyn Collector>],
+    cfg: &AgentConfig,
+    agent_id: &str,
+    epoch: u64,
+    boot_id: &str,
+    ts: i64,
+    seq: &AtomicU64,
+    buffer: &Mutex<DiskBuffer>,
+) -> Result<usize> {
+    let mut samples = Vec::new();
+    for collector in collectors {
+        samples.extend(collector.collect(ts));
+    }
+
+    // M4-B1：客户端证书剩余寿命（天 + 小时）。未纳管 / 读取失败时跳过这两个
+    // 指标，只记 debug（每个采集周期都失败时不能刷 WARN）。
+    match client_cert_lifetimes(cfg, ts) {
+        Ok((days_left, hours_left)) => {
+            samples.push(Sample::new("cert.days_left", ts, days_left as f64));
+            samples.push(Sample::new("cert.hours_left", ts, hours_left as f64));
+        }
+        Err(err) => tracing::debug!(error = %err, "读取客户端证书剩余寿命失败，跳过指标"),
+    }
+
+    let mut guard = buffer.lock().await;
+    let pending_bytes = guard.pending_bytes();
+    samples.push(Sample::new(
+        "buffer.pending_bytes",
+        ts,
+        pending_bytes as f64,
+    ));
+    samples.push(Sample::new(
+        "buffer.pending_ratio",
+        ts,
+        buffer_pending_ratio(pending_bytes, cfg.buffer_max_bytes),
+    ));
+
+    let batches = build_sample_batches(
+        samples,
+        agent_id,
+        epoch,
+        boot_id,
+        ts,
+        cfg.max_batch_samples,
+        seq,
+    )?;
+
+    let mut pushed = 0usize;
+    for batch in batches {
+        match guard.push(&batch) {
+            Ok(()) => pushed += 1,
+            Err(err) => {
+                tracing::warn!(error = %err, seq = batch.seq, "写入本地缓冲失败");
+            }
+        }
+    }
+    Ok(pushed)
 }
 
 /// 按 `session_max_hours` 给会话加一个最长存活时间。
@@ -1170,7 +1253,6 @@ fn load_server_ca(cfg: &AgentConfig) -> Result<String> {
     if !path.is_absolute() {
         bail!("server_ca 必须是绝对路径: {}", path.display());
     }
-
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("读取 server_ca 元数据失败: {}", path.display()))?;
     if meta.file_type().is_symlink() {
@@ -1664,6 +1746,7 @@ fn apply_sample_interval(interval: &AtomicU64, ms: u64) -> Result<()> {
 async fn maybe_renew_client_cert<Si, St>(
     sink: &mut Si,
     stream: &mut St,
+    control_rx: &mut tokio::sync::mpsc::Receiver<ControlResponse>,
     cfg: &AgentConfig,
     agent_id: &str,
 ) -> Result<()>
@@ -1681,7 +1764,7 @@ where
         return Ok(());
     }
     tracing::info!(days_left, threshold, "客户端证书接近到期，开始续签");
-    renew_client_cert(sink, stream, cfg, agent_id).await
+    renew_client_cert(sink, stream, control_rx, cfg, agent_id).await
 }
 
 /// 把已经完成、但还排在 channel 里的控制应答写回 hub（不等待新结果）。
@@ -1709,7 +1792,8 @@ where
 /// 已经完成 ACK 的批次。只有写超时说明连接可能已半死，必须向上传播重连。
 ///
 /// 进入续签前先 drain 已完成控制应答：续签会长时间占用 stream，不能让 hub 的
-/// 控制命令因等待写回而超时。
+/// 控制命令因等待写回而超时；续签等待期间的已完成应答由
+/// [`wait_for_cert_renewed`] 继续写回（#57）。
 async fn run_cert_check_if_due<Si, St>(
     sink: &mut Si,
     stream: &mut St,
@@ -1733,7 +1817,9 @@ where
             if cert_check_due(days_left, threshold, now, cert_check.last_attempt_ms) {
                 cert_check.last_attempt_ms = now;
                 tracing::info!(days_left, threshold, "周期证书检查：进入续签窗口");
-                if let Err(err) = maybe_renew_client_cert(sink, stream, cfg, agent_id).await {
+                if let Err(err) =
+                    maybe_renew_client_cert(sink, stream, control_rx, cfg, agent_id).await
+                {
                     if is_send_timeout_error(&err) {
                         return Err(err);
                     }
@@ -1807,14 +1893,101 @@ fn validate_renewed_cert(cfg: &AgentConfig, agent_id: &str, cert_pem: &str) -> R
     Ok(())
 }
 
+/// 等待 hub 下发 `CertRenewed`，同时把已完成控制应答写回（#57）。
+///
+/// 续签等待最多 20s，而 hub 侧控制命令有 15s 超时。旧实现只读 WebSocket，
+/// 续签开始后完成的命令应答会滞留到续签结束，hub 因此误报超时。
+///
+/// 这里仍然只有 `sink` 一个写者：stream 帧、Pong、busy_renewing 与已完成
+/// `ControlResponse` 全部经同一个 `&mut Si` 顺序写出。
+///
+/// `biased` 是必要的：`recv_frame` 一旦从 stream 取出完整帧就不可取消，默认的
+/// 随机选择可能在同一轮丢弃已就绪的 `CertRenewed` / `Problem`。控制应答分支
+/// 排在前面；控制并发上限为 4，且续签期间新 `ControlRequest` 只回 busy、不再
+/// 派发，不存在无限响应流，因此不会饿死续签帧。
+async fn wait_for_cert_renewed<Si, St>(
+    sink: &mut Si,
+    stream: &mut St,
+    control_rx: &mut tokio::sync::mpsc::Receiver<ControlResponse>,
+    cfg: &AgentConfig,
+) -> Result<String>
+where
+    Si: Sink<Message, Error = WsError> + Unpin,
+    St: Stream<Item = std::result::Result<Message, WsError>> + Unpin,
+{
+    let mut control_open = true;
+    tokio::time::timeout(CERT_RENEW_TIMEOUT, async {
+        loop {
+            tokio::select! {
+                biased;
+                response = control_rx.recv(), if control_open => {
+                    match response {
+                        Some(response) => {
+                            send_frame_with_config(
+                                sink,
+                                &Frame::ControlResponse(response),
+                                cfg,
+                            )
+                            .await?;
+                        }
+                        // dispatcher 已释放：之后不会再有应答。禁用该分支，
+                        // 避免 ready 的 None 让 select 忙循环。
+                        None => control_open = false,
+                    }
+                }
+                incoming = recv_frame(stream) => {
+                    match incoming? {
+                        Frame::CertRenewed { cert_pem } => return Ok(cert_pem),
+                        // 等待期间 hub 可能发来心跳，必须回应。
+                        Frame::Ping { ts } => {
+                            send_frame_with_config(sink, &Frame::Pong { ts }, cfg).await?;
+                        }
+                        Frame::Problem { code, message } => {
+                            bail!("hub 拒绝续签: {code} {message}");
+                        }
+                        // #16：续签等待期间不执行任何控制动作，立即回固定错误，
+                        // 避免 hub 一直等到超时。日志只记录 id / 错误码 / 帧类型，
+                        // 不记录 CSR、证书或控制参数；发送失败说明连接已不可用。
+                        Frame::ControlRequest(request) => {
+                            tracing::debug!(
+                                id = request.id,
+                                frame = "ControlRequest",
+                                code = control_codes::BUSY_RENEWING,
+                                "续签期间收到控制请求，回复 busy_renewing"
+                            );
+                            let response = ControlResponse::failure(
+                                request.id,
+                                ControlError::busy_renewing(),
+                            );
+                            send_frame_with_config(
+                                sink,
+                                &Frame::ControlResponse(response),
+                                cfg,
+                            )
+                            .await?;
+                        }
+                        // 其他帧与续签无关（例如在途批次的 Ack），等待期间丢弃。
+                        _ => {}
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("等待 CertRenewed 超时（{}s）", CERT_RENEW_TIMEOUT.as_secs()))?
+}
+
 /// 用当前私钥生成 CSR，向 hub 申请新证书并原子落盘。
 ///
 /// - 复用私钥：hub 全程不接触私钥，新旧证书对应同一把 key；
 /// - 20s 内必须收到 `CertRenewed`，等待期间照常回 Ping（否则会被 hub 判心跳超时）；
-/// - 落盘前用 [`validate_renewed_cert`] 做五项校验，任何一项不满足都保留旧证书。
+/// - 等待期间 select 已完成控制应答，复用同一个 sink 及时写回（#57）；
+/// - 落盘前用 [`validate_renewed_cert`] 做五项校验，任何一项不满足都保留旧证书；
+/// - 新证书落盘后写回剩余控制应答失败只告警，不把成功续签降级为失败。
 async fn renew_client_cert<Si, St>(
     sink: &mut Si,
     stream: &mut St,
+    control_rx: &mut tokio::sync::mpsc::Receiver<ControlResponse>,
     cfg: &AgentConfig,
     agent_id: &str,
 ) -> Result<()>
@@ -1829,39 +2002,21 @@ where
         std::fs::read_to_string(&key_path).context("读取客户端私钥失败，可能需要重新纳管")?;
     let csr_pem = tls::make_csr_with_key(&key_pem)?;
 
+    // #57：调用方 drain 之后还要读私钥、生成 CSR；这段时间完成的应答同样不能
+    // 被压在 channel 里等到续签结束。
+    drain_control_responses(sink, control_rx, cfg).await?;
     send_frame_with_config(sink, &Frame::RenewCert { csr_pem }, cfg).await?;
-    let cert_pem = tokio::time::timeout(CERT_RENEW_TIMEOUT, async {
-        loop {
-            match recv_frame(stream).await? {
-                Frame::CertRenewed { cert_pem } => return Ok::<String, anyhow::Error>(cert_pem),
-                // 等待期间 hub 可能发来心跳，必须回应。
-                Frame::Ping { ts } => {
-                    send_frame_with_config(sink, &Frame::Pong { ts }, cfg).await?;
-                }
-                Frame::Problem { code, message } => {
-                    bail!("hub 拒绝续签: {code} {message}");
-                }
-                // #16：续签等待期间不执行任何控制动作，立即回固定错误，
-                // 避免 hub 一直等到超时。日志只记录 id / 错误码 / 帧类型，
-                // 不记录 CSR、证书或控制参数；发送失败说明连接已不可用，向上传播。
-                Frame::ControlRequest(request) => {
-                    tracing::debug!(
-                        id = request.id,
-                        frame = "ControlRequest",
-                        code = control_codes::BUSY_RENEWING,
-                        "续签期间收到控制请求，回复 busy_renewing"
-                    );
-                    let response =
-                        ControlResponse::failure(request.id, ControlError::busy_renewing());
-                    send_frame_with_config(sink, &Frame::ControlResponse(response), cfg).await?;
-                }
-                // 其他帧与续签无关（例如在途批次的 Ack），等待期间丢弃。
-                _ => {}
-            }
+
+    let renewed = wait_for_cert_renewed(sink, stream, control_rx, cfg).await;
+    let cert_pem = match renewed {
+        Ok(cert_pem) => cert_pem,
+        Err(err) => {
+            // 续签失败 / 超时：仍尽量把等待期间完成的应答写回。写失败说明连接
+            // 已不可用，按原语义上抛；原始续签错误由调用方记录。
+            drain_control_responses(sink, control_rx, cfg).await?;
+            return Err(err);
         }
-    })
-    .await
-    .map_err(|_| anyhow!("等待 CertRenewed 超时（{}s）", CERT_RENEW_TIMEOUT.as_secs()))??;
+    };
 
     // 先校验再落盘：坏证书写进去会导致下次连接失败，比不续签更糟。
     validate_renewed_cert(cfg, agent_id, &cert_pem)?;
@@ -1877,6 +2032,16 @@ where
         tracing::warn!(
             error = %err,
             "更新 enrollment.complete 失败；下次启动会按当前证书修复完成标记"
+        );
+    }
+
+    // #57：等待期间 / 校验落盘期间完成的应答在这里统一写回。此时新证书已经
+    // 落盘，drain 失败只能说明连接不可用，不能反过来把续签判为失败，更不能
+    // 丢弃刚收到的新证书；降级为 WARN，重连后继续使用新证书。
+    if let Err(err) = drain_control_responses(sink, control_rx, cfg).await {
+        tracing::warn!(
+            error = %err,
+            "新证书已落盘，但写回已完成控制应答失败，本次会话继续"
         );
     }
 
@@ -2090,9 +2255,22 @@ async fn session(
         );
     }
 
+    // M3：控制请求由独立任务执行，应答经 channel 回到会话循环统一写 sink。
+    // 在首次续签前创建：续签等待期间也要及时写回已完成应答（#57），且
+    // sink 始终只有一个写者。
+    let (dispatcher, mut control_rx) = control::ControlDispatcher::new(ctx.cfg.control.clone());
+
     // A5：握手后检查客户端证书，必要时在会话内续签；失败只告警，不影响采集上报。
     // 但写超时说明连接可能已半死，必须向上传播并重连，不能只告警后继续。
-    if let Err(err) = maybe_renew_client_cert(&mut sink, &mut stream, ctx.cfg, ctx.agent_id).await {
+    if let Err(err) = maybe_renew_client_cert(
+        &mut sink,
+        &mut stream,
+        &mut control_rx,
+        ctx.cfg,
+        ctx.agent_id,
+    )
+    .await
+    {
         if is_send_timeout_error(&err) {
             return Err(err);
         }
@@ -2109,9 +2287,6 @@ async fn session(
     // 不主动重连，不能跳过续签窗口；deadline 与 session_deadline 相互独立。
     // #44：同一个 deadline 还会在每批 ACK 后检查，避免持续 backlog 饿死续签。
     let mut cert_check = CertCheckState::new(cert_check_period(ctx.cfg.cert_check_interval_hours));
-    // M3：控制请求由独立任务执行，应答经 channel 回到会话循环统一写 sink。
-    // 这样控制执行不会阻塞采集、ACK 或心跳；sink 仍然只有一个写者。
-    let (dispatcher, mut control_rx) = control::ControlDispatcher::new(ctx.cfg.control.clone());
 
     loop {
         let uploaded = upload_pending_batches(
@@ -2279,7 +2454,10 @@ async fn renew_once(cfg: &AgentConfig) -> Result<()> {
         &boot_id(),
     )
     .await?;
-    renew_client_cert(&mut sink, &mut stream, cfg, &agent_id).await?;
+    // 手工续签没有会话主循环 / 控制任务：用一个没有生产者的 channel，
+    // 让续签等待沿用与常驻会话相同的、唯一的写回路径（#57）。
+    let (_control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+    renew_client_cert(&mut sink, &mut stream, &mut control_rx, cfg, &agent_id).await?;
     // 主动关连接：否则 hub 侧只能看到 TCP 直接断开（close_notify 缺失），日志里会出现
     // 一条误导性的接收失败。关闭失败（含半死连接上的超时）不影响已经落盘的结果。
     if let Err(err) =
@@ -2620,6 +2798,102 @@ mod tests {
         }
     }
 
+    /// 没有生产者的控制应答 channel。
+    ///
+    /// 续签等待必须把 `None` 当成“以后不会再有应答”并禁用该分支；否则
+    /// ready 的 `None` 会让 select 忙循环。
+    fn closed_control_channel() -> tokio::sync::mpsc::Receiver<ControlResponse> {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(tx);
+        rx
+    }
+
+    /// 把记录下来的消息解码成帧，供断言使用。
+    fn sent_frames(sent: &Arc<std::sync::Mutex<Vec<Message>>>) -> Vec<Frame> {
+        sent.lock()
+            .expect("测试记录锁不应中毒")
+            .iter()
+            .map(|message| match message {
+                Message::Binary(bytes) => {
+                    Frame::decode(bytes.as_ref()).expect("发出的帧必须可解码")
+                }
+                other => panic!("只应发送二进制帧，实际: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// 记录型 sink，并在写出 RenewCert / ControlResponse 时唤醒测试等待者。
+    ///
+    /// 用于构造确定性时序：慢续签（hub 等应答写出后才发 CertRenewed）、
+    /// 续签前/中/后完成的 ControlResponse。`Notify::notify_one` 会为尚未开始
+    /// 等待的任务保留一个许可，避免测试里的竞态。
+    struct NotifyingRecordingSink {
+        sent: Arc<std::sync::Mutex<Vec<Message>>>,
+        renew_sent: Arc<tokio::sync::Notify>,
+        control_sent: Arc<tokio::sync::Notify>,
+    }
+
+    impl NotifyingRecordingSink {
+        #[allow(clippy::type_complexity)]
+        fn new() -> (
+            Self,
+            Arc<std::sync::Mutex<Vec<Message>>>,
+            Arc<tokio::sync::Notify>,
+            Arc<tokio::sync::Notify>,
+        ) {
+            let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let renew_sent = Arc::new(tokio::sync::Notify::new());
+            let control_sent = Arc::new(tokio::sync::Notify::new());
+            (
+                Self {
+                    sent: Arc::clone(&sent),
+                    renew_sent: Arc::clone(&renew_sent),
+                    control_sent: Arc::clone(&control_sent),
+                },
+                sent,
+                renew_sent,
+                control_sent,
+            )
+        }
+    }
+
+    impl Sink<Message> for NotifyingRecordingSink {
+        type Error = WsError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Message) -> std::result::Result<(), WsError> {
+            if let Message::Binary(bytes) = &item {
+                match Frame::decode(bytes.as_ref()) {
+                    Ok(Frame::RenewCert { .. }) => self.renew_sent.notify_one(),
+                    Ok(Frame::ControlResponse(_)) => self.control_sent.notify_one(),
+                    _ => {}
+                }
+            }
+            self.sent.lock().expect("测试记录锁不应中毒").push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     /// 第一次完整发送（RenewCert）放行，之后 `poll_ready` / `poll_flush` 永不就绪。
     ///
     /// 用来验证续签期间的 `busy_renewing` 应答被 `send_timeout_secs` 约束，
@@ -2756,7 +3030,8 @@ mod tests {
 
         let mut sink = NullSink;
         let mut stream = futures_util::stream::iter(vec![Ok(Message::Binary(frame))]);
-        renew_client_cert(&mut sink, &mut stream, &cfg, "agent-test")
+        let mut control_rx = closed_control_channel();
+        renew_client_cert(&mut sink, &mut stream, &mut control_rx, &cfg, "agent-test")
             .await
             .expect("收到 CertRenewed 必须续签成功");
 
@@ -3238,7 +3513,8 @@ mod tests {
         ]);
 
         let (mut sink, sent) = RecordingSink::new();
-        renew_client_cert(&mut sink, &mut stream, &cfg, "agent-test")
+        let mut control_rx = closed_control_channel();
+        renew_client_cert(&mut sink, &mut stream, &mut control_rx, &cfg, "agent-test")
             .await
             .expect("ControlRequest 不得中断续签");
 
@@ -3305,8 +3581,9 @@ mod tests {
         ]);
 
         let mut sink = StuckAfterFirstSendSink::default();
+        let mut control_rx = closed_control_channel();
         let started = tokio::time::Instant::now();
-        let err = renew_client_cert(&mut sink, &mut stream, &cfg, "agent-test")
+        let err = renew_client_cert(&mut sink, &mut stream, &mut control_rx, &cfg, "agent-test")
             .await
             .expect_err("busy_renewing 发送超时后必须结束续签");
         let elapsed = started.elapsed();
@@ -3341,7 +3618,8 @@ mod tests {
 
         let mut sink = NullSink;
         let mut stream = futures_util::stream::empty::<std::result::Result<Message, WsError>>();
-        maybe_renew_client_cert(&mut sink, &mut stream, &cfg, "agent-test")
+        let mut control_rx = closed_control_channel();
+        maybe_renew_client_cert(&mut sink, &mut stream, &mut control_rx, &cfg, "agent-test")
             .await
             .expect("未到阈值时不应报错");
 
@@ -3367,8 +3645,9 @@ mod tests {
         let mut sink = NullSink;
         let mut stream =
             futures_util::stream::iter(vec![Ok(Message::Binary(problem.encode().unwrap()))]);
+        let mut control_rx = closed_control_channel();
 
-        let err = renew_client_cert(&mut sink, &mut stream, &cfg, "agent-test")
+        let err = renew_client_cert(&mut sink, &mut stream, &mut control_rx, &cfg, "agent-test")
             .await
             .expect_err("hub 拒绝时续签必须失败");
         assert!(
@@ -3407,7 +3686,8 @@ mod tests {
         let frame = Frame::CertRenewed { cert_pem: foreign }.encode().unwrap();
         let mut sink = NullSink;
         let mut stream = futures_util::stream::iter(vec![Ok(Message::Binary(frame))]);
-        let err = renew_client_cert(&mut sink, &mut stream, &cfg, "agent-test")
+        let mut control_rx = closed_control_channel();
+        let err = renew_client_cert(&mut sink, &mut stream, &mut control_rx, &cfg, "agent-test")
             .await
             .expect_err("无关 CA 签发的证书必须被拒绝");
         assert!(format!("{err:#}").contains("签发"), "错误信息: {err:#}");
@@ -3501,6 +3781,249 @@ mod tests {
         for valid in [MIN_SAMPLE_INTERVAL_MS, 5_000, MAX_SAMPLE_INTERVAL_MS] {
             validate_sample_interval_config(valid).expect("合法配置必须通过");
         }
+    }
+
+    // ===== v1.0.0 R2：#63 max_batch_samples =====
+
+    /// 固定产出的测试 collector（不依赖宿主 /proc 的实际指标数量）。
+    struct FixedCollector {
+        name: &'static str,
+        metrics: &'static [&'static str],
+    }
+
+    impl Collector for FixedCollector {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn collect(&self, ts: i64) -> Vec<Sample> {
+            self.metrics
+                .iter()
+                .enumerate()
+                .map(|(index, metric)| Sample::new(*metric, ts, index as f64))
+                .collect()
+        }
+    }
+
+    fn fixed_samples(count: usize, ts: i64) -> Vec<Sample> {
+        (0..count)
+            .map(|index| Sample::new(format!("metric.{index}"), ts, index as f64))
+            .collect()
+    }
+
+    fn batch_shapes(batches: &[SampleBatch]) -> Vec<(u64, usize)> {
+        batches
+            .iter()
+            .map(|batch| (batch.seq, batch.samples.len()))
+            .collect()
+    }
+
+    /// #63：恰好整除时按上限拆批；每个子批独立 seq，字段与样本顺序保持一致。
+    #[test]
+    fn v100_max_batch_samples_exact_division_keeps_order_and_seq() {
+        let ts = 1_700_000_000_000;
+        let samples = fixed_samples(6, ts);
+        let seq = AtomicU64::new(0);
+        let batches =
+            build_sample_batches(samples.clone(), "agent-test", 7, "boot-fixed", ts, 3, &seq)
+                .expect("合法上限必须成功");
+
+        assert_eq!(batch_shapes(&batches), vec![(0, 3), (1, 3)]);
+        assert_eq!(seq.load(Ordering::Relaxed), 2);
+        for batch in &batches {
+            assert_eq!(batch.agent_id, "agent-test");
+            assert_eq!(batch.epoch, 7);
+            assert_eq!(batch.boot_id, "boot-fixed");
+            assert_eq!(batch.sent_at, ts);
+        }
+        let flattened: Vec<Sample> = batches
+            .iter()
+            .flat_map(|batch| batch.samples.iter().cloned())
+            .collect();
+        assert_eq!(flattened, samples, "拆批不得改变样本顺序或内容");
+
+        // 下一轮必须继续从共享 seq 递增，不能重复使用 0/1。
+        let next = build_sample_batches(
+            fixed_samples(1, ts + 1),
+            "agent-test",
+            7,
+            "boot-fixed",
+            ts + 1,
+            3,
+            &seq,
+        )
+        .expect("第二轮拆批必须成功");
+        assert_eq!(next[0].seq, 2);
+    }
+
+    /// #63：有余数时保留全部样本，且每批长度不超过上限。
+    #[test]
+    fn v100_max_batch_samples_remainder_keeps_every_sample() {
+        let samples = fixed_samples(7, 1);
+        let seq = AtomicU64::new(0);
+        let batches = build_sample_batches(samples.clone(), "agent-test", 1, "boot", 1, 3, &seq)
+            .expect("合法上限必须成功");
+
+        assert_eq!(batch_shapes(&batches), vec![(0, 3), (1, 3), (2, 1)]);
+        assert!(
+            batches.iter().all(|batch| batch.samples.len() <= 3),
+            "每批长度不得超过上限: {batches:?}"
+        );
+        let flattened: Vec<Sample> = batches
+            .iter()
+            .flat_map(|batch| batch.samples.iter().cloned())
+            .collect();
+        assert_eq!(flattened, samples, "余数批不得丢样本或改变顺序");
+        assert_eq!(flattened.len(), 7);
+    }
+
+    /// #63：单样本只产生一个批次（不产生空批）。
+    #[test]
+    fn v100_max_batch_samples_single_sample_is_one_batch() {
+        let seq = AtomicU64::new(0);
+        let batches =
+            build_sample_batches(fixed_samples(1, 1), "agent-test", 1, "boot", 1, 512, &seq)
+                .expect("合法上限必须成功");
+
+        assert_eq!(batch_shapes(&batches), vec![(0, 1)]);
+        assert_eq!(seq.load(Ordering::Relaxed), 1);
+    }
+
+    /// #63：上限 = 1 时每个样本单独成批，seq 连续且互不重复。
+    #[test]
+    fn v100_max_batch_samples_one_sends_each_sample_separately() {
+        let samples = fixed_samples(4, 1);
+        let seq = AtomicU64::new(0);
+        let batches = build_sample_batches(samples.clone(), "agent-test", 1, "boot", 1, 1, &seq)
+            .expect("上限 1 必须合法");
+
+        assert_eq!(batch_shapes(&batches), vec![(0, 1), (1, 1), (2, 1), (3, 1)]);
+        let flattened: Vec<Sample> = batches
+            .iter()
+            .flat_map(|batch| batch.samples.iter().cloned())
+            .collect();
+        assert_eq!(flattened, samples);
+    }
+
+    /// #63：空采集不发送空批，也不消耗 seq。
+    #[test]
+    fn v100_max_batch_samples_empty_round_sends_nothing() {
+        let seq = AtomicU64::new(5);
+        let batches = build_sample_batches(Vec::new(), "agent-test", 1, "boot", 1, 1, &seq)
+            .expect("空输入是正常状态");
+        assert!(batches.is_empty(), "不得发送空批: {batches:?}");
+        assert_eq!(seq.load(Ordering::Relaxed), 5, "空批不得消耗 seq");
+    }
+
+    /// #63：上限 0 必须在配置层明确拒绝；拆批 helper 也不得静默按 1 处理。
+    #[test]
+    fn v100_max_batch_samples_zero_is_rejected_explicitly() {
+        let dir = temp_dir("max-batch-zero");
+        let mut cfg = AgentConfig {
+            data_dir: dir.clone(),
+            ..AgentConfig::default()
+        };
+        cfg.max_batch_samples = 0;
+        let err = cfg
+            .validate()
+            .expect_err("max_batch_samples=0 必须被配置校验拒绝");
+        assert!(
+            err.to_string().contains("max_batch_samples"),
+            "错误必须点明字段: {err}"
+        );
+        cfg.max_batch_samples = 1;
+        cfg.validate().expect("max_batch_samples=1 必须合法");
+
+        let seq = AtomicU64::new(0);
+        let err = build_sample_batches(fixed_samples(1, 1), "a", 1, "b", 1, 0, &seq)
+            .expect_err("拆批 helper 也必须拒绝 0");
+        assert!(err.to_string().contains("max_batch_samples"), "错误: {err}");
+        assert_eq!(seq.load(Ordering::Relaxed), 0, "非法配置不得消耗 seq");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #63：采集轮次真的读取 `cfg.max_batch_samples`；collector / cert / buffer
+    /// 指标混在一起时也要按原始顺序拆开，无丢失、无重复、无空批。
+    #[tokio::test]
+    async fn v100_max_batch_samples_is_wired_into_collection_round() {
+        let dir = temp_dir("max-batch-round");
+        let mut cfg = enrolled_config(&dir, 90);
+        cfg.max_batch_samples = 3;
+        let collectors: Vec<Box<dyn Collector>> = vec![
+            Box::new(FixedCollector {
+                name: "fixed-a",
+                metrics: &["cpu.usage", "mem.usage"],
+            }),
+            Box::new(FixedCollector {
+                name: "fixed-b",
+                metrics: &["disk.usage", "net.rx"],
+            }),
+        ];
+        let buffer =
+            Mutex::new(DiskBuffer::open(&dir, 8 * 1024 * 1024, 0).expect("打开 DiskBuffer 失败"));
+        let seq = AtomicU64::new(0);
+        let ts = now_ms();
+
+        let pushed = collect_and_buffer_once(
+            &collectors,
+            &cfg,
+            "agent-test",
+            11,
+            "boot-round",
+            ts,
+            &seq,
+            &buffer,
+        )
+        .await
+        .expect("一轮采集必须成功");
+
+        // 4 collector + 2 cert + 2 buffer = 8 条；上限 3 -> 3/3/2。
+        assert_eq!(pushed, 3, "应拆成 3 个非空子批");
+        assert_eq!(seq.load(Ordering::Relaxed), 3);
+        let batches = {
+            let mut guard = buffer.lock().await;
+            guard.read_next(100).expect("读取缓冲失败")
+        };
+        assert_eq!(batch_shapes(&batches), vec![(0, 3), (1, 3), (2, 2)]);
+        for batch in &batches {
+            assert_eq!(batch.agent_id, "agent-test");
+            assert_eq!(batch.epoch, 11);
+            assert_eq!(batch.boot_id, "boot-round");
+            assert_eq!(batch.sent_at, ts);
+            assert!(
+                batch.samples.len() <= cfg.max_batch_samples,
+                "子批长度 {} 超过上限 {}",
+                batch.samples.len(),
+                cfg.max_batch_samples
+            );
+        }
+        let metrics: Vec<&str> = batches
+            .iter()
+            .flat_map(|batch| batch.samples.iter())
+            .map(|sample| sample.metric.as_str())
+            .collect();
+        assert_eq!(
+            metrics,
+            vec![
+                "cpu.usage",
+                "mem.usage",
+                "disk.usage",
+                "net.rx",
+                "cert.days_left",
+                "cert.hours_left",
+                "buffer.pending_bytes",
+                "buffer.pending_ratio",
+            ],
+            "拆批必须保持 collector → cert → buffer 的原始顺序"
+        );
+        let cert_days = batches
+            .iter()
+            .flat_map(|batch| batch.samples.iter())
+            .find(|sample| sample.metric == "cert.days_left")
+            .map(|sample| sample.value)
+            .expect("必须包含 cert.days_left");
+        assert!(cert_days > 0.0, "证书指标必须来自真实证书: {cert_days}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Welcome 间隔写入共享 atomic；0 / 越界值必须拒绝且不覆盖当前值。
@@ -4641,10 +5164,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #44 复审：续签前必须先 drain 已完成的控制应答。
+    /// #44 复审 / #57 续签前：进入续签前必须先 drain 已完成的控制应答。
     ///
     /// 续签最多占用 stream 20s，而 hub 的控制命令超时是 15s；不 drain 会让已经
-    /// 执行完的应答被压在 channel 里直到超时。
+    /// 执行完的应答被压在 channel 里直到超时。续签中 / 后的用例见下方 #57 测试。
     #[tokio::test]
     async fn v100_due_cert_check_drains_control_before_renew() {
         let dir = temp_dir("cert-drain-control");
@@ -4714,6 +5237,299 @@ mod tests {
             tls::days_left(&on_disk, now_ms()).unwrap(),
             90,
             "续签必须完成并落盘"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #57：续签等待期间完成的控制应答必须立即写回，不能等 `CertRenewed`。
+    ///
+    /// 用「hub 等到应答写出后才发 CertRenewed」的慢续签时序：若等待循环只读
+    /// WebSocket，本用例会卡到 20s 超时；修复后应答在等待期间经同一个 sink 写出。
+    #[tokio::test]
+    async fn v100_renewal_writes_control_response_completed_during_wait() {
+        let dir = temp_dir("renew-control-during");
+        let cfg = enrolled_config(&dir, 1);
+        let key_pem = std::fs::read_to_string(dir.join(AGENT_KEY)).unwrap();
+        let new_cert = hub_sign(&dir, &tls::make_csr_with_key(&key_pem).unwrap(), 90);
+
+        let (mut sink, sent, renew_sent, control_sent) = NotifyingRecordingSink::new();
+        let (tx, mut control_rx) = tokio::sync::mpsc::channel(4);
+        // RenewCert 写出后，模拟一个早已派发的控制任务完成并写入 channel。
+        let sender = tokio::spawn(async move {
+            renew_sent.notified().await;
+            tx.send(ControlResponse::failure(
+                8801,
+                ControlError::control_failed("done-during-renew"),
+            ))
+            .await
+            .expect("测试控制应答发送失败");
+        });
+
+        let gate = Arc::clone(&control_sent);
+        let cert_for_stream = new_cert.clone();
+        let mut stream: DelayedStream = Box::pin(futures_util::stream::once(async move {
+            // 慢续签：只有看到 ControlResponse 已写出，hub 才发 CertRenewed。
+            gate.notified().await;
+            Ok(Message::Binary(
+                Frame::CertRenewed {
+                    cert_pem: cert_for_stream,
+                }
+                .encode()
+                .expect("CertRenewed 编码失败"),
+            ))
+        }));
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            renew_client_cert(&mut sink, &mut stream, &mut control_rx, &cfg, "agent-test"),
+        )
+        .await
+        .expect("续签等待必须同时 select control_rx，不能卡到 20s 超时")
+        .expect("续签必须成功");
+        sender.await.expect("测试控制应答任务失败");
+
+        let frames = sent_frames(&sent);
+        let renew_pos = frames
+            .iter()
+            .position(|frame| matches!(frame, Frame::RenewCert { .. }))
+            .expect("必须发出 RenewCert");
+        let control_pos = frames
+            .iter()
+            .position(|frame| {
+                matches!(
+                    frame,
+                    Frame::ControlResponse(response) if response.id == 8801
+                )
+            })
+            .expect("续签等待期间完成的应答必须写回");
+        assert!(
+            renew_pos < control_pos,
+            "应答必须在 RenewCert 之后、CertRenewed 之前写出: {frames:?}"
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "续签结束时 channel 必须已 drain 空"
+        );
+
+        let on_disk = std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap();
+        assert_eq!(
+            tls::days_left(&on_disk, now_ms()).unwrap(),
+            90,
+            "续签必须完成并落盘"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #57：收到 `CertRenewed` 同一轮才完成、尚未被 select 消费的应答，必须在
+    /// 续签返回前补 drain，不能留给会话后续的 ACK / 心跳周期。
+    #[tokio::test]
+    async fn v100_renewal_writes_control_response_completed_after_cert_renewed() {
+        let dir = temp_dir("renew-control-after");
+        let cfg = enrolled_config(&dir, 1);
+        let key_pem = std::fs::read_to_string(dir.join(AGENT_KEY)).unwrap();
+        let new_cert = hub_sign(&dir, &tls::make_csr_with_key(&key_pem).unwrap(), 90);
+
+        let (mut sink, sent) = RecordingSink::new();
+        let (tx, mut control_rx) = tokio::sync::mpsc::channel(4);
+        let cert_for_stream = new_cert.clone();
+        let mut stream: DelayedStream = Box::pin(futures_util::stream::once(async move {
+            // 与 CertRenewed 同一次 poll 入队：续签前 drain 一定看不到它。
+            tx.send(ControlResponse::failure(
+                8802,
+                ControlError::control_failed("done-at-renewed"),
+            ))
+            .await
+            .expect("测试控制应答发送失败");
+            Ok(Message::Binary(
+                Frame::CertRenewed {
+                    cert_pem: cert_for_stream,
+                }
+                .encode()
+                .expect("CertRenewed 编码失败"),
+            ))
+        }));
+
+        renew_client_cert(&mut sink, &mut stream, &mut control_rx, &cfg, "agent-test")
+            .await
+            .expect("续签必须成功");
+
+        let frames = sent_frames(&sent);
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                Frame::ControlResponse(response) if response.id == 8802
+            )),
+            "CertRenewed 同轮完成的应答必须由续签路径补写: {frames:?}"
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "续签返回前 channel 必须已 drain 空"
+        );
+
+        let on_disk = std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap();
+        assert_eq!(
+            tls::days_left(&on_disk, now_ms()).unwrap(),
+            90,
+            "续签必须完成并落盘"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #57 复审：新证书已落盘后，写回已完成控制应答失败只能告警，不能把续签
+    /// 判为失败，更不能丢弃刚收到的新证书。
+    #[tokio::test]
+    async fn v100_renewal_keeps_new_cert_when_final_control_drain_fails() {
+        let dir = temp_dir("renew-drain-fail-after-persist");
+        let mut cfg = enrolled_config(&dir, 1);
+        cfg.send_timeout_secs = 1;
+        let key_pem = std::fs::read_to_string(dir.join(AGENT_KEY)).unwrap();
+        let new_cert = hub_sign(&dir, &tls::make_csr_with_key(&key_pem).unwrap(), 90);
+
+        let (tx, mut control_rx) = tokio::sync::mpsc::channel(4);
+        let cert_for_stream = new_cert.clone();
+        let mut stream: DelayedStream = Box::pin(futures_util::stream::once(async move {
+            // 与 CertRenewed 同轮入队：select 会优先结束等待，应答留给落盘后的 drain。
+            tx.send(ControlResponse::failure(
+                8805,
+                ControlError::control_failed("drain-after-persist"),
+            ))
+            .await
+            .expect("测试控制应答发送失败");
+            Ok(Message::Binary(
+                Frame::CertRenewed {
+                    cert_pem: cert_for_stream,
+                }
+                .encode()
+                .expect("CertRenewed 编码失败"),
+            ))
+        }));
+
+        // 只放行 RenewCert；新证书落盘后的 ControlResponse 写入超时。
+        let mut sink = StuckAfterFirstSendSink::default();
+        let started = tokio::time::Instant::now();
+        renew_client_cert(&mut sink, &mut stream, &mut control_rx, &cfg, "agent-test")
+            .await
+            .expect("新证书已落盘后 drain 失败必须保留成功返回");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "必须真的尝试过写回应答并等满发送超时: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "只能耗一次发送超时，不能退化成 20s 续签超时: {elapsed:?}"
+        );
+
+        let on_disk = std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap();
+        assert_eq!(on_disk, new_cert, "不得丢弃已收到并落盘的新证书");
+        assert_eq!(
+            tls::days_left(&on_disk, now_ms()).unwrap(),
+            90,
+            "新证书必须保持可用"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #57：hub 拒绝续签（`Problem`）时，等待期间完成的应答同样不能滞留。
+    #[tokio::test]
+    async fn v100_renewal_failure_still_writes_completed_control_response() {
+        let dir = temp_dir("renew-control-failure");
+        let cfg = enrolled_config(&dir, 1);
+        let before = std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap();
+
+        let (mut sink, sent) = RecordingSink::new();
+        let (tx, mut control_rx) = tokio::sync::mpsc::channel(4);
+        let problem = Frame::Problem {
+            code: codes::RATE_LIMITED.to_string(),
+            message: "同一会话只能续签一次".to_string(),
+        }
+        .encode()
+        .expect("Problem 编码失败");
+        let mut stream: DelayedStream = Box::pin(futures_util::stream::once(async move {
+            tx.send(ControlResponse::failure(
+                8803,
+                ControlError::control_failed("done-before-problem"),
+            ))
+            .await
+            .expect("测试控制应答发送失败");
+            Ok(Message::Binary(problem))
+        }));
+
+        let err = renew_client_cert(&mut sink, &mut stream, &mut control_rx, &cfg, "agent-test")
+            .await
+            .expect_err("hub 拒绝续签必须失败");
+        assert!(
+            err.to_string().contains(codes::RATE_LIMITED),
+            "错误信息: {err}"
+        );
+
+        let frames = sent_frames(&sent);
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                Frame::ControlResponse(response) if response.id == 8803
+            )),
+            "失败路径也必须写回已完成应答: {frames:?}"
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "失败返回前 channel 必须已 drain 空"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap(),
+            before,
+            "续签失败不得覆盖旧证书"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #57：等待 `CertRenewed` 超时后，等待期间完成的应答仍要先写回再返回错误。
+    #[tokio::test(start_paused = true)]
+    async fn v100_renewal_timeout_still_writes_completed_control_response() {
+        let dir = temp_dir("renew-control-timeout");
+        let cfg = enrolled_config(&dir, 1);
+        let before = std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap();
+
+        let (mut sink, sent) = RecordingSink::new();
+        let (tx, mut control_rx) = tokio::sync::mpsc::channel(4);
+        let mut stream: DelayedStream = Box::pin(futures_util::stream::once(async move {
+            tx.send(ControlResponse::failure(
+                8804,
+                ControlError::control_failed("done-before-timeout"),
+            ))
+            .await
+            .expect("测试控制应答发送失败");
+            // hub 永不下发 CertRenewed；虚拟时间会快进到 20s 超时。
+            std::future::pending::<std::result::Result<Message, WsError>>().await
+        }));
+
+        let started = tokio::time::Instant::now();
+        let err = renew_client_cert(&mut sink, &mut stream, &mut control_rx, &cfg, "agent-test")
+            .await
+            .expect_err("等待 CertRenewed 必须超时");
+        assert!(err.to_string().contains("超时"), "错误信息: {err}");
+        assert!(
+            started.elapsed() >= CERT_RENEW_TIMEOUT,
+            "必须且只能等满续签超时预算: {:?}",
+            started.elapsed()
+        );
+
+        let frames = sent_frames(&sent);
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                Frame::ControlResponse(response) if response.id == 8804
+            )),
+            "超时路径也必须写回已完成应答: {frames:?}"
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "超时返回前 channel 必须已 drain 空"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(AGENT_CERT)).unwrap(),
+            before,
+            "续签超时不得覆盖旧证书"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

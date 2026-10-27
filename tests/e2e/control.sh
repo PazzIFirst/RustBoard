@@ -51,6 +51,28 @@ die() {
   exit 1
 }
 
+# 失败现场统一脱敏后再输出：hub init 会打印临时管理 API token，agent add 会
+# 打印一次性 enrollment token，curl/日志里还可能出现 Bearer 与密码。公开 CI
+# 日志不能包含这些值。
+redact_stream() {
+  sed -E \
+    -e '/(密码|password|passwd|admin_token|admin-token|hub_token|hub-token|token|secret)[^:：=]*[:：=].*/I s/.*/<redacted sensitive line>/' \
+    -e 's/(--(token|token_file|token-file|admin-token|hub-token)(-file)?[[:space:]=]+)[^[:space:]]+/\1<redacted>/Ig' \
+    -e 's/(--password(-file)?[[:space:]=]+)[^[:space:]]+/\1<redacted>/Ig' \
+    -e 's/((admin_token|token|secret|password|passwd)[[:space:]]*=[[:space:]]*)"[^"]*"/\1"<redacted>"/Ig' \
+    -e 's/((admin_token|token|secret|password|passwd)[[:space:]]*[=:][[:space:]]*)[^[:space:]",]+/\1<redacted>/Ig' \
+    -e 's/(Bearer[[:space:]]+)[A-Za-z0-9._~+\/=-]+/\1<redacted>/Ig' \
+    -e 's/\b[0-9a-fA-F]{64}\b/<redacted-64hex>/g'
+}
+
+dump_log() {
+  local log=$1 lines=${2:-80}
+  if [[ -s "$log" ]]; then
+    echo "---- $(basename "$log") (tail -n $lines, redacted) ----" >&2
+    tail -n "$lines" -- "$log" 2>/dev/null | redact_stream >&2 || true
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # 临时目录与清理
 # ---------------------------------------------------------------------------
@@ -113,19 +135,13 @@ cleanup() {
   done
 
   if (( code != 0 || FAILS > 0 )); then
-    echo "===== control e2e 失败现场 =====" >&2
+    echo "===== control e2e 失败现场（redacted）=====" >&2
     for log in "$HUB_LOG" "$A_LOG" "$B_LOG" "$C_LOG" "$D_LOG" "$E_LOG" "$PANEL_LOG" \
                "$TMP_DIR/init.log" "$TMP_DIR/panel-init.log" "$TMP_DIR/curl.err"; do
-      if [[ -s "$log" ]]; then
-        echo "---- $(basename "$log") (tail -n 80) ----" >&2
-        tail -n 80 "$log" >&2 || true
-      fi
+      dump_log "$log" 80
     done
     for log in "$SYSTEMCTL_LOG" "$DOCKER_LOG" "$JOURNAL_LOG"; do
-      if [[ -s "$log" ]]; then
-        echo "---- $(basename "$log") ----" >&2
-        tail -n 40 "$log" >&2 || true
-      fi
+      dump_log "$log" 40
     done
   fi
 
@@ -202,6 +218,55 @@ try:
 except Exception:
     print("")
 ' "$1" <<<"$BODY" 2>/dev/null || true
+}
+
+# 当前响应里最大的审计 id；用于要求“本次请求之后新增”的记录，旧记录不能代替。
+audit_max_id() {
+  "$PYTHON" - "$HTTP_BODY_FILE" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        entries = json.load(handle).get("entries", [])
+    print(max((int(item.get("id", 0)) for item in entries), default=0))
+except Exception:
+    print("__ERR__")
+PY
+}
+
+# 在 id > min_id 的记录里，找同 agent / 同 action / 同 target 的记录并取字段。
+# 无匹配输出空串；供“面板控制后必须新增对应审计”的断言使用。
+audit_new_record_field() {
+  local min_id=$1 agent_id=$2 action=$3 target=$4 field=$5
+  "$PYTHON" - "$HTTP_BODY_FILE" "$min_id" "$agent_id" "$action" "$target" "$field" <<'PY'
+import json
+import sys
+
+path, min_raw, agent_id, action, target, field = sys.argv[1:7]
+try:
+    threshold = int(min_raw)
+    with open(path, encoding="utf-8") as handle:
+        entries = json.load(handle).get("entries", [])
+except Exception:
+    print("")
+    raise SystemExit(0)
+for entry in entries:
+    try:
+        entry_id = int(entry.get("id", 0))
+    except (TypeError, ValueError):
+        continue
+    if (
+        entry_id > threshold
+        and entry.get("agent_id") == agent_id
+        and entry.get("action") == action
+        and entry.get("target") == target
+    ):
+        print(entry.get(field, ""))
+        break
+else:
+    print("")
+PY
 }
 
 check_eq() {
@@ -363,7 +428,8 @@ add_agent_token() {
     || die "agent add --name $name 失败"
   token=$(printf '%s\n' "$out" \
     | awk '/一次性 token/{getline; gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit}')
-  [[ "$token" =~ ^[0-9a-f]{64}$ ]] || die "无法从 agent add 输出解析 token: $out"
+  [[ "$token" =~ ^[0-9a-f]{64}$ ]] \
+    || die "无法从 agent add 输出解析 token（原始输出已隐藏，避免一次性 token 进入公开日志）"
   printf '%s' "$token"
 }
 
@@ -1064,20 +1130,27 @@ panel_api GET "/api/agents/${A_ID}/control"
 expect_status "7.3 面板读取控制状态 200" 200
 check_eq "7.4 面板状态 control_enabled" "True" "$(json_get 'd.get("control_enabled")')"
 
+# 记录面板控制前的最大审计 id：7.8 起要求面板代理产生 id 更大的新记录，
+# 之前直连 API 的 nginx restart 审计（即使字段完全相同）不能代替。
+api GET "/api/v1/audit?limit=1&capability=systemd"
+expect_status "7.4a 面板控制前读取审计基线 200" 200
+AUDIT_ID_BEFORE=$(audit_max_id)
+
 panel_api POST "/api/agents/${A_ID}/control" \
   '{"capability":"systemd","action":"restart","target":"nginx.service","confirm":true}'
 expect_status "7.5 面板 restart nginx 200" 200
 check_eq "7.6 面板代理 restart ok" "True" "$(json_get 'd.get("ok")')"
 
-# 前面越权测试也产生了 sshd.service 审计，不能只看最新一条；在列表里按 target 找。
-panel_api GET "/api/audit?limit=20&capability=systemd"
+# 前面越权测试也产生了 sshd.service 审计，不能只看最新一条；按 target 找，
+# 且必须 id > AUDIT_ID_BEFORE，证明是本次面板请求新写入的记录。
+panel_api GET "/api/audit?limit=200&capability=systemd"
 expect_status "7.7 面板审计 200" 200
-check_eq "7.8 面板审计存在 admin 的 nginx 记录" "True" \
-  "$(json_get 'any(e.get("actor")=="admin" and e.get("target")=="nginx.service" for e in d.get("entries",[]))')"
-check_eq "7.9 面板审计存在 nginx restart 记录" "True" \
-  "$(json_get 'any(e.get("action")=="restart" and e.get("target")=="nginx.service" for e in d.get("entries",[]))')"
-check_eq "7.10 面板审计 target=nginx.service" "True" \
-  "$(json_get 'any(e.get("target")=="nginx.service" and e.get("action")=="restart" and e.get("actor")=="admin" for e in d.get("entries",[]))')"
+check_eq "7.8 本次面板控制新增 nginx restart 审计且 result=ok" "ok" \
+  "$(audit_new_record_field "$AUDIT_ID_BEFORE" "$A_ID" "restart" "nginx.service" "result")"
+check_eq "7.9 该新增记录 actor=admin" "admin" \
+  "$(audit_new_record_field "$AUDIT_ID_BEFORE" "$A_ID" "restart" "nginx.service" "actor")"
+check_eq "7.10 该新增记录 agent_id=A" "$A_ID" \
+  "$(audit_new_record_field "$AUDIT_ID_BEFORE" "$A_ID" "restart" "nginx.service" "agent_id")"
 
 # ---------------------------------------------------------------------------
 # 8. 离线 503 / hub 能力关闭 / hub 总开关关闭

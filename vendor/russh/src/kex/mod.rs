@@ -207,7 +207,8 @@ pub(crate) trait KexAlgorithmImplementor {
         &self,
         session_id: &[u8],
         exchange_hash: &[u8],
-        cipher: cipher::Name,
+        client_cipher: cipher::Name,
+        server_cipher: cipher::Name,
         remote_to_local_mac: mac::Name,
         local_to_remote_mac: mac::Name,
         is_server: bool,
@@ -371,14 +372,25 @@ pub(crate) fn compute_keys<D: Digest>(
     shared_secret: Option<&SharedSecret>,
     session_id: &[u8],
     exchange_hash: &[u8],
-    cipher: cipher::Name,
+    client_cipher: cipher::Name,
+    server_cipher: cipher::Name,
     remote_to_local_mac: mac::Name,
     local_to_remote_mac: mac::Name,
     is_server: bool,
 ) -> Result<super::cipher::CipherPair, Error> {
-    let cipher = CIPHERS.get(&cipher).ok_or(Error::UnknownAlgo)?;
+    // RFC 4253 §6.3: the two directions may use different ciphers, so resolve
+    // and derive both independently. Direction letters (§7.2) are fixed:
+    // A/C/E = client-to-server IV/key/MAC key, B/D/F = server-to-client.
+    let client_cipher = CIPHERS.get(&client_cipher).ok_or(Error::UnknownAlgo)?;
+    let server_cipher = CIPHERS.get(&server_cipher).ok_or(Error::UnknownAlgo)?;
     let remote_to_local_mac = MACS.get(&remote_to_local_mac).ok_or(Error::UnknownAlgo)?;
     let local_to_remote_mac = MACS.get(&local_to_remote_mac).ok_or(Error::UnknownAlgo)?;
+
+    let (local_to_remote_cipher, remote_to_local_cipher) = if is_server {
+        (server_cipher, client_cipher)
+    } else {
+        (client_cipher, server_cipher)
+    };
 
     // https://tools.ietf.org/html/rfc4253#section-7.2
     BUFFER.with(|buffer| {
@@ -446,26 +458,50 @@ pub(crate) fn compute_keys<D: Digest>(
                     let mut nonce = nonce.borrow_mut();
                     let mut mac = mac.borrow_mut();
 
-                    compute_key(local_to_remote, &mut key, cipher.key_len())?;
-                    compute_key(local_to_remote_nonce, &mut nonce, cipher.nonce_len())?;
+                    compute_key(
+                        local_to_remote,
+                        &mut key,
+                        local_to_remote_cipher.key_len(),
+                    )?;
+                    compute_key(
+                        local_to_remote_nonce,
+                        &mut nonce,
+                        local_to_remote_cipher.nonce_len(),
+                    )?;
                     compute_key(
                         local_to_remote_mac_key,
                         &mut mac,
                         local_to_remote_mac.key_len(),
                     )?;
 
-                    let local_to_remote =
-                        cipher.make_sealing_key(&key, &nonce, &mac, *local_to_remote_mac);
+                    let local_to_remote = local_to_remote_cipher.make_sealing_key(
+                        &key,
+                        &nonce,
+                        &mac,
+                        *local_to_remote_mac,
+                    );
 
-                    compute_key(remote_to_local, &mut key, cipher.key_len())?;
-                    compute_key(remote_to_local_nonce, &mut nonce, cipher.nonce_len())?;
+                    compute_key(
+                        remote_to_local,
+                        &mut key,
+                        remote_to_local_cipher.key_len(),
+                    )?;
+                    compute_key(
+                        remote_to_local_nonce,
+                        &mut nonce,
+                        remote_to_local_cipher.nonce_len(),
+                    )?;
                     compute_key(
                         remote_to_local_mac_key,
                         &mut mac,
                         remote_to_local_mac.key_len(),
                     )?;
-                    let remote_to_local =
-                        cipher.make_opening_key(&key, &nonce, &mac, *remote_to_local_mac);
+                    let remote_to_local = remote_to_local_cipher.make_opening_key(
+                        &key,
+                        &nonce,
+                        &mac,
+                        *remote_to_local_mac,
+                    );
 
                     Ok(super::cipher::CipherPair {
                         local_to_remote,
@@ -503,8 +539,15 @@ pub(crate) fn encode_mpint<W: Writer>(s: &[u8], w: &mut W) -> Result<(), Error> 
 
 #[cfg(test)]
 mod tests {
+    use sha2::Sha256;
+
     use super::encode_mpint;
+    use super::*;
     use crate::CryptoVec;
+    use crate::cipher::{self, CipherPair};
+    use crate::compression::Compress;
+    use crate::mac;
+    use crate::sshbuffer::{PacketWriter, SSHBuffer};
 
     // Regression: an all-zero shared secret (attacker-controlled all-zero
     // Curve25519 point) used to index s[s.len()] and panic. RFC 4251 §5: the
@@ -514,5 +557,109 @@ mod tests {
         let mut w = CryptoVec::new();
         encode_mpint(&[0u8; 32], &mut w).unwrap();
         assert_eq!(&w[..], &[0, 0, 0, 0]);
+    }
+
+    fn derive(
+        client_cipher: cipher::Name,
+        server_cipher: cipher::Name,
+        is_server: bool,
+    ) -> CipherPair {
+        let shared_secret = SharedSecret::from_string(b"directional shared secret").unwrap();
+        compute_keys::<Sha256>(
+            Some(&shared_secret),
+            b"directional-session-id",
+            b"directional-exchange-hash",
+            client_cipher,
+            server_cipher,
+            mac::HMAC_SHA256,
+            mac::HMAC_SHA256,
+            is_server,
+        )
+        .unwrap()
+    }
+
+    /// Write one SSH packet with the pair's `local_to_remote` key.
+    fn seal(pair: CipherPair, payload: &[u8]) -> Vec<u8> {
+        let mut writer = PacketWriter::new(pair.local_to_remote, Compress::None);
+        writer.packet_raw(payload).unwrap();
+        writer.buffer().buffer.clone()
+    }
+
+    /// Read one SSH packet with the pair's `remote_to_local` key.
+    async fn open(mut pair: CipherPair, packet: &[u8]) -> Result<Vec<u8>, crate::Error> {
+        let mut buffer = SSHBuffer::new();
+        let mut reader: &[u8] = packet;
+        let end = cipher::read(&mut reader, &mut buffer, &mut *pair.remote_to_local).await?;
+        // buffer = 4-byte packet_length || padding_length || payload
+        Ok(buffer.buffer[5..end].to_vec())
+    }
+
+    /// #98: each direction must use its own negotiated cipher for key
+    /// derivation; sealing client-to-server with AES-256 and opening it with
+    /// the server's remote-to-local key (and vice versa) must round-trip.
+    #[tokio::test]
+    async fn c2s_and_s2c_round_trip_with_different_ciphers() {
+        let payload = b"direction-specific payload";
+
+        let client_packet = seal(derive(cipher::AES_256_CTR, cipher::AES_128_CTR, false), payload);
+        let opened = open(
+            derive(cipher::AES_256_CTR, cipher::AES_128_CTR, true),
+            &client_packet,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened, payload);
+
+        let server_packet = seal(derive(cipher::AES_256_CTR, cipher::AES_128_CTR, true), payload);
+        let opened = open(
+            derive(cipher::AES_256_CTR, cipher::AES_128_CTR, false),
+            &server_packet,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened, payload);
+    }
+
+    /// #98: the receive key must come from the server-to-client cipher, not
+    /// from the client-to-server cipher that the old code reused for both
+    /// directions.
+    #[tokio::test]
+    async fn s2c_receive_key_uses_the_server_cipher() {
+        // Reference sender that really uses AES-128 for server-to-client.
+        let reference = derive(cipher::AES_128_CTR, cipher::AES_128_CTR, true);
+        let packet = seal(reference, b"server-to-client");
+
+        let client = derive(cipher::AES_256_CTR, cipher::AES_128_CTR, false);
+        assert_eq!(open(client, &packet).await.unwrap(), b"server-to-client");
+
+        // A sender that wrongly uses AES-256 for server-to-client must not be
+        // accepted by the client's s2c key.
+        let wrong_sender = derive(cipher::AES_256_CTR, cipher::AES_256_CTR, true);
+        let packet = seal(wrong_sender, b"server-to-client");
+        let client = derive(cipher::AES_256_CTR, cipher::AES_128_CTR, false);
+        assert!(
+            open(client, &packet).await.is_err(),
+            "server-to-client data must not be accepted with the c2s cipher"
+        );
+    }
+
+    /// #98: the send key must come from the client-to-server cipher.
+    #[tokio::test]
+    async fn c2s_send_key_uses_the_client_cipher() {
+        // A receiver that derives client-to-server with AES-128 must reject a
+        // sender that encrypted client-to-server with AES-256.
+        let wrong_client = derive(cipher::AES_128_CTR, cipher::AES_128_CTR, false);
+        let packet = seal(wrong_client, b"client-to-server");
+        let server = derive(cipher::AES_256_CTR, cipher::AES_128_CTR, true);
+        assert!(
+            open(server, &packet).await.is_err(),
+            "client-to-server data must not be accepted with the s2c cipher"
+        );
+
+        // And the matching pair must round-trip.
+        let client = derive(cipher::AES_256_CTR, cipher::AES_128_CTR, false);
+        let packet = seal(client, b"client-to-server");
+        let server = derive(cipher::AES_256_CTR, cipher::AES_128_CTR, true);
+        assert_eq!(open(server, &packet).await.unwrap(), b"client-to-server");
     }
 }

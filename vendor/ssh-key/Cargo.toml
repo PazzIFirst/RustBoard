@@ -284,3 +284,7 @@ unreachable_pub = "warn"
 unsafe_code = "forbid"
 unused_lifetimes = "warn"
 unused_qualifications = "warn"
+
+# 本 crate 作为路径依赖被主 workspace 引用；同时声明为独立 workspace，
+# 这样发布前可以单独执行 `cargo test --manifest-path vendor/ssh-key/Cargo.toml --locked`。
+[workspace]

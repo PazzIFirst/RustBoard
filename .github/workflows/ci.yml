@@ -56,6 +56,37 @@ jobs:
       - name: 单元与集成测试
         run: cargo test --workspace --locked
 
+      - name: P6 测试门禁纯函数回归
+        run: python3 tests/pentest/test_p6_gates.py -v
+
+      # vendored ssh-key 自带独立 workspace 与 Cargo.lock；它作为 path patch 时
+      # 不会进入主 workspace 的 `cargo test --workspace`，必须单独执行。
+      - name: vendored ssh-key 格式检查
+        run: cargo fmt --manifest-path vendor/ssh-key/Cargo.toml -- --check
+
+      - name: vendored ssh-key 单元测试（#99–#102）
+        env:
+          CARGO_TARGET_DIR: target
+        run: cargo test --manifest-path vendor/ssh-key/Cargo.toml --locked
+
+      - name: vendored ssh-key no_std ECDSA 编译
+        env:
+          CARGO_TARGET_DIR: target
+        run: >-
+          cargo test
+          --manifest-path vendor/ssh-key/Cargo.toml
+          --locked
+          --no-default-features
+          --features ecdsa
+          --no-run
+
+      - name: vendored russh 格式检查
+        run: cargo fmt --manifest-path vendor/russh/Cargo.toml -- --check
+
+      - name: vendored russh 单元测试（#96–#98）
+        env: { CARGO_TARGET_DIR: target }
+        run: cargo test --manifest-path vendor/russh/Cargo.toml --locked
+
   postgres:
     name: postgres / Phase D 实库测试
     runs-on: ubuntu-latest
@@ -175,6 +206,9 @@ jobs:
 
       - name: 运行安全回归
         run: bash tests/e2e/security.sh
+
+      - name: 控制面日志脱敏自测
+        run: bash tests/e2e/control_redact_test.sh
 
       - name: 证书轮换回归
         run: bash tests/e2e/cert-rotation.sh

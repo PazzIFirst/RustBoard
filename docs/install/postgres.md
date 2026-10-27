@@ -326,7 +326,7 @@ rustboard-hub restore --from /var/lib/rustboard/backups/<timestamp> \
   不会在无备份情况下覆盖。只有显式 `--no-pre-restore-backup` 才跳过这个保护；
 - 目标路径含符号链接或 `..` 会在写入前拒绝。**SQLite 目标若存在 `-wal`/`-shm`/
   `-journal`，restore 直接拒绝**：必须先干净停止 hub 并确认/删除这些 sidecar，
-  否则 SQLite 会重放旧 WAL。rename 前后还会校验 SHA256、`quick_check` 与 21 张
+  否则 SQLite 会重放旧 WAL。rename 前后还会校验 SHA256、`quick_check` 与 22 张
   表行数；失败会用恢复前副本回滚（没有旧库则删除新库）并报错；
 - 恢复同样要求 hub 已停止：有 systemd unit 且明确 inactive 可继续；无 systemd、
   unit 不存在或状态无法确认时，必须显式 `--hub-stopped`；
@@ -369,13 +369,12 @@ rustboard-hub migrate \
   确认时**必须显式 `--hub-stopped`**（先停 hub，再由人工确认）。不读取/伪造 PID
   文件；迁移开始即持有目标端的会话级 advisory lock，覆盖
   `inspect → pg_dump → TRUNCATE → import → 配置切换`，并发 migrate 会串行等待。
-  该锁使用 `sslmode=disable` 的专用连接；`verify-full` 目标拿不到锁时非 force
-  迁移会 WARN 并依赖 core 导入事务的空库复验与表锁，`--force` 非空目标仍要求
-  `sslmode=disable`；
-- 目标非空：默认拒绝；`--force` 会先 `pg_dump` 目标、二次确认后清空 21 张业务表
-  （保留 `schema_migrations`）。**当前限制**：`--force` 的清空路径只支持显式
-  `sslmode=disable`（内部使用 NoTls）；`verify-full` 的非空目标需先手工备份并
-  `TRUNCATE` 21 张业务表，再不带 `--force` 迁移；
+  该锁与运行连接使用同一 DSN/TLS/密码解析（默认 `verify-full`，只有显式
+  `sslmode=disable` 才关闭；私有 CA 走 `db_sslrootcert`/DSN `sslrootcert`）；
+  目标不可连接时迁移失败，不会在未获锁时继续。
+- 目标非空：默认拒绝；`--force` 会先 `pg_dump` 目标、二次确认后清空 22 张业务表
+  （保留 `schema_migrations`）。清空路径同样继承 Hub TLS 策略，不再要求
+  `sslmode=disable`；旧 schema（<9）目标会在 `pg_dump`/`TRUNCATE` 前 fail closed，不会被清空；
 - `--force` 目标非空时需要外部 `pg_dump`（`--format=custom --no-owner
   --no-privileges`）；目标为空时不需要；
 - 回滚：把 `database` 改回 SQLite 路径，或 `install --force --db sqlite`；
@@ -392,30 +391,94 @@ rustboard-hub migrate \
 > `pg_dump --version` 与 `psql --version` 确认版本；跨大版本时优先装与服务端
 > 匹配的客户端，或临时用 `postgres:<major>` 容器执行。
 
-```bash
-# 1) 停 hub，确保没有写入
-sudo systemctl stop rustboard-hub
+#### 仅备份（可在 hub 运行时执行）
 
-# 2) 一致性备份（custom 格式，便于 pg_restore 选择性恢复）
+```bash
+# 在 root shell 中执行（备份目录 0700、dump 0600）
+(
+set -euo pipefail
 TS=$(date +%Y%m%dT%H%M%S)
 OUT=/var/lib/rustboard/backups/pg-$TS
 install -d -m 0700 "$OUT"
-# 重定向由 root shell 完成，备份文件不会以 postgres 用户身份落到目录外
-sudo -u postgres pg_dump --format=custom --no-owner --no-privileges rustboard > "$OUT/rustboard.dump"
+# 重定向由 root shell 打开；pg_dump 只以 postgres 身份写 stdout
+runuser -u postgres -- pg_dump --format=custom --no-owner --no-privileges rustboard \
+  > "$OUT/rustboard.dump"
 chmod 0600 "$OUT/rustboard.dump"
+test -s "$OUT/rustboard.dump"
+pg_restore --list "$OUT/rustboard.dump" >/dev/null
+printf '备份: %s\n' "$OUT/rustboard.dump"
+)
+```
 
-# 3) 恢复前先备份当前目标；恢复到空库或全新数据库
-sudo -u postgres pg_restore --clean --if-exists --no-owner --no-privileges \
-  --dbname=rustboard "$OUT/rustboard.dump"
+#### 覆盖恢复（先备份当前库，失败不启动）
 
-# 4) 启动并验证
-sudo systemctl start rustboard-hub
-curl -fsS http://127.0.0.1:8444/healthz
+下面按**覆盖现有库**演示：`DUMP` 指向要恢复的备份，恢复前先把当前库另存到
+`pg-pre-restore-<ts>`，再用 `--single-transaction --exit-on-error` 恢复。任一步
+失败子 shell 立即退出，不会启动 hub。若想恢复到新库，先创建空库并把
+`--dbname` 改为新库名，验证通过后再切换 `hub.toml` 的 `database`。
+
+```bash
+# 在 root shell 中执行；子 shell 隔离 set -e，失败不会影响当前 shell，
+# 也不会继续执行启动步骤。
+(
+set -euo pipefail
+
+# 0) 指定要恢复的备份；必须是普通文件、非符号链接且非空
+DUMP=/var/lib/rustboard/backups/pg-YYYYmmddTHHMMSS/rustboard.dump
+test -f "$DUMP" && test ! -L "$DUMP" && test -s "$DUMP" \
+  || { echo "DUMP 必须是存在、非符号链接、非空的普通文件: $DUMP" >&2; exit 1; }
+# 只读校验归档可解析；损坏的 dump 在停 hub 前就失败
+pg_restore --list "$DUMP" >/dev/null
+
+# 1) 停 hub，确保没有写入
+systemctl stop rustboard-hub
+
+# 2) 恢复前先真实备份当前库；失败立即中止
+TS=$(date +%Y%m%dT%H%M%S)
+PRE=/var/lib/rustboard/backups/pg-pre-restore-$TS
+install -d -m 0700 "$PRE"
+runuser -u postgres -- pg_dump --format=custom --no-owner --no-privileges rustboard \
+  > "$PRE/rustboard.dump"
+chmod 0600 "$PRE/rustboard.dump"
+test -s "$PRE/rustboard.dump" \
+  || { echo "恢复前备份为空: $PRE/rustboard.dump" >&2; exit 1; }
+pg_restore --list "$PRE/rustboard.dump" >/dev/null
+printf '恢复前备份: %s\n' "$PRE/rustboard.dump"
+
+# 3) 单事务覆盖恢复；失败时 --exit-on-error 中止、--single-transaction 整体回滚。
+#    备份文件是 root 0700/0600，postgres 无法直接读：由 root 打开 fd 3 作为 stdin。
+exec 3< "$DUMP"
+runuser -u postgres -- pg_restore \
+  --clean --if-exists --no-owner --no-privileges \
+  --exit-on-error --single-transaction \
+  --dbname=rustboard <&3
+exec 3<&-
+
+# 4) 启动前校验；任一检查失败则子 shell 退出，不启动 hub
+runuser -u postgres -- psql --dbname=rustboard --set=ON_ERROR_STOP=1 -tAc \
+  'SELECT count(*) FROM schema_migrations;'
+runuser -u postgres -- psql --dbname=rustboard --set=ON_ERROR_STOP=1 -tAc \
+  'SELECT 1 FROM samples LIMIT 1;'
+runuser -u postgres -- psql --dbname=rustboard --set=ON_ERROR_STOP=1 -tAc \
+  'SELECT 1 FROM agents LIMIT 1;'
+
+# 5) 读取实际管理端口，再启动并做健康检查
+#    默认管理端口是随机五位数回环端口；8444 不是默认值
+ADMIN_PORT=$(rustboard-hub ports --config /etc/rustboard/hub.toml | awk '/管理 API 端口/{print $NF}')
+systemctl start rustboard-hub
+# admin_tls=required 时把 http 改为 https，并按证书来源带 --cacert / SNI
+curl -fsS "http://127.0.0.1:${ADMIN_PORT}/healthz"
+)
 ```
 
 要点：
 
 - `pg_dump` 使用一致性快照，但迁移/切换场景仍要求先停 hub；
+- `pg_restore` 使用 `--single-transaction --exit-on-error`；失败整体回滚，脚本
+  在启动 hub 前退出。恢复前备份失败同样中止，不会覆盖当前库；
+- 管理端口默认是随机五位数回环端口，不是固定 `8444`；用
+  `rustboard-hub ports` 查看。`admin_tls=required` 时健康检查改用 HTTPS 并按证书
+  来源带 `--cacert` / SNI，见 [acme.md](acme.md) §4.5；
 - 密码不要写在命令行：用 `PGPASSWORD` 环境变量或 0600 的 `~/.pgpass`；
 - 备份文件含 agent secret、API token 哈希等敏感数据，按 secret 管理；
 - 恢复后核对：samples 点数/时间范围、agents、alert_states/events、api_tokens
@@ -463,7 +526,7 @@ docker compose -f docker/compose.example.yml \
 > 限制与本次结果。
 
 脚本必须带 dist 来源绑定运行；仅校验 `--version`/revision 不能排除同名旧
-rc.2 dist，因此 S4 运行前要重建 dist 并生成 manifest（重建后必须重新生成）：
+dist，因此 S4 运行前要重建 dist 并生成 manifest（重建后必须重新生成）：
 
 ```bash
 mkdir -p target
@@ -474,7 +537,11 @@ mkdir -p target
   printf 'web=%s\n'   "$(sha256sum web/dist/index.html             | awk '{ print $1 }')"
 } > target/dist-manifest.txt
 
-bash tests/e2e/v100-docker-pg.sh --dist-manifest target/dist-manifest.txt
+# 从 Cargo.toml 派生当前版本，与 dist/包名/镜像 label 使用同一来源
+EXPECTED_VERSION=$(cargo metadata --no-deps --format-version 1 --offline \
+  | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "rustboard-hub"))')
+EXPECTED_VERSION="$EXPECTED_VERSION" \
+  bash tests/e2e/v100-docker-pg.sh --dist-manifest target/dist-manifest.txt
 # 或：EXPECTED_DIST_SHA256='hub=... panel=... agent=... web=...' \
 #       bash tests/e2e/v100-docker-pg.sh
 ```
@@ -482,7 +549,7 @@ bash tests/e2e/v100-docker-pg.sh --dist-manifest target/dist-manifest.txt
 脚本把 HEAD、四个 dist sha256、三个镜像 ID 写入证据 `provenance.txt`；manifest
 与当前 dist 任一不符会在 build 前 FATAL。它在 Docker 内验证 PG overlay：
 
-- 用当前 dist 构建 `:local-s4` hub/panel/agent 镜像，**不**使用旧 rc.2
+- 用当前 dist 构建 `:local-s4` hub/panel/agent 镜像，**不**使用旧 RC
   GHCR 镜像或同名旧 dist；hub 镜像内没有 `pg_dump`/`pg_restore`/`psql`；
 - 默认 compose 仍是 SQLite，无 postgres service、无 5432/8444 发布；
 - PG overlay 用 stock `postgres:16-alpine`；本机只有 `postgres:16` 时脚本在
@@ -578,9 +645,10 @@ bash tests/e2e/v100-docker-pg.sh --dist-manifest target/dist-manifest.txt
 1. **单 hub 语义**：PG 后端没有 leader 选举或多活协调。同一数据库只允许一个
    active hub；多个 hub 同时连接会重复评估告警、重复发送通知/归档。需要 HA 时
    由部署方保证单写者；当前版本不承诺多活。
-2. **`migrate --force` 的 TLS 限制**：非空 PG 目标清空路径内部使用 NoTls，目前
-   只支持显式 `sslmode=disable`；`verify-full` 非空目标必须手工备份并清空
-   21 张业务表（保留 `schema_migrations`）后，再不带 `--force` 迁移。
+2. **`migrate --force` 的 TLS**：非空 PG 目标的清空路径与运行连接使用同一
+   DSN/TLS/密码解析（默认 `verify-full`，只有显式 `sslmode=disable` 才关闭；
+   私有 CA 通过 `db_sslrootcert`/DSN `sslrootcert`）。旧 schema（<9）目标会在
+   `pg_dump`/`TRUNCATE` 前被拒绝，不会被清空。
 3. **外部 `pg_dump`/`pg_restore`**：hub 静态构建、离线包与 Docker 镜像不内置
    PostgreSQL 客户端；PG 备份/恢复缺少命令时会失败并提示安装
    `postgresql-client`。客户端主版本最好与服务端一致；PG17 client 对 PG16 会

@@ -42,10 +42,11 @@ use rustboard_common::tls;
 use rustboard_common::util::port_of;
 use rustboard_common::{fsutil, DEFAULT_ADMIN_PORT};
 use rustboard_install::{
-    detect_system, is_systemd_unit_dir, pick_free_port, read_private_file, render_unit,
-    require_systemd, shell_arg, unit_is_ours, validate_install_prefix, validate_managed_path,
-    wait_http_ok, InstallLock, InstallState, InstallTxn, ManagedPathKind, PathOverrides, Paths,
-    Prompt, Role, RoleState, ServiceManager,
+    detect_system, ensure_service_stopped, is_systemd_unit_dir, pick_free_port, read_private_file,
+    remove_enable_symlink, render_unit, require_systemd, shell_arg, stop_service_checked,
+    unit_is_ours, validate_install_prefix, validate_managed_path, wait_http_ok, InstallLock,
+    InstallState, InstallTxn, ManagedPathKind, PathOverrides, Paths, Prompt, Role, RoleState,
+    ServiceControl, ServiceManager,
 };
 use rustls::pki_types::ServerName;
 
@@ -208,8 +209,8 @@ struct PanelTlsPlan {
     material: crate::PanelTlsFiles,
     cert_path: PathBuf,
     key_path: PathBuf,
-    /// `--tls-cert/--tls-key` 显式给出时为 true；`--force` 复用旧配置时为 false，
-    /// 不重写已有文件（但仍会校验文件本身）。
+    /// 是否需要把材料写入固定 `panel-tls` 路径。显式参数与旧配置复用都必须
+    /// 由事务写出（旧配置源与目标相同也重写），以保证内容和 0600 权限可回滚。
     copy_files: bool,
     public_origin: String,
 }
@@ -338,7 +339,6 @@ fn resolve_panel_tls(
     base: Option<&PanelConfig>,
     listen: &str,
     tls_dir: &Path,
-    dry_run: bool,
 ) -> Result<Option<PanelTlsPlan>> {
     // 显式 --http：忽略旧配置里的 TLS 字段，由 downgrade 流程事务删除旧材料。
     if args.http {
@@ -365,16 +365,19 @@ fn resolve_panel_tls(
             if cert.is_empty() || key.is_empty() {
                 bail!("已有面板配置的 tls_cert/tls_key 未成对，拒绝安装");
             }
-            let policy = if dry_run {
-                crate::TlsFilePolicy::ReadOnly
-            } else {
-                crate::TlsFilePolicy::Runtime
-            };
-            (
-                crate::validate_panel_tls_files(Path::new(cert), Path::new(key), policy)
-                    .context("校验已有面板 TLS 配置失败")?,
-                false,
+            // 旧配置复用时不要就地 chmod 源文件：源可能是外部路径，安装失败
+            // 时也无法回滚权限。统一用 ReadOnly 校验内容，再由事务把材料写到
+            // 固定 panel-tls 路径（源与目标相同时也视为重写，权限随事务回滚）。
+            // 配置最终永远指向 `<prefix>/etc/rustboard/panel-tls/{cert,key}.pem`，
+            // 因此必须 `copy_files=true`，否则会写出指向不存在/权限不合规文件
+            // 的配置（#71）。
+            let material = crate::validate_panel_tls_files(
+                Path::new(cert),
+                Path::new(key),
+                crate::TlsFilePolicy::ReadOnly,
             )
+            .context("校验已有面板 TLS 配置失败")?;
+            (material, true)
         }
         _ => bail!("--tls-cert 与 --tls-key 必须成对提供：都为空使用 HTTP，都非空才启用面板 HTTPS"),
     };
@@ -662,8 +665,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
 
     // C7：在写盘 / 启动前完成 TLS 源文件、配套、有效期、SAN、hub_ca 与策略校验。
     let tls_dir = paths.prefix.join(PANEL_TLS_DIR_RELATIVE);
-    let panel_tls =
-        resolve_panel_tls(&args, base_config.as_ref(), &listen, &tls_dir, args.dry_run)?;
+    let panel_tls = resolve_panel_tls(&args, base_config.as_ref(), &listen, &tls_dir)?;
     let public_origin = match &panel_tls {
         Some(plan) => plan.public_origin.clone(),
         None => resolve_http_public_origin(&args, base_config.as_ref()),
@@ -920,15 +922,8 @@ impl ApplyInstall<'_> {
             self.txn.create_dir(self.tls_dir, 0o700)?;
         }
         self.txn.create_owned_dir(&self.paths.data_dir, 0o700)?;
-        self.txn
-            .write(&self.paths.config, self.config_bytes.as_bytes(), 0o600)?;
-        if let Some(unit) = self.unit_text {
-            self.txn.write(&self.paths.unit, unit.as_bytes(), 0o644)?;
-        }
-        install_binary(self.txn, &self.paths.binary)?;
-
-        // 证书/私钥/CA 在 config 与 binary 之后写入：任一步失败都会由事务回滚
-        // 恢复旧文件，不会留下「配置指向新证书、磁盘还是旧证书」的半完成状态。
+        // 先写证书/私钥/CA，再写配置：避免配置文件先落盘、随后 TLS 材料写入
+        // 失败（即便有事务，顺序上也应保证 config 不指向尚未写出的材料）。
         if let Some(tls) = self.tls {
             if tls.copy_files {
                 self.txn
@@ -940,6 +935,12 @@ impl ApplyInstall<'_> {
         if let Some(hub_ca) = self.hub_ca {
             self.txn.write(&hub_ca.dest, &hub_ca.bytes, 0o644)?;
         }
+        self.txn
+            .write(&self.paths.config, self.config_bytes.as_bytes(), 0o600)?;
+        if let Some(unit) = self.unit_text {
+            self.txn.write(&self.paths.unit, unit.as_bytes(), 0o644)?;
+        }
+        install_binary(self.txn, &self.paths.binary)?;
 
         if self.mode.manages() {
             let unit_name = Role::Panel.unit_name();
@@ -1101,6 +1102,11 @@ fn https_health_once(
 
 /// 执行卸载。
 pub fn uninstall(args: UninstallArgs) -> Result<()> {
+    uninstall_impl(args, None)
+}
+
+/// 带可注入 systemd 的卸载实现（测试用 fake，生产只经 [`uninstall`] 进入）。
+fn uninstall_impl(args: UninstallArgs, injected: Option<&dyn ServiceControl>) -> Result<()> {
     // P-01：与 install 相同，先校验原始 prefix，避免 `--prefix //` 归一化成 `/`
     // 后把 dry-run / 卸载指向生产路径。
     let paths = resolve_checked_paths(
@@ -1111,7 +1117,11 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
     )?;
     // 非 dry-run 全程持有全局锁，且在读取 install-state 之前获取，避免与安装 /
     // 另一次卸载（包括其他角色）并发。hub 子进程继承父进程锁时跳过；dry-run 不加锁。
-    let _lock = acquire_install_lock(args.dry_run, InstallLock::inherited(), "面板卸载")?;
+    let _lock = if injected.is_some() {
+        None
+    } else {
+        acquire_install_lock(args.dry_run, InstallLock::inherited(), "面板卸载")?
+    };
     let mut state = load_install_state(&paths.state)?;
     let record = state.role(Role::Panel).cloned();
     // 有安装记录时优先使用记录中的路径：e2e 的 unit 在 /run/systemd/system，
@@ -1133,8 +1143,10 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
     // R-S2：只有 unit 位于系统 unit 目录且 systemd 可用时才允许查询 / stop /
     // disable。`--prefix /opt/test` 的 unit 在 prefix 内，只删文件，绝不触碰宿主
     // 的同名生产 `rustboard-panel.service`。
-    let systemd_manage = manage_service_for(&unit_dir, detect_system().systemd);
-    let service = ServiceManager::new(unit_dir, systemd_manage, args.dry_run);
+    let systemd_manage =
+        injected.is_some() || manage_service_for(&unit_dir, detect_system().systemd);
+    let manager = ServiceManager::new(unit_dir, systemd_manage, args.dry_run);
+    let service: &dyn ServiceControl = injected.unwrap_or(&manager);
     let unit_name = Role::Panel.unit_name();
 
     // H1/M4：在提示、停服、删除之前完成全部只读 preflight。
@@ -1238,56 +1250,106 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
         }
     }
 
+    execute_uninstall(
+        &args,
+        &paths,
+        &mut state,
+        &unit_path,
+        &binary_path,
+        &config_path,
+        &data_path,
+        unit_exists,
+        service_action,
+        service,
+        systemd_manage,
+        purge_targets.as_ref(),
+    )
+}
+
+/// 执行已通过 preflight / 确认的卸载动作。
+///
+/// 独立成函数便于测试注入 [`ServiceControl`]：停止失败或无法确认 inactive 时
+/// 必须在删除 unit / binary / config / data / state 之前返回。
+#[allow(clippy::too_many_arguments)]
+fn execute_uninstall(
+    args: &UninstallArgs,
+    paths: &Paths,
+    state: &mut InstallState,
+    unit_path: &Path,
+    binary_path: &Path,
+    config_path: &Path,
+    data_path: &Path,
+    unit_exists: bool,
+    service_action: UninstallServiceAction,
+    service: &dyn ServiceControl,
+    check_service: bool,
+    purge_targets: Option<&PurgeTargets>,
+) -> Result<()> {
+    let unit_name = Role::Panel.unit_name();
     let mut unit_removed = false;
     if unit_exists {
         if service_action == UninstallServiceAction::StopAndDisable {
             // preflight 与真正 stop 之间隔着 --purge 确认（prompt），期间 unit
-            // 可能被替换。执行前即时复核 FragmentPath；确认不了就直接返回错误，
+            // 可能被替换。执行前即时复核 FragmentPath；确认不了就返回错误，
             // 此时尚未删除任何文件，绝不 stop/disable。
-            service.ensure_fragment_is(unit_name, &unit_path).context(
+            service.ensure_fragment_is(unit_name, unit_path).context(
                 "停止前 systemd 解析的 panel unit 已变化；未 stop/disable，也未删除任何文件",
             )?;
-            // disable / stop 失败只警告并继续：unit 与 state 必须清理，否则会留下
-            // “无法重装 / 开机仍自启”的中间状态。这里只对 fragment 已确认归属的
-            // unit 调用 systemctl，不直接删除 `/etc` 下的任何 wants 链接。
-            if let Err(error) = service.stop_disable(unit_name) {
-                eprintln!("警告: 停止/禁用 {unit_name} 失败（继续删除 unit）: {error:#}");
+            // stop 失败或无法确认已停止：直接返回错误，unit / binary /
+            // config / data / state 全部保留；确认停止后才 disable。
+            stop_service_checked(service, unit_name, "panel")?;
+            if check_service {
+                if let Some(dir) = unit_path.parent() {
+                    // 必须在本安装 unit 仍存在时按目标路径确认归属，只删指向
+                    // 该 unit 的 wants 链接；同名外来 unit 的链接保留。
+                    remove_enable_symlink(dir, unit_name, unit_path)
+                        .context("清理面板启用链接失败")?;
+                }
             }
-            unit_removed = remove_regular_file(&unit_path, "panel unit")?;
+            unit_removed = remove_regular_file(unit_path, "panel unit")?;
             if let Err(error) = service.daemon_reload() {
                 eprintln!("警告: 删除 {unit_name} 后 systemctl daemon-reload 失败: {error:#}");
             }
         } else {
-            // unit 在 prefix 内、systemd 未解析到该 unit，或 unit 文件不存在：
-            // 只删本安装写入的文件，不调用 systemctl。
-            unit_removed = remove_regular_file(&unit_path, "panel unit")?;
+            // fragment 未解析 / transient：不能 stop，但同名服务仍可能 active。
+            if check_service {
+                ensure_service_stopped(service, unit_name, "panel")?;
+                if let Some(dir) = unit_path.parent() {
+                    remove_enable_symlink(dir, unit_name, unit_path)
+                        .context("清理面板启用链接失败")?;
+                }
+            }
+            unit_removed = remove_regular_file(unit_path, "panel unit")?;
         }
+    } else if check_service {
+        // unit 文件不存在（例如被手工删除）也必须查询同名服务状态，不能直接
+        // 删除 binary / config / data / state 或 purge；无法确认归属时也不清理
+        // wants 链接（remove_enable_symlink 在 expected_target 缺失时保留）。
+        ensure_service_stopped(service, unit_name, "panel")?;
     }
 
-    let binary_removed = remove_regular_file(&binary_path, "panel 二进制")?;
+    let binary_removed = remove_regular_file(binary_path, "panel 二进制")?;
 
     // 先完成 --purge 删除，再删除 state 记录：purge 失败时保留记录，重试卸载仍能
     // 定位到同一组路径；state 中 roles 为空时删除整个 state 文件。
     let mut purged_config = false;
     let mut purged_data = false;
     let mut purged_tls = false;
-    let tls_purge_path = purge_targets
-        .as_ref()
-        .and_then(|targets| targets.tls.clone());
+    let tls_purge_path = purge_targets.and_then(|targets| targets.tls.clone());
     if let Some(targets) = purge_targets {
-        if let Some(config) = targets.config {
+        if let Some(config) = targets.config.clone() {
             check_existing_regular_file(&config, "panel 配置")?;
             fs::remove_file(&config)
                 .with_context(|| format!("删除面板配置 {} 失败", config.display()))?;
             purged_config = true;
         }
-        if let Some(data) = targets.data {
+        if let Some(data) = targets.data.clone() {
             check_removable_directory(&data, "panel 数据目录")?;
             fs::remove_dir_all(&data)
                 .with_context(|| format!("删除面板数据目录 {} 失败", data.display()))?;
             purged_data = true;
         }
-        if let Some(tls) = targets.tls {
+        if let Some(tls) = targets.tls.clone() {
             // preflight 后、删除前再复核一次：目录不能被换成符号链接。
             check_removable_directory(&tls, "面板 TLS 目录")?;
             fs::remove_dir_all(&tls)
@@ -1296,14 +1358,14 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
         }
     }
 
-    let removed_record = remove_state_record(&mut state, &paths.state)?;
+    let removed_record = remove_state_record(state, &paths.state)?;
 
     print_uninstall_summary(
-        &paths,
-        &unit_path,
-        &binary_path,
-        &config_path,
-        &data_path,
+        paths,
+        unit_path,
+        binary_path,
+        config_path,
+        data_path,
         unit_removed,
         binary_removed,
         removed_record,
@@ -2358,7 +2420,7 @@ fn remove_regular_file(path: &Path, label: &str) -> Result<bool> {
 }
 
 /// `--purge` 的目标（已解析为 canonical path）。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PurgeTargets {
     config: Option<PathBuf>,
     data: Option<PathBuf>,
@@ -2725,6 +2787,7 @@ fn existence_label(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustboard_install::ServiceState;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
@@ -3787,6 +3850,303 @@ mod tests {
         assert!(validate_recorded_config_and_data(&paths, &paths.config, &paths.config).is_err());
     }
 
+    /// 生成一对面板服务端证书/私钥；`expired` 时有效期固定在 2020 年。
+    fn write_panel_tls_pair(dir: &Path, stem: &str, expired: bool) -> (PathBuf, PathBuf) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["panel.test".to_string()]).unwrap();
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()));
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        if expired {
+            params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2020, 2, 1);
+        }
+        let cert = params.self_signed(&key).unwrap();
+        let cert_path = dir.join(format!("{stem}-cert.pem"));
+        let key_path = dir.join(format!("{stem}-key.pem"));
+        write_with_mode(&cert_path, cert.pem().as_bytes(), 0o644);
+        write_with_mode(&key_path, key.serialize_pem().as_bytes(), 0o600);
+        (cert_path, key_path)
+    }
+
+    /// #71：`--force` 复用旧配置里的外部 TLS 路径时，必须事务复制到固定
+    /// panel-tls 目录，不能只改配置路径而不写文件。
+    #[test]
+    fn reused_external_panel_tls_is_copied_to_managed_paths() {
+        let dir = TempDir::new("tls-external");
+        let tls_dir = dir.path.join(PANEL_TLS_DIR_RELATIVE);
+        let external = dir.join("external");
+        fs::create_dir_all(&external).unwrap();
+        let (cert, key) = write_panel_tls_pair(&external, "external", false);
+
+        let base = PanelConfig {
+            tls_cert: cert.to_string_lossy().into_owned(),
+            tls_key: key.to_string_lossy().into_owned(),
+            public_origin: "https://panel.test".to_string(),
+            ..PanelConfig::default()
+        };
+        let args = test_install_args();
+        let plan = resolve_panel_tls(&args, Some(&base), "127.0.0.1:19091", &tls_dir)
+            .unwrap()
+            .expect("旧配置有 TLS 时必须生成 TLS 计划");
+
+        assert!(plan.copy_files, "外部源文件必须复制到托管目录");
+        assert_eq!(plan.cert_path, tls_dir.join(PANEL_TLS_CERT_FILE));
+        assert_eq!(plan.key_path, tls_dir.join(PANEL_TLS_KEY_FILE));
+        // 配置最终引用的路径必须能在事务中写出实际材料。
+        assert_eq!(
+            plan.material.cert_pem,
+            fs::read_to_string(&cert).unwrap(),
+            "复制的证书内容必须与旧配置源文件一致"
+        );
+        assert_eq!(
+            plan.material.key_pem,
+            fs::read_to_string(&key).unwrap(),
+            "复制的私钥内容必须与旧配置源文件一致"
+        );
+    }
+
+    /// 旧配置已经指向固定 panel-tls 路径时也在事务内重写，确保内容与权限
+    /// 随事务提交/回滚，而不是就地 chmod 源文件。
+    #[test]
+    fn reused_managed_panel_tls_is_rewritten_transactionally() {
+        let dir = TempDir::new("tls-managed");
+        let tls_dir = dir.path.join(PANEL_TLS_DIR_RELATIVE);
+        fs::create_dir_all(&tls_dir).unwrap();
+        let (cert, key) = write_panel_tls_pair(&tls_dir, "managed", false);
+        let managed_cert = tls_dir.join(PANEL_TLS_CERT_FILE);
+        let managed_key = tls_dir.join(PANEL_TLS_KEY_FILE);
+        fs::rename(&cert, &managed_cert).unwrap();
+        fs::rename(&key, &managed_key).unwrap();
+
+        let base = PanelConfig {
+            tls_cert: managed_cert.to_string_lossy().into_owned(),
+            tls_key: managed_key.to_string_lossy().into_owned(),
+            public_origin: "https://panel.test".to_string(),
+            ..PanelConfig::default()
+        };
+        let plan = resolve_panel_tls(
+            &test_install_args(),
+            Some(&base),
+            "127.0.0.1:19091",
+            &tls_dir,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(plan.copy_files, "固定路径也必须由事务重写以纳入权限回滚");
+    }
+
+    /// 旧配置指向固定路径但文件缺失：必须在写盘前失败，而不是写出悬空配置。
+    #[test]
+    fn reused_managed_panel_tls_rejects_missing_files() {
+        let dir = TempDir::new("tls-missing");
+        let tls_dir = dir.path.join(PANEL_TLS_DIR_RELATIVE);
+        let base = PanelConfig {
+            tls_cert: tls_dir
+                .join(PANEL_TLS_CERT_FILE)
+                .to_string_lossy()
+                .into_owned(),
+            tls_key: tls_dir
+                .join(PANEL_TLS_KEY_FILE)
+                .to_string_lossy()
+                .into_owned(),
+            public_origin: "https://panel.test".to_string(),
+            ..PanelConfig::default()
+        };
+        let error = match resolve_panel_tls(
+            &test_install_args(),
+            Some(&base),
+            "127.0.0.1:19091",
+            &tls_dir,
+        ) {
+            Ok(_) => panic!("固定证书缺失必须失败"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("校验已有面板 TLS 配置失败"), "{message}");
+        assert!(
+            message.contains("cert.pem") || message.contains("tls_cert"),
+            "{message}"
+        );
+    }
+
+    /// 旧固定证书已过期：必须在写盘前失败。
+    #[test]
+    fn reused_managed_panel_tls_rejects_expired_cert() {
+        let dir = TempDir::new("tls-expired");
+        let tls_dir = dir.path.join(PANEL_TLS_DIR_RELATIVE);
+        fs::create_dir_all(&tls_dir).unwrap();
+        let (cert, key) = write_panel_tls_pair(&tls_dir, "expired", true);
+        let managed_cert = tls_dir.join(PANEL_TLS_CERT_FILE);
+        let managed_key = tls_dir.join(PANEL_TLS_KEY_FILE);
+        fs::rename(&cert, &managed_cert).unwrap();
+        fs::rename(&key, &managed_key).unwrap();
+
+        let base = PanelConfig {
+            tls_cert: managed_cert.to_string_lossy().into_owned(),
+            tls_key: managed_key.to_string_lossy().into_owned(),
+            public_origin: "https://panel.test".to_string(),
+            ..PanelConfig::default()
+        };
+        let error = match resolve_panel_tls(
+            &test_install_args(),
+            Some(&base),
+            "127.0.0.1:19091",
+            &tls_dir,
+        ) {
+            Ok(_) => panic!("过期证书必须失败"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("已过期"), "{error:#}");
+    }
+
+    /// 构造一个无 systemd 的 ApplyInstall 场景，返回 paths / txn / apply 所需的
+    /// 只读参数。测试自身负责 run/commit/rollback。
+    struct ApplyTlsFixture {
+        _dir: TempDir,
+        paths: Paths,
+        cfg: PanelConfig,
+        config_bytes: String,
+        plan: PanelTlsPlan,
+        tls_dir: PathBuf,
+    }
+
+    fn apply_tls_fixture(tag: &str, external: (&Path, &Path)) -> ApplyTlsFixture {
+        let dir = TempDir::new(tag);
+        let prefix = dir.path.clone();
+        let tls_dir = prefix.join(PANEL_TLS_DIR_RELATIVE);
+        let base = PanelConfig {
+            tls_cert: external.0.to_string_lossy().into_owned(),
+            tls_key: external.1.to_string_lossy().into_owned(),
+            public_origin: "https://panel.test".to_string(),
+            ..PanelConfig::default()
+        };
+        let args = test_install_args();
+        let plan = resolve_panel_tls(&args, Some(&base), "127.0.0.1:19091", &tls_dir)
+            .unwrap()
+            .expect("外部 TLS 应生成计划");
+        let paths = resolve_paths(Some(&prefix), None, None).unwrap();
+        let mut cfg = base;
+        cfg.listen = "127.0.0.1:19091".to_string();
+        cfg.hub_url = "http://127.0.0.1:18444".to_string();
+        cfg.token = "test-token".to_string();
+        cfg.admin_password_hash = "$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$hashvalue".to_string();
+        cfg.public_origin = "https://panel.test".to_string();
+        cfg.cookie_secure = CookieSecure::Always;
+        cfg.tls_cert = plan.cert_path.to_string_lossy().into_owned();
+        cfg.tls_key = plan.key_path.to_string_lossy().into_owned();
+        cfg.validate().unwrap();
+        let config_bytes = render_panel_config(&cfg);
+        ApplyTlsFixture {
+            _dir: dir,
+            paths,
+            cfg,
+            config_bytes,
+            plan,
+            tls_dir,
+        }
+    }
+
+    fn run_apply_tls(fixture: &ApplyTlsFixture, mut txn: InstallTxn) -> (Result<()>, InstallTxn) {
+        let service = ServiceManager::new(fixture.tls_dir.clone(), false, true);
+        let mut state = InstallState::new();
+        let mut apply = ApplyInstall {
+            txn: &mut txn,
+            paths: &fixture.paths,
+            cfg: &fixture.cfg,
+            config_bytes: &fixture.config_bytes,
+            unit_text: None,
+            mode: ServiceMode::None,
+            service: &service,
+            was_active: false,
+            reload_done: false,
+            activation_attempted: false,
+            state: &mut state,
+            tls_dir: &fixture.tls_dir,
+            tls: Some(&fixture.plan),
+            hub_ca: None,
+            downgrade: None,
+        };
+        (apply.run(), txn)
+    }
+
+    /// #71：完整 ApplyInstall 路径必须写出目标 cert/key（0600 key），配置指向
+    /// 实际材料；旧外部源文件不被就地 chmod。
+    #[cfg(unix)]
+    #[test]
+    fn external_tls_is_applied_transactionally_before_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("apply-external");
+        let external = dir.join("external");
+        fs::create_dir_all(&external).unwrap();
+        let (cert, key) = write_panel_tls_pair(&external, "external", false);
+        // 旧源 key 故意放宽到 0640：ReadOnly 不应就地 chmod，最终固定私钥才是 0600。
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let fixture = apply_tls_fixture("apply-external-fixture", (&cert, &key));
+        let txn = InstallTxn::begin(&fixture.paths, false).unwrap();
+        let (result, mut txn) = run_apply_tls(&fixture, txn);
+        result.expect("ApplyInstall 应成功");
+        txn.commit().unwrap();
+
+        let dest_cert = fixture.tls_dir.join(PANEL_TLS_CERT_FILE);
+        let dest_key = fixture.tls_dir.join(PANEL_TLS_KEY_FILE);
+        assert_eq!(
+            fs::read_to_string(&dest_cert).unwrap(),
+            fs::read_to_string(&cert).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(&dest_key).unwrap(),
+            fs::read_to_string(&key).unwrap()
+        );
+        assert_eq!(file_mode(&dest_cert), 0o644);
+        assert_eq!(file_mode(&dest_key), 0o600);
+        // 源文件权限不能被安装流程改写（旧实现会 Runtime harden）。
+        assert_eq!(file_mode(&key), 0o640);
+
+        let loaded: PanelConfig =
+            toml::from_str(&fs::read_to_string(&fixture.paths.config).unwrap()).unwrap();
+        assert_eq!(loaded.tls_cert, dest_cert.to_string_lossy());
+        assert_eq!(loaded.tls_key, dest_key.to_string_lossy());
+    }
+
+    /// #71：cert/key 写入后配置写入失败时，事务回滚必须恢复旧目标文件内容与权限。
+    #[cfg(unix)]
+    #[test]
+    fn tls_material_rolls_back_with_config_failure() {
+        let dir = TempDir::new("apply-rollback");
+        let external = dir.join("external");
+        fs::create_dir_all(&external).unwrap();
+        let (cert, key) = write_panel_tls_pair(&external, "external", false);
+        let fixture = apply_tls_fixture("apply-rollback-fixture", (&cert, &key));
+
+        fs::create_dir_all(&fixture.tls_dir).unwrap();
+        let old_cert = fixture.tls_dir.join(PANEL_TLS_CERT_FILE);
+        let old_key = fixture.tls_dir.join(PANEL_TLS_KEY_FILE);
+        write_with_mode(&old_cert, b"old-cert", 0o644);
+        write_with_mode(&old_key, b"old-key", 0o600);
+        // 配置目标是目录：TLS 先写入，随后 config 写入失败，触发回滚。
+        fs::create_dir_all(&fixture.paths.config).unwrap();
+
+        let txn = InstallTxn::begin(&fixture.paths, false).unwrap();
+        let (result, mut txn) = run_apply_tls(&fixture, txn);
+        assert!(result.is_err(), "配置写入失败必须返回错误");
+        txn.rollback().unwrap();
+
+        assert_eq!(fs::read(&old_cert).unwrap(), b"old-cert");
+        assert_eq!(fs::read(&old_key).unwrap(), b"old-key");
+        assert_eq!(file_mode(&old_cert), 0o644);
+        assert_eq!(file_mode(&old_key), 0o600);
+        assert!(
+            fs::symlink_metadata(&fixture.paths.config)
+                .unwrap()
+                .is_dir(),
+            "回滚不应删除原有配置目录"
+        );
+    }
+
     /// C7：安装器 HTTPS 健康检查必须走真实 TLS，验证 CA + SNI，且错误 SNI 失败。
     #[test]
     fn https_health_check_uses_ca_and_checks_sni() {
@@ -3933,5 +4293,280 @@ mod tests {
             CookieSecure::Never,
             "HTTP 模式保留显式策略"
         );
+    }
+
+    /// #72：面板卸载流程的 fake systemd，走 preflight→execute 完整卸载路径。
+    struct UninstallFakeService {
+        stop_error: Option<&'static str>,
+        stop_calls: std::cell::Cell<usize>,
+        disable_calls: std::cell::Cell<usize>,
+        fragment: Option<PathBuf>,
+        state: std::cell::RefCell<ServiceState>,
+        state_after_stop: ServiceState,
+        state_error: Option<&'static str>,
+    }
+
+    impl UninstallFakeService {
+        fn stopped(fragment: Option<PathBuf>) -> Self {
+            Self {
+                stop_error: None,
+                stop_calls: std::cell::Cell::new(0),
+                disable_calls: std::cell::Cell::new(0),
+                fragment,
+                state: std::cell::RefCell::new(ServiceState::Inactive),
+                state_after_stop: ServiceState::Inactive,
+                state_error: None,
+            }
+        }
+    }
+
+    impl ServiceControl for UninstallFakeService {
+        fn fragment_path(&self, _unit: &str) -> Result<Option<PathBuf>> {
+            Ok(self.fragment.clone())
+        }
+
+        fn ensure_fragment_is(&self, _unit: &str, _expected: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn daemon_reload(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_managing(&self) -> bool {
+            true
+        }
+
+        fn active_state(&self, _unit: &str) -> Result<ServiceState> {
+            match self.state_error {
+                Some(message) => bail!("{message}"),
+                None => Ok(self.state.borrow().clone()),
+            }
+        }
+
+        fn main_pid(&self, _unit: &str) -> Result<u32> {
+            Ok(0)
+        }
+
+        fn enable_now(&self, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn restart(&self, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&self, _unit: &str) -> Result<()> {
+            self.stop_calls.set(self.stop_calls.get() + 1);
+            match self.stop_error {
+                Some(message) => bail!("{message}"),
+                None => {
+                    *self.state.borrow_mut() = self.state_after_stop.clone();
+                    Ok(())
+                }
+            }
+        }
+
+        fn disable(&self, _unit: &str) -> Result<()> {
+            self.disable_calls.set(self.disable_calls.get() + 1);
+            Ok(())
+        }
+    }
+
+    struct PanelUninstallFixture {
+        _dir: TempDir,
+        paths: Paths,
+        tls_dir: PathBuf,
+    }
+
+    fn panel_uninstall_fixture(tag: &str, unit_present: bool) -> PanelUninstallFixture {
+        let dir = TempDir::new_in(&install_prefix_base(), tag);
+        let prefix = dir.path.clone();
+        let paths = resolve_paths(Some(&prefix), None, None).unwrap();
+        fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+        fs::write(&paths.config, b"token = \"x\"\n").unwrap();
+        fs::create_dir_all(paths.unit.parent().unwrap()).unwrap();
+        if unit_present {
+            fs::write(&paths.unit, render_unit(Role::Panel, &paths).unwrap()).unwrap();
+        }
+        fs::create_dir_all(paths.binary.parent().unwrap()).unwrap();
+        fs::write(&paths.binary, b"bin").unwrap();
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        fs::write(paths.data_dir.join("keep"), b"data").unwrap();
+        let tls_dir = prefix.join(PANEL_TLS_DIR_RELATIVE);
+        fs::create_dir_all(&tls_dir).unwrap();
+        fs::write(tls_dir.join(PANEL_TLS_CERT_FILE), b"cert").unwrap();
+        fs::write(tls_dir.join(PANEL_TLS_KEY_FILE), b"key").unwrap();
+
+        let mut state = InstallState::new();
+        state.upsert(
+            Role::Panel,
+            RoleState::new(&paths, env!("CARGO_PKG_VERSION"), paths.backup_root.clone()),
+        );
+        state.save(&paths.state).unwrap();
+        PanelUninstallFixture {
+            _dir: dir,
+            paths,
+            tls_dir,
+        }
+    }
+
+    fn run_panel_uninstall(
+        fixture: PanelUninstallFixture,
+        service: &UninstallFakeService,
+    ) -> (Result<()>, PanelUninstallFixture) {
+        let args = UninstallArgs {
+            prefix: Some(fixture.paths.prefix.clone()),
+            config: None,
+            unit_dir: None,
+            purge: true,
+            yes: true,
+            dry_run: false,
+        };
+        let result = uninstall_impl(args, Some(service));
+        (result, fixture)
+    }
+
+    fn assert_panel_targets_preserved(fixture: &PanelUninstallFixture, context: &str) {
+        for path in [
+            &fixture.paths.unit,
+            &fixture.paths.binary,
+            &fixture.paths.config,
+            &fixture.paths.data_dir,
+            &fixture.tls_dir,
+            &fixture.paths.state,
+        ] {
+            assert!(path.exists(), "{context}时必须保留 {}", path.display());
+        }
+    }
+
+    fn assert_panel_targets_preserved_without_unit(fixture: &PanelUninstallFixture, context: &str) {
+        for path in [
+            &fixture.paths.binary,
+            &fixture.paths.config,
+            &fixture.paths.data_dir,
+            &fixture.tls_dir,
+            &fixture.paths.state,
+        ] {
+            assert!(path.exists(), "{context}时必须保留 {}", path.display());
+        }
+        assert!(
+            !fixture.paths.unit.exists(),
+            "{context}时本就不存在 unit 文件，不应被创建"
+        );
+    }
+
+    #[test]
+    fn uninstall_stop_failure_preserves_files_and_state() {
+        let fixture = panel_uninstall_fixture("uninstall-stop", true);
+        let unit = fixture.paths.unit.clone();
+        let mut service = UninstallFakeService::stopped(Some(unit));
+        service.stop_error = Some("mock stop failure");
+        service.state = std::cell::RefCell::new(ServiceState::Active);
+        let (result, fixture) = run_panel_uninstall(fixture, &service);
+        let message = format!("{:#}", result.expect_err("stop 失败必须返回错误"));
+        assert!(message.contains("停止 panel 服务"), "{message}");
+        assert!(message.contains("安装状态已保留"), "{message}");
+        assert_eq!(service.stop_calls.get(), 1);
+        assert_eq!(service.disable_calls.get(), 0);
+        assert_panel_targets_preserved(&fixture, "stop 失败");
+    }
+
+    #[test]
+    fn uninstall_active_or_unknown_state_preserves_files_and_state() {
+        let fixture = panel_uninstall_fixture("uninstall-active", true);
+        let unit = fixture.paths.unit.clone();
+        let mut active = UninstallFakeService::stopped(Some(unit));
+        active.state = std::cell::RefCell::new(ServiceState::Active);
+        active.state_after_stop = ServiceState::Active;
+        let (result, fixture) = run_panel_uninstall(fixture, &active);
+        let message = format!("{:#}", result.expect_err("仍 active 必须失败"));
+        assert!(message.contains("ActiveState=active"), "{message}");
+        assert_eq!(active.disable_calls.get(), 0);
+        assert_panel_targets_preserved(&fixture, "仍 active");
+
+        let fixture = panel_uninstall_fixture("uninstall-unknown", true);
+        let unit = fixture.paths.unit.clone();
+        let mut unknown = UninstallFakeService::stopped(Some(unit));
+        unknown.state_error = Some("mock ActiveState failure");
+        let (result, fixture) = run_panel_uninstall(fixture, &unknown);
+        let message = format!("{:#}", result.expect_err("无法确认停止必须失败"));
+        assert!(message.contains("无法确认 panel 服务"), "{message}");
+        assert_eq!(unknown.disable_calls.get(), 0);
+        assert_panel_targets_preserved(&fixture, "状态未知");
+    }
+
+    /// unit 文件已不存在但同名服务仍 active：preflight 之后也必须拒绝删除/purge。
+    #[test]
+    fn uninstall_missing_unit_but_active_service_preserves_everything() {
+        for (tag, state) in [
+            ("reloading", ServiceState::Reloading),
+            ("deactivating", ServiceState::Deactivating),
+            ("other", ServiceState::Other("maintenance".to_string())),
+        ] {
+            let fixture = panel_uninstall_fixture(&format!("uninstall-unit-missing-{tag}"), false);
+            let mut service = UninstallFakeService::stopped(None);
+            service.state = std::cell::RefCell::new(state.clone());
+            let (result, fixture) = run_panel_uninstall(fixture, &service);
+            let message = format!("{:#}", result.expect_err("unit 缺失但服务未停止必须失败"));
+            assert!(
+                message.contains(&format!("ActiveState={}", state.as_str())),
+                "{message}"
+            );
+            assert_eq!(service.stop_calls.get(), 0, "unit 缺失时不得 stop");
+            assert_eq!(service.disable_calls.get(), 0);
+            assert_panel_targets_preserved_without_unit(&fixture, "unit 缺失但服务未停止");
+        }
+    }
+
+    /// unit 文件缺失但同名服务已明确 stopped：允许清理，且不得 stop / 清理链接。
+    #[test]
+    fn uninstall_missing_unit_but_inactive_service_proceeds() {
+        let fixture = panel_uninstall_fixture("uninstall-unit-missing-inactive", false);
+        let service = UninstallFakeService::stopped(None);
+        let (result, fixture) = run_panel_uninstall(fixture, &service);
+        result.expect("unit 缺失但服务 inactive 时卸载应成功");
+        assert_eq!(service.stop_calls.get(), 0);
+        assert_eq!(service.disable_calls.get(), 0);
+        assert!(!fixture.paths.unit.exists());
+        assert!(!fixture.paths.binary.exists());
+        assert!(!fixture.paths.config.exists());
+        assert!(!fixture.paths.data_dir.exists());
+        assert!(!fixture.tls_dir.exists());
+        assert!(!fixture.paths.state.exists());
+    }
+
+    #[test]
+    fn uninstall_successful_stop_removes_all_targets() {
+        let fixture = panel_uninstall_fixture("uninstall-ok", true);
+        let unit = fixture.paths.unit.clone();
+        // 同名 foreign unit 的 enable 链接：指向别的 unit，卸载必须保留。
+        let foreign = fixture.paths.prefix.join("foreign-panel.service");
+        fs::write(&foreign, b"foreign unit").unwrap();
+        let wants = fixture
+            .paths
+            .unit
+            .parent()
+            .unwrap()
+            .join("multi-user.target.wants");
+        fs::create_dir_all(&wants).unwrap();
+        let foreign_link = wants.join(Role::Panel.unit_name());
+        std::os::unix::fs::symlink(&foreign, &foreign_link).unwrap();
+        let service = UninstallFakeService::stopped(Some(unit));
+        let (result, fixture) = run_panel_uninstall(fixture, &service);
+        result.expect("已停止时卸载应成功");
+        assert!(
+            std::fs::symlink_metadata(&foreign_link).is_ok(),
+            "同名外来 unit 的 wants 链接必须保留"
+        );
+        assert!(foreign.exists(), "外来 unit 不能被删除");
+        assert_eq!(service.stop_calls.get(), 1);
+        assert_eq!(service.disable_calls.get(), 1);
+        assert!(!fixture.paths.unit.exists());
+        assert!(!fixture.paths.binary.exists());
+        assert!(!fixture.paths.config.exists());
+        assert!(!fixture.paths.data_dir.exists());
+        assert!(!fixture.tls_dir.exists());
+        assert!(!fixture.paths.state.exists());
     }
 }

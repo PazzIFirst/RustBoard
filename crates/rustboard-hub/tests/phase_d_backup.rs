@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use rustboard_common::config::HubConfig;
 use rustboard_common::model::{AgentRecord, Sample, SampleBatch};
+use rustboard_common::tls;
 use rustboard_core::alerts::{AlertState, AlertStateKind};
 use rustboard_core::archive::{ArchiveObject, ArchiveStatus};
 use rustboard_core::storage::migrate::validate_target_empty;
@@ -197,16 +198,20 @@ fn write_config(root: &Path, data_dir: &Path, database: &str) -> (PathBuf, Vec<u
 }
 
 fn write_certs(data_dir: &Path) {
+    // 备份现在会校验 server/CA 配套，测试夹具必须是真实可解析的证书材料。
+    tls::ensure_self_signed_server(
+        data_dir,
+        &["127.0.0.1".to_string()],
+        tls::CertPolicy::default(),
+    )
+    .expect("生成测试证书");
     let certs = data_dir.join("certs");
-    fs::create_dir_all(&certs).expect("创建证书目录");
-    fs::set_permissions(&certs, fs::Permissions::from_mode(0o700)).expect("certs 0700");
     // 模拟旧安装遗留的 0644 cert；备份必须收紧为 0600。
-    fs::write(certs.join("ca.crt"), b"d5b-ca-cert\n").expect("写 ca.crt");
-    fs::set_permissions(certs.join("ca.crt"), fs::Permissions::from_mode(0o644))
-        .expect("ca.crt 0644");
-    fs::write(certs.join("server.key"), b"d5b-server-key\n").expect("写 server.key");
-    fs::set_permissions(certs.join("server.key"), fs::Permissions::from_mode(0o600))
-        .expect("server.key 0600");
+    for name in [tls::CA_CERT_FILE, tls::SERVER_CERT_FILE] {
+        fs::set_permissions(certs.join(name), fs::Permissions::from_mode(0o644))
+            .unwrap_or_else(|err| panic!("设置 {name} 0644 失败: {err}"));
+    }
+    assert_eq!(mode_of(&certs.join(tls::SERVER_KEY_FILE)), 0o600);
 }
 
 fn seed_sqlite(db_path: &Path) {
@@ -331,7 +336,7 @@ fn assert_manifest_hashes(backup: &Path) {
     let manifest = manifest_of(backup);
     assert_eq!(manifest["manifest_version"], 1);
     assert_eq!(manifest["backend"], "sqlite");
-    assert_eq!(manifest["schema"], 8);
+    assert_eq!(manifest["schema"], 9);
     assert!(!manifest["files"].as_array().unwrap().is_empty());
     for file in manifest["files"].as_array().unwrap() {
         let rel = file["path"].as_str().unwrap();
@@ -581,6 +586,175 @@ fn migrate_failure_keeps_config_byte_identical_and_redacts_password() {
     assert_eq!(file_sha(&db_path), before_db, "迁移失败不得改 SQLite");
 }
 
+/// P0：旧 v8 PostgreSQL 目标在 `--force`/`--dry-run` 下都必须在 pg_dump/
+/// TRUNCATE 之前被拒绝，目标行不得被清空。
+#[test]
+fn migrate_rejects_old_postgres_target_before_dump_or_truncate() {
+    let Some(db) = PgTestDb::create() else {
+        return;
+    };
+    let root = TestRoot::new("migrate-old-pg-target");
+    let (config_path, db_path, data_dir, _config_bytes) = setup_sqlite(root.path());
+
+    // 构造「v8 + 有业务行」的旧目标：如果 preflight 把它当成 NonEmpty，
+    // --force 会先 pg_dump 再 TRUNCATE，随后才被 apply_schema 拒绝。
+    {
+        let mut client = connect_for_schema(&db.dsn).expect("连接旧目标");
+        client
+            .batch_execute(
+                "CREATE TABLE schema_migrations (version bigint NOT NULL);\
+                 INSERT INTO schema_migrations (version) VALUES (8);\
+                 CREATE TABLE agents (id bigint PRIMARY KEY, name text NOT NULL);\
+                 INSERT INTO agents (id, name) VALUES (1, 'legacy-canary');",
+            )
+            .expect("构造旧目标 schema");
+    }
+
+    // fake pg_dump：一旦被执行就留下 marker；本用例必须完全没有 marker。
+    let fake_bin = root.path().join("fakebin-old-target");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let marker = root.path().join("pg-dump-ran");
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"${{1:-}}\" = \"--version\" ]; then echo 'pg_dump (fake) 1'; exit 0; fi\n\
+         printf 'ran' > {}\n\
+         exit 1\n",
+        marker.display()
+    );
+    fs::write(fake_bin.join("pg_dump"), script).unwrap();
+    fs::set_permissions(fake_bin.join("pg_dump"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path_env = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let before_db = file_sha(&db_path);
+
+    for (dry_run, force) in [(true, false), (false, true)] {
+        let _ = fs::remove_file(&marker);
+        let mut args = vec![
+            "migrate",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--to",
+            db.dsn.as_str(),
+            "--yes",
+            "--hub-stopped",
+        ];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        if force {
+            args.push("--force");
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_rustboard-hub"))
+            .args(&args)
+            .env("PATH", &path_env)
+            .env_remove("RUSTBOARD_DATABASE_PASSWORD")
+            .output()
+            .expect("执行 migrate 旧目标用例");
+        assert!(
+            !output.status.success(),
+            "旧 v8 目标必须拒绝（dry_run={dry_run}, force={force}）: {}",
+            combined(&output)
+        );
+        let text = combined(&output);
+        assert!(
+            text.contains("只支持全新安装"),
+            "错误文案必须与启动一致（dry_run={dry_run}, force={force}）: {text}"
+        );
+        assert!(
+            !marker.exists(),
+            "旧目标不得执行 pg_dump（dry_run={dry_run}, force={force}）"
+        );
+        let mut client = connect_for_schema(&db.dsn).expect("复查旧目标");
+        let count: i64 = client
+            .query_one("SELECT COUNT(*) FROM agents", &[])
+            .expect("统计 canary 行")
+            .get(0);
+        assert_eq!(
+            count, 1,
+            "旧目标业务行被 TRUNCATE/改写（dry_run={dry_run}, force={force}）"
+        );
+    }
+    assert_eq!(file_sha(&db_path), before_db, "迁移失败不得改 SQLite");
+    // data_dir/backups 只应由真正的迁移前备份创建；旧目标在备份前就失败。
+    assert!(
+        !data_dir.join("backups").exists(),
+        "旧目标拒绝时不得创建迁移前备份目录"
+    );
+
+    // 2) 自称 v9 但对象不完整：同样必须在 pg_dump/TRUNCATE 之前拒绝。
+    {
+        let mut client = connect_for_schema(&db.dsn).expect("连接不完整 v9 目标");
+        client
+            .batch_execute("UPDATE schema_migrations SET version = 9")
+            .expect("伪造成 v9");
+    }
+    let _ = fs::remove_file(&marker);
+    let output = Command::new(env!("CARGO_BIN_EXE_rustboard-hub"))
+        .args([
+            "migrate",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--to",
+            db.dsn.as_str(),
+            "--force",
+            "--yes",
+            "--hub-stopped",
+        ])
+        .env("PATH", &path_env)
+        .env_remove("RUSTBOARD_DATABASE_PASSWORD")
+        .output()
+        .expect("执行不完整 v9 目标用例");
+    assert!(!output.status.success(), "不完整 v9 目标必须拒绝");
+    let text = combined(&output);
+    assert!(
+        text.contains("不完整") || text.contains("缺少表"),
+        "错误应指出 v9 对象不完整: {text}"
+    );
+    assert!(!marker.exists(), "不完整 v9 目标不得执行 pg_dump");
+    let mut client = connect_for_schema(&db.dsn).expect("复查不完整 v9 目标");
+    let count: i64 = client
+        .query_one("SELECT COUNT(*) FROM agents", &[])
+        .expect("统计 canary 行")
+        .get(0);
+    assert_eq!(count, 1, "不完整 v9 目标不得被 TRUNCATE");
+}
+
+/// P1 复审：`run` / `tls status` / `rotate-cert` 的坏配置不能把含 token/密码的
+/// TOML 源码行写到 stderr。
+#[test]
+fn service_commands_bad_config_do_not_echo_token_or_password() {
+    let root = TestRoot::new("run-bad-config");
+    let config_path = root.path().join("hub.toml");
+    let secret = "run-toml-canary-token-3f9e";
+    fs::write(
+        &config_path,
+        format!("admin_token = \"{secret}\"\ndatabase = [\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let config = config_path.to_str().unwrap();
+
+    for (name, args) in [
+        ("run", vec!["run", "--config", config]),
+        ("tls status", vec!["tls", "status", "--config", config]),
+        ("rotate-cert", vec!["rotate-cert", "--config", config]),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rustboard-hub"))
+            .args(&args)
+            .env_remove("RUSTBOARD_DATABASE_PASSWORD")
+            .output()
+            .unwrap_or_else(|err| panic!("执行 {name} 坏配置用例失败: {err}"));
+        assert!(!output.status.success(), "{name}: 坏配置必须失败");
+        let text = combined(&output);
+        assert!(text.contains("TOML 解析失败"), "{name}: {text}");
+        assert!(text.contains("hub.toml"), "{name}: {text}");
+        assert!(!text.contains(secret), "{name}: 错误泄露配置原文: {text}");
+    }
+}
+
 fn pg_dsn() -> Option<String> {
     match std::env::var("RUSTBOARD_TEST_PG") {
         Ok(dsn) if !dsn.is_empty() => Some(dsn),
@@ -803,7 +977,7 @@ fn pg_migrate_dry_run_success_force_and_config_switch() {
     assert_eq!(file_sha(&db_path), source_db_sha);
     assert_pg_empty(&dsn);
 
-    // 真实迁移：21 表 + 配置切换。
+    // 真实迁移：22 表 + 配置切换。
     let output = hub(&[
         "migrate",
         "--config",
@@ -823,7 +997,7 @@ fn pg_migrate_dry_run_success_force_and_config_switch() {
         "migrate 泄露密码: {text}"
     );
     assert!(text.contains("迁移完成"), "{text}");
-    assert!(text.contains("21 张表"), "{text}");
+    assert!(text.contains("22 张表"), "{text}");
     assert_eq!(file_sha(&db_path), source_db_sha, "迁移不得修改源 SQLite");
     let new_config = fs::read_to_string(&config_path).unwrap();
     assert!(
@@ -1064,7 +1238,7 @@ fn pg_backup_restore_requires_real_client_tools() {
     let backup = backup_dirs(&out).remove(0);
     let manifest = manifest_of(&backup);
     assert_eq!(manifest["backend"], "postgres");
-    assert_eq!(manifest["schema"], 8);
+    assert_eq!(manifest["schema"], 9);
     assert!(backup.join("rustboard.dump").is_file());
     assert_eq!(mode_of(&backup.join("rustboard.dump")), 0o600);
 
@@ -1259,7 +1433,7 @@ fn restore_pg_without_config_requires_data_dir_and_db() {
     let manifest = serde_json::json!({
         "manifest_version": 1,
         "version": "test",
-        "schema": 8,
+        "schema": 9,
         "backend": "postgres",
         "created_at": "2026-01-01T00:00:00.000Z",
         "created_at_ms": 0,
@@ -1311,6 +1485,111 @@ fn restore_pg_without_config_requires_data_dir_and_db() {
     assert!(!data_dir.exists(), "拒绝时不得创建目标目录");
 }
 
+/// P1 复审：`pg_restore` 之后必须校验目标真实 schema；不满足 v9 时不得
+/// 恢复证书/切换配置。用 no-op fake pg_restore 模拟“恢复后仍是空库（v0）”。
+#[test]
+fn restore_rejects_postgres_backup_when_restored_schema_is_not_v9() {
+    let Some(target) = PgTestDb::create() else {
+        return;
+    };
+    let root = TestRoot::new("restore-pg-post-schema");
+    let backup = root.path().join("pg-backup");
+    fs::create_dir_all(&backup).unwrap();
+    let cfg = HubConfig {
+        data_dir: root.path().join("original-data"),
+        database: target.dsn.clone(),
+        ..HubConfig::default()
+    };
+    let cfg_bytes = toml::to_string_pretty(&cfg).unwrap().into_bytes();
+    fs::write(backup.join("hub.toml"), &cfg_bytes).unwrap();
+    let dump = b"fake-pg-dump";
+    fs::write(backup.join("rustboard.dump"), dump).unwrap();
+    let manifest = serde_json::json!({
+        "manifest_version": 1,
+        "version": "test",
+        "schema": 9,
+        "backend": "postgres",
+        "created_at": "2026-01-01T00:00:00.000Z",
+        "created_at_ms": 0,
+        "files": [
+            {"path": "hub.toml", "sha256": sha256(&cfg_bytes), "size": cfg_bytes.len(), "mode": "0600"},
+            {"path": "rustboard.dump", "sha256": sha256(dump), "size": dump.len(), "mode": "0600"}
+        ]
+    });
+    fs::write(
+        backup.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(
+        backup.join("manifest.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+
+    let target_data = root.path().join("target-data");
+    let target_cfg = HubConfig {
+        data_dir: target_data.clone(),
+        database: target.dsn.clone(),
+        ..HubConfig::default()
+    };
+    let target_config = root.path().join("target-hub.toml");
+    target_cfg.save(&target_config).unwrap();
+    let before_config = fs::read(&target_config).unwrap();
+
+    // fake pg_restore：--version 成功；真正恢复时 no-op 成功，目标保持空库 v0。
+    let fake_bin = root.path().join("fakebin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let fake_restore = fake_bin.join("pg_restore");
+    fs::write(
+        &fake_restore,
+        "#!/bin/sh\n\
+         if [ \"${1:-}\" = \"--version\" ]; then echo 'pg_restore (fake) 1'; exit 0; fi\n\
+         exit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_restore, fs::Permissions::from_mode(0o755)).unwrap();
+    let path_env = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rustboard-hub"))
+        .args([
+            "restore",
+            "--config",
+            target_config.to_str().unwrap(),
+            "--from",
+            backup.to_str().unwrap(),
+            "--yes",
+            "--hub-stopped",
+        ])
+        .env("PATH", path_env)
+        .env_remove("RUSTBOARD_DATABASE_PASSWORD")
+        .output()
+        .expect("执行 PG 恢复后 schema 校验用例");
+    assert!(!output.status.success(), "恢复后非 v9 目标必须拒绝");
+    let text = combined(&output);
+    assert!(
+        text.contains("只支持全新安装"),
+        "错误文案必须与启动一致: {text}"
+    );
+    assert!(
+        !text.contains("证书目录已恢复"),
+        "schema 校验失败后不得恢复证书: {text}"
+    );
+    assert_eq!(
+        fs::read(&target_config).unwrap(),
+        before_config,
+        "schema 校验失败后不得切换配置"
+    );
+    assert!(
+        !target_data.join("certs").exists(),
+        "schema 校验失败后不得创建证书目录"
+    );
+}
+
 /// `--force` 的 pre-restore 快照失败必须中止；只有显式
 /// `--no-pre-restore-backup` 才允许在无备份情况下继续。
 #[test]
@@ -1329,8 +1608,9 @@ fn restore_force_aborts_when_pre_restore_backup_fails() {
     assert!(output.status.success(), "{}", combined(&output));
     let backup = backup_dirs(&out).remove(0);
     remove_sqlite_sidecars(&db_path);
-    // 让 pre-restore 快照的 certs 复制失败。
-    fs::remove_dir_all(data_dir.join("certs")).unwrap();
+    // 让 pre-restore 快照无法创建 <data_dir>/backups（普通文件挡路）。
+    let blocker = data_dir.join("backups");
+    fs::write(&blocker, b"blocked").expect("创建 pre-restore 失败注入文件");
     let before_db = file_sha(&db_path);
     let before_config = fs::read(&config_path).unwrap();
 
@@ -1352,6 +1632,8 @@ fn restore_force_aborts_when_pre_restore_backup_fails() {
     assert_eq!(file_sha(&db_path), before_db, "中止时不得改目标库");
     assert_eq!(fs::read(&config_path).unwrap(), before_config);
 
+    // 移除挡路文件后，显式跳过预备份应成功。
+    fs::remove_file(&blocker).expect("移除 pre-restore 失败注入文件");
     remove_sqlite_sidecars(&db_path);
     let output = hub(&[
         "restore",
@@ -1371,6 +1653,148 @@ fn restore_force_aborts_when_pre_restore_backup_fails() {
     assert_seeded(&StorageHandle::sqlite(&db_path, 4).expect("打开 SQLite"));
     assert_eq!(mode_of(&data_dir.join("certs/server.key")), 0o600);
     let _ = config_bytes;
+}
+
+/// v1.0.0 只支持全新安装：manifest schema=v8 的备份必须在写任何目标文件前
+/// 被拒绝（数据库/证书/配置都不动），错误文案与启动路径一致。
+#[test]
+fn restore_rejects_legacy_schema_manifest_without_writing_target() {
+    let root = TestRoot::new("restore-legacy-schema");
+    let (config_path, db_path, data_dir, _config_bytes) = setup_sqlite(root.path());
+    let out = root.path().join("backups");
+    let output = hub(&[
+        "backup",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--yes",
+    ]);
+    assert!(output.status.success(), "{}", combined(&output));
+    let backup = backup_dirs(&out).remove(0);
+
+    // 把 manifest 伪装成旧版本备份；manifest 自身不在哈希清单里。
+    let manifest_path = backup.join("manifest.json");
+    let mut manifest = manifest_of(&backup);
+    manifest["schema"] = Value::from(8);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // 清空目标材料，任何写入都会被后续断言发现。
+    remove_sqlite_sidecars(&db_path);
+    fs::remove_file(&db_path).expect("删除目标数据库");
+    fs::remove_dir_all(data_dir.join("certs")).expect("删除目标证书目录");
+    let before_config = fs::read(&config_path).unwrap();
+
+    let output = hub(&[
+        "restore",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--from",
+        backup.to_str().unwrap(),
+        "--force",
+        "--yes",
+    ]);
+    assert!(!output.status.success(), "v8 备份必须拒绝恢复");
+    let text = combined(&output);
+    assert!(
+        text.contains("只支持全新安装"),
+        "错误文案必须与启动一致: {text}"
+    );
+    assert!(
+        text.contains("旧数据兼容将在首个正式版本之后提供"),
+        "错误文案必须说明旧数据兼容计划: {text}"
+    );
+    assert!(!db_path.exists(), "v8 备份不得写入数据库");
+    assert!(!data_dir.join("certs").exists(), "v8 备份不得写入证书");
+    assert_eq!(
+        fs::read(&config_path).unwrap(),
+        before_config,
+        "v8 备份不得改写配置"
+    );
+    let config_bak = fs::read_dir(config_path.parent().unwrap())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("hub.toml.bak-")
+        });
+    assert!(!config_bak, "v8 备份在拒绝前不得写配置备份");
+}
+
+/// 恢复不能只信 manifest 的 schema 字段：备份里的真实 SQLite 是 v8，或自称
+/// v9 却缺表时，都必须在写目标/预备份之前拒绝。
+#[test]
+fn restore_validates_real_sqlite_version_and_tables_not_manifest_claim() {
+    let root = TestRoot::new("restore-real-sqlite-schema");
+    let (config_path, db_path, data_dir, _config_bytes) = setup_sqlite(root.path());
+    let out = root.path().join("backups");
+    let output = hub(&[
+        "backup",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--yes",
+    ]);
+    assert!(output.status.success(), "{}", combined(&output));
+    let backup = backup_dirs(&out).remove(0);
+    let backup_db = backup.join("rustboard.db");
+    remove_sqlite_sidecars(&db_path);
+    let before_db = file_sha(&db_path);
+    let before_config = fs::read(&config_path).unwrap();
+
+    // 1) manifest 仍为 schema=9，但数据库真实 user_version=8。
+    let conn = rusqlite::Connection::open(&backup_db).unwrap();
+    conn.pragma_update(None, "user_version", 8).unwrap();
+    drop(conn);
+    refresh_manifest_file(&backup, "rustboard.db");
+    let output = hub(&[
+        "restore",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--from",
+        backup.to_str().unwrap(),
+        "--force",
+        "--yes",
+    ]);
+    assert!(!output.status.success(), "真实 v8 的备份必须拒绝");
+    let text = combined(&output);
+    assert!(text.contains("只支持全新安装"), "{text}");
+    assert_eq!(file_sha(&db_path), before_db, "拒绝时不得改目标数据库");
+    assert_eq!(fs::read(&config_path).unwrap(), before_config);
+    assert!(
+        !data_dir.join("backups").exists(),
+        "拒绝时不得创建 pre-restore 备份"
+    );
+
+    // 2) 版本改回 v9，但删掉 v9 新表 alert_rule_channels。
+    let conn = rusqlite::Connection::open(&backup_db).unwrap();
+    conn.pragma_update(None, "user_version", 9).unwrap();
+    conn.execute("DROP TABLE alert_rule_channels", [])
+        .expect("删除备份中的 v9 新表");
+    drop(conn);
+    refresh_manifest_file(&backup, "rustboard.db");
+    let output = hub(&[
+        "restore",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--from",
+        backup.to_str().unwrap(),
+        "--force",
+        "--yes",
+    ]);
+    assert!(!output.status.success(), "缺表的 v9 备份必须拒绝");
+    let text = combined(&output);
+    assert!(text.contains("缺少表 alert_rule_channels"), "{text}");
+    assert_eq!(file_sha(&db_path), before_db, "缺表时不得改目标数据库");
+    assert_eq!(fs::read(&config_path).unwrap(), before_config);
 }
 
 /// 恢复前存在旧 `-wal`：必须拒绝；清理 sidecar 后再恢复，旧 WAL 中的旧表不能
@@ -1698,7 +2122,7 @@ fn concurrent_force_migrate_is_serialized_by_advisory_lock() {
 
 /// pentest 回归：v7 源库有未 checkpoint 的 `-wal` 时，immutable 只看主库会把
 /// user_version 读成 0。预检必须复制 DB+WAL 到临时目录读取；dry-run 成功、
-/// 能识别 21 表与 WAL 中的新增行，且源目录不新增任何文件。
+/// 能识别 22 表与 WAL 中的新增行，且源目录不新增任何文件。
 #[test]
 fn migrate_dry_run_reads_uncheckpointed_wal_source() {
     let Some(db) = PgTestDb::create() else {
@@ -1741,12 +2165,12 @@ fn migrate_dry_run_reads_uncheckpointed_wal_source() {
         combined(&output)
     );
     let text = combined(&output);
-    assert!(text.contains("schema v8"), "{text}");
+    assert!(text.contains("schema v9"), "{text}");
     assert!(
         text.contains("samples 4 行"),
         "必须读到 WAL 中的新增行: {text}"
     );
-    assert!(text.contains("21 张表齐全"), "{text}");
+    assert!(text.contains("22 张表齐全"), "{text}");
     let after = list_tree(&data_dir);
     assert_eq!(before, after, "dry-run 不得在源目录创建/删除文件");
     assert_pg_empty(&dsn);

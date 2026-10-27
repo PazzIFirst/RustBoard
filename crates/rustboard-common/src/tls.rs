@@ -1510,16 +1510,41 @@ pub fn parse_fingerprint(text: &str) -> Result<[u8; 32]> {
 /// feature，也不会静默回退到 TLS 1.2）。证书与私钥必须配套，否则直接报错并提示
 /// 修复命令——不能等到握手时才失败。
 pub fn server_config(data_dir: &Path) -> Result<Arc<rustls::ServerConfig>> {
+    Ok(server_config_with_cert_pem_from_disk(data_dir)?.0)
+}
+
+/// 读取 `server.crt` 并用**同一份 PEM** 构建 mTLS 配置，返回配置与证书 PEM。
+///
+/// 调用方可以用返回的 PEM 计算 live 摘要，避免“读配置后再读一次磁盘”之间
+/// 发生 rotate 导致 listener 配置与 `CertStatus` 不一致。
+pub fn server_config_with_cert_pem_from_disk(
+    data_dir: &Path,
+) -> Result<(Arc<rustls::ServerConfig>, String)> {
     let dir = cert_dir(data_dir);
     let cert_path = dir.join(SERVER_CERT_FILE);
     let cert_pem = std::fs::read_to_string(&cert_path)?;
+    let config = server_config_with_cert_pem(data_dir, &cert_pem)?;
+    Ok((config, cert_pem))
+}
+
+/// 用调用方已经读取的证书 PEM 构建 mTLS 配置。
+///
+/// `cert_pem` 必须是实际要生效的那一份材料；构建过程中只额外读取私钥与 CA，
+/// 不会重新读取 `server.crt`。这样启动 / 热加载 / 续签可以用同一份 PEM 同时
+/// 构建配置与 `CertStatus`，不会在两次读盘之间被 rotate 插入。
+pub fn server_config_with_cert_pem(
+    data_dir: &Path,
+    cert_pem: &str,
+) -> Result<Arc<rustls::ServerConfig>> {
+    let dir = cert_dir(data_dir);
+    let cert_path = dir.join(SERVER_CERT_FILE);
     let key_path = dir.join(SERVER_KEY_FILE);
     // M3：服务端私钥也属于敏感文件，旧版本可能留下过宽权限。
     crate::fsutil::harden(&key_path, 0o600)?;
     let key_pem = std::fs::read_to_string(&key_path)?;
     let ca_pem = std::fs::read_to_string(dir.join(CA_CERT_FILE))?;
 
-    if !cert_matches_key(&cert_pem, &key_pem)? {
+    if !cert_matches_key(cert_pem, &key_pem)? {
         return Err(anyhow!(
             "服务端证书与私钥不匹配（{} 与 {} 不是一对，可能是上次续签在写盘中途被中断）；\
              执行 `rustboard-hub rotate-cert --force` 重新签发，或直接启动 hub 触发自动修复",
@@ -1528,7 +1553,7 @@ pub fn server_config(data_dir: &Path) -> Result<Arc<rustls::ServerConfig>> {
         ));
     }
 
-    let certs = load_certs(&cert_pem)?;
+    let certs = load_certs(cert_pem)?;
     let key = load_key(&key_pem)?;
 
     let mut roots = rustls::RootCertStore::empty();

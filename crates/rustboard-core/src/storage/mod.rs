@@ -22,7 +22,7 @@ use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, Ser
 
 use self::postgres::PostgresStorage;
 use self::sqlite::{AlertSeriesSnapshot, ArchiveRawRow, SqliteStorage};
-use crate::alerts::{AlertEvent, AlertRule, AlertSilence, AlertState};
+use crate::alerts::{AlertEvaluationOutcome, AlertEvent, AlertRule, AlertSilence, AlertState};
 use crate::archive::{ArchiveObject, ArchiveStatus};
 use crate::channels::NotificationChannel;
 
@@ -443,9 +443,14 @@ pub trait Storage: Send + Sync {
     // ---- M4-B1 告警规则（schema v7 `alert_rules`） ----
 
     /// 写入内置规则种子；按 id 已存在则跳过，重复调用幂等，返回新增条数。
+    ///
+    /// 种子规则若带 `channel_ids`，与普通创建一样在同一事务内校验存在性并写
+    /// `alert_rule_channels`；内置规则当前恒为空。
     fn seed_builtin_alert_rules(&self, rules: &[AlertRule], now: i64) -> Result<usize>;
 
     /// 按 id 读取规则；不存在返回 `None`。
+    ///
+    /// 部分实现会校验关系表与 JSON `channel_ids` 一致，不一致时 fail closed。
     fn get_alert_rule(&self, id: &str) -> Result<Option<AlertRule>>;
 
     /// 列出全部规则：内置在前，同组按名称升序。
@@ -454,10 +459,15 @@ pub trait Storage: Send + Sync {
     /// 规则总数（含内置规则）。
     fn alert_rule_count(&self) -> Result<usize>;
 
-    /// 新建规则；达到上限或名称重复返回领域错误。
+    /// 新建规则；达到上限、名称重复、渠道不存在或已禁用返回领域错误。
+    ///
+    /// `channel_ids` 在同一事务内先校验存在且启用、再写入 JSON 与
+    /// `alert_rule_channels` 关系行；任一失败整体回滚。
     fn create_alert_rule(&self, rule: &AlertRule) -> Result<()>;
 
     /// 更新规则的可写字段；不清理 `alert_states`。
+    ///
+    /// 与创建相同，渠道关系行与 JSON 在同一事务内整体替换。
     fn update_alert_rule(&self, rule: &AlertRule) -> Result<()>;
 
     /// 与 `update_alert_rule` 相同，并在同一事务内清空该规则的状态。
@@ -541,14 +551,20 @@ pub trait Storage: Send + Sync {
     /// 单事务批量落库事件与状态（先事件后状态，at-least-once）。
     fn apply_alert_transitions(&self, events: &[AlertEvent], states: &[AlertState]) -> Result<()>;
 
-    /// 单事务落库事件、状态与每规则状态上限清理，返回淘汰行数。
+    /// 单事务落库事件、状态与每规则状态上限清理。
+    ///
+    /// 事务内先按 `rule_id` 读取 `enabled` / `revision` 并做 CAS：规则不存在、
+    /// 已禁用或 `revision != expected_revision` 时返回
+    /// [`AlertEvaluationOutcome::Stale`]，**不写入任何事件 / 状态，也不 prune**。
+    /// 只有匹配时才落库并返回淘汰行数。
     fn apply_alert_evaluation(
         &self,
         rule_id: &str,
+        expected_revision: i64,
         events: &[AlertEvent],
         states: &[AlertState],
         keep_states: usize,
-    ) -> Result<usize>;
+    ) -> Result<AlertEvaluationOutcome>;
 
     /// 当前最大告警事件 id；没有事件返回 0。
     fn max_alert_event_id(&self) -> Result<i64>;

@@ -6,14 +6,15 @@ Phase B 新增 `.github/workflows/release.yml`：只由 `v*` tag push 触发。�
 正式发布 job 增加 `environment: release` 人工闸门；Phase D 增加 PostgreSQL
 显式 opt-in，不改变发布流水线或默认 SQLite。
 
-> **当前状态**：Phase B/C workflow 已由 `v1.0.0-rc.2` 真实执行并通过
-> `delivery-e2e`、`delivery-docker`、`delivery-arm64`、SBOM 与 attestation；
-> Phase D 已实现 PostgreSQL 与迁移/备份/恢复，Phase E 已修复 KI-22 并完成
-> hub 级 200/100/500/1000 短档压测、真实 TLS PG 与 Docker PG e2e；全 workspace
-> 测试 **1386 passed / 0 failed / 5 ignored**（含 PG load）。release workflow
-> 现在额外依赖 `postgres` 实库 job，PG 用例 SKIP 或红灯都不会进入发布。
-> `Cargo.toml` 为 `1.0.0-rc.2`，版本归档、CHANGELOG `[v1.0.0]` 与正式发布属于
-> Phase E；`v1.0.0-rc.2` 不移动，Phase D checkpoint 不创建/移动 `v1.0.0`。
+> **当前状态**：`v1.0.0-rc.2`/`v1.0.0-rc.3` 已发布且**不移动**；第二轮
+> #51–#102 修复进入 `v1.0.0-rc.4` 候选，`v1.0.0` 尚未发布。release workflow
+> 现在有两层自动门禁：先查询目标 `$GITHUB_SHA` 的 CI 五项结果，再在发布流程内
+> 重跑 security/control/v041/cert-rotation/hardening；任一失败、缺失或运行中
+> 都不会提升正式 tag/Release。
+>
+> **v1.0.0 只支持全新安装**：schema <9 的旧数据库会被拒绝；`#51`/`#58`/`#59`
+> 的旧数据兼容推迟到首个正式版本之后。发布前仍需完成 3h/24h 长稳、
+> 100/500/1000、Docker PG/安装、arm64 与最终评审/渗透。
 
 ## 1. 触发条件
 
@@ -176,12 +177,16 @@ DOCKER_ARCH=arm64 SKIP_ARM64=1 bash tests/e2e/v100-docker.sh
 PACKAGE="$(readlink -f dist/serverdashboard-v*-aarch64.tar.gz)"
 sudo env PACKAGE="$PACKAGE" SKIP_BUILD=1 STRICT=1 bash tests/e2e/v100-arm64.sh
 
+# 当前版本从 Cargo.toml 派生，避免文档落后于实际包
+VERSION=$(cargo metadata --no-deps --format-version 1 --offline \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+
 # SPDX SBOM
 packaging/sbom.py --output /tmp/sbom.spdx.json \
-  --version 1.0.0-rc.2 --revision "$(git rev-parse HEAD)" --arch x86_64
+  --version "$VERSION" --revision "$(git rev-parse HEAD)" --arch x86_64
 
 # release notes 提取
-packaging/release-notes.sh 1.0.0-rc.2 CHANGELOG.md
+packaging/release-notes.sh "$VERSION" CHANGELOG.md
 
 # workflow 静态检查
 actionlint .github/workflows/release.yml

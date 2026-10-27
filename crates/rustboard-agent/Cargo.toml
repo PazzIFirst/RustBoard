@@ -32,3 +32,5 @@ uuid = { workspace = true }
 # #42 测试：本地起 TLS 服务端验证「TLS 完成但不回 101」的 deadline。
 # 该 crate 已在 Cargo.lock（hub/panel 使用），不引入新依赖。
 tokio-rustls = { workspace = true }
+# #57 测试：用虚拟时间验证续签等待超时后仍写回已完成控制应答。
+tokio = { workspace = true, features = ["test-util"] }

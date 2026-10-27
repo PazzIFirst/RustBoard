@@ -1,7 +1,7 @@
-//! R1a-1：schema v8 迁移门禁与归档 claim 存储原语。
+//! R1a-1：schema v9 门禁与归档 claim 存储原语。
 //!
 //! 只依赖公开接口与真实 SQLite 文件，覆盖：
-//! - v7→v8 列/数据回填（聚合水位、last_ts、ledger_version、ledger pending）；
+//! - v1.0.0 旧 schema（v7 等）fail closed，不执行 v7→v8 补列/回填；
 //! - 更高 `user_version` 拒绝且不建/改业务表；
 //! - 两个并发 claim 只有一个成功，冲突返回可重试领域错误；
 //! - 按 `archive_object_id` 读回同一行集；
@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use rustboard_common::model::{Sample, SampleBatch};
 use rustboard_core::archive::{
     ArchiveObject, ArchiveStatus, ArchiveStoreError, LEDGER_VERSION_V7, LEDGER_VERSION_V8,
@@ -187,26 +187,6 @@ fn table_columns(conn: &Connection, table: &str) -> Vec<(String, bool, Option<St
     .expect("收集 table_info 失败")
 }
 
-fn assert_column(
-    conn: &Connection,
-    table: &str,
-    name: &str,
-    not_null: bool,
-    default: Option<&str>,
-) {
-    let columns = table_columns(conn, table);
-    let column = columns
-        .iter()
-        .find(|(column, _, _)| column == name)
-        .unwrap_or_else(|| panic!("{table}.{name} 不存在"));
-    assert_eq!(column.1, not_null, "{table}.{name} NOT NULL 不符");
-    let raw_default = column.2.as_deref().map(str::trim);
-    assert_eq!(
-        raw_default, default,
-        "{table}.{name} 默认值不符（实际 {raw_default:?}）"
-    );
-}
-
 fn index_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
@@ -218,239 +198,20 @@ fn index_exists(conn: &Connection, name: &str) -> bool {
 }
 
 #[test]
-fn v7_to_v8_migration_reconciles_count_order_and_keeps_old_data() {
-    let dir = TempDb::new("migrate");
-    build_v7_fixture(&dir.db_path(), true, true);
-
-    {
-        let storage = SqliteStorage::open(&dir.db_path()).expect("v7→v8 迁移失败");
-        assert_eq!(
-            storage
-                .get_archive_state("archive_ledger_pending")
-                .expect("读取 ledger pending 失败")
-                .as_deref(),
-            Some("1"),
-            "v7 归档水位存在时必须写 ledger pending"
-        );
-        let object = storage
-            .get_archive_object(1)
-            .expect("读取旧归档对象失败")
-            .expect("旧归档对象必须保留");
-        assert_eq!(object.ledger_version, LEDGER_VERSION_V7);
-        assert_eq!(object.object_key, "v7/old.csv.gz");
-        assert_eq!(storage.count_archive_objects().unwrap(), 1);
-        assert_eq!(storage.sample_count("a").unwrap(), 4, "旧 raw 行不得丢失");
-    }
-
-    let conn = Connection::open(dir.db_path()).expect("重新打开迁移后库失败");
-    assert_eq!(user_version(&conn), 8);
-    assert_column(&conn, "samples", "archive_object_id", false, None);
-    assert_column(&conn, "samples", "aggregated_1m", true, Some("0"));
-    assert_column(&conn, "samples_1m", "last_ts", true, Some("0"));
-    assert_column(&conn, "samples_1m", "aggregated_1h", true, Some("0"));
-    assert_column(&conn, "archive_objects", "ledger_version", true, Some("0"));
-    assert_column(&conn, "archive_objects", "attempts", true, Some("0"));
-    for index in [
-        "idx_samples_unarchived",
-        "idx_samples_unaggregated",
-        "idx_samples_1m_unaggregated",
-    ] {
-        assert!(index_exists(&conn, index), "缺少 v8 partial index {index}");
-    }
-
-    let raw: Vec<(i64, i64)> = conn
-        .prepare("SELECT ts, aggregated_1m FROM samples ORDER BY ts")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
-    // 迟到/崩溃窗口：59000 的 rowid 晚于原 1m 行，bucket 0 的 1m.count=1，
-    // 只能认领最早一条 raw（30000）；59000 必须保持 0，否则永久漏聚合。
-    assert_eq!(
-        raw,
-        vec![(30_000, 1), (59_000, 0), (90_000, 1), (180_000, 1)],
-        "raw 按 1m count/rowid 对账：只标最早 count 条，late raw 保持 0"
-    );
-
-    let buckets: Vec<(i64, i64, i64)> = conn
-        .prepare("SELECT bucket_ts, last_ts, aggregated_1h FROM samples_1m ORDER BY bucket_ts")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
-    assert_eq!(
-        buckets,
-        vec![
-            (0, 30_000, 1),
-            (60_000, 90_000, 1),
-            (120_000, 179_999, 1),
-            (180_000, 180_000, 0),
-            (3_660_000, 3_719_999, 0),
-        ],
-        "last_ts 取最早 count 条 raw 的 MAX(ts)，无 raw 才用桶尾；\
-         1h 按累计 count 对账，180000 的累计 7 > 1h.count 6 必须为 0"
-    );
-}
-
-/// 迁移后的旧 raw 不得被 R1b delta 重复计数：迁移按 1m.count 只认领最早
-/// 的 raw，bucket 0 中迟到的 59000 保持未聚合；delta 只把它增量合并进
-/// bucket 0，1h 由 1m 重算后 count 包含迟到行且不重复计算 30000。
-#[test]
-fn v7_migration_then_downsample_does_not_double_count() {
-    let dir = TempDb::new("migrate-no-double");
-    build_v7_fixture(&dir.db_path(), true, false);
-    let storage = SqliteStorage::open(&dir.db_path()).expect("v7→v8 迁移失败");
-
-    run_downsample(&storage, 4_000_000, None).expect("迁移后的增量降采样失败");
-
-    let conn = Connection::open(dir.db_path()).unwrap();
-    let buckets: Vec<(i64, i64)> = conn
-        .prepare("SELECT bucket_ts, count FROM samples_1m ORDER BY bucket_ts")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
-    assert_eq!(
-        buckets,
-        vec![
-            (0, 2),
-            (60_000, 2),
-            (120_000, 3),
-            (180_000, 1),
-            (3_660_000, 1),
-        ],
-        "迁移只标最早 count 条 raw（30000），迟到 59000 必须由 delta 合并进 bucket 0"
-    );
-
-    let hour: (i64, f64, f64, f64) = conn
-        .query_row(
-            "SELECT count, min_value, max_value, avg_value FROM samples_1h
-             WHERE agent_id = 'a' AND metric = 'm' AND labels = '{}' AND bucket_ts = 0",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
-    // 1h 由整小时 1m 重算：bucket0 count2(1+4)、bucket60000 count2、
-    // bucket120000 count3、bucket180000 count1 → count8、min1、max4。
-    assert_eq!(
-        hour.0, 8,
-        "1h count = 各 1m count 之和（2+2+3+1），含迟到 59000"
-    );
-    assert_eq!(hour.1, 1.0);
-    assert_eq!(hour.2, 4.0);
-    assert_eq!(hour.3, 2.5, "加权 avg=(2.5*2+1.5*2+3*3+3*1)/8=2.5");
-}
-
-#[test]
-fn v7_migration_without_1h_rows_does_not_mark_1h_or_pending() {
-    let dir = TempDb::new("no-watermark");
-    build_v7_fixture(&dir.db_path(), false, false);
-    {
-        let storage = SqliteStorage::open(&dir.db_path()).expect("v7→v8 迁移失败");
-        assert_eq!(
-            storage.get_archive_state("archive_ledger_pending").unwrap(),
-            None,
-            "没有归档水位时不得写 ledger pending"
-        );
-    }
-    let conn = Connection::open(dir.db_path()).unwrap();
-    assert_eq!(user_version(&conn), 8);
-    let raw_flagged: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM samples WHERE aggregated_1m = 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let m_flagged: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM samples_1m WHERE aggregated_1h != 0",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        raw_flagged, 3,
-        "raw 按 1m count/rowid 对账（与维护水位无关）"
-    );
-    assert_eq!(m_flagged, 0, "没有 1h 行时 1m 必须全部保持 0");
-}
-
-#[test]
-fn v7_migration_does_not_mark_extreme_or_future_timestamps() {
-    let dir = TempDb::new("future-ts");
-    build_v7_fixture(&dir.db_path(), true, false);
-    {
-        let conn = Connection::open(dir.db_path()).unwrap();
-        // 2033 年（未来但未超 ArchiveDay 上限）与超过 9999 年的极端值。
-        for (agent, ts) in [
-            ("future", 2_000_000_000_000_i64),
-            ("beyond", 253_402_300_800_000),
-        ] {
-            let bucket = (ts / 60_000) * 60_000;
-            let hour = (bucket / 3_600_000) * 3_600_000;
-            conn.execute(
-                "INSERT INTO samples VALUES (?1, 'm', '{}', ?2, 1.0)",
-                params![agent, ts],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO samples_1m VALUES (?1, 'm', '{}', ?2, 1.0, 1.0, 1.0, 1.0, 1)",
-                params![agent, bucket],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO samples_1h VALUES (?1, 'm', '{}', ?2, 1.0, 1.0, 1.0, 1.0, 1)",
-                params![agent, hour],
-            )
-            .unwrap();
-        }
-    }
-    let storage = SqliteStorage::open(&dir.db_path()).unwrap();
-    let conn = Connection::open(dir.db_path()).unwrap();
-    let flagged: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM samples WHERE agent_id IN ('future','beyond') AND aggregated_1m != 0",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let m_flagged: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM samples_1m
-             WHERE agent_id IN ('future','beyond')
-               AND (last_ts != 0 OR aggregated_1h != 0)",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(flagged, 0, "超界/未来 raw 不得被标成已聚合");
-    assert_eq!(m_flagged, 0, "超界/未来 1m 不得回填 last_ts 或标 1h");
-    assert_eq!(
-        storage.count_invalid_archive_raw_rows().unwrap(),
-        2,
-        "超界 raw 必须可计数，供 R1b 隔离/告警"
-    );
-}
-
-#[test]
 fn newer_sqlite_schema_version_is_rejected_before_ddl() {
     let dir = TempDb::new("future-version");
     {
         let conn = Connection::open(dir.db_path()).unwrap();
-        conn.pragma_update(None, "user_version", 9)
-            .expect("设置 user_version=9 失败");
+        conn.pragma_update(None, "user_version", 10)
+            .expect("设置 user_version=10 失败");
     }
     let err = match SqliteStorage::open(&dir.db_path()) {
-        Ok(_) => panic!("v9 库必须拒绝打开"),
+        Ok(_) => panic!("v10 库必须拒绝打开"),
         Err(err) => err,
     };
     let message = format!("{err:#}");
     assert!(
-        message.contains('9') && message.contains('8') && message.contains("高于"),
+        message.contains("10") && message.contains('9') && message.contains("高于"),
         "拒绝信息应点名实际/支持版本并说明原因：{message}"
     );
 
@@ -464,7 +225,98 @@ fn newer_sqlite_schema_version_is_rejected_before_ddl() {
         )
         .unwrap();
     assert_eq!(count, 0, "拒绝路径不得创建表");
-    assert_eq!(user_version(&conn), 9, "拒绝路径不得改写 user_version");
+    assert_eq!(user_version(&conn), 10, "拒绝路径不得改写 user_version");
+}
+
+/// v1.0.0 只支持全新安装：真实 v7 库必须被拒绝，旧表/数据/水位零改写，
+/// 不执行 v7→v8 的补列、partial index 或 ledger pending 回填。
+#[test]
+fn v7_database_is_rejected_without_running_v8_backfill() {
+    let dir = TempDb::new("reject-v7");
+    build_v7_fixture(&dir.db_path(), true, true);
+
+    let before_samples = table_columns(&Connection::open(dir.db_path()).unwrap(), "samples");
+    let before_1m = table_columns(&Connection::open(dir.db_path()).unwrap(), "samples_1m");
+    let before_archive =
+        table_columns(&Connection::open(dir.db_path()).unwrap(), "archive_objects");
+    let before_object_count: i64 = Connection::open(dir.db_path())
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM archive_objects", [], |row| row.get(0))
+        .unwrap();
+
+    let err = match SqliteStorage::open(&dir.db_path()) {
+        Ok(_) => panic!("v7 旧库必须被拒绝"),
+        Err(err) => err,
+    };
+    let message = format!("{err:#}");
+    assert!(message.contains("schema v7"), "{message}");
+    assert!(message.contains("只支持全新安装"), "{message}");
+    assert!(
+        message.contains("旧数据兼容将在首个正式版本之后提供"),
+        "{message}"
+    );
+
+    let conn = Connection::open(dir.db_path()).unwrap();
+    assert_eq!(user_version(&conn), 7, "拒绝路径不得改写 user_version");
+    // v8 补列/回填都没有发生。
+    assert_eq!(
+        table_columns(&conn, "samples"),
+        before_samples,
+        "拒绝路径不得给 samples 补 v8 列"
+    );
+    assert_eq!(
+        table_columns(&conn, "samples_1m"),
+        before_1m,
+        "拒绝路径不得给 samples_1m 补 v8 列"
+    );
+    assert_eq!(
+        table_columns(&conn, "archive_objects"),
+        before_archive,
+        "拒绝路径不得给 archive_objects 补 v8 列"
+    );
+    for (table, column) in [
+        ("samples", "archive_object_id"),
+        ("samples", "aggregated_1m"),
+        ("samples_1m", "last_ts"),
+        ("samples_1m", "aggregated_1h"),
+        ("archive_objects", "ledger_version"),
+        ("archive_objects", "attempts"),
+    ] {
+        assert!(
+            !table_columns(&conn, table)
+                .iter()
+                .any(|(name, _, _)| name == column),
+            "拒绝路径不得补列 {table}.{column}"
+        );
+    }
+    for index in [
+        "idx_samples_unarchived",
+        "idx_samples_unaggregated",
+        "idx_samples_1m_unaggregated",
+    ] {
+        assert!(
+            !index_exists(&conn, index),
+            "拒绝路径不得创建 v8 partial index {index}"
+        );
+    }
+    // 旧数据原样保留，且没有写 archive_ledger_pending。
+    let sample_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM samples", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(sample_count, 4, "拒绝路径不得删除旧 raw");
+    let object_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM archive_objects", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(object_count, before_object_count);
+    let pending: Option<String> = conn
+        .query_row(
+            "SELECT value FROM archive_state WHERE key = 'archive_ledger_pending'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(pending, None, "拒绝路径不得写 archive_ledger_pending");
 }
 
 fn claim_object(key: &str, rows: &[ArchiveRawRow]) -> ArchiveObject {

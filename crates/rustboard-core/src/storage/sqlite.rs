@@ -13,8 +13,9 @@ use rustboard_common::model::{AgentRecord, Labels, SampleBatch, SeriesQuery, Ser
 use rustboard_common::util::now_ms;
 
 use crate::alerts::{
-    AlertEvent, AlertRule, AlertRuleStoreError, AlertSilence, AlertSilenceStoreError, AlertSource,
-    AlertState, AlertStateKind, Comparator, MAX_ALERT_RULES, MAX_ALERT_SILENCES,
+    dedupe_channel_ids, AlertEvaluationOutcome, AlertEvent, AlertRule, AlertRuleStoreError,
+    AlertSilence, AlertSilenceStoreError, AlertSource, AlertState, AlertStateKind, Comparator,
+    MAX_ALERT_RULES, MAX_ALERT_SILENCES,
 };
 use crate::archive::{ArchiveObject, ArchiveStatus, ArchiveStoreError, LEDGER_VERSION_V8};
 use crate::channels::{ChannelConfig, ChannelKind, NotificationChannel};
@@ -38,8 +39,12 @@ pub const MAX_READ_POOL_SIZE: usize = 16;
 /// v5 = 新增 `agent_control` / `audit_log`（M3 控制面，纯新增表），
 /// v6 = 新增 `api_tokens`（管理 API scoped token，纯新增表），
 /// v7 = 新增 M4 降采样 / 告警 / 通知 / 归档 / 维护水位表（纯新增表与索引）。
-/// v8 = raw 归档归属 / 聚合认领列、1m 水位列、归档 ledger 版本与对应 partial index。
-const SCHEMA_VERSION: i64 = 8;
+/// v8 = raw 归档归属 / 聚合认领列、1m 水位列、归档 ledger 版本与对应 partial index；
+/// v9 = `alert_rules.revision` 与 `alert_rule_channels` 关系表（最终 schema）。
+///
+/// **v1.0.0 只支持全新安装**：schema < 9 的已有库一律 fail closed，不执行任何
+/// 升级/回填；v9 是首个正式版本使用的唯一 schema。
+const SCHEMA_VERSION: i64 = 9;
 
 /// `last_used_at` 的写入节流窗口：同一 token 60s 内只写一次，避免每个管理
 /// 请求都抢写连接；首次鉴权（`last_used_at IS NULL`）一定会写。
@@ -202,8 +207,9 @@ CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
 /// 全部为 `CREATE TABLE / INDEX IF NOT EXISTS`，不重写 v1–v6 任何表或数据；
 /// v0.3.5 等旧版本二进制会忽略这些表，可安全回滚。
 ///
-/// `alert_rules.channel_ids` 按方案**刻意不加外键**：渠道引用完整性由 hub 在
-/// 保存规则、删除渠道时校验，SQLite 侧只存 JSON 数组。
+/// `alert_rules.channel_ids` 是按管理 API 兼容保留的 JSON 列；v9 起渠道引用
+/// 同时落到 `alert_rule_channels` 关系表，由外键保证规则/渠道删除时的一致性。
+/// 规则 create/update 在同一事务内维护两处，读取时校验一致（不一致 fail closed）。
 const M4_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS samples_1m (
     agent_id   TEXT NOT NULL,
@@ -263,7 +269,8 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     is_builtin        INTEGER NOT NULL DEFAULT 0,
     updated_by        TEXT NOT NULL DEFAULT '',
     created_at        INTEGER NOT NULL,
-    updated_at        INTEGER NOT NULL
+    updated_at        INTEGER NOT NULL,
+    revision          INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS alert_states (
@@ -322,6 +329,19 @@ CREATE TABLE IF NOT EXISTS notification_channels (
     updated_at  INTEGER NOT NULL
 );
 
+-- v9：规则→渠道关系表。JSON `channel_ids` 仅为 API 兼容保留；关系表以
+-- 复合主键去重，规则删除级联清理，渠道仍被引用时由 RESTRICT 阻止删除。
+CREATE TABLE IF NOT EXISTS alert_rule_channels (
+    rule_id    TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    PRIMARY KEY (rule_id, channel_id),
+    FOREIGN KEY (rule_id) REFERENCES alert_rules(id) ON DELETE CASCADE,
+    FOREIGN KEY (channel_id) REFERENCES notification_channels(id) ON DELETE RESTRICT
+);
+-- FK RESTRICT 检查按 channel_id 反查，没有索引会全表扫描。
+CREATE INDEX IF NOT EXISTS idx_alert_rule_channels_channel
+    ON alert_rule_channels(channel_id);
+
 CREATE TABLE IF NOT EXISTS archive_objects (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     backend      TEXT NOT NULL,
@@ -348,13 +368,9 @@ CREATE TABLE IF NOT EXISTS archive_state (
     value      TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
-"#;
 
-/// v8 的 partial index。
-///
-/// 必须在 [`ensure_v8_columns`] 之后执行：旧 v7 库建索引时新列还不存在。
-/// 扫描条件与索引谓词完全一致，SQLite 才会走 partial index 而不是全表。
-const V8_INDEXES: &str = r#"
+-- v8 的 partial index：v9 全新库建表时列已存在，直接与建表同批创建。
+-- 扫描条件必须与索引谓词完全一致，SQLite 才会走 partial index。
 CREATE INDEX IF NOT EXISTS idx_samples_unarchived ON samples(ts)
     WHERE archive_object_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_samples_unaggregated ON samples(ts)
@@ -362,47 +378,6 @@ CREATE INDEX IF NOT EXISTS idx_samples_unaggregated ON samples(ts)
 CREATE INDEX IF NOT EXISTS idx_samples_1m_unaggregated ON samples_1m(bucket_ts)
     WHERE aggregated_1h = 0;
 "#;
-
-/// v8 新增列（旧 v7 库逐列检查后 ALTER）。
-///
-/// `(表, 列, ALTER 语句)` 全部是编译期常量，不接受外部输入。
-const V8_COLUMNS: [(&str, &str, &str); 6] = [
-    (
-        "samples",
-        "archive_object_id",
-        "ALTER TABLE samples ADD COLUMN archive_object_id INTEGER",
-    ),
-    (
-        "samples",
-        "aggregated_1m",
-        "ALTER TABLE samples ADD COLUMN aggregated_1m INTEGER NOT NULL DEFAULT 0",
-    ),
-    (
-        "samples_1m",
-        "last_ts",
-        "ALTER TABLE samples_1m ADD COLUMN last_ts INTEGER NOT NULL DEFAULT 0",
-    ),
-    (
-        "samples_1m",
-        "aggregated_1h",
-        "ALTER TABLE samples_1m ADD COLUMN aggregated_1h INTEGER NOT NULL DEFAULT 0",
-    ),
-    (
-        "archive_objects",
-        "ledger_version",
-        "ALTER TABLE archive_objects ADD COLUMN ledger_version INTEGER NOT NULL DEFAULT 0",
-    ),
-    (
-        "archive_objects",
-        "attempts",
-        "ALTER TABLE archive_objects ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
-    ),
-];
-
-/// `archive_state` 中的最后成功归档水位。
-const STATE_LAST_ARCHIVED_TS: &str = "last_archived_ts";
-/// `archive_state` 中的 v8 ledger 重建待办标记。
-const STATE_ARCHIVE_LEDGER_PENDING: &str = "archive_ledger_pending";
 
 /// 可归档 raw 的最小时间戳（Unix 毫秒）：小于 0 的旧行不进入 v8 claim。
 ///
@@ -1231,14 +1206,14 @@ fn db_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(os)
 }
 
-/// 初始化写连接：设置 PRAGMA、建表并迁移。
+/// 初始化写连接：设置 PRAGMA、校验 schema 版本、建表并把 v9 schema 补齐。
 fn init_writer(mut conn: Connection) -> Result<Connection> {
-    // busy_timeout 必须最先设置：两个进程并发首次打开旧库时，
-    // 切 WAL 会拿写锁，没有超时就会直接报 database is locked。
+    // busy_timeout 必须最先设置：两个进程并发首次打开同一库时，
+    // 切 WAL/建表会拿写锁，没有超时就会直接报 database is locked。
     conn.pragma_update(None, "busy_timeout", 5_000)?;
-    // v8 门禁：更高版本库必须在 WAL/DDL/迁移之前拒绝，避免旧二进制写坏新库。
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    reject_newer_schema_version(version)?;
+    // v9 门禁必须在 WAL 切换与任何 DDL 之前：旧库不得被写入任何字节。
+    // 全新库在这里就把 user_version 置为 9，避免建表中途崩溃后下次被误判为旧库。
+    ensure_supported_schema(&conn)?;
     // journal_mode 会返回一行，必须用 query_row 消费掉
     let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     tracing::debug!(mode, "sqlite journal mode");
@@ -1249,15 +1224,68 @@ fn init_writer(mut conn: Connection) -> Result<Connection> {
     Ok(conn)
 }
 
-/// 拒绝比本程序更新的 SQLite schema，避免旧二进制写坏新库。
-fn reject_newer_schema_version(version: i64) -> Result<()> {
+/// 校验 `PRAGMA user_version`，只放行 v9 与真正的全新库。
+///
+/// - 高于 [`SCHEMA_VERSION`]：拒绝，避免旧二进制写坏新库；
+/// - 等于 [`SCHEMA_VERSION`]：继续（幂等补齐建表/索引）；
+/// - 0 且没有任何用户表：视为全新库，先把 `user_version` 写成 9 再建表；
+/// - 其余 0/1..8（含没有 user_version 的 v1 库）：一律 fail closed。
+///
+/// 错误文案是可测试契约，必须包含「只支持全新安装」与「旧数据兼容」。
+fn ensure_supported_schema(conn: &Connection) -> Result<()> {
+    let mut version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version > SCHEMA_VERSION {
         anyhow::bail!(
             "SQLite schema 版本 {version} 高于本程序支持的 v{SCHEMA_VERSION}；\
              请升级 rustboard-hub 后再启动，避免旧二进制写坏新库"
         );
     }
-    Ok(())
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version == 0 && !has_user_tables(conn)? {
+        // 先把版本钉在 v9：建表在中途崩溃时，下次打开会走「已是 v9」的幂等
+        // 补齐路径，而不是把半套表误判成旧库并拒绝。
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tracing::info!(
+            to = SCHEMA_VERSION,
+            "初始化全新数据库：user_version 已置为 v9"
+        );
+        return Ok(());
+    }
+    if version == 0 {
+        // 并发首次打开：另一个 hub 进程可能刚在前两次读之间把 user_version
+        // 钉到 v9 并开始建表。重新读一次，避免把正在初始化的新库误判成旧库；
+        // 若仍是 0（或其它旧版本），继续按旧库 fail closed。
+        version = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+        if version > SCHEMA_VERSION {
+            anyhow::bail!(
+                "SQLite schema 版本 {version} 高于本程序支持的 v{SCHEMA_VERSION}；\
+                 请升级 rustboard-hub 后再启动，避免旧二进制写坏新库"
+            );
+        }
+    }
+    anyhow::bail!(
+        "检测到已有数据库 schema v{version}：v1.0.0 只支持全新安装，\
+         不执行任何旧 schema 升级或数据回填；旧数据兼容将在首个正式版本之后提供。\
+         请先备份该数据库，再按全新安装部署（本程序不会修改旧库）"
+    )
+}
+
+/// 库里是否有任何用户表（排除 `sqlite_%` 内部表）。
+fn has_user_tables(conn: &Connection) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
 }
 
 /// 打开一条文件库只读连接。
@@ -1284,259 +1312,29 @@ fn prepare_reader(conn: Connection) -> Result<Connection> {
     Ok(conn)
 }
 
-/// 把 `ingest_state` 从 v1（agent_id 主键）迁移到 v2（agent_id + epoch 主键），
-/// 为 v3 建好 `ingest_batches` 精确判重表，为 v4 建好 `agent_settings` 表，
-/// 为 v5–v7 建好 M3/M4 的纯新增表，并把 v7 库补列/回填到 v8。旧行原样保留。
+/// 幂等补齐 v9 schema：建表/索引全部 `CREATE ... IF NOT EXISTS`。
 ///
-/// v1 代码从未写过 `user_version`，所以只靠版本号无法区分「空库」和「v1 库」：
-/// 版本号不足 2 时再看表是否存在。整个迁移在一个 `BEGIN IMMEDIATE` 事务里完成，
-/// 避免多个 hub 进程同时启动时重复迁移；旧行原样保留。
-///
-/// **v8 是单向升级**：已发布的 v7 二进制不会识别新列，升级后不得回退旧二进制，
-/// 回滚只能恢复升级前备份。
+/// v1.0.0 只支持全新库：任何 schema < 9 的已有库都会在
+/// [`ensure_supported_schema`] 被拒绝，这里在持有写锁后再校验一次，避免与
+/// 另一个进程的首次初始化竞态。因此本函数**没有任何版本升级/数据回填分支**；
+/// 重复打开只做零写入的 DDL 检查（见 `v9_reopen_is_idempotent` 测试）。
 fn migrate(conn: &mut Connection) -> Result<()> {
-    // L3：先拿写锁再读版本，两个进程同时启动时只有一个能迁移。
+    // L3：先拿写锁再读版本，两个进程同时首次初始化时只有一个能进入建表。
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    ensure_supported_schema(&tx)?;
 
-    // v8 门禁放在任何 DDL/数据迁移之前；init_writer 的预检只是提前拒绝，
-    // 这里在持有写锁后再判一次，避免与另一个迁移进程竞态。
-    reject_newer_schema_version(version)?;
-
-    if version < 2 {
-        // 半途失败的残留表先清掉，避免 ALTER RENAME 撞名；即使本次没有
-        // ingest_state 需要迁移，也顺手清理历史遗留。
-        tx.execute_batch("DROP TABLE IF EXISTS ingest_state_v2;")?;
-
-        let has_ingest_state: i64 = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ingest_state')",
-            [],
-            |r| r.get(0),
-        )?;
-
-        if has_ingest_state != 0 {
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS ingest_state_v2 (
-                     agent_id   TEXT NOT NULL,
-                     epoch      INTEGER NOT NULL,
-                     last_seq   INTEGER NOT NULL DEFAULT 0,
-                     updated_at INTEGER NOT NULL DEFAULT 0,
-                     PRIMARY KEY (agent_id, epoch)
-                 );
-                 INSERT INTO ingest_state_v2 (agent_id, epoch, last_seq, updated_at)
-                     SELECT agent_id, epoch, last_seq, updated_at FROM ingest_state;
-                 DROP TABLE ingest_state;
-                 ALTER TABLE ingest_state_v2 RENAME TO ingest_state;",
-            )?;
-            tracing::info!("ingest_state 已迁移到 v2：按 (agent_id, epoch) 去重");
-        }
-    }
-
-    // 无论版本如何都执行 IF NOT EXISTS：兼容 v1/v2 以及迁移中断后缺表的库。
+    // 全部对象都带 IF NOT EXISTS：兼容 v9 重复打开与建表中途崩溃后的补齐。
     tx.execute_batch(INGEST_STATE_V2)?;
     tx.execute_batch(INGEST_BATCHES)?;
     tx.execute_batch(AGENT_SETTINGS)?;
-    // v5：控制面能力与审计表。纯新增，旧版本二进制忽略这两张表。
+    // v5：控制面能力与审计表。
     tx.execute_batch(CONTROL_AUDIT_SCHEMA)?;
-    // v6：管理 API scoped token 表。纯新增，旧版本二进制忽略这张表。
+    // v6：管理 API scoped token 表。
     tx.execute_batch(API_TOKENS_SCHEMA)?;
-    // v7：M4 降采样 / 告警 / 归档 / 维护水位表。纯新增，旧版本二进制忽略这些表；
-    // 带 IF NOT EXISTS，迁移中断或重复打开都不会重复建表。
+    // v7/v8/v9：M4 表、partial index、revision 列与 alert_rule_channels 关系表。
     tx.execute_batch(M4_SCHEMA)?;
-    // 旧 v7 库（B2b 首次落地）的 alert_events 没有 series_key；纯新增列，
-    // 历史事件自动补空串，通知 worker 按空序列处理。
-    ensure_alert_events_series_key(&tx)?;
 
-    // v8：先补列（旧 v7 的 CREATE TABLE IF NOT EXISTS 不会改已存在的表），
-    // 再建依赖新列的 partial index，最后回填旧数据。
-    ensure_v8_columns(&tx)?;
-    tx.execute_batch(V8_INDEXES)?;
-    apply_v8_data_migration(&tx, version)?;
-
-    if version < SCHEMA_VERSION {
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        tracing::info!(
-            from = version,
-            to = SCHEMA_VERSION,
-            "数据库已迁移：schema v8（归档 claim / 聚合认领列与 v7 旧数据回填）"
-        );
-    }
     tx.commit()?;
-    Ok(())
-}
-
-/// 为旧 v7 库逐列补 v8 新增列；列已存在时零写入。
-fn ensure_v8_columns(tx: &Transaction<'_>) -> Result<()> {
-    for (table, column, alter_sql) in V8_COLUMNS {
-        let exists: i64 = tx.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2
-             )",
-            params![table, column],
-            |row| row.get(0),
-        )?;
-        if exists != 0 {
-            continue;
-        }
-        tx.execute_batch(alter_sql)?;
-        tracing::info!(table, column, "已补充 v8 列");
-    }
-    Ok(())
-}
-
-/// v7→v8 数据回填；`version >= 8` 时整体跳过，保证重复打开不重写数据。
-///
-/// **按桶对账，不按维护水位**：v7 的 downsample 先写 1m 行再推进水位，崩溃
-/// 窗口里会有「1m 已写、水位未推进」的桶。若按水位标记 `aggregated_1m`，
-/// 这些桶的 raw 会被再次聚合（双计）；反过来水位先行也会漏计。因此：
-///
-/// 1. `samples.aggregated_1m`：同一分钟桶的 raw 按 `rowid` 升序编号，
-///    编号 `<= 1m.count` 的置 1；raw 少于 count 全置 1，无 1m 行保持 0。
-///    仅凭「桶已有 1m 行」会把崩溃窗口后到达的 late raw 误标，造成永久漏计；
-/// 2. `samples_1m.last_ts`：按 `rowid` 升序取最早 `1m.count` 条 raw 的
-///    `MAX(ts)`；raw 已删（无现存 raw）才回填 `bucket_ts + 59999`，避免迟到行
-///    被错误当成已聚合的 last；
-/// 3. `samples_1m.aggregated_1h`：同小时 1m 行按 `(bucket_ts, rowid)` 累计
-///    `count`，累计值 `<= 1h.count` 的置 1，其余保持 0；不读 1h 水位（v7 水位
-///    可能落在非整点）；
-/// 4. `archive_objects.ledger_version` / `attempts`：DB 默认 0，不需要额外更新；
-/// 5. 归档水位存在时写 `archive_state.archive_ledger_pending=1`，交给 R1a-2
-///    worker 重新导出仍存在的 unclaimed raw；这里只写状态，不做上传。
-///
-/// 迁移层拿不到 `archive.enabled`；`last_archived_ts` 是 v7 归档 worker 唯一
-/// 的持久化证据，因此以「水位存在」作为归档曾启用的 DB 侧代理。禁用归档的库
-/// 不会写入 pending，重复打开也不会重写。
-///
-/// TODO(R1b): 超界旧 `ts` 的隔离/计数（`invalid_timestamp_rows`）与聚合查询
-/// 过滤不在本切片；这里不修改任何 raw 的 `ts`，避免写坏数据。
-fn apply_v8_data_migration(tx: &Transaction<'_>, version: i64) -> Result<()> {
-    if version >= SCHEMA_VERSION {
-        return Ok(());
-    }
-
-    // 按桶对账，而不是按非原子水位：避免 v7 崩溃窗口造成双计/漏计。
-    // 先清掉非 0 残留（半迁移/异常数据），保证「无 1m 桶」严格为 0。
-    // 超界时间戳（i64::MIN / 未来）不参与认领，留给 R1b 计数/隔离。
-    let now = now_ms().min(MAX_ARCHIVE_TS_MS);
-    tx.execute(
-        "UPDATE samples SET aggregated_1m = 0 WHERE aggregated_1m != 0",
-        [],
-    )?;
-    // 只认领每个 1m 桶「最早 1m.count 条 raw」（按 rowid 排序）；raw 少于
-    // count 时全部认领。不能仅凭桶存在就把所有 raw 标 1，否则崩溃窗口后
-    // 才到的 late raw 会被永久漏聚合。
-    let aggregated = tx.execute(
-        "UPDATE samples SET aggregated_1m = 1
-         WHERE rowid IN (
-             SELECT s.rowid FROM (
-                 SELECT rowid, agent_id, metric, labels, ts,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY agent_id, metric, labels, (ts / 60000) * 60000
-                            ORDER BY rowid ASC
-                        ) AS rn
-                 FROM samples
-                 WHERE ts >= ?1 AND ts <= ?2
-             ) s
-             JOIN samples_1m m
-               ON m.agent_id = s.agent_id
-              AND m.metric = s.metric
-              AND m.labels = s.labels
-              AND m.bucket_ts = (s.ts / 60000) * 60000
-             WHERE s.rn <= m.count
-         )",
-        params![MIN_ARCHIVE_TS_MS, now],
-    )?;
-    tracing::info!(aggregated, "v8 迁移：按已存在的 1m 桶标记已聚合 raw");
-
-    // last_ts 取「该桶最早 count 条 raw」的 MAX(ts)；raw 已删的桶才回填
-    // bucket_ts+59999。这样 late raw 不会被错误当成已聚合的 last。
-    tx.execute("UPDATE samples_1m SET last_ts = 0 WHERE last_ts != 0", [])?;
-    let backfilled = tx.execute(
-        "UPDATE samples_1m SET last_ts = COALESCE(
-             (SELECT MAX(s.ts) FROM samples s
-              WHERE s.agent_id = samples_1m.agent_id
-                AND s.metric = samples_1m.metric
-                AND s.labels = samples_1m.labels
-                AND s.ts >= samples_1m.bucket_ts
-                AND s.ts < samples_1m.bucket_ts + 60000
-                AND (SELECT COUNT(*) FROM samples s2
-                     WHERE s2.agent_id = samples_1m.agent_id
-                       AND s2.metric = samples_1m.metric
-                       AND s2.labels = samples_1m.labels
-                       AND s2.ts >= samples_1m.bucket_ts
-                       AND s2.ts < samples_1m.bucket_ts + 60000
-                       AND s2.rowid <= s.rowid) <= samples_1m.count),
-             samples_1m.bucket_ts + 59999)
-         WHERE bucket_ts >= ?1 AND bucket_ts <= ?2",
-        params![MIN_ARCHIVE_TS_MS, now],
-    )?;
-    tracing::info!(backfilled, "v8 迁移：回填 legacy 1m last_ts");
-
-    // 1h 按 (bucket_ts, rowid) 累计 count 对账：累计值 <= 1h.count 的 1m
-    // 行才算已并入；崩溃窗口后的 late 1m 行保持 0，交给 R1b 重算。
-    tx.execute(
-        "UPDATE samples_1m SET aggregated_1h = 0 WHERE aggregated_1h != 0",
-        [],
-    )?;
-    let aggregated_hour = tx.execute(
-        "UPDATE samples_1m SET aggregated_1h = 1
-         WHERE rowid IN (
-             SELECT m.rowid FROM (
-                 SELECT rowid, agent_id, metric, labels, bucket_ts, count,
-                        SUM(count) OVER (
-                            PARTITION BY agent_id, metric, labels,
-                                         (bucket_ts / 3600000) * 3600000
-                            ORDER BY bucket_ts ASC, rowid ASC
-                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                        ) AS cumulative_count
-                 FROM samples_1m
-                 WHERE bucket_ts >= ?1 AND bucket_ts <= ?2
-             ) m
-             JOIN samples_1h h
-               ON h.agent_id = m.agent_id
-              AND h.metric = m.metric
-              AND h.labels = m.labels
-              AND h.bucket_ts = (m.bucket_ts / 3600000) * 3600000
-             WHERE m.cumulative_count <= h.count
-         )",
-        params![MIN_ARCHIVE_TS_MS, now],
-    )?;
-    tracing::info!(aggregated_hour, "v8 迁移：按已存在的 1h 桶标记已聚合 1m");
-
-    let archived_watermark: Option<String> = tx
-        .query_row(
-            "SELECT value FROM archive_state WHERE key = ?1",
-            params![STATE_LAST_ARCHIVED_TS],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if archived_watermark.is_some_and(|value| !value.trim().is_empty()) {
-        tx.execute(
-            "INSERT INTO archive_state (key, value, updated_at)
-             VALUES (?1, '1', ?2)
-             ON CONFLICT(key) DO UPDATE SET
-                 value = excluded.value,
-                 updated_at = excluded.updated_at",
-            params![STATE_ARCHIVE_LEDGER_PENDING, now_ms()],
-        )?;
-        tracing::info!("v8 迁移：archive_ledger_pending=1（等待 R1a-2 重建 ledger）");
-    }
-    Ok(())
-}
-
-/// 为旧 v7 库补 `alert_events.series_key`（`CREATE TABLE IF NOT EXISTS` 不会
-/// 修改已存在的表）。每次打开都检查 `PRAGMA table_info`，列已存在时零写入。
-fn ensure_alert_events_series_key(tx: &Transaction<'_>) -> Result<()> {
-    let columns = {
-        let mut stmt = tx.prepare("PRAGMA table_info(alert_events)")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    if columns.iter().any(|column| column == "series_key") {
-        return Ok(());
-    }
-    tx.execute_batch("ALTER TABLE alert_events ADD COLUMN series_key TEXT NOT NULL DEFAULT ''")?;
-    tracing::info!("alert_events 已补充 series_key 列（历史事件补空串）");
     Ok(())
 }
 
@@ -2361,11 +2159,19 @@ impl Storage for SqliteStorage {
     fn apply_alert_evaluation(
         &self,
         rule_id: &str,
+        expected_revision: i64,
         events: &[AlertEvent],
         states: &[AlertState],
         keep_states: usize,
-    ) -> Result<usize> {
-        SqliteStorage::apply_alert_evaluation(self, rule_id, events, states, keep_states)
+    ) -> Result<AlertEvaluationOutcome> {
+        SqliteStorage::apply_alert_evaluation(
+            self,
+            rule_id,
+            expected_revision,
+            events,
+            states,
+            keep_states,
+        )
     }
 
     fn max_alert_event_id(&self) -> Result<i64> {
@@ -2677,25 +2483,33 @@ impl Storage for SqliteStorage {
 }
 
 // ---------------------------------------------------------------------------
-// M4-B1：告警规则（schema v7 `alert_rules` 表）
+// M4-B1：告警规则（schema v9 `alert_rules` 表）
 // ---------------------------------------------------------------------------
 
 /// `alert_rules` 的 SELECT 列表；与 [`alert_rule_from_row`] 的列下标一一对应。
+///
+/// `revision` 固定放在列尾：v8 及之前的列位置不变，只追加新列。
 const ALERT_RULE_COLUMNS: &str = "id, name, enabled, source, metric, comparator, threshold, \
      duration_secs, cooldown_secs, filter_agent_id, filter_labels, channel_ids, \
-     notify_on_resolve, is_builtin, updated_by, created_at, updated_at";
+     notify_on_resolve, is_builtin, updated_by, created_at, updated_at, revision";
 
 /// 新建 / 种子共用的列清单。
+///
+/// `revision` 不写入：由表默认值 0 起算，只有 [`ALERT_RULE_UPDATE_SQL`] 递增。
 const ALERT_RULE_INSERT_COLUMNS: &str = "(id, name, enabled, source, metric, comparator, \
      threshold, duration_secs, cooldown_secs, filter_agent_id, filter_labels, channel_ids, \
      notify_on_resolve, is_builtin, updated_by, created_at, updated_at)";
 
 /// 更新语句只覆盖可写字段：id 不变，`is_builtin` / `created_at` 由存储层保持原值。
+///
+/// `revision = revision + 1` 是 CAS 版本号的唯一产生点；调用方传入的
+/// `rule.revision` 不参与写入，避免业务层伪造版本。
 const ALERT_RULE_UPDATE_SQL: &str =
     "UPDATE alert_rules SET name = ?2, enabled = ?3, source = ?4, metric = ?5, \
      comparator = ?6, threshold = ?7, duration_secs = ?8, cooldown_secs = ?9, \
      filter_agent_id = ?10, filter_labels = ?11, channel_ids = ?12, \
-     notify_on_resolve = ?13, updated_by = ?14, updated_at = ?15 WHERE id = ?1";
+     notify_on_resolve = ?13, updated_by = ?14, updated_at = ?15, \
+     revision = revision + 1 WHERE id = ?1";
 
 /// 数据库里出现未知枚举值时产生的错误（不静默降级成默认值）。
 #[derive(Debug)]
@@ -2761,6 +2575,7 @@ fn alert_rule_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertRule> {
         updated_by: row.get(14)?,
         created_at: row.get(15)?,
         updated_at: row.get(16)?,
+        revision: row.get(17)?,
     })
 }
 
@@ -2794,6 +2609,107 @@ fn map_seed_alert_rule_error(err: rusqlite::Error, rule_id: &str) -> anyhow::Err
     }
     tracing::debug!(error = %err, rule_id = %rule_id, "写入内置告警规则种子失败（非名称唯一冲突）");
     anyhow::anyhow!("写入内置告警规则 {rule_id} 失败（数据库错误详见日志）")
+}
+
+/// SQLite 外键约束冲突判定。
+///
+/// 只按 SQLite 约束错误码判断，不解析（也不依赖）SQLite 生成的错误文本；
+/// 外键名字在 schema 里由 SQLite 自动生成，不能硬编码。bundled SQLite 对
+/// `ON DELETE RESTRICT` 可能报 `SQLITE_CONSTRAINT_TRIGGER`（1811，内部用触发器
+/// 实现）而不是 `SQLITE_CONSTRAINT_FOREIGNKEY`（787），两者都视为外键失败。
+fn is_foreign_key_violation(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.code == rusqlite::ErrorCode::ConstraintViolation
+                && (inner.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+                    || inner.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER)
+    )
+}
+
+/// 在规则写事务内复核每个 `channel_id` 都存在且启用。
+///
+/// `channel_ids` 先按首次出现去重（与 JSON 落库顺序一致），空列表不查库；
+/// 内置种子通常为空，因此不会额外产生关系行。
+fn validate_alert_rule_channels_in_tx(tx: &Transaction<'_>, channel_ids: &[String]) -> Result<()> {
+    for channel_id in dedupe_channel_ids(channel_ids) {
+        let enabled: Option<i64> = tx
+            .query_row(
+                "SELECT enabled FROM notification_channels WHERE id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match enabled {
+            None => return Err(AlertRuleStoreError::ChannelNotFound.into()),
+            Some(0) => return Err(AlertRuleStoreError::ChannelDisabled.into()),
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// 用给定的渠道列表**整体替换**规则的关系行。
+///
+/// 与 JSON `channel_ids` 的写入位于同一事务；先删后插，保证更新后不会残留
+/// 已解除引用的渠道。关系插入的外键失败映射为 `ChannelNotFound`（并发删除
+/// 渠道时即便前置校验通过，也由这里兜底）。
+fn replace_alert_rule_channels_in_tx(
+    tx: &Transaction<'_>,
+    rule_id: &str,
+    channel_ids: &[String],
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM alert_rule_channels WHERE rule_id = ?1",
+        params![rule_id],
+    )?;
+    for channel_id in dedupe_channel_ids(channel_ids) {
+        tx.execute(
+            "INSERT INTO alert_rule_channels (rule_id, channel_id) VALUES (?1, ?2)",
+            params![rule_id, channel_id],
+        )
+        .map_err(|err| {
+            if is_foreign_key_violation(&err) {
+                AlertRuleStoreError::ChannelNotFound.into()
+            } else {
+                tracing::debug!(error = %err, "写入告警规则渠道关系失败");
+                anyhow::anyhow!("写入告警规则渠道关系失败（数据库错误，详见日志）")
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// 校验一条规则的关系行与 JSON `channel_ids` 一致（顺序无关，按集合比较）。
+///
+/// v1.0.0 只支持全新库，正常写入路径必然一致；若数据库被外部修改，宁可
+/// fail closed 返回明确错误，也不把不一致的渠道列表当作真实配置输出。
+pub(crate) fn ensure_alert_rule_channels_consistent(
+    rule: &AlertRule,
+    relation: &[String],
+) -> Result<()> {
+    let mut json_channels = dedupe_channel_ids(&rule.channel_ids);
+    json_channels.sort_unstable();
+    let mut relation_channels = relation.to_vec();
+    relation_channels.sort_unstable();
+    relation_channels.dedup();
+    if json_channels != relation_channels {
+        tracing::error!(
+            rule_id = %rule.id,
+            "alert_rules.channel_ids 与 alert_rule_channels 不一致，拒绝返回"
+        );
+        anyhow::bail!("告警规则的渠道关系与 JSON channel_ids 不一致，拒绝返回不一致数据");
+    }
+    Ok(())
+}
+
+/// 读取一条规则的全部关系行（顺序不保证，调用方按集合比较）。
+fn load_alert_rule_channel_ids(conn: &Connection, rule_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT channel_id FROM alert_rule_channels WHERE rule_id = ?1 ORDER BY channel_id",
+    )?;
+    let rows = stmt.query_map(params![rule_id], |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
 }
 
 impl SqliteStorage {
@@ -2830,8 +2746,10 @@ impl SqliteStorage {
                 // 可能已被用户改过阈值 / 启停 / 名称：种子绝不覆盖。
                 continue;
             }
+            validate_alert_rule_channels_in_tx(&tx, &rule.channel_ids)?;
             let filter_labels = serde_json::to_string(&rule.filter_labels)?;
-            let channel_ids = serde_json::to_string(&rule.channel_ids)?;
+            let channel_ids = dedupe_channel_ids(&rule.channel_ids);
+            let channel_ids_json = serde_json::to_string(&channel_ids)?;
             tx.execute(
                 &sql,
                 params![
@@ -2846,7 +2764,7 @@ impl SqliteStorage {
                     i64::from(rule.cooldown_secs),
                     rule.filter_agent_id.as_deref(),
                     filter_labels,
-                    channel_ids,
+                    channel_ids_json,
                     rule.notify_on_resolve as i64,
                     rule.is_builtin as i64,
                     rule.updated_by,
@@ -2855,6 +2773,7 @@ impl SqliteStorage {
                 ],
             )
             .map_err(|err| map_seed_alert_rule_error(err, &rule.id))?;
+            replace_alert_rule_channels_in_tx(&tx, &rule.id, &channel_ids)?;
             inserted += 1;
         }
         tx.commit()?;
@@ -2862,23 +2781,56 @@ impl SqliteStorage {
     }
 
     /// 按 id 读取一条规则；不存在返回 `None`。
+    ///
+    /// 读取时会校验关系表与 JSON `channel_ids` 一致；不一致说明数据库被外部
+    /// 修改，fail closed 返回错误而不是输出错误配置。
     pub fn get_alert_rule(&self, id: &str) -> Result<Option<AlertRule>> {
         let conn = self.lock_read();
+        // 显式读事务：规则行与关系行必须来自同一快照。若用两条 autocommit
+        // SELECT，并发 update 可能让第一句读到旧行、第二句读到新关系行。
+        let tx = conn.unchecked_transaction()?;
         let sql = format!("SELECT {ALERT_RULE_COLUMNS} FROM alert_rules WHERE id = ?1");
-        Ok(conn
+        let rule: Option<AlertRule> = tx
             .query_row(&sql, params![id], alert_rule_from_row)
-            .optional()?)
+            .optional()?;
+        let Some(rule) = rule else {
+            return Ok(None);
+        };
+        let relation = load_alert_rule_channel_ids(&tx, &rule.id)?;
+        ensure_alert_rule_channels_consistent(&rule, &relation)?;
+        Ok(Some(rule))
     }
 
     /// 列出全部规则：内置规则在前，同组按名称升序。
+    ///
+    /// 与 [`Self::get_alert_rule`] 相同，逐条校验关系表与 JSON 一致；两条查询
+    /// 在同一读事务内，避免并发更新期间读到“新 JSON + 旧关系行”而误报 500。
     pub fn list_alert_rules(&self) -> Result<Vec<AlertRule>> {
         let conn = self.lock_read();
+        let tx = conn.unchecked_transaction()?;
         let sql = format!(
             "SELECT {ALERT_RULE_COLUMNS} FROM alert_rules ORDER BY is_builtin DESC, name ASC"
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = tx.prepare(&sql)?;
         let rows = stmt.query_map([], alert_rule_from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let rules = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut relation_map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        {
+            let mut relation_stmt =
+                tx.prepare("SELECT rule_id, channel_id FROM alert_rule_channels")?;
+            let relation_rows =
+                relation_stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            for row in relation_rows {
+                let (rule_id, channel_id): (String, String) = row?;
+                relation_map.entry(rule_id).or_default().push(channel_id);
+            }
+        }
+        for rule in &rules {
+            let relation = relation_map.get(&rule.id).cloned().unwrap_or_default();
+            ensure_alert_rule_channels_consistent(rule, &relation)?;
+        }
+        Ok(rules)
     }
 
     /// 规则总数（含内置规则）。
@@ -2891,9 +2843,10 @@ impl SqliteStorage {
 
     /// 新建一条规则。
     ///
-    /// 事务内先查重再写入，把两种失败翻译成领域错误：
+    /// 事务内先查重、再校验渠道、最后写规则 + 关系行；领域错误：
     /// - 总数（含内置）达到 [`MAX_ALERT_RULES`] → [`AlertRuleStoreError::LimitReached`]；
-    /// - 名称重复 → [`AlertRuleStoreError::NameExists`]（并发下仍由 UNIQUE 兜底）。
+    /// - 名称重复 → [`AlertRuleStoreError::NameExists`]（并发下仍由 UNIQUE 兜底）；
+    /// - 渠道不存在 / 已禁用 → `ChannelNotFound` / `ChannelDisabled`，整体回滚。
     pub fn create_alert_rule(&self, rule: &AlertRule) -> Result<()> {
         let mut conn = self.lock_write();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2911,8 +2864,10 @@ impl SqliteStorage {
         if name_exists.is_some() {
             return Err(AlertRuleStoreError::NameExists.into());
         }
+        validate_alert_rule_channels_in_tx(&tx, &rule.channel_ids)?;
         let filter_labels = serde_json::to_string(&rule.filter_labels)?;
-        let channel_ids = serde_json::to_string(&rule.channel_ids)?;
+        let channel_ids = dedupe_channel_ids(&rule.channel_ids);
+        let channel_ids_json = serde_json::to_string(&channel_ids)?;
         let sql = format!(
             "INSERT INTO alert_rules {ALERT_RULE_INSERT_COLUMNS} VALUES \
              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
@@ -2931,7 +2886,7 @@ impl SqliteStorage {
                 i64::from(rule.cooldown_secs),
                 rule.filter_agent_id.as_deref(),
                 filter_labels,
-                channel_ids,
+                channel_ids_json,
                 rule.notify_on_resolve as i64,
                 rule.is_builtin as i64,
                 rule.updated_by,
@@ -2940,6 +2895,7 @@ impl SqliteStorage {
             ],
         )
         .map_err(map_alert_rule_unique_error)?;
+        replace_alert_rule_channels_in_tx(&tx, &rule.id, &channel_ids)?;
         tx.commit()?;
         Ok(())
     }
@@ -2987,8 +2943,10 @@ impl SqliteStorage {
         if name_exists.is_some() {
             return Err(AlertRuleStoreError::NameExists.into());
         }
+        validate_alert_rule_channels_in_tx(&tx, &rule.channel_ids)?;
         let filter_labels = serde_json::to_string(&rule.filter_labels)?;
-        let channel_ids = serde_json::to_string(&rule.channel_ids)?;
+        let channel_ids = dedupe_channel_ids(&rule.channel_ids);
+        let channel_ids_json = serde_json::to_string(&channel_ids)?;
         tx.execute(
             ALERT_RULE_UPDATE_SQL,
             params![
@@ -3003,13 +2961,14 @@ impl SqliteStorage {
                 i64::from(rule.cooldown_secs),
                 rule.filter_agent_id.as_deref(),
                 filter_labels,
-                channel_ids,
+                channel_ids_json,
                 rule.notify_on_resolve as i64,
                 rule.updated_by,
                 rule.updated_at,
             ],
         )
         .map_err(map_alert_rule_unique_error)?;
+        replace_alert_rule_channels_in_tx(&tx, &rule.id, &channel_ids)?;
         if clear_states {
             tx.execute(
                 "DELETE FROM alert_states WHERE rule_id = ?1",
@@ -3673,23 +3632,40 @@ impl SqliteStorage {
 
     /// 引擎单规则落库：事件 + 状态 + **规则状态硬上限**在同一事务内完成。
     ///
+    /// 事务内先读取 `alert_rules.enabled` / `revision` 做 CAS：规则不存在、
+    /// 已被禁用或 `revision != expected_revision` 时返回
+    /// [`AlertEvaluationOutcome::Stale`]，不写事件 / 状态、也不 prune。
+    /// `BEGIN IMMEDIATE` 与规则更新 / 删除事务串行化，因此旧评估不可能在
+    /// “禁用并清空状态”之后把状态写回来。
+    ///
     /// `keep_states` 是写完后该规则最多保留的状态数；超出部分（优先 resolved，
     /// 其次更旧）当场删除。这样即使每轮大量新 series 持续 churn，状态表也不会
     /// 无限增长，下一次加载仍 ≤ `MAX_ALERT_STATES_PER_RULE`。
-    /// 返回本事务淘汰的状态行数。
     pub fn apply_alert_evaluation(
         &self,
         rule_id: &str,
+        expected_revision: i64,
         events: &[AlertEvent],
         states: &[AlertState],
         keep_states: usize,
-    ) -> Result<usize> {
+    ) -> Result<AlertEvaluationOutcome> {
         let mut conn = self.lock_write();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT enabled, revision FROM alert_rules WHERE id = ?1",
+                params![rule_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match current {
+            Some((enabled, revision)) if enabled != 0 && revision == expected_revision => {}
+            _ => return Ok(AlertEvaluationOutcome::Stale),
+        }
         insert_alert_transitions(&tx, events, states)?;
         let removed = prune_alert_states_for_rule_in_tx(&tx, rule_id, keep_states)?;
         tx.commit()?;
-        Ok(removed)
+        Ok(AlertEvaluationOutcome::Applied { removed })
     }
 
     /// 当前最大告警事件 id；没有事件时返回 0。
@@ -4057,12 +4033,13 @@ impl SqliteStorage {
         Ok(())
     }
 
-    /// 删除一条渠道；仍被 `alert_rules.channel_ids` 引用时返回
+    /// 删除一条渠道；仍被任何规则的关系行引用时返回
     /// [`ChannelStoreError::InUse`]，绝不留下悬空引用。
     ///
-    /// 引用检查与 DELETE 在同一个 `IMMEDIATE` 事务内完成，避免检查通过后另一
-    /// 条规则写入引用造成竞态。`channel_ids` 是 JSON 数组，损坏时返回错误而不
-    /// 是放行删除。
+    /// 引用检查完全交给 `alert_rule_channels.channel_id` 的 `ON DELETE RESTRICT`
+    /// 外键：检查与 DELETE 是同一个语句，且外部 `IMMEDIATE` 事务与规则写入
+    /// 串行化，不会出现“先查 JSON 再删”的竞态。外键失败只按 SQLite 扩展错误码
+    /// 判定，不解析 SQL 文本、也不依赖自动生成的约束名。
     pub fn delete_notification_channel(&self, id: &str) -> Result<()> {
         let mut conn = self.lock_write();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4076,22 +4053,15 @@ impl SqliteStorage {
         if exists.is_none() {
             return Err(ChannelStoreError::NotFound.into());
         }
-        let references: Vec<(String, String)> = {
-            let mut stmt = tx.prepare("SELECT id, channel_ids FROM alert_rules")?;
-            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (rule_id, channel_ids) in references {
-            let ids: Vec<String> = serde_json::from_str(&channel_ids)
-                .with_context(|| format!("告警规则 {rule_id} 的 channel_ids 损坏，拒绝删除渠道"))?;
-            if ids.iter().any(|channel_id| channel_id == id) {
-                return Err(ChannelStoreError::InUse.into());
-            }
-        }
-        tx.execute(
+        if let Err(err) = tx.execute(
             "DELETE FROM notification_channels WHERE id = ?1",
             params![id],
-        )?;
+        ) {
+            if is_foreign_key_violation(&err) {
+                return Err(ChannelStoreError::InUse.into());
+            }
+            return Err(err).context("删除通知渠道失败");
+        }
         tx.commit()?;
         Ok(())
     }
@@ -5868,115 +5838,6 @@ mod tests {
         assert_eq!(states, 0);
     }
 
-    /// issue #4 / M2：v1 库按 user_version 迁移到 v3，已有 ingest_state 行必须保留，
-    /// 并补齐 `ingest_batches` 表；迁移后按 seq 精确判重。
-    #[test]
-    fn issue_4_v1_schema_migrates_and_preserves_state() {
-        let dir = std::env::temp_dir().join(format!("rb-sqlite-migrate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("rustboard.db");
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE ingest_state (
-                     agent_id   TEXT PRIMARY KEY,
-                     epoch      INTEGER NOT NULL DEFAULT 0,
-                     last_seq   INTEGER NOT NULL DEFAULT 0,
-                     updated_at INTEGER NOT NULL DEFAULT 0
-                 );
-                 INSERT INTO ingest_state (agent_id, epoch, last_seq, updated_at)
-                     VALUES ('a1', 7, 5, 42);",
-            )
-            .unwrap();
-        }
-
-        let s = SqliteStorage::open(&db_path).unwrap();
-        let version: i64 = s
-            .lock_read()
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        let batches_table: i64 = s
-            .lock_read()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ingest_batches')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(batches_table, 1);
-        // 迁移保留了旧状态行（v1 主键含 agent_id，若未迁移这里会丢）。
-        assert_eq!(ingest_states(&s), vec![(7, 5)]);
-
-        // 旧库里没有逐批记录，因此 (7,5) 第一次按新数据写入，重放才判重。
-        assert_eq!(
-            s.insert_batch(&batch_with("a1", 7, 5)).unwrap(),
-            IngestOutcome::Inserted { inserted: 2 }
-        );
-        assert_eq!(
-            s.insert_batch(&batch_with("a1", 7, 5)).unwrap(),
-            IngestOutcome::Duplicate
-        );
-        assert_eq!(
-            s.insert_batch(&batch_with("a1", 7, 6)).unwrap(),
-            IngestOutcome::Inserted { inserted: 2 }
-        );
-        // 新 epoch 有独立状态（若仍以 agent_id 为主键这里会冲突）
-        assert_eq!(
-            s.insert_batch(&batch_with("a1", 8, 0)).unwrap(),
-            IngestOutcome::Inserted { inserted: 2 }
-        );
-        assert_eq!(s.sample_count("a1").unwrap(), 6);
-        assert_eq!(ingest_states(&s), vec![(7, 6), (8, 0)]);
-
-        drop(s);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// L3：v2 库（user_version=2）启动时补建 ingest_batches / agent_settings /
-    /// v5 控制面表，user_version 升级到当前版本。
-    #[test]
-    fn l3_v2_schema_upgrades_to_v3_with_ingest_batches() {
-        let dir = std::env::temp_dir().join(format!("rb-sqlite-v2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("rustboard.db");
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE ingest_state (
-                     agent_id   TEXT NOT NULL,
-                     epoch      INTEGER NOT NULL,
-                     last_seq   INTEGER NOT NULL DEFAULT 0,
-                     updated_at INTEGER NOT NULL DEFAULT 0,
-                     PRIMARY KEY (agent_id, epoch)
-                 );
-                 INSERT INTO ingest_state (agent_id, epoch, last_seq, updated_at)
-                     VALUES ('a1', 1, 9, 42);
-                 PRAGMA user_version = 2;",
-            )
-            .unwrap();
-        }
-
-        let s = SqliteStorage::open(&db_path).unwrap();
-        let version: i64 = s
-            .lock_read()
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        // 水位 9 只作统计：seq 3 未处理过，必须正常写入（M2）。
-        assert_eq!(
-            s.insert_batch(&batch_with("a1", 1, 3)).unwrap(),
-            IngestOutcome::Inserted { inserted: 2 }
-        );
-        assert_eq!(s.sample_count("a1").unwrap(), 2);
-        assert_eq!(ingest_states(&s), vec![(1, 9)]);
-
-        drop(s);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn enroll_token_is_single_use() {
         let s = SqliteStorage::open_in_memory().unwrap();
@@ -6154,73 +6015,6 @@ mod tests {
         assert_eq!(updated_at, 102, "覆盖写入必须刷新 updated_at");
     }
 
-    /// v3 → 当前版本：只建新表、升级 user_version，旧数据原样保留；重复打开幂等。
-    #[test]
-    fn v4_migration_from_v3_is_idempotent_and_preserves_data() {
-        let dir = std::env::temp_dir().join(format!("rb-sqlite-v3-v4-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("rustboard.db");
-        {
-            // 模拟 v3 库：真实旧表结构 + 一行样本，user_version = 3。
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE samples (
-                     agent_id TEXT NOT NULL,
-                     metric   TEXT NOT NULL,
-                     labels   TEXT NOT NULL DEFAULT '{}',
-                     ts       INTEGER NOT NULL,
-                     value    REAL NOT NULL
-                 );
-                 CREATE TABLE ingest_state (
-                     agent_id   TEXT NOT NULL,
-                     epoch      INTEGER NOT NULL,
-                     last_seq   INTEGER NOT NULL DEFAULT 0,
-                     updated_at INTEGER NOT NULL DEFAULT 0,
-                     PRIMARY KEY (agent_id, epoch)
-                 );
-                 INSERT INTO samples (agent_id, metric, labels, ts, value)
-                     VALUES ('a1', 'cpu.usage', '{}', 1700000000000, 12.5);
-                 PRAGMA user_version = 3;",
-            )
-            .unwrap();
-        }
-
-        for _ in 0..2 {
-            let s = SqliteStorage::open(&db_path).unwrap();
-            let version: i64 = s
-                .lock_read()
-                .query_row("PRAGMA user_version", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(version, SCHEMA_VERSION);
-            let settings_table: i64 = s
-                .lock_read()
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_settings')",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(settings_table, 1, "v4 必须创建 agent_settings");
-            assert_eq!(s.sample_count("a1").unwrap(), 1, "旧样本不得被重写或删除");
-
-            let rows = s
-                .query_series(&SeriesQuery {
-                    agent_id: "a1".into(),
-                    metrics: Vec::new(),
-                    from: 0,
-                    to: i64::MAX,
-                    limit: 10,
-                })
-                .unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].value, 12.5);
-            assert_eq!(rows[0].ts, 1_700_000_000_000);
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// 同桶多点取平均、ts 返回桶起点、空桶不补点；多指标分别聚合。
     #[test]
     fn v4_bucketed_query_averages_and_skips_empty_buckets() {
@@ -6395,8 +6189,8 @@ mod tests {
         dir.join("rustboard.db")
     }
 
-    /// v7 的 10 张新表（与方案 §4 一一对应）。
-    const V7_TABLES: [&str; 10] = [
+    /// M4 的 10 张 v7 新表 + v9 的 alert_rule_channels（共 11 张）。
+    const V7_TABLES: [&str; 11] = [
         "samples_1m",
         "samples_1h",
         "maintenance_state",
@@ -6405,12 +6199,13 @@ mod tests {
         "alert_events",
         "alert_silences",
         "notification_channels",
+        "alert_rule_channels",
         "archive_objects",
         "archive_state",
     ];
 
-    /// v7 的 13 个显式索引 + v8 的 3 个 partial index，共 16 个。
-    const V7_INDEXES: [&str; 16] = [
+    /// v7 的 13 个显式索引 + v8 的 3 个 partial index + v9 的 1 个渠道索引，共 17 个。
+    const V7_INDEXES: [&str; 17] = [
         "idx_samples_1m_lookup",
         "idx_samples_1m_ts",
         "idx_samples_1h_lookup",
@@ -6422,6 +6217,7 @@ mod tests {
         "idx_alert_events_pending",
         "idx_alert_states_state_eval",
         "idx_alert_silences_until",
+        "idx_alert_rule_channels_channel",
         "idx_archive_objects_range",
         "idx_archive_objects_status",
         "idx_samples_unarchived",
@@ -6816,52 +6612,6 @@ mod tests {
         }
     }
 
-    /// v4 库（已有 agent_settings 行）启动时幂等升级到 v5：只新增表，旧数据保留。
-    #[test]
-    fn m3_v4_schema_upgrades_to_v5_without_touching_old_tables() {
-        let dir = std::env::temp_dir().join(format!("rb-sqlite-v5-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("rustboard.db");
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE agent_settings (
-                     agent_id           TEXT PRIMARY KEY,
-                     sample_interval_ms INTEGER NOT NULL,
-                     updated_at         INTEGER NOT NULL
-                 );
-                 INSERT INTO agent_settings VALUES ('a1', 2500, 42);
-                 PRAGMA user_version = 4;",
-            )
-            .unwrap();
-        }
-
-        for round in 0..2 {
-            let s = SqliteStorage::open(&db_path)
-                .unwrap_or_else(|err| panic!("第 {round} 次打开 v4 库失败（迁移必须幂等）: {err}"));
-            let version: i64 = s
-                .lock_read()
-                .query_row("PRAGMA user_version", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(version, SCHEMA_VERSION);
-            assert_eq!(s.get_sample_interval("a1").unwrap(), Some(2500));
-            for table in ["agent_control", "audit_log"] {
-                let exists: i64 = s
-                    .lock_read()
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-                        params![table],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
-                assert_eq!(exists, 1, "v5 必须建好 {table} 表");
-            }
-            assert_eq!(s.list_audit(10, None, None, None).unwrap(), Vec::new());
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn m3_agent_control_upsert_replaces_capabilities() {
         let s = SqliteStorage::open_in_memory().unwrap();
@@ -6979,104 +6729,66 @@ mod tests {
         let s = SqliteStorage::open_in_memory().unwrap();
         let now = rustboard_common::util::now_ms();
         let stale_ts = now - AUDIT_RETENTION_MS - 1;
-        s.insert_audit(&audit_entry("a1", "systemd", "list", stale_ts))
+        let cutoff = now - AUDIT_RETENTION_MS;
+        let old_id = s
+            .insert_audit(&audit_entry("a1", "systemd", "list", stale_ts))
             .unwrap();
 
-        // 再写 999 条：累计 1000 条，触发清理。
+        // 直接 COUNT 数据库行，不能只靠 list_audit(10) 的返回集过滤：
+        // 旧行若没删，只要不在最近 10 条里，过滤后计数同样是 0。
+        let count_by_id = |id: i64| -> i64 {
+            s.lock_read()
+                .query_row(
+                    "SELECT COUNT(*) FROM audit_log WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let count_old_range = || -> i64 {
+            s.lock_read()
+                .query_row(
+                    "SELECT COUNT(*) FROM audit_log WHERE ts < ?1",
+                    params![cutoff],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        // 触发前确认旧记录真实存在，避免“本来就没写进去”造成假阳性通过。
+        assert_eq!(count_by_id(old_id), 1, "触发前旧审计必须存在");
+        assert_eq!(count_old_range(), 1, "触发前旧时间范围必须恰有 1 行");
+
+        // 再写 1000 条：第 1000 条写入（累计 1001 行）触发清理。
+        let mut last_fresh_id = 0;
         for _ in 0..AUDIT_CLEANUP_EVERY {
-            s.insert_audit(&audit_entry("a1", "systemd", "list", now))
+            last_fresh_id = s
+                .insert_audit(&audit_entry("a1", "systemd", "list", now))
                 .unwrap();
         }
-        let stale_left = s
-            .list_audit(10, None, Some("a1"), None)
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.ts == stale_ts)
-            .count();
-        assert_eq!(stale_left, 0, "第 1000 条写入后应清理 180 天前的审计");
+
+        // 触发后：旧 id、旧时间范围都必须为 0；新写入的行必须保留。
+        assert_eq!(count_by_id(old_id), 0, "旧 id 的审计行必须被删除");
+        assert_eq!(count_old_range(), 0, "完整旧时间范围的审计行必须为 0");
+        assert_eq!(count_by_id(last_fresh_id), 1, "最后一条新审计必须保留");
+        let fresh_count: i64 = s
+            .lock_read()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE ts >= ?1",
+                params![cutoff],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(
-            s.list_audit(10, None, None, None).unwrap().len(),
-            10,
-            "新写入的审计必须保留"
+            fresh_count,
+            i64::try_from(AUDIT_CLEANUP_EVERY).unwrap(),
+            "新写入的 1000 条审计必须全部保留"
         );
     }
 
     // ------------------------------------------------------------------
     // v6：管理 API scoped token
     // ------------------------------------------------------------------
-
-    /// v5 库（已有审计与控制数据）升级到 v6：只新增 api_tokens，旧数据保留，重复打开幂等。
-    #[test]
-    fn v6_v5_schema_upgrades_and_preserves_old_data() {
-        let path = temp_db("v6-migration");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE agent_settings (
-                     agent_id           TEXT PRIMARY KEY,
-                     sample_interval_ms INTEGER NOT NULL,
-                     updated_at         INTEGER NOT NULL
-                 );
-                 INSERT INTO agent_settings VALUES ('a1', 2500, 42);
-                 CREATE TABLE audit_log (
-                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                     ts            INTEGER NOT NULL,
-                     actor         TEXT NOT NULL,
-                     agent_id      TEXT NOT NULL,
-                     capability    TEXT NOT NULL,
-                     action        TEXT NOT NULL,
-                     target        TEXT NOT NULL DEFAULT '',
-                     params        TEXT NOT NULL DEFAULT '{}',
-                     result        TEXT NOT NULL,
-                     error_code    TEXT NOT NULL DEFAULT '',
-                     error_message TEXT NOT NULL DEFAULT '',
-                     duration_ms   INTEGER NOT NULL
-                 );
-                 INSERT INTO audit_log
-                     (ts, actor, agent_id, capability, action, target, params, result,
-                      error_code, error_message, duration_ms)
-                 VALUES (111, 'admin', 'a1', 'systemd', 'list', '', '{}', 'ok', '', '', 5);
-                 PRAGMA user_version = 5;",
-            )
-            .unwrap();
-        }
-
-        for round in 0..2 {
-            let s = SqliteStorage::open(&path).unwrap_or_else(|err| {
-                panic!("第 {round} 次打开 v5 库失败（v5→v6 迁移必须幂等）: {err}")
-            });
-            let version: i64 = s
-                .lock_read()
-                .query_row("PRAGMA user_version", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(version, SCHEMA_VERSION, "必须升级到 v6");
-            assert_eq!(s.get_sample_interval("a1").unwrap(), Some(2500));
-            let audits = s.list_audit(10, None, None, None).unwrap();
-            assert_eq!(audits.len(), 1, "旧审计必须保留");
-            assert_eq!(audits[0].actor, "admin");
-            assert!(s.list_api_tokens().unwrap().is_empty());
-
-            let table_exists: i64 = s
-                .lock_read()
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'api_tokens')",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(table_exists, 1, "v6 必须建好 api_tokens 表");
-            let index_exists: i64 = s
-                .lock_read()
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_api_tokens_hash')",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(index_exists, 1, "v6 必须建好 idx_api_tokens_hash");
-        }
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
 
     /// 创建 / 列表排序 / 重复 name / 非法 scope；数据库只存哈希。
     #[test]
@@ -7236,30 +6948,243 @@ mod tests {
     // v7：M4 schema（降采样 / 告警 / 归档 / 维护水位）
     // ------------------------------------------------------------------
 
-    /// fresh 库：方案 §4 的 10 张新表与 v8 的 16 个索引全部存在，版本号为 8。
+    /// fresh 库：v9 全部对象存在（11 张 M4/v9 表、17 个索引），版本号为 9；
+    /// `alert_rules.revision` 是 NOT NULL DEFAULT 0。
     #[test]
-    fn v7_schema_creates_all_tables_and_indexes() {
+    fn v9_schema_creates_all_tables_indexes_and_revision() {
         let s = SqliteStorage::open_in_memory().unwrap();
         let version: i64 = s
             .lock_read()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, 9);
         for table in V7_TABLES {
             assert!(
                 sqlite_object_exists(&s, "table", table),
-                "缺少 v7 表: {table}"
+                "缺少 v9 表: {table}"
             );
         }
         for index in V7_INDEXES {
             assert!(
                 sqlite_object_exists(&s, "index", index),
-                "缺少 v7 索引: {index}"
+                "缺少 v9 索引: {index}"
             );
+        }
+
+        let conn = s.lock_read();
+        let (not_null, default): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT \"notnull\", dflt_value FROM pragma_table_info('alert_rules')
+                 WHERE name = 'revision'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(not_null, 1, "alert_rules.revision 必须 NOT NULL");
+        assert_eq!(
+            default.as_deref(),
+            Some("0"),
+            "alert_rules.revision 默认值必须是 0"
+        );
+    }
+
+    /// v9 重复打开：不新增对象，也不改写规则数据与 revision。
+    #[test]
+    fn v9_reopen_is_idempotent_and_does_not_rewrite_data() {
+        let path = temp_db("v9-reopen");
+        let (object_count, rule_id) = {
+            let s = SqliteStorage::open(&path).unwrap();
+            let mut rule = alert_rule("reopen");
+            rule.updated_at = 1_234;
+            s.create_alert_rule(&rule).unwrap();
+            let mut updated = s.get_alert_rule(&rule.id).unwrap().unwrap();
+            updated.name = "reopen-updated".to_string();
+            updated.updated_at = 2_345;
+            s.update_alert_rule(&updated).unwrap();
+            let stored = s.get_alert_rule(&rule.id).unwrap().unwrap();
+            assert_eq!(stored.revision, 1);
+            assert_eq!(stored.updated_at, 2_345);
+            (sqlite_object_count(&s), rule.id)
+        };
+
+        for round in 0..2 {
+            let s = SqliteStorage::open(&path).unwrap();
+            assert_eq!(
+                sqlite_object_count(&s),
+                object_count,
+                "第 {round} 次重复打开不得新增表/索引"
+            );
+            let stored = s.get_alert_rule(&rule_id).unwrap().unwrap();
+            assert_eq!(stored.revision, 1, "重复打开不得改写 revision");
+            assert_eq!(stored.updated_at, 2_345, "重复打开不得改写 updated_at");
+            assert_eq!(stored.name, "reopen-updated");
         }
     }
 
-    /// 已存在的 v7 库缺少 B1b 新增索引时，重新打开必须补建（IF NOT EXISTS 每次都执行）。
+    /// 新建规则 revision=0；每次 update 只由存储层 +1，调用方传入的 revision 被忽略。
+    #[test]
+    fn v9_alert_rule_revision_defaults_to_zero_and_increments_on_update() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let mut rule = alert_rule("revision");
+        rule.revision = 99;
+        s.create_alert_rule(&rule).unwrap();
+
+        let stored = s.get_alert_rule(&rule.id).unwrap().unwrap();
+        assert_eq!(stored.revision, 0, "创建时 revision 必须是默认值 0");
+
+        s.update_alert_rule(&stored).unwrap();
+        let stored = s.get_alert_rule(&rule.id).unwrap().unwrap();
+        assert_eq!(stored.revision, 1, "第一次更新后 revision 必须为 1");
+
+        s.update_alert_rule(&stored).unwrap();
+        let stored = s.get_alert_rule(&rule.id).unwrap().unwrap();
+        assert_eq!(stored.revision, 2, "第二次更新后 revision 必须为 2");
+    }
+
+    /// v9 alert_rule_channels：复合主键去重、FK 级联删除、渠道 RESTRICT。
+    #[test]
+    fn v9_alert_rule_channels_enforces_primary_key_and_foreign_keys() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let rule = alert_rule("channels");
+        s.create_alert_rule(&rule).unwrap();
+
+        {
+            let conn = s.lock_write();
+            conn.execute(
+                "INSERT INTO notification_channels
+                     (id, name, kind, config_json, created_at, updated_at)
+                 VALUES ('chan-1', '值班群', 'telegram', '{}', 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO alert_rule_channels (rule_id, channel_id) VALUES (?1, ?2)",
+                params![rule.id, "chan-1"],
+            )
+            .unwrap();
+
+            // 复合主键：同一 (rule_id, channel_id) 重复插入必须失败。
+            assert!(
+                conn.execute(
+                    "INSERT INTO alert_rule_channels (rule_id, channel_id) VALUES (?1, ?2)",
+                    params![rule.id, "chan-1"],
+                )
+                .is_err(),
+                "alert_rule_channels 复合主键必须拒绝重复关系"
+            );
+            // FK：不存在的 rule_id / channel_id 都必须被拒绝。
+            assert!(
+                conn.execute(
+                    "INSERT INTO alert_rule_channels (rule_id, channel_id)
+                     VALUES ('missing-rule', 'chan-1')",
+                    [],
+                )
+                .is_err(),
+                "不存在的 rule_id 必须触发外键错误"
+            );
+            assert!(
+                conn.execute(
+                    "INSERT INTO alert_rule_channels (rule_id, channel_id)
+                     VALUES (?1, 'missing-channel')",
+                    params![rule.id],
+                )
+                .is_err(),
+                "不存在的 channel_id 必须触发外键错误"
+            );
+            // 渠道仍被引用：ON DELETE RESTRICT 拒绝删除。
+            let err = conn
+                .execute("DELETE FROM notification_channels WHERE id = 'chan-1'", [])
+                .unwrap_err();
+            assert!(
+                format!("{err}").contains("FOREIGN KEY"),
+                "被引用的渠道删除必须触发 FK RESTRICT: {err}"
+            );
+        }
+
+        // 删除规则：关系行 ON DELETE CASCADE 清理，随后渠道可删除。
+        s.delete_alert_rule(&rule.id).unwrap();
+        let conn = s.lock_write();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM alert_rule_channels", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "删除规则必须级联清理关系行");
+        conn.execute("DELETE FROM notification_channels WHERE id = 'chan-1'", [])
+            .expect("关系行已清理后渠道必须可删除");
+    }
+
+    /// v1.0.0 只支持全新安装：已有库（v0..v8）必须被拒绝，且数据/版本零改写。
+    ///
+    /// 并发首开的窄窗口（读到 v0 / 已有表，另一个进程刚好把 user_version 钉到
+    /// v9）在 `ensure_supported_schema` 内通过再次读取 `PRAGMA user_version`
+    /// 消除误拒；该窗口没有可注入的同步点，无法在单测里稳定复现。这里覆盖
+    /// “重读后仍为 v0 → 必须拒绝”的安全侧，`v9_reopen_is_idempotent...` 覆盖
+    /// “已是 v9 → 放行”的初始化完成侧。
+    #[test]
+    fn old_schema_databases_are_rejected_without_modification() {
+        for version in 0..=8i64 {
+            let path = temp_db(&format!("reject-v{version}"));
+            {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE legacy_marker (id INTEGER PRIMARY KEY, note TEXT NOT NULL);
+                     INSERT INTO legacy_marker (id, note) VALUES (1, 'keep-me');",
+                )
+                .unwrap();
+                if version > 0 {
+                    conn.pragma_update(None, "user_version", version).unwrap();
+                }
+            }
+
+            let err = match SqliteStorage::open(&path) {
+                Ok(_) => panic!("已有 schema v{version} 的库必须被拒绝"),
+                Err(err) => err,
+            };
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("只支持全新安装"),
+                "v{version} 拒绝文案缺少“只支持全新安装”: {message}"
+            );
+            assert!(
+                message.contains(&format!("schema v{version}")),
+                "v{version} 拒绝文案缺少实际版本: {message}"
+            );
+            assert!(
+                message.contains("旧数据兼容将在首个正式版本之后提供"),
+                "v{version} 拒绝文案缺少兼容承诺: {message}"
+            );
+
+            // 拒绝路径不得建表、改版本或改数据。
+            let conn = Connection::open(&path).unwrap();
+            let actual_version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                actual_version, version,
+                "v{version}: 拒绝路径改写了 user_version"
+            );
+            let names: Vec<String> = {
+                let mut stmt = conn
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                    .unwrap();
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+                rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+            };
+            assert_eq!(
+                names,
+                vec!["legacy_marker".to_string()],
+                "v{version}: 拒绝路径创建了业务表"
+            );
+            let note: String = conn
+                .query_row("SELECT note FROM legacy_marker WHERE id = 1", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(note, "keep-me", "v{version}: 拒绝路径改写了旧数据");
+        }
+    }
+
+    /// 已存在 v9 库缺少索引时，重新打开必须补建（IF NOT EXISTS 每次都执行）。
     #[test]
     fn m4_b1b_v7_reopen_creates_new_indexes() {
         let path = temp_db("b1b-index-upgrade");
@@ -7270,7 +7195,8 @@ mod tests {
                     "DROP INDEX idx_alert_events_pending;
                      DROP INDEX idx_alert_states_state_eval;
                      DROP INDEX idx_alert_silences_until;
-                     DROP INDEX idx_samples_metric_ts;",
+                     DROP INDEX idx_samples_metric_ts;
+                     DROP INDEX idx_alert_rule_channels_channel;",
                 )
                 .unwrap();
             assert!(!sqlite_object_exists(
@@ -7286,107 +7212,12 @@ mod tests {
                 "idx_alert_states_state_eval",
                 "idx_alert_silences_until",
                 "idx_samples_metric_ts",
+                "idx_alert_rule_channels_channel",
             ] {
                 assert!(
                     sqlite_object_exists(&s, "index", index),
                     "重新打开后必须补建索引 {index}"
                 );
-            }
-        }
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    /// v6 库升级到 v8：建新表并给 samples 补 v8 列，旧 agents / samples /
-    /// api_tokens 数据不变，连续打开两次不报错、不重复建表，`user_version=8`。
-    #[test]
-    fn v7_v6_schema_upgrades_preserves_old_data_and_is_idempotent() {
-        let path = temp_db("v7-migration");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE agents (
-                     agent_id      TEXT PRIMARY KEY,
-                     name          TEXT NOT NULL,
-                     hostname      TEXT NOT NULL,
-                     os            TEXT NOT NULL DEFAULT '',
-                     arch          TEXT NOT NULL DEFAULT '',
-                     version       TEXT NOT NULL DEFAULT '',
-                     boot_id       TEXT NOT NULL DEFAULT '',
-                     status        TEXT NOT NULL DEFAULT 'offline',
-                     last_seen_at  INTEGER NOT NULL DEFAULT 0,
-                     created_at    INTEGER NOT NULL DEFAULT 0
-                 );
-                 INSERT INTO agents VALUES
-                     ('a1', '老 agent', 'old-host', 'linux', 'x86_64', '0.3.5', 'boot',
-                      'online', 123, 100);
-                 CREATE TABLE samples (
-                     agent_id TEXT NOT NULL,
-                     metric   TEXT NOT NULL,
-                     labels   TEXT NOT NULL DEFAULT '{}',
-                     ts       INTEGER NOT NULL,
-                     value    REAL NOT NULL
-                 );
-                 INSERT INTO samples VALUES ('a1', 'cpu.usage', '{}', 1000, 12.5);
-                 INSERT INTO samples VALUES ('a1', 'mem.used', '{}', 1000, 1024.0);
-                 CREATE TABLE api_tokens (
-                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                     name         TEXT NOT NULL UNIQUE,
-                     token_hash   TEXT NOT NULL UNIQUE,
-                     scope        TEXT NOT NULL CHECK (scope IN ('read','write','admin')),
-                     created_at   INTEGER NOT NULL,
-                     last_used_at INTEGER,
-                     revoked_at   INTEGER
-                 );
-                 INSERT INTO api_tokens (name, token_hash, scope, created_at)
-                     VALUES ('legacy', 'hash-legacy', 'read', 50);
-                 PRAGMA user_version = 6;",
-            )
-            .unwrap();
-        }
-
-        let mut first_object_count = None;
-        for round in 0..2 {
-            let s = SqliteStorage::open(&path).unwrap_or_else(|err| {
-                panic!("第 {round} 次打开 v6 库失败（v6→v8 迁移必须幂等）: {err}")
-            });
-            let version: i64 = s
-                .lock_read()
-                .query_row("PRAGMA user_version", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(version, SCHEMA_VERSION, "必须升级到 v8");
-
-            // 旧数据逐字段保留。
-            let agent = s.get_agent("a1").unwrap().expect("旧 agent 必须保留");
-            assert_eq!(agent.hostname, "old-host");
-            assert_eq!(agent.version, "0.3.5");
-            assert_eq!(agent.status, "online");
-            assert_eq!(s.sample_count("a1").unwrap(), 2);
-            let value: f64 = s
-                .lock_read()
-                .query_row(
-                    "SELECT value FROM samples WHERE metric = 'cpu.usage'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(value, 12.5);
-            let tokens = s.list_api_tokens().unwrap();
-            assert_eq!(tokens.len(), 1);
-            assert_eq!(tokens[0].name, "legacy");
-            assert_eq!(tokens[0].scope, "read");
-
-            // 新表全部建好。
-            for table in V7_TABLES {
-                assert!(
-                    sqlite_object_exists(&s, "table", table),
-                    "第 {round} 次打开缺少表 {table}"
-                );
-            }
-
-            let count = sqlite_object_count(&s);
-            match first_object_count {
-                None => first_object_count = Some(count),
-                Some(first) => assert_eq!(count, first, "重复打开不得重复建表/索引"),
             }
         }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -8705,6 +8536,7 @@ mod tests {
             updated_by: "admin".to_string(),
             created_at: 1_000,
             updated_at: 1_000,
+            revision: 0,
         }
     }
 
@@ -8717,6 +8549,12 @@ mod tests {
     #[test]
     fn m4_b1_alert_rule_crud_roundtrip() {
         let s = SqliteStorage::open_in_memory().unwrap();
+        // v9 起存储层在写规则事务内校验渠道存在；先建两条渠道。
+        for (id, name) in [("channel-1", "渠道一"), ("channel-2", "渠道二")] {
+            let mut channel = notification_channel(name);
+            channel.id = id.to_string();
+            s.create_notification_channel(&channel).unwrap();
+        }
         let mut rule = alert_rule("磁盘告警");
         rule.filter_agent_id = Some("agent-1".into());
         rule.filter_labels.insert("mount".into(), "/".into());
@@ -8740,6 +8578,9 @@ mod tests {
         updated.updated_by = "ops".into();
         updated.updated_at = 2_000;
         s.update_alert_rule(&updated).unwrap();
+        // revision 只能由存储层递增；更新后数据库里是 1，调用方的副本需同步
+        // 才能做整行比较。
+        updated.revision = 1;
 
         assert_eq!(s.get_alert_rule(&rule.id).unwrap(), Some(updated.clone()));
         assert_eq!(s.list_alert_rules().unwrap(), vec![updated.clone()]);
@@ -8822,6 +8663,8 @@ mod tests {
         edited.updated_by = "ops".into();
         edited.updated_at = now + 60_000;
         s.update_alert_rule(&edited).unwrap();
+        // 更新由存储层递增 revision；用于后续整行比较的副本同步为 1。
+        edited.revision = 1;
 
         assert_eq!(
             s.seed_builtin_alert_rules(&builtin_rules(now + 120_000, 90, 48), now + 120_000)
@@ -8921,6 +8764,11 @@ mod tests {
     #[test]
     fn m4_b1_alert_rule_json_columns_are_stable() {
         let s = SqliteStorage::open_in_memory().unwrap();
+        for (id, name) in [("channel-a", "渠道 A"), ("channel-b", "渠道 B")] {
+            let mut channel = notification_channel(name);
+            channel.id = id.to_string();
+            s.create_notification_channel(&channel).unwrap();
+        }
         let mut rule = alert_rule("json");
         // 插入顺序与字典序相反，落库必须按字典序稳定输出。
         rule.filter_labels.insert("mount".into(), "/data".into());
@@ -9689,6 +9537,11 @@ mod tests {
     fn m4_b1b_rule_state_load_limit_and_prune_priority() {
         let s = SqliteStorage::open_in_memory().unwrap();
         let rule_id = "rule-cap";
+        // CAS 要求规则存在且启用；状态表没有外键，但 apply 会先读规则行。
+        let mut rule = alert_rule("cap");
+        rule.id = rule_id.to_string();
+        rule.enabled = true;
+        s.create_alert_rule(&rule).unwrap();
         let seed = |key: &str, kind: AlertStateKind, last_eval_at: i64| {
             let mut state = alert_state(rule_id, "agent-1", key);
             state.state = kind;
@@ -9734,9 +9587,9 @@ mod tests {
         new_state.state = AlertStateKind::Firing;
         new_state.last_eval_at = 700;
         assert_eq!(
-            s.apply_alert_evaluation(rule_id, &[], &[new_state], 3)
+            s.apply_alert_evaluation(rule_id, 0, &[], &[new_state], 3)
                 .unwrap(),
-            1
+            AlertEvaluationOutcome::Applied { removed: 1 }
         );
         let after = s.list_alert_states_for_rule(rule_id, 10).unwrap();
         assert_eq!(
@@ -9961,6 +9814,405 @@ mod tests {
             channel_store_error(s.delete_notification_channel(&channel.id).unwrap_err()),
             ChannelStoreError::NotFound
         );
+    }
+
+    /// 读取某条规则的关系行（测试辅助；按 channel_id 排序）。
+    fn stored_rule_channels(s: &SqliteStorage, rule_id: &str) -> Vec<String> {
+        let conn = s.lock_read();
+        let mut stmt = conn
+            .prepare(
+                "SELECT channel_id FROM alert_rule_channels WHERE rule_id = ?1 ORDER BY channel_id",
+            )
+            .unwrap();
+        stmt.query_map(params![rule_id], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
+    }
+
+    /// #69：禁用并清空状态后，携带旧 revision 的评估必须 Stale。
+    ///
+    /// 固定交错：旧评估已读到 Pending → API 禁用规则并在同事务清空状态 →
+    /// 旧评估才提交。断言状态不复活、没有新 firing 事件。
+    #[test]
+    fn v9_stale_evaluation_cannot_resurrect_disabled_rule() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let mut rule = alert_rule("cas");
+        rule.enabled = true;
+        s.create_alert_rule(&rule).unwrap();
+        let old_revision = rule.revision;
+
+        let mut pending = alert_state(&rule.id, "agent-1", "series-1");
+        pending.state = AlertStateKind::Pending;
+        pending.since = 1_000;
+        pending.last_eval_at = 1_000;
+        s.upsert_alert_state(&pending).unwrap();
+
+        let mut event = alert_event(2_000, AlertStateKind::Firing, false);
+        event.rule_id = rule.id.clone();
+        event.series_key = "series-1".into();
+        let mut firing = pending.clone();
+        firing.state = AlertStateKind::Firing;
+        firing.since = 2_000;
+        firing.last_eval_at = 2_000;
+        firing.last_value = Some(99.0);
+        let mut keep = alert_state(&rule.id, "agent-2", "keep");
+        keep.state = AlertStateKind::Firing;
+        keep.last_eval_at = 1_200;
+        s.upsert_alert_state(&keep).unwrap();
+
+        // 先单独验证 Stale 的“零写入 / 零 prune”：预先存在两条状态，
+        // 即使本次调用带 events / states 且 keep_states=0，也不得触发裁剪。
+        let mut extra = alert_state(&rule.id, "agent-3", "new");
+        extra.state = AlertStateKind::Firing;
+        assert_eq!(
+            s.apply_alert_evaluation(&rule.id, old_revision + 1, &[event.clone()], &[extra], 0)
+                .unwrap(),
+            AlertEvaluationOutcome::Stale
+        );
+        let mut state_keys = s
+            .list_alert_states()
+            .unwrap()
+            .into_iter()
+            .map(|state| (state.agent_id, state.series_key))
+            .collect::<Vec<_>>();
+        state_keys.sort();
+        assert_eq!(
+            state_keys,
+            vec![
+                ("agent-1".to_string(), "series-1".to_string()),
+                ("agent-2".to_string(), "keep".to_string())
+            ],
+            "Stale 不得 prune 既有状态，也不得写入新状态"
+        );
+        assert!(s.list_alert_events(10, None).unwrap().is_empty());
+
+        // 禁用 + 清空（与 API 的 update 路径一致），revision 变为 1。
+        let mut disabled = s.get_alert_rule(&rule.id).unwrap().unwrap();
+        disabled.enabled = false;
+        disabled.updated_at = 1_500;
+        s.update_alert_rule_and_clear_states(&disabled).unwrap();
+        assert!(s.list_alert_states().unwrap().is_empty());
+
+        assert_eq!(
+            s.apply_alert_evaluation(
+                &rule.id,
+                old_revision,
+                &[event.clone()],
+                &[firing.clone()],
+                10
+            )
+            .unwrap(),
+            AlertEvaluationOutcome::Stale
+        );
+        assert!(
+            s.list_alert_states().unwrap().is_empty(),
+            "旧评估不得复活状态"
+        );
+        assert!(
+            s.list_alert_events(10, None).unwrap().is_empty(),
+            "旧评估不得产生 firing 事件 / 通知"
+        );
+
+        // 规则被删除后同样 Stale（不写任何数据）。
+        s.delete_alert_rule_and_clear_states(&rule.id).unwrap();
+        assert_eq!(
+            s.apply_alert_evaluation(&rule.id, old_revision, &[event], &[firing], 10)
+                .unwrap(),
+            AlertEvaluationOutcome::Stale
+        );
+        assert!(s.list_alert_events(10, None).unwrap().is_empty());
+    }
+
+    /// #70：创建 / 更新 / 删除规则时关系表与 JSON 同步维护。
+    #[test]
+    fn v9_alert_rule_channels_are_written_replaced_and_cascaded() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let mut first = notification_channel("渠道-A");
+        first.id = "channel-a".into();
+        let mut second = notification_channel("渠道-B");
+        second.id = "channel-b".into();
+        s.create_notification_channel(&first).unwrap();
+        s.create_notification_channel(&second).unwrap();
+
+        let mut rule = alert_rule("关系表");
+        rule.channel_ids = vec!["channel-b".into(), "channel-a".into()];
+        s.create_alert_rule(&rule).unwrap();
+        assert_eq!(
+            stored_rule_channels(&s, &rule.id),
+            vec!["channel-a".to_string(), "channel-b".to_string()]
+        );
+
+        // 直接 FK INSERT 失败（不经过 create/update 的前置校验）。
+        let err = s
+            .lock_write()
+            .execute(
+                "INSERT INTO alert_rule_channels (rule_id, channel_id) VALUES (?1, 'missing-channel')",
+                params![&rule.id],
+            )
+            .unwrap_err();
+        assert!(
+            is_foreign_key_violation(&err),
+            "不存在的 channel_id 必须触发 FK: {err:?}"
+        );
+        let err = s
+            .lock_write()
+            .execute(
+                "INSERT INTO alert_rule_channels (rule_id, channel_id) \
+                 VALUES ('missing-rule', 'channel-a')",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            is_foreign_key_violation(&err),
+            "不存在的 rule_id 必须触发 FK: {err:?}"
+        );
+
+        // 更新为只引用 channel-a：旧关系行必须被替换，而不是累积。
+        let mut updated = s.get_alert_rule(&rule.id).unwrap().unwrap();
+        updated.channel_ids = vec!["channel-a".into()];
+        updated.updated_at = 2_000;
+        s.update_alert_rule(&updated).unwrap();
+        assert_eq!(
+            stored_rule_channels(&s, &rule.id),
+            vec!["channel-a".to_string()]
+        );
+
+        // 删除规则：关系行由 ON DELETE CASCADE 清理，渠道随后可删除。
+        s.delete_alert_rule(&rule.id).unwrap();
+        assert!(stored_rule_channels(&s, &rule.id).is_empty());
+        s.delete_notification_channel(&first.id).unwrap();
+    }
+
+    /// #70：不存在的 channel_id 在规则 create / update 事务内被拒绝且整体回滚。
+    #[test]
+    fn v9_alert_rule_rejects_missing_channel_and_rolls_back() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let valid = notification_channel("有效渠道");
+        s.create_notification_channel(&valid).unwrap();
+        let mut disabled = notification_channel("禁用渠道");
+        disabled.enabled = false;
+        s.create_notification_channel(&disabled).unwrap();
+
+        let mut bad = alert_rule("坏渠道");
+        bad.channel_ids = vec!["does-not-exist".into()];
+        assert_eq!(
+            store_error(s.create_alert_rule(&bad).unwrap_err()),
+            AlertRuleStoreError::ChannelNotFound
+        );
+        assert_eq!(s.alert_rule_count().unwrap(), 0, "失败不得写入规则");
+        assert!(stored_rule_channels(&s, &bad.id).is_empty());
+
+        // 存在但已禁用：与 Hub 前置校验一致，事务内也拒绝。
+        let mut disabled_ref = alert_rule("禁用渠道规则");
+        disabled_ref.channel_ids = vec![disabled.id.clone()];
+        assert_eq!(
+            store_error(s.create_alert_rule(&disabled_ref).unwrap_err()),
+            AlertRuleStoreError::ChannelDisabled
+        );
+        assert_eq!(s.alert_rule_count().unwrap(), 0);
+        assert!(stored_rule_channels(&s, &disabled_ref.id).is_empty());
+
+        let mut rule = alert_rule("更新坏渠道");
+        rule.channel_ids = vec![valid.id.clone()];
+        s.create_alert_rule(&rule).unwrap();
+        let mut updated = s.get_alert_rule(&rule.id).unwrap().unwrap();
+        updated.channel_ids = vec!["does-not-exist".into()];
+        updated.updated_at = 2_000;
+        assert_eq!(
+            store_error(s.update_alert_rule(&updated).unwrap_err()),
+            AlertRuleStoreError::ChannelNotFound
+        );
+        let stored = s.get_alert_rule(&rule.id).unwrap().unwrap();
+        assert_eq!(
+            stored.channel_ids,
+            vec![valid.id.clone()],
+            "更新必须整体回滚"
+        );
+        assert_eq!(
+            stored_rule_channels(&s, &rule.id),
+            vec![valid.id.clone()],
+            "关系行不得被半更新"
+        );
+    }
+
+    /// #70：渠道删除由关系表 FK 阻止，不能用“JSON 里没有引用”绕过。
+    #[test]
+    fn v9_channel_delete_uses_relation_fk_not_json_scan() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let channel = notification_channel("被关系表引用");
+        s.create_notification_channel(&channel).unwrap();
+        let mut rule = alert_rule("FK 引用");
+        rule.channel_ids = vec![channel.id.clone()];
+        s.create_alert_rule(&rule).unwrap();
+
+        // 模拟外部把 JSON 改坏、但关系行仍在：读取 fail closed，删除仍必须被
+        // FK RESTRICT 拒绝。
+        s.lock_write()
+            .execute(
+                "UPDATE alert_rules SET channel_ids = '[]' WHERE id = ?1",
+                params![rule.id],
+            )
+            .unwrap();
+        let err = s.get_alert_rule(&rule.id).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("不一致"),
+            "关系表与 JSON 不一致必须 fail closed: {err:#}"
+        );
+        assert_eq!(
+            channel_store_error(s.delete_notification_channel(&channel.id).unwrap_err()),
+            ChannelStoreError::InUse
+        );
+
+        // 只删关系行后渠道可删除；证明判断来自关系表而不是 JSON。
+        s.lock_write()
+            .execute(
+                "DELETE FROM alert_rule_channels WHERE rule_id = ?1",
+                params![rule.id],
+            )
+            .unwrap();
+        s.delete_notification_channel(&channel.id).unwrap();
+        assert_eq!(
+            channel_store_error(s.delete_notification_channel(&channel.id).unwrap_err()),
+            ChannelStoreError::NotFound
+        );
+    }
+
+    /// #70 并发：创建规则与删除渠道同时发生，至少一方失败且不留 dangling。
+    #[test]
+    fn v9_concurrent_channel_delete_and_rule_create_never_dangle() {
+        use std::sync::{Arc, Barrier};
+
+        let path = temp_db("channel-race");
+        // 两个独立的 SqliteStorage（各自 writer 连接），走真正的 SQLite
+        // BEGIN IMMEDIATE 文件锁，而不是同一个进程内的 Mutex。
+        let conn_a = Arc::new(SqliteStorage::open(&path).unwrap());
+        let conn_b = Arc::new(SqliteStorage::open(&path).unwrap());
+        let reader = Arc::new(SqliteStorage::open(&path).unwrap());
+        for index in 0..20 {
+            let mut channel = notification_channel(&format!("竞态渠道-{index}"));
+            channel.id = format!("race-channel-{index}");
+            conn_a.create_notification_channel(&channel).unwrap();
+
+            let mut rule = alert_rule(&format!("竞态规则-{index}"));
+            rule.id = format!("race-rule-{index}");
+            rule.channel_ids = vec![channel.id.clone()];
+
+            let barrier = Arc::new(Barrier::new(2));
+            let create_storage = Arc::clone(&conn_a);
+            let create_rule = rule.clone();
+            let create_barrier = Arc::clone(&barrier);
+            let creator = std::thread::spawn(move || {
+                create_barrier.wait();
+                create_storage.create_alert_rule(&create_rule)
+            });
+            let delete_storage = Arc::clone(&conn_b);
+            let channel_id = channel.id.clone();
+            let delete_barrier = Arc::clone(&barrier);
+            let deleter = std::thread::spawn(move || {
+                delete_barrier.wait();
+                delete_storage.delete_notification_channel(&channel_id)
+            });
+
+            let created = creator.join().unwrap();
+            let deleted = deleter.join().unwrap();
+
+            // 恰一方成功：create 赢了则 DELETE 必须 FK InUse；delete 赢了则
+            // create 必须明确 ChannelNotFound（不能两边都成功留下 dangling）。
+            match (&created, &deleted) {
+                (Ok(()), Err(err)) => {
+                    assert_eq!(
+                        err.downcast_ref::<ChannelStoreError>(),
+                        Some(&ChannelStoreError::InUse),
+                        "iteration {index}: 创建成功后删除必须 InUse"
+                    );
+                }
+                (Err(err), Ok(())) => {
+                    assert_eq!(
+                        err.downcast_ref::<AlertRuleStoreError>(),
+                        Some(&AlertRuleStoreError::ChannelNotFound),
+                        "iteration {index}: 渠道先删后创建必须 ChannelNotFound"
+                    );
+                }
+                (Ok(()), Ok(())) => panic!("iteration {index}: 两边都成功会留下 dangling"),
+                (Err(create_err), Err(delete_err)) => panic!(
+                    "iteration {index}: 两边都失败（create={create_err:#}, delete={delete_err:#}）"
+                ),
+            }
+
+            let rule_exists = reader.get_alert_rule(&rule.id).unwrap().is_some();
+            let channel_exists = reader
+                .get_notification_channel(&channel.id)
+                .unwrap()
+                .is_some();
+            let relations = stored_rule_channels(&reader, &rule.id);
+            if rule_exists {
+                assert!(channel_exists, "规则存在时渠道不能被删掉（dangling）");
+                assert_eq!(relations, vec![channel.id.clone()], "关系行必须存在");
+            } else {
+                assert!(relations.is_empty(), "规则不存在时不得留下关系行");
+            }
+        }
+    }
+
+    /// #70 读一致性：规则行 + 关系行必须在同一读快照，并发更新不能误报 500。
+    #[test]
+    fn v9_rule_read_snapshot_survives_concurrent_channel_update() {
+        use std::sync::Arc;
+
+        let path = temp_db("rule-read-snapshot");
+        let writer = Arc::new(SqliteStorage::open(&path).unwrap());
+        let reader = Arc::new(SqliteStorage::open(&path).unwrap());
+
+        let mut channel_a = notification_channel("快照渠道 A");
+        channel_a.id = "snapshot-a".into();
+        let mut channel_b = notification_channel("快照渠道 B");
+        channel_b.id = "snapshot-b".into();
+        writer.create_notification_channel(&channel_a).unwrap();
+        writer.create_notification_channel(&channel_b).unwrap();
+        let mut rule = alert_rule("快照规则");
+        rule.id = "snapshot-rule".into();
+        rule.channel_ids = vec![channel_a.id.clone()];
+        writer.create_alert_rule(&rule).unwrap();
+
+        let update_writer = Arc::clone(&writer);
+        let updater = std::thread::spawn(move || {
+            for index in 0..100 {
+                let mut current = update_writer
+                    .get_alert_rule("snapshot-rule")
+                    .unwrap()
+                    .unwrap();
+                current.channel_ids = if index % 2 == 0 {
+                    vec!["snapshot-b".to_string()]
+                } else {
+                    vec!["snapshot-a".to_string()]
+                };
+                current.updated_at += 1;
+                update_writer.update_alert_rule(&current).unwrap();
+            }
+        });
+
+        for _ in 0..200 {
+            let current = reader
+                .get_alert_rule("snapshot-rule")
+                .expect("并发更新期间读取不得因快照撕裂而失败")
+                .unwrap();
+            assert!(
+                current.channel_ids == vec!["snapshot-a".to_string()]
+                    || current.channel_ids == vec!["snapshot-b".to_string()],
+                "读到半更新渠道列表: {:?}",
+                current.channel_ids
+            );
+            let listed = reader
+                .list_alert_rules()
+                .expect("并发更新期间列表读取不得失败");
+            assert_eq!(listed.len(), 1);
+        }
+        updater.join().unwrap();
+
+        // 最终两侧一致。
+        let final_rule = reader.get_alert_rule("snapshot-rule").unwrap().unwrap();
+        assert_eq!(final_rule.channel_ids, vec!["snapshot-a".to_string()]);
     }
 
     /// B2 游标查询：只返回 `id > cursor` 且未通知、未静默的事件。

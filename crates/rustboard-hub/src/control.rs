@@ -26,19 +26,19 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use rustboard_common::config::{HubControlConfig, LogSourceKind};
 use rustboard_common::control::{
-    codes as control_codes, is_forbidden_unit, known_capability, validate_container_name,
-    validate_source_id, validate_unit_name, ControlError, ControlOp, ControlRequest,
-    ControlResponse, ControlResult, DockerAction, KillSignal, SystemdAction, ALL_CAPABILITIES,
-    CAP_DOCKER, CAP_LOGS, CAP_PROCESS, CAP_SYSTEMD, MAX_CMDLINE_BYTES, MAX_LIST_ITEMS,
-    MAX_LOG_LINES, MAX_LOG_LINE_BYTES, MAX_LOG_TARGET_BYTES, MAX_NAME_LEN, MAX_OUTPUT_BYTES,
-    MAX_PROCESS_ITEMS, MAX_TARGET_LEN, TRUNCATED_MARKER,
+    codes as control_codes, is_forbidden_unit, known_capability, normalize_unit_name,
+    validate_container_name, validate_source_id, validate_unit_name, ControlError, ControlOp,
+    ControlRequest, ControlResponse, ControlResult, DockerAction, KillSignal, SystemdAction,
+    ALL_CAPABILITIES, CAP_DOCKER, CAP_LOGS, CAP_PROCESS, CAP_SYSTEMD, MAX_CMDLINE_BYTES,
+    MAX_LIST_ITEMS, MAX_LOG_LINES, MAX_LOG_LINE_BYTES, MAX_LOG_TARGET_BYTES, MAX_NAME_LEN,
+    MAX_OUTPUT_BYTES, MAX_PROCESS_ITEMS, MAX_TARGET_LEN, TRUNCATED_MARKER,
 };
 use rustboard_common::util::now_ms;
 use rustboard_common::wire::Frame;
 use rustboard_core::storage::{AuditEntry, NewAuditEntry};
 use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::timeout;
+use tokio::time::timeout_at;
 
 use crate::auth::AuthPrincipal;
 use crate::{is_valid_agent_id, validate_agent_path, ApiError, AppState};
@@ -105,6 +105,11 @@ struct PendingControl {
 pub struct ControlCommand {
     pub op: ControlOp,
     pub reply: ControlReply,
+    /// API 入队时计算的**绝对**派发 deadline（单调时钟）。
+    ///
+    /// 会话不能在出队时用 `now + request_timeout` 重新计时：队列暂停期间 API
+    /// 可能已返回 504 并丢弃 reply，重新计时会把早已过期的旧请求发给 agent。
+    pub deadline: Instant,
 }
 
 /// 单个 agent 会话的控制状态。
@@ -113,10 +118,19 @@ pub struct ControlSession {
     next_id: u64,
     pending: HashMap<u64, PendingControl>,
     max_pending: usize,
-    /// 每条控制请求从入表起允许等待的时长。
+    /// 单条控制请求允许等待的最长时长（防御性上限）。
+    ///
+    /// 真正的 deadline 由 API 在入队时给出；这里只用于夹住异常值，绝不能在
+    /// 出队时重新起算。
     request_timeout: Duration,
     /// 收到的未知 id 应答计数（陈旧 / 伪造应答），只用于排障。
     unknown_responses: u64,
+    /// 派发前发现等待者已取消（API 超时 / 客户端断开）的计数（测试与排障）。
+    #[cfg(test)]
+    discarded_cancelled: u64,
+    /// 派发前发现绝对 deadline 已过的计数（测试与排障）。
+    #[cfg(test)]
+    discarded_expired: u64,
 }
 
 impl ControlSession {
@@ -127,11 +141,17 @@ impl ControlSession {
             max_pending: max_pending.max(MIN_PENDING_LIMIT),
             request_timeout,
             unknown_responses: 0,
+            #[cfg(test)]
+            discarded_cancelled: 0,
+            #[cfg(test)]
+            discarded_expired: 0,
         }
     }
 
     /// 分配 id 并登记待处理项，返回要发送给 agent 的请求。
     ///
+    /// 使用 `command.deadline` 作为 pending 的实际 deadline，绝不按出队时刻
+    /// 重新计时；`request_timeout` 只作为上限夹住异常 deadline。
     /// 超过上限时不发送任何帧，直接通过 `command.reply` 回 `too_many_pending`。
     fn enqueue(
         &mut self,
@@ -142,7 +162,11 @@ impl ControlSession {
             let _ = command.reply.send(Err(error.clone()));
             return Err(error);
         }
-        let ControlCommand { op, reply } = command;
+        let ControlCommand {
+            op,
+            reply,
+            deadline,
+        } = command;
         self.next_id = self.next_id.wrapping_add(1);
         if self.next_id == 0 {
             // 溢出回绕后跳过 0，保持 id 从 1 开始。
@@ -153,10 +177,45 @@ impl ControlSession {
             id,
             PendingControl {
                 reply,
-                deadline: Instant::now() + self.request_timeout,
+                deadline: deadline.min(Instant::now() + self.request_timeout),
             },
         );
         Ok(ControlRequest::new(id, op))
+    }
+
+    /// 派发前检查：等待者已取消或绝对 deadline 已过时，登记错误并**不返回请求**。
+    ///
+    /// 队列暂停（会话 loop 暂时不消费 `control_rx`）期间 API 可能已经 504 并
+    /// 丢弃 reply；恢复消费后必须在这里丢弃旧命令，绝不能补发给 agent。
+    /// API 已为超时写过审计，这里只记一次 warn，避免重复审计。
+    fn accept_for_dispatch(&mut self, command: ControlCommand) -> Option<ControlRequest> {
+        if command.reply.is_closed() {
+            // API 超时路径已经打过 WARN 并写过审计；这里只留 debug，避免同一
+            // 过期请求重复记日志。
+            tracing::debug!(
+                op = command.op.kind(),
+                "控制命令的等待者已取消（API 超时或客户端断开），丢弃且不发送给 agent"
+            );
+            #[cfg(test)]
+            {
+                self.discarded_cancelled = self.discarded_cancelled.saturating_add(1);
+            }
+            return None;
+        }
+        if command.deadline <= Instant::now() {
+            // 若等待者还在，回固定超时错误；API 会按 504 写一次审计。
+            let _ = command.reply.send(Err(control_timeout_error()));
+            tracing::warn!(
+                op = command.op.kind(),
+                "控制命令已超过绝对 deadline，丢弃且不发送给 agent"
+            );
+            #[cfg(test)]
+            {
+                self.discarded_expired = self.discarded_expired.saturating_add(1);
+            }
+            return None;
+        }
+        self.enqueue(command).ok()
     }
 
     /// 清理所有已到期的 pending，向等待者回 `control_timeout`，返回清理数量。
@@ -172,10 +231,7 @@ impl ControlSession {
             .collect();
         for id in &expired {
             if let Some(pending) = self.pending.remove(id) {
-                let _ = pending.reply.send(Err(ControlError::new(
-                    hub_codes::CONTROL_TIMEOUT,
-                    "控制请求超时",
-                )));
+                let _ = pending.reply.send(Err(control_timeout_error()));
             }
         }
         expired.len()
@@ -190,17 +246,59 @@ impl ControlSession {
         socket: &mut WebSocket,
         command: ControlCommand,
     ) -> anyhow::Result<()> {
-        let request = match self.enqueue(command) {
-            Ok(request) => request,
-            // 容量超限已经回复错误，会话继续正常工作。
-            Err(_) => return Ok(()),
+        let Some(request) = self.accept_for_dispatch(command) else {
+            return Ok(());
         };
+        self.send_request(request, |request| async move {
+            crate::send_frame(socket, &Frame::ControlRequest(request)).await
+        })
+        .await
+    }
+
+    /// 真正写帧前再检查一次等待者状态。
+    ///
+    /// `accept_for_dispatch` 到 `send_frame` 之间仍有一个极短窗口：API 可能在
+    /// 这里超时并丢弃 reply。若不再检查，旧请求仍会被发给 agent。`send` 参数
+    /// 让单测可以注入“记录是否被调用”的假发送器。
+    async fn send_request<F, Fut>(&mut self, request: ControlRequest, send: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(ControlRequest) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<()>>,
+    {
         let id = request.id;
-        let sent = tokio::time::timeout(
-            CONTROL_WRITE_TIMEOUT,
-            crate::send_frame(socket, &Frame::ControlRequest(request)),
-        )
-        .await;
+        let closed = self
+            .pending
+            .get(&id)
+            .is_none_or(|pending| pending.reply.is_closed());
+        if closed {
+            self.pending.remove(&id);
+            // 正常是 API 已超时并写过审计；这里只记 debug，避免重复日志。
+            tracing::debug!(id, "发送前等待者已取消，丢弃控制请求且不发送给 agent");
+            #[cfg(test)]
+            {
+                self.discarded_cancelled = self.discarded_cancelled.saturating_add(1);
+            }
+            return Ok(());
+        }
+        if self
+            .pending
+            .get(&id)
+            .is_some_and(|pending| pending.deadline <= Instant::now())
+        {
+            if let Some(pending) = self.pending.remove(&id) {
+                let _ = pending.reply.send(Err(control_timeout_error()));
+            }
+            tracing::warn!(
+                id,
+                "发送前控制命令已超过绝对 deadline，丢弃且不发送给 agent"
+            );
+            #[cfg(test)]
+            {
+                self.discarded_expired = self.discarded_expired.saturating_add(1);
+            }
+            return Ok(());
+        }
+        let sent = tokio::time::timeout(CONTROL_WRITE_TIMEOUT, send(request)).await;
         match sent {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => {
@@ -247,6 +345,18 @@ impl ControlSession {
     fn unknown_responses(&self) -> u64 {
         self.unknown_responses
     }
+
+    /// 派发前被取消的命令数（测试与排障）。
+    #[cfg(test)]
+    fn discarded_cancelled(&self) -> u64 {
+        self.discarded_cancelled
+    }
+
+    /// 派发前已过绝对 deadline 的命令数（测试与排障）。
+    #[cfg(test)]
+    fn discarded_expired(&self) -> u64 {
+        self.discarded_expired
+    }
 }
 
 impl Drop for ControlSession {
@@ -273,6 +383,11 @@ fn too_many_pending_error() -> ControlError {
         hub_codes::TOO_MANY_PENDING,
         "待处理的控制命令过多，请稍后重试",
     )
+}
+
+/// 会话本地超时错误；API 按错误码映射固定 504 文案。
+fn control_timeout_error() -> ControlError {
+    ControlError::new(hub_codes::CONTROL_TIMEOUT, "控制请求超时")
 }
 
 /// 只保留本版本已知的能力，去重并限制条数；未知值只记数量，不落库也不打日志内容。
@@ -670,10 +785,15 @@ pub(crate) async fn control_action(
         return finish_error(&state, audit, started, &reject).await;
     }
 
+    // #65：绝对 deadline 在入队前计算，命令在 mpsc 队列里暂停再久也不会
+    // 被会话重新计时；超时后 API 丢弃 reply，会话恢复消费时必须直接丢弃。
+    let wait = Duration::from_millis(state.cfg.control.request_timeout_ms.max(1));
+    let deadline = Instant::now() + wait;
     let (reply_tx, reply_rx) = oneshot::channel();
     match sender.try_send(ControlCommand {
         op: prepared.op,
         reply: reply_tx,
+        deadline,
     }) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -685,8 +805,7 @@ pub(crate) async fn control_action(
         }
     }
 
-    let wait = Duration::from_millis(state.cfg.control.request_timeout_ms.max(1));
-    match timeout(wait, reply_rx).await {
+    match timeout_at(deadline.into(), reply_rx).await {
         Err(_) => {
             tracing::warn!(
                 agent = %agent_id,
@@ -872,7 +991,9 @@ fn prepare_control(
             }
             "start" | "stop" | "restart" => {
                 reject_extra_fields(payload, &["target"])?;
-                let target = required_target(payload)?.to_string();
+                // #78：先按 systemctl 规则统一规范化（短名补 `.service`，已带
+                // `.socket` 等后缀不改），禁止项 / 审计 / 下发都使用同一形式。
+                let target = normalize_unit_name(required_target(payload)?).into_owned();
                 validate_unit_name(&target).map_err(invalid_parameter)?;
                 if matches!(action, "stop" | "restart") && payload.confirm != Some(true) {
                     return Err(Reject::invalid("stop / restart 必须显式 confirm: true"));
@@ -1618,7 +1739,14 @@ mod tests {
 
     #[test]
     fn forbidden_units_are_denied_before_reaching_agent() {
-        for unit in ["sshd.service", "rustboard-agent.service", "dbus.service"] {
+        for unit in [
+            "sshd.service",
+            "ssh",
+            "ssh.service",
+            "ssh.socket",
+            "rustboard-agent.service",
+            "dbus.service",
+        ] {
             let body = format!(
                 r#"{{"capability":"systemd","action":"restart","target":"{unit}","confirm":true}}"#
             );
@@ -1627,6 +1755,37 @@ mod tests {
             assert_eq!(reject.code, control_codes::NOT_WHITELISTED);
             assert_eq!(reject.audit_result, AUDIT_DENIED);
         }
+    }
+
+    /// #78：Hub 下发与审计统一使用规范化后的完整 unit 名；短名与完整名等价。
+    #[test]
+    fn systemd_targets_are_normalized_before_dispatch() {
+        for target in ["nginx", "nginx.service"] {
+            let body =
+                format!(r#"{{"capability":"systemd","action":"start","target":"{target}"}}"#);
+            let prepared =
+                prepare(&body).unwrap_or_else(|reject| panic!("{target}: {}", reject.message));
+            assert_eq!(prepared.target, "nginx.service");
+            assert_eq!(
+                prepared.op,
+                ControlOp::SystemdAction {
+                    unit: "nginx.service".into(),
+                    action: SystemdAction::Start
+                }
+            );
+            assert_eq!(prepared.params, r#"{"target":"nginx.service"}"#);
+        }
+        // 已带其它类型后缀的 unit 不能被补成 `.socket.service`。
+        let prepared =
+            prepare(r#"{"capability":"systemd","action":"start","target":"nginx.socket"}"#)
+                .unwrap();
+        assert_eq!(
+            prepared.op,
+            ControlOp::SystemdAction {
+                unit: "nginx.socket".into(),
+                action: SystemdAction::Start
+            }
+        );
     }
 
     #[test]
@@ -1751,6 +1910,7 @@ mod tests {
             .enqueue(ControlCommand {
                 op: ControlOp::SystemdList,
                 reply: reply_one,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
             })
             .expect("第一个命令应成功");
         assert_eq!(request.id, 1);
@@ -1759,6 +1919,7 @@ mod tests {
             .enqueue(ControlCommand {
                 op: ControlOp::ProcessList,
                 reply: reply_two,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
             })
             .expect("第二个命令应成功");
         assert_eq!(request.id, 2);
@@ -1769,6 +1930,7 @@ mod tests {
             .enqueue(ControlCommand {
                 op: ControlOp::LogList,
                 reply: reply_three,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
             })
             .expect_err("超过上限必须拒绝");
         assert_eq!(error.code, hub_codes::TOO_MANY_PENDING);
@@ -1788,6 +1950,7 @@ mod tests {
             .enqueue(ControlCommand {
                 op: ControlOp::LogList,
                 reply,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
             })
             .unwrap();
         session.complete(ControlResponse::success(
@@ -1806,6 +1969,7 @@ mod tests {
             .enqueue(ControlCommand {
                 op: ControlOp::DockerList,
                 reply,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
             })
             .unwrap();
         session.complete(ControlResponse::failure(
@@ -1830,6 +1994,7 @@ mod tests {
             .enqueue(ControlCommand {
                 op: ControlOp::SystemdList,
                 reply,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
             })
             .unwrap();
         session.complete(ControlResponse {
@@ -1853,6 +2018,7 @@ mod tests {
             .enqueue(ControlCommand {
                 op: ControlOp::SystemdList,
                 reply,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
             })
             .unwrap();
 
@@ -1861,6 +2027,7 @@ mod tests {
             .enqueue(ControlCommand {
                 op: ControlOp::SystemdList,
                 reply,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
             })
             .expect_err("pending 已满必须拒绝");
         assert_eq!(error.code, hub_codes::TOO_MANY_PENDING);
@@ -1913,6 +2080,7 @@ mod tests {
                 .enqueue(ControlCommand {
                     op: ControlOp::SystemdList,
                     reply,
+                    deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
                 })
                 .unwrap();
         }
@@ -1933,6 +2101,7 @@ mod tests {
             .enqueue(ControlCommand {
                 op: ControlOp::SystemdList,
                 reply,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
             })
             .expect("第一个命令应成功");
         assert_eq!(session.pending_len(), 1);
@@ -1955,9 +2124,203 @@ mod tests {
             .enqueue(ControlCommand {
                 op: ControlOp::ProcessList,
                 reply,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
             })
             .expect("过期清理后必须能再入队");
         assert_eq!(session.pending_len(), 1);
+    }
+
+    /// #65：队列暂停期间 API 已返回 504 并丢弃 reply；恢复消费后命令必须
+    /// 直接丢弃，不能补发给 agent，也不能占用 pending 名额。
+    #[tokio::test]
+    async fn cancelled_queued_command_is_not_dispatched() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (reply, reply_rx) = oneshot::channel();
+        sender
+            .try_send(ControlCommand {
+                op: ControlOp::SystemdList,
+                reply,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
+            })
+            .expect("命令应进入会话队列");
+        // 模拟 API 超时：handler 返回 504 时 reply 接收端被丢弃。
+        drop(reply_rx);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let command = receiver.recv().await.expect("命令必须仍在队列中");
+        let mut session = ControlSession::new(4, TEST_REQUEST_TIMEOUT);
+        assert!(
+            session.accept_for_dispatch(command).is_none(),
+            "等待者已取消的命令不得派发"
+        );
+        assert_eq!(session.pending_len(), 0, "取消的命令不能占 pending 名额");
+        assert_eq!(session.discarded_cancelled(), 1);
+        assert_eq!(session.discarded_expired(), 0);
+    }
+
+    /// #65：deadline 在入队时固定；队列暂停超过 deadline 后即使等待者还在，
+    /// 也必须回超时并拒绝派发，不能用出队时刻重新计时。
+    #[tokio::test]
+    async fn queued_command_uses_absolute_deadline() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (reply, reply_rx) = oneshot::channel();
+        sender
+            .try_send(ControlCommand {
+                op: ControlOp::ProcessList,
+                reply,
+                deadline: Instant::now() + Duration::from_millis(20),
+            })
+            .expect("命令应进入会话队列");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let command = receiver.recv().await.expect("命令必须仍在队列中");
+        let mut session = ControlSession::new(4, TEST_REQUEST_TIMEOUT);
+        assert!(
+            session.accept_for_dispatch(command).is_none(),
+            "超过绝对 deadline 的命令不得派发"
+        );
+        assert_eq!(session.pending_len(), 0);
+        assert_eq!(session.discarded_expired(), 1);
+        assert_eq!(
+            reply_rx
+                .await
+                .expect("等待者应收到超时错误")
+                .expect_err("必须是错误")
+                .code,
+            hub_codes::CONTROL_TIMEOUT
+        );
+    }
+
+    /// #65 回归：未过期的正常命令仍能派发并完成，检查不能误伤正常路径。
+    #[tokio::test]
+    async fn fresh_queued_command_dispatches_and_completes() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (reply, reply_rx) = oneshot::channel();
+        sender
+            .try_send(ControlCommand {
+                op: ControlOp::SystemdList,
+                reply,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
+            })
+            .expect("命令应进入会话队列");
+        let command = receiver.recv().await.expect("命令必须仍在队列中");
+
+        let mut session = ControlSession::new(4, TEST_REQUEST_TIMEOUT);
+        let request = session
+            .accept_for_dispatch(command)
+            .expect("未过期命令必须正常派发");
+        assert_eq!(session.pending_len(), 1);
+        session.complete(ControlResponse::success(
+            request.id,
+            ControlResult::SystemdUnits(Vec::new()),
+        ));
+        assert_eq!(
+            reply_rx.await.expect("应收到成功回复").unwrap(),
+            ControlResult::SystemdUnits(Vec::new())
+        );
+        assert_eq!(session.pending_len(), 0);
+        assert_eq!(session.discarded_cancelled(), 0);
+        assert_eq!(session.discarded_expired(), 0);
+    }
+
+    /// #65：accept 通过后、真正发送前 API 超时并丢弃 reply；发送前复查必须
+    /// 拦住命令，假发送器一次都不能被调用。
+    #[tokio::test]
+    async fn send_request_rechecks_cancelled_before_send() {
+        let mut session = ControlSession::new(4, TEST_REQUEST_TIMEOUT);
+        let (reply, reply_rx) = oneshot::channel();
+        let request = session
+            .enqueue(ControlCommand {
+                op: ControlOp::SystemdList,
+                reply,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
+            })
+            .expect("命令应成功入 pending");
+        // 模拟 accept 之后 API 返回 504 并 drop reply。
+        drop(reply_rx);
+
+        let called = std::cell::Cell::new(false);
+        session
+            .send_request(request, |_request| {
+                called.set(true);
+                async { Ok::<(), anyhow::Error>(()) }
+            })
+            .await
+            .expect("取消路径不是发送错误");
+        assert!(!called.get(), "等待者已取消时绝不能调用发送器");
+        assert_eq!(session.pending_len(), 0);
+        assert_eq!(session.discarded_cancelled(), 1);
+        assert_eq!(session.discarded_expired(), 0);
+    }
+
+    /// #65：#65 发送前复查 deadline；已过期时回固定超时错误且不调用发送器。
+    #[tokio::test]
+    async fn send_request_rechecks_expired_before_send() {
+        let mut session = ControlSession::new(4, TEST_REQUEST_TIMEOUT);
+        let (reply, reply_rx) = oneshot::channel();
+        let request = session
+            .enqueue(ControlCommand {
+                op: ControlOp::ProcessList,
+                reply,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
+            })
+            .expect("命令应成功入 pending");
+        session.pending.get_mut(&request.id).unwrap().deadline =
+            Instant::now() - Duration::from_millis(1);
+
+        let called = std::cell::Cell::new(false);
+        session
+            .send_request(request, |_request| {
+                called.set(true);
+                async { Ok::<(), anyhow::Error>(()) }
+            })
+            .await
+            .expect("过期路径不是发送错误");
+        assert!(!called.get(), "已过期时绝不能调用发送器");
+        assert_eq!(session.pending_len(), 0);
+        assert_eq!(
+            reply_rx
+                .await
+                .expect("等待者应收到超时错误")
+                .expect_err("必须是错误")
+                .code,
+            hub_codes::CONTROL_TIMEOUT
+        );
+        assert_eq!(session.discarded_expired(), 1);
+    }
+
+    /// #65 回归：发送前复查通过时必须真的调用发送器，且 pending 保留到应答。
+    #[tokio::test]
+    async fn send_request_sends_when_still_wanted() {
+        let mut session = ControlSession::new(4, TEST_REQUEST_TIMEOUT);
+        let (reply, reply_rx) = oneshot::channel();
+        let request = session
+            .enqueue(ControlCommand {
+                op: ControlOp::SystemdList,
+                reply,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
+            })
+            .expect("命令应成功入 pending");
+
+        let called = std::cell::Cell::new(false);
+        session
+            .send_request(request.clone(), |_request| {
+                called.set(true);
+                async { Ok::<(), anyhow::Error>(()) }
+            })
+            .await
+            .expect("正常发送应成功");
+        assert!(called.get(), "未过期命令必须调用发送器");
+        assert_eq!(session.pending_len(), 1);
+        session.complete(ControlResponse::success(
+            request.id,
+            ControlResult::SystemdUnits(Vec::new()),
+        ));
+        assert_eq!(
+            reply_rx.await.expect("应收到成功回复").unwrap(),
+            ControlResult::SystemdUnits(Vec::new())
+        );
+        assert_eq!(session.pending_len(), 0);
     }
 
     /// #18：过期后晚到的应答按未知 id 丢弃，不 panic、不改变 pending。
@@ -1969,6 +2332,7 @@ mod tests {
             .enqueue(ControlCommand {
                 op: ControlOp::LogList,
                 reply,
+                deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
             })
             .unwrap();
         assert_eq!(
@@ -2001,7 +2365,13 @@ mod tests {
         let mut receivers = Vec::new();
         for op in [ControlOp::SystemdList, ControlOp::ProcessList] {
             let (reply, rx) = oneshot::channel();
-            let request = session.enqueue(ControlCommand { op, reply }).unwrap();
+            let request = session
+                .enqueue(ControlCommand {
+                    op,
+                    reply,
+                    deadline: Instant::now() + TEST_REQUEST_TIMEOUT,
+                })
+                .unwrap();
             ids.push(request.id);
             receivers.push(rx);
         }

@@ -149,12 +149,23 @@ sudo ./install.sh hub --yes \
   --tls acme-domain \
   --acme-email admin@example.com \
   --domain board.example.com \
+  --admin-listen 0.0.0.0:8444 \
   --admin-tls required
 ```
 
-`--admin-tls required` 不要求管理口绑回环：绑 `0.0.0.0` 时健康检查连回环但用
-证书里的域名做 SNI / 主机名校验。若管理口绑定指定 IP，则该 IP 或可访问的 DNS
-名必须出现在证书 SAN 中；否则安装器会在写盘前提示先补 `--domain` / `--san`。
+`--admin-tls required` 不要求管理口绑回环，但**必须同时显式给 `--admin-listen`**：
+安装器未给 `--admin-listen` 时会分配一个**随机五位数回环端口**（不是固定的
+`8444`；用 `rustboard-hub ports` 查看实际管理端口），而 ACME 域名证书只有 DNS
+SAN、不含回环 IP，这个默认组合会在监听前被 fail-closed 拒绝（见 §4.6）。上面的
+示例显式绑定 `0.0.0.0:8444`（`8444` 只是示例，可换其他端口），请用防火墙 /
+云安全组限制来源；管理端实际访问的 DNS 名必须出现在 `--domain`（即
+`tls.domains`）中。**`--san` 只影响 self-signed / ACME 回退证书，不会进入 ACME
+证书**，不能用它补管理端 SAN。健康检查仍连回环，但用证书域名做 SNI /
+主机名校验。
+
+如果不想让管理口对外监听，改用 §4.6 方式 2：保持 `admin_tls = "off"`、
+`admin_listen = "127.0.0.1:8444"`（端口按 `rustboard-hub ports` 的实际值替换），
+由 nginx / Caddy 反向代理对外终止 TLS。
 
 ### 4.6 ACME 域名证书 + 回环管理口（fail-closed，刻意保留）
 
@@ -168,7 +179,9 @@ admin_tls="required" 且管理 API 只绑定回环地址 127.0.0.1，但证书�
 ```
 
 这是**有意的 fail-closed**，不是配置没生效：管理端按 IP 直连时必须校验证书
-覆盖该 IP，hub 不会为了启动而放宽校验。请任选一种部署方式：
+覆盖该 IP，hub 不会为了启动而放宽校验。下面配置中的 `8444` 都只是示例；默认
+安装的管理端口是随机五位数回环端口，实际值用 `rustboard-hub ports` 查看，改
+配置、防火墙或反代时同步替换。请任选一种部署方式：
 
 1. 管理口绑定对外地址，用防火墙 / 云安全组限制来源：
 
@@ -358,9 +371,10 @@ ACME 模式下 agent 不能继续用 v0.4 的指纹钉扎。`hub agent add` 会�
 
 ## 9. 续期与状态
 
-- hub 运行期间自动检查证书剩余寿命：普通证书到 1/3 寿命、IP 短寿命证书到
-  48 小时阈值时续期；成功原子替换 `server.crt` / `server.key` 并热加载新连接，
-  不需要重启。
+- hub 运行期间自动检查证书剩余寿命：剩余寿命 ≤ `min(lifetime/3, 48h)` 时续期。
+  90 天普通证书的 `lifetime/3` 是 30 天，但**同样受 48 小时上限约束**；6 天 IP
+  短寿命证书的 `lifetime/3` 正好是 48 小时。两者实际都在剩余约 48 小时续期。
+  续期成功后原子替换 `server.crt` / `server.key` 并热加载新连接，不需要重启。
 - 续期失败保留旧证书并告警，不会把运行中的服务停掉。
 - 手动查看 / 续期（C4/C6 已实现；旧二进制没有 `tls` 子命令）：
 

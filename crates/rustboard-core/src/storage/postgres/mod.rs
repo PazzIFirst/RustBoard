@@ -1,6 +1,6 @@
 //! PostgreSQL 后端（M5 Phase D）。
 //!
-//! D2 落地 schema/migration：[`schema::apply_schema`] 建 21 张表与 19 个命名
+//! D2 落地 schema/migration：[`schema::apply_schema`] 建 22 张表与 23 个命名
 //! 索引、维护 PG 独立的 `schema_migrations`，并用事务级 advisory lock 串行化
 //! 多实例启动。
 //!
@@ -270,7 +270,7 @@ impl PostgresStorage {
         })
     }
 
-    /// 在池内连接上幂等应用 schema v8。
+    /// 在池内连接上幂等应用 schema v9。
     ///
     /// 与 [`schema::apply_schema`] 相同，只是复用连接池；必须在 tokio runtime
     /// 外的 blocking 线程调用（启动路径）。
@@ -547,14 +547,7 @@ fn resolve_dsn(
     }
 
     let (cleaned, tls_mode, query_root) = extract_ssl_options(dsn)?;
-    let root = match (config_root, query_root) {
-        (Some(config_path), Some(query_path)) if config_path != query_path => bail!(
-            "db_sslrootcert 与 DSN 中的 sslrootcert 指向不同文件；\
-             请只保留一处配置，或让两处指向同一 PEM 文件"
-        ),
-        (Some(config_path), _) => Some(config_path.to_path_buf()),
-        (None, query_root) => query_root,
-    };
+    let root = resolve_root(config_root, query_root)?;
 
     let mut config: postgres::Config = cleaned
         .parse()
@@ -580,6 +573,338 @@ fn resolve_dsn(
         redacted,
         redactor,
     })
+}
+
+/// 合并配置层根 CA 与 DSN `sslrootcert`。
+///
+/// 两处同时出现时必须指向同一文件：运行连接、备份/恢复/迁移的外部工具
+/// 以及错误提示都复用这一条规则，避免某条路径静默选用另一份信任根。
+fn resolve_root(
+    config_root: Option<&Path>,
+    query_root: Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    match (config_root, query_root) {
+        (Some(config_path), Some(query_path)) if config_path != query_path => bail!(
+            "db_sslrootcert 与 DSN 中的 sslrootcert 指向不同文件；\
+             请只保留一处配置，或让两处指向同一 PEM 文件"
+        ),
+        (Some(config_path), _) => Ok(Some(config_path.to_path_buf())),
+        (None, query_root) => Ok(query_root),
+    }
+}
+
+/// 外部 PostgreSQL 工具（`pg_dump` / `pg_restore` / 迁移目标连接）所需的
+/// DSN 与 TLS 策略。
+///
+/// 与运行连接复用同一套解析：
+/// - `sslmode` 缺省 `verify-full`，只接受显式 `disable`；
+/// - `db_sslrootcert` / DSN `sslrootcert` 的冲突校验一致；
+/// - URL 内密码优先级完全交给 `postgres::Config`（query 覆盖 authority、
+///   重复 query 后者生效、参数名先百分号解码），非空
+///   `RUSTBOARD_DATABASE_PASSWORD` 再覆盖。
+///
+/// 结构体包含密码，故意不实现 `Debug`，防止被日志/panic 意外打印。
+pub struct PgExternalToolDsn {
+    /// 已剥离 authority/query 密码、`sslpassword`、`sslmode`、`sslrootcert`
+    /// 的 DSN，可以安全放进 argv。
+    pub sanitized: String,
+    /// URL 自身的有效密码（未应用环境变量覆盖），仅用于错误脱敏。
+    pub url_password: Option<String>,
+    /// 实际应通过 `PGPASSWORD` 传递的密码（环境变量覆盖后）。
+    pub effective_password: Option<String>,
+    /// `sslpassword`（已从 DSN 剥离），通过 `PGSSLPASSWORD` 传递。
+    pub sslpassword: Option<String>,
+    /// `verify-full` 或 `disable`（外部工具通过 `PGSSLMODE` 显式传递）。
+    pub sslmode: &'static str,
+    /// 私有 CA（如有），外部工具通过 `PGSSLROOTCERT` 传递。
+    pub sslrootcert: Option<PathBuf>,
+}
+
+/// 解析外部 PostgreSQL 工具所需的 DSN 与 TLS 策略。
+///
+/// 读取一次 `RUSTBOARD_DATABASE_PASSWORD`（与运行连接同一个环境变量）；
+/// 非 UTF-8 时 fail-closed。
+pub fn resolve_external_tool_dsn(
+    dsn: &str,
+    config_root: Option<&Path>,
+) -> Result<PgExternalToolDsn> {
+    let env_password = database_password_from_env()?;
+    resolve_external_tool_dsn_with_env(dsn, config_root, env_password.as_deref())
+}
+
+/// [`resolve_external_tool_dsn`] 的可注入环境变量版本（供测试对比驱动优先级）。
+fn resolve_external_tool_dsn_with_env(
+    dsn: &str,
+    config_root: Option<&Path>,
+    env_password: Option<&str>,
+) -> Result<PgExternalToolDsn> {
+    let redacted = redact_database_url(dsn);
+    if !(dsn.starts_with("postgres://") || dsn.starts_with("postgresql://")) {
+        bail!(
+            "PostgreSQL DSN 必须以 postgres:// 或 postgresql:// 开头；\
+             不支持 keyword 形式，也无法安全解析 sslmode（当前值已脱敏：{redacted}）"
+        );
+    }
+    // fragment 不是合法连接参数，且可能被用来把密码后缀藏进错误信息；直接拒绝。
+    if dsn.contains('#') {
+        bail!("PostgreSQL DSN 不能包含 fragment（#）；当前值已脱敏：{redacted}");
+    }
+
+    // sslmode/sslrootcert 的解析、重复检测与冲突校验与运行连接完全一致。
+    let (cleaned, tls_mode, query_root) = extract_ssl_options(dsn)?;
+    let root = resolve_root(config_root, query_root)?;
+    // sslpassword 是 libpq 参数，`postgres` 驱动不认识；先提取并从 DSN 剥离，
+    // 再把剩余部分交给驱动解析密码优先级。
+    let (cleaned, sslpassword) = extract_sslpassword(&cleaned)?;
+    let mut config: postgres::Config = cleaned
+        .parse()
+        .map_err(|_| anyhow!("PostgreSQL DSN 解析失败（当前值已脱敏：{redacted}），已拒绝"))?;
+    let url_password = config.get_password().map(password_to_string).transpose()?;
+    if let Some(password) = env_password.filter(|password| !password.is_empty()) {
+        config.password(password);
+    }
+    let effective_password = config.get_password().map(password_to_string).transpose()?;
+    let sanitized = strip_url_passwords(&cleaned)
+        .map_err(|err| anyhow!("无法生成脱敏 PostgreSQL DSN（当前值已脱敏：{redacted}）：{err}"))?;
+    // 纵深防御：即使畸形 authority 未被上面的解析覆盖，argv 里也不能出现密码。
+    // 对合法 DSN（已无密码）该函数原样返回。
+    let sanitized = redact_database_url(&sanitized);
+    // spawn 前断言：驱动不能再解析出 password，且已知长密码不以明文残留。
+    ensure_sanitized_has_no_password(
+        &sanitized,
+        url_password.as_deref(),
+        effective_password.as_deref(),
+    )?;
+
+    Ok(PgExternalToolDsn {
+        sanitized,
+        url_password,
+        effective_password,
+        sslpassword,
+        sslmode: match tls_mode {
+            PgTlsMode::VerifyFull => "verify-full",
+            PgTlsMode::Disable => "disable",
+        },
+        // disable 下根证书不会被使用；运行连接同样忽略它，但冲突校验仍然执行。
+        sslrootcert: match tls_mode {
+            PgTlsMode::VerifyFull => root,
+            PgTlsMode::Disable => None,
+        },
+    })
+}
+
+/// 把驱动返回的密码字节转成可放进环境变量的 UTF-8 字符串。
+fn password_to_string(bytes: &[u8]) -> Result<String> {
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| anyhow!("PostgreSQL DSN 密码不是合法 UTF-8；无法安全传给外部工具"))
+}
+
+/// 从已剥离 TLS 参数的 DSN 中提取 `sslpassword` 并移除该参数。
+///
+/// 参数名与值都按驱动/libpq 规则做百分号解码；重复参数取最后一个（与
+/// libpq/驱动一致）。非法编码直接拒绝，避免把无法可靠识别的值写进 argv。
+fn extract_sslpassword(dsn: &str) -> Result<(String, Option<String>)> {
+    let Some(query_start) = dsn.find('?') else {
+        return Ok((dsn.to_string(), None));
+    };
+    let base = &dsn[..query_start];
+    let query = &dsn[query_start + 1..];
+    let mut remaining: Vec<&str> = Vec::new();
+    let mut sslpassword = None;
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_value) = pair
+            .split_once('=')
+            .ok_or_else(|| anyhow!("PostgreSQL DSN query 参数缺少 =（保留参数名，不输出原值）"))?;
+        let key = percent_decode(raw_key, "query 参数名")?;
+        if key.eq_ignore_ascii_case("sslpassword") {
+            sslpassword = Some(percent_decode(raw_value, "sslpassword")?);
+        } else {
+            remaining.push(pair);
+        }
+    }
+    let cleaned = if remaining.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", remaining.join("&"))
+    };
+    Ok((cleaned, sslpassword))
+}
+
+/// 从 DSN 中剥离 authority 与 query 两处密码，生成可放进 argv 的 DSN。
+///
+/// userinfo 到第一个 `@` 结束，**绝不**先按 `/` 截断 authority：密码里的裸
+/// `/`（如 `user:2024/secret@host`）会让旧逻辑把数字前缀当端口、把密码后半段
+/// 留在 path 里。多个裸 `@` 无法判断密码边界，直接 fail closed；query 中所有
+/// 解码后为 `password` / `sslpassword` 的参数整体删除。
+fn strip_url_passwords(dsn: &str) -> Result<String> {
+    let (scheme, rest) = dsn
+        .split_once("://")
+        .ok_or_else(|| anyhow!("DSN 缺少 scheme"))?;
+    let boundary = rest.find(['?', '#']).unwrap_or(rest.len());
+    let head = &rest[..boundary];
+    let tail = &rest[boundary..];
+
+    let sanitized_head = match head.find('@') {
+        Some(first_at) => {
+            if head[first_at + 1..].contains('@') {
+                // 驱动按第一个 `@` 结束 userinfo；多个裸 `@` 时无法判断
+                // `pa@ss` 哪一段是密码，拒绝生成 argv。
+                bail!(
+                    "PostgreSQL DSN userinfo 含多个裸 @，无法安全剥离密码；\
+                     请对密码中的 @ 做百分号编码"
+                );
+            }
+            let userinfo = &head[..first_at];
+            let host_and_path = &head[first_at + 1..];
+            match userinfo.split_once(':') {
+                Some((user, _password)) => format!("{user}@{host_and_path}"),
+                None => format!("{userinfo}@{host_and_path}"),
+            }
+        }
+        None => {
+            // 查询/片段里出现裸 `@`：驱动同样会把它当作 userinfo 分隔符，
+            // 无法安全判断哪段是密码，fail closed。
+            if tail.contains('@') {
+                bail!("PostgreSQL DSN 的 @ 出现在 query/fragment 中，无法安全剥离密码");
+            }
+            // 没有 `@` 但形如 `user:非数字密码`（漏写 @host）：无法定位 host。
+            let authority_end = head.find('/').unwrap_or(head.len());
+            if let Some((_, password)) = head[..authority_end].split_once(':') {
+                if !password.is_empty() && !password.bytes().all(|b| b.is_ascii_digit()) {
+                    bail!("PostgreSQL DSN userinfo 缺少 @，无法安全剥离密码");
+                }
+            }
+            head.to_string()
+        }
+    };
+
+    let mut kept: Vec<&str> = Vec::new();
+    if let Some(query) = tail.strip_prefix('?') {
+        // `#` 在调用方已拒绝；这里再取一次防止绕过。
+        let query = query.split('#').next().unwrap_or(query);
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (raw_key, _) = pair
+                .split_once('=')
+                .ok_or_else(|| anyhow!("PostgreSQL DSN query 参数缺少 =，无法安全剥离密码"))?;
+            let key = percent_decode(raw_key, "query 参数名")?;
+            if key.eq_ignore_ascii_case("password") || key.eq_ignore_ascii_case("sslpassword") {
+                continue;
+            }
+            kept.push(pair);
+        }
+    }
+    let mut sanitized = format!("{scheme}://{sanitized_head}");
+    if !kept.is_empty() {
+        sanitized.push('?');
+        sanitized.push_str(&kept.join("&"));
+    }
+    Ok(sanitized)
+}
+
+/// 生成 argv DSN 后的最后一道断言：驱动不能再从中解析出密码，且已知密码
+/// 不应以明文片段残留。失败时拒绝 spawn 外部工具。
+fn ensure_sanitized_has_no_password(
+    sanitized: &str,
+    url_password: Option<&str>,
+    effective_password: Option<&str>,
+) -> Result<()> {
+    let reparsed: postgres::Config = sanitized
+        .parse()
+        .map_err(|_| anyhow!("内部错误：脱敏后的 PostgreSQL DSN 无法被驱动解析，已拒绝"))?;
+    if reparsed.get_password().is_some() {
+        bail!("内部错误：脱敏后的 PostgreSQL DSN 仍含密码，拒绝传给外部工具");
+    }
+    for secret in [url_password, effective_password].into_iter().flatten() {
+        // 极短密码可能天然出现在用户名/主机名中；驱动级“无 password 字段”
+        // 已覆盖语义，这里只对可判定的长密码做明文包含检查。
+        if secret.len() >= 6 && sanitized.contains(secret) {
+            bail!("内部错误：脱敏后的 PostgreSQL DSN 仍包含密码，拒绝传给外部工具");
+        }
+    }
+    Ok(())
+}
+
+/// 按 Hub 配置建立一条 PostgreSQL 应用连接（与连接池同一 DSN/TLS/密码解析）。
+///
+/// 供 CLI 子命令在不需要连接池时使用（迁移串行化锁、清理目标、schema 探针）。
+/// 与 **必须在 tokio runtime 外调用** 的约束一致：`postgres` 是同步驱动。
+pub fn connect_with_config(cfg: &HubConfig, dsn: &str) -> Result<postgres::Client> {
+    let env_password = database_password_from_env()?;
+    let resolved = resolve_dsn(dsn, cfg.db_sslrootcert.as_deref(), env_password.as_deref())?;
+    let ResolvedDsn {
+        mut config,
+        tls_mode,
+        root,
+        redacted,
+        redactor,
+    } = resolved;
+    config.connect_timeout(Duration::from_millis(cfg.db_connect_timeout_ms));
+    let connector = match tls_mode {
+        PgTlsMode::VerifyFull => PgTls::Rustls(build_rustls_connector(root.as_deref())?),
+        PgTlsMode::Disable => PgTls::NoTls,
+    };
+    let client = match &connector {
+        PgTls::Rustls(connector) => config.connect(connector.clone()),
+        PgTls::NoTls => config.connect(NoTls),
+    };
+    client.map_err(|err| {
+        anyhow!(
+            "连接 PostgreSQL 失败（dsn={redacted}）：{}",
+            redactor.scrub(&err.to_string())
+        )
+    })
+}
+
+/// 校验目标 PostgreSQL 确实是完整 v9 schema（只读事务）。
+///
+/// 用于 `pg_restore` 之后、切换配置/证书之前：`schema_migrations` 缺失或
+/// `MAX(version)` 为 NULL 视为 0；版本必须等于 [`POSTGRES_SCHEMA_VERSION`]，
+/// 且 22 张业务表与 23 个命名索引齐全。任何失败都返回错误，调用方必须中止。
+pub fn validate_postgres_schema_v9(cfg: &HubConfig, dsn: &str) -> Result<()> {
+    let redacted = redact_database_url(dsn);
+    let mut client = connect_with_config(cfg, dsn)
+        .with_context(|| format!("连接 PostgreSQL 校验 schema 失败（{redacted}）"))?;
+    let mut tx = client
+        .transaction()
+        .context("开启 PostgreSQL schema 校验事务失败")?;
+    let has_version_table: bool = tx
+        .query_one(
+            "SELECT EXISTS (
+                 SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = current_schema() AND table_name = 'schema_migrations'
+             )",
+            &[],
+        )
+        .context("检查 PostgreSQL schema_migrations 是否存在失败")?
+        .get(0);
+    let version: Option<i64> = if has_version_table {
+        tx.query_one("SELECT MAX(version) FROM schema_migrations", &[])
+            .context("读取恢复后的 PostgreSQL schema 版本失败")?
+            .get(0)
+    } else {
+        None
+    };
+    let version = version.unwrap_or(0);
+    if version > POSTGRES_SCHEMA_VERSION {
+        bail!(
+            "恢复后的 PostgreSQL schema 版本 {version} 高于本程序支持的 \
+             {POSTGRES_SCHEMA_VERSION}；拒绝切换配置，请升级 rustboard-hub"
+        );
+    }
+    if version < POSTGRES_SCHEMA_VERSION {
+        return schema::bail_old_schema(version);
+    }
+    schema::ensure_schema_objects(&mut tx)
+        .context("恢复后的 PostgreSQL 声明 schema v9，但 22 张业务表/23 个命名索引不完整")?;
+    tx.rollback()
+        .context("结束 PostgreSQL schema 校验事务失败")?;
+    Ok(())
 }
 
 /// 构建校验型 rustls 连接器：证书链与主机名都由 rustls 校验。
@@ -919,5 +1244,218 @@ mod tests {
         };
         let err = PostgresStorage::open(options).expect_err("pool_size=0 必须拒绝");
         assert!(format!("{err:#}").contains("db_pool_size"));
+    }
+
+    fn driver_password(dsn: &str) -> Option<String> {
+        let config: postgres::Config = dsn.parse().expect("测试 DSN 必须能被驱动解析");
+        config
+            .get_password()
+            .map(|password| String::from_utf8(password.to_vec()).expect("测试密码是 UTF-8"))
+    }
+
+    /// #64：外部工具的有效密码必须与真实 `postgres::Config` 完全一致。
+    #[test]
+    fn external_tool_password_matches_driver_priority() {
+        for (dsn, expected) in [
+            // authority-only
+            (
+                "postgres://u:auth-secret@h/db?sslmode=disable",
+                "auth-secret",
+            ),
+            // query-only
+            (
+                "postgres://u@h/db?password=query-secret&sslmode=disable",
+                "query-secret",
+            ),
+            // 两处都有：query 覆盖 authority
+            (
+                "postgres://u:auth-secret@h/db?password=query-secret&sslmode=disable",
+                "query-secret",
+            ),
+            // 重复 query：后者覆盖
+            (
+                "postgres://u@h/db?password=first&password=second&sslmode=disable",
+                "second",
+            ),
+            // 参数名百分号编码
+            (
+                "postgres://u:auth-secret@h/db?pass%77ord=encoded-key&sslmode=disable",
+                "encoded-key",
+            ),
+            (
+                "postgres://u@h/db?%70assword=encoded-query&sslmode=disable",
+                "encoded-query",
+            ),
+        ] {
+            assert_eq!(
+                driver_password(dsn).as_deref(),
+                Some(expected),
+                "前提：驱动对 {dsn} 的有效密码"
+            );
+            let resolved =
+                resolve_external_tool_dsn_with_env(dsn, None, None).expect("合法 DSN 必须解析成功");
+            assert_eq!(
+                resolved.url_password.as_deref(),
+                Some(expected),
+                "外部工具 URL 密码必须与驱动一致: {dsn}"
+            );
+            assert_eq!(
+                resolved.effective_password.as_deref(),
+                Some(expected),
+                "无 env 时有效密码必须与驱动一致: {dsn}"
+            );
+            for secret in [
+                "auth-secret",
+                "query-secret",
+                "first",
+                "second",
+                "encoded-key",
+                "encoded-query",
+            ] {
+                assert!(
+                    !resolved.sanitized.contains(secret),
+                    "sanitized DSN 泄露密码 {secret}: {}",
+                    resolved.sanitized
+                );
+            }
+            assert!(
+                !resolved.sanitized.contains("password="),
+                "{}",
+                resolved.sanitized
+            );
+        }
+    }
+
+    /// #64：非空环境变量覆盖后的有效密码与驱动一致；空串不覆盖。
+    #[test]
+    fn external_tool_env_password_matches_driver_override() {
+        let dsn = "postgres://u:url-secret@h/db?password=query-secret&sslmode=disable";
+        let mut driver: postgres::Config = dsn.parse().unwrap();
+        driver.password("env-secret");
+        assert_eq!(
+            driver
+                .get_password()
+                .map(|password| String::from_utf8(password.to_vec()).unwrap()),
+            Some("env-secret".to_string())
+        );
+        let resolved = resolve_external_tool_dsn_with_env(dsn, None, Some("env-secret")).unwrap();
+        assert_eq!(resolved.effective_password.as_deref(), Some("env-secret"));
+        assert_eq!(resolved.url_password.as_deref(), Some("query-secret"));
+
+        let empty = resolve_external_tool_dsn_with_env(dsn, None, Some("")).unwrap();
+        assert_eq!(empty.effective_password.as_deref(), Some("query-secret"));
+        for secret in ["url-secret", "query-secret", "env-secret"] {
+            assert!(!resolved.sanitized.contains(secret));
+        }
+    }
+
+    /// #64：`sslpassword` 从 DSN 剥离（单独通过 PGSSLPASSWORD 传递）。
+    #[test]
+    fn external_tool_strips_sslpassword_from_dsn() {
+        let dsn = "postgres://u:p@h/db?sslpassword=ssl-secret&application_name=hub&sslmode=disable";
+        let resolved = resolve_external_tool_dsn_with_env(dsn, None, None).unwrap();
+        assert_eq!(resolved.sslpassword.as_deref(), Some("ssl-secret"));
+        assert!(!resolved.sanitized.contains("sslpassword"));
+        assert!(!resolved.sanitized.contains("ssl-secret"));
+        assert!(resolved.sanitized.contains("application_name=hub"));
+    }
+
+    /// P1 复审：密码含裸 `/` 且数字前缀像端口时，argv DSN 必须仍能剥离密码。
+    #[test]
+    fn external_tool_strips_raw_slash_password_from_argv_dsn() {
+        for (dsn, password, expected) in [
+            (
+                "postgres://rb_user:2024/secret@127.0.0.1:1/db?sslmode=disable",
+                "2024/secret",
+                "postgres://rb_user@127.0.0.1:1/db",
+            ),
+            (
+                "postgres://rb_user:99999/secret@127.0.0.1:1/db?sslmode=disable",
+                "99999/secret",
+                "postgres://rb_user@127.0.0.1:1/db",
+            ),
+            (
+                "postgres://us/er:s3cret@host/db",
+                "s3cret",
+                "postgres://us/er@host/db",
+            ),
+        ] {
+            let resolved = resolve_external_tool_dsn_with_env(dsn, None, None)
+                .expect("裸 / 密码 DSN 必须可安全剥离");
+            assert_eq!(
+                resolved.sanitized, expected,
+                "argv DSN 不符合预期: dsn={dsn}"
+            );
+            for secret in [password, "secret", "s3cret"] {
+                assert!(
+                    !resolved.sanitized.contains(secret),
+                    "argv DSN 泄露 {secret}: {}",
+                    resolved.sanitized
+                );
+            }
+            let reparsed: postgres::Config =
+                resolved.sanitized.parse().expect("sanitized 必须可解析");
+            assert!(reparsed.get_password().is_none());
+        }
+
+        // 多个裸 @：无法判断 userinfo 边界，必须在 spawn 前拒绝。
+        let err = match resolve_external_tool_dsn_with_env(
+            "postgres://u:pa@ss@host/db?sslmode=disable",
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("多个裸 @ 必须拒绝"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("多个裸 @"));
+        assert!(!format!("{err:#}").contains("pa"));
+    }
+
+    /// #67：外部工具 TLS 策略与运行连接一致：缺省 verify-full、显式 disable、
+    /// DSN/配置根 CA 冲突校验。
+    #[test]
+    fn external_tool_tls_matches_runtime_policy() {
+        let dsn = "postgres://u:p@h/db?sslrootcert=%2Ftmp%2Frb-ca.pem";
+        let resolved = resolve_external_tool_dsn_with_env(dsn, None, None).unwrap();
+        assert_eq!(resolved.sslmode, "verify-full");
+        assert_eq!(
+            resolved.sslrootcert.as_deref(),
+            Some(Path::new("/tmp/rb-ca.pem"))
+        );
+        assert!(!resolved.sanitized.contains("sslrootcert"));
+        assert!(!resolved.sanitized.contains("sslmode"));
+
+        // 配置根与 DSN 根不一致：与运行连接相同的错误。
+        let err = match resolve_external_tool_dsn_with_env(
+            dsn,
+            Some(Path::new("/tmp/other-ca.pem")),
+            None,
+        ) {
+            Ok(_) => panic!("根证书冲突必须拒绝"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("不同文件"));
+
+        // 显式 disable 才 disable，且根证书不再传给外部工具。
+        let disabled = resolve_external_tool_dsn_with_env(
+            "postgres://u:p@h/db?sslmode=disable&sslrootcert=%2Ftmp%2Frb-ca.pem",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(disabled.sslmode, "disable");
+        assert!(disabled.sslrootcert.is_none());
+
+        // require/prefer 会静默降级，必须与运行连接一样拒绝。
+        for mode in ["require", "prefer", "verify-ca"] {
+            let dsn = format!("postgres://u:topsecret@h/db?sslmode={mode}");
+            let err = match resolve_external_tool_dsn_with_env(&dsn, None, None) {
+                Ok(_) => panic!("{mode} 必须拒绝"),
+                Err(err) => err,
+            };
+            let message = format!("{err:#}");
+            assert!(message.contains("verify-full") && message.contains("disable"));
+            assert!(!message.contains("topsecret"), "错误泄露密码: {message}");
+        }
     }
 }

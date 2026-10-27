@@ -16,8 +16,8 @@ use rusqlite::{params, Connection};
 use rustboard_core::storage::sqlite::SqliteStorage;
 use rustboard_core::storage::Storage;
 
-/// 方案 §4 规定的 10 张 v7 新表。
-const V7_TABLES: [&str; 10] = [
+/// 方案 §4 规定的 10 张 v7 新表 + v9 的 alert_rule_channels（共 11 张）。
+const V7_TABLES: [&str; 11] = [
     "samples_1m",
     "samples_1h",
     "maintenance_state",
@@ -26,12 +26,13 @@ const V7_TABLES: [&str; 10] = [
     "alert_events",
     "alert_silences",
     "notification_channels",
+    "alert_rule_channels",
     "archive_objects",
     "archive_state",
 ];
 
-/// v7 的 13 个索引 + v8 的 3 个 partial index，共 16 个。
-const V7_INDEXES: [(&str, &str); 16] = [
+/// v7 的 13 个索引 + v8 的 3 个 partial index + v9 的渠道索引，共 17 个。
+const V7_INDEXES: [(&str, &str); 17] = [
     ("idx_samples_1m_lookup", "samples_1m"),
     ("idx_samples_1m_ts", "samples_1m"),
     ("idx_samples_1h_lookup", "samples_1h"),
@@ -43,6 +44,7 @@ const V7_INDEXES: [(&str, &str); 16] = [
     ("idx_alert_events_pending", "alert_events"),
     ("idx_alert_states_state_eval", "alert_states"),
     ("idx_alert_silences_until", "alert_silences"),
+    ("idx_alert_rule_channels_channel", "alert_rule_channels"),
     ("idx_archive_objects_range", "archive_objects"),
     ("idx_archive_objects_status", "archive_objects"),
     ("idx_samples_unarchived", "samples"),
@@ -614,7 +616,7 @@ fn create_v6_database(path: &Path) -> (TableSqlSnapshot, TableCountSnapshot) {
 }
 
 // ---------------------------------------------------------------------------
-// 用例 1：fresh 库的版本、10 张表、13 个索引；重复打开不重复建表。
+// 用例 1：fresh 库的版本、11 张表、17 个索引；重复打开不重复建表。
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -625,14 +627,14 @@ fn v7_fresh_database_has_version_tables_and_indexes() {
     }
 
     let conn = Connection::open(dir.db_path()).expect("打开 fresh 库失败");
-    assert_eq!(user_version(&conn), 8, "fresh 库的 user_version 必须是 8");
+    assert_eq!(user_version(&conn), 9, "fresh 库的 user_version 必须是 9");
     assert_v7_objects(&conn);
     drop(conn);
 
     // 关闭再打开一次：建表必须幂等，不能报错或产生同名重复对象。
     let storage = open_storage(&dir);
     let conn = Connection::open(dir.db_path()).expect("第二次打开 fresh 库失败");
-    assert_eq!(user_version(&conn), 8, "重复打开后 user_version 仍应为 8");
+    assert_eq!(user_version(&conn), 9, "重复打开后 user_version 仍应为 9");
     assert_v7_objects(&conn);
     for table in V7_TABLES {
         assert_eq!(
@@ -709,7 +711,7 @@ fn v7_key_columns_primary_keys_and_unique_constraints() {
     let cols = columns(&conn, "samples_1h");
     assert_default(&cols, "labels", "{}");
 
-    // 告警规则表：方案 §4.2 的全部 17 列。
+    // 告警规则表：方案 §4.2 的 17 列 + v9 的 revision（共 18 列）。
     //
     // 注意：方案 DDL 里 `id TEXT PRIMARY KEY` 没有显式 NOT NULL，SQLite 对
     // 非 STRICT 表的 PRIMARY KEY 不会补 notnull 标记（PRAGMA 报 0）；主键约束
@@ -735,6 +737,7 @@ fn v7_key_columns_primary_keys_and_unique_constraints() {
             ("updated_by", "TEXT", true),
             ("created_at", "INTEGER", true),
             ("updated_at", "INTEGER", true),
+            ("revision", "INTEGER", true),
         ],
     );
     assert_primary_key(&conn, "alert_rules", &["id"]);
@@ -750,6 +753,15 @@ fn v7_key_columns_primary_keys_and_unique_constraints() {
     assert_default(&rule_cols, "notify_on_resolve", "1");
     assert_default(&rule_cols, "is_builtin", "0");
     assert_default(&rule_cols, "updated_by", "");
+    assert_default(&rule_cols, "revision", "0");
+
+    // v9 规则→渠道关系表：两列 TEXT 复合主键。
+    assert_columns(
+        &conn,
+        "alert_rule_channels",
+        &[("rule_id", "TEXT", true), ("channel_id", "TEXT", true)],
+    );
+    assert_primary_key(&conn, "alert_rule_channels", &["rule_id", "channel_id"]);
 
     // 告警事件表：方案 §4.2 的 11 列 + B2b 的 series_key（共 12 列）。
     assert_columns(
@@ -899,15 +911,15 @@ fn v7_key_columns_primary_keys_and_unique_constraints() {
 }
 
 // ---------------------------------------------------------------------------
-// 用例 3：v6→v7 迁移守恒旧数据、新表落地、重复打开幂等。
+// 用例 3：v1.0.0 只支持全新安装——v6 库必须被拒绝且旧数据零改写。
 // ---------------------------------------------------------------------------
 
 #[test]
-fn v7_migrates_real_v6_database_and_reopen_is_idempotent() {
-    let dir = TempDbDir::new("v6-migration");
+fn v6_database_is_rejected_without_modifying_old_data() {
+    let dir = TempDbDir::new("v6-rejected");
     let (old_sql, old_counts) = create_v6_database(&dir.db_path());
 
-    // 迁移前先确认 fixture 确实是 v6，且没有任何 v7 表。
+    // fixture 确实停在 v6，且没有任何 v7/v9 表。
     {
         let conn = Connection::open(dir.db_path()).expect("打开 v6 fixture 失败");
         assert_eq!(user_version(&conn), 6, "fixture 的 user_version 必须是 6");
@@ -920,72 +932,51 @@ fn v7_migrates_real_v6_database_and_reopen_is_idempotent() {
         assert_eq!(read_old_api_tokens(&conn), expected_api_tokens());
     }
 
-    // 第一次由 v6 打开：迁移到 v8。
-    let storage = open_storage(&dir);
-    let conn = Connection::open(dir.db_path()).expect("迁移后打开数据库失败");
-    assert_eq!(user_version(&conn), 8, "v6→v8 迁移后 user_version 必须是 8");
-    assert_v7_objects(&conn);
-    assert_eq!(
-        read_old_agent(&conn),
-        expected_agent(),
-        "迁移后旧 agents 行必须逐字段不变"
+    // 两次打开都必须 fail closed，且错误文案可测试。
+    for round in 0..2 {
+        let err = match SqliteStorage::open(&dir.db_path()) {
+            Ok(_) => panic!("第 {round} 次打开 v6 库必须被拒绝"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("只支持全新安装"),
+            "第 {round} 次拒绝文案缺少“只支持全新安装”: {message}"
+        );
+        assert!(
+            message.contains("schema v6"),
+            "第 {round} 次拒绝文案缺少实际版本: {message}"
+        );
+        assert!(
+            message.contains("旧数据兼容将在首个正式版本之后提供"),
+            "第 {round} 次拒绝文案缺少兼容承诺: {message}"
+        );
+    }
+
+    // 拒绝路径不得建表、改版本或改数据。
+    let conn = Connection::open(dir.db_path()).expect("拒绝后打开数据库失败");
+    assert_eq!(user_version(&conn), 6, "拒绝路径不得改写 user_version");
+    assert!(
+        !object_exists(&conn, "table", "samples_1m"),
+        "拒绝路径不得创建任何 v7/v9 表"
     );
-    assert_eq!(
-        read_old_samples(&conn),
-        expected_samples(),
-        "迁移后旧 samples 行必须逐字段不变"
-    );
-    assert_eq!(
-        read_old_api_tokens(&conn),
-        expected_api_tokens(),
-        "迁移后旧 api_tokens 行必须逐字段不变"
+    assert!(
+        !object_exists(&conn, "table", "alert_rule_channels"),
+        "拒绝路径不得创建 v9 关系表"
     );
     assert_eq!(
         table_sql(&conn, &V6_SCHEMA_UNCHANGED_TABLES),
         old_sql,
-        "迁移不得改写除 samples（v8 补列）外任何旧表 SQL"
+        "拒绝路径不得改写任何旧表 SQL"
     );
     assert_eq!(
         table_counts(&conn, &V6_TABLES),
         old_counts,
-        "迁移不得增删任何旧表行"
-    );
-
-    // 公开读接口仍可读取旧数据。
-    let agents = storage.list_agents().expect("迁移后 list_agents 失败");
-    assert_eq!(agents.len(), 1, "迁移后应仍只有一台旧 agent");
-    assert_eq!(agents[0].agent_id, "agent-old");
-    assert_eq!(agents[0].status, "online");
-    assert_eq!(agents[0].last_seen_at, 1_712_345_678_901);
-    assert_eq!(
-        storage
-            .sample_count("agent-old")
-            .expect("迁移后 sample_count 失败"),
-        3
-    );
-    drop(conn);
-    drop(storage);
-
-    // 第二次打开：幂等，旧表 SQL 与行数仍与 v6 基线完全一致。
-    let storage = open_storage(&dir);
-    let conn = Connection::open(dir.db_path()).expect("第二次打开迁移后数据库失败");
-    assert_eq!(user_version(&conn), 8, "重复打开后 user_version 必须仍是 8");
-    assert_v7_objects(&conn);
-    assert_eq!(
-        table_sql(&conn, &V6_SCHEMA_UNCHANGED_TABLES),
-        old_sql,
-        "重复打开不得改写旧表 SQL"
-    );
-    assert_eq!(
-        table_counts(&conn, &V6_TABLES),
-        old_counts,
-        "重复打开不得改变旧表行数"
+        "拒绝路径不得增删任何旧表行"
     );
     assert_eq!(read_old_agent(&conn), expected_agent());
     assert_eq!(read_old_samples(&conn), expected_samples());
     assert_eq!(read_old_api_tokens(&conn), expected_api_tokens());
-    drop(conn);
-    drop(storage);
 }
 
 // ---------------------------------------------------------------------------
@@ -1235,11 +1226,11 @@ fn m4_a1_samples_1m_primary_key_rejects_duplicate() {
 }
 
 // ---------------------------------------------------------------------------
-// 用例 5：B2b 首版 v7 的 alert_events 缺 series_key，打开时纯新增补齐。
+// 用例 5：v7 旧库同样 fail closed，不得自动补 series_key 或任何 v9 列。
 // ---------------------------------------------------------------------------
 
 #[test]
-fn v7_alert_events_gains_series_key_on_existing_database() {
+fn v7_database_is_rejected_without_adding_columns() {
     let dir = TempDbDir::new("event-series-key");
     {
         let conn = Connection::open(dir.db_path()).expect("创建旧 v7 库失败");
@@ -1268,21 +1259,34 @@ fn v7_alert_events_gains_series_key_on_existing_database() {
         .expect("建旧 v7 alert_events 失败");
     }
 
-    let storage = open_storage(&dir);
-    let events = storage
-        .list_alert_events(10, None)
-        .expect("读取迁移后事件失败");
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].series_key, "", "旧事件必须补空序列键");
-    assert_eq!(events[0].rule_id, "rule-old");
-    drop(storage);
+    let err = match SqliteStorage::open(&dir.db_path()) {
+        Ok(_) => panic!("v7 旧库必须被拒绝"),
+        Err(err) => err,
+    };
+    let message = format!("{err:#}");
+    assert!(message.contains("schema v7"), "{message}");
+    assert!(message.contains("只支持全新安装"), "{message}");
 
-    let conn = Connection::open(dir.db_path()).expect("打开迁移后库失败");
-    assert_eq!(user_version(&conn), 8, "v7 库打开后必须升级到 v8");
+    let conn = Connection::open(dir.db_path()).expect("拒绝后打开数据库失败");
+    assert_eq!(user_version(&conn), 7, "拒绝路径不得改写 user_version");
     let event_cols = columns(&conn, "alert_events");
     assert!(
-        event_cols.iter().any(|column| column.name == "series_key"),
-        "旧 v7 库必须自动补 series_key 列"
+        !event_cols.iter().any(|column| column.name == "series_key"),
+        "拒绝路径不得补 series_key 列"
     );
-    assert_default(&event_cols, "series_key", "");
+    let events: Vec<(String, i64)> = {
+        let mut stmt = conn
+            .prepare("SELECT rule_id, ts FROM alert_events")
+            .expect("准备旧事件查询失败");
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("查询旧事件失败");
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .expect("收集旧事件失败")
+    };
+    assert_eq!(
+        events,
+        vec![("rule-old".to_string(), 1_700_000_000_000)],
+        "拒绝路径不得改写旧事件"
+    );
 }

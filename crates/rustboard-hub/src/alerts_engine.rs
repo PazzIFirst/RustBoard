@@ -14,9 +14,11 @@
 //!   过多跳过整条规则；
 //! - `agent_offline`：`now - agents.last_seen_at` 与阈值（秒）比较；每个 agent
 //!   一条状态（`series_key` 为空），已吊销 agent 跳过；
-//! - `hub_cert`：读取 `cfg.data_dir/certs/server.crt` 的剩余**小时数**
-//!   （与 `cert_warn_hours` 同单位），全局一条状态；读盘 / 解析失败只 WARN 并
-//!   跳过本轮，**绝不 resolve**。
+//! - `hub_cert`：读取**监听器实际在用**的 live 证书剩余**小时数**
+//!   （`Arc<RwLock<CertStatus>>`，与 `cert_warn_hours` 同单位），全局一条状态。
+//!   热加载失败时 watcher 保留旧 live 证书，告警也继续按旧证书到期时间触发，
+//!   **不会**读磁盘上新写但未生效的 `server.crt`；live 状态不可读 / 未初始化时
+//!   只 WARN 并跳过本轮，**绝不 resolve**。
 //!
 //! 资源边界：
 //! - 每轮最多 [`MAX_ALERT_RULES`] 条规则；
@@ -36,19 +38,20 @@
 //! 全量。所有 SQL 参数化。
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rustboard_common::config::HubConfig;
 use rustboard_common::model::AgentRecord;
-use rustboard_common::tls;
 use rustboard_common::util::now_ms;
 use rustboard_core::alerts::{
-    self, AlertEvent, AlertRule, AlertSilence, AlertSource, AlertState, AlertStateKind,
-    MAX_ALERT_RULES,
+    self, AlertEvaluationOutcome, AlertEvent, AlertRule, AlertSilence, AlertSource, AlertState,
+    AlertStateKind, MAX_ALERT_RULES,
 };
 use rustboard_core::storage::StorageHandle;
+
+use crate::cert_rotation::CertStatus;
 
 /// metric 规则回看窗口下限：60 秒。
 ///
@@ -128,6 +131,8 @@ pub(crate) struct EvaluationReport {
     pub states_evicted: usize,
     /// 因预算耗尽而未处理的序列数（估算值）。
     pub series_skipped_budget: usize,
+    /// 本轮因规则被修改 / 禁用 / 删除而丢弃的旧评估数（CAS 返回 Stale）。
+    pub stale_rules: usize,
     /// 清理的事件数。
     pub pruned_events: usize,
     /// 清理的 resolved 状态数。
@@ -143,14 +148,17 @@ pub(crate) struct EvaluationReport {
 /// 流程：读取启用规则与生效静默 → 逐条规则查询观测值并推进状态机 → 单事务批量
 /// 落库该规则的状态 / 事件 → 预算允许时按小时清理过期数据。
 ///
-/// 任何单条规则的查询失败只记 WARN 与计数，**不会**把状态误判成 resolved；
-/// 存储写入失败则整轮返回错误，下一轮重试。
+/// `live_cert` 是监听器实际生效的证书摘要（watcher 热加载成功后才更新）。规则
+/// 被修改 / 禁用 / 删除时，CAS 返回 `Stale` 计入 [`EvaluationReport::stale_rules`]，
+/// **不重试、不写状态**；任何单条规则的查询失败只记 WARN 与计数，**不会**把状态
+/// 误判成 resolved；存储写入失败则整轮返回错误，下一轮重试。
 pub(crate) fn evaluate_once(
     storage: &StorageHandle,
     cfg: &HubConfig,
     now: i64,
+    live_cert: &RwLock<CertStatus>,
 ) -> Result<EvaluationReport> {
-    evaluate_once_with_cert_hours(storage, cfg, now, |cfg| hub_cert_hours_left(cfg, now))
+    evaluate_once_with_cert_hours(storage, cfg, now, |_| hub_cert_hours_left(live_cert, now))
 }
 
 /// 带证书剩余小时数注入的评估入口，供单测替换真实证书读取。
@@ -354,7 +362,7 @@ where
                                 tracing::warn!(
                                     rule_id = %rule.id,
                                     error = %err,
-                                    "读取 Hub 服务端证书失败，本轮跳过 hub_cert 规则（不改状态）"
+                                    "读取 live 证书状态失败，本轮跳过 hub_cert 规则（不改状态）"
                                 );
                                 None
                             }
@@ -389,13 +397,32 @@ where
 
         let batch = evaluator.finish();
         if !batch.events.is_empty() || !batch.states.is_empty() {
-            // 状态写入与每规则硬上限裁剪在同一事务内完成。
-            report.states_evicted += storage.apply_alert_evaluation(
+            // 状态写入与每规则硬上限裁剪在同一事务内完成；CAS 的 expected
+            // revision 来自本轮开始时加载的规则。规则在评估期间被改过 / 禁用 /
+            // 删除时返回 Stale：丢弃整批结果，不重试。
+            match storage.apply_alert_evaluation(
                 &rule.id,
+                rule.revision,
                 &batch.events,
                 &batch.states,
                 MAX_ALERT_STATES_PER_RULE,
-            )?;
+            )? {
+                AlertEvaluationOutcome::Applied { removed } => {
+                    report.states_evicted += removed;
+                }
+                AlertEvaluationOutcome::Stale => {
+                    report.stale_rules += 1;
+                    tracing::warn!(
+                        rule_id = %rule.id,
+                        "告警规则在评估期间被修改或禁用，丢弃本轮评估结果（CAS Stale）"
+                    );
+                    if budget_hit {
+                        report.budget_exhausted = true;
+                        report.rules_skipped_budget = rule_count.saturating_sub(index + 1);
+                    }
+                    continue;
+                }
+            }
         }
         report.rules_evaluated += 1;
         report.series_evaluated += batch.series_evaluated;
@@ -587,17 +614,19 @@ fn metric_lookback_ms(cfg: &HubConfig) -> i64 {
         .saturating_mul(1_000)
 }
 
-/// 读取 hub 服务端证书剩余小时数（`data_dir/certs/server.crt`）。
+/// 读取**监听器实际在用**的 live 证书剩余小时数。
 ///
 /// **单位是小时**：规则阈值来自 `alerts.cert_warn_hours`（如 48 小时）。旧实现
-/// 用 `days_left` 与「48」比较，等于把阈值放大成 48 天，证书快到期也不会告警。
-/// 只读磁盘上的当前证书：证书轮换 / 续签后下一轮自动使用新值。读取或解析失败
-/// 由调用方 WARN 并跳过，不会 resolve。
-fn hub_cert_hours_left(cfg: &HubConfig, now: i64) -> Result<i64> {
-    let path = tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE);
-    let pem = std::fs::read_to_string(&path)
-        .with_context(|| format!("读取服务端证书失败: {}", path.display()))?;
-    tls::hours_left(&pem, now).context("解析服务端证书失败")
+/// 直接读 `data_dir/certs/server.crt`，热加载失败时会按磁盘新证书计算——即使
+/// 新证书还未生效，也会把告警错误地 resolve 掉。现在只读 watcher 成功应用后
+/// 更新的 [`CertStatus`]：热加载失败时保留旧 live 证书，告警继续按旧到期时间
+/// 触发。状态不可读 / 未初始化时由调用方 WARN 并跳过，不会 resolve。
+fn hub_cert_hours_left(live_cert: &RwLock<CertStatus>, now: i64) -> Result<i64> {
+    let status = live_cert
+        .read()
+        .map_err(|_| anyhow::anyhow!("读取 live 证书状态失败（锁已中毒）"))?
+        .clone();
+    status.hours_left_at(now)
 }
 
 /// 启动后台告警评估任务。
@@ -605,8 +634,13 @@ fn hub_cert_hours_left(cfg: &HubConfig, now: i64) -> Result<i64> {
 /// - `alerts.enabled = false`：只记一条 INFO，不启动循环；
 /// - 启动后先睡一个周期，避免与监听启动抢 SQLite 写锁；
 /// - 每轮在 `spawn_blocking` 内串行执行，错误只 WARN，任务不退出；
+/// - `live_cert` 与证书 watcher 共享：只有热加载成功后才更新，失败保留旧值；
 /// - 日志只输出计数，不输出 secret。
-pub(crate) fn spawn_alert_engine(storage: Arc<StorageHandle>, cfg: HubConfig) {
+pub(crate) fn spawn_alert_engine(
+    storage: Arc<StorageHandle>,
+    cfg: HubConfig,
+    live_cert: Arc<RwLock<CertStatus>>,
+) {
     if !cfg.alerts.enabled {
         tracing::info!("告警引擎未启用（alerts.enabled = false）");
         return;
@@ -623,12 +657,16 @@ pub(crate) fn spawn_alert_engine(storage: Arc<StorageHandle>, cfg: HubConfig) {
             tokio::time::sleep(interval).await;
             let storage = storage.clone();
             let cfg = cfg.clone();
-            let outcome =
-                tokio::task::spawn_blocking(move || evaluate_once(&storage, &cfg, now_ms())).await;
+            let live_cert = live_cert.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                evaluate_once(&storage, &cfg, now_ms(), &live_cert)
+            })
+            .await;
             match outcome {
                 Ok(Ok(report)) => {
                     if report.firing_events > 0
                         || report.resolved_events > 0
+                        || report.stale_rules > 0
                         || report.rules_skipped_budget > 0
                     {
                         tracing::info!(?report, "告警评估完成");
@@ -658,6 +696,25 @@ mod tests {
             data_dir: PathBuf::from("/tmp/rb-alert-engine-unused-data-dir"),
             ..HubConfig::default()
         }
+    }
+
+    /// 构造只含公开字段的 live 证书状态（不依赖真实证书文件）。
+    fn live_cert_hours(now: i64, hours: i64) -> RwLock<CertStatus> {
+        RwLock::new(CertStatus {
+            fingerprint: "test-live-cert".to_string(),
+            not_after: now.div_euclid(1_000).saturating_add(hours * 3_600),
+            days_left: 0,
+        })
+    }
+
+    /// 不需要 hub_cert 的用例统一使用远未到期的 live 状态。
+    fn evaluate_fixture(
+        storage: &StorageHandle,
+        cfg: &HubConfig,
+        now: i64,
+    ) -> Result<EvaluationReport> {
+        let live = live_cert_hours(now, 720);
+        evaluate_once(storage, cfg, now, &live)
     }
 
     fn seed_agent(storage: &StorageHandle, id: &str, last_seen_at: i64) {
@@ -729,6 +786,7 @@ mod tests {
             updated_by: "test".into(),
             created_at: 0,
             updated_at: 0,
+            revision: 0,
         }
     }
 
@@ -801,7 +859,7 @@ mod tests {
         disk.filter_labels.insert("mount".into(), "/".into());
         store(&storage, &disk);
 
-        let report = evaluate_once(&storage, &cfg, now).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, now).unwrap();
         assert_eq!(report.rules_evaluated, 1);
         assert_eq!(report.series_evaluated, 2, "只评估 mount=/ 的两个序列");
         assert_eq!(report.firing_events, 2);
@@ -850,7 +908,7 @@ mod tests {
         }
 
         // 下一轮仍然超阈值：不重复产生 firing 事件。
-        let report = evaluate_once(&storage, &cfg, now + 15_000).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, now + 15_000).unwrap();
         assert_eq!(report.firing_events, 0);
         assert_eq!(report.series_evaluated, 2);
         assert_eq!(storage.list_alert_events(10, None).unwrap().len(), 2);
@@ -907,7 +965,7 @@ mod tests {
             })
             .unwrap();
 
-        let report = evaluate_once(&storage, &cfg, now).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, now).unwrap();
         assert_eq!(report.series_evaluated, 1, "过滤后只应评估目标序列");
         assert_eq!(report.firing_events, 1, "第 5001 条目标序列必须触发");
         assert_eq!(report.truncated_rules, 0, "过滤后不足上限，不应截断");
@@ -951,7 +1009,7 @@ mod tests {
             now - 1_000,
             95.0,
         );
-        let report = evaluate_once(&storage, &cfg, now).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, now).unwrap();
         assert_eq!(report.firing_events, 0);
         let state = storage
             .get_alert_state(
@@ -974,7 +1032,7 @@ mod tests {
             later - 1_000,
             96.0,
         );
-        let report = evaluate_once(&storage, &cfg, later).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, later).unwrap();
         assert_eq!(report.firing_events, 1);
         let state = storage
             .get_alert_state(
@@ -998,7 +1056,7 @@ mod tests {
             even_later - 1_000,
             97.0,
         );
-        let report = evaluate_once(&storage, &cfg, even_later).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, even_later).unwrap();
         assert_eq!(report.firing_events, 0);
     }
 
@@ -1019,7 +1077,10 @@ mod tests {
             now - 1_000,
             95.0,
         );
-        assert_eq!(evaluate_once(&storage, &cfg, now).unwrap().firing_events, 1);
+        assert_eq!(
+            evaluate_fixture(&storage, &cfg, now).unwrap().firing_events,
+            1
+        );
         let series = alerts::series_key("disk.used_percent", &Labels::new());
         // 通知 worker 写入冷却锚点；resolve / re-fire 都不能把它冲掉。
         assert!(storage
@@ -1036,7 +1097,7 @@ mod tests {
             resolved_at - 1_000,
             10.0,
         );
-        let report = evaluate_once(&storage, &cfg, resolved_at).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, resolved_at).unwrap();
         assert_eq!(report.firing_events, 0);
         assert_eq!(report.resolved_events, 1);
         let state = storage
@@ -1064,7 +1125,7 @@ mod tests {
             retrigger_at - 1_000,
             99.0,
         );
-        let report = evaluate_once(&storage, &cfg, retrigger_at).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, retrigger_at).unwrap();
         assert_eq!(report.firing_events, 1);
         let state = storage
             .get_alert_state("flap", "a1", &series)
@@ -1225,7 +1286,7 @@ mod tests {
             .unwrap();
 
         // 没有样本：规则被跳过，状态与事件都不变。
-        let report = evaluate_once(&storage, &cfg, now).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, now).unwrap();
         assert_eq!(report.series_evaluated, 0);
         assert_eq!(report.firing_events, 0);
         assert_eq!(report.resolved_events, 0);
@@ -1264,6 +1325,177 @@ mod tests {
         assert_eq!(state.state, AlertStateKind::Firing);
     }
 
+    /// #68：热加载失败时，hub_cert 必须按 live 旧证书到期时间告警。
+    ///
+    /// 构造：磁盘已是长有效期新 crt（但私钥不配套 → 热加载失败），live 仍是
+    /// 临近到期的旧 crt。若引擎偷看磁盘会看到 365 天而误判“安全”；正确行为
+    /// 是按 live 的 24 小时触发。live 状态不可读 / 未初始化时跳过且不 resolve。
+    #[test]
+    fn m4_b1fix_hub_cert_uses_live_state_after_reload_failure() {
+        use std::fs;
+
+        use rustboard_common::tls;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rb-alert-live-cert-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            ..HubConfig::default()
+        };
+        tls::ensure_hub_material(
+            &cfg.data_dir,
+            &["localhost".to_string()],
+            tls::CertPolicy::default(),
+        )
+        .unwrap();
+        let ca_key =
+            fs::read_to_string(tls::cert_dir(&cfg.data_dir).join(tls::CA_KEY_FILE)).unwrap();
+        let (old_cert, old_key) =
+            tls::issue_server_cert(&ca_key, &["localhost".to_string()], 1).unwrap();
+        let (new_cert, _new_key) =
+            tls::issue_server_cert(&ca_key, &["localhost".to_string()], 365).unwrap();
+        let cert_path = tls::cert_dir(&cfg.data_dir).join(tls::SERVER_CERT_FILE);
+        let key_path = tls::cert_dir(&cfg.data_dir).join(tls::SERVER_KEY_FILE);
+        fs::write(&cert_path, &old_cert).unwrap();
+        fs::write(&key_path, &old_key).unwrap();
+
+        let old_status = CertStatus::from_pem(&old_cert).unwrap();
+        let live = RwLock::new(old_status.clone());
+        let (tx, _rx) = tokio::sync::watch::channel(tls::server_config(&cfg.data_dir).unwrap());
+
+        // 磁盘换成 365 天新证书，但保留旧私钥：热加载必须失败并保留旧 live。
+        fs::write(&cert_path, &new_cert).unwrap();
+        let err = crate::cert_rotation::reload_server_config_if_changed(&cfg, &tx, &live)
+            .expect_err("证书与私钥不配套时必须拒绝热加载");
+        assert!(format!("{err:#}").contains("不配套"), "错误信息: {err:#}");
+        assert_eq!(
+            live.read().unwrap().fingerprint,
+            old_status.fingerprint,
+            "热加载失败必须保留旧 live 证书"
+        );
+
+        let storage = StorageHandle::sqlite_memory().unwrap();
+        let now = now_ms();
+        store(
+            &storage,
+            &rule(
+                "hub-cert-live",
+                AlertSource::HubCert,
+                "",
+                Comparator::Lt,
+                48.0,
+                0,
+            ),
+        );
+
+        // live 旧证书只剩约 24 小时：必须 firing（磁盘新证书 365 天不得影响）。
+        let report = evaluate_once(&storage, &cfg, now, &live).unwrap();
+        assert_eq!(report.firing_events, 1, "按 live 旧证书 24 小时必须触发");
+        let state = storage
+            .get_alert_state("hub-cert-live", "", "")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.state, AlertStateKind::Firing);
+        assert_eq!(state.last_value, Some(24.0), "剩余小时数应来自 live 证书");
+
+        // live 未初始化：WARN + 跳过本轮，绝不能 resolve。
+        let uninitialized = RwLock::new(CertStatus {
+            fingerprint: String::new(),
+            not_after: 0,
+            days_left: 0,
+        });
+        let report = evaluate_once(&storage, &cfg, now + 15_000, &uninitialized).unwrap();
+        assert_eq!(report.cert_read_errors, 1);
+        assert_eq!(report.resolved_events, 0);
+        assert_eq!(
+            storage
+                .get_alert_state("hub-cert-live", "", "")
+                .unwrap()
+                .unwrap()
+                .state,
+            AlertStateKind::Firing,
+            "live 不可读时不得把状态误判成 resolved"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #69：旧评估读到 Pending 后规则被禁用并清空，提交时必须 Stale。
+    #[tokio::test]
+    async fn m4_b1fix_stale_evaluation_after_disable_does_not_notify() {
+        use crate::notify::MockNotifier;
+        use crate::notify_worker::notify_once;
+
+        let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
+        let cfg = test_cfg();
+        let now = 1_700_000_000_000;
+        let rule = metric_rule("stale-eval", 90.0, 0);
+        store(&storage, &rule);
+        seed_sample(
+            &storage,
+            1,
+            "a1",
+            "disk.used_percent",
+            Labels::new(),
+            now,
+            95.0,
+        );
+        storage
+            .upsert_alert_state(&AlertState {
+                rule_id: rule.id.clone(),
+                agent_id: "a1".into(),
+                series_key: alerts::series_key("disk.used_percent", &Labels::new()),
+                state: AlertStateKind::Pending,
+                since: now - 60_000,
+                last_eval_at: now - 60_000,
+                last_value: Some(94.0),
+                last_notified_at: None,
+            })
+            .unwrap();
+
+        let report = {
+            let storage = Arc::clone(&storage);
+            evaluate_with_options_after_load(
+                &storage,
+                &cfg,
+                now,
+                |_| Ok(720),
+                MAX_ALERT_SERIES_PER_RULE,
+                Duration::from_secs(60),
+                &mut |storage, loaded_rule| {
+                    // API 的禁用路径：更新 revision + 同事务清空状态。
+                    let mut disabled = storage.get_alert_rule(&loaded_rule.id).unwrap().unwrap();
+                    disabled.enabled = false;
+                    disabled.updated_at = now + 1;
+                    storage
+                        .update_alert_rule_and_clear_states(&disabled)
+                        .unwrap();
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(report.stale_rules, 1, "旧评估必须被 CAS 识别为 Stale");
+        assert_eq!(report.firing_events, 0);
+        assert!(storage.list_alert_events(10, None).unwrap().is_empty());
+        assert!(
+            storage.list_alert_states().unwrap().is_empty(),
+            "禁用时清空的状态不得被旧评估复活"
+        );
+
+        // 没有事件，通知 worker 无任何可发送内容。
+        let mock = Arc::new(MockNotifier::new());
+        let notify = notify_once(Arc::clone(&storage), mock.clone(), 0, now + 2)
+            .await
+            .unwrap();
+        assert_eq!(notify.processed, 0);
+        assert_eq!(mock.send_count(), 0);
+    }
+
     /// agent_offline：阈值比较、吊销跳过、恢复后 resolved。
     #[test]
     fn m4_b1b_offline_rule_fires_skips_revoked_and_resolves() {
@@ -1288,7 +1520,7 @@ mod tests {
         );
         store(&storage, &offline);
 
-        let report = evaluate_once(&storage, &cfg, now).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, now).unwrap();
         assert_eq!(report.firing_events, 1, "只有 a1 离线超过阈值");
         assert!(storage
             .get_alert_state("offline", "a1", "")
@@ -1318,7 +1550,7 @@ mod tests {
 
         // a1 重新上报 → 离线时长归零 → resolved。
         storage.mark_seen("a1", now).unwrap();
-        let report = evaluate_once(&storage, &cfg, now + 1_000).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, now + 1_000).unwrap();
         assert_eq!(report.resolved_events, 1);
         let state = storage
             .get_alert_state("offline", "a1", "")
@@ -1408,7 +1640,7 @@ mod tests {
             now - 1_000,
             95.0,
         );
-        let report = evaluate_once(&storage, &cfg, now).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, now).unwrap();
         assert_eq!(report.firing_events, 1);
         assert_eq!(report.silenced_events, 1);
         let event = storage.list_alert_events(1, None).unwrap().pop().unwrap();
@@ -1427,7 +1659,7 @@ mod tests {
             resolved_at - 1_000,
             10.0,
         );
-        let report = evaluate_once(&storage, &cfg, resolved_at).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, resolved_at).unwrap();
         assert_eq!(report.resolved_events, 1);
         assert_eq!(report.silenced_events, 1);
 
@@ -1443,7 +1675,7 @@ mod tests {
             expired_at - 1_000,
             99.0,
         );
-        let report = evaluate_once(&storage, &cfg, expired_at).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, expired_at).unwrap();
         assert_eq!(report.firing_events, 1);
         assert_eq!(report.silenced_events, 0);
         let event = storage.list_alert_events(1, None).unwrap().pop().unwrap();
@@ -1473,7 +1705,7 @@ mod tests {
                 now - 1_000,
                 95.0,
             );
-            let report = evaluate_once(&storage, &cfg, now).unwrap();
+            let report = evaluate_fixture(&storage, &cfg, now).unwrap();
             assert_eq!(report.firing_events, 1);
         }
 
@@ -1497,7 +1729,7 @@ mod tests {
                 now + 14_000,
                 96.0,
             );
-            let report = evaluate_once(&storage, &cfg, now + 15_000).unwrap();
+            let report = evaluate_fixture(&storage, &cfg, now + 15_000).unwrap();
             assert_eq!(report.firing_events, 0, "重启不能重复产生 firing 事件");
             assert_eq!(storage.list_alert_events(10, None).unwrap().len(), 1);
         }
@@ -1576,7 +1808,7 @@ mod tests {
             })
             .unwrap();
 
-        let report = evaluate_once(&storage, &cfg, now).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, now).unwrap();
         assert_eq!(report.pruned_events, 1);
         assert_eq!(report.pruned_states, 1, "只清陈旧的 resolved");
         assert_eq!(
@@ -1614,7 +1846,7 @@ mod tests {
             95.0,
         );
         // 第一阶段：raw 存在 → firing。
-        let first = evaluate_once(&storage, &cfg, now).unwrap();
+        let first = evaluate_fixture(&storage, &cfg, now).unwrap();
         assert_eq!(first.firing_events, 1);
         let key = alerts::series_key("disk.used_percent", &Labels::new());
         let firing = storage
@@ -1635,7 +1867,7 @@ mod tests {
         assert_eq!(storage.sample_count("a1").unwrap(), 0, "raw 已删除");
 
         // 第二阶段：不得用旧桶再次 firing，也不得用旧桶 resolve。
-        let second = evaluate_once(&storage, &cfg, now + 15_000).unwrap();
+        let second = evaluate_fixture(&storage, &cfg, now + 15_000).unwrap();
         assert_eq!(second.series_evaluated, 0, "1m 桶不能当作当前值");
         assert_eq!(second.firing_events, 0);
         assert_eq!(second.resolved_events, 0, "无 raw 样本不得 resolve");
@@ -1770,7 +2002,7 @@ mod tests {
             })
             .unwrap();
 
-        let report = evaluate_once(&storage, &cfg, now).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, now).unwrap();
         assert_eq!(
             report.states_loaded, MAX_ALERT_STATES_PER_RULE,
             "单轮加载必须被硬上限截断"
@@ -1797,7 +2029,7 @@ mod tests {
         );
 
         // 相同序列仍在窗口内：加载 ≤ 上限，状态已在，不能重复 firing 事件。
-        let report = evaluate_once(&storage, &cfg, now + 15_000).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, now + 15_000).unwrap();
         assert_eq!(report.states_loaded, MAX_ALERT_STATES_PER_RULE);
         assert_eq!(report.firing_events, 0);
         assert_eq!(report.series_evaluated, 5_000);
@@ -1831,18 +2063,18 @@ mod tests {
         };
 
         storage.insert_alert_event(&old_event()).unwrap();
-        let first = evaluate_once(&storage, &cfg, now).unwrap();
+        let first = evaluate_fixture(&storage, &cfg, now).unwrap();
         assert_eq!(first.pruned_events, 1);
         assert!(storage.list_alert_events(10, None).unwrap().is_empty());
 
         // 15 秒后：未到清理周期，不再执行 DELETE。
         storage.insert_alert_event(&old_event()).unwrap();
-        let second = evaluate_once(&storage, &cfg, now + 15_000).unwrap();
+        let second = evaluate_fixture(&storage, &cfg, now + 15_000).unwrap();
         assert_eq!(second.pruned_events, 0);
         assert_eq!(storage.list_alert_events(10, None).unwrap().len(), 1);
 
         // 一小时后：恢复清理。
-        let third = evaluate_once(&storage, &cfg, now + PRUNE_INTERVAL_MS).unwrap();
+        let third = evaluate_fixture(&storage, &cfg, now + PRUNE_INTERVAL_MS).unwrap();
         assert_eq!(third.pruned_events, 1);
         assert!(storage.list_alert_events(10, None).unwrap().is_empty());
     }
@@ -1866,7 +2098,7 @@ mod tests {
             95.0,
         );
 
-        let report = evaluate_once(&storage, &cfg, now).unwrap();
+        let report = evaluate_fixture(&storage, &cfg, now).unwrap();
         assert_eq!(report.rules_evaluated, 0);
         assert_eq!(report.firing_events, 0);
         assert!(storage.list_alert_events(10, None).unwrap().is_empty());

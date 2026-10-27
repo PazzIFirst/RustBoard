@@ -325,6 +325,7 @@ mod tests {
             archive_download_principal_slots: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            self_interval: tokio::sync::watch::channel(5_000).0,
         }
     }
 
@@ -513,6 +514,7 @@ mod tests {
             updated_by: "admin".to_string(),
             created_at: now_ms(),
             updated_at: now_ms(),
+            revision: 0,
         };
         state.storage.create_alert_rule(&rule).unwrap();
         let (status, body) = call(

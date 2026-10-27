@@ -69,6 +69,7 @@ fn default_rule(now: i64, updated_by: String) -> AlertRule {
         updated_by,
         created_at: now,
         updated_at: now,
+        revision: 0,
     }
 }
 
@@ -101,6 +102,14 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
             ),
             AlertRuleStoreError::BuiltinRule => {
                 ApiError::forbidden("builtin_rule", "内置规则不允许删除")
+            }
+            // 与前置 `validate_rule_channels` 的错误码保持一致；差别只在于这里
+            // 是存储事务内复核失败（并发删除 / 禁用渠道），仍映射成 400 而非 500。
+            AlertRuleStoreError::ChannelNotFound => {
+                ApiError::bad_request_code("channel_not_found", "告警规则引用的通知渠道不存在")
+            }
+            AlertRuleStoreError::ChannelDisabled => {
+                ApiError::bad_request_code("channel_disabled", "告警规则引用的通知渠道已禁用")
             }
         };
     }
@@ -226,6 +235,10 @@ pub(crate) async fn create_rule(
 /// - 请求体只覆盖出现的字段（例如 `{"enabled": true}` 只切换启停）；
 /// - id / `is_builtin` / `created_at` 保持数据库原值，内置规则同样可改可停；
 /// - 规则不存在返回 404。
+///
+/// 已知限制（后续处理，不新增协议字段）：合并基于读取时的快照，PUT 没有
+/// revision CAS；两个并发更新后到的请求可能覆盖前一个请求的 `enabled` 等字段。
+/// 评估侧 CAS 仍保证旧评估不会复活状态。
 pub(crate) async fn update_rule(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -467,6 +480,7 @@ mod tests {
             archive_download_principal_slots: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            self_interval: tokio::sync::watch::channel(5_000).0,
         }
     }
 
@@ -1048,6 +1062,14 @@ mod tests {
         match map_store_error(AlertRuleStoreError::BuiltinRule.into()) {
             ApiError::Forbidden { code, .. } => assert_eq!(code, "builtin_rule"),
             other => panic!("应为 403 Forbidden: {other:?}"),
+        }
+        match map_store_error(AlertRuleStoreError::ChannelNotFound.into()) {
+            ApiError::BadRequestCode { code, .. } => assert_eq!(code, "channel_not_found"),
+            other => panic!("应为 400 channel_not_found: {other:?}"),
+        }
+        match map_store_error(AlertRuleStoreError::ChannelDisabled.into()) {
+            ApiError::BadRequestCode { code, .. } => assert_eq!(code, "channel_disabled"),
+            other => panic!("应为 400 channel_disabled: {other:?}"),
         }
         match map_store_error(AlertSilenceStoreError::LimitReached.into()) {
             ApiError::Conflict { code, .. } => assert_eq!(code, "silence_limit"),

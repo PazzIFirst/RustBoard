@@ -7,7 +7,8 @@
 //! 核对 systemd 实际解析的 `FragmentPath`。`wait_http_ok` 只支持明文 `http://`，
 //! 不引入 reqwest。
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -282,6 +283,110 @@ fn systemd_quote(value: &str) -> String {
     escaped
 }
 
+/// systemd `ActiveState` 的严格分类。
+///
+/// 安装器不能把“systemctl 没输出 / 非零退出 / activating”当成已停止。只有
+/// `inactive` 与 `failed` 被视为停止；其余状态（含未知字符串）都必须由调用方
+/// 按 fail-closed 处理。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceState {
+    Inactive,
+    Failed,
+    Active,
+    Activating,
+    Deactivating,
+    Reloading,
+    Other(String),
+}
+
+impl ServiceState {
+    /// 解析 `systemctl show -p ActiveState --value` 的输出。
+    pub fn parse(value: &str) -> Self {
+        match value.trim() {
+            "inactive" => Self::Inactive,
+            "failed" => Self::Failed,
+            "active" => Self::Active,
+            "activating" => Self::Activating,
+            "deactivating" => Self::Deactivating,
+            "reloading" => Self::Reloading,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// 是否明确停止（只有 inactive / failed）。
+    pub fn is_stopped(&self) -> bool {
+        matches!(self, Self::Inactive | Self::Failed)
+    }
+
+    /// 是否可视为“已启用且正在运行 / 启动中”，用于 was_active 判定。
+    ///
+    /// `deactivating` 与未知状态不在此列：它们不能证明服务会继续运行，也不能
+    /// 证明已经停止，必须由调用方 fail-closed。
+    pub fn is_active_or_starting(&self) -> bool {
+        matches!(self, Self::Active | Self::Activating | Self::Reloading)
+    }
+
+    /// 用于错误信息的稳定文本。
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Inactive => "inactive",
+            Self::Failed => "failed",
+            Self::Active => "active",
+            Self::Activating => "activating",
+            Self::Deactivating => "deactivating",
+            Self::Reloading => "reloading",
+            Self::Other(value) => value,
+        }
+    }
+}
+
+/// 安装器依赖的 systemd 控制面。
+///
+/// 生产实现是 [`ServiceManager`]；测试可以注入 fake，验证停止失败 / 无法确认
+/// inactive / disable 失败等分支，而不触碰宿主机 systemd。卸载流程只在
+/// fragment 已确认归属后才调用这些方法。
+pub trait ServiceControl {
+    /// 查询 systemd 实际解析的 unit 文件。
+    fn fragment_path(&self, unit: &str) -> Result<Option<PathBuf>>;
+    /// 断言 systemd 实际解析的 unit 就是 `expected`。
+    fn ensure_fragment_is(&self, unit: &str, expected: &Path) -> Result<()>;
+    /// `systemctl daemon-reload`。
+    fn daemon_reload(&self) -> Result<()>;
+    /// 是否真正启用 systemd 管理（非 `--no-systemd` / 非 dry-run）。
+    ///
+    /// 为 false 时所有状态查询 / stop / restart 都必须拒绝，不能把 no-op 当成
+    /// 成功（尤其卸载时）。
+    fn is_managing(&self) -> bool;
+    /// 查询严格 `ActiveState`；查询失败或输出为空必须返回 `Err`。
+    fn active_state(&self, unit: &str) -> Result<ServiceState>;
+    /// 便捷判定：只有 active / activating / reloading 返回 true；inactive /
+    /// failed 返回 false；deactivating / 未知状态 / 查询失败返回 `Err`。
+    fn is_active(&self, unit: &str) -> Result<bool> {
+        if !self.is_managing() {
+            bail!("systemd 管理未启用（--no-systemd / dry-run），拒绝把 no-op 当作服务状态");
+        }
+        match self.active_state(unit)? {
+            ServiceState::Inactive | ServiceState::Failed => Ok(false),
+            ServiceState::Active | ServiceState::Activating | ServiceState::Reloading => Ok(true),
+            state @ (ServiceState::Deactivating | ServiceState::Other(_)) => bail!(
+                "无法把 {} 的 ActiveState={} 判定为运行或停止（拒绝猜测）",
+                unit,
+                state.as_str()
+            ),
+        }
+    }
+    /// `systemctl show -p MainPID --value`；未运行时返回 0。
+    fn main_pid(&self, unit: &str) -> Result<u32>;
+    /// `systemctl enable --now`。
+    fn enable_now(&self, unit: &str) -> Result<()>;
+    /// `systemctl restart`。
+    fn restart(&self, unit: &str) -> Result<()>;
+    /// 只 `systemctl stop`，不 disable。
+    fn stop(&self, unit: &str) -> Result<()>;
+    /// 只 `systemctl disable`，不 stop。
+    fn disable(&self, unit: &str) -> Result<()>;
+}
+
 /// systemd 服务管理器。
 pub struct ServiceManager {
     pub unit_dir: PathBuf,
@@ -343,33 +448,119 @@ impl ServiceManager {
         self.run_systemctl(&["restart", unit])
     }
 
+    /// 只执行 `systemctl stop <unit>`，不 disable。
+    ///
+    /// 卸载时 stop 失败必须立即中止，不能用 disable 成功掩盖；调用前先用
+    /// [`Self::ensure_fragment_is`] 确认归属。
+    pub fn stop(&self, unit: &str) -> Result<()> {
+        validate_unit_arg(unit)?;
+        self.run_systemctl(&["stop", unit])
+    }
+
+    /// 只执行 `systemctl disable <unit>`，不 stop。
+    ///
+    /// 卸载流程在确认服务已 inactive 之后才调用；disable 失败只影响开机自启，
+    /// 不应与 stop 失败混为一谈。
+    pub fn disable(&self, unit: &str) -> Result<()> {
+        validate_unit_arg(unit)?;
+        self.run_systemctl(&["disable", unit])
+    }
+
     /// 先 `systemctl stop` 再 `systemctl disable`。
     ///
     /// 卸载时必须在调用前用 [`Self::ensure_fragment_is`] 确认要停的是我们的 unit；
     /// 只检查 `paths.unit` 文件挡不住同名的更高优先级 unit 或 transient unit。
+    /// 新代码应改用 [`ServiceControl::stop`] / [`ServiceControl::disable`] 分别
+    /// 处理失败，本方法仅供安装失败回滚等“尽力清理”路径使用。
     pub fn stop_disable(&self, unit: &str) -> Result<()> {
         validate_unit_arg(unit)?;
         let stop = self.run_systemctl(&["stop", unit]);
-        // stop 失败也继续 disable：卸载时不能因为服务本来没跑就留下自启项。
+        // stop 失败也继续 disable：回滚时不能因为服务本来没跑就留下自启项。
         let disable = self.run_systemctl(&["disable", unit]);
         stop.and(disable)
     }
 
-    /// `systemctl is-active --quiet <unit>`；inactive / 不存在返回 `false`。
-    pub fn is_active(&self, unit: &str) -> Result<bool> {
+    /// `systemctl show <unit> -p MainPID --value`；未运行时返回 0。
+    ///
+    /// 安装器用它确认重启后确实产生了新进程，避免把 `enable --now` 对已运行
+    /// 服务的 no-op 误认为“新二进制 / 新配置已生效”。
+    pub fn main_pid(&self, unit: &str) -> Result<u32> {
         validate_unit_arg(unit)?;
         if !self.manage || self.dry_run {
-            return Ok(false);
+            return Ok(0);
         }
         let output = Command::new("systemctl")
-            .args(["is-active", "--quiet", unit])
+            .args(["show", unit, "-p", "MainPID", "--value"])
             .stdin(Stdio::null())
             .output()
-            .with_context(|| format!("执行 systemctl is-active {unit} 失败"))?;
-        Ok(output.status.success())
+            .with_context(|| format!("执行 systemctl show {unit} -p MainPID --value 失败"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "systemctl show {unit} -p MainPID 失败（退出状态 {}）: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.trim()
+            .parse::<u32>()
+            .with_context(|| format!("systemctl show {unit} 返回了非法 MainPID: {text:?}"))
     }
 
-    /// 查询 systemd 实际解析到的 unit 文件（`FragmentPath`）。
+    /// 是否真正启用 systemd 管理（非 `--no-systemd` / 非 dry-run）。
+    pub fn is_managing(&self) -> bool {
+        self.manage && !self.dry_run
+    }
+
+    /// `systemctl show <unit> -p ActiveState --value`，严格解析。
+    ///
+    /// 非零退出、空输出、启动失败、未知状态一律返回错误；调用方不得把
+    /// “查不到”当成 inactive。只有 [`ServiceState::Inactive`] / `Failed` 可视为
+    /// 已停止。
+    pub fn active_state(&self, unit: &str) -> Result<ServiceState> {
+        validate_unit_arg(unit)?;
+        if !self.is_managing() {
+            bail!("systemd 管理未启用（--no-systemd / dry-run），拒绝把 no-op 当作服务状态");
+        }
+        let output = Command::new("systemctl")
+            .args(["show", unit, "-p", "ActiveState", "--value"])
+            .stdin(Stdio::null())
+            .output()
+            .with_context(|| format!("执行 systemctl show {unit} -p ActiveState --value 失败"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "systemctl show {unit} -p ActiveState 失败（退出状态 {}）: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        let text = String::from_utf8(output.stdout)
+            .with_context(|| format!("systemctl show {unit} 的 ActiveState 不是 UTF-8"))?;
+        let state = text.trim();
+        if state.is_empty() {
+            bail!("systemctl show {unit} 返回空 ActiveState，拒绝猜测服务状态");
+        }
+        Ok(ServiceState::parse(state))
+    }
+
+    /// `systemctl show -p ActiveState --value` 的布尔封装。
+    ///
+    /// 只有 `active` / `activating` / `reloading` 返回 true；`inactive` / `failed`
+    /// 返回 false；`deactivating`、未知状态与查询失败返回错误。
+    pub fn is_active(&self, unit: &str) -> Result<bool> {
+        match self.active_state(unit)? {
+            ServiceState::Inactive | ServiceState::Failed => Ok(false),
+            ServiceState::Active | ServiceState::Activating | ServiceState::Reloading => Ok(true),
+            state @ (ServiceState::Deactivating | ServiceState::Other(_)) => bail!(
+                "无法把 {unit} 的 ActiveState={} 判定为运行或停止（拒绝猜测）",
+                state.as_str()
+            ),
+        }
+    }
+
+    /// 查询 systemd 实际解析到的 unit 文件（`FragmentPath` + `LoadState`）。
     ///
     /// 只看 `paths.unit` 文件是否存在并不够：systemd 按 unit **名字**操作，
     /// `/etc/systemd/system` 中同名 unit 的优先级高于 `/run/systemd/system`；
@@ -378,9 +569,11 @@ impl ServiceManager {
     ///
     /// 行为：
     /// - `manage=false` 或 `dry_run` 时不执行 systemctl，返回 `None`；
-    /// - `systemctl show` 成功但值为空白（unit 未加载 / 不存在）返回 `None`；
-    /// - `systemctl show` 非零退出（旧版本对 unit not found 返回非零）返回 `None`；
-    /// - 无法启动 systemctl（例如 PATH 中没有）或输出畸形返回 `Err`。
+    /// - `LoadState=not-found` 或 stderr 明确 “Unit ... could not be found” 返回
+    ///   `None`（unit 确实不存在）；
+    /// - **只允许明确 not-found 返回 `None`**；D-Bus、权限、systemctl 不存在、
+    ///   其他非零退出或输出畸形一律 `Err`，不能因此让卸载走“只删文件”；
+    /// - 成功但 `FragmentPath` 为空返回 `None`（transient / 未加载）。
     ///
     /// 返回路径已归一化，便于和 [`crate::Paths::unit`] 直接比较。安装流程应在
     /// 写完 unit 并 `daemon-reload` 后立即查询，此时 systemd 才能解析到新文件。
@@ -390,20 +583,20 @@ impl ServiceManager {
             return Ok(None);
         }
         let output = Command::new("systemctl")
-            .args(["show", unit, "-p", "FragmentPath", "--value"])
+            .args(["show", unit, "-p", "FragmentPath", "-p", "LoadState"])
             .stdin(Stdio::null())
             .output()
             .with_context(|| {
                 format!(
-                    "执行 systemctl show {unit} -p FragmentPath --value 失败（systemctl 不存在或不可执行？）"
+                    "执行 systemctl show {unit} -p FragmentPath -p LoadState 失败（systemctl 不存在或不可执行？）"
                 )
             })?;
-        // unit 不存在 / 未加载时不同 systemd 版本可能返回非零；统一按“未解析”处理，
-        // 由 ensure_fragment_is 拒绝操作。
-        if !output.status.success() {
-            return Ok(None);
-        }
-        parse_fragment_path(&output.stdout, unit)
+        fragment_path_from_show(
+            output.status.success(),
+            &output.stdout,
+            &output.stderr,
+            unit,
+        )
     }
 
     /// 断言 systemd 实际解析的 unit 文件就是 `expected`。
@@ -454,6 +647,172 @@ impl ServiceManager {
     }
 }
 
+impl ServiceControl for ServiceManager {
+    fn fragment_path(&self, unit: &str) -> Result<Option<PathBuf>> {
+        ServiceManager::fragment_path(self, unit)
+    }
+
+    fn ensure_fragment_is(&self, unit: &str, expected: &Path) -> Result<()> {
+        ServiceManager::ensure_fragment_is(self, unit, expected)
+    }
+
+    fn daemon_reload(&self) -> Result<()> {
+        ServiceManager::daemon_reload(self)
+    }
+
+    fn is_managing(&self) -> bool {
+        ServiceManager::is_managing(self)
+    }
+
+    fn active_state(&self, unit: &str) -> Result<ServiceState> {
+        ServiceManager::active_state(self, unit)
+    }
+
+    fn main_pid(&self, unit: &str) -> Result<u32> {
+        ServiceManager::main_pid(self, unit)
+    }
+
+    fn enable_now(&self, unit: &str) -> Result<()> {
+        ServiceManager::enable_now(self, unit)
+    }
+
+    fn restart(&self, unit: &str) -> Result<()> {
+        ServiceManager::restart(self, unit)
+    }
+
+    fn stop(&self, unit: &str) -> Result<()> {
+        ServiceManager::stop(self, unit)
+    }
+
+    fn disable(&self, unit: &str) -> Result<()> {
+        ServiceManager::disable(self, unit)
+    }
+}
+
+/// 卸载前停止服务并确认 inactive，随后尽力 disable。
+///
+/// 顺序固定为 **stop → ActiveState → disable → 真正删除文件**：
+/// - 未启用 systemd 管理（`--no-systemd` / dry-run）：直接报错，不能把 no-op
+///   当成已停止；
+/// - stop 失败：直接返回错误，调用方不得删除 unit / binary / state，更不得 purge；
+/// - stop 成功但 ActiveState 不是精确 `inactive` / `failed`，或查询失败：同样
+///   返回错误并保留全部文件；
+/// - 已确认停止后才 disable；disable 失败只警告，因为 unit 文件即将删除，
+///   不应把“自启链接残留”与“服务仍在运行”混为一谈。
+///
+/// 错误信息由 `label` 拼成（例如“hub”），调用方负责在错误链里补充上下文。
+pub fn stop_service_checked(service: &dyn ServiceControl, unit: &str, label: &str) -> Result<()> {
+    if !service.is_managing() {
+        bail!(
+            "{label} 卸载未启用 systemd 管理（--no-systemd / dry-run），拒绝把 no-op 当作服务已停止"
+        );
+    }
+    service.stop(unit).with_context(|| {
+        format!(
+            "停止 {label} 服务 {unit} 失败；未删除任何文件，安装状态已保留（可修复 systemd 后重试）"
+        )
+    })?;
+    match service.active_state(unit) {
+        Ok(state) if state.is_stopped() => {}
+        Ok(state) => bail!(
+            "停止 {label} 服务 {unit} 后 ActiveState={}；无法确认已停止，未删除任何文件，安装状态已保留",
+            state.as_str()
+        ),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "无法确认 {label} 服务 {unit} 已停止；未删除任何文件，安装状态已保留（拒绝在状态未知时删除）"
+                )
+            })
+        }
+    }
+    if let Err(err) = service.disable(unit) {
+        eprintln!("警告：禁用 {label} 服务 {unit} 失败（继续删除 unit）: {err:#}");
+    }
+    Ok(())
+}
+
+/// 卸载时对“没有可停 unit 文件”的同名服务做严格状态检查。
+///
+/// unit 文件不存在、或 FragmentPath 为空（transient / 未加载）时不能 stop，
+/// 但仍必须确认同名服务确实已停止；active / activating / reloading /
+/// deactivating / 未知状态或查询失败都必须拒绝删除与 purge。
+pub fn ensure_service_stopped(service: &dyn ServiceControl, unit: &str, label: &str) -> Result<()> {
+    if !service.is_managing() {
+        bail!(
+            "{label} 卸载未启用 systemd 管理（--no-systemd / dry-run），无法确认同名服务状态；拒绝删除"
+        );
+    }
+    match service.active_state(unit) {
+        Ok(state) if state.is_stopped() => Ok(()),
+        Ok(state) => bail!(
+            "{label} 的 unit 文件不存在或未解析，但同名服务 {unit} 的 ActiveState={}；\
+             拒绝删除 unit / binary / config / data / state，也拒绝 --purge",
+            state.as_str()
+        ),
+        Err(err) => Err(err).with_context(|| {
+            format!("无法确认同名 {label} 服务 {unit} 已停止；拒绝删除与 --purge（安装状态已保留）")
+        }),
+    }
+}
+
+/// 删除 `systemctl enable` 生成的 target.wants 符号链接（只删符号链接）。
+///
+/// 安全边界：链接目标 canonicalize 后必须等于 `expected_target`（本安装 unit
+/// 的实际路径），否则保留。这样同名外来 unit 的 enable 链接不会被误删；
+/// `expected_target` 不存在（unit 文件缺失/未解析）时同样保留，不按名字猜。
+///
+/// `disable` 失败时 unit 文件删除前仍可能留下自启链接；调用方应先于删除 unit
+/// 调用本函数。同时检查 unit_dir 与 `/etc/systemd/system`（仅当 unit_dir 是
+/// systemd 会读取的目录，避免 prefix 测试触碰宿主）。
+pub fn remove_enable_symlink(
+    unit_dir: &Path,
+    unit_name: &str,
+    expected_target: &Path,
+) -> Result<()> {
+    validate_unit_arg(unit_name)?;
+    // unit 文件已不存在 / 不是普通文件（含符号链接）/ 路径无法解析：无法证明
+    // 链接归属，直接保留，不能按文件名删除。
+    match fs::symlink_metadata(expected_target) {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {}
+        _ => return Ok(()),
+    }
+    let Ok(expected) = fs::canonicalize(expected_target) else {
+        return Ok(());
+    };
+    let system_dir = Path::new("/etc/systemd/system");
+    let mut dirs = vec![unit_dir];
+    if unit_dir != system_dir && is_systemd_unit_dir(unit_dir) {
+        dirs.push(system_dir);
+    }
+    for dir in dirs {
+        for target in ["multi-user.target.wants", "graphical.target.wants"] {
+            let path = dir.join(target).join(unit_name);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    // canonicalize 同时解析相对目标与多级链接；失败（悬空/权限）
+                    // 时保留链接，不能按文件名删除。
+                    let Ok(actual) = fs::canonicalize(&path) else {
+                        continue;
+                    };
+                    if actual != expected {
+                        continue;
+                    }
+                    fs::remove_file(&path)
+                        .with_context(|| format!("删除启用链接 {} 失败", path.display()))?;
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("检查启用链接 {} 失败", path.display()))
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 校验 unit 文件名，返回文件名本身。
 fn validate_unit_name(name: &str) -> Result<&str> {
     if name.is_empty() {
@@ -492,6 +851,83 @@ fn validate_unit_arg(unit: &str) -> Result<()> {
 ///
 /// 空输出（unit 未加载 / transient）返回 `None`；输出必须是单行绝对路径。
 /// 非 UTF-8、含控制字符或多行输出都视为畸形并返回错误（fail-closed）。
+/// `systemctl show` 中安装器关心的属性。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UnitShowInfo {
+    fragment_path: Option<String>,
+    load_state: Option<String>,
+}
+
+/// 解析 `systemctl show -p FragmentPath -p LoadState` 的 `key=value` 输出。
+fn parse_unit_show(stdout: &[u8], unit: &str) -> Result<UnitShowInfo> {
+    let text = std::str::from_utf8(stdout)
+        .with_context(|| format!("systemctl show {unit} 返回的属性不是有效 UTF-8"))?;
+    let mut info = UnitShowInfo::default();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            bail!("systemctl show {unit} 返回了无法解析的行: {line:?}");
+        };
+        match key {
+            "FragmentPath" => info.fragment_path = Some(value.to_string()),
+            "LoadState" => info.load_state = Some(value.to_string()),
+            // 只请求了两个属性；其他行说明 systemd 行为异常，但忽略不会放大权限。
+            _ => {}
+        }
+    }
+    Ok(info)
+}
+
+/// stderr 是否明确表示 unit 不存在（而不是 D-Bus / 权限 / 其他故障）。
+fn stderr_looks_like_not_found(stderr: &[u8]) -> bool {
+    let lower = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    lower.contains("not-found")
+        || lower.contains("not found")
+        || lower.contains("could not be found")
+}
+
+/// 解释 `systemctl show` 结果；只有明确 not-found 才允许返回 `Ok(None)`。
+///
+/// 旧实现把所有非零退出都当成“unit 未加载”，D-Bus/权限错误也会让卸载走
+/// “只删文件”的危险路径；这里必须区分明确不存在与其他失败。
+fn fragment_path_from_show(
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+    unit: &str,
+) -> Result<Option<PathBuf>> {
+    // 即使 systemctl 非零退出，部分旧版本仍会在 stdout 输出 LoadState=not-found；
+    // 解析失败时不要用输出错误覆盖原始失败信息。
+    let parsed = parse_unit_show(stdout, unit).ok();
+    if parsed.as_ref().and_then(|info| info.load_state.as_deref()) == Some("not-found") {
+        return Ok(None);
+    }
+    if !success {
+        if stderr_looks_like_not_found(stderr) {
+            return Ok(None);
+        }
+        let stderr = String::from_utf8_lossy(stderr);
+        let detail = stderr.trim();
+        bail!(
+            "systemctl show {unit} 失败（不是明确的 not-found；拒绝当作 unit 不存在）: {}",
+            if detail.is_empty() {
+                "<无 stderr>"
+            } else {
+                detail
+            }
+        );
+    }
+    let info = parsed
+        .ok_or_else(|| anyhow::anyhow!("systemctl show {unit} 输出无法解析，拒绝猜测 unit 状态"))?;
+    match info.fragment_path.as_deref() {
+        None | Some("") => Ok(None),
+        Some(path) => parse_fragment_path(path.as_bytes(), unit),
+    }
+}
+
 fn parse_fragment_path(stdout: &[u8], unit: &str) -> Result<Option<PathBuf>> {
     let text = std::str::from_utf8(stdout)
         .with_context(|| format!("systemctl show {unit} 返回的 FragmentPath 不是有效 UTF-8"))?;
@@ -823,5 +1259,324 @@ mod tests {
             message.contains("拒绝操作同名外来/更高优先级 unit"),
             "{message}"
         );
+    }
+
+    /// 卸载停止流程的 fake：只记录调用，不接触宿主 systemd。
+    struct FakeService {
+        stop_error: Option<&'static str>,
+        disable_error: Option<&'static str>,
+        state: ServiceState,
+        state_error: Option<&'static str>,
+        managing: bool,
+        stop_calls: std::cell::Cell<usize>,
+        disable_calls: std::cell::Cell<usize>,
+    }
+
+    impl FakeService {
+        fn new() -> Self {
+            Self {
+                stop_error: None,
+                disable_error: None,
+                state: ServiceState::Inactive,
+                state_error: None,
+                managing: true,
+                stop_calls: std::cell::Cell::new(0),
+                disable_calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl ServiceControl for FakeService {
+        fn fragment_path(&self, _unit: &str) -> Result<Option<PathBuf>> {
+            Ok(None)
+        }
+
+        fn ensure_fragment_is(&self, _unit: &str, _expected: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn daemon_reload(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_managing(&self) -> bool {
+            self.managing
+        }
+
+        fn active_state(&self, _unit: &str) -> Result<ServiceState> {
+            match self.state_error {
+                Some(message) => bail!("{message}"),
+                None => Ok(self.state.clone()),
+            }
+        }
+
+        fn main_pid(&self, _unit: &str) -> Result<u32> {
+            Ok(if self.state.is_active_or_starting() {
+                4242
+            } else {
+                0
+            })
+        }
+
+        fn enable_now(&self, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn restart(&self, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&self, _unit: &str) -> Result<()> {
+            self.stop_calls.set(self.stop_calls.get() + 1);
+            match self.stop_error {
+                Some(message) => bail!("{message}"),
+                None => Ok(()),
+            }
+        }
+
+        fn disable(&self, _unit: &str) -> Result<()> {
+            self.disable_calls.set(self.disable_calls.get() + 1);
+            match self.disable_error {
+                Some(message) => bail!("{message}"),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn service_state_classification_is_strict() {
+        for state in ["inactive", "failed"] {
+            assert!(ServiceState::parse(state).is_stopped(), "{state}");
+            assert!(
+                !ServiceState::parse(state).is_active_or_starting(),
+                "{state}"
+            );
+        }
+        for state in ["active", "activating", "reloading"] {
+            assert!(!ServiceState::parse(state).is_stopped(), "{state}");
+            assert!(
+                ServiceState::parse(state).is_active_or_starting(),
+                "{state}"
+            );
+        }
+        for state in ["deactivating", "unknown", ""] {
+            assert!(!ServiceState::parse(state).is_stopped(), "{state:?}");
+            assert!(
+                !ServiceState::parse(state).is_active_or_starting(),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fragment_path_show_distinguishes_not_found_from_systemd_errors() {
+        let unit = "rustboard-hub.service";
+        // 明确 not-found：可以返回 None。
+        assert_eq!(
+            fragment_path_from_show(
+                false,
+                b"",
+                b"Unit rustboard-hub.service could not be found.\n",
+                unit
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            fragment_path_from_show(false, b"LoadState=not-found\n", b"", unit).unwrap(),
+            None
+        );
+        // 其他非零（D-Bus / 权限 / 未知）必须 Err，不能当成未加载。
+        for stderr in [
+            b"Failed to connect to bus: Permission denied\n".as_slice(),
+            b"Failed to connect to bus: No such file or directory\n".as_slice(),
+            b"Some unexpected DBus failure\n".as_slice(),
+            b"".as_slice(),
+        ] {
+            let error = fragment_path_from_show(false, b"", stderr, unit).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("不是明确的 not-found"),
+                "{error:#}"
+            );
+        }
+        // 成功输出正常解析；空 FragmentPath 视为未解析。
+        assert_eq!(
+            fragment_path_from_show(
+                true,
+                b"FragmentPath=/etc/systemd/system/rustboard-hub.service\nLoadState=loaded\n",
+                b"",
+                unit
+            )
+            .unwrap(),
+            Some(PathBuf::from("/etc/systemd/system/rustboard-hub.service"))
+        );
+        assert_eq!(
+            fragment_path_from_show(true, b"FragmentPath=\nLoadState=loaded\n", b"", unit).unwrap(),
+            None
+        );
+        assert!(fragment_path_from_show(true, b"not-a-property\n", b"", unit).is_err());
+    }
+
+    #[test]
+    fn stop_failure_aborts_before_disable() {
+        let mut service = FakeService::new();
+        service.stop_error = Some("stop failed");
+        // 服务在 stop 失败后可能仍在运行；必须直接报错，不能 disable。
+        service.state = ServiceState::Active;
+        let error = stop_service_checked(&service, "rustboard-hub.service", "hub").unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("停止 hub 服务"), "{message}");
+        assert!(message.contains("安装状态已保留"), "{message}");
+        assert_eq!(service.stop_calls.get(), 1);
+        assert_eq!(
+            service.disable_calls.get(),
+            0,
+            "stop 失败后不得继续 disable"
+        );
+    }
+
+    #[test]
+    fn still_active_or_unknown_state_aborts_before_disable() {
+        let mut service = FakeService::new();
+        service.state = ServiceState::Active;
+        let error = stop_service_checked(&service, "rustboard-agent.service", "agent").unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("ActiveState=active"), "{message}");
+        assert!(message.contains("未删除任何文件"), "{message}");
+        assert_eq!(service.disable_calls.get(), 0);
+
+        // activating / deactivating / reloading 都不能当成已停止。
+        for state in [
+            ServiceState::Activating,
+            ServiceState::Deactivating,
+            ServiceState::Reloading,
+        ] {
+            let mut service = FakeService::new();
+            service.state = state.clone();
+            let error =
+                stop_service_checked(&service, "rustboard-panel.service", "panel").unwrap_err();
+            assert!(
+                format!("{error:#}").contains(state.as_str()),
+                "{}: {error:#}",
+                state.as_str()
+            );
+            assert_eq!(service.disable_calls.get(), 0);
+        }
+
+        let mut service = FakeService::new();
+        service.state_error = Some("systemctl show ActiveState 执行失败");
+        let error = stop_service_checked(&service, "rustboard-panel.service", "panel").unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("无法确认 panel 服务"), "{message}");
+        assert!(message.contains("拒绝在状态未知时删除"), "{message}");
+        assert_eq!(service.disable_calls.get(), 0);
+    }
+
+    #[test]
+    fn no_op_manager_is_rejected() {
+        let mut service = FakeService::new();
+        service.managing = false;
+        let error = stop_service_checked(&service, "rustboard-hub.service", "hub").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("未启用 systemd 管理"),
+            "{error:#}"
+        );
+        assert_eq!(service.stop_calls.get(), 0);
+        assert_eq!(service.disable_calls.get(), 0);
+
+        let error = ensure_service_stopped(&service, "rustboard-hub.service", "hub").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("未启用 systemd 管理"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn ensure_service_stopped_rejects_running_and_unknown_states() {
+        for state in [
+            ServiceState::Active,
+            ServiceState::Activating,
+            ServiceState::Deactivating,
+            ServiceState::Reloading,
+        ] {
+            let mut service = FakeService::new();
+            service.state = state.clone();
+            let error =
+                ensure_service_stopped(&service, "rustboard-agent.service", "agent").unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains(state.as_str()), "{message}");
+            assert!(message.contains("拒绝删除"), "{message}");
+        }
+        for state in [ServiceState::Inactive, ServiceState::Failed] {
+            let mut service = FakeService::new();
+            service.state = state;
+            ensure_service_stopped(&service, "rustboard-agent.service", "agent").unwrap();
+        }
+        let mut service = FakeService::new();
+        service.state_error = Some("mock query failure");
+        let error =
+            ensure_service_stopped(&service, "rustboard-agent.service", "agent").unwrap_err();
+        assert!(format!("{error:#}").contains("拒绝删除"), "{error:#}");
+    }
+
+    #[test]
+    fn remove_enable_symlink_only_removes_symlinks() {
+        let unit_dir = std::env::temp_dir().join(format!(
+            "rb-install-enable-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let wants = unit_dir.join("multi-user.target.wants");
+        std::fs::create_dir_all(&wants).unwrap();
+        let unit_name = format!("rustboard-test-{}.service", std::process::id());
+        let target = unit_dir.join("rustboard-test.service");
+        std::fs::write(&target, b"unit").unwrap();
+        let link = wants.join(&unit_name);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        remove_enable_symlink(&unit_dir, &unit_name, &target).unwrap();
+        assert!(!link.exists(), "wants 符号链接应被删除");
+        assert!(target.exists(), "链接目标不能被删除");
+
+        // 同名普通文件必须保留（不能把用户文件当链接删除）。
+        std::fs::write(&link, b"keep").unwrap();
+        remove_enable_symlink(&unit_dir, &unit_name, &target).unwrap();
+        assert!(link.exists(), "同名普通文件不能被删除");
+
+        // 同名外来 unit 的 wants 链接必须保留。
+        let foreign = unit_dir.join("foreign.service");
+        std::fs::write(&foreign, b"foreign unit").unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&foreign, &link).unwrap();
+        remove_enable_symlink(&unit_dir, &unit_name, &target).unwrap();
+        assert!(link.exists(), "链接目标不是本安装 unit 时必须保留");
+        assert!(foreign.exists(), "外来 unit 不能被删除");
+
+        // 悬空链接 / 本安装 unit 缺失：无法确认归属，保留链接。
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("missing.service", &link).unwrap();
+        remove_enable_symlink(&unit_dir, &unit_name, &target).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "悬空链接不能按名字删除"
+        );
+        std::fs::remove_file(&target).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&foreign, &link).unwrap();
+        remove_enable_symlink(&unit_dir, &unit_name, &target).unwrap();
+        assert!(link.exists(), "unit 缺失时不能按名字删除");
+        let _ = std::fs::remove_dir_all(&unit_dir);
+    }
+
+    #[test]
+    fn disable_failure_is_reported_but_does_not_fail_after_inactive() {
+        let mut service = FakeService::new();
+        service.disable_error = Some("disable failed");
+        // stop 成功、已确认 inactive 时 disable 失败只影响自启，不阻塞文件清理。
+        stop_service_checked(&service, "rustboard-hub.service", "hub").unwrap();
+        assert_eq!(service.stop_calls.get(), 1);
+        assert_eq!(service.disable_calls.get(), 1);
     }
 }

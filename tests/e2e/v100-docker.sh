@@ -803,6 +803,7 @@ setup_resources() {
 
 write_compose_facts_py() {
   cat >"$TMP_ROOT/compose_facts.py" <<'PY'
+import ipaddress
 import json
 import sys
 
@@ -816,31 +817,75 @@ def as_int(value):
     return int(text) if text.isdigit() else None
 
 
+LOOPBACK_V4 = ipaddress.IPv4Address("127.0.0.1")
+LOOPBACK_V6 = ipaddress.IPv6Address("::1")
+
+
+def normalize_host_ip(host_ip):
+    text = "" if host_ip is None else str(host_ip).strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    if not text:
+        return ""
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        return text.lower()
+    if addr == LOOPBACK_V4 or addr == LOOPBACK_V6:
+        return "loopback"
+    return str(addr)
+
+
 def parse_short(value):
     text = str(value).strip()
     if not text:
-        return None, None
+        return None, None, ""
     if "/" in text:
         text = text.split("/", 1)[0]
+    host_ip = ""
+    published = None
+    target = None
     if text.startswith("["):
         end = text.find("]")
         if end < 0:
-            return None, None
-        parts = [p for p in text[end + 1:].split(":") if p]
-        target = parts[-1] if parts else None
-        published = parts[-2] if len(parts) >= 2 else None
+            return None, None, ""
+        host_ip = text[1:end]
+        rest = text[end + 1:]
+        if rest.startswith(":"):
+            rest = rest[1:]
+        parts = rest.split(":") if rest else []
+        if len(parts) >= 2:
+            published = parts[-2]
+            target = parts[-1]
+        elif len(parts) == 1:
+            target = parts[0]
     else:
         parts = text.split(":")
-        target = parts[-1] if parts else None
-        published = parts[-2] if len(parts) >= 2 else None
-    return as_int(target), published
+        if len(parts) >= 3:
+            host_ip = parts[0]
+            published = parts[-2]
+            target = parts[-1]
+        elif len(parts) == 2:
+            published = parts[0]
+            target = parts[1]
+        elif len(parts) == 1:
+            target = parts[0]
+    if published in ("", None):
+        published = None
+    else:
+        published = str(published)
+    return as_int(target), published, normalize_host_ip(host_ip)
 
 
 def normalize_port(port):
     if isinstance(port, dict):
-        return as_int(port.get("target")), port.get("published")
+        return (
+            as_int(port.get("target")),
+            port.get("published"),
+            normalize_host_ip(port.get("host_ip")),
+        )
     if isinstance(port, int):
-        return port, None
+        return port, None, ""
     return parse_short(port)
 
 
@@ -848,7 +893,7 @@ def port_values(services, name):
     targets = set()
     published = set()
     for port in (services.get(name) or {}).get("ports") or []:
-        target, pub = normalize_port(port)
+        target, pub, _host_ip = normalize_port(port)
         if target is not None:
             targets.add(target)
         if pub is not None:
@@ -866,6 +911,19 @@ def pub_contains(published, port):
             if start.isdigit() and end.isdigit() and int(start) <= port <= int(end):
                 return True
     return False
+
+
+def collect_8080(services):
+    entries = 0
+    nonloopback = 0
+    for service in (services or {}).values():
+        for port in (service or {}).get("ports") or []:
+            _target, pub, host_ip = normalize_port(port)
+            if pub is not None and pub_contains({pub}, 8080):
+                entries += 1
+                if host_ip != "loopback":
+                    nonloopback += 1
+    return entries, nonloopback
 
 
 def socket_mount(service):
@@ -911,6 +969,9 @@ def main():
         or 8444 in agent_targets
     ) else 0
 
+    count_8080, nonloopback_8080 = collect_8080(services)
+    loopback_8080_ok = 1 if count_8080 > 0 and nonloopback_8080 == 0 else 0
+
     profiles = agent.get("profiles") or []
     if not isinstance(profiles, list):
         profiles = [str(profiles)]
@@ -930,6 +991,9 @@ def main():
     print("agent_privileged=" + ("true" if agent.get("privileged") else "false"))
     print("agent_socket=" + str(socket_mount(agent)))
     print("all_8444=" + str(all_8444))
+    print("published_8080_entries=%d" % count_8080)
+    print("published_8080_nonloopback=%d" % nonloopback_8080)
+    print("published_8080_loopback=%d" % loopback_8080_ok)
 
 
 if __name__ == "__main__":
@@ -989,6 +1053,8 @@ compose_checks() {
     "$(compose_fact hub_targets)" "8080,8443"
   check_csv_eq "C.3b" "hub ports published 仅 8443 与 8080" \
     "$(compose_fact hub_published)" "8080,8443"
+  check_eq "C.3c" "8080 发布项均显式回环 127.0.0.1/::1" "0/1" \
+    "$(compose_fact published_8080_nonloopback)/$(compose_fact published_8080_loopback)"
   check_eq "C.4" "8444 不出现在任何 service 的 ports（target/published）" "0" \
     "$(compose_fact all_8444)"
   check_eq "C.5" "panel 使用 network_mode: service:hub" "service:hub" \

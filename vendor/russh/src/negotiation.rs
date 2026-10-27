@@ -44,7 +44,14 @@ pub struct Names {
     pub kex: kex::Name,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub key: Algorithm,
+    /// Cipher for the client-to-server direction.
     pub cipher: cipher::Name,
+    /// Cipher for the server-to-client direction.
+    ///
+    /// RFC 4253 §6.3 only *recommends* using the same algorithm in both
+    /// directions; each direction is negotiated independently and may end up
+    /// with a different cipher.
+    pub server_cipher: cipher::Name,
     pub client_mac: mac::Name,
     pub server_mac: mac::Name,
     pub server_compression: compression::Compression,
@@ -380,33 +387,58 @@ pub(crate) trait Select {
         };
 
         // Cipher
+        //
+        // RFC 4253 §6.3: each direction is negotiated independently, so both
+        // name-lists must be read and selected separately. Using the
+        // client-to-server choice for both directions breaks a backend that
+        // offers e.g. aes256-ctr only client-to-server and aes128-ctr only
+        // server-to-client. `Self::select` always iterates the client's
+        // preference list first (for the client that is `pref`, for the
+        // server that is the peer's list), which is the RFC 4253 §7.1 rule.
 
-        let cipher_list = NameList::decode(&mut r)?;
-        let (_cipher_both_first, cipher) =
-            Self::select(&pref.cipher, &cipher_list, AlgorithmKind::Cipher)?;
-        String::decode(&mut r)?; // cipher server-to-client.
+        let client_cipher_list = NameList::decode(&mut r)?;
+        let (_client_cipher_both_first, client_cipher) =
+            Self::select(&pref.cipher, &client_cipher_list, AlgorithmKind::Cipher)?;
+
+        let server_cipher_list = NameList::decode(&mut r)?;
+        let (_server_cipher_both_first, server_cipher) =
+            Self::select(&pref.cipher, &server_cipher_list, AlgorithmKind::Cipher)?;
 
         // MAC
+        //
+        // Whether a MAC is required depends on the cipher of *that* direction:
+        // an AEAD cipher in one direction (e.g. chacha20-poly1305) must not
+        // force a MAC in the other, and a non-AEAD cipher must never be paired
+        // with `none`.
 
-        let need_mac = CIPHERS.get(&cipher).map(|x| x.needs_mac()).unwrap_or(false);
+        let need_client_mac = CIPHERS
+            .get(&client_cipher)
+            .map(|x| x.needs_mac())
+            .unwrap_or(false);
+        let need_server_mac = CIPHERS
+            .get(&server_cipher)
+            .map(|x| x.needs_mac())
+            .unwrap_or(false);
 
         // Select a MAC, refusing `none` whenever the negotiated cipher needs an
         // integrity MAC — regardless of whether `none` was a common choice or
         // only the no-common-MAC fallback. Pairing e.g. aes*-ctr/cbc with
         // mac=none yields a tag_len() of 0 and a panic on the read path.
-        let select_mac = |list: &[String]| match Self::select(&pref.mac, list, AlgorithmKind::Mac) {
-            Ok((_, m)) if need_mac && m == mac::NONE => Err(Error::NoCommonAlgo {
-                kind: AlgorithmKind::Mac,
-                ours: pref.mac.iter().map(|x| x.as_ref().to_owned()).collect(),
-                theirs: list.to_vec(),
-            }),
-            Ok((_, m)) => Ok(m),
-            Err(_) if !need_mac => Ok(mac::NONE),
-            Err(e) => Err(e),
-        };
+        let select_mac =
+            |list: &[String], need_mac: bool| match Self::select(&pref.mac, list, AlgorithmKind::Mac)
+            {
+                Ok((_, m)) if need_mac && m == mac::NONE => Err(Error::NoCommonAlgo {
+                    kind: AlgorithmKind::Mac,
+                    ours: pref.mac.iter().map(|x| x.as_ref().to_owned()).collect(),
+                    theirs: list.to_vec(),
+                }),
+                Ok((_, m)) => Ok(m),
+                Err(_) if !need_mac => Ok(mac::NONE),
+                Err(e) => Err(e),
+            };
 
-        let client_mac = select_mac(&NameList::decode(&mut r)?)?;
-        let server_mac = select_mac(&NameList::decode(&mut r)?)?;
+        let client_mac = select_mac(&NameList::decode(&mut r)?, need_client_mac)?;
+        let server_mac = select_mac(&NameList::decode(&mut r)?, need_server_mac)?;
 
         // Compression
 
@@ -438,7 +470,8 @@ pub(crate) trait Select {
         Ok(Names {
             kex: kex_algorithm,
             key: key_algorithm,
-            cipher,
+            cipher: client_cipher,
+            server_cipher,
             client_mac,
             server_mac,
             client_compression,
@@ -998,5 +1031,280 @@ mod tests {
             server_certificate_names(&no_sha1, &[cert], &keys),
             vec!["rsa-sha2-512-cert-v01@openssh.com".to_string()]
         );
+    }
+
+    /// Build a KEXINIT payload with independent cipher lists per direction
+    /// and an explicit (identical) MAC list for both directions.
+    fn build_kexinit_ciphers(
+        kex_names: &[&str],
+        key_names: &[&str],
+        client_ciphers: &[&str],
+        server_ciphers: &[&str],
+        macs: &[String],
+        follows: bool,
+    ) -> Vec<u8> {
+        let pref = Preferred::DEFAULT;
+        let mut buf = vec![msg::KEXINIT];
+        buf.extend_from_slice(&[0u8; 16]); // cookie
+        let names = |v: Vec<String>| NameList(v);
+        names(kex_names.iter().map(|s| s.to_string()).collect())
+            .encode(&mut buf)
+            .unwrap();
+        names(key_names.iter().map(|s| s.to_string()).collect())
+            .encode(&mut buf)
+            .unwrap();
+        names(client_ciphers.iter().map(|s| s.to_string()).collect())
+            .encode(&mut buf)
+            .unwrap();
+        names(server_ciphers.iter().map(|s| s.to_string()).collect())
+            .encode(&mut buf)
+            .unwrap();
+        for _ in 0..2 {
+            names(macs.to_vec()).encode(&mut buf).unwrap();
+        }
+        for _ in 0..2 {
+            names(
+                pref.compression
+                    .iter()
+                    .map(|x| x.as_ref().to_string())
+                    .collect(),
+            )
+            .encode(&mut buf)
+            .unwrap();
+        }
+        Vec::<String>::new().encode(&mut buf).unwrap(); // lang c2s
+        Vec::<String>::new().encode(&mut buf).unwrap(); // lang s2c
+        (follows as u8).encode(&mut buf).unwrap();
+        0u32.encode(&mut buf).unwrap();
+        buf
+    }
+
+    fn default_macs() -> Vec<String> {
+        Preferred::DEFAULT
+            .mac
+            .iter()
+            .map(|m| m.as_ref().to_string())
+            .collect()
+    }
+
+    /// #98: RFC 4253 §6.3 allows a different cipher per direction. A backend
+    /// that only offers aes256-ctr client-to-server and aes128-ctr
+    /// server-to-client must negotiate exactly that, and the client and the
+    /// server must agree on the pair.
+    #[test]
+    fn ciphers_are_negotiated_per_direction() {
+        let buf = build_kexinit_ciphers(
+            KEX_FIRST,
+            &["ssh-ed25519"],
+            &["aes256-ctr"],
+            &["aes128-ctr"],
+            &default_macs(),
+            false,
+        );
+
+        let client = Client::read_kex(
+            &buf,
+            &Preferred::DEFAULT,
+            None,
+            None,
+            &KexCause::Initial,
+        )
+        .unwrap();
+        assert_eq!(client.cipher, cipher::AES_256_CTR);
+        assert_eq!(client.server_cipher, cipher::AES_128_CTR);
+
+        let server = Server::read_kex(
+            &buf,
+            &Preferred::DEFAULT,
+            None,
+            None,
+            &KexCause::Initial,
+        )
+        .unwrap();
+        assert_eq!(server.cipher, client.cipher);
+        assert_eq!(server.server_cipher, client.server_cipher);
+    }
+
+    /// #98: the default OpenSSH-style single-list negotiation must keep
+    /// picking one cipher for both directions.
+    #[test]
+    fn default_preferences_keep_single_cipher_when_lists_match() {
+        let ciphers: Vec<String> = Preferred::DEFAULT
+            .cipher
+            .iter()
+            .map(|c| c.as_ref().to_string())
+            .collect();
+        let cipher_refs: Vec<&str> = ciphers.iter().map(String::as_str).collect();
+        let buf = build_kexinit_ciphers(
+            KEX_FIRST,
+            &["ssh-ed25519"],
+            &cipher_refs,
+            &cipher_refs,
+            &default_macs(),
+            false,
+        );
+
+        let client = Client::read_kex(
+            &buf,
+            &Preferred::DEFAULT,
+            None,
+            None,
+            &KexCause::Initial,
+        )
+        .unwrap();
+        assert_eq!(client.cipher, client.server_cipher);
+        assert_eq!(client.cipher, cipher::CHACHA20_POLY1305);
+
+        let server = Server::read_kex(
+            &buf,
+            &Preferred::DEFAULT,
+            None,
+            None,
+            &KexCause::Initial,
+        )
+        .unwrap();
+        assert_eq!(server.cipher, client.cipher);
+        assert_eq!(server.server_cipher, client.server_cipher);
+    }
+
+    /// #98: a peer that only supports one cipher still works in both
+    /// directions.
+    #[test]
+    fn single_algorithm_peer_is_selected_for_both_directions() {
+        let buf = build_kexinit_ciphers(
+            KEX_FIRST,
+            &["ssh-ed25519"],
+            &["aes128-ctr"],
+            &["aes128-ctr"],
+            &default_macs(),
+            false,
+        );
+        let client = Client::read_kex(
+            &buf,
+            &Preferred::DEFAULT,
+            None,
+            None,
+            &KexCause::Initial,
+        )
+        .unwrap();
+        assert_eq!(client.cipher, cipher::AES_128_CTR);
+        assert_eq!(client.server_cipher, cipher::AES_128_CTR);
+    }
+
+    /// #98: no common cipher in *either* direction must be a hard,
+    /// direction-specific error rather than a silent fallback.
+    #[test]
+    fn no_common_cipher_in_one_direction_is_explicit_error() {
+        // server-to-client has no common algorithm.
+        let buf = build_kexinit_ciphers(
+            KEX_FIRST,
+            &["ssh-ed25519"],
+            &["aes256-ctr"],
+            &["3des-cbc"],
+            &default_macs(),
+            false,
+        );
+        let err = Client::read_kex(&buf, &Preferred::DEFAULT, None, None, &KexCause::Initial)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::NoCommonAlgo {
+                    kind: AlgorithmKind::Cipher,
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        // client-to-server has no common algorithm.
+        let buf = build_kexinit_ciphers(
+            KEX_FIRST,
+            &["ssh-ed25519"],
+            &["3des-cbc"],
+            &["aes128-ctr"],
+            &default_macs(),
+            false,
+        );
+        let err = Server::read_kex(&buf, &Preferred::DEFAULT, None, None, &KexCause::Initial)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::NoCommonAlgo {
+                    kind: AlgorithmKind::Cipher,
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// #98: requiring a MAC is a per-direction property: an AEAD cipher in one
+    /// direction must not mask a missing MAC in the other, and `none` stays
+    /// valid when both directions are AEAD.
+    #[test]
+    fn mac_requirement_follows_each_direction_cipher() {
+        let none_mac = Preferred {
+            mac: Cow::Borrowed(&[mac::NONE]),
+            ..Preferred::DEFAULT
+        };
+        let none_macs = vec!["none".to_string()];
+
+        // AEAD client-to-server + aes256-ctr server-to-client: the s2c MAC
+        // must be selected and `none` is not acceptable there.
+        let buf = build_kexinit_ciphers(
+            KEX_FIRST,
+            &["ssh-ed25519"],
+            &["chacha20-poly1305@openssh.com"],
+            &["aes256-ctr"],
+            &none_macs,
+            false,
+        );
+        let err = Client::read_kex(&buf, &none_mac, None, None, &KexCause::Initial).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::NoCommonAlgo {
+                    kind: AlgorithmKind::Mac,
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        // The reverse must fail for the client-to-server direction.
+        let buf = build_kexinit_ciphers(
+            KEX_FIRST,
+            &["ssh-ed25519"],
+            &["aes256-ctr"],
+            &["chacha20-poly1305@openssh.com"],
+            &none_macs,
+            false,
+        );
+        let err = Client::read_kex(&buf, &none_mac, None, None, &KexCause::Initial).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::NoCommonAlgo {
+                    kind: AlgorithmKind::Mac,
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        // AEAD in both directions: mac=none is legal.
+        let buf = build_kexinit_ciphers(
+            KEX_FIRST,
+            &["ssh-ed25519"],
+            &["chacha20-poly1305@openssh.com"],
+            &["chacha20-poly1305@openssh.com"],
+            &none_macs,
+            false,
+        );
+        let names = Client::read_kex(&buf, &none_mac, None, None, &KexCause::Initial).unwrap();
+        assert_eq!(names.client_mac, mac::NONE);
+        assert_eq!(names.server_mac, mac::NONE);
     }
 }

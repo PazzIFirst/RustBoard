@@ -10,6 +10,102 @@
 
 ## [Unreleased]
 
+### Added
+
+- schema v9：`alert_rules.revision` 与 `alert_rule_channels` 关系表（FK
+  `ON DELETE CASCADE` / `ON DELETE RESTRICT`），规则/渠道写路径在同一事务内
+  维护关系；API 继续输出兼容的 `channel_ids` JSON。
+- 告警评估 CAS：引擎提交时校验规则存在、启用状态与 revision；禁用/删除后的
+  旧评估返回 `Stale`，不再复活状态或产生新通知。
+- 本机采集（hub-self）使用 `agent_settings` 的有效间隔并响应设置变更；入库
+  失败进入独立 `hub-self-buffer` 持久缓冲，按 ACK 重试、重启可恢复。
+- Release 双层门禁：发布前校验目标 `$GITHUB_SHA` 的 CI 五项全绿（缺失、运行中、
+  取消、失败、API 错误均拒绝），并在 release 内重跑 security/control/v041/
+  cert-rotation/hardening；正式 tag 提升前校验远端 tag SHA。
+
+### Changed
+
+- **v1.0.0 只支持全新安装**：SQLite/PostgreSQL schema <9 一律 fail closed，
+  不执行旧数据迁移/回填；`#51`/`#58`/`#59` 的旧数据兼容推迟到首个正式版本之后，
+  发布说明必须写明 fresh install only。
+- PostgreSQL 备份/恢复/迁移的外部工具继承 Hub TLS 策略（默认 `verify-full`，
+  仅显式 `sslmode=disable` 才关闭；私有 CA 通过 `PGSSLROOTCERT`），并清理会
+  降级/覆盖的继承环境变量。
+- 卸载服务：stop 失败、ActiveState 非 inactive/failed、unit 缺失但同名服务仍
+  活动或 systemd 状态未知时，保留 unit/binary/config/data/state，不再误删。
+- Agent `--force` 升级已运行服务时显式 restart 并校验证书/配置生效；
+  `max_batch_samples` 现在真正拆批且拒绝 0。
+- 控制面 unit 规范化统一（短名补 `.service`，`ssh`/`sshd`/`ssh@`/`sshd@` 等
+  OpenSSH 名称禁止），队列携带绝对 deadline，超时/取消的命令不再派发。
+- Docker Agent 支持 `RUSTBOARD_TLS_MODE=fingerprint|system-roots|custom-ca`，
+  ACME Hub 可用 system-roots/custom-ca；文档新增已初始化 volume 的受控属主切换
+  重配置流程。
+
+### Fixed
+
+- `#52` 备份证书与 CertLock/轮换互斥，复制后校验 cert/key 与 CA 配套；恢复前
+  同样校验，避免备份/恢复不配套材料。
+- `#53` Hub 安装确认回答 n 时在任何写入前取消。
+- `#54` Release 不再绕过目标提交的安全 E2E/CI 结果。
+- `#56` Docker Agent 不再固定 fingerprint，支持 ACME system-roots/custom-ca。
+- `#57` 证书续签期间已完成控制命令的应答及时写回，避免 Hub 误报超时。
+- `#60` ACME 长输出按 UTF-8 边界有界截断，不再因中文输出死循环。
+- `#61` backup/restore/migrate 的 TOML 解析错误不再回显配置原文/token。
+- `#62` PostgreSQL 编码后的 `password` 参数名也被脱敏，fragment 不泄露后缀。
+- `#63` Agent 按 `max_batch_samples` 拆批，样本无丢失/重复，子批独立 seq。
+- `#64` 备份/恢复密码优先级与运行驱动一致（query 覆盖 authority，env 再覆盖）。
+- `#65` 已 504 的未派发控制请求恢复消费后不再执行。
+- `#66` hub-self 设置间隔真正生效，本机采集响应运行时变更。
+- `#67` pg_dump/pg_restore/migrate 继承 Hub TLS 策略，不再回退 prefer/明文。
+- `#68` 到期告警读取 live 证书而非热加载失败的磁盘新证书。
+- `#69` 禁用规则后的旧评估不能重建状态/产生通知。
+- `#70` 规则渠道校验与写入同事务，关系表/FK 阻止并发删除留下悬空引用。
+- `#71` Panel `--force` 复用外部 TLS 时事务复制到配置指向的托管路径。
+- `#72` Hub/Panel/Agent 卸载停服失败或状态未知时拒绝删除/purge。
+- `#73` 腾讯云元数据探测使用固定字面 IP，不再被字面 IP 校验拒绝。
+- `#74` 自动审计清理测试直接断言旧记录删除，禁用 prune 会失败。
+- `#75` hub-self 入库失败/重启后可重试，不再直接丢弃样本。
+- `#76` 面板启动加载与 watcher 注册之间的密码重置不再被吞。
+- `#77` Agent 已运行服务升级后 restart 并校验新进程，失败回滚旧服务。
+- `#78` 控制面统一 unit 规范化，禁止 `ssh`/`sshd` 短名与实例模板。
+- `#79` Docker 已初始化 volume 的受控重配置流程，不再被 prefix 属主校验拒绝。
+- `#80` Docker 文档构建命令补 `-f docker/Dockerfile` 并明确仓库根 context。
+- `#81` 压力/SFTP RSS 门禁统一 KiB，采样失败不再默认 0。
+- `#82` 告警压力门禁强制 20 规则启用、health 全 200 与真实评估/预算证据。
+- `#83` 会话保持探针收到 Problem/提前关闭立即失败，必须真实保持到期。
+- `#84` 面板控制审计要求本次新增记录，旧审计不能代替。
+- `#85` DOS-04b 同时要求 hub 健康与 agent 在线。
+- `#86` ARCH-15b 同时比较远端 size 与 DB `archive_objects.bytes`。
+- `#87` Docker PG 按 s4-agent ID 断言真实样本/批次，hub-self 不能代偿。
+- `#88` Compose 回环发布断言保留 host_ip，全网/缺省绑定会失败。
+- `#89` ARM64/离线门禁信号退出码 130/143，失败/中断不再 0 退出。
+- `#90` `ALLOW_UNVERIFIED` 逐项校验可得来源，已确定不一致仍 FATAL。
+- `#91` 手工 PG 恢复流程用 root 打开备份 fd，postgres 用户不再读 root 0700
+  文件；恢复块补 `set -euo pipefail`、预检、真实预恢复备份与 `--exit-on-error`。
+- `#92` README/离线/容器文档从 Cargo 版本派生包名，不再硬编码 rc.2。
+- `#93` ACME 管理 HTTPS 示例补 `--admin-listen`，并澄清默认随机回环端口与
+  ACME SAN 只来自 `--domain`。
+- `#94` 容器降权验证读取服务进程 `/proc/<pid>/status`，fail closed。
+- `#95` ACME 续期窗口统一为 `min(lifetime/3, 48h)`。
+- `#96` vendored russh 跳过空 SSH Data，合法空帧不再被当 EOF。
+- `#97` 零窗口断连唤醒 writer 并返回 BrokenPipe（含 `into_stream` 生产路径）。
+- `#98` c2s/s2c cipher 分别协商与派生，支持双向不同算法。
+- `#99` vendored ssh-key RSA 私钥相等比较补上 iqmp。
+- `#100` 证书算法解析拒绝空/空白/控制字符名称，`certificate_type` 不 panic。
+- `#101` authorized_keys 支持 options 无 comment、引号/tab/`#`，同时对齐
+  OpenSSH 行内注释与转义语义。
+- `#102` ECDSA 私钥接受短/带前导零的合法标量，并补曲线阶/零/负值校验。
+
+### Security
+
+- PG 外部工具显式 TLS 策略与私有 CA；DSN 密码只经环境变量传递，argv/错误/
+  日志不含密码。
+- 面板/控制/安全 E2E 失败日志统一脱敏，临时 admin token 与一次性 enrollment
+  token 不再进入公开 CI/release 日志。
+- 崩溃安全的证书备份/恢复锁，卸载停服严格状态校验，Agent 升级失败回滚。
+- vendored `russh`/`ssh-key` 的最小安全 patch 记录在 `vendor/*/PATCHES.md`，
+  CI 直接运行两个 vendor crate 的单测、格式与 no_std 组合。
+
 ## [1.0.0-rc.3] - 2026-10-27
 
 ### Fixed

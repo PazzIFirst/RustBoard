@@ -186,7 +186,9 @@ pub enum Error {
 /// Load a public key from a file. Ed25519, EC-DSA and RSA keys are supported.
 ///
 /// ```
-/// russh::keys::load_public_key("../files/id_ed25519.pub").unwrap();
+/// // P5 vendor 注：上游仓库的 fixture 位于 crate 同级的 `files/`；本仓库把
+/// // 发布包缺失的 `files/id_ed25519.pub` 一并放入 vendor crate，使 doctest 可运行。
+/// russh::keys::load_public_key("files/id_ed25519.pub").unwrap();
 /// ```
 pub fn load_public_key<P: AsRef<Path>>(path: P) -> Result<ssh_key::PublicKey, Error> {
     let mut pubkey = String::new();

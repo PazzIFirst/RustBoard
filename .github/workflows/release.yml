@@ -22,10 +22,14 @@ env:
 
 jobs:
   # 1. 版本/tag/main 祖先与全部门禁。任何失败都不会进入构建与推送。
+  # 第一层 #54 门禁：构建前查询目标 $GITHUB_SHA 的 CI check-runs，只信这个 SHA 的
+  # 全绿结果；显式授予 checks: read / actions: read（其余 job 保持最小权限）。
   verify:
     name: 校验与发布门禁
     permissions:
       contents: read
+      actions: read
+      checks: read
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
@@ -39,6 +43,284 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.sha }}
           persist-credentials: false
+
+      # #54 第一层门禁（在任何构建之前）：目标 SHA 的 CI 必须全绿。
+      # 只查 $GITHUB_SHA，不回退到 main 最新；缺失、排队/运行中、取消/失败/
+      # 超时/中性/跳过、API 非零、JSON 非法一律 fail closed。同一 SHA 的多次
+      # attempt：存在任何未完成的同名 check 即拒绝；否则只取最后启动的 completed
+      # attempt 判定，避免旧成功掩盖新 attempt 的失败，也允许失败后重跑成功。
+      # 同时校验 check run 来自 github-actions 且 check_suite 关联目标 SHA 的
+      # .github/workflows/ci.yml push run，防止同名 check 冒名。
+      - name: 目标 SHA CI 门禁（fmt/postgres/e2e/web/audit）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY 未设置}"
+          sha="${GITHUB_SHA:?GITHUB_SHA 未设置}"
+          owner="${repo%%/*}"
+          name="${repo#*/}"
+          if [ "$owner" = "$repo" ] \
+            || [ "$owner" = "." ] || [ "$owner" = ".." ] \
+            || [ "$name" = "." ] || [ "$name" = ".." ] \
+            || [[ ! "$owner" =~ ^[A-Za-z0-9_.-]+$ ]] \
+            || [[ ! "$name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::GITHUB_REPOSITORY 非法: ${repo}"
+            exit 1
+          fi
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::GITHUB_SHA 不是 40 位小写十六进制: ${sha}"
+            exit 1
+          fi
+
+          # 必须与 ci.yml 的 job 显示名精确一致；名称缺失同样拒绝发布。
+          required=(
+            "fmt / clippy / test"
+            "postgres / Phase D 实库测试"
+            "e2e 安全回归"
+            "web / tsc / build"
+            "cargo audit"
+          )
+
+          work_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/sha-ci-gate.XXXXXX")"
+          trap 'rm -rf "$work_dir"' EXIT
+
+          # 读取一页 JSON 并输出条目数；JSON 非法/缺数组一律失败。
+          json_page_count() {
+            local body=$1 key=$2
+            python3 - "$body" "$key" <<'PY'
+          import json
+          import sys
+
+          path, key = sys.argv[1], sys.argv[2]
+          try:
+              with open(path, encoding="utf-8") as handle:
+                  payload = json.load(handle)
+          except (OSError, ValueError) as exc:
+              raise SystemExit(f"{key} JSON 解析失败: {exc}")
+          if not isinstance(payload, dict) or not isinstance(payload.get(key), list):
+              raise SystemExit(f"{key} 响应缺少 {key} 数组")
+          print(len(payload[key]))
+          PY
+          }
+
+          # 分页取全：每页 100 条。第 20 页仍满时再取第 21 页确认确实为空，
+          # 避免恰好 2000 条时把第 20 页满误判为超限。
+          fetch_pages() {
+            local label=$1 url=$2 key=$3 out_dir=$4
+            local page=1 body count
+            mkdir -p "$out_dir"
+            while [ "$page" -le 20 ]; do
+              body="$out_dir/page-${page}.json"
+              if ! gh api "${url}&page=${page}" > "$body"; then
+                echo "::error::查询 ${label} 失败（page ${page}），拒绝发布"
+                exit 1
+              fi
+              count="$(json_page_count "$body" "$key")" || {
+                echo "::error::${label} 响应非法（page ${page}），拒绝发布"
+                exit 1
+              }
+              if [ "$count" -lt 100 ]; then
+                return 0
+              fi
+              page=$((page + 1))
+            done
+            body="$out_dir/page-21.json"
+            if ! gh api "${url}&page=21" > "$body"; then
+              echo "::error::查询 ${label} 失败（page 21），拒绝发布"
+              exit 1
+            fi
+            count="$(json_page_count "$body" "$key")" || {
+              echo "::error::${label} 响应非法（page 21），拒绝发布"
+              exit 1
+            }
+            if [ "$count" -ne 0 ]; then
+              echo "::error::${label} 超过 20 页（page 21 仍有 ${count} 条），拒绝发布"
+              exit 1
+            fi
+          }
+
+          check_runs_url="repos/${repo}/commits/${sha}/check-runs?filter=all&per_page=100"
+          workflow_runs_url="repos/${repo}/actions/runs?head_sha=${sha}&event=push&per_page=100"
+
+          echo "查询目标 SHA ${sha} 的 check-runs 与 CI workflow run（repo=${repo}，只查该 SHA）"
+          fetch_pages "目标 SHA ${sha} 的 check-runs" "$check_runs_url" "check_runs" "$work_dir/check-runs"
+          fetch_pages "目标 SHA ${sha} 的 CI workflow runs" "$workflow_runs_url" "workflow_runs" "$work_dir/workflow-runs"
+
+          python3 - "$sha" "$work_dir/check-runs" "$work_dir/workflow-runs" "${required[@]}" <<'PY'
+          import glob
+          import json
+          import os
+          import sys
+
+          sha, check_dir, runs_dir, *required = sys.argv[1:]
+          if not required:
+              print("::error::CI 门禁未配置必需 check 名称", file=sys.stderr)
+              raise SystemExit(2)
+
+
+          def page_number(path):
+              base = os.path.basename(path)
+              if not (base.startswith("page-") and base.endswith(".json")):
+                  raise SystemExit(f"非法分页文件名: {base}")
+              try:
+                  return int(base[5:-5])
+              except ValueError:
+                  raise SystemExit(f"非法分页文件名: {base}")
+
+
+          def load_pages(directory, key):
+              items = []
+              for path in sorted(glob.glob(os.path.join(directory, "*.json")), key=page_number):
+                  try:
+                      with open(path, encoding="utf-8") as handle:
+                          payload = json.load(handle)
+                  except (OSError, ValueError) as exc:
+                      print(
+                          f"::error::{key} JSON 解析失败（{os.path.basename(path)}）: {exc}",
+                          file=sys.stderr,
+                      )
+                      raise SystemExit(1)
+                  if not isinstance(payload, dict) or not isinstance(payload.get(key), list):
+                      print(
+                          f"::error::{key} 响应缺少 {key} 数组（{os.path.basename(path)}）",
+                          file=sys.stderr,
+                      )
+                      raise SystemExit(1)
+                  items.extend(payload[key])
+              return items
+
+
+          def text(value):
+              return value if isinstance(value, str) else ""
+
+
+          def as_int(value):
+              if isinstance(value, int):
+                  return value
+              if isinstance(value, str) and value.isdigit():
+                  return int(value)
+              return None
+
+
+          def app_slug(run):
+              app = run.get("app")
+              return text(app.get("slug")) if isinstance(app, dict) else ""
+
+
+          def suite_id(run):
+              suite = run.get("check_suite")
+              return as_int(suite.get("id")) if isinstance(suite, dict) else None
+
+
+          check_runs = load_pages(check_dir, "check_runs")
+          workflow_runs = load_pages(runs_dir, "workflow_runs")
+
+          # 只认目标 SHA 的 CI workflow（.github/workflows/ci.yml）push run；
+          # 用 workflow run 的 check_suite_id 与 check run 的 check_suite.id 关联，
+          # 避免同名 check run 来自其它 workflow/App。CI run 必须成功完成。
+          ci_runs = [
+              run for run in workflow_runs
+              if isinstance(run, dict)
+              and run.get("path") == ".github/workflows/ci.yml"
+              and run.get("event") == "push"
+              and run.get("head_sha") == sha
+          ]
+          successful_ci_runs = [
+              run for run in ci_runs
+              if run.get("status") == "completed" and run.get("conclusion") == "success"
+          ]
+          ci_suite_ids = {
+              as_int(run.get("check_suite_id"))
+              for run in successful_ci_runs
+          }
+          ci_suite_ids.discard(None)
+
+          problems = []
+          if not successful_ci_runs:
+              problems.append(
+                  "CI workflow run: 目标 SHA 没有成功完成的 "
+                  ".github/workflows/ci.yml push run"
+              )
+
+          for name in required:
+              matching = [run for run in check_runs if isinstance(run, dict) and run.get("name") == name]
+              if not matching:
+                  problems.append(f"{name}: 缺失（目标 SHA 没有同名 check run）")
+                  continue
+
+              bad_apps = sorted({
+                  app_slug(run) or "<空>"
+                  for run in matching
+                  if app_slug(run) != "github-actions"
+              })
+              if bad_apps:
+                  problems.append(
+                      f"{name}: check run app.slug 不是 github-actions（{','.join(bad_apps)}）"
+                  )
+                  continue
+
+              bad_sha = sorted({
+                  text(run.get("head_sha")) or "<空>"
+                  for run in matching
+                  if run.get("head_sha") != sha
+              })
+              if bad_sha:
+                  problems.append(
+                      f"{name}: head_sha 与目标 SHA 不一致 {','.join(bad_sha)}"
+                  )
+                  continue
+
+              pending = sorted({
+                  text(run.get("status")) or "<空>"
+                  for run in matching
+                  if run.get("status") != "completed"
+              })
+              if pending:
+                  problems.append(f"{name}: 仍在运行/排队（status={','.join(pending)}）")
+                  continue
+
+              # 按 started_at 取最后启动的 attempt（同秒用 id 破并列），而不是
+              # completed_at：更晚启动、更早完成的 failure 也必须被选中，避免
+              # 旧 success 掩盖新 attempt 的失败。
+              def attempt_key(run):
+                  started = text(run.get("started_at"))
+                  run_id = run.get("id")
+                  return (started, run_id if isinstance(run_id, int) else -1)
+
+              latest = max(matching, key=attempt_key)
+              conclusion = latest.get("conclusion")
+              if conclusion != "success":
+                  problems.append(
+                      f"{name}: 最新 check run 结论为 {text(conclusion) or '<空>'}，要求 success"
+                  )
+                  continue
+
+              suite = suite_id(latest)
+              if suite is None:
+                  problems.append(f"{name}: 最新 check run 缺少 check_suite.id")
+                  continue
+              if suite not in ci_suite_ids:
+                  problems.append(
+                      f"{name}: 最新 check run 的 check_suite.id={suite} "
+                      "不属于目标 SHA 的 CI workflow run"
+                  )
+                  continue
+
+              print(f"OK {name}: success（check run {latest.get('id')}，suite {suite}）")
+
+          if problems:
+              for problem in problems:
+                  print(f"::error::{problem}", file=sys.stderr)
+              print(
+                  f"::error::目标 SHA {sha} 的 CI 门禁未通过（{len(problems)} 项），拒绝发布",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+
+          print(f"CI 门禁通过：目标 SHA {sha} 的 {len(required)} 项 check 均为 success")
+          PY
 
       - name: 安装 Rust stable（rustfmt / clippy）
         run: |
@@ -327,6 +609,124 @@ jobs:
           cargo test -p rustboard-hub --test phase_d_backup --locked
           cargo test -p rustboard-hub --bin rustboard-hub install_cmd::tests --locked
 
+  # #54 第二层门禁：不信任历史 CI 结论，在发布流程内对目标 SHA 重跑关键安全 E2E。
+  # 依赖 verify（CI 查询门禁先过），与 build 并行；release 必须等本 job 成功。
+  # ci.yml 的 e2e 未显式设置超时（GitHub 默认 360 分钟）；这里同样给 360 兜底，
+  # 避免慢 runner 把正确结果误判为超时（近期 CI 全量 e2e 约 9 分钟）。
+  security-e2e:
+    name: 安全 E2E 重跑（security / cert-rotation / hardening / control / v041）
+    permissions:
+      contents: read
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: 检出目标提交
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: 安装 Rust stable
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: 缓存 cargo 与 target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: 安装 Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      # 与 ci.yml 的 e2e job 一致：部分脚本需要仓库内 web/dist。
+      - name: 构建前端资源
+        working-directory: web
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      # security/cert-rotation/hardening/control/v041 只依赖 python3 标准库、
+      # curl、timeout 与 GNU coreutils；缺什么装什么，避免 runner 镜像差异误判。
+      - name: 检查 e2e 基础依赖
+        run: |
+          set -euo pipefail
+          missing=()
+          for cmd in python3 curl timeout; do
+            if ! command -v "$cmd" > /dev/null 2>&1; then
+              case "$cmd" in
+                timeout) missing+=(coreutils) ;;
+                *) missing+=("$cmd") ;;
+              esac
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "${missing[@]}"
+          fi
+          python3 -V
+          curl --version | sed -n '1p'
+          timeout --version | sed -n '1p'
+
+      - name: 失败日志脱敏自测（security.sh）
+        env:
+          SECURITY_E2E_SELFTEST: "1"
+        run: |
+          set -euo pipefail
+          test -f tests/e2e/security.sh
+          bash tests/e2e/security.sh
+
+      - name: 安全回归（security.sh）
+        run: |
+          set -euo pipefail
+          test -f tests/e2e/security.sh
+          bash tests/e2e/security.sh
+
+      - name: 控制面失败日志脱敏自测
+        run: |
+          set -euo pipefail
+          test -f tests/e2e/control_redact_test.sh
+          bash tests/e2e/control_redact_test.sh
+
+      - name: 证书轮换回归（cert-rotation.sh）
+        run: |
+          set -euo pipefail
+          test -f tests/e2e/cert-rotation.sh
+          bash tests/e2e/cert-rotation.sh
+
+      - name: 安全硬化回归（hardening.sh）
+        run: |
+          set -euo pipefail
+          test -f tests/e2e/hardening.sh
+          bash tests/e2e/hardening.sh
+
+      - name: 控制面回归（control.sh）
+        run: |
+          set -euo pipefail
+          test -f tests/e2e/control.sh
+          bash tests/e2e/control.sh
+
+      - name: v0.4.1 回归（v041.sh）
+        run: |
+          set -euo pipefail
+          test -f tests/e2e/v041.sh
+          bash tests/e2e/v041.sh
+
   # 2. 两架构原生构建：静态 musl 二进制 + 离线包 + 包内校验和。
   build:
     name: 构建 ${{ matrix.arch }} 离线包
@@ -477,7 +877,7 @@ jobs:
       contents: read
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - name: 检出代码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -535,6 +935,23 @@ jobs:
           set -euo pipefail
           test -f tests/e2e/v100-docker.sh
           SKIP_ARM64=1 DOCKER_ARCH=amd64 bash tests/e2e/v100-docker.sh
+
+      # #87/#88：真实 agent 在 PG overlay 下落库、Compose 8080 回环发布。
+      # 该脚本需要固定宿主端口 8080/8443，hosted runner 默认空闲。
+      - name: Docker + PostgreSQL overlay e2e（#87/#88）
+        run: |
+          set -euo pipefail
+          test -f tests/e2e/v100-docker-pg.sh
+          manifest=$(mktemp)
+          {
+            printf 'hub=%s\n' "$(sha256sum dist/amd64/bin/rustboard-hub | cut -d' ' -f1)"
+            printf 'panel=%s\n' "$(sha256sum dist/amd64/bin/rustboard-panel | cut -d' ' -f1)"
+            printf 'agent=%s\n' "$(sha256sum dist/amd64/bin/rustboard-agent | cut -d' ' -f1)"
+            printf 'web=%s\n' "$(sha256sum web/dist/index.html | cut -d' ' -f1)"
+          } > "$manifest"
+          EXPECTED_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          test -n "$EXPECTED_VERSION"
+          EXPECTED_VERSION="$EXPECTED_VERSION" bash tests/e2e/v100-docker-pg.sh --dist-manifest "$manifest"
 
   # 发布前的原生 arm64 交付门禁：先在 arm64 runner 上安装/启动 aarch64 离线包，
   # 再原生构建并运行三镜像 Docker e2e；不使用 QEMU，也不推送 GHCR。
@@ -634,6 +1051,8 @@ jobs:
     needs:
       - verify
       - build
+      # #54 第二层未通过时不得推送任何 staging/正式镜像 tag。
+      - security-e2e
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -717,6 +1136,7 @@ jobs:
       - verify
       - build
       - images
+      - security-e2e
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -822,8 +1242,11 @@ jobs:
       - delivery-e2e
       - delivery-docker
       - delivery-arm64
+      # #54 第二层：发布流程内重跑的安全 E2E 失败时，不得创建/发布正式 Release。
+      - security-e2e
     # 正式 tag/sha/latest 提升与 Release 发布前的最后人工闸门：
     # GitHub 仓库需在 Settings -> Environments -> release 配置 required reviewers。
+    # 人工 approval 只是附加闸门，不能替代 verify/postgres/security-e2e 的自动门禁。
     environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -981,6 +1404,31 @@ jobs:
 
       # 资产与全部 attestation 成功后才把 staging 提升为正式 tag 与 sha-<short>；
       # 失败则 Release 保持 draft。
+      # 提升前再次核对远端 tag 的 peeled commit：tag 在构建/审批期间被移动时
+      # 绝不能把旧 SHA 的镜像提升到被移动的 tag 名下。
+      - name: 提升前校验远端 tag 未被移动（peeled SHA == GITHUB_SHA）
+        env:
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag_ref="refs/tags/${TAG}"
+          if ! remote="$(git ls-remote origin "$tag_ref" "$tag_ref^{}")"; then
+            echo "::error::无法读取远端 tag ${TAG}"
+            exit 1
+          fi
+          peeled="$(printf '%s\n' "$remote" | awk -v ref="${tag_ref}^{}" '$2 == ref { print $1 }')"
+          direct="$(printf '%s\n' "$remote" | awk -v ref="$tag_ref" '$2 == ref { print $1 }')"
+          if [ -z "$peeled" ] && [ -z "$direct" ]; then
+            echo "::error::远端不存在 tag ${TAG}"
+            exit 1
+          fi
+          target="${peeled:-$direct}"
+          if [ "$target" != "$GITHUB_SHA" ]; then
+            echo "::error::远端 tag ${TAG} peeled=${target:-<空>}，与目标 ${GITHUB_SHA} 不一致（tag 可能被移动）"
+            exit 1
+          fi
+          echo "远端 tag ${TAG} 指向 ${target}，与 GITHUB_SHA 一致"
+
       - name: 将 staging 提升为正式 tag 与 sha-<short> 并校验 digest
         env:
           TAG: ${{ needs.verify.outputs.tag }}
@@ -1050,6 +1498,30 @@ jobs:
           done
 
       # 只有前面所有步骤（含 latest 提升）成功才会执行；失败时 draft 保留，不 publish。
+      # 发布前再核对一次远端 tag，覆盖提升/attestation 期间的 TOCTOU。
+      - name: 发布前再次校验远端 tag 未被移动（peeled SHA == GITHUB_SHA）
+        env:
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag_ref="refs/tags/${TAG}"
+          if ! remote="$(git ls-remote origin "$tag_ref" "$tag_ref^{}")"; then
+            echo "::error::无法读取远端 tag ${TAG}"
+            exit 1
+          fi
+          peeled="$(printf '%s\n' "$remote" | awk -v ref="${tag_ref}^{}" '$2 == ref { print $1 }')"
+          direct="$(printf '%s\n' "$remote" | awk -v ref="$tag_ref" '$2 == ref { print $1 }')"
+          if [ -z "$peeled" ] && [ -z "$direct" ]; then
+            echo "::error::远端不存在 tag ${TAG}"
+            exit 1
+          fi
+          target="${peeled:-$direct}"
+          if [ "$target" != "$GITHUB_SHA" ]; then
+            echo "::error::远端 tag ${TAG} peeled=${target:-<空>}，与目标 ${GITHUB_SHA} 不一致（tag 可能被移动）"
+            exit 1
+          fi
+          echo "远端 tag ${TAG} 指向 ${target}，与 GITHUB_SHA 一致"
+
       - name: 发布 Release（取消 draft）
         env:
           GH_TOKEN: ${{ github.token }}

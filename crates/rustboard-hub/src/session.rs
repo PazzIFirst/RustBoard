@@ -474,7 +474,7 @@ mod tests {
     use rustboard_common::control::ControlOp;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn only_last_connection_marks_agent_offline() {
@@ -779,6 +779,7 @@ mod tests {
             .try_send(ControlCommand {
                 op: ControlOp::SystemdList,
                 reply,
+                deadline: Instant::now() + Duration::from_secs(30),
             })
             .expect("新连接队列应可写");
         assert!(old.control_rx.try_recv().is_err(), "旧连接不得收到控制命令");
@@ -809,6 +810,7 @@ mod tests {
                 .try_send(ControlCommand {
                     op: ControlOp::ProcessList,
                     reply,
+                    deadline: Instant::now() + Duration::from_secs(30),
                 })
                 .is_err(),
             "会话结束后 try_send 必须失败"

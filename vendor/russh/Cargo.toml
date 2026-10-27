@@ -37,9 +37,13 @@ all-features = true
 _bench = ["dep:criterion"]
 async-trait = ["dep:async-trait"]
 aws-lc-rs = ["dep:aws-lc-rs"]
+# P5 vendor 注：本仓库统一使用 ring（纯 Rust）；上游默认 aws-lc-rs 依赖 cmake，
+# 独立执行 `cargo test --manifest-path vendor/russh/Cargo.toml --locked` 时会走
+# 与产品不一致的构建路径。作为路径依赖时根 Cargo.toml 显式
+# `default-features = false, features = ["ring"]`，此处默认值不影响产品构建。
 default = [
     "flate2",
-    "aws-lc-rs",
+    "ring",
 ]
 des = ["dep:des"]
 dsa = ["ssh-key/dsa"]
@@ -286,25 +290,8 @@ version = "0.6.1"
 [dependencies.zeroize]
 version = "1.7"
 
-[dev-dependencies.anyhow]
-version = "1.0.4"
-
-[dev-dependencies.clap]
-version = "4"
-features = ["derive"]
-
 [dev-dependencies.env_logger]
 version = "0.11"
-
-[dev-dependencies.rand]
-version = "0.10"
-features = ["thread_rng"]
-
-[dev-dependencies.ratatui]
-version = "0.30"
-
-[dev-dependencies.shell-escape]
-version = "0.1"
 
 [dev-dependencies.tempfile]
 version = "3.14.0"
@@ -331,12 +318,6 @@ features = [
     "net",
 ]
 
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies.russh-sftp]
-version = "2.3.0"
-
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies.tokio]
-version = "1.17.0"
-
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies.tokio-stream]
 version = "0.1.3"
 features = [
@@ -344,11 +325,16 @@ features = [
     "sync",
 ]
 
-[target.'cfg(not(target_os = "windows"))'.dev-dependencies.termion]
-version = "4"
-
-[target.'cfg(not(target_os = "windows"))'.dev-dependencies.tokio-fd]
-version = "0.3"
-
 [target."cfg(windows)".dependencies.pageant]
 version = "0.2"
+
+# P5：与 vendor/ssh-key 相同，声明为独立 workspace，使上游补丁可以在本仓库内
+# 直接跑单测：`cargo test --manifest-path vendor/russh/Cargo.toml --locked
+# --no-default-features --features ring`。
+# 说明：作为主 workspace 的路径依赖时，本 `[patch]` 与 `[workspace]` 不生效
+# （patch 只读取 workspace 根）；独立运行时把 ssh-key 指到同仓库 vendor 版本，
+# 避免拉取带 optional rsa 的 crates.io 包。
+[workspace]
+
+[patch.crates-io]
+ssh-key = { path = "../ssh-key" }

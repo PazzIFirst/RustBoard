@@ -38,8 +38,8 @@ use postgres::config::SslMode;
 use postgres::NoTls;
 use rustboard_common::model::{AgentRecord, Labels, Sample, SampleBatch, SeriesQuery, SeriesRow};
 use rustboard_core::alerts::{
-    builtin_rules, AlertEvent, AlertRule, AlertRuleStoreError, AlertSilence,
-    AlertSilenceStoreError, AlertSource, AlertState, AlertStateKind, Comparator,
+    builtin_rules, AlertEvaluationOutcome, AlertEvent, AlertRule, AlertRuleStoreError,
+    AlertSilence, AlertSilenceStoreError, AlertSource, AlertState, AlertStateKind, Comparator,
     BUILTIN_AGENT_OFFLINE, BUILTIN_DISK_PERCENT, MAX_ALERT_RULES, MAX_ALERT_SILENCES,
 };
 use rustboard_core::archive::{ArchiveObject, ArchiveStatus, ArchiveStoreError};
@@ -339,6 +339,7 @@ fn custom_rule(id: &str, name: &str) -> AlertRule {
         updated_by: "admin".to_string(),
         created_at: NOW,
         updated_at: NOW,
+        revision: 0,
     }
 }
 
@@ -814,6 +815,8 @@ fn alert_rules_seed_crud_and_enabled_parity() {
     // 创建自定义规则：逐字段往返，包含 labels / channel_ids / filter。
     let rule = custom_rule("custom-1", "生产 CPU 告警");
     let (pg_created, sq_created) = both(&fx, |s| {
+        s.create_notification_channel(&telegram_channel("chan-a", "渠道 A", true))
+            .unwrap();
         s.create_alert_rule(&rule).unwrap();
         (
             s.get_alert_rule("custom-1").unwrap(),
@@ -856,6 +859,8 @@ fn alert_rules_seed_crud_and_enabled_parity() {
 
     // 更新：可写字段生效，is_builtin / created_at 不得被上层伪造。
     let (pg_updated, sq_updated) = both(&fx, |s| {
+        s.create_notification_channel(&telegram_channel("chan-z", "渠道 Z", true))
+            .unwrap();
         let mut updated = s.get_alert_rule("custom-1").unwrap().unwrap();
         updated.name = "生产 CPU 告警（更新）".to_string();
         updated.enabled = false;
@@ -981,6 +986,8 @@ fn alert_rule_state_cleanup_parity() {
 
     // update_and_clear_states：更新规则 A 并清空 A 的状态，B 的状态保留。
     let (pg_update, sq_update) = both(&fx, |s| {
+        s.create_notification_channel(&telegram_channel("chan-a", "渠道 A", true))
+            .unwrap();
         s.create_alert_rule(&rule_a).unwrap();
         s.create_alert_rule(&rule_b).unwrap();
         s.upsert_alert_state(&state_a1).unwrap();
@@ -1085,6 +1092,8 @@ fn alert_rule_limit_parity() {
 
     let (pg, sq) = both(&fx, |s| {
         s.seed_builtin_alert_rules(&builtin_rules(NOW, 90, 48), NOW)
+            .unwrap();
+        s.create_notification_channel(&telegram_channel("chan-a", "渠道 A", true))
             .unwrap();
         for index in 0..(MAX_ALERT_RULES - 5) {
             let rule = custom_rule(
@@ -1838,12 +1847,15 @@ fn alert_events_queue_prune_and_apply_parity() {
         alert_state("eval-rule", "a1", "old-2", AlertStateKind::Resolved, 0, 20),
         alert_state("eval-rule", "a1", "old-3", AlertStateKind::Resolved, 0, 30),
     ];
+    let mut eval_rule = custom_rule("eval-rule", "评估规则");
+    eval_rule.channel_ids.clear();
     let (pg_eval, sq_eval) = both(&fx, |s| {
+        s.create_alert_rule(&eval_rule).unwrap();
         for state in &old_eval_states {
             s.upsert_alert_state(state).unwrap();
         }
         let removed = s
-            .apply_alert_evaluation("eval-rule", &eval_events, &eval_states, 2)
+            .apply_alert_evaluation("eval-rule", 0, &eval_events, &eval_states, 2)
             .unwrap();
         (
             removed,
@@ -1860,7 +1872,11 @@ fn alert_events_queue_prune_and_apply_parity() {
         )
     });
     assert_eq!(pg_eval, sq_eval, "评估事务结果必须一致");
-    assert_eq!(pg_eval.0, 3, "5 条状态保留 2 条应淘汰 3 条");
+    assert_eq!(
+        pg_eval.0,
+        AlertEvaluationOutcome::Applied { removed: 3 },
+        "5 条状态保留 2 条应淘汰 3 条"
+    );
     assert_eq!(
         pg_eval.1,
         vec!["new-2".to_string(), "new-1".to_string()],
@@ -1979,9 +1995,13 @@ fn alert_transaction_rollback_is_atomic_on_failure() {
         alert_state("ok-rule", "a1", "s1", AlertStateKind::Firing, NOW, NOW),
         alert_state("poison", "a1", "s1", AlertStateKind::Firing, NOW, NOW),
     ];
+    let mut poison_rule = custom_rule("poison-eval", "评估规则");
+    poison_rule.channel_ids.clear();
     let (pg_eval_fail, sq_eval_fail) = both(&fx, |s| {
+        s.create_alert_rule(&poison_rule).unwrap();
         s.apply_alert_evaluation(
             "poison-eval",
+            0,
             std::slice::from_ref(&eval_event),
             &eval_states,
             0,
@@ -2234,6 +2254,20 @@ fn notification_channels_crud_reference_and_limit_parity() {
     );
     assert_eq!(pg_created.4.as_ref().unwrap().kind, ChannelKind::Dingtalk);
 
+    // 规则引用必须在渠道仍启用时创建；后续渠道禁用不应让已有规则失效
+    // （worker 会跳过禁用渠道，但不阻止规则 update 清空引用）。
+    let (pg_reference_created, sq_reference_created) = both(&fx, |s| {
+        let mut rule = custom_rule("channel-ref", "引用渠道规则");
+        rule.channel_ids = vec!["chan-telegram".to_string()];
+        s.create_alert_rule(&rule).unwrap();
+        s.get_alert_rule("channel-ref").unwrap().unwrap()
+    });
+    assert_eq!(pg_reference_created, sq_reference_created);
+    assert_eq!(
+        pg_reference_created.channel_ids,
+        vec!["chan-telegram".to_string()]
+    );
+
     // secret 的 Debug 必须脱敏，不能出现在日志/断言输出中。
     let debug = format!("{telegram:?}");
     assert!(
@@ -2347,9 +2381,6 @@ fn notification_channels_crud_reference_and_limit_parity() {
     assert_eq!(pg_update.2, ChannelStoreError::NotFound);
 
     let (pg_reference, sq_reference) = both(&fx, |s| {
-        let mut rule = custom_rule("channel-ref", "引用渠道规则");
-        rule.channel_ids = vec!["chan-telegram".to_string()];
-        s.create_alert_rule(&rule).unwrap();
         let in_use =
             channel_store_error(s.delete_notification_channel("chan-telegram").unwrap_err());
         let still_there = s

@@ -74,9 +74,10 @@ impl AlgorithmName {
             .strip_suffix(CERT_STR_SUFFIX)
             .ok_or_else(|| LabelError::new(id))?;
 
-        Ok(Self {
-            id: format!("{name}@{domain}"),
-        })
+        // Re-validate the derived `name@domainname` identifier. In particular this
+        // rejects an empty `name` (e.g. `-cert-v01@example.com`) instead of
+        // constructing a value which would later panic in `certificate_type`.
+        Self::new(format!("{name}@{domain}"))
     }
 }
 
@@ -88,9 +89,10 @@ impl FromStr for AlgorithmName {
     }
 }
 
-/// Check if the length of `id` is at most `n`, and that `id` only consists of ASCII characters.
+/// Check if the length of `id` is at most `n`, and that `id` consists only of
+/// printable, non-whitespace ASCII characters.
 fn validate_algorithm_id(id: &str, n: usize) -> Result<(), LabelError> {
-    if id.len() > n || !id.is_ascii() {
+    if id.len() > n || !id.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(LabelError::new(id));
     }
 
@@ -107,4 +109,84 @@ fn split_algorithm_id(id: &str) -> Result<(&str, &str), LabelError> {
     }
 
     Ok((name, domain))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AlgorithmName, CERT_STR_SUFFIX, MAX_CERT_STR_LEN};
+    use alloc::string::String;
+
+    fn cert_id(name: &str, domain: &str) -> String {
+        format!("{name}{CERT_STR_SUFFIX}@{domain}")
+    }
+
+    #[test]
+    fn from_certificate_type_rejects_empty_name() {
+        // `-cert-v01@example.com` used to produce an `AlgorithmName` with the
+        // invalid internal identifier `@example.com`, which later panicked in
+        // `certificate_type`.
+        assert!(AlgorithmName::from_certificate_type("-cert-v01@example.com").is_err());
+        assert!(AlgorithmName::new("@example.com").is_err());
+    }
+
+    #[test]
+    fn from_certificate_type_rejects_invalid_identifiers() {
+        assert!(AlgorithmName::from_certificate_type("custom@example.com").is_err());
+        assert!(AlgorithmName::from_certificate_type("custom-cert-v01@").is_err());
+        assert!(AlgorithmName::from_certificate_type("@example.com").is_err());
+        assert!(AlgorithmName::from_certificate_type("custom-cert-v01@example.com@extra").is_err());
+        assert!(AlgorithmName::from_certificate_type("é-cert-v01@example.com").is_err());
+    }
+
+    #[test]
+    fn certificate_type_roundtrip() {
+        let name = AlgorithmName::new("custom@example.com").unwrap();
+        assert_eq!(name.certificate_type(), "custom-cert-v01@example.com");
+
+        let parsed = AlgorithmName::from_certificate_type(&name.certificate_type()).unwrap();
+        assert_eq!(parsed, name);
+        assert_eq!(parsed.certificate_type(), name.certificate_type());
+    }
+
+    #[test]
+    fn algorithm_name_rejects_whitespace_and_control_characters() {
+        for id in [
+            "foo bar@example.com",
+            "foo\tbar@example.com",
+            "foo\nbar@example.com",
+            "foo\x7fbar@example.com",
+            "foo@example .com",
+        ] {
+            assert!(AlgorithmName::new(id).is_err(), "accepted {id:?}");
+        }
+
+        for id in [
+            "foo bar-cert-v01@example.com",
+            "foo\tbar-cert-v01@example.com",
+            "foo\x7fbar-cert-v01@example.com",
+        ] {
+            assert!(
+                AlgorithmName::from_certificate_type(id).is_err(),
+                "accepted {id:?}"
+            );
+        }
+
+        // Printable punctuation and the `@` separator remain valid.
+        assert!(AlgorithmName::new("foo-bar_baz.qux@example.com").is_ok());
+    }
+
+    #[test]
+    fn certificate_type_length_boundary() {
+        // `MAX_CERT_STR_LEN` includes the suffix, `@`, and the shortest
+        // possible domain name.
+        let name = "a".repeat(MAX_CERT_STR_LEN - CERT_STR_SUFFIX.len() - 1 - 1);
+        let valid = cert_id(&name, "d");
+        assert_eq!(valid.len(), MAX_CERT_STR_LEN);
+        assert!(AlgorithmName::from_certificate_type(&valid).is_ok());
+
+        let too_long_name = "a".repeat(name.len() + 1);
+        let too_long = cert_id(&too_long_name, "d");
+        assert_eq!(too_long.len(), MAX_CERT_STR_LEN + 1);
+        assert!(AlgorithmName::from_certificate_type(&too_long).is_err());
+    }
 }

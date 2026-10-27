@@ -10,8 +10,8 @@ use std::thread;
 use std::time::Duration;
 
 use rustboard_install::{
-    is_systemd_unit_dir, render_unit, shell_arg, unit_is_ours, PathOverrides, Paths, Role,
-    ServiceManager, UNIT_MARKER,
+    is_systemd_unit_dir, render_unit, shell_arg, stop_service_checked, unit_is_ours, PathOverrides,
+    Paths, Role, ServiceManager, UNIT_MARKER,
 };
 
 const HUB_STATIC: &str = include_str!("../../../packaging/systemd/rustboard-hub.service");
@@ -129,7 +129,11 @@ fn manage_false_skips_systemctl_for_all_operations() {
     manager.enable_now("rustboard-hub.service").unwrap();
     manager.restart("rustboard-hub.service").unwrap();
     manager.stop_disable("rustboard-hub.service").unwrap();
-    assert!(!manager.is_active("rustboard-hub.service").unwrap());
+    // no-op manager 不能把“没执行 systemctl”当成 inactive / 任何有效状态；
+    // 卸载流程会因 is_managing=false 拒绝继续删除。
+    assert!(manager.is_active("rustboard-hub.service").is_err());
+    assert!(manager.active_state("rustboard-hub.service").is_err());
+    assert!(stop_service_checked(&manager, "rustboard-hub.service", "hub").is_err());
 }
 
 #[test]

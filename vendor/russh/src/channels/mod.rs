@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -117,6 +118,10 @@ pub enum ChannelMsg {
 pub(crate) struct WindowSizeRef {
     value: Arc<Mutex<u32>>,
     notifier: Arc<Notify>,
+    /// Cleared to `true` when the session drops its last handle to the
+    /// channel. Writers waiting for a positive send window must observe this
+    /// and fail with `BrokenPipe` instead of waiting forever.
+    closed: Arc<AtomicBool>,
 }
 
 impl WindowSizeRef {
@@ -125,6 +130,7 @@ impl WindowSizeRef {
         Self {
             value: Arc::new(Mutex::new(initial)),
             notifier,
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -136,6 +142,37 @@ impl WindowSizeRef {
     pub(crate) fn subscribe(&self) -> Arc<Notify> {
         Arc::clone(&self.notifier)
     }
+
+    /// Marks the channel as closed and wakes every writer that is waiting for
+    /// the send window. Unlike a window update (`notify_one`), this must wake
+    /// all waiters: after a close there will never be another update.
+    pub(crate) fn close(&self) {
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            self.notifier.notify_waiters();
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn closed_ref(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.closed)
+    }
+
+    pub(crate) fn value_ref(&self) -> Arc<Mutex<u32>> {
+        Arc::clone(&self.value)
+    }
+}
+
+/// The `BrokenPipe` error used when the session or channel is gone while a
+/// writer still has data to send.
+pub(crate) fn closed_channel_io_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "channel closed")
+}
+
+pub(crate) fn closed_channel_error() -> Error {
+    Error::IO(closed_channel_io_error())
 }
 
 /// A handle to the reading part of a session channel.
@@ -375,9 +412,21 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
                 }
                 return Ok(writable);
             }
+            // Register for both shutdown signals before releasing the lock and
+            // re-checking the flags, so neither a channel close nor a session
+            // shutdown can be missed between the check and the await (#97).
             let notified = self.window_size.notifier.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            let closed = self.sender.closed();
+            let closed = std::pin::pin!(closed);
+
+            if self.window_size.is_closed() || self.sender.is_closed() {
+                return Err(closed_channel_error());
+            }
             drop(window_size);
-            notified.await;
+
+            futures::future::select(notified, closed).await;
         }
     }
 
@@ -428,14 +477,14 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
         self.make_writer_ext(None)
     }
 
-    /// Make a writer for the [`Channel`] to send [`ChannelMsg::Data`] or [`ChannelMsg::ExtendedData`]
+    /// Make a writer for the [`Channel`] to send [`ChannelMsg::Data`] or
+    /// [`ChannelMsg::ExtendedData`]
     /// depending on the `ext` parameter, through the `AsyncWrite` trait.
     pub fn make_writer_ext(&self, ext: Option<u32>) -> impl AsyncWrite + 'static {
-        io::ChannelTx::new(
+        io::ChannelTx::new_with_window(
             self.sender.clone(),
             self.id,
-            self.window_size.value.clone(),
-            self.window_size.subscribe(),
+            self.window_size.clone(),
             self.max_packet_size,
             ext,
         )
@@ -660,11 +709,10 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
     /// sending and receiving [`ChannelMsg::Data`] as `AsyncRead` + `AsyncWrite`.
     pub fn into_stream(self) -> ChannelStream<S> {
         ChannelStream::new(
-            io::ChannelTx::new(
+            io::ChannelTx::new_with_window(
                 self.write_half.sender.clone(),
                 self.write_half.id,
-                self.write_half.window_size.value.clone(),
-                self.write_half.window_size.subscribe(),
+                self.write_half.window_size.clone(),
                 self.write_half.max_packet_size,
                 None,
             ),
@@ -838,6 +886,154 @@ mod tests {
                 assert_eq!(data.as_ref(), b"channel");
             }
             msg => panic!("unexpected message: {msg:?}"),
+        }
+    }
+
+    /// #97: `ChannelWriteHalf` waits for the window on the same `Notify` as
+    /// `ChannelTx`; a channel close must make it fail with `BrokenPipe`
+    /// instead of hanging.
+    #[tokio::test]
+    async fn data_bytes_returns_broken_pipe_when_channel_closes_at_zero_window() {
+        let window_size = WindowSizeRef::new(0);
+        let (write_half, _receiver) = test_write_half(window_size.clone(), 1024);
+        let send = tokio::spawn(async move {
+            write_half
+                .data_bytes(Bytes::from_static(b"blocked"))
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!send.is_finished());
+
+        window_size.close();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), send)
+            .await
+            .expect("channel close must wake the blocked writer")
+            .expect("writer task must not panic");
+        match result {
+            Err(Error::IO(err)) => assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe),
+            other => panic!("expected BrokenPipe, got {other:?}"),
+        }
+    }
+
+    /// #97: `Channel::into_stream()` is the production SFTP path
+    /// (`archive_sftp.rs` uses `channel.into_stream()`). It must share the
+    /// channel-close flag; otherwise a zero-window writer never learns about a
+    /// peer `CHANNEL_CLOSE` (simulated by dropping the session-side
+    /// `ChannelRef`).
+    #[tokio::test]
+    async fn into_stream_returns_broken_pipe_after_channel_ref_drop_at_zero_window() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (sender, _session_receiver) = mpsc::channel(8);
+        let (channel, channel_ref) =
+            Channel::<(ChannelId, ChannelMsg)>::new(ChannelId(9), sender, 4096, 0, 8);
+        let mut stream = channel.into_stream();
+        let write = tokio::spawn(async move {
+            let mut stream = stream;
+            stream.write_all(b"blocked").await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!write.is_finished(), "zero-window write must wait");
+
+        // Only the session-side handle is dropped: the mpsc "session" is still
+        // alive, so this exercises exactly the `ChannelRef::drop` path.
+        drop(channel_ref);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), write)
+            .await
+            .expect("ChannelRef drop must wake the into_stream writer")
+            .expect("writer task must not panic");
+        assert_eq!(
+            result
+                .expect_err("write on a closed channel must fail")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    /// #97: the same `into_stream` close path when the send window is positive;
+    /// the first write succeeds, the next one must fail with `BrokenPipe`.
+    #[tokio::test]
+    async fn into_stream_returns_broken_pipe_after_channel_ref_drop_with_window() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (sender, mut session_receiver) = mpsc::channel(8);
+        let (channel, channel_ref) =
+            Channel::<(ChannelId, ChannelMsg)>::new(ChannelId(9), sender, 4096, 4096, 8);
+        let mut stream = channel.into_stream();
+
+        stream.write_all(b"before-close").await.unwrap();
+        match session_receiver.recv().await.unwrap() {
+            (ChannelId(9), ChannelMsg::Data { data }) => {
+                assert_eq!(&data[..], b"before-close");
+            }
+            msg => panic!("unexpected message: {msg:?}"),
+        }
+
+        drop(channel_ref);
+
+        let err = stream.write_all(b"after-close").await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// #97: `ChannelWriteHalf` shares the session-side `WindowSizeRef`; losing
+    /// the `ChannelRef` must wake its zero-window wait (not only a direct
+    /// `WindowSizeRef::close()` call).
+    #[tokio::test]
+    async fn data_bytes_returns_broken_pipe_after_channel_ref_drop() {
+        let (sender, _session_receiver) = mpsc::channel(8);
+        let (channel, channel_ref) =
+            Channel::<(ChannelId, ChannelMsg)>::new(ChannelId(9), sender, 1024, 0, 8);
+        let (read_half, write_half) = channel.split();
+        let send = tokio::spawn(async move {
+            write_half
+                .data_bytes(Bytes::from_static(b"blocked"))
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!send.is_finished());
+
+        drop(channel_ref);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), send)
+            .await
+            .expect("ChannelRef drop must wake the ChannelWriteHalf")
+            .expect("writer task must not panic");
+        match result {
+            Err(Error::IO(err)) => assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe),
+            other => panic!("expected BrokenPipe, got {other:?}"),
+        }
+        drop(read_half);
+    }
+
+    /// #97: session shutdown (receiver dropped) must also wake the
+    /// `ChannelWriteHalf` window wait.
+    #[tokio::test]
+    async fn data_bytes_returns_broken_pipe_when_session_closes_at_zero_window() {
+        let window_size = WindowSizeRef::new(0);
+        let (write_half, receiver) = test_write_half(window_size, 1024);
+        let send = tokio::spawn(async move {
+            write_half
+                .data_bytes(Bytes::from_static(b"blocked"))
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!send.is_finished());
+
+        drop(receiver);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), send)
+            .await
+            .expect("session close must wake the blocked writer")
+            .expect("writer task must not panic");
+        match result {
+            Err(Error::IO(err)) => assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe),
+            other => panic!("expected BrokenPipe, got {other:?}"),
         }
     }
 }
