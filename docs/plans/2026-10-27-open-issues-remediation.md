@@ -760,6 +760,20 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 - 尚未关闭或评论任何 issue；修复合并/发布证据齐后只补评论，由用户确认关闭。
 - 24h 长稳不能复用 2026-10-26 的 2h 中止证据。
 
+### 12.9 rc.3 最终包与最终 E2E（2026-10-27 08:00）
+
+- 1m retention 改为按 `(series,hour)` 整组删除，修复 5000 行批次导致的永久残留；
+  全 workspace + PG 在 `80a43ad` rc=0，fmt/clippy 通过。
+- 最终 amd64 包 revision `80a43ad`，三二进制 rc.3。
+- 最终源码/包重跑：
+  - install E2E **121/121**（rc.3 debug/source）
+  - offline E2E **122/122**（最终包）
+  - Docker PG **104 PASS / 0 FAIL / 1 SKIP**
+  - security **9/9**
+  - panel **159/159**
+- 3h 预检在最终 amd64 二进制上运行中；arm64 包仍在 qemu 构建。
+- **未 tag rc.3、未跑 24h/1000 agent**。
+
 ### 12.8 1m retention 分批修正与 rc.3 最终包（2026-10-27 08:00）
 
 - 复审发现 1m retention 的 5000 行 DELETE 会把同一 series 小时截断，等式门禁在
