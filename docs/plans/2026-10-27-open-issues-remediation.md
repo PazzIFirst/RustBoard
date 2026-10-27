@@ -760,6 +760,12 @@ worktree 并行，但共享 schema 的 R1a→R1b 必须串行。
 - 尚未关闭或评论任何 issue；修复合并/发布证据齐后只补评论，由用户确认关闭。
 - 24h 长稳不能复用 2026-10-26 的 2h 中止证据。
 
+### 12.11 rc.3 全量门禁最终确认（2026-10-27 08:15）
+
+- 最终代码 `80a43ad` 上 `cargo test --workspace` + 真实 PG **rc=0**（最终全量）。
+- install/offline/security/panel/Docker PG 均在最终代码/包上通过（见 12.10）。
+- 3h 预检与 arm64 构建仍在后台；尚未 tag/24h。
+
 ### 12.10 rc.3 最终全量门禁（2026-10-27 08:10）
 
 - 最终代码 `80a43ad` 上 `cargo test --workspace` + 真实 PostgreSQL 16 **rc=0**；
