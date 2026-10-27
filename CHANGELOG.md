@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-29
+
 ### Added
 
 - schema v9：`alert_rules.revision` 与 `alert_rule_channels` 关系表（FK
@@ -105,6 +107,15 @@
 - 崩溃安全的证书备份/恢复锁，卸载停服严格状态校验，Agent 升级失败回滚。
 - vendored `russh`/`ssh-key` 的最小安全 patch 记录在 `vendor/*/PATCHES.md`，
   CI 直接运行两个 vendor crate 的单测、格式与 no_std 组合。
+
+### Notes
+
+- **v1.0.0 只支持全新安装**：schema <9 的旧 SQLite/PostgreSQL 数据库会在
+  启动/备份/恢复/迁移时明确拒绝，不执行 v7/v8 回填或旧数据迁移。
+- `#51`/`#58`/`#59` 的旧数据兼容（v7/v8 迁移、序列高水位、聚合时间戳溢出）
+  不在本版本修复范围，将在 v1.0.0 之后处理；这些 issue 仍保持 OPEN。
+- 已发布 tag `v1.0.0-rc.2`、`v1.0.0-rc.3` 不移动；`v1.0.0` 只在本版本全部门禁
+  （含 24h 长稳、100/500/1000、Docker PG/安装、arm64、评审/渗透）通过后发布。
 
 ## [1.0.0-rc.3] - 2026-10-27
 

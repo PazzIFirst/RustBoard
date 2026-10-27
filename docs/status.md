@@ -19,7 +19,7 @@
 | M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | v0.4.1 已知问题修复 | 🟢 完成 | KI-29 rowid 竞态、KI-31 64 MiB 配置/下载一致性、KI-28 拒绝日志采样、KI-20 安装命令引用；SFTP 真实环境 29/29，M4 基线渗透无高危；v041 26/26；v0.4.1 发布 |
 | v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
-| M5 安装与交付 | 🟢 Phase E v1.0.0 候选代码/门禁完成；3h/24h 待跑 | Phase A 安装器；Phase B 离线/Docker；Phase C RC `v1.0.0-rc.2`；Phase D PG 迁移/备份/恢复；#51–#102 第二轮：schema v9（fresh install only）、告警 CAS/关系表、备份 TLS/证书锁、控制面/安装器、SFTP vendor、测试门禁、文档；workspace+真实 PG 全绿，security 9/9、cert 103/103、panel 159/159、hardening 36/36、control 103/103、v041 26/26+2 SKIP；**3h 预检/24h 长稳、100/500/1000、Docker PG、arm64、v1.0.0 未完成** |
+| M5 安装与交付 | 🟢 Phase E v1.0.0 候选代码/门禁完成；24h 长稳运行中 | Phase A 安装器；Phase B 离线/Docker；Phase C RC `v1.0.0-rc.2`；Phase D PG 迁移/备份/恢复；#51–#102 第二轮：schema v9（fresh install only）、告警 CAS/关系表、备份 TLS/证书锁、控制面/安装器、SFTP vendor、测试门禁、文档；workspace+真实 PG 全绿，security 9/9、cert 103/103、panel 159/159、hardening 36/36、control 103/103、v041 26/26+2 SKIP；**24h 长稳运行中（3h 检查点待复核）、100/500/1000、Docker PG、arm64、v1.0.0 未完成** |
 
 ## 2026-10-28 第二轮开放 issue 修复（v1.0.0 候选）
 
@@ -34,8 +34,10 @@
   全绿；vendor `russh` 217、`ssh-key` 59 单测通过。
 - 关键 E2E：security 9/9、cert-rotation 103/103、panel 159/159、hardening
   36/36、control 103/103、v041 26/26（2 SKIP）；SFTP 29/29（新二进制）。
-- 待跑：Docker PG/安装、arm64、100/500/1000、3h 预检、24h 长稳、最终
-  独立评审/渗透、`v1.0.0` tag/release/镜像。
+- 已启动：200 agent / 24h（最终二进制 `f14c700`，02:43 HKT 开始，3h/24h
+  检查点从 `metrics.jsonl` 复核）。
+- 待跑：Docker PG/安装、arm64、100/500/1000、最终独立评审/渗透、
+  `v1.0.0` tag/release/镜像。
 - 硬约束：`v1.0.0-rc.2`/`v1.0.0-rc.3` 不移动；issue 只补评论，关闭由用户确认。
 
 ## 构建产物清理（2026-10-25 Phase C 收尾）
