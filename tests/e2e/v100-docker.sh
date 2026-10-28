@@ -44,6 +44,7 @@
 #       python3 + PyYAML）、curl、python3、git、timeout、sha256sum、tar。
 # 用法：DOCKER_ARCH=amd64 bash tests/e2e/v100-docker.sh
 #       DOCKER_ARCH=arm64 SKIP_ARM64=1 bash tests/e2e/v100-docker.sh   # arm64 原生主机
+#       bash tests/e2e/v100-docker.sh --self-test-compose-facts       # 仅 compose facts 回归，无需 Docker
 #       bash tests/e2e/v100-docker.sh --help
 # 环境：
 #   DOCKER_ARCH=amd64|arm64  运行架构（默认 amd64）。平台 linux/$DOCKER_ARCH、源
@@ -183,7 +184,7 @@ image_for_role() {
 
 usage() {
   cat <<'EOF'
-用法: [DOCKER_ARCH=amd64|arm64] [SKIP_ARM64=1] bash tests/e2e/v100-docker.sh [--help]
+用法: [DOCKER_ARCH=amd64|arm64] [SKIP_ARM64=1] bash tests/e2e/v100-docker.sh [--help | --self-test-compose-facts]
 
 M5 Docker 交付 e2e：按 DOCKER_ARCH 构建并运行 hub/panel/agent 三镜像
 （在对应架构主机上为原生执行），
@@ -205,6 +206,7 @@ x86_64 主机可在 QEMU 可用且 dist/arm64 存在时附加验证 arm64 hub。
   bash tests/e2e/v100-docker.sh
   DOCKER_ARCH=amd64 SKIP_ARM64=1 bash tests/e2e/v100-docker.sh
   DOCKER_ARCH=arm64 SKIP_ARM64=1 bash tests/e2e/v100-docker.sh   # arm64 原生主机
+  bash tests/e2e/v100-docker.sh --self-test-compose-facts       # 仅 compose facts 回归（无需 Docker）
 EOF
 }
 
@@ -836,6 +838,13 @@ def normalize_host_ip(host_ip):
     return str(addr)
 
 
+def normalize_published(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
 def parse_short(value):
     text = str(value).strip()
     if not text:
@@ -870,18 +879,14 @@ def parse_short(value):
             target = parts[1]
         elif len(parts) == 1:
             target = parts[0]
-    if published in ("", None):
-        published = None
-    else:
-        published = str(published)
-    return as_int(target), published, normalize_host_ip(host_ip)
+    return as_int(target), normalize_published(published), normalize_host_ip(host_ip)
 
 
 def normalize_port(port):
     if isinstance(port, dict):
         return (
             as_int(port.get("target")),
-            port.get("published"),
+            normalize_published(port.get("published")),
             normalize_host_ip(port.get("host_ip")),
         )
     if isinstance(port, int):
@@ -1001,6 +1006,66 @@ if __name__ == "__main__":
 PY
 }
 
+compose_facts_port_case() {
+  local id=$1 desc=$2 host_ip=$3 published_json=$4 want=$5
+  local dir="$TMP_ROOT/compose-facts-ports"
+  local fixture="$dir/$id.json" err="$dir/$id.err" out="" loop="" non=""
+  if ! printf '{"services":{"hub":{"ports":[{"target":8080,"published":%s,"host_ip":"%s"}]}}}\n' \
+    "$published_json" "$host_ip" >"$fixture" 2>"$err"; then
+    fail "$id" "$desc（写入 fixture 失败）"
+    return
+  fi
+  if ! out=$("$PYTHON" "$TMP_ROOT/compose_facts.py" "$fixture" json 2>"$err"); then
+    fail "$id" "$desc（compose_facts.py 退出非零）"
+    dump_file "$err" 20
+    return
+  fi
+  loop=$(printf '%s\n' "$out" | sed -n 's/^published_8080_loopback=//p' | head -n 1)
+  non=$(printf '%s\n' "$out" | sed -n 's/^published_8080_nonloopback=//p' | head -n 1)
+  if [[ "$loop/$non" == "$want" ]]; then
+    pass "$id" "$desc（compose_facts.py 退出 0，loopback/nonloopback=$want）"
+  else
+    fail "$id" "$desc（期望 loopback/nonloopback=$want，实际 ${loop:-?}/${non:-?}）"
+  fi
+}
+
+# 回归 #88：Compose schema 允许 published 为整数，raw YAML 回退会保留整数；
+# 必须先归一化为 None/str，否则 pub_contains 的 "-" in int 会抛 TypeError。
+# 本组只调用脚本自己生成的 compose_facts.py，不依赖 Docker daemon。
+check_compose_facts_port_types() {
+  local dir="$TMP_ROOT/compose-facts-ports"
+  if ! mkdir -p -- "$dir"; then
+    fail "C.10" "无法创建 compose facts 端口类型回归目录: $dir"
+    return
+  fi
+  compose_facts_port_case "C.10a" "整数 published + host_ip 127.0.0.1 判定为回环 8080" \
+    "127.0.0.1" "8080" "1/0"
+  compose_facts_port_case "C.10b" "整数 published + host_ip 0.0.0.0 计为非回环 8080" \
+    "0.0.0.0" "8080" "0/1"
+  compose_facts_port_case "C.10c" "字符串 published + host_ip 127.0.0.1 仍判定为回环 8080" \
+    "127.0.0.1" '"8080"' "1/0"
+}
+
+# 不依赖 Docker daemon 的最小 harness：mktemp + 脚本自身的 write_compose_facts_py，
+# 仅运行上述回归后退出，供无法启动 Docker 的主机/CI 单测使用。
+self_test_compose_facts() {
+  local tmp_base=${TMPDIR:-/tmp}
+  tmp_base=${tmp_base%/}
+  TMP_ROOT=$(mktemp -d "$tmp_base/rustboard-v100-docker.XXXXXX") || {
+    printf 'FATAL: 无法创建 compose facts 回归临时目录\n' >&2
+    return 1
+  }
+  trap 'rm -rf -- "${TMP_ROOT:?}"' EXIT
+  write_compose_facts_py
+  if [[ ! -s "$TMP_ROOT/compose_facts.py" ]]; then
+    printf 'FATAL: 生成 compose_facts.py 失败\n' >&2
+    return 1
+  fi
+  check_compose_facts_port_types
+  printf '===== compose facts 端口类型回归: PASS=%s FAIL=%s =====\n' "$PASSES" "$FAILS"
+  (( FAILS == 0 ))
+}
+
 compose_fact() {
   local key=$1
   printf '%s\n' "$COMPOSE_FACTS" | sed -n "s/^${key}=//p" | head -n 1
@@ -1013,6 +1078,7 @@ compose_checks() {
   local facts_source="" facts_mode="json" agent_default=""
 
   write_compose_facts_py
+  check_compose_facts_port_types
 
   if (( HAVE_COMPOSE )); then
     if ! docker compose -f "$compose_file" config --format json \
@@ -2069,6 +2135,10 @@ parse_args() {
         -h | --help)
           usage
           exit 0
+          ;;
+        --self-test-compose-facts)
+          self_test_compose_facts
+          exit $?
           ;;
         *)
           printf '未知参数: %s\n' "$1" >&2

@@ -1,7 +1,7 @@
 # RustBoard 运行时镜像（多 target：base / hub / panel / agent）。
 #
 # 构建上下文必须是仓库根目录：
-#   docker buildx build --platform linux/amd64 --target hub -t rustboard-hub:dev .
+#   docker buildx build -f docker/Dockerfile --platform linux/amd64 --target hub -t rustboard-hub:dev .
 #
 # 镜像内不编译 Rust，只复制 packaging/build-release.sh 产出的静态二进制：
 #   dist/<TARGETARCH>/bin/rustboard-{hub,panel,agent}

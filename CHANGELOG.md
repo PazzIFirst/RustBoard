@@ -87,7 +87,8 @@
 - `#85` DOS-04b 同时要求 hub 健康与 agent 在线。
 - `#86` ARCH-15b 同时比较远端 size 与 DB `archive_objects.bytes`。
 - `#87` Docker PG 按 s4-agent ID 断言真实样本/批次，hub-self 不能代偿。
-- `#88` Compose 回环发布断言保留 host_ip，全网/缺省绑定会失败。
+- `#88` Compose 回环发布断言保留 host_ip，全网/缺省绑定会失败；兼容
+  字符串/整数 `published`，避免合法回环配置被误拒。
 - `#89` ARM64/离线门禁信号退出码 130/143，失败/中断不再 0 退出。
 - `#90` `ALLOW_UNVERIFIED` 逐项校验可得来源，已确定不一致仍 FATAL。
 - `#91` 手工 PG 恢复流程用 root 打开备份 fd，postgres 用户不再读 root 0700
