@@ -28,7 +28,7 @@
 ### Changed
 
 - **v1.0.0 只支持全新安装**：SQLite/PostgreSQL schema <9 一律 fail closed，
-  不执行旧数据迁移/回填；`#51` 的 v7→v8 兼容推迟到首个正式版本之后，
+  不执行旧数据迁移/回填；`#51` 已由维护者按 `not_planned` 关闭，
   发布说明必须写明 fresh install only。
 - PostgreSQL 备份/恢复/迁移的外部工具继承 Hub TLS 策略（默认 `verify-full`，
   仅显式 `sslmode=disable` 才关闭；私有 CA 通过 `PGSSLROOTCERT`），并清理会
@@ -121,9 +121,12 @@
 
 - **v1.0.0 只支持全新安装**：schema <9 的旧 SQLite/PostgreSQL 数据库会在
   启动/备份/恢复/迁移时明确拒绝，不执行 v7/v8 回填或旧数据迁移。
-- `#51` 的 v7→v8 旧数据迁移缺陷不在本版本修复范围，将在 v1.0.0 之后处理；
-  该 issue 仍保持 OPEN。`#58`/`#59` 属于 v1.0.0 仍可用的 SQLite→PostgreSQL
-  迁移路径，已在本版本修复。
+- `#51` 的 v7→v8 旧数据迁移缺陷不在本版本修复范围；维护者已按
+  `not_planned` 关闭该 issue，v1.0.0 继续拒绝 schema<9。
+  `#58`/`#59` 属于 v1.0.0 仍可用的 SQLite→PostgreSQL 迁移路径，已修复。
+- 24h 长稳的 RssAnon 门禁按方案 R5 使用 2h 基线：脚本默认 10min 基线
+  会包含启动爬坡（+20.9%）；2h 基线到 24h 峰值 +8.0%、结束 -4.2%，
+  FD/线程 0 增量，0 丢点/重复/错误。该口径经用户明确确认。
 - 已发布 tag `v1.0.0-rc.2`、`v1.0.0-rc.3` 不移动；`v1.0.0` 只在本版本全部门禁
   （含 24h 长稳、100/500/1000、Docker PG/安装、arm64、评审/渗透）通过后发布。
 
