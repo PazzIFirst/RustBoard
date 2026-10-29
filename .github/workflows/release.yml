@@ -940,6 +940,7 @@ jobs:
       - name: 准备 Docker PG e2e 镜像
         run: |
           set -euo pipefail
+          docker pull debian:bookworm-slim
           docker pull postgres:16
           docker pull postgres:16-alpine
 
