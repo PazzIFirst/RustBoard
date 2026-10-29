@@ -397,8 +397,10 @@ case "$PW_HASH_BEFORE" in
 esac
 
 # panel_data 备份（含 token/密码哈希，只保存在 0700 临时目录，证据只记摘要）。
+# 备份由容器内 root 写入 bind mount；GitHub runner 以非 root 运行，需把文件
+# 本身设为 0644（父目录仍是 0700），否则宿主无法校验/计算摘要。
 helper_sh -v "$PANEL_VOL:/data" -v "$TMP/backup:/backup" "$PANEL_IMAGE" \
-  -c 'set -eu; umask 077; tar -C /data -czf /backup/panel-data-before.tgz .' \
+  -c 'set -eu; umask 077; tar -C /data -czf /backup/panel-data-before.tgz .; chmod 0644 /backup/panel-data-before.tgz' \
   || die "panel_data 备份失败"
 BACKUP_FILE="$TMP/backup/panel-data-before.tgz"
 [ -s "$BACKUP_FILE" ] || die "panel_data 备份为空"
