@@ -1826,8 +1826,18 @@ user_10001_checks() {
 
   # 密码文件需对 UID 10001 可读：保留 0600，只把 owner 改成 10001；测试副本
   # 与生产 secret 分离，不改动 root:root 0600 的 $PG_PW_FILE。
-  if ! install -m 0600 "$PG_PW_FILE" "$USER_PW_FILE" \
-    || ! chown 10001:10001 "$USER_PW_FILE"; then
+  if ! install -m 0600 "$PG_PW_FILE" "$USER_PW_FILE"; then
+    fail "U.1" "无法创建 0600 且属主 10001 的 --user 测试密码文件"
+    return 1
+  fi
+  # GitHub Actions runner 以非 root 运行；本地 root 直接 chown。两者都必须
+  # 在失败时显式 FAIL，不能用 set -e 直接中断。
+  if [[ $EUID -eq 0 ]]; then
+    if ! chown 10001:10001 "$USER_PW_FILE"; then
+      fail "U.1" "无法创建 0600 且属主 10001 的 --user 测试密码文件"
+      return 1
+    fi
+  elif ! sudo -n chown 10001:10001 "$USER_PW_FILE"; then
     fail "U.1" "无法创建 0600 且属主 10001 的 --user 测试密码文件"
     return 1
   fi
