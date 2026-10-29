@@ -961,6 +961,13 @@ jobs:
           test -n "$EXPECTED_VERSION"
           EXPECTED_VERSION="$EXPECTED_VERSION" bash tests/e2e/v100-docker-pg.sh --dist-manifest "$manifest"
 
+      # #79：已初始化 panel_data 的受控 TLS 重配置；复用上一步 local-s4 镜像。
+      - name: Docker Panel 受控重配置 e2e（#79）
+        run: |
+          set -euo pipefail
+          test -f tests/e2e/v100-docker-panel-reconfig.sh
+          bash tests/e2e/v100-docker-panel-reconfig.sh
+
   # 发布前的原生 arm64 交付门禁：先在 arm64 runner 上安装/启动 aarch64 离线包，
   # 再原生构建并运行三镜像 Docker e2e；不使用 QEMU，也不推送 GHCR。
   delivery-arm64:

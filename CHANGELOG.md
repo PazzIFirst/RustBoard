@@ -10,6 +10,21 @@
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-29
+
+### Fixed
+
+- `#79` Docker 已初始化 `panel_data` 的直连 HTTPS 重配置：Panel 文档补齐
+  停服、备份、受控 root 属主切换（含 `/data/etc` 与 `/data/etc/rustboard`）、
+  `install --force`、恢复 `10001:10001`、HTTPS 健康验收；证书挂载改为
+  `/run/rustboard-panel-tls/`，避免与只读 `hub_run` 冲突。
+
+### Tests
+
+- 新增 `tests/e2e/v100-docker-panel-reconfig.sh`：真实初始化 panel volume →
+  按文档重配 → 10001 启动 → HTTPS healthz 200，并断言密码哈希/hub token
+  保留、cert/key 权限与进程 UID；Release `delivery-docker` 已纳入该门禁。
+
 ## [1.0.0] - 2026-10-29
 
 ### Added

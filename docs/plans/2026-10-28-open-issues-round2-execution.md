@@ -99,3 +99,17 @@
   - `ghcr.io/pazzifirst/rustboard-agent:v1.0.0` `sha256:0eb33332…`
 - issue 状态由用户确认；9 条仍 OPEN（#33/#39/#52/#53/#54/#56/#57/#80/#88），
   已修复的 #80/#88 等不自行关闭。
+
+## 7. v1.0.1 补丁（#79 Panel 分支）
+
+- `#79` 复核指出 v1.0.0 只修了 Hub Docker 重配置，Panel 分支仍按旧文档
+  直接 root install，会被 `/data` 10001 属主的 prefix 校验拒绝。
+- 修复：`docs/install/panel-tls.md` §9 增加停服、备份、受控 chown
+  （含 `/data/etc`、`/data/etc/rustboard`）、root `install --force`、恢复
+  10001、`--user 10001` 启动与 HTTPS 健康验收；cert/key 改挂
+  `/run/rustboard-panel-tls/`，避开只读 `hub_run` 的 mountpoint 冲突。
+- 新增 `tests/e2e/v100-docker-panel-reconfig.sh`：真实初始化 panel_data →
+  按文档重配 → HTTPS healthz 200，断言密码哈希/hub token 保留、TLS/config
+  权限、进程 UID 10001；本地连续 3 次 **PASS=33 FAIL=0**。
+- Release `delivery-docker` 增加该 E2E 门禁；`Cargo.toml`/锁版本升 1.0.1，
+  `CHANGELOG` 增 `[1.0.1]`。无协议/schema/产品行为变更。

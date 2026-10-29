@@ -203,30 +203,86 @@ public_origin = "https://panel.example.com"
 默认 `docker/entrypoint-panel.sh` 没有面板 TLS 的环境变量，`compose.example.yml`
 也不发布面板端口。要在容器里用直连 HTTPS：
 
-1. 把证书/私钥只读挂载到容器（例如 `/run/rustboard/panel-tls/`）；
-2. 用容器 root 执行一次安装/更新（entrypoint 有参数时直接 exec，不进入初始化）：
-   ```bash
-   docker compose -f docker/compose.example.yml run --rm \
-     -v /host/panel.crt:/run/rustboard/panel-tls/cert.pem:ro \
-     -v /host/panel.key:/run/rustboard/panel-tls/key.pem:ro \
-     panel rustboard-panel install --force --no-systemd --prefix /data \
-       --hub-url http://127.0.0.1:8444 \
-       --hub-token-file /run/rustboard/admin_token \
-       --static-dir /usr/share/rustboard/web \
-       --tls-cert /run/rustboard/panel-tls/cert.pem \
-       --tls-key /run/rustboard/panel-tls/key.pem \
-       --public-origin https://panel.example.com \
-       --listen 0.0.0.0:8080
-   ```
-   注意 `docker compose run` 默认不会继承 `depends_on` 的健康等待；hub 需已运行。
-3. 重新 `up -d` 让入口以 UID 10001 启动面板。证书已复制进 `panel_data` 的
-   `/data/etc/rustboard/panel-tls/`，后续重启不依赖宿主挂载。
-4. 面板改为 HTTPS 后，hub 服务发布的 8080 映射仍在，但容器内 8080 已经是
+1. 把证书/私钥只读挂载到容器（例如 `/run/rustboard-panel-tls/`）。不要挂到
+   `/run/rustboard/` 下：panel compose 已把该目录只读挂载，runc 无法再在其下创建
+   mountpoint。
+2. **已初始化 `panel_data` 必须先停服并受控切换属主**；`panel_data` 首启后归
+   `10001:10001`，而 `rustboard-panel install` 必须以 root 运行，且
+   `validate_install_prefix` 会拒绝 root 访问 10001 属主的 prefix。不要删除
+   volume、不要 chmod 0777、也不要放宽安装器校验。完整顺序：
+
+```bash
+# 0) 停 panel（hub 保持运行）；记录配置 hash 并备份 panel_data
+#    panel_data 含 hub token 与密码哈希，按 secret 保管。
+docker compose -f docker/compose.example.yml stop panel
+docker compose -f docker/compose.example.yml cp panel:/data/etc/rustboard/panel.toml   /tmp/rb-panel-before.toml
+BACKUP_DIR=${RUSTBOARD_BACKUP_DIR:-$HOME/rustboard-backups}
+install -d -m 0700 "$BACKUP_DIR"
+docker compose -f docker/compose.example.yml run --rm --no-deps   -v "$BACKUP_DIR:/backup" --entrypoint /bin/sh panel   -c 'umask 077; tar -C /data -czf /backup/panel-data-$(date +%Y%m%dT%H%M%S).tgz .'
+
+# 1) 只把安装必需路径切成 root；先拒绝符号链接/子挂载，再 -xdev + chown -h
+docker compose -f docker/compose.example.yml run --rm --no-deps panel sh -c '
+  set -eu
+  bad=$(find /data -xdev -type l -print -quit)
+  [ -z "$bad" ] || { echo "拒绝：$bad 是符号链接" >&2; exit 1; }
+  dev=$(stat -c %d /data)
+  bad_mount=$(find /data -xdev -type d -exec stat -c "%d %n" {} + \
+    | awk -v dev="$dev" "\$1 != dev { print \$2; exit }")
+  [ -z "$bad_mount" ] || { echo "拒绝：$bad_mount 是子挂载" >&2; exit 1; }
+  chown -h 0:0 /data /data/etc /data/etc/rustboard /data/var /data/var/lib
+  find /data/var/lib/rustboard -xdev -exec chown -h 0:0 {} +
+'
+
+# 2) 以 root 安装/更新 TLS；非 TTY 必须 --yes
+docker compose -f docker/compose.example.yml run --rm --no-deps \
+  -v /host/panel.crt:/run/rustboard-panel-tls/cert.pem:ro \
+  -v /host/panel.key:/run/rustboard-panel-tls/key.pem:ro \
+  panel rustboard-panel install --yes --force --no-systemd --prefix /data \
+    --hub-url http://127.0.0.1:8444 \
+    --hub-token-file /run/rustboard/admin_token \
+    --static-dir /usr/share/rustboard/web \
+    --tls-cert /run/rustboard-panel-tls/cert.pem \
+    --tls-key /run/rustboard-panel-tls/key.pem \
+    --public-origin https://panel.example.com \
+    --listen 0.0.0.0:8080
+
+# 3) 成功或失败都恢复 10001；同样拒绝符号链接/子挂载，-xdev + chown -h
+docker compose -f docker/compose.example.yml run --rm --no-deps panel sh -c '
+  set -eu
+  bad=$(find /data -xdev -type l -print -quit)
+  [ -z "$bad" ] || { echo "拒绝：$bad 是符号链接" >&2; exit 1; }
+  dev=$(stat -c %d /data)
+  bad_mount=$(find /data -xdev -type d -exec stat -c "%d %n" {} + \
+    | awk -v dev="$dev" "\$1 != dev { print \$2; exit }")
+  [ -z "$bad_mount" ] || { echo "拒绝：$bad_mount 是子挂载" >&2; exit 1; }
+  find /data -xdev -exec chown -h 10001:10001 {} +
+  bad_owner=$(find /data -xdev \( ! -uid 10001 -o ! -gid 10001 \) -print -quit)
+  [ -z "$bad_owner" ] || { echo "属主未恢复: $bad_owner" >&2; exit 1; }
+'
+
+# 4) 启动；容器内 8080 已是 HTTPS
+docker compose -f docker/compose.example.yml up -d
+curl -fsS --cacert /host/panel-ca-or-cert.pem \
+  --resolve panel.example.com:8080:127.0.0.1 \
+  https://panel.example.com:8080/healthz
+```
+
+失败处理：
+
+- 第 1/3 步在 chown 前已拒绝符号链接/子挂载；chown 中断则重跑第 3 步。
+- 第 2 步失败/中断后，先单独重跑第 3 步恢复 10001；不要用 `--user 10001`
+  启动“修复”，也不要在 root 属主状态下直接 `up -d`。
+- `docker compose run` 默认不等待 `depends_on` 健康；Hub 必须已运行。
+- 证书已复制进 `/data/etc/rustboard/panel-tls/`，后续重启不依赖宿主挂载。
+
+3. 面板改为 HTTPS 后，hub 服务发布的 8080 映射仍在，但容器内 8080 已经是
    TLS；浏览器需用 `https://<面板主机>:8080`。若要改成 443/8443 等端口，需要
    在 hub 服务的 `ports` 中调整映射（默认示例只发布 8443 与回环 8080），或继续
    放在反代/VPN 后。
 
-本阶段不把面板 TLS 纳入默认 compose 门禁；Docker 面板 TLS 的端到端验证留 C9。
+本阶段不把面板 TLS 纳入默认 compose 门禁；Docker 面板 TLS 的端到端验证见
+`tests/e2e/v100-docker-panel-reconfig.sh`（真实初始化 panel volume → 文档顺序
+重配 → HTTPS health）。
 
 ## 10. 相关文档
 
