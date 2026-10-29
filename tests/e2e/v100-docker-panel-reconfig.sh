@@ -377,8 +377,9 @@ docker stop "$PANEL_CT" >/dev/null || die "无法停止 panel 容器"
 PANEL_STOPPED_STATE=$(docker inspect -f '{{.State.Status}}' "$PANEL_CT" 2>/dev/null || true)
 check_eq 1.6 "切换前 panel 已停止" "exited" "${PANEL_STOPPED_STATE:-missing}"
 
-docker cp "$PANEL_CT:/data/etc/rustboard/panel.toml" "$TMP/panel-before.toml" >/dev/null \
-  || die "无法从已停止的 panel 容器取回 panel.toml"
+docker run --rm -v "$PANEL_VOL:/data:ro" --entrypoint /bin/cat "$PANEL_IMAGE" \
+  /data/etc/rustboard/panel.toml >"$TMP/panel-before.toml" \
+  || die "无法从已停止的 panel 卷取回 panel.toml"
 chmod 0600 "$TMP/panel-before.toml"
 
 TOKEN_BEFORE=$(config_value "$TMP/panel-before.toml" token)
@@ -598,7 +599,7 @@ else
   fi
 fi
 
-docker cp "$PANEL_CT:/data/etc/rustboard/panel.toml" "$TMP/panel-after.toml" >/dev/null \
+docker exec "$PANEL_CT" cat /data/etc/rustboard/panel.toml >"$TMP/panel-after.toml" \
   || die "无法从运行中的 panel 取回 panel.toml"
 chmod 0600 "$TMP/panel-after.toml"
 TOKEN_AFTER=$(config_value "$TMP/panel-after.toml" token)
