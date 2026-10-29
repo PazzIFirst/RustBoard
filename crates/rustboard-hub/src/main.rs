@@ -14563,7 +14563,10 @@ mod tests {
 
     /// #66：watch 收到相同间隔时不得重置 next_tick；否则高频同值 PUT/通知会让
     /// 采样无限推迟。这里直接观察实际采集时间戳。
-    #[tokio::test]
+    // 该用例同时运行采样任务和高频 watch 发送；current_thread 调度器在 CI
+    // 负载下可能让 20ms 发送循环压住 100ms 采样定时器，造成 after=before+1
+    // 的假阴性。生产 runtime 为多线程，这里用 2 worker 复现真实调度。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn self_monitor_same_interval_notifications_do_not_postpone_sampling() {
         let dir = temp_dir("self-monitor-same-interval");
         let storage = Arc::new(StorageHandle::sqlite_memory().unwrap());
