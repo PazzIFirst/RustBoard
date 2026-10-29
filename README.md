@@ -12,7 +12,7 @@
 已知问题见 [docs/known-issues.md](docs/known-issues.md)。
 协作流程见 [AGENTS.md](AGENTS.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面、v0.3.x 硬化、M4 告警/归档、v0.4.x 修复已完成；M5 Phase A/B/C/D 已完成，Phase E 第二轮 #51–#102 修复已进入 `v1.0.0` 候选（1.0.0，schema v9、fresh install only、告警 CAS/关系表、备份 TLS/证书锁、安装器/SFTP/测试门禁修复）。** 已发布的 `v1.0.0-rc.2`/`v1.0.0-rc.3` tag 不移动；amd64 单元/PG/关键 E2E 已通过，**200 agent 24h（按用户批准的 2h 基线）、100/500/1000 agent、Docker PG/TLS、安装/离线、arm64 与最终渗透均已通过；`v1.0.1`（发布中）包含 #79 Panel Docker 受控重配置修复；v1.0.0 的三镜像多架构与双架构包仍可用**。具体门禁见 [docs/status.md](docs/status.md) 与 [修复方案](docs/plans/2026-10-28-open-issues-round2.md)。
+> **当前状态：M1/M2、v0.2.1 安全硬化、M3 控制面、v0.3.x 硬化、M4 告警/归档、v0.4.x 修复已完成；M5 Phase A/B/C/D 已完成，Phase E 第二轮 #51–#102 修复已进入 `v1.0.0` 候选（1.0.0，schema v9、fresh install only、告警 CAS/关系表、备份 TLS/证书锁、安装器/SFTP/测试门禁修复）。** 已发布的 `v1.0.0-rc.2`/`v1.0.0-rc.3` tag 不移动；amd64 单元/PG/关键 E2E 已通过，**200 agent 24h（按用户批准的 2h 基线）、100/500/1000 agent、Docker PG/TLS、安装/离线、arm64 与最终渗透均已通过；[`v1.0.1`](https://github.com/PazzIFirst/RustBoard/releases/tag/v1.0.1) 已发布，包含 #79 Panel Docker 受控重配置修复；v1.0.0 的三镜像多架构与双架构包仍可用**。具体门禁见 [docs/status.md](docs/status.md) 与 [修复方案](docs/plans/2026-10-28-open-issues-round2.md)。
 >
 > **v1.0.0 只支持全新安装**：schema <9 的旧数据库会被明确拒绝，不执行旧数据迁移；`#51` 已由维护者按 `not_planned` 关闭，v1.0.0 不执行旧库升级。**
 > Phase B 交付静态 musl 离线包、Docker 多架构镜像和 release workflow；Phase C 增加 ACME（域名 / 公网 IP 自动续期）与面板直连 HTTPS；Phase D 增加 PostgreSQL（默认仍 SQLite）与迁移/备份/恢复。PostgreSQL 为单 hub 语义，配置与限制见 [PostgreSQL 文档](docs/install/postgres.md)。

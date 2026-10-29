@@ -113,3 +113,6 @@
   权限、进程 UID 10001；本地连续 3 次 **PASS=33 FAIL=0**。
 - Release `delivery-docker` 增加该 E2E 门禁；`Cargo.toml`/锁版本升 1.0.1，
   `CHANGELOG` 增 `[1.0.1]`。无协议/schema/产品行为变更。
+- `v1.0.1` 已发布：<https://github.com/PazzIFirst/RustBoard/releases/tag/v1.0.1>
+  tag `847d6e9`；Release workflow 全绿（含 Panel reconfig E2E、Docker PG、
+  arm64、离线/安装、镜像 manifest）。

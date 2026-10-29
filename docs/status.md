@@ -19,7 +19,7 @@
 | M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | v0.4.1 已知问题修复 | 🟢 完成 | KI-29 rowid 竞态、KI-31 64 MiB 配置/下载一致性、KI-28 拒绝日志采样、KI-20 安装命令引用；SFTP 真实环境 29/29，M4 基线渗透无高危；v041 26/26；v0.4.1 发布 |
 | v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
-| M5 安装与交付 | 🟢 v1.0.1 发布中（2026-10-29） | Phase A 安装器；Phase B 离线/Docker；Phase C RC `v1.0.0-rc.2`；Phase D PG 迁移/备份/恢复；#51–#102 第二轮：schema v9（fresh install only）、告警 CAS/关系表、备份 TLS/证书锁、控制面/安装器、SFTP vendor、测试门禁、文档；workspace+真实 PG 全绿，security 9/9、cert 103/103、panel 159/159、hardening 36/36、control 103/103、v041 26/26+2 SKIP；**v1.0.1 修复 #79 Panel 受控重配置并纳入 Release Docker 门禁；v1.0.0 的 24h/压力/交付/渗透证据保持有效** |
+| M5 安装与交付 | 🟢 v1.0.1 已发布（2026-10-29） | Phase A 安装器；Phase B 离线/Docker；Phase C RC `v1.0.0-rc.2`；Phase D PG 迁移/备份/恢复；#51–#102 第二轮：schema v9（fresh install only）、告警 CAS/关系表、备份 TLS/证书锁、控制面/安装器、SFTP vendor、测试门禁、文档；workspace+真实 PG 全绿，security 9/9、cert 103/103、panel 159/159、hardening 36/36、control 103/103、v041 26/26+2 SKIP；**v1.0.1 修复 #79 Panel 受控重配置并纳入 Release Docker 门禁；v1.0.0 的 24h/压力/交付/渗透证据保持有效** |
 
 ## 2026-10-28 第二轮开放 issue 修复（v1.0.0 候选）
 
@@ -44,8 +44,9 @@
   30/0、stress 4/0、SFTP 29/0。
 - 已发布：`v1.0.0` tag/Release（2026-10-29）；三镜像多架构与双架构离线包、
   SBOM、image-digests 已上传。
-- `v1.0.1`：修复 #79 Panel Docker 受控 TLS 重配置文档与 E2E，纳入 Release
-  `delivery-docker`；无协议/schema/产品行为变更。
+- `v1.0.1` 已发布：修复 #79 Panel Docker 受控 TLS 重配置文档与 E2E，
+  纳入 Release `delivery-docker`；无协议/schema/产品行为变更。
+  <https://github.com/PazzIFirst/RustBoard/releases/tag/v1.0.1>
 - issue 由用户确认关闭；9 条仍 OPEN，不自行关闭。
 - 硬约束：`v1.0.0-rc.2`/`v1.0.0-rc.3` 不移动；issue 只补评论，关闭由用户确认。
 
