@@ -16,7 +16,9 @@
     备份、恢复、migrate 全部 fail closed，fresh install 不可达。
   - `#51` 由维护者按 `not_planned` 关闭，不计入“已修复”；v1.0.0 继续以
     schema<9 fail closed 保护旧数据。
-- `v1.0.0-rc.2`、`v1.0.0-rc.3` 未移动；`v1.0.0` 待 tag、未发布。
+- `v1.0.0-rc.2`、`v1.0.0-rc.3` 未移动；`v1.0.0` 已 tag 并发布：
+  <https://github.com/PazzIFirst/RustBoard/releases/tag/v1.0.0>。
+  发布 tag `de135d6`；Release workflow 全绿。
 
 ## 2. 代码提交
 
@@ -86,8 +88,14 @@
 | 渗透压力（DOS-01/ALERT） | 4 PASS / 0 FAIL（100k 事件淘汰未构造，另由单测覆盖） |
 | SFTP/ARCH 真实环境 | 29 PASS / 0 FAIL |
 
-## 6. 待完成
+## 6. 发布结果
 
-- `v1.0.0` tag、GitHub Release、三镜像多架构。
-- issue 状态由用户确认；当前 9 条 OPEN（#33/#39/#52/#53/#54/#56/#57/#80/#88），
+- `v1.0.0` tag：`de135d6`；Release workflow 全绿。
+- GitHub Release：<https://github.com/PazzIFirst/RustBoard/releases/tag/v1.0.0>
+- 资产：amd64/aarch64 离线包、SBOM、SHA256SUMS、image-digests。
+- 镜像（多架构 amd64/arm64）：
+  - `ghcr.io/pazzifirst/rustboard-hub:v1.0.0` `sha256:84d5da62…`
+  - `ghcr.io/pazzifirst/rustboard-panel:v1.0.0` `sha256:a948efbf…`
+  - `ghcr.io/pazzifirst/rustboard-agent:v1.0.0` `sha256:0eb33332…`
+- issue 状态由用户确认；9 条仍 OPEN（#33/#39/#52/#53/#54/#56/#57/#80/#88），
   已修复的 #80/#88 等不自行关闭。

@@ -4,7 +4,7 @@
 > 代码提交与门禁证据见 [执行记录](2026-10-28-open-issues-round2-execution.md)。
 > 仅 #51（v7→v8 旧迁移，v1.0.0 fresh install 不可达）由维护者按
 > `not_planned` 关闭；200 agent / 24h（用户确认 2h 基线）、100/500/1000、
-> Docker/安装/arm64、最终渗透均已通过。待 tag/release/镜像，`v1.0.0` 未发布。
+> Docker/安装/arm64、最终渗透均已通过。`v1.0.0` 已 tag 并发布。
 
 ## 0. 状态、范围与用户决策
 
