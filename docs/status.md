@@ -707,3 +707,23 @@ Phase E S1/S3/S4 已完成；S2 hub 级 200/100/500/1000 各 10min 已通过
 [Phase B 交付计划](plans/2026-10-25-m5-phase-b-delivery.md)、
 [Phase C 计划](plans/2026-10-25-m5-phase-c-tls-release-gates.md)。控制面/告警/归档均按
 “默认关闭或最小暴露 + 审计/固定错误码”交付。
+
+## 2026-10-29 工作区清理记录
+
+- 清理前：`/dev/sda1` 158G，used 99G，avail 53G（66%）。
+- 清理后：`/dev/sda1` 158G，used 72G，avail 80G（48%）。
+- 清理范围：
+  - `target/debug`（v1.0.1 构建/测试产物，约 3.3G）；
+  - 旧 `target/load`：2026-10-26 多次短档 + 无效的
+    `20261027T184322Z-200a`；保留最终 24h `20261027T212205Z-200a` 与
+    100/500/1000 三档；
+  - 旧 `dist`：v0.4.2、rc.2、rc.3 包；保留 v1.0.0 发布包与当前
+    `dist/amd64`、`dist/arm64`；
+  - 测试 Docker 容器/镜像/卷（`rb-sftp-*`、`rb-pebble`、
+    `rb-pg-restore-test`、`rustboard-test/*`、`local-s4` 等）和 builder cache；
+  - `/tmp` 测试目录/日志/工具链缓存；最终门禁日志已归档到
+    `target/release-evidence/`。
+- 保留：`target/baseline-bin/`（v0.4.0 冻结基线）、`target/load/` 最终证据、
+  `target/{docker-pg-e2e,docker-tls-volume-e2e,docker-panel-reconfig-e2e,pg-tls-e2e}/`、
+  `tests/pentest/evidence/`、源码、`vendor/`、`.git/`、v1.0.0 发布包。
+- 未动：`lite-nav-redis-dev` 容器、ecom-community 数据卷、`/root/work-showcase`。
