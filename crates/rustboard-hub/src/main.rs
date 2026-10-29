@@ -14589,12 +14589,16 @@ mod tests {
 
         wait_for_timestamp_count(&timestamps, 2, "同值通知前的采样").await;
         let before = timestamps.lock().expect("时间戳锁不得中毒").len();
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(350);
-        while tokio::time::Instant::now() < deadline {
+        // 不在固定 350ms 窗口里数点：CI 调度抖动会把“已采样但少 1 个”误判为
+        // 推迟。持续发送同值通知，最多等 2s，直到采样数增加 2；若同值通知真的
+        // 重置 next_tick，采样会被无限推迟，本断言仍会失败。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut after = before;
+        while after < before + 2 && tokio::time::Instant::now() < deadline {
             tx.send(100).expect("watch 接收端必须存活");
             tokio::time::sleep(Duration::from_millis(20)).await;
+            after = timestamps.lock().expect("时间戳锁不得中毒").len();
         }
-        let after = timestamps.lock().expect("时间戳锁不得中毒").len();
         assert!(
             after >= before + 2,
             "相同间隔的重复通知不能推迟采样：before={before}, after={after}"
