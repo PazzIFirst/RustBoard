@@ -132,4 +132,9 @@
 - 门禁：fmt/clippy 通过；`cargo test --workspace --locked`
   1652 passed / 0 failed / 5 ignored；`cargo audit` 无未允许高危。
 - 兼容性：无协议/schema/配置变更；Agent 无需升级。
-- 发布：`v1.0.2` Release 流程完成后补链接与镜像 digest。
+- `v1.0.2` 已发布：<https://github.com/PazzIFirst/RustBoard/releases/tag/v1.0.2>
+  tag `ebb369d`；Release workflow 41467942800 全绿（verify / postgres /
+  security E2E / build / delivery / images / manifest / release）。
+- 镜像 digest：hub `sha256:af213eff…`、panel `sha256:d9660d64…`、
+  agent `sha256:e4f5444d…`（多架构 amd64/arm64）。
+- 资产：amd64/aarch64 离线包、SBOM、SHA256SUMS、image-digests。

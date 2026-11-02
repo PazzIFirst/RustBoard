@@ -6,9 +6,10 @@ Phase B 新增 `.github/workflows/release.yml`：只由 `v*` tag push 触发。�
 正式发布 job 增加 `environment: release` 人工闸门；Phase D 增加 PostgreSQL
 显式 opt-in，不改变发布流水线或默认 SQLite。
 
-> **当前状态**：`v1.0.0-rc.2`/`v1.0.0-rc.3` 已发布且**不移动**；第二轮
-> #51–#102 修复进入 `v1.0.0-rc.4` 候选，`v1.0.0` 尚未发布。release workflow
-> 现在有两层自动门禁：先查询目标 `$GITHUB_SHA` 的 CI 五项结果，再在发布流程内
+> **当前状态**：`v1.0.0-rc.2`/`v1.0.0-rc.3` 已发布且**不移动**；
+> `v1.0.0`（fresh install only）、`v1.0.1`（#79 Panel Docker 重配置）、
+> `v1.0.2`（#57 Hub 续签期间控制应答解耦）均已发布。release workflow
+> 有两层自动门禁：先查询目标 `$GITHUB_SHA` 的 CI 五项结果，再在发布流程内
 > 重跑 security/control/v041/cert-rotation/hardening；任一失败、缺失或运行中
 > 都不会提升正式 tag/Release。
 >

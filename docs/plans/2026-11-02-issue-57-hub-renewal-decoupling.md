@@ -214,7 +214,10 @@ if let Some(gate) = ctx.test_gate() {
   66/66 PASS。
 - 独立评审：未发现严重问题；采纳其失败路径、无第二任务、状态单一判据、
   `dead_code` 清理、测试入口注释与取消计数语义建议。
-- 发布：`v1.0.2` tag / GitHub Release / 镜像 digest 在发布完成后补记录。
+- 发布：`v1.0.2` tag `ebb369d` 已发布；
+  <https://github.com/PazzIFirst/RustBoard/releases/tag/v1.0.2>；
+  Release workflow 41467942800 全绿。镜像 digest：hub
+  `sha256:af213eff…`、panel `sha256:d9660d64…`、agent `sha256:e4f5444d…`。
 
 ## 11. 取消计数语义
 

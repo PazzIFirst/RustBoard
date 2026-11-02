@@ -19,7 +19,7 @@
 | M4 告警与归档 | 🟢 完成 | A 降采样/选层/保留期；B 告警/事件/静默/四渠道通知/面板；C WebDAV/S3/SFTP 归档与下载；D v040 27/27、panel 159/159、security 9/9、web 79/79、workspace/clippy/audit 全绿；v0.4.0 |
 | v0.4.1 已知问题修复 | 🟢 完成 | KI-29 rowid 竞态、KI-31 64 MiB 配置/下载一致性、KI-28 拒绝日志采样、KI-20 安装命令引用；SFTP 真实环境 29/29，M4 基线渗透无高危；v041 26/26；v0.4.1 发布 |
 | v0.4.2 安全/测试修复 | 🟢 完成 | v041 KI-28 计数兼容 CI ANSI；vendored russh 0.64.1 + ssh-key 0.7.0-rc.11 + crypto-bigint 0.7.6（RUSTSEC-2026-0387）；v0.4.2 发布 |
-| M5 安装与交付 | 🟢 v1.0.2 发布中（2026-11-02） | Phase A 安装器；Phase B 离线/Docker；Phase C RC `v1.0.0-rc.2`；Phase D PG 迁移/备份/恢复；#51–#102 第二轮：schema v9（fresh install only）、告警 CAS/关系表、备份 TLS/证书锁、控制面/安装器、SFTP vendor、测试门禁、文档；workspace+真实 PG 全绿，security 9/9、cert 103/103、panel 159/159、hardening 36/36、control 103/103、v041 26/26+2 SKIP；**v1.0.1 修复 #79 Panel 受控重配置并纳入 Release Docker 门禁；v1.0.2 修复 #57 Hub 续签期间控制应答解耦；v1.0.0 的 24h/压力/交付/渗透证据保持有效** |
+| M5 安装与交付 | 🟢 v1.0.2 已发布（2026-11-02） | Phase A 安装器；Phase B 离线/Docker；Phase C RC `v1.0.0-rc.2`；Phase D PG 迁移/备份/恢复；#51–#102 第二轮：schema v9（fresh install only）、告警 CAS/关系表、备份 TLS/证书锁、控制面/安装器、SFTP vendor、测试门禁、文档；workspace+真实 PG 全绿，security 9/9、cert 103/103、panel 159/159、hardening 36/36、control 103/103、v041 26/26+2 SKIP；**v1.0.1 修复 #79 Panel 受控重配置并纳入 Release Docker 门禁；v1.0.2 修复 #57 Hub 续签期间控制应答解耦；v1.0.0 的 24h/压力/交付/渗透证据保持有效** |
 
 ## 2026-10-28 第二轮开放 issue 修复（v1.0.0 候选）
 
@@ -70,8 +70,17 @@
   - `cargo clippy --workspace --all-targets --locked -- -D warnings` 通过；
   - `cargo test --workspace --locked`：1652 passed / 0 failed / 5 ignored；
   - `cargo test -p rustboard-hub --locked v102_`：4 passed / 0 failed；
-  - `cargo audit`：无未允许高危（仅既有的 yanked 允许项）。
-- 发布：`v1.0.2` Release 流程完成后补链接。
+  - `cargo audit`：无未允许高危（仅既有的 yanked 允许项）；
+  - `tests/e2e/v032.sh`：66/66 PASS（控制面/续签 busy/日志脱敏回归）。
+- 发布：`v1.0.2` tag `ebb369d`；[Release workflow 41467942800](https://github.com/PazzIFirst/RustBoard/actions/runs/41467942800)
+  全绿（verify / postgres / security E2E / build / delivery / images /
+  manifest / release）。GitHub Release：
+  <https://github.com/PazzIFirst/RustBoard/releases/tag/v1.0.2>
+- 镜像 digest：
+  - `ghcr.io/pazzifirst/rustboard-hub:v1.0.2` `sha256:af213eff…`
+  - `ghcr.io/pazzifirst/rustboard-panel:v1.0.2` `sha256:d9660d64…`
+  - `ghcr.io/pazzifirst/rustboard-agent:v1.0.2` `sha256:e4f5444d…`
+- 资产：amd64/aarch64 离线包、SBOM、SHA256SUMS、image-digests。
 
 ## 构建产物清理（2026-10-25 Phase C 收尾）
 
