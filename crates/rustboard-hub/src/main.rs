@@ -5288,6 +5288,11 @@ async fn handle_session(mut socket: WebSocket, state: AppState, hello: AgentHell
         let mut watch_shutdown = true;
         // 会话内只记录最近一次成功时间；能否续签由每 agent 冷却窗口决定。
         let mut renew = RenewState::default();
+        // 同一会话最多一个在途续签任务：任务结果经一次性 channel 回到 `select!`，
+        // WebSocket 写仍只发生在会话循环。`renewal_task` 的 `Drop` 负责提前退出时
+        // abort 任务；`renewal_rx.is_some()` 即“有在途续签”的唯一判据。
+        let mut renewal_rx: Option<tokio::sync::mpsc::Receiver<RenewalCompletion>> = None;
+        let mut renewal_task: Option<RenewalTask> = None;
         // 绝对空闲 deadline：每秒的控制清理 tick 不会重置它，只有入站帧才续期。
         let mut idle = SessionIdle::new(SESSION_IDLE_TIMEOUT);
 
@@ -5315,6 +5320,15 @@ async fn handle_session(mut socket: WebSocket, state: AppState, hello: AgentHell
                     Some(command) => SessionEvent::Control(command),
                     None => SessionEvent::ControlClosed,
                 },
+                // 续签结果必须先于 `recv` 被轮询：持续到达的批次不能在 biased
+                // select 里把签发结果饿死。任务 panic / 未发送就结束时 receiver
+                // 关闭，`recv` 返回 `None`。
+                completion = async {
+                    match renewal_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if renewal_rx.is_some() => SessionEvent::RenewalDone(completion),
                 received = recv => match received {
                     None => SessionEvent::Closed,
                     Some(Err(err)) => SessionEvent::RecvError(err.to_string()),
@@ -5380,16 +5394,35 @@ async fn handle_session(mut socket: WebSocket, state: AppState, hello: AgentHell
                         tracing::debug!(agent = %agent_id, expired, "清理超时的控制请求");
                     }
                 }
+                SessionEvent::RenewalDone(completion) => {
+                    // 丢弃 receiver 后 `renewal_rx.is_some()` 即为 false，本会话之后
+                    // 可再次发起续签（冷却窗口仍由 RenewGuard 把关）。receiver 已
+                    // 收到结果或关闭，丢弃它不会泄漏任务。
+                    renewal_rx = None;
+                    renewal_task = None;
+                    match completion {
+                        Some(done) => {
+                            renew = done.renew;
+                            if matches!(done.frame, Frame::CertRenewed { .. }) {
+                                mark_seen(&state, &agent_id).await;
+                            }
+                            send_frame(&mut socket, &done.frame).await?;
+                        }
+                        None => {
+                            // 任务在发送结果前 panic / 结束：与旧 JoinError 路径
+                            // 一致，回 INTERNAL，不让会话挂死。
+                            tracing::error!(
+                                agent = %agent_id,
+                                "证书续签任务未返回结果（panic 或被取消）"
+                            );
+                            send_frame(&mut socket, &problem(codes::INTERNAL, "hub 无法签发证书"))
+                                .await?;
+                        }
+                    }
+                }
                 SessionEvent::Message(message) => {
-                    match handle_message(
-                        &mut socket,
-                        &state,
-                        &agent_id,
-                        &mut renew,
-                        &mut control,
-                        message,
-                    )
-                    .await?
+                    match handle_message(&mut socket, &state, &agent_id, &mut control, message)
+                        .await?
                     {
                         MessageAction::Continue => {
                             // 只有完整处理完一帧才续期：慢批次入库 / 证书签发等
@@ -5398,11 +5431,64 @@ async fn handle_session(mut socket: WebSocket, state: AppState, hello: AgentHell
                             idle.on_frame();
                         }
                         MessageAction::Close => break,
+                        MessageAction::RenewCert(csr_pem) => {
+                            // 帧已读完即算心跳；签发耗时不再卡住本连接的读循环。
+                            idle.on_frame();
+                            if renewal_rx.is_some() {
+                                // 同一会话只允许一个在途签发任务，避免重复签名
+                                // 放大；已有任务的结果仍会正常返回。
+                                tracing::warn!(
+                                    agent = %agent_id,
+                                    "续签仍在进行，拒绝并发的续签请求"
+                                );
+                                send_frame(
+                                    &mut socket,
+                                    &problem(codes::RATE_LIMITED, "续签正在进行，请稍后再试"),
+                                )
+                                .await?;
+                                continue;
+                            }
+                            let (tx, rx) = tokio::sync::mpsc::channel(1);
+                            let ctx = state.renewal.clone();
+                            let task_agent = agent_id.clone();
+                            let task_now = now_ms();
+                            // `RenewState` 是 Copy：任务拿走副本，结果回来后再覆盖
+                            // 会话本地值，避免任务与会话同时借用同一状态。
+                            // 任务启动即由 `handle_renewal` 写入冷却表；之后即使会话
+                            // 退出并被 abort，这次尝试仍计数（有意防刷），重连后 10
+                            // 分钟内会收到 `RATE_LIMITED`。
+                            let mut task_renew = renew;
+                            let task = tokio::spawn(async move {
+                                let frame = handle_renewal(
+                                    &ctx,
+                                    &mut task_renew,
+                                    &task_agent,
+                                    &csr_pem,
+                                    task_now,
+                                )
+                                .await;
+                                // 会话已退出时 receiver 已关闭，发送失败无需处理；
+                                // 任务绝不直接写 socket。
+                                let _ = tx
+                                    .send(RenewalCompletion {
+                                        frame,
+                                        renew: task_renew,
+                                    })
+                                    .await;
+                            });
+                            renewal_rx = Some(rx);
+                            renewal_task = Some(RenewalTask(task));
+                        }
                     }
                 }
             }
         }
 
+        // 会话退出时 `renewal_task` 的 Drop 会 abort 在途任务；这里显式读取一次
+        // 句柄并留下排障日志，确认没有等待结果的任务泄漏。
+        if renewal_task.is_some() {
+            tracing::debug!(agent = %agent_id, "会话结束，取消在途续签任务");
+        }
         tracing::info!(agent = %agent_id, "agent 会话结束");
         Ok(())
     }
@@ -5490,11 +5576,15 @@ enum SessionEvent {
     IdleTimeout,
     Shutdown(ShutdownReason),
     WatchClosed,
+    /// 后台续签任务结束：`Some` 为结果；`None` 表示任务未发送就结束 / panic。
+    RenewalDone(Option<RenewalCompletion>),
 }
 
 enum MessageAction {
     Continue,
     Close,
+    /// 收到 `RenewCert`：签发放到后台任务，由会话循环处理结果并写 socket。
+    RenewCert(String),
 }
 
 /// 会话空闲超时的绝对 deadline。
@@ -5533,9 +5623,42 @@ impl SessionIdle {
 /// 只记录本会话最近一次成功的时间（Unix 毫秒，0 表示尚未成功），用于日志 /
 /// 指标；准入门槛完全由 [`RenewGuard`] 的每 agent 冷却窗口与容量上限决定，
 /// 因此同一会话在冷却结束后可以再次续签。
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct RenewState {
     last_success_ms: i64,
+}
+
+/// 后台续签任务交回会话循环的结果。
+///
+/// 任务只做「限流 + 读 CA + 签发」，绝不持有 WebSocket；会话循环收到后仍是
+/// 唯一的 socket 写入者。
+struct RenewalCompletion {
+    frame: Frame,
+    renew: RenewState,
+}
+
+/// 会话内的续签任务句柄：会话提前退出（含 `?` 路径）时由 `Drop` 取消任务，
+/// 避免任务在 socket 已关闭后继续等待一次性 channel。
+///
+/// 注意：`handle_renewal` 在任务一开始就调用 `RenewGuard::begin_attempt` 写入
+/// 冷却表；即使任务随后因会话退出被 abort，这次尝试**仍然计数**，agent 重连
+/// 后在 10 分钟冷却窗口内会收到 `RATE_LIMITED`。这是有意的防刷语义（取消不
+/// 退还名额），不是泄漏。
+struct RenewalTask(tokio::task::JoinHandle<()>);
+
+impl Drop for RenewalTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// 仅测试构建存在的续签闸门：确定性地挂起签发，制造「续签在途」窗口。
+///
+/// 生产构建不包含该类型、字段与等待分支，测试也不需要 sleep 竞态。
+#[cfg(test)]
+struct RenewalTestGate {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 /// 客户端续签的冷却窗口：同一 agent 10 分钟内只允许一次尝试。
@@ -5595,6 +5718,9 @@ struct RenewalContext {
     client_days: u32,
     /// 用 std Mutex：临界区只有一次 HashMap 操作，不跨 await 持有。
     guard: StdMutex<RenewGuard>,
+    /// 仅测试构建：安装后 `handle_renewal` 会在签发前挂起，收到 release 才继续。
+    #[cfg(test)]
+    test_gate: StdMutex<Option<Arc<RenewalTestGate>>>,
 }
 
 impl RenewalContext {
@@ -5603,6 +5729,8 @@ impl RenewalContext {
             cert_dir,
             client_days,
             guard: StdMutex::new(RenewGuard::new()),
+            #[cfg(test)]
+            test_gate: StdMutex::new(None),
         })
     }
 
@@ -5610,6 +5738,25 @@ impl RenewalContext {
         match self.guard.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// 安装 / 清除测试闸门。仅供单元测试使用；会话级 #57 用例
+    /// （`v102_*`）在收到 `started` 后发送控制应答，再 `release` 继续签发。
+    #[cfg(test)]
+    fn set_test_gate(&self, gate: Option<Arc<RenewalTestGate>>) {
+        match self.test_gate.lock() {
+            Ok(mut slot) => *slot = gate,
+            Err(poisoned) => *poisoned.into_inner() = gate,
+        }
+    }
+
+    /// 读取当前闸门；每次返回独立 `Arc`，不跨 await 持锁。
+    #[cfg(test)]
+    fn test_gate(&self) -> Option<Arc<RenewalTestGate>> {
+        match self.test_gate.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 }
@@ -5657,6 +5804,14 @@ async fn handle_renewal(
             "续签 CSR 超过长度上限，已拒绝"
         );
         return problem(codes::BAD_FRAME, "CSR 无效");
+    }
+
+    // 仅测试构建：在进入 spawn_blocking 前挂起，制造确定性的“签发在途”窗口；
+    // 生产二进制不包含该分支，也不依赖任何 sleep。
+    #[cfg(test)]
+    if let Some(gate) = ctx.test_gate() {
+        gate.started.notify_one();
+        gate.release.notified().await;
     }
 
     let cert_dir = ctx.cert_dir.clone();
@@ -5727,7 +5882,6 @@ async fn handle_message(
     socket: &mut WebSocket,
     state: &AppState,
     agent_id: &str,
-    renew: &mut RenewState,
     control: &mut ControlSession,
     message: Message,
 ) -> Result<MessageAction> {
@@ -5881,14 +6035,10 @@ async fn handle_message(
                     tracing::debug!(agent = %agent_id, "收到 agent 发来的 ControlRequest，已忽略");
                 }
                 Frame::RenewCert { csr_pem } => {
-                    // 限流/冷却判定、长度检查、读 CA 私钥与签发都在 handle_renewal 里；
-                    // 任何结果都只回 Problem / CertRenewed，不断开连接。
-                    let reply =
-                        handle_renewal(&state.renewal, renew, agent_id, &csr_pem, now_ms()).await;
-                    if matches!(reply, Frame::CertRenewed { .. }) {
-                        mark_seen(state, agent_id).await;
-                    }
-                    send_frame(socket, &reply).await?;
+                    // 限流/冷却、长度检查、读 CA 与签发都可能阻塞数百毫秒以上；
+                    // 交给会话循环启动后台任务，避免 await 期间读不到同连接上的
+                    // ControlResponse。所有结果仍由会话循环回 Problem / CertRenewed。
+                    return Ok(MessageAction::RenewCert(csr_pem));
                 }
                 other => {
                     // L6：只打变体名，Frame 的 Debug 也已脱敏；绝不打印 Hello/Enroll 内容。
@@ -14807,6 +14957,384 @@ mod tests {
         let reopened = SelfMonitorOutbox::open(&dir, 300, SELF_MONITOR_BUFFER_MAX_AGE_MS)
             .expect("容量淘汰后重启必须成功");
         assert!(reopened.pending_len() < 20);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ==== #57：Hub 续签与控制应答解耦的会话级回归 ====
+
+    use futures_util::{SinkExt, StreamExt};
+    use rustboard_common::control::{ControlOp, ControlResponse};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    type V102Ws = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// #57 测试用：真实本地 axum WebSocket 入口。
+    ///
+    /// 绕过生产 upgrade/dispatch 入口（测试没有 mTLS 层），只读取第一帧 Hello，
+    /// 随后把 socket 交给生产 `handle_session`；鉴权后的会话循环、注册、Welcome、
+    /// 控制派发与续签均为真实路径。
+    async fn v102_ws_entry(
+        ws: WebSocketUpgrade,
+        State(state): State<AppState>,
+    ) -> impl IntoResponse {
+        ws.on_upgrade(move |mut socket| async move {
+            let hello = match socket.recv().await {
+                Some(Ok(Message::Binary(bytes))) => match Frame::decode(&bytes) {
+                    Ok(Frame::Hello(hello)) => hello,
+                    _ => return,
+                },
+                _ => return,
+            };
+            let _ = handle_session(socket, state, hello).await;
+        })
+    }
+
+    /// #57 测试用：带真实 CA 材料、可安装续签闸门的 AppState。
+    fn v102_state(tag: &str, agent_id: &str, secret: &str) -> (PathBuf, AppState) {
+        let dir = temp_dir(tag);
+        tls::ensure_hub_material(&dir, &["localhost".to_string()], tls::CertPolicy::default())
+            .unwrap();
+        let cfg = HubConfig {
+            data_dir: dir.clone(),
+            ..HubConfig::default()
+        };
+        let mut state = hub_state_with(cfg);
+        // hub_state_with 默认用不存在的测试 CA 目录；这里换成真实材料，续签才能签发。
+        state.renewal = RenewalContext::new(tls::cert_dir(&dir), 90);
+        state
+            .storage
+            .set_agent_secret(agent_id, &tls::sha256_hex(secret), now_ms())
+            .unwrap();
+        (dir, state)
+    }
+
+    fn v102_hello(agent_id: &str, secret: &str) -> AgentHello {
+        let mut hello = valid_hello();
+        hello.agent_id = agent_id.to_string();
+        hello.secret = secret.to_string();
+        hello.capabilities = Vec::new();
+        hello
+    }
+
+    async fn v102_start_server(state: AppState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/agent", get(v102_ws_entry))
+            .with_state(state);
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("测试服务绑定本地端口失败");
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, server)
+    }
+
+    async fn v102_send(ws: &mut V102Ws, frame: &Frame) {
+        let bytes = frame.encode().expect("帧编码失败");
+        ws.send(WsMessage::Binary(bytes))
+            .await
+            .expect("WebSocket 发送失败");
+    }
+
+    async fn v102_recv(ws: &mut V102Ws) -> Frame {
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Binary(bytes))) => {
+                    return Frame::decode(&bytes).expect("收到无法解码的帧")
+                }
+                Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
+                Some(Ok(WsMessage::Close(frame))) => panic!("会话被关闭: {frame:?}"),
+                Some(Ok(other)) => panic!("收到非二进制帧: {other:?}"),
+                Some(Err(err)) => panic!("WebSocket 读取失败: {err}"),
+                None => panic!("WebSocket 连接已结束"),
+            }
+        }
+    }
+
+    async fn v102_recv_within(ws: &mut V102Ws, dur: Duration, what: &str) -> Frame {
+        tokio::time::timeout(dur, v102_recv(ws))
+            .await
+            .unwrap_or_else(|_| panic!("等待 {what} 超时"))
+    }
+
+    async fn v102_connect(addr: SocketAddr, hello: AgentHello) -> V102Ws {
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/agent"))
+            .await
+            .expect("连接测试 WebSocket 失败");
+        v102_send(&mut ws, &Frame::Hello(hello)).await;
+        match v102_recv_within(&mut ws, Duration::from_secs(3), "Welcome").await {
+            Frame::Welcome(_) => ws,
+            other => panic!("握手后必须收到 Welcome，实际: {other:?}"),
+        }
+    }
+
+    fn v102_gate() -> Arc<RenewalTestGate> {
+        Arc::new(RenewalTestGate {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// #57 主回归：续签签发被挂起期间，同连接上的 `ControlResponse` 必须继续被
+    /// 处理，对应 oneshot 在 1s 内完成；释放后仍由会话循环发出 `CertRenewed`。
+    ///
+    /// 旧实现会在 `handle_renewal(...).await` 期间停止读帧，本测试会因 oneshot
+    /// 1s 超时而失败。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v102_control_response_handled_while_renewal_in_flight() {
+        let agent_id = "agent-v102-control";
+        let secret = "s".repeat(64);
+        let (dir, state) = v102_state("v102-control-during-renewal", agent_id, &secret);
+        let (addr, server) = v102_start_server(state.clone()).await;
+        let mut ws = v102_connect(addr, v102_hello(agent_id, &secret)).await;
+
+        // 1. 会话内先派发控制命令；客户端收到 ControlRequest 后故意不回复。
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        state
+            .sessions
+            .control_sender(agent_id)
+            .expect("会话必须已注册")
+            .send(ControlCommand {
+                op: ControlOp::ProcessList,
+                reply,
+                deadline: Instant::now() + Duration::from_secs(10),
+            })
+            .await
+            .expect("控制命令必须入队");
+        let request =
+            match v102_recv_within(&mut ws, Duration::from_secs(2), "ControlRequest").await {
+                Frame::ControlRequest(request) => request,
+                other => panic!("必须先收到 ControlRequest，实际: {other:?}"),
+            };
+
+        // 2. 安装闸门并发送 RenewCert；用 started 确认签发已在途（不 sleep 猜）。
+        let gate = v102_gate();
+        state.renewal.set_test_gate(Some(gate.clone()));
+        let (csr_pem, _key) = tls::make_csr().expect("生成 CSR 失败");
+        v102_send(&mut ws, &Frame::RenewCert { csr_pem }).await;
+        tokio::time::timeout(Duration::from_secs(1), gate.started.notified())
+            .await
+            .expect("续签签发必须在 1s 内开始");
+
+        // 3. 签发仍被挂起时回 ControlResponse：oneshot 必须在 1s 内完成。
+        let response = ControlResponse::success(request.id, ControlResult::Processes(Vec::new()));
+        v102_send(&mut ws, &Frame::ControlResponse(response)).await;
+        let replied = tokio::time::timeout(Duration::from_secs(1), reply_rx).await;
+        // 无论断言是否通过，先放行闸门，避免会话 / 签发任务被永久挂住。
+        gate.release.notify_one();
+        match replied {
+            Ok(Ok(Ok(ControlResult::Processes(processes)))) => {
+                assert!(processes.is_empty(), "测试只期望空进程列表")
+            }
+            Ok(Ok(Ok(other))) => panic!("控制结果类型不符: {other:?}"),
+            Ok(Ok(Err(err))) => panic!(
+                "控制命令收到错误应答: code={} message={}",
+                err.code, err.message
+            ),
+            Ok(Err(err)) => panic!("控制命令应答通道被关闭: {err}"),
+            Err(_) => {
+                panic!("#57 回归失败：续签签发在途时，ControlResponse 未在 1s 内完成对应 oneshot")
+            }
+        }
+
+        // 4. 放行后签发结果仍必须回到同一会话并由会话循环写出。
+        match v102_recv_within(&mut ws, Duration::from_secs(3), "CertRenewed").await {
+            Frame::CertRenewed { cert_pem } => {
+                assert!(!cert_pem.is_empty(), "证书 PEM 不能为空")
+            }
+            other => panic!("释放续签后必须收到 CertRenewed，实际: {other:?}"),
+        }
+
+        // 5. 会话循环继续工作：Ping 仍能得到 Pong。
+        v102_send(&mut ws, &Frame::Ping { ts: 57 }).await;
+        match v102_recv_within(&mut ws, Duration::from_secs(2), "Pong").await {
+            Frame::Pong { ts } => assert_eq!(ts, 57),
+            other => panic!("续签结束后会话必须继续处理帧，实际: {other:?}"),
+        }
+
+        state.renewal.set_test_gate(None);
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #57 边界：同一会话已有续签在途时，第二个 RenewCert 必须立即得到固定
+    /// Problem（不启动第二个签发）；释放后第一个续签仍返回 CertRenewed。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v102_duplicate_renew_rejected_while_first_in_flight() {
+        let agent_id = "agent-v102-duplicate";
+        let secret = "s".repeat(64);
+        let (dir, state) = v102_state("v102-duplicate-renewal", agent_id, &secret);
+        let (addr, server) = v102_start_server(state.clone()).await;
+        let mut ws = v102_connect(addr, v102_hello(agent_id, &secret)).await;
+
+        let gate = v102_gate();
+        state.renewal.set_test_gate(Some(gate.clone()));
+        let (first_csr, _first_key) = tls::make_csr().expect("生成 CSR 失败");
+        v102_send(&mut ws, &Frame::RenewCert { csr_pem: first_csr }).await;
+        tokio::time::timeout(Duration::from_secs(1), gate.started.notified())
+            .await
+            .expect("首个续签签发必须在 1s 内开始");
+
+        // 首个签发仍挂起时再发一个 RenewCert：必须在签发结束前收到固定 Problem。
+        let (second_csr, _second_key) = tls::make_csr().expect("生成 CSR 失败");
+        v102_send(
+            &mut ws,
+            &Frame::RenewCert {
+                csr_pem: second_csr,
+            },
+        )
+        .await;
+        let duplicate = v102_recv_within(&mut ws, Duration::from_secs(1), "重复续签 Problem").await;
+        // 先释放第一个签发，再做断言；断言失败也不会把任务挂住。
+        gate.release.notify_one();
+        match duplicate {
+            Frame::Problem { code, message } => {
+                assert_eq!(code, codes::RATE_LIMITED, "在途重复续签必须回 RATE_LIMITED");
+                assert_eq!(
+                    message, "续签正在进行，请稍后再试",
+                    "在途重复续签必须回固定文案"
+                );
+            }
+            other => panic!("在途重复续签必须收到 Problem，实际: {other:?}"),
+        }
+
+        match v102_recv_within(&mut ws, Duration::from_secs(3), "首个续签的 CertRenewed").await
+        {
+            Frame::CertRenewed { cert_pem } => {
+                assert!(!cert_pem.is_empty(), "证书 PEM 不能为空")
+            }
+            other => panic!("释放后首个续签必须收到 CertRenewed，实际: {other:?}"),
+        }
+
+        // 首个续签完成后会话必须继续工作。
+        v102_send(&mut ws, &Frame::Ping { ts: 59 }).await;
+        match v102_recv_within(&mut ws, Duration::from_secs(2), "Pong").await {
+            Frame::Pong { ts } => assert_eq!(ts, 59),
+            other => panic!("首个续签结束后会话必须继续处理帧，实际: {other:?}"),
+        }
+
+        // 确认没有第二个并发签发任务：1s 内不得再出现任何二进制帧
+        // （超时即通过；Ping/Pong/Close 等非二进制消息不算）。
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Err(_) => {}
+            Ok(Some(Ok(WsMessage::Binary(bytes)))) => {
+                let frame = Frame::decode(&bytes);
+                panic!("重复续签不得启动第二个签发任务，却收到额外帧: {frame:?}");
+            }
+            Ok(None) => {}
+            Ok(Some(Err(_))) => {}
+            Ok(Some(Ok(_))) => {}
+        }
+
+        state.renewal.set_test_gate(None);
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #57 失败路径：坏 CSR 必须回 `Problem(BAD_FRAME, "CSR 无效")`，且会话循环
+    /// 继续工作；坏 CSR 计入 10 分钟冷却，随后合法 CSR 收到冷却期 `RATE_LIMITED`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v102_bad_csr_returns_problem_and_session_continues() {
+        let agent_id = "agent-v102-bad-csr";
+        let secret = "s".repeat(64);
+        let (dir, state) = v102_state("v102-bad-csr", agent_id, &secret);
+        let (addr, server) = v102_start_server(state.clone()).await;
+        let mut ws = v102_connect(addr, v102_hello(agent_id, &secret)).await;
+
+        // 1. 坏 CSR：签发任务返回 Problem，经 RenewalDone 分支回写会话。
+        v102_send(
+            &mut ws,
+            &Frame::RenewCert {
+                csr_pem: "not a csr".to_string(),
+            },
+        )
+        .await;
+        match v102_recv_within(&mut ws, Duration::from_secs(1), "坏 CSR 的 Problem").await {
+            Frame::Problem { code, message } => {
+                assert_eq!(code, codes::BAD_FRAME, "坏 CSR 必须回 BAD_FRAME");
+                assert_eq!(message, "CSR 无效", "坏 CSR 必须回固定文案");
+            }
+            other => panic!("坏 CSR 必须收到 Problem(BAD_FRAME)，实际: {other:?}"),
+        }
+
+        // 2. 会话继续工作：Ping 仍能得到 Pong（证明失败路径未卡住循环）。
+        v102_send(&mut ws, &Frame::Ping { ts: 58 }).await;
+        match v102_recv_within(&mut ws, Duration::from_secs(2), "Pong").await {
+            Frame::Pong { ts } => assert_eq!(ts, 58),
+            other => panic!("坏 CSR 后会话必须继续处理帧，实际: {other:?}"),
+        }
+
+        // 3. 坏 CSR 已计入冷却：紧接着的合法 CSR 在 1s 内得到冷却期固定 Problem。
+        let (csr_pem, _key) = tls::make_csr().expect("生成 CSR 失败");
+        v102_send(&mut ws, &Frame::RenewCert { csr_pem }).await;
+        match v102_recv_within(&mut ws, Duration::from_secs(1), "冷却期 Problem").await {
+            Frame::Problem { code, message } => {
+                assert_eq!(code, codes::RATE_LIMITED, "冷却期内续签必须回 RATE_LIMITED");
+                assert_eq!(
+                    message, "续签过于频繁，请稍后再试",
+                    "冷却期拒绝必须与在途拒绝使用不同文案"
+                );
+            }
+            other => panic!("冷却期内合法 CSR 必须收到 Problem，实际: {other:?}"),
+        }
+
+        state.renewal.set_test_gate(None);
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #57 可选：续签签发在途时会话被吊销，必须立即关闭并回 `Problem(REVOKED)`，
+    /// 不能因为等待签发而挂死；放行闸门后也不得再向已关闭的 socket 写续签结果。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v102_revoke_during_renewal_closes_session_without_hang() {
+        let agent_id = "agent-v102-revoke";
+        let secret = "s".repeat(64);
+        let (dir, state) = v102_state("v102-revoke-during-renewal", agent_id, &secret);
+        let (addr, server) = v102_start_server(state.clone()).await;
+        let mut ws = v102_connect(addr, v102_hello(agent_id, &secret)).await;
+
+        let gate = v102_gate();
+        state.renewal.set_test_gate(Some(gate.clone()));
+        let (csr_pem, _key) = tls::make_csr().expect("生成 CSR 失败");
+        v102_send(&mut ws, &Frame::RenewCert { csr_pem }).await;
+        tokio::time::timeout(Duration::from_secs(1), gate.started.notified())
+            .await
+            .expect("续签签发必须在 1s 内开始");
+
+        // 吊销：会话循环必须仍能处理取消信号，而不是等签发结束。
+        state.storage.revoke_agent(agent_id, now_ms()).unwrap();
+        assert!(state.sessions.shutdown(agent_id), "吊销时必须存在活跃会话");
+
+        match v102_recv_within(&mut ws, Duration::from_secs(3), "吊销 Problem").await {
+            Frame::Problem { code, message } => {
+                assert_eq!(code, codes::REVOKED, "吊销必须回 REVOKED");
+                assert_eq!(message, "该 agent 已被吊销");
+            }
+            other => panic!("续签在途被吊销时必须收到 Problem(REVOKED)，实际: {other:?}"),
+        }
+        // Problem 之后必须是 Close（tungstenite 也可能直接报连接已关闭）。
+        match tokio::time::timeout(Duration::from_secs(2), ws.next()).await {
+            Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(WsMessage::Close(_)))) => {}
+            Ok(Some(Ok(other))) => panic!("吊销后必须关闭连接，实际收到: {other:?}"),
+            Err(_) => panic!("吊销后 2s 内连接必须关闭"),
+        }
+
+        // 放行被取消的签发：不得再向已关闭的 socket 写 CertRenewed / 挂住测试。
+        gate.release.notify_one();
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(WsMessage::Close(_)))) => {}
+            Ok(Some(Ok(WsMessage::Binary(_)))) => {
+                panic!("会话已关闭后不得再写入续签结果")
+            }
+            Ok(Some(Ok(_))) => {}
+            Err(_) => panic!("关闭后的 WebSocket 读取不得挂住"),
+        }
+
+        state.renewal.set_test_gate(None);
+        server.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

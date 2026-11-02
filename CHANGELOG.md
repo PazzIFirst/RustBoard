@@ -10,6 +10,24 @@
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-11-02
+
+### Fixed
+
+- `#57` Hub 在客户端证书续签签发期间不再阻塞同一条 WebSocket 的收包：签发
+  放到后台任务，结果经一次性通道回到会话循环的单一发送者；已派发的控制命令
+  应答可在签发完成前完成，避免“动作已执行、面板却报超时”导致重复执行。同一
+  会话在途重复续签回固定 `rate_limited`，不并发启动第二个签发任务；会话关闭
+  时取消未完成任务，绝不向已关闭的 socket 写续签结果。
+
+### Tests
+
+- 新增 4 条真实 Hub 会话回归：慢签发期间 `ControlResponse` 及时完成、
+  在途重复续签被拒且无第二个签发任务、坏 CSR 回 `BAD_FRAME` 且计入冷却、
+  续签在途吊销时立即关闭且不挂死。
+  `cargo test --workspace --locked`：1652 passed / 0 failed / 5 ignored；
+  `cargo clippy --workspace --all-targets --locked -- -D warnings` 通过。
+
 ## [1.0.1] - 2026-10-29
 
 ### Fixed

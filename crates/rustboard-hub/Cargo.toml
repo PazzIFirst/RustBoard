@@ -65,3 +65,5 @@ tokio = { workspace = true, features = ["test-util"] }
 x509-parser = { workspace = true }
 # C4 续期阈值测试需要构造固定有效期的证书。
 time = { workspace = true }
+# #57 会话级续签解耦测试：本地 axum WebSocket 客户端（workspace 已锁定该依赖）。
+tokio-tungstenite = { workspace = true }

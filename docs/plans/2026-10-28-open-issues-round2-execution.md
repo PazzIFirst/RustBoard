@@ -116,3 +116,20 @@
 - `v1.0.1` 已发布：<https://github.com/PazzIFirst/RustBoard/releases/tag/v1.0.1>
   tag `847d6e9`；Release workflow 全绿（含 Panel reconfig E2E、Docker PG、
   arm64、离线/安装、镜像 manifest）。
+
+## 8. v1.0.2 补丁（#57 Hub 续签解耦）
+
+- `#57` 最终复核确认：Agent 侧 `wait_for_cert_renewed` 已修复，但 Hub
+  `handle_session` 仍在 `handle_renewal(...).await` 期间停止读同一 WebSocket，
+  慢签发时已派发控制命令的应答排队，API 15s deadline 先到。
+- 修复：Hub 续签签发改为后台任务，结果经一次性 `mpsc` 回到会话循环；
+  WebSocket 写仍由会话循环独占。签发期间继续处理 `ControlResponse`、Ping、
+  Batch 与吊销；在途重复 `RenewCert` 回固定 `rate_limited`；会话退出时
+  `RenewalTask` Drop abort，不向已关闭 socket 写结果。
+- 测试：4 条真实本地 axum WebSocket + `tokio-tungstenite` 会话回归
+  （慢签发 ControlResponse、在途重复续签且无第二任务、坏 CSR/冷却失败路径、
+  在途吊销关闭）；新增测试设施仅 `#[cfg(test)]`。
+- 门禁：fmt/clippy 通过；`cargo test --workspace --locked`
+  1652 passed / 0 failed / 5 ignored；`cargo audit` 无未允许高危。
+- 兼容性：无协议/schema/配置变更；Agent 无需升级。
+- 发布：`v1.0.2` Release 流程完成后补链接与镜像 digest。
